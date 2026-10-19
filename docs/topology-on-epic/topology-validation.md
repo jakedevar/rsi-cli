@@ -1,11 +1,25 @@
 # Topology Validation
 
-Source: `crates/rsid/src/session/topology_ops.rs`
+Source of truth: `crates/rsid-store/src/store_support/topology_validation.rs`
+(pure validators), `crates/rsi-common/src/types.rs` (`TopologyStep`,
+`CatalogOp`, `GateCondition`, `EdgeWhen`), and `crates/rsid/src/topology/steps.rs`
+(execute-time decode and validation).
 
-The daemon runs a four-stage validation pipeline on every `CreateTopology` and
-`UpdateTopology` call (when `definition` is `Some`). Validation is **pure**
-(no DB access) and runs before any mutation. The first failing stage short-
-circuits and returns `DaemonError::InvalidParam` with a specific message.
+`crates/rsid/src/session/topology_ops.rs` and `topology::steps` re-export these
+at their old paths (issue #1021 S3a). Read the store file, not the re-exports.
+
+Validation is **pure** (no DB access) and runs before any mutation, at three
+points:
+
+| When | Caller | Input |
+|---|---|---|
+| Definition write | `CreateTopology` / `UpdateTopology` (when `definition` is `Some`), `AgentTopologyUpsert` | the `TopologyDefinition` |
+| Execute | `ExecuteTopology` / `AgentTopologyExecute` / `ExecuteWorkflow` | the workflow snapshot (`steps::validate_workflow`) |
+| Launch | each node launch of an agent execution | provider policy (see [rpc-reference.md](rpc-reference.md) "Agent topology verbs") |
+
+The first failing stage short-circuits and returns `DaemonError::InvalidParam`
+with a specific message. For agent upserts the message arrives as a
+`diagnostics[]` entry with `invalid_definition`.
 
 ---
 
@@ -16,273 +30,300 @@ validate_topology_definition(def)
   ├── 1. validate_node_kinds(def)
   ├── 2. validate_edges_reference_existing_nodes(def)
   ├── 3. detect_cycles(def)
-  └── 4. validate_iteration_caps(def)
+  ├── 4. validate_iteration_caps(def)
+  └── 5. validate_topology(def)        typed steps + edge routing (#635, #1641)
+          └── validate_graph(nodes, edges)
 ```
 
-Source: `crates/rsid/src/session/topology_ops.rs:250-258`
+Stages 1-4 are the original graph-shape checks; stage 5 is the typed-step
+layer. A topology with no `params.step` anywhere is a legacy all-session
+topology: stage 5 only checks `params.when` and the forbidden author keys.
 
 ---
 
 ## Stage 1: Node Kind Legality
 
-**Function:** `validate_node_kinds(def)`
-Source: `crates/rsid/src/session/topology_ops.rs:262-272`
+Every `node.kind` must be in `legal_children(Some(SessionKind::Epic))`: the
+leaf kinds (`Story`, `Task`, `Bug`, `Feature`, `Refactor`, `Research`,
+`Standard`, `TaskRabbit`). Container kinds (`Group`, `Epic`) are illegal.
 
-Every `node.kind` must be in `legal_children(Some(SessionKind::Epic))`.
+Error: `illegal node kind: <kind> (must be in legal_children(Some(Epic)))`.
 
-The canonical legality set (from `rsi-common/src/types.rs:740-751`): all leaf
-kinds — `Story`, `Task`, `Bug`, `Feature`, `Refactor`, `Research`, `Standard`,
-`TaskRabbit`. Container kinds (`Group`, `Epic`) are illegal node kinds.
-
-**Why:** A topology node represents a work unit that runs as a session. Only
-leaf kinds spawn provider subprocesses. Container kinds are organizational
-nodes that cannot execute.
-
-**Error message:** `"illegal node kind: <kind> (must be in legal_children(Some(Epic)))"`
-
-```json
-// Bad: Epic cannot be a topology node
-{"nodes": [{"id": "wrapper", "kind": "Epic", "label": "..."}], "edges": []}
-// Error: "illegal node kind: Epic (must be in legal_children(Some(Epic)))"
-```
-
----
+Every node, whatever its step, still carries a leaf `kind` (the kind of the
+session it would launch; command, gate, review and land nodes launch no agent
+turn of their own).
 
 ## Stage 2: Edge Reference Validity
 
-**Function:** `validate_edges_reference_existing_nodes(def)`
-Source: `crates/rsid/src/session/topology_ops.rs:275-288`
+Every `edge.from` and `edge.to` must name a `node.id`, over the full edge set
+including `loop_edge: true`.
 
-Every `edge.from` and `edge.to` must resolve to a `node.id` in `def.nodes`.
-Checked over the full edge set (including `loop_edge: true`).
+Error: `edge references unknown node id: <id>`.
 
-**Error message:** `"edge references unknown node id: <id>"`
+## Stage 3: Cycle Detection (Kahn)
 
-```json
-// Bad: edge targets a node that doesn't exist
-{"nodes": [{"id": "a", "kind": "Task", "label": "A"}],
- "edges": [{"from": "a", "to": "nonexistent", "loop_edge": false}]}
-// Error: "edge references unknown node id: nonexistent"
-```
+Kahn's sort over edges with `loop_edge == false`. A leftover node means a
+cycle. Intentional cycles are written as `loop_edge: true` edges.
 
----
+Error: `topology DAG contains a cycle (excluding loop_edge: true)`.
 
-## Stage 3: Cycle Detection (Kahn's Algorithm)
+## Stage 4: Iteration Caps and Loop Guards
 
-**Function:** `detect_cycles(def)`
-Source: `crates/rsid/src/session/topology_ops.rs:292-332`
+- **Per-node cap.** `node.max_iterations`, when set, is at most
+  `MAX_ITERATIONS = 32` (`topology_validation.rs:17`). Error:
+  `max_iterations <n> exceeds hard cap 32`.
+- **Loop guard.** Tarjan's SCCs over the full edge set. A loop region is an SCC
+  of size > 1, or a single node with a self-loop. Without `def.until`, at least
+  one node in a loop SCC must set `max_iterations`. Error:
+  `topology contains a loop region with no termination guard (define until or per-node max_iterations)`.
 
-Runs Kahn's topological sort over the **acyclic subset** of edges — only edges
-where `loop_edge == false`. Loop edges are explicitly excluded because the
-loop mechanism is the correct way to express intentional cycles.
-
-**Algorithm:**
-1. Build in-degree map and adjacency list from non-loop edges only.
-2. Initialize queue with zero-in-degree nodes.
-3. Process queue: decrement neighbors' in-degrees; push newly-zero nodes.
-4. If `visited != len(nodes)`, a cycle exists → `CycleDetected`.
-
-**Error message:** `"topology DAG contains a cycle (excluding loop_edge: true)"`
-
-```json
-// Bad: a→b and b→a with loop_edge=false is a true cycle
-{"nodes": [{"id":"a","kind":"Task","label":"A"},{"id":"b","kind":"Task","label":"B"}],
- "edges": [{"from":"a","to":"b","loop_edge":false},{"from":"b","to":"a","loop_edge":false}]}
-// Error: "topology DAG contains a cycle (excluding loop_edge: true)"
-
-// OK: b→a with loop_edge=true is an intentional loop (handled by stage 4)
-{"edges": [{"from":"a","to":"b","loop_edge":false},{"from":"b","to":"a","loop_edge":true}]}
-```
+`compute_scc_regions` returns the loop regions (members sorted by id, regions
+sorted by minimum id); the bridge stamps them into the workflow metadata as
+`scc_regions`.
 
 ---
 
-## Stage 4: Iteration Cap Validation
+## Stage 5: Typed Steps and Edge Routing
 
-**Function:** `validate_iteration_caps(def)`
-Source: `crates/rsid/src/session/topology_ops.rs:338-384`
+### Where the data lives
 
-Two sub-checks:
+A node's typed kind is `TopologyNode.params["step"]`; the routing of its
+incoming edges is `params["when"]`, a map `{source_node_id: EdgeWhen}` on the
+**target** node. A node without `step` is a legacy session node; an edge
+without a `when` entry is `success`. Both decode strictly (`deny_unknown_fields`):
+an unknown field or kind is an error, never ignored. The bridge copies them
+into workflow metadata `topology_steps` and `edge_when`; the executor decodes
+only from there.
 
-### 4a: Per-node cap
+`params.when` may only name a source that has an edge into the node
+(`node <id>: when names <from>, which has no edge into it`).
 
-Every `node.max_iterations`, when `Some`, must be `<= MAX_ITERATIONS (32)`.
+### The five step kinds
 
-**Error message:** `"max_iterations <n> exceeds hard cap 32"`
+| `step.kind` | Fields | What runs |
+|---|---|---|
+| `session` | `expects_commit` (bool), `pass_content` (bool), `require_verified` (bool), `structured_handoff` (bool) | An ordinary agent session. Succeeds only on a validated `PIPELINE HANDOFF` with `status: complete` and a clean tree. `expects_commit` requires HEAD to differ from the fork commit; `pass_content` renders upstream nodes' full last message into the prompt; `structured_handoff` (#2759, omitted when false) has the handoff-format continuation turn validated against the handoff JSON Schema by the harness (Claude `--json-schema`, Codex `--output-schema` + `-o`). |
+| `command` | `op` (a `CatalogOp`) | One closed, daemon-owned op; no agent turn. |
+| `gate` | `condition` (a `GateCondition`) | A pure boolean over upstream typed outputs; no agent turn. |
+| `review` | `of`, `reviewer {provider, model, effort}`, `max_rounds` (default 2) | An independent review of the commit node `of` produced; no agent turn of the topology's own. |
+| `land` | `accepted`, `test_filters` (default empty) | Publishes the accepted commit through the daemon merge queue; no agent turn. |
 
-```json
-// Bad: cap of 33 exceeds the hard limit
-{"nodes": [{"id":"a","kind":"Task","label":"A","max_iterations":33}], "edges": []}
-// Error: "max_iterations 33 exceeds hard cap 32"
-```
+### Command catalog (`CatalogOp`, rule 7)
 
-### 4b: Loop termination guard
+The author names an op and typed params. The daemon builds argv and env and
+derives the effect class (`check` for every v1 op); the author supplies none of
+those.
 
-Any **loop region** must declare at least one termination guard. A loop region
-is identified via Tarjan's SCC algorithm over the **full edge set** (including
-`loop_edge: true`).
+| `op.name` | Params |
+|---|---|
+| `cargo_test_focused` | `crate`, `filter?`, `lib_only` |
+| `cargo_clippy_crate` | `crate` |
+| `cargo_check_crate` | `crate` |
+| `rolling_baseline` | `crates?` (1..=8 unique; default `rsi-common`, `rsid`, `rsi`) |
 
-A loop region is:
-- An SCC of size > 1, OR
-- A single-node SCC with a self-loop edge.
+`CatalogOp::validate` checks syntax only: crate names are 1..=64 bytes of
+`[A-Za-z0-9_-]` not starting with `-`; a test filter is 1..=128 bytes of
+`[A-Za-z0-9_:]`. Workspace membership is checked against the execution's
+repository at execute time.
 
-**Termination guard options (any one suffices):**
-1. `def.until` is `Some` (topology-level predicate applies to the whole graph)
-2. At least one node in the loop SCC has `max_iterations: Some(n)`
+**Forbidden author keys (rule 8).** `argv`, `env`, `script`, `script_path` and
+`effect_class` (`TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS`) are refused on **every**
+node: `node <id>: author-supplied <key> is refused; command nodes run only
+daemon catalog ops (#645)`. At execute time the same check reads the
+`key=value` tags the bridge made from unknown params.
 
-**Error message:** `"topology contains a loop region with no termination guard (define until or per-node max_iterations)"`
+### Gate conditions (rule 2)
 
-```json
-// Bad: loop region {a,b} with no guard
-{"nodes": [{"id":"a","kind":"Task","label":"A"},{"id":"b","kind":"Task","label":"B"}],
- "edges": [{"from":"a","to":"b","loop_edge":false},{"from":"b","to":"a","loop_edge":true}]}
-// Error: unbounded loop
+`GateCondition` is a closed JSON AST tagged by `op`: `eq`, `ne`, `in`,
+`exists`, `lt`, `le`, `gt`, `ge`, `and`, `or`, `not`. Limits: depth at most
+`GATE_MAX_DEPTH = 16`; `and`/`or` take 1..=32 operands; `in` takes 1..=32
+values; ordering comparisons need a finite number. Every `path` is
+`nodes.<ancestor_id>.<field>[.<field>…]` with segments of 1..=64 bytes of
+`[A-Za-z0-9_-]`.
 
-// OK: topology-level until guard
-{"nodes": [...same...],
- "edges": [...same...],
- "until": {"type":"lead_halt"}}
+Static rule: every node a gate path names must be a **forward ancestor** of the
+gate (`node <id>: gate path references <x>, which is not an ancestor`). At run
+time the operators differ:
 
-// OK: per-node cap on a node in the SCC
-{"nodes": [{"id":"a","kind":"Task","label":"A","max_iterations":5},{"id":"b","kind":"Task","label":"B"}],
- "edges": [{"from":"a","to":"b","loop_edge":false},{"from":"b","to":"a","loop_edge":true}]}
-```
+- `eq`, `ne` and `in` need a value: a missing (or `null`) path fails the gate
+  (`gate_error`). A present value is compared as JSON (numbers compare
+  numerically), so a type difference is simply "not equal", not an error.
+- `lt`, `le`, `gt`, `ge` need a number: a missing path or a non-numeric value
+  fails the gate (`gate_error`).
+- `exists` is a presence predicate: a missing or `null` path yields `false`, not
+  an error, so `not(exists(...))` is `true` for an absent path. Use it to route
+  `gate_false` on absence.
+- `and`, `or` and `not` propagate an error from any operand they evaluate
+  (`and`/`or` short-circuit, so an unevaluated operand cannot error).
 
-### SCC discovery (Tarjan's algorithm)
+A `gate_error` is never coerced to `false`.
 
-Source: `crates/rsid/src/session/topology_ops.rs:390-475`
+### Edge routing (`EdgeWhen`)
 
-The private `strongly_connected_components(def)` function implements Tarjan's
-iterative SCC discovery over the full edge set. Used by `validate_iteration_caps`
-to identify loop regions.
+| `when` | Taken when the source ... |
+|---|---|
+| `success` (default) | succeeded |
+| `failure` | failed terminally (not cancelled) |
+| `completed` | succeeded or failed terminally |
+| `gate_true` / `gate_false` | is a gate whose boolean (`output.fields.value`) matches |
+| `verdict_accepted` / `verdict_changes_requested` | is a review whose `output.fields.verdict` matches |
+| `review_required` (#2688) | is a `land` node the daemon refused `land_requires_review` (a migration, or a change that needs a pre-land review); no other failure takes it, and that refusal takes no `failure` edge |
+
+An untaken edge never feeds its target. A node whose incoming edges are all
+untaken is `skipped` (`dead_path`). A source under legacy
+`FailurePolicy::Skip` takes only its `success` edges.
+
+Static edge rules (`validate_graph`):
+
+1. Every edge names two known nodes.
+2. `gate_true` / `gate_false` must leave a `gate` node.
+3. `verdict_accepted` / `verdict_changes_requested` must leave a `review` node.
+4. An edge leaving a review node must not be a plain `success` edge. A review
+   that asked for changes still succeeds, so `success` would carry a rejected
+   commit onward. The accepted routings are `verdict_accepted`,
+   `verdict_changes_requested`, and the outcome edges `failure` and `completed`
+   (`completed` also fires for a successfully settled `changes_requested`
+   review). The verdict-only restriction applies to a `land` node, whose only input is
+   the `verdict_accepted` edge from its review.
+5. A `loop_edge` must be a `success` edge.
+6. `review_required` must leave a `land` node. A land with such an out-edge
+   settles that refusal as a routed `failed(land_requires_review)` instead of
+   `blocked`, so the execution continues on the edge (the starters
+   `issue-pipeline` and `issue-pipeline-post-review` route it to `pre_review`).
+   Without the edge the land still blocks `land_requires_review`.
+
+### Review rules (#1641)
+
+`validate_review` (`topology_validation.rs:467-514`):
+
+- `max_rounds` is in `1..=TOPOLOGY_MAX_REVIEW_ROUNDS` (3, the store's
+  per-revision cap).
+- `reviewer.model` and `reviewer.effort` are non-empty: the launch is explicit
+  (`reviewer.provider` is a typed enum). At upsert and launch the daemon also
+  requires the reviewer's vendor family to differ from the author's, and
+  that the explicit launch matches an operator `allowed_launches` entry.
+- `of` names a node that is a `session` with `expects_commit: true`.
+- `of` is a forward ancestor of the review, **or** the fix node whose loop edge
+  re-enters the review (`loop_edge` from `of` to the review).
+
+Executions with a review node need an Epic: its Work lives on the Epic's
+manager ledger, and an owning manager resolves from the Epic's project. An
+operator start without one is refused with a typed reason.
+
+### Land rules (#1641 S2)
+
+`validate_land` (`topology_validation.rs:516-564`):
+
+- `test_filters` has at most `ROLLING_QUEUE_MAX_TEST_FILTERS` entries, each a
+  valid `PACKAGE=FILTER` pair (`rsi_common::rolling_queue::valid_test_filter`).
+- `accepted` names a **review** node.
+- The land node's **only** input is the `verdict_accepted` edge from that
+  review, and it is not a loop edge. Another input, or any loop edge into it,
+  could publish a commit nobody accepted.
+- The land node cannot be the source of a loop edge (it would publish twice).
+
+The daemon enqueues on behalf of the execution's owner (its manager or Epic
+lead; for an operator start, the Epic's project manager).
+
+### Custody (execute time)
+
+Not part of `validate_topology_definition`: `plan_topology_custody`
+(`crates/rsid/src/topology/custody.rs`) runs when a live workflow is accepted
+and refuses a plan it cannot resolve.
+
+- A node forks from the commit of its single non-loop input; with none, from
+  the execution's base commit.
+- A node with **more than one** input must declare `params.custody.from`
+  (`base` or `node:<upstream_id>`); otherwise: `node <id> has multiple inputs;
+  custody.from is required`. A `node:` source must be upstream.
+- At most one loop custody source per node.
+- Inside one SCC a node forks from the source's **current iteration**; outside,
+  from the source's latest result. A loop's first node after iteration 0 forks
+  from the previous iteration of its loop source.
+- Every fork is a daemon-observed exact commit, never a moving ref. A session
+  whose tree is dirty at the end is `uncommitted_work`; a catalog op that
+  changes its sandbox outside `target/` and `.rsi-tmp/` settles
+  `sandbox_mutated` and is never re-run in place; diverged work is preserved
+  under a ref and the attempt blocks as `preserved_work` for
+  `ResolveTopologyAttempt`.
+
+### Execute-time re-validation
+
+`steps::validate_workflow` runs the same `validate_graph` over the snapshot:
+steps may only name known nodes, `edge_when` may only name existing edges, and
+each (from, to) pair has at most one routing condition. An author cannot reach
+the executor with an unvalidated step even through `ExecuteWorkflow`. Typed
+effects (command, gate, review, land) additionally require the durable
+executor: with `topology_executor_enabled=false` a live run of one is refused
+(`command and gate nodes need the durable topology executor`).
 
 ---
 
-## `MAX_ITERATIONS = 32`
+## Runtime bounds
 
-The hard cap is defined in two places:
+| Bound | Value | Source |
+|---|---|---|
+| Hard cap on iterations | 32 | `MAX_ITERATIONS` |
+| Charged attempts per node instance | 3 | `topology/graph.rs` `MAX_ATTEMPTS_PER_NODE` |
+| All attempts per execution | 64 | `MAX_NODE_ATTEMPTS_PER_EXECUTION` |
+| Session node wall time | 4 hours | `topology/executor.rs` `SESSION_WALL_TIME` |
+| Catalog op wall time | 1 hour | `topology/catalog.rs` `CATALOG_OP_WALL_TIME` |
+| Review rounds | 1..=3 per node | `TOPOLOGY_MAX_REVIEW_ROUNDS` |
+| Command build nodes in parallel | daemon config `topology_max_concurrent_build_nodes` | |
+| Session nodes of an agent execution in parallel | 3 | |
 
-1. **Topology validator** (definition-level): `crates/rsid/src/session/topology_ops.rs:27`
-   — rejects definitions with per-node caps > 32.
-2. **Spawn coordinator** (runtime): `crates/rsid/src/session/spawn_coordinator.rs:44`
-   — rejects spawn directives where iteration > min(node.max_iterations, 32).
+A queued landing is not bounded by the node wall time: the queue has its own
+gate budget and always settles an entry.
 
-Both places use the same numeric constant but are independent. The spawn-time
-cap is the runtime guard; the definition-time cap prevents invalid definitions
-from being stored.
+Loop termination at run time is the executor's: `until`, per-node
+`max_iterations`, or a lead `/halt`
+([spawn-child-grammar.md](spawn-child-grammar.md)), under the hard cap above.
 
----
+## Failure classes
 
-## Name Uniqueness (SELECT-then-INSERT)
-
-Name uniqueness is enforced in two layers:
-
-1. **Daemon pre-check** (`topology_name_exists`): SELECT before INSERT. Returns
-   `InvalidParam("topology name already exists")` on conflict.
-2. **DB constraint**: `UNIQUE` on `topologies.name` is the final guard against
-   concurrent writes.
-
-For `UpdateTopology`, the uniqueness check uses `exclude_id` to allow a
-topology to be renamed to its current name (no-op) without a false conflict.
-Source: `crates/rsid/src/store/topologies.rs:191-217`
-
----
-
-## Delete Guard (In-Use Check)
-
-`DeleteTopology` checks whether any Epic session's `workflow_id` column points
-at the target topology before deleting.
-
-**Query:** `SELECT id FROM sessions WHERE workflow_id = ?1 AND session_kind = 'Epic' LIMIT 1`
-Source: `crates/rsid/src/store/topologies.rs:168-186`
-
-`workflow_id_override` pointers are NOT checked. If a session has
-`workflow_id_override` pointing at a deleted topology, `effective_topology()`
-returns `None` for that session (the walk yields no match), which is safe —
-it falls through to the Epic's `workflow_id` instead.
+Recorded on the attempt (`topology/store.rs` `failure`): `session_failed`,
+`timeout`, `interrupted`, `lost_before_session`, `lost_after_session`,
+`preserved_work`, `custody_refused`, `cancelled`, `preserved_work_discarded`,
+`handoff_invalid`, `handoff_blocked`, `sandbox_mutated`, `exit_nonzero`,
+`gate_error`, `review_unsettled`, `review_rounds_exhausted`,
+`review_reopened`, `review_no_manager_ledger`, `land_admission_lost`,
+`land_refused`, `queue_disabled`, `dead_path`, `launch_refused`, `policy_refused`. Losses that are not the node's fault (`lost_*`, `interrupted`) are
+never charged against the execution cap.
 
 ---
 
-## Error Reference
+## Name uniqueness
 
-| `TopologyError` variant | `InvalidParam` message |
-|------------------------|------------------------|
-| `DuplicateName` | `"topology name already exists"` |
-| `UnknownNode(id)` | `"edge references unknown node id: <id>"` |
-| `CycleDetected` | `"topology DAG contains a cycle (excluding loop_edge: true)"` |
-| `IllegalNodeKind(kind)` | `"illegal node kind: <kind> (must be in legal_children(Some(Epic)))"` |
-| `IterationCapExceeded(n)` | `"max_iterations <n> exceeds hard cap 32"` |
-| `UnboundedLoop` | `"topology contains a loop region with no termination guard (define until or per-node max_iterations)"` |
-| `NotFound` | `"topology not found"` |
-| `InUse(epic_id)` | `"topology in use by Epic <uuid>: clear the reference before deleting"` |
+`topologies.name` is unique: a daemon pre-check (`topology_name_exists`) returns
+`topology name already exists`, and the `UNIQUE` constraint is the final guard.
+`UpdateTopology` excludes the topology's own id so a no-op rename is fine.
 
-Source: `crates/rsid/src/session/topology_ops.rs:53-87`
+## Delete guard
 
----
+`DeleteTopology` refuses while an Epic session's `workflow_id` points at the
+topology (`topology in use by Epic <uuid>: clear the reference before
+deleting`). `workflow_id_override` is not checked; a dangling override resolves
+to no topology and falls through to the Epic's `workflow_id`.
 
-## Loop Termination: Three Mechanisms
+## Error reference
 
-The loop guard requirement exists at definition time. At runtime, the executor
-enforces termination via three independent mechanisms (all implemented as of P1.11):
-
-| Mechanism | Phase available | How it fires |
-|-----------|-----------------|--------------|
-| `until: MaxIterations(n)` | P1.4 (definition) | Topology-level; `UntilEvaluator` stops when iteration hits n |
-| Per-node `max_iterations` | P1.4 (definition) | Node-level; `FailurePolicy::Retry` counts against cap |
-| Lead emits `/halt` | P1.11 | `until: LeadHalt` — `DaemonEvent::HaltDirective` bus event triggers halt |
-
-Any one of these terminating is sufficient. The `UnboundedLoop` error ensures
-at least one is declared. The `MAX_ITERATIONS = 32` hard cap in `run_loop_region`
-provides a hard backstop independent of the definition.
-
-See [spawn-child-grammar.md](spawn-child-grammar.md) for `/halt` directive details.
-
----
-
-## Loop Regions at Runtime (P1.11)
-
-P1.4 validates loop region structure at definition time. P1.11 enforces these at
-execution time:
-
-**What the bridge stamps (P1.11):** When `ExecuteTopology` bridges a topology,
-the workflow metadata receives:
-- `loop_edges`: JSON list of `{from, to}` pairs for all `loop_edge: true` edges
-- `scc_regions`: JSON list of SCC member node ID groups (Tarjan's algorithm, pre-computed)
-- `until_condition`: structured JSON of the `UntilCondition` variant
-
-**What the executor does:** `run_graph_workflow` reads these metadata keys and,
-when `scc_regions` is non-empty, switches to the loop-aware execution path:
-1. Pre-loop layers execute once (acyclic nodes before the first SCC layer).
-2. The SCC region executes via `run_loop_region`, which:
-   - Runs acyclic-skeleton layers concurrently per iteration.
-   - After each iteration, calls `UntilEvaluator::check_async` to decide halt/continue.
-   - Enforces `MAX_ITERATIONS = 32` as a hard ceiling.
-3. Post-loop layers execute once after the loop halts.
-
-**FailurePolicy at runtime:** Per-node `on_failure` policies are read from
-`metadata["failure_policies"]` and applied in `execute_layer`:
-- `Halt` (default): abort the workflow on node failure.
-- `Skip`: insert empty `NodeData` for the failed node; downstream nodes still run.
-- `Retry`: re-run the node up to `repeat_policy.max_iterations` times before halting.
-
-Source: `crates/rsid/src/session/graph_runner.rs` — `run_graph_workflow`,
-`run_loop_region`, `execute_layer`.
-
-## Per-node `params` bag
-
-`TopologyNode.params` is an opaque `HashMap<String, serde_json::Value>`.
-The daemon does **not** validate its contents — `validate_topology_definition`
-deliberately skips it. Consumers (Phase 5 scheduler, spawn coordinator) own
-the interpretation contract. A topology with malformed params will fail at
-execution time, not at `CreateTopology` time.
-
-The field serializes as `"params": {}` when empty (not elided). Pre-P1.8
-topologies stored without the key deserialize cleanly to an empty map.
+| `TopologyError` | `InvalidParam` message |
+|---|---|
+| `DuplicateName` | `topology name already exists` |
+| `UnknownNode(id)` | `edge references unknown node id: <id>` |
+| `CycleDetected` | `topology DAG contains a cycle (excluding loop_edge: true)` |
+| `IllegalNodeKind(kind)` | `illegal node kind: <kind> (must be in legal_children(Some(Epic)))` |
+| `IterationCapExceeded(n)` | `max_iterations <n> exceeds hard cap 32` |
+| `UnboundedLoop` | `topology contains a loop region with no termination guard (define until or per-node max_iterations)` |
+| `NotFound` | `topology not found` |
+| `InUse(epic_id)` | `topology in use by Epic <uuid>: clear the reference before deleting` |
+| `InvalidStep(message)` | the message itself (every typed-step, routing, review, land and forbidden-key rule above) |
 
 ---
 
 ## See Also
 
-- [README.md](README.md) — Phase 1 overview and Quickstart
-- [rpc-reference.md](rpc-reference.md) — `CreateTopology` / `UpdateTopology` error codes that validation produces
-- [topology-workflow-bridge.md](topology-workflow-bridge.md) — how `params` keys are consumed at `ExecuteTopology` time
-- [spawn-child-grammar.md](spawn-child-grammar.md) — runtime spawn-time validation (prereqs, iteration cap, uniqueness)
+- [README.md](README.md): overview and "Operational Starters (#1641)", the current typed-step examples
+- [rpc-reference.md](rpc-reference.md): RPC errors, plus the typed-step reference under "Agent topology verbs"
+- [topology-workflow-bridge.md](topology-workflow-bridge.md): the P1 bridge and the legacy runner (`topology_executor_enabled=false`)
+- [spawn-child-grammar.md](spawn-child-grammar.md): runtime spawn-time validation

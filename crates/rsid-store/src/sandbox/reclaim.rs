@@ -2,7 +2,9 @@
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
 use crate::store::sandbox_reclaim::{AbsentRootCandidate, AdoptionOutcome};
-use std::collections::{HashMap, HashSet};
+use crate::store::source_worktree_v120::DependencyProofWork;
+use rsid_core::pass_cost::{StageCosts, ThreadMeter};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
@@ -37,35 +39,154 @@ pub fn run_absent_root_adoption(
     if !created {
         return Ok(run_id);
     }
+    let meter = ThreadMeter::start();
+    let mut costs = AdoptionPassCosts::default();
     let candidates = store.absent_root_candidates(max_count)?;
+    costs.candidates = candidates.len() as u64;
     let mut evidence = RepoEvidenceCache::default();
+    // Retained outcomes only insert an audit row, so they are written one
+    // transaction per batch instead of one commit each: about 300 commits per
+    // restore on the hub (#2354). An adopted outcome commits its custody
+    // transition with its own row, so pending retained rows go first and the
+    // rows land in the order a one-commit-per-item run would have written.
+    let mut retained: Vec<(AbsentRootCandidate, Option<String>, &'static str)> = Vec::new();
+    // Restarts and periodic passes journal a retained candidate only when its
+    // verdict changed (#2364); an operator or manager request asks for the full
+    // report, so it keeps one row per candidate. The run's counts come from the
+    // decisions made here, not from the rows written.
+    let changed_only = !matches!(trigger, "operator" | "manager");
+    let (mut adopted_count, mut retained_count) = (0usize, 0usize);
     for candidate in candidates {
-        let (branch_oid, outcome) = match store.absent_root_gate(&candidate)? {
-            Some(code) => (None, AdoptionOutcome::Retained(code)),
-            None => match prove_absent_root(&base, &candidate, &mut evidence) {
-                Ok(oid) => {
-                    // Recheck custody and every database gate immediately before commit.
-                    match store.absent_root_dependency_gate(&candidate)? {
-                        Some(code) => (Some(oid), AdoptionOutcome::Retained(code)),
-                        None => match store.absent_root_gate(&candidate)? {
-                            Some(code) => (Some(oid), AdoptionOutcome::Retained(code)),
-                            None => (Some(oid), AdoptionOutcome::Adopted),
-                        },
-                    }
-                }
-                Err(code) => (None, AdoptionOutcome::Retained(code)),
-            },
-        };
-        store.record_absent_adoption_item(
-            run_id,
+        let (branch_oid, outcome) = match judge_absent_root_candidate(
+            store,
+            &base,
             &candidate,
-            branch_oid.as_deref(),
-            outcome,
-            dry_run,
-        )?;
+            &mut evidence,
+            &mut costs,
+        ) {
+            Ok(judged) => judged,
+            Err(error) => {
+                // Keep what the earlier candidates already earned, as the
+                // per-item path did before returning the error.
+                let _ =
+                    store.record_absent_adoption_retained_batch(run_id, &retained, changed_only);
+                return Err(error);
+            }
+        };
+        match outcome {
+            AdoptionOutcome::Retained(code) => {
+                retained_count += 1;
+                *costs.retained.entry(code).or_default() += 1;
+                retained.push((candidate, branch_oid, code));
+                if retained.len() >= RETAINED_BATCH {
+                    store.record_absent_adoption_retained_batch(run_id, &retained, changed_only)?;
+                    retained.clear();
+                }
+            }
+            AdoptionOutcome::Adopted => {
+                adopted_count += 1;
+                store.record_absent_adoption_retained_batch(run_id, &retained, changed_only)?;
+                retained.clear();
+                store.record_absent_adoption_item(
+                    run_id,
+                    &candidate,
+                    branch_oid.as_deref(),
+                    outcome,
+                    dry_run,
+                )?;
+            }
+        }
     }
-    store.finish_absent_adoption_run(run_id, None)?;
+    store.record_absent_adoption_retained_batch(run_id, &retained, changed_only)?;
+    store.finish_absent_adoption_run(run_id, None, adopted_count, retained_count)?;
+    costs.adopted = adopted_count as u64;
+    costs.log(trigger, dry_run, &meter.finish());
     Ok(run_id)
+}
+
+/// What one absent-root adoption pass did and cost (hub #2940): logged once
+/// per pass, never per candidate. Evidence only; no verdict reads it.
+#[derive(Default)]
+struct AdoptionPassCosts {
+    candidates: u64,
+    adopted: u64,
+    retained: BTreeMap<&'static str, u64>,
+    /// Candidates that reached the dependency proof.
+    dependency_proofs: u64,
+    dependency_work: DependencyProofWork,
+    stages: StageCosts,
+}
+
+impl AdoptionPassCosts {
+    fn log(&self, trigger: &str, dry_run: bool, pass: &rsid_core::pass_cost::Cost) {
+        // A pass with nothing to judge costs a query: keep it out of the log.
+        if self.candidates == 0 {
+            return;
+        }
+        tracing::info!(
+            trigger,
+            dry_run,
+            candidates = self.candidates,
+            adopted = self.adopted,
+            retained = ?self.retained,
+            dependency_proofs = self.dependency_proofs,
+            dependency_enabled_jobs_validated = self.dependency_work.enabled_jobs_validated,
+            dependency_relevant_sessions_validated =
+                self.dependency_work.relevant_sessions_validated,
+            dependency_indexed_job_rows = self.dependency_work.indexed_job_rows_loaded,
+            dependency_indexed_session_rows = self.dependency_work.indexed_session_rows_loaded,
+            dependency_path_canonicalizations = self.dependency_work.path_canonicalizations,
+            wall_ms = pass.wall_ms(),
+            thread_cpu_ms = pass.cpu_ms(),
+            read_kib = pass.read_kib(),
+            stage_cpu_wall_runs = %self.stages.summary(),
+            "Sandbox absent-root adoption pass finished"
+        );
+    }
+}
+
+/// Retained audit rows written per transaction.
+const RETAINED_BATCH: usize = 256;
+
+/// The verdict for one candidate: its branch tip (when proven) and whether it
+/// is adopted or retained with a reason code. Filesystem evidence is collected
+/// before the database gate is rechecked, immediately before the commit.
+fn judge_absent_root_candidate(
+    store: &Store,
+    base: &Path,
+    candidate: &AbsentRootCandidate,
+    evidence: &mut RepoEvidenceCache,
+    costs: &mut AdoptionPassCosts,
+) -> Result<(Option<String>, AdoptionOutcome)> {
+    let gate = costs
+        .stages
+        .stage("database_gate", || store.absent_root_gate(candidate))?;
+    if let Some(code) = gate {
+        return Ok((None, AdoptionOutcome::Retained(code)));
+    }
+    let proved = costs
+        .stages
+        .stage("git_proof", || prove_absent_root(base, candidate, evidence));
+    let oid = match proved {
+        Ok(oid) => oid,
+        Err(code) => return Ok((None, AdoptionOutcome::Retained(code))),
+    };
+    // Recheck custody and every database gate immediately before commit.
+    costs.dependency_proofs += 1;
+    let (dependency_verdict, work) = costs.stages.stage("dependency_proof", || {
+        store.absent_root_dependency_gate_with_work(candidate)
+    })?;
+    costs.dependency_work.add(work);
+    if let Some(code) = dependency_verdict {
+        return Ok((Some(oid), AdoptionOutcome::Retained(code)));
+    }
+    let recheck = costs
+        .stages
+        .stage("database_gate", || store.absent_root_gate(candidate))?;
+    Ok(match recheck {
+        Some(code) => (Some(oid), AdoptionOutcome::Retained(code)),
+        None => (Some(oid), AdoptionOutcome::Adopted),
+    })
 }
 
 /// Repository evidence read once per adoption run (#961).

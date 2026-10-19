@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:diagnostics": {
+      "status": "substitute",
+      "location": "src/actions/admin.ts, src/admin-model.ts, src/actions/admin-spec.ts",
+      "note": ":diagnostics (:diag) opens a read-only overlay with the desktop's own measurements (daemon round trip, frame interval, sessions listed, daemon connection) in place of the TUI's RSI_PROFILE render, poll and cache metrics"
+    },
+    "key:<Space>K": {
+      "status": "done",
+      "location": "src/admin-schedules.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin.rs",
+      "note": "<Space>K opens the scheduled jobs browser (also View \u203a Scheduled jobs\u2026)"
+    },
+    "module:ui/overlay/cohort_settlement.rs": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "see overlay-ref:source-worktree-settlement"
+    },
+    "module:ui/overlay/diagnostics.rs": {
+      "status": "substitute",
+      "location": "src/actions/admin.ts, src/admin-model.ts, src/actions/admin-spec.ts",
+      "note": "see cmd:diagnostics"
+    },
+    "module:ui/overlay/legacy_scratch.rs": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "see overlay:legacy-scratch-adoption"
+    },
+    "module:ui/overlay/mcp_server_form.rs": {
+      "status": "done",
+      "location": "src/admin-keys.ts, src/admin-model.ts, src/actions/admin-spec.ts, src-tauri/src/admin.rs",
+      "note": "MCP servers list (a add, Enter/e edit, t enable, s set / r rotate / d clear the write-only credential, R refresh) and the definition form; secret-looking arguments and URL user-info are masked before the webview (ListMcpServers, UpsertMcpServer, SetMcpServerEnabled, Set/Rotate/ClearMcpServerSecret)"
+    },
+    "module:ui/overlay/remote.rs": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "see overlay:remote-settings"
+    },
+    "module:ui/overlay/satellite_registry.rs": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "see overlay:satellite-registry-browser"
+    },
+    "module:ui/overlay/schedule_browser.rs": {
+      "status": "done",
+      "location": "src/admin-schedules.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin.rs",
+      "note": "see overlay-ref:scheduled-jobs-browser"
+    },
+    "module:ui/overlay/schedule_form.rs": {
+      "status": "done",
+      "location": "src/admin-schedules.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin.rs",
+      "note": "see overlay-ref:schedule-form"
+    },
+    "overlay-ref:diagnostics": {
+      "status": "substitute",
+      "location": "src/actions/admin.ts, src/admin-model.ts, src/actions/admin-spec.ts",
+      "note": "q/Esc close, r measures again, Space N / Space ; as in the TUI; desktop metrics replace the TUI's render/poll/cache rows"
+    },
+    "overlay-ref:schedule-form": {
+      "status": "done",
+      "location": "src/admin-schedules.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin.rs",
+      "note": "Tab fields, Left/Right cycles recurrence, Enter saves, Esc returns to the browser; create also takes an optional working directory, provider and model (the TUI uses its cwd and launch selection); edit sends name, message and schedule as the TUI does (CreateScheduledJob, UpdateScheduledJob)"
+    },
+    "overlay-ref:scheduled-jobs-browser": {
+      "status": "done",
+      "location": "src/admin-schedules.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin.rs",
+      "note": "j/k, n new, Enter/e edit, Space enable or disable, t run now, dd delete, r refresh, H history, m more, q/Esc; held wakes and wake mode shown per row (ListScheduledJobs, ListScheduledJobHolds, ToggleScheduledJob, TriggerScheduledJob, DeleteScheduledJob)"
+    },
+    "overlay-ref:source-worktree-settlement": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "View \u203a Source-worktree settlement\u2026: j/k J/K select (a selection change drops the audit), Enter audits, A begins authorization, r refreshes the receipt, Esc/q, Space N / Space ; (ListSourceWorktreeCohorts, AuditSourceWorktreeCohort, ListSourceWorktreeSettlementRuns, ApplySourceWorktreeCohort)"
+    },
+    "overlay:legacy-scratch-adoption": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "View \u203a Legacy scratch adoption\u2026: each unrecorded directory with the daemon's verdict; a/Enter or A (at most 32 adoptable) open a confirmation listing every full path and nothing is sent until y; Esc/n/q cancel; r refresh (ListLegacyScratch, AdoptLegacyScratch)"
+    },
+    "overlay:remote-settings": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "View \u203a Remote access\u2026: status block (URL, gateway, serve route, funnel, tailscale, the one-time serve command), Tab devices/projects, Space/Enter allow or expose (max 32 projects), e enable, n answers, m messages, a re-converge, r refresh, q/Esc (RemoteGetStatus, RemoteSetConfig)"
+    },
+    "overlay:satellite-registry-browser": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "View \u203a Satellite registry\u2026: Tab peers/links/cached sessions, j/k, a/e add or edit, d enable or disable (disabling a peer also clears reads and dispatch), R quarantine repair edit, p probe, I inbound policy, n/b session pages, r refresh, q/Esc; peer saves send the scope at the new revision as the TUI does (ListSatellitePeers, GetSatelliteScopeStatus, Get/PutSatelliteInboundPolicy, PutSatellitePeer, PutSatellitePeerScope, PutSatelliteLink, ProbeSatelliteLink, ListHubSatelliteSessions)"
+    },
+    "overlay:source-worktree-settlement-authorization": {
+      "status": "done",
+      "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
+      "note": "only after a fresh applyable audit of the selected cohort; the phrase is typed, never prefilled, and Apply runs only on an exact match (checked again in the Tauri backend); Esc leaves and clears it; one desktop-<uuid> retry key per authorization"
+    }
+  }
+}

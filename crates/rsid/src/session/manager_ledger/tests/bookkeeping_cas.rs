@@ -38,6 +38,7 @@ async fn ownership_expansion_survives_work_row_advance_and_keeps_ownership_cas()
                     state: ManagerStageStateV2::Partial,
                     note: "Implementation expanded the known file set".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "implementation-progress",
             ),
@@ -202,6 +203,7 @@ async fn evidence_stage_still_refuses_when_source_head_moves() -> Result<()> {
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "stage-with-moved-source",
             ),
@@ -241,6 +243,7 @@ fn source_bound_update_classification_is_explicit() {
         state: ManagerStageStateV2::Partial,
         note: String::new(),
         evidence: Some(evidence.clone()),
+        job_evidence: None,
     };
     assert!(!super::super::manager_update_work_snapshot_changed(
         &bookkeeping,
@@ -265,6 +268,7 @@ fn source_bound_update_classification_is_explicit() {
             state: ManagerStageStateV2::Partial,
             note: String::new(),
             evidence: None,
+            job_evidence: None,
         }
     ));
     assert!(super::super::requires_work_version_match(
@@ -275,6 +279,7 @@ fn source_bound_update_classification_is_explicit() {
             state: ManagerStageStateV2::Partial,
             note: String::new(),
             evidence: Some(evidence),
+            job_evidence: None,
         }
     ));
     assert!(super::super::requires_work_version_match(
@@ -365,6 +370,7 @@ async fn ownership_update_commits_across_concurrent_work_row_advance() -> Result
                     state: ManagerStageStateV2::Partial,
                     note: "work advanced".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "stage-advance",
             ),
@@ -400,6 +406,7 @@ async fn source_bound_stage_update_rejects_across_concurrent_work_row_advance() 
                             artifact_commit: f.source_head.clone(),
                             closure_evidence_id: None,
                         }),
+                        job_evidence: None,
                     },
                     "source-bound-race",
                 ),
@@ -418,6 +425,7 @@ async fn source_bound_stage_update_rejects_across_concurrent_work_row_advance() 
                     state: ManagerStageStateV2::Partial,
                     note: "work advanced".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "stage-advance",
             ),

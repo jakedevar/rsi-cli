@@ -5,7 +5,7 @@
       "kind": "Task",
       "label": "Implement the Issue",
       "params": {
-        "instructions": "You are a short-lived worker implementing the Issue in the upstream context ('issue': its number, title and body). The Issue states the intent and acceptance criteria; the principle is the ground truth, not the existing code. Follow AGENTS.md and the worker contract in your repository checkout: read the code you change, keep the diff focused, cover what you change with tests that assert the Issue's intent, and verify with scripts/scoped-test --base origin/rolling. Format only the files you changed (scripts/fmt-changed.sh origin/rolling), stage explicit paths, and commit on your sandbox branch. Do not push, do not touch rolling or main. When a product choice or a missing fact blocks you, ask with AskUserQuestion; if you cannot ask, end with a BLOCKED handoff. Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block whose fields are doc_path: inline, status: complete, a short summary, the commit SHA and the tests you ran. For a BLOCKED handoff use status: blocked with blocker, blocker_class (technical_impasse unless it is production, destructive, resource, authority or forbidden_scope), blocker_evidence and blocker_question (the single question that unblocks you).",
+        "instructions": "You are a short-lived worker implementing the Issue in the upstream context ('issue': its number, title and body). The Issue states the intent and acceptance criteria; the principle is the ground truth, not the existing code. Follow AGENTS.md and the worker contract in your repository checkout: read the code you change, keep the diff focused, cover what you change with tests that assert the Issue's intent, and verify with scripts/scoped-test --base origin/rolling. Format only the files you changed (scripts/fmt-changed.sh origin/rolling), stage explicit paths, and commit on your sandbox branch. Do not push, do not touch rolling or main. Decide engineering questions yourself and record the decision and its assumption in the handoff. Broken tooling, a stale tool copy, build/test infrastructure failures and a daemon redeploy needed to restore tooling are technical_impasse, answerable by the manager. Use resource for a real spending request only, and name the amount and currency in blocker_evidence and blocker_question. Resource defaults to an operator spend gate; only explicit tooling with no money signal may be answered by the manager, and unknown resource phrasing stays operator-owned; real spending, credentials, main or release, and deleting user data require the operator. End with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope). Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block whose fields are doc_path: inline, manifest_path: inline, status: complete, a short summary, the commit SHA and the tests you ran. For a BLOCKED handoff use status: blocked with blocker, blocker_class (technical_impasse unless it is production, destructive, resource, authority or forbidden_scope), blocker_evidence and blocker_question (the single question that unblocks you).",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -29,7 +29,7 @@
           "of": "implement",
           "reviewer": {
             "provider": "codex",
-            "model": "gpt-6.1-sol",
+            "model": "gpt-6-luna",
             "effort": "high"
           },
           "max_rounds": 2
@@ -44,7 +44,7 @@
         "review"
       ],
       "params": {
-        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in the same sandbox: fix the cause, add or adjust tests that assert the Issue's intent, re-run scripts/scoped-test --base origin/rolling, format only changed files, and commit. Do not widen scope. If a finding needs a product choice, ask with AskUserQuestion or end with a BLOCKED handoff carrying blocker_question. Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block with doc_path: inline, status: complete, a summary of how each finding was addressed, and the commit SHA.",
+        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in the same sandbox: fix the cause, add or adjust tests that assert the Issue's intent, re-run scripts/scoped-test --base origin/rolling, format only changed files, and commit. Do not widen scope. Decide engineering questions yourself and record the decision and its assumption in the handoff; end with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope). Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block with doc_path: inline, manifest_path: inline, status: complete, a summary of how each finding was addressed, and the commit SHA.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",

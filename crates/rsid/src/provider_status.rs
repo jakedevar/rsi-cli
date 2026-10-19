@@ -12,8 +12,9 @@ use crate::vault::secret::SecretString;
 use crate::vault::slots::Slot;
 use chrono::{DateTime, Utc};
 use rsi_common::agent_provider_status::{
-    AgentGetProviderStatusResultV1, PROVIDER_STATUS_CACHE_TTL_SECS, PROVIDER_STATUS_NAMES,
-    ProviderCredentialCheckV1, ProviderCreditV1, ProviderStatusEntryV1,
+    AgentGetProviderStatusResultV1, PROVIDER_AUTH_INVALID_DETAIL, PROVIDER_STATUS_CACHE_TTL_SECS,
+    PROVIDER_STATUS_NAMES, ProviderAuthEpisodeV1, ProviderCredentialCheckV1, ProviderCreditV1,
+    ProviderStatusEntryV1,
 };
 use rsi_common::provider_credentials::CredentialCheckClass;
 use std::collections::HashMap;
@@ -37,18 +38,25 @@ pub trait OpenRouterApi: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct HttpOpenRouterApi {
     pub base: String,
+    /// Offline daemon (#130): every read returns [`ProbeOutcome::Offline`]
+    /// without a request.
+    pub offline: bool,
 }
 
 impl Default for HttpOpenRouterApi {
     fn default() -> Self {
         Self {
             base: "https://openrouter.ai".into(),
+            offline: crate::offline::is_offline(),
         }
     }
 }
 
 impl HttpOpenRouterApi {
     async fn get(&self, path: &str, secret: &SecretString) -> ProbeOutcome {
+        if self.offline {
+            return ProbeOutcome::Offline;
+        }
         let Ok(http) = reqwest::Client::builder()
             .connect_timeout(API_TIMEOUT)
             .timeout(API_TIMEOUT)
@@ -203,7 +211,7 @@ impl ProviderStatusService {
                 ProbeOutcome::Timeout | ProbeOutcome::Connect | ProbeOutcome::Failed => {
                     any_transport_failure = true;
                 }
-                ProbeOutcome::Unsupported => {}
+                ProbeOutcome::Unsupported | ProbeOutcome::Offline => {}
             }
         }
         probe.reachable = if any_http {
@@ -299,10 +307,18 @@ impl ProviderStatusService {
             (None, _) => ("open", None),
         };
         // A provider that rejected its credential at startup stays refused
-        // until a later launch gets past startup (#1610).
+        // until a later launch gets past startup (#1610), a logged-in CLI
+        // reading taken after the last failure ends it, or, with no such
+        // reading, one probe launch is admitted after a bounded interval
+        // (hub #2957; the login reading is folded in by
+        // `apply_provider_login`).
+        let auth_episode = launch_stats
+            .auth_episode_started_at
+            .zip(launch_stats.last_auth_failure_at)
+            .map(|(started, last)| ProviderAuthEpisodeV1::from_failures(started, last, now));
         let (launch_admission, refusal_detail) =
-            if launch_admission == "open" && launch_stats.auth_episode_started_at.is_some() {
-                ("refused", Some("auth_invalid".to_string()))
+            if launch_admission == "open" && auth_episode.as_ref().is_some_and(|e| e.refuses()) {
+                ("refused", Some(PROVIDER_AUTH_INVALID_DETAIL.to_string()))
             } else {
                 (launch_admission, refusal_detail)
             };
@@ -346,9 +362,13 @@ impl ProviderStatusService {
             last_402_at,
             last_429_at: launch_stats.last_rate_limit_at,
             last_auth_failure_at: launch_stats.last_auth_failure_at,
+            auth_episode,
             launches_24h: launch_stats.launches,
             failed_launches_24h: launch_stats.failed,
             failure_rate_24h,
+            models_unavailable: Vec::new(),
+            login: None,
+            contract: None,
         }
     }
 }
@@ -532,6 +552,140 @@ mod tests {
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    fn codex_stats(failed_at: DateTime<Utc>) -> HashMap<String, ProviderLaunchStats> {
+        HashMap::from([(
+            "Codex".to_string(),
+            ProviderLaunchStats {
+                launches: 1,
+                failed: 1,
+                last_auth_failure_at: Some(failed_at),
+                auth_episode_started_at: Some(failed_at),
+                ..ProviderLaunchStats::default()
+            },
+        )])
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    fn codex_login(
+        state: rsi_common::provider_login::ProviderLoginState,
+        checked_at: DateTime<Utc>,
+    ) -> Vec<(String, rsi_common::provider_login::ProviderLoginV1)> {
+        vec![(
+            "codex".to_string(),
+            rsi_common::provider_login::ProviderLoginV1 {
+                state,
+                checked_at: Some(checked_at),
+                ..Default::default()
+            },
+        )]
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn a_logged_in_check_after_the_auth_failure_reopens_codex_admission() {
+        use rsi_common::agent_provider_status::ProviderAuthEpisodeStateV1;
+        use rsi_common::provider_login::ProviderLoginState;
+        let service = ProviderStatusService::new(
+            stub(http(200, "{}"), http(200, "{}")),
+            Duration::from_secs(60),
+        );
+        let now = Utc::now();
+        let failed_at = now - chrono::Duration::minutes(20);
+        let stats = codex_stats(failed_at);
+        let mut result = service
+            .report(&vault(true), &stats, Some("codex"), now)
+            .await;
+        let entry = &result.providers[0];
+        // No successful launch and no login reading yet: still refused, and
+        // the episode names its start, last failure and next probe.
+        assert_eq!(entry.launch_admission, "refused");
+        let episode = entry.auth_episode.as_ref().unwrap();
+        assert_eq!(episode.state, ProviderAuthEpisodeStateV1::AwaitingProbe);
+        assert_eq!(
+            (episode.started_at, episode.last_failure_at),
+            (failed_at, failed_at)
+        );
+        assert_eq!(
+            episode.next_probe_at,
+            Some(failed_at + chrono::Duration::hours(1))
+        );
+
+        // A later logged-in check ends the refusal with no launch in between.
+        result.apply_provider_login(codex_login(
+            ProviderLoginState::LoggedIn,
+            now - chrono::Duration::seconds(5),
+        ));
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "open");
+        assert_eq!(entry.refusal_detail, None);
+        let episode = entry.auth_episode.as_ref().unwrap();
+        assert_eq!(episode.state, ProviderAuthEpisodeStateV1::ClearedByLogin);
+        assert_eq!(episode.last_failure_at, failed_at);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn a_still_failing_login_keeps_codex_refused() {
+        use rsi_common::agent_provider_status::ProviderAuthEpisodeStateV1;
+        use rsi_common::provider_login::ProviderLoginState;
+        let service = ProviderStatusService::new(
+            stub(http(200, "{}"), http(200, "{}")),
+            Duration::from_secs(60),
+        );
+        let now = Utc::now();
+        let failed_at = now - chrono::Duration::minutes(20);
+        let stats = codex_stats(failed_at);
+        // Logged out: re-login needed, with no timed probe.
+        let mut result = service
+            .report(&vault(true), &stats, Some("codex"), now)
+            .await;
+        result.apply_provider_login(codex_login(ProviderLoginState::LoggedOut, now));
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "refused");
+        assert_eq!(entry.refusal_detail.as_deref(), Some("auth_invalid"));
+        let episode = entry.auth_episode.as_ref().unwrap();
+        assert_eq!(episode.state, ProviderAuthEpisodeStateV1::ReloginNeeded);
+        assert_eq!(episode.next_probe_at, None);
+
+        // A logged-in reading older than the failure proves nothing.
+        let mut result = service
+            .report(&vault(true), &stats, Some("codex"), now)
+            .await;
+        result.apply_provider_login(codex_login(
+            ProviderLoginState::LoggedIn,
+            failed_at - chrono::Duration::minutes(1),
+        ));
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "refused");
+        assert_eq!(
+            entry.auth_episode.as_ref().unwrap().state,
+            ProviderAuthEpisodeStateV1::AwaitingProbe
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn one_probe_is_admitted_after_the_bound_with_no_login_reading() {
+        use rsi_common::agent_provider_status::ProviderAuthEpisodeStateV1;
+        let service = ProviderStatusService::new(
+            stub(http(200, "{}"), http(200, "{}")),
+            Duration::from_secs(60),
+        );
+        let now = Utc::now();
+        let failed_at = now - chrono::Duration::minutes(61);
+        let result = service
+            .report(&vault(true), &codex_stats(failed_at), Some("codex"), now)
+            .await;
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "open");
+        assert_eq!(entry.refusal_detail, None);
+        let episode = entry.auth_episode.as_ref().unwrap();
+        assert_eq!(episode.state, ProviderAuthEpisodeStateV1::ProbeAdmitted);
+        assert_eq!(episode.next_probe_at, None);
+        assert_eq!(entry.last_auth_failure_at, Some(failed_at));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn remote_portion_is_cached_within_ttl_and_refetched_after() {
         let api = stub(
@@ -658,5 +812,25 @@ mod tests {
             .unwrap();
         assert_eq!(claude.configured, None);
         assert_eq!(claude.launch_admission, "open");
+    }
+
+    /// #130: offline, the OpenRouter key and credit reads send no request.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn an_offline_openrouter_status_read_sends_no_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = HttpOpenRouterApi {
+            base: server.uri(),
+            offline: true,
+        };
+        let secret = SecretString::new("sk-test-offline".into());
+        assert_eq!(api.key(&secret).await, ProbeOutcome::Offline);
+        assert_eq!(api.credits(&secret).await, ProbeOutcome::Offline);
+        server.verify().await;
     }
 }

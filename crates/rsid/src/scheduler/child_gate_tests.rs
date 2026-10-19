@@ -241,6 +241,63 @@ async fn a_resume_held_by_a_draining_deploy_stays_due_and_runs_after_it_settles(
     assert_eq!(launcher.resumes(), vec![world.parent], "runs once released");
 }
 
+/// A manager whose `succeed_manager` is unresolved is handing its seat over: a
+/// due resume of it would disturb the handoff, so the row stays due (never
+/// dropped) and runs once the succession resolves.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_resume_held_by_an_unresolved_manager_succession_stays_due_until_it_resolves() {
+    let world = world(30).await;
+    let wake = due_resume(&world, 20).await;
+    let operation = Uuid::new_v4();
+    {
+        let store = world.store.lock().await;
+        store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO manager_root_successions(operation_id,project_id,manager_session_id,predecessor_session_id,candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,policy_version,authority_epoch,frozen_json,state,row_version,created_at,updated_at)
+                 VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,'{}','reserved',1,?7,?7)",
+                [
+                    operation.to_string(),
+                    Uuid::new_v4().to_string(),
+                    world.parent.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+    }
+    let launcher = ResumeOnlyLauncher::new();
+
+    tick(&world, &launcher).await;
+
+    assert!(
+        launcher.resumes().is_empty(),
+        "the handoff holds the resume"
+    );
+    let held = job(&world, wake.id).await;
+    assert!(held.enabled, "deferred, never dropped");
+    assert_eq!(held.next_fire_at, wake.next_fire_at);
+    assert_eq!(held.last_fired_at, None);
+
+    // The succession fails: the seat is not displaced, so its wake runs once.
+    world
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE manager_root_successions SET state='failed',row_version=2 WHERE operation_id=?1",
+            [operation.to_string()],
+        )
+        .unwrap();
+    tick(&world, &launcher).await;
+    assert_eq!(launcher.resumes(), vec![world.parent], "runs once released");
+}
+
 /// The drain can engage after the wake precheck and before the continuation:
 /// the continuation's typed refusal must keep the one-shot wake due.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

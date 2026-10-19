@@ -62,7 +62,7 @@ async fn stop_fixture_sessions(h: &E2eHarness, fixture: &Value) -> E2eResult<()>
     if ids.is_empty() {
         return Ok(());
     }
-    let mut client = DaemonClient::new(h.socket_path.clone());
+    let mut client = DaemonClient::new(h.socket_path.clone()).with_session_token(None);
     client.connect().await?;
     let active = |status| {
         matches!(
@@ -154,13 +154,18 @@ async fn test_e2e_manager_presets_save_task_and_custom_reopen() -> E2eResult<()>
     for name in [
         "manager-policy.json",
         "manager-action-result.json",
+        "manager-action-view.json",
         "manager-action.json",
         "manager-child.json",
         "execute-screen.txt",
         "full-screen.txt",
         "custom-screen.txt",
     ] {
-        let source = harness.artifacts_dir.join(name);
+        let source = if name == "manager-action-view.json" {
+            harness.bin_dir.join(name)
+        } else {
+            harness.artifacts_dir.join(name)
+        };
         if source.exists() {
             fs::copy(source, artifacts.join(name))?;
         }
@@ -185,6 +190,14 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
     h.phase = "manager-presets-daemon";
     h.start_daemon()?;
     let mut client = h.wait_for_daemon().await?;
+    let daemon_config = client.get_daemon_config().await?;
+    for field in [
+        "host_load_admission_threshold",
+        "governor_min_free_disk_gb",
+        "job_thermal_ceiling_c",
+    ] {
+        assert_eq!(daemon_config[field], 0, "fixture admission setting {field}");
+    }
     let project = client
         .create_project("Manager preset fixture", Some(&repo), None, None)
         .await?;
@@ -433,9 +446,11 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
             h.artifacts_dir.join("manager-action.json"),
             serde_json::to_vec_pretty(&action)?,
         )?;
+        let action_view = fs::read_to_string(h.bin_dir.join("manager-action-view.json"))
+            .unwrap_or_else(|error| format!("action view unavailable: {error}"));
         assert_eq!(
             action["state"], "succeeded",
-            "action: {action}; fixture receipt: {receipt}"
+            "action: {action}; fixture receipt: {receipt}; live action view (held reason): {action_view}"
         );
         let children = client.list_sessions().await?;
         let child = children

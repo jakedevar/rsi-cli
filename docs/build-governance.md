@@ -3,10 +3,14 @@
 Sandboxed agent sessions receive Cargo defaults when their process starts.
 The defaults are four jobs per Cargo command and line-tables-only dev
 debuginfo. Fresh children and reviewers also receive `CARGO_INCREMENTAL=0`
-and use `sccache` when it is installed and enabled. Epic leads retain
+and use `sccache` only when `agent_build_sccache_enabled` is on (off by
+default since #1883: measured no wall-clock gain over the warm target pool). Epic leads retain
 incremental compilation. Non-sandboxed sessions keep their own Cargo setup.
 Workers share `~/.rsi/agent-sccache` on each machine, separate from the
-user's ordinary sccache cache.
+user's ordinary sccache cache. The cache server's socket lives inside that
+directory (#2745), so a Codex `workspace-write` launch, which creates the
+directory and grants it as a writable root, can start the server on a cold
+machine.
 
 `rsi-build-rustc` is installed beside `rsid` by `make release-install`. Cargo
 uses it as `RUSTC_WRAPPER` in sandboxed sessions. Each compiler invocation
@@ -22,14 +26,14 @@ The operator settings page, `GetDaemonConfig`, and `UpdateDaemonConfig` expose:
 | --- | ---: | --- |
 | `agent_build_jobs` | 4 | 1–32 jobs per Cargo command |
 | `agent_build_line_tables_only` | true | dev debuginfo override |
-| `agent_build_sccache_enabled` | true | worker cache when installed |
+| `agent_build_sccache_enabled` | false | worker cache when installed; off since #1883 |
 | `agent_build_sccache_cache_gib` | 10 | 1–512 GiB local cache cap |
 | `agent_build_slots` | 16 | 1–64 compiler processes per machine |
 
 Changes apply to newly started provider processes. A running sccache server
 may keep its existing cache-size configuration; after changing the cap, let
 active builds finish and run
-`SCCACHE_SERVER_UDS="$HOME/.rsi/agent-sccache.sock" sccache --stop-server`
+`SCCACHE_SERVER_UDS="$HOME/.rsi/agent-sccache/server.sock" sccache --stop-server`
 before the next build.
 The next worker starts it with the new cap. Keep one sccache server per local
 cache directory; concurrent servers sharing one directory can race.

@@ -55,4 +55,22 @@ impl RpcServer {
             .map_err(DaemonError::InvalidParam)?;
         Ok(serde_json::to_value(status)?)
     }
+
+    /// `RemoteSendManagerMessageV2` (#2962): queue an operator message for a
+    /// manager seat exactly as `QueueOperatorMessage` does. Operator-only (a
+    /// tokened caller is refused); the gateway authorizes the device, session,
+    /// scope and `allow_messages` before calling, and the Store proves the
+    /// session is a manager seat of the project.
+    pub(super) async fn handle_remote_send_manager_message(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params = crate::remote_read::parse_send(request)?;
+        let receipt = {
+            let store = self.session_manager.store();
+            let mut store = store.lock().await;
+            crate::remote_read::send_message(&mut store, &params)?
+        };
+        Ok(serde_json::to_value(receipt)?)
+    }
 }

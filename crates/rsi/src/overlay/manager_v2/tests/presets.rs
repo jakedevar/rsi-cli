@@ -457,7 +457,7 @@ async fn every_builtin_provider_uses_exact_catalog_id_and_default_effort_without
         assert!(screen(&mut app).contains("retained-unavailable"));
         assert!(screen(&mut app).contains("Friendly catalog label"));
         key(&mut app, KeyCode::Enter).await;
-        assert!(screen(&mut app).contains("Default (no explicit effort)"));
+        assert!(screen(&mut app).contains("any effort"));
         key(&mut app, KeyCode::Enter).await;
         assert_eq!(policy_mut(&mut app).draft, expected.policy);
         assert_eq!(
@@ -617,7 +617,8 @@ async fn custom_endpoints_are_named_without_inventing_local_choices_and_cancel_i
         id: Uuid::new_v4(),
         name: "Named research endpoint".into(),
         base_url: "http://unused.invalid".into(),
-        api_key: "fixture-key".into(),
+        api_key_set: true,
+        api_key_fingerprint: None,
         default_model: "custom-default".into(),
     });
     let (_dir, task) = connect(
@@ -853,7 +854,7 @@ async fn duplicate_catalog_choice_keeps_existing_rows_and_32_choice_limit_blocks
     state
         .draft
         .allowed_launches
-        .resize(32, original.policy.allowed_launches[0].clone());
+        .resize(64, original.policy.allowed_launches[0].clone());
     let before = state.request();
     state.activate(policy::Field::AddLaunch);
     assert!(state.picker.is_none());
@@ -861,7 +862,7 @@ async fn duplicate_catalog_choice_keeps_existing_rows_and_32_choice_limit_blocks
     assert_eq!(state.idempotency_key, before.idempotency_key);
     assert_eq!(
         state.error.as_deref(),
-        Some("At most 32 allowed launch choices.")
+        Some("At most 64 allowed launch choices.")
     );
     assert_eq!(finish(task).await.len(), 2);
 }
@@ -1267,6 +1268,65 @@ async fn daemon_settings_grant_and_bounds_save_with_the_policy() {
     assert!(policy_mut(&mut app).draft.daemon_setting_bounds.is_empty());
 }
 
+/// #1997: keys with built-in default bounds show them, blank restores the
+/// default after an explicit bound, and `off` is the explicit disable.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn defaulted_setting_bounds_show_default_and_distinguish_off() {
+    let (mut app, config) = fixture();
+    let saved = policy_config(&config);
+    let (_dir, _task) = connect(
+        &mut app,
+        vec![("GetHarnessManagerPolicy", json!({"result":saved}))],
+    )
+    .await;
+    policy::open(&mut app, config, "Coordination desk".into())
+        .await
+        .unwrap();
+    let index = rsi_common::manager_daemon_settings::MANAGER_ADJUSTABLE_DAEMON_SETTINGS
+        .iter()
+        .position(|s| s.key == "host_load_admission_threshold")
+        .unwrap();
+    let bound = policy::Field::SettingBound(index);
+    let row = |app: &mut _| {
+        policy_mut(app)
+            .rows()
+            .into_iter()
+            .find(|r| r.field == bound)
+            .unwrap()
+    };
+    let first = row(&mut app);
+    assert_eq!(first.value, "default 8-64");
+    assert!(
+        first.description.contains("blank restores"),
+        "{}",
+        first.description
+    );
+    policy_mut(&mut app).apply_text(bound, "16-32").unwrap();
+    assert_eq!(row(&mut app).value, "16-32");
+    // Blank restores the default rather than disabling.
+    policy_mut(&mut app).apply_text(bound, "").unwrap();
+    assert_eq!(row(&mut app).value, "default 8-64");
+    assert!(policy_mut(&mut app).draft.daemon_setting_bounds.is_empty());
+    // `off` is the explicit disable and survives as a stored entry.
+    policy_mut(&mut app).apply_text(bound, "off").unwrap();
+    assert_eq!(row(&mut app).value, "off");
+    assert!(policy_mut(&mut app).draft.daemon_setting_bounds[0].is_disabled());
+    assert_eq!(policy_mut(&mut app).field_error(bound), None);
+    // A key without defaults keeps today's meaning and refuses `off`.
+    let plain = policy::Field::SettingBound(0);
+    assert_eq!(
+        policy_mut(&mut app)
+            .rows()
+            .into_iter()
+            .find(|r| r.field == plain)
+            .unwrap()
+            .value,
+        "not adjustable"
+    );
+    assert!(policy_mut(&mut app).apply_text(plain, "off").is_err());
+}
+
 /// #1045: `Deploy` is an operator-toggled row, off by default, and one
 /// save stores it under its snake_case wire name.
 #[tokio::test]
@@ -1278,10 +1338,7 @@ async fn toggling_deploy_on_custom_draft_saves_it() {
     saved.policy.capabilities = vec![ManagerCapabilityV2::WorkPlan];
     let mut reply = saved.clone();
     reply.row_version += 1;
-    reply
-        .policy
-        .capabilities
-        .push(ManagerCapabilityV2::Deploy);
+    reply.policy.capabilities.push(ManagerCapabilityV2::Deploy);
     let (_dir, task) = connect(
         &mut app,
         vec![
@@ -1302,10 +1359,7 @@ async fn toggling_deploy_on_custom_draft_saves_it() {
     assert_eq!(row.value, "false");
     activate(&mut app, field).await;
     let text = screen(&mut app);
-    assert!(
-        text.contains("Grant Deploy: true (saved false)"),
-        "{text}"
-    );
+    assert!(text.contains("Grant Deploy: true (saved false)"), "{text}");
     key(&mut app, KeyCode::Char('s')).await;
     let requests = finish(task).await;
     assert_eq!(

@@ -73,12 +73,12 @@ thread_local! {
     static D05_RECONCILE_DEADLINE_BEFORE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn d05_test_fail_next_semantic(fault: D05SemanticFault) {
     D05_SEMANTIC_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn d05_test_force_reconcile_deadline_before_first() {
     D05_RECONCILE_DEADLINE_BEFORE_FIRST.with(|slot| slot.set(true));
 }

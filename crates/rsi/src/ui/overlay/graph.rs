@@ -184,16 +184,31 @@ pub fn render_graph_review(
                 }
                 frame.render_widget(Paragraph::new(lines), inner_dashboard_area);
             }
-        } else if let Some(run) =
-            execution.filter(|execution| is_topology_run(execution) && graph_area.width >= 90)
-        {
-            // #1746: a durable topology run shows its run view beside the canvas.
-            let chunks =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(RUN_VIEW_WIDTH)])
-                    .split(graph_area);
+        } else if let Some(run) = execution.filter(|execution| is_topology_run(execution)) {
+            // #1746: a durable topology run shows its run view beside the canvas
+            // (wide) or, below RUN_VIEW_MIN_WIDE_WIDTH columns, in a compact panel
+            // under it that leads with the on-call line and waiting reason (#1753).
+            let wide = graph_area.width >= RUN_VIEW_MIN_WIDE_WIDTH;
+            let (canvas_area, run_area) = if wide {
+                let chunks =
+                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(RUN_VIEW_WIDTH)])
+                        .split(graph_area);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                let wanted = run_view_rows(workflow, run, graph_area.width, true);
+                let height = wanted.min(graph_area.height.saturating_mul(3) / 5);
+                if height < 3 {
+                    (graph_area, None)
+                } else {
+                    let chunks =
+                        Layout::vertical([Constraint::Fill(1), Constraint::Length(height)])
+                            .split(graph_area);
+                    (chunks[0], Some(chunks[1]))
+                }
+            };
             render_graph_canvas(
                 frame,
-                chunks[0],
+                canvas_area,
                 workflow,
                 mode,
                 viewport,
@@ -202,7 +217,9 @@ pub fn render_graph_review(
                 &validation,
                 execution,
             );
-            render_run_view(frame, chunks[1], workflow, run);
+            if let Some(run_area) = run_area {
+                render_run_view(frame, run_area, workflow, run, !wide);
+            }
         } else {
             render_graph_canvas(
                 frame,
@@ -994,6 +1011,9 @@ fn write_char(buf: &mut Buffer, x: u16, y: u16, ch: char, style: Style) {
 /// Width of the topology run view beside the canvas.
 const RUN_VIEW_WIDTH: u16 = 46;
 
+/// Graph-area width from which the run view sits beside the canvas.
+const RUN_VIEW_MIN_WIDE_WIDTH: u16 = 90;
+
 /// Whether a snapshot is a durable topology run (a dry-run or in-memory
 /// workflow carries no row version).
 pub(crate) fn is_topology_run(execution: &WorkflowExecutionSnapshot) -> bool {
@@ -1005,18 +1025,18 @@ pub(crate) fn is_topology_run(execution: &WorkflowExecutionSnapshot) -> bool {
 pub(crate) struct RunNodeRow {
     pub(crate) id: String,
     pub(crate) state: Option<WorkflowNodeExecutionState>,
-    /// Launches of the node since its last success (0 until it first runs).
+    /// The daemon's attempt number within the round (0 until it first runs).
     pub(crate) attempt: u32,
-    /// Loop round: one more than the successes that came before this launch.
+    /// Loop round: the daemon's iteration + 1 (0 until it first runs).
     pub(crate) round: u32,
     /// The node has an attempt reserved, launching, running or waiting.
     pub(crate) current: bool,
 }
 
-/// Node rows in workflow order. `attempt` and `round` are derived from the
-/// node's update stream (each launch is a `Running` update, each success
-/// closes the round), so a retry raises the attempt and a loop revisit raises
-/// the round.
+/// Node rows in workflow order. `attempt` and `round` come from the daemon's
+/// per-node latest attempt (#1753): a retry raises the attempt, a loop or
+/// review revisit raises the round (iteration + 1). A node that never launched
+/// has neither.
 pub(crate) fn run_node_rows(
     workflow: &WorkflowDefinition,
     execution: &WorkflowExecutionSnapshot,
@@ -1025,37 +1045,24 @@ pub(crate) fn run_node_rows(
         .nodes
         .iter()
         .map(|node| {
-            let (mut state, mut attempt, mut successes) = (None, 0_u32, 0_u32);
-            for update in &execution.updates {
-                if update.node_id.as_deref() != Some(node.id.as_str()) {
-                    continue;
-                }
-                let Some(node_state) = update.node_state else {
-                    continue;
-                };
-                state = Some(node_state);
-                match node_state {
-                    WorkflowNodeExecutionState::Running => attempt += 1,
-                    WorkflowNodeExecutionState::Succeeded => {
-                        successes += 1;
-                        attempt = 0;
-                    }
-                    _ => {}
-                }
-            }
-            let started = state.is_some();
-            let settled_ok = matches!(state, Some(WorkflowNodeExecutionState::Succeeded));
+            let state = execution
+                .updates
+                .iter()
+                .rev()
+                .find(|update| {
+                    update.node_id.as_deref() == Some(node.id.as_str())
+                        && update.node_state.is_some()
+                })
+                .and_then(|update| update.node_state);
+            let launched = execution
+                .node_attempts
+                .iter()
+                .find(|view| view.node_id == node.id);
             RunNodeRow {
                 id: node.id.clone(),
                 state,
-                attempt,
-                round: if !started {
-                    0
-                } else if settled_ok {
-                    successes
-                } else {
-                    successes + 1
-                },
+                attempt: launched.map_or(0, |view| view.attempt_no),
+                round: launched.map_or(0, |view| view.iteration + 1),
                 current: execution.current_nodes.iter().any(|id| id == &node.id),
             }
         })
@@ -1080,13 +1087,16 @@ fn on_call_seat_word(seat: &rsi_common::types::TopologyOnCallSeat) -> &'static s
     }
 }
 
-/// Plain text of the run view: node rows (the current node first marked `>`),
-/// the on-call line, the rulings list and the waiting reason.
+/// Plain text of the run view: node rows (the current node marked `>`), the
+/// on-call line, the waiting reason and the rulings list. `compact` (the panel
+/// under the canvas on narrow terminals) moves the on-call line and waiting
+/// reason up under the title so a short panel still shows them.
 pub(crate) fn run_view_text(
     workflow: &WorkflowDefinition,
     execution: &WorkflowExecutionSnapshot,
+    compact: bool,
 ) -> Vec<(String, RunLineKind)> {
-    let mut lines = vec![(
+    let mut title = vec![(
         format!(
             "{} {}",
             execution.workflow_name,
@@ -1094,6 +1104,7 @@ pub(crate) fn run_view_text(
         ),
         RunLineKind::Title,
     )];
+    let mut lines = Vec::new();
     for row in run_node_rows(workflow, execution) {
         let detail = if row.attempt == 0 && row.round == 0 {
             String::new()
@@ -1114,8 +1125,9 @@ pub(crate) fn run_view_text(
             },
         ));
     }
+    let mut on_call_lines = Vec::new();
     match &execution.on_call {
-        Some(on_call) => lines.push((
+        Some(on_call) => on_call_lines.push((
             format!(
                 "on-call: {} ({})",
                 on_call_seat_word(&on_call.seat),
@@ -1127,20 +1139,20 @@ pub(crate) fn run_view_text(
                 RunLineKind::Warn
             },
         )),
-        None => lines.push(("on-call: none".to_owned(), RunLineKind::Hint)),
+        None => on_call_lines.push(("on-call: none".to_owned(), RunLineKind::Hint)),
     }
     if let Some(waiting) = &execution.waiting {
-        lines.push((
+        on_call_lines.push((
             format!("waiting: {} - {}", waiting.node_id, waiting.reason),
             RunLineKind::Warn,
         ));
     }
-    lines.push((
+    let mut ruling_lines = vec![(
         format!("rulings ({})", execution.rulings.len()),
         RunLineKind::Title,
-    ));
+    )];
     if execution.rulings.is_empty() {
-        lines.push(("  none".to_owned(), RunLineKind::Hint));
+        ruling_lines.push(("  none".to_owned(), RunLineKind::Hint));
     }
     for ruling in &execution.rulings {
         let by = ruling
@@ -1148,7 +1160,7 @@ pub(crate) fn run_view_text(
             .as_deref()
             .map(|by| format!(" by {by}"))
             .unwrap_or_default();
-        lines.push((
+        ruling_lines.push((
             format!(
                 "  {} [{}{by}] {}",
                 ruling.node_id, ruling.status, ruling.question
@@ -1156,7 +1168,31 @@ pub(crate) fn run_view_text(
             RunLineKind::Node,
         ));
     }
-    lines
+    if compact {
+        title.extend(on_call_lines);
+        title.extend(lines);
+    } else {
+        title.extend(lines);
+        title.extend(on_call_lines);
+    }
+    title.extend(ruling_lines);
+    title
+}
+
+/// Rows the run view needs at `width` columns (lines wrapped, plus the title
+/// border row), so the compact panel can size itself.
+fn run_view_rows(
+    workflow: &WorkflowDefinition,
+    execution: &WorkflowExecutionSnapshot,
+    width: u16,
+    compact: bool,
+) -> u16 {
+    let width = usize::from(width.saturating_sub(1)).max(1);
+    let rows: usize = run_view_text(workflow, execution, compact)
+        .iter()
+        .map(|(text, _)| text.chars().count().div_ceil(width).max(1))
+        .sum();
+    u16::try_from(rows + 1).unwrap_or(u16::MAX)
 }
 
 fn execution_word(status: WorkflowExecutionStatus) -> &'static str {
@@ -1186,9 +1222,10 @@ fn render_run_view(
     area: Rect,
     workflow: &WorkflowDefinition,
     execution: &WorkflowExecutionSnapshot,
+    compact: bool,
 ) {
     let block = Block::default()
-        .borders(Borders::LEFT)
+        .borders(if compact { Borders::TOP } else { Borders::LEFT })
         .border_style(Style::default().fg(theme::overlay_border()))
         .title(Span::styled(
             " run ",
@@ -1198,7 +1235,7 @@ fn render_run_view(
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines: Vec<Line<'static>> = run_view_text(workflow, execution)
+    let lines: Vec<Line<'static>> = run_view_text(workflow, execution, compact)
         .into_iter()
         .map(|(text, kind)| {
             let style = match kind {
@@ -2301,7 +2338,7 @@ mod tests {
             recursive_graph_id: uuid::Uuid::new_v4(),
         };
 
-        let mut app = test_app();
+        let app = test_app();
         let caps = rsi_common::rpc::DaemonCapabilities {
             recursive_dag_inspection: true,
             recursive_dag_run_inspection: true,
@@ -2468,8 +2505,8 @@ fn render_persistence_badge(persistence_state: GraphDraftPersistenceState) -> Sp
 mod run_view_tests {
     use super::*;
     use rsi_common::types::{
-        GraphExecutionUpdate, TopologyOnCallSeat, TopologyOnCallView, TopologyOnCallWait,
-        TopologyRulingView,
+        GraphExecutionUpdate, TopologyNodeAttemptView, TopologyOnCallSeat, TopologyOnCallView,
+        TopologyOnCallWait, TopologyRulingView,
     };
     use uuid::Uuid;
 
@@ -2547,6 +2584,19 @@ mod run_view_tests {
                 answered_by: Some("manager".into()),
                 answer_digest: None,
             }],
+            // implement ran a second round; review is on its second attempt.
+            node_attempts: vec![
+                TopologyNodeAttemptView {
+                    node_id: "implement".into(),
+                    iteration: 1,
+                    attempt_no: 1,
+                },
+                TopologyNodeAttemptView {
+                    node_id: "review".into(),
+                    iteration: 0,
+                    attempt_no: 2,
+                },
+            ],
         }
     }
 
@@ -2558,7 +2608,7 @@ mod run_view_tests {
         assert_eq!(implement.state, Some(WorkflowNodeExecutionState::Succeeded));
         assert_eq!(
             (implement.attempt, implement.round, implement.current),
-            (0, 2, false)
+            (1, 2, false)
         );
         let review = find("review");
         assert_eq!(review.state, Some(WorkflowNodeExecutionState::Running));
@@ -2569,7 +2619,7 @@ mod run_view_tests {
 
     #[test]
     fn run_view_shows_rows_on_call_rulings_and_the_waiting_reason() {
-        let text: Vec<String> = run_view_text(&workflow(), &run())
+        let text: Vec<String> = run_view_text(&workflow(), &run(), false)
             .into_iter()
             .map(|(line, _)| line)
             .collect();
@@ -2582,11 +2632,100 @@ mod run_view_tests {
         assert!(text.contains(&"waiting: review - no_live_project_manager".to_owned()));
         assert!(text.contains(&"rulings (1)".to_owned()));
         assert!(text.contains(&"  review [answered by manager] ship it?".to_owned()));
-        let kinds: Vec<RunLineKind> = run_view_text(&workflow(), &run())
+        let kinds: Vec<RunLineKind> = run_view_text(&workflow(), &run(), false)
             .into_iter()
             .map(|(_, kind)| kind)
             .collect();
         assert!(kinds.contains(&RunLineKind::Current));
+    }
+
+    #[test]
+    fn attempt_and_round_follow_the_snapshot_not_the_update_stream() {
+        // A failed-then-retried node and a revisited node look alike in the
+        // stream; the daemon's attempt_no / iteration tell them apart (#1753).
+        let mut execution = run();
+        execution.node_attempts = vec![TopologyNodeAttemptView {
+            node_id: "review".into(),
+            iteration: 3,
+            attempt_no: 4,
+        }];
+        let rows = run_node_rows(&workflow(), &execution);
+        let review = rows.iter().find(|row| row.id == "review").unwrap();
+        assert_eq!((review.attempt, review.round), (4, 4));
+        let implement = rows.iter().find(|row| row.id == "implement").unwrap();
+        assert_eq!((implement.attempt, implement.round), (0, 0));
+    }
+
+    fn render_run(width: u16, height: u16) -> Vec<String> {
+        use ratatui::{Terminal, backend::TestBackend};
+        let flow = workflow();
+        let execution = run();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut picker_state = ratatui::widgets::ListState::default();
+        let app = crate::app::App::new(crate::client::DaemonClient::new(std::path::PathBuf::from(
+            "/tmp/test.sock",
+        )));
+        terminal
+            .draw(|frame| {
+                render_graph_review(
+                    frame,
+                    frame.area(),
+                    &flow,
+                    crate::types::GraphDraftPersistenceState::Clean,
+                    GraphMode::Navigate {
+                        camera: crate::types::GraphCamera::FollowSelection,
+                    },
+                    GraphViewport::default(),
+                    0,
+                    &HashSet::new(),
+                    "",
+                    0,
+                    Some(&execution),
+                    &[],
+                    &[],
+                    &GraphViewOrigin::AuthoredWorkflow,
+                    &mut picker_state,
+                    false,
+                    false,
+                    None,
+                    &app,
+                );
+            })
+            .expect("render");
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    /// #1753: below 90 columns the run view moves under the canvas and still
+    /// shows the on-call line, the waiting reason and the rulings.
+    #[test]
+    fn run_view_survives_narrow_terminals() {
+        for width in [80_u16, 60] {
+            let rendered = render_run(width, 32).join("\n");
+            for needle in [
+                "on-call: project manager (not live)",
+                "waiting: review - no_live_project_manager",
+                "rulings (1)",
+                "review [answered by manager] ship it?",
+                "attempt 2 round 1",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "{width} cols: {needle}\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_run_view_leads_with_the_on_call_line() {
+        let compact = run_view_text(&workflow(), &run(), true);
+        assert!(compact[1].0.starts_with("on-call:"), "{compact:?}");
+        assert!(compact[2].0.starts_with("waiting:"), "{compact:?}");
     }
 
     #[test]

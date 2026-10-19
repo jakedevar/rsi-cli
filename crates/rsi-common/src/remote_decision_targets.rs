@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 pub struct RemoteGetDecisionTargetsV1 {
     pub project_id: WireUuid,
     pub session_id: WireUuid,
+    /// Continue the producer-published `pending_items` after this
+    /// `decision_id` (the previous response's `pending_next`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_after: Option<Text<160>>,
 }
 
 /// Whether the project has a configured manager at all. Absence is not an
@@ -77,6 +81,10 @@ pub struct RemoteGetDecisionTargetsResponseV1 {
     pub items: Vec<DecisionTargetItemV1>,
     #[serde(default)]
     pub pending_items: Vec<PendingDecisionTargetItemV1>,
+    /// Present only when `pending_items` stopped before the producer inventory
+    /// was exhausted; send it back as `pending_after` for the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_next: Option<Text<160>>,
     pub truncated: bool,
 }
 

@@ -11,7 +11,10 @@ use rsi_common::satellite::{
     SatellitePeerConfigV1, SatellitePeerV1, SatelliteProbeLinkRequestV1, SatellitePutLinkRequestV1,
     SatellitePutPeerRequestV1, SatelliteUuidV1,
 };
-use rsi_common::satellite_dispatch::{SatelliteInboundPolicyV1, SatellitePutScopeRequestV1};
+use rsi_common::satellite_dispatch::{
+    SatelliteInboundPolicyV1, SatellitePutScopeRequestV1, format_satellite_scope_text,
+    parse_satellite_scope_text,
+};
 
 fn state(app: &mut App) -> Option<&mut SatelliteRegistryOverlayState> {
     match &mut app.overlay {
@@ -23,6 +26,7 @@ fn state(app: &mut App) -> Option<&mut SatelliteRegistryOverlayState> {
 pub async fn open(app: &mut App) {
     match app.client.list_satellite_peers().await {
         Ok(registry) => {
+            let scope_status = app.client.get_satellite_scope_status().await.ok();
             app.overlay =
                 OverlayState::SatelliteRegistry(Box::new(SatelliteRegistryOverlayState {
                     registry,
@@ -33,6 +37,7 @@ pub async fn open(app: &mut App) {
                     sessions: None,
                     form: None,
                     last_probe: None,
+                    scope_status,
                     last_error: None,
                 }));
         }
@@ -50,7 +55,9 @@ async fn refresh(app: &mut App) {
     });
     match app.client.list_satellite_peers().await {
         Ok(registry) => {
+            let scope_status = app.client.get_satellite_scope_status().await.ok();
             if let Some(state) = state(app) {
+                state.scope_status = scope_status;
                 state.selected_peer = selected_id
                     .and_then(|id| {
                         registry
@@ -212,17 +219,11 @@ async fn move_selection(app: &mut App, step: isize) {
 async fn open_inbound_form(app: &mut App) {
     match app.client.get_satellite_inbound_policy().await {
         Ok(policy) => {
-            let join = |ids: &[SatelliteUuidV1]| {
-                ids.iter()
-                    .map(|id| id.0.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
             if let Some(state) = state(app) {
                 state.last_error = None;
                 state.form = Some(SatelliteRegistryForm::Inbound {
-                    hubs: join(&policy.allowed_hub_installations),
-                    roots: join(&policy.scope_roots),
+                    hubs: format_satellite_scope_text(&policy.allowed_hub_installations, &[]),
+                    roots: format_satellite_scope_text(&policy.scope_roots, &policy.scope_projects),
                     field: 0,
                 });
             }
@@ -283,12 +284,10 @@ fn open_edit_form(app: &mut App) {
             enabled: peer.config.enabled,
             read_enabled: peer.config.read_enabled,
             dispatch_enabled: peer.config.dispatch_enabled,
-            dispatch_scope: peer
-                .dispatch_scope
-                .iter()
-                .map(|id| id.0.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
+            dispatch_scope: format_satellite_scope_text(
+                &peer.dispatch_scope,
+                &peer.dispatch_project_scope,
+            ),
             repair_quarantine: false,
             field: 0,
         }),
@@ -325,16 +324,23 @@ fn open_repair_form(app: &mut App) {
     }
 }
 
-/// Parse the comma-separated scope field into remote session ids.
-fn parse_dispatch_scope(text: &str) -> Result<Vec<SatelliteUuidV1>, String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            serde_json::from_value::<SatelliteUuidV1>(serde_json::Value::String(part.to_string()))
-                .map_err(|error| format!("Invalid scope session ID `{part}`: {error}"))
-        })
-        .collect()
+/// Parse the comma-separated scope field into `(session ids, project ids)`;
+/// a `project:<id>` entry is a project whose current appointed manager is the
+/// target (#1928).
+fn parse_dispatch_scope(
+    text: &str,
+) -> Result<(Vec<SatelliteUuidV1>, Vec<SatelliteUuidV1>), String> {
+    parse_satellite_scope_text(text)
+}
+
+/// A plain id list (hub installations): project entries make no sense there.
+fn parse_id_list(text: &str) -> Result<Vec<SatelliteUuidV1>, String> {
+    let (ids, projects) = parse_satellite_scope_text(text)?;
+    if projects.is_empty() {
+        Ok(ids)
+    } else {
+        Err("Hub installation IDs cannot be project: entries".into())
+    }
 }
 
 /// Build the revision-fenced peer edit for the registry `d`/toggle key.
@@ -419,20 +425,57 @@ async fn probe_selected(app: &mut App) {
     }
 }
 
-/// The active text field's character limit and whether it only takes the
-/// hex/dash/comma id alphabet (`None` on toggle and numeric fields).
-fn active_text_limit(form: &SatelliteRegistryForm) -> Option<(usize, bool)> {
+/// The characters a text field accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldAlphabet {
+    /// Any printable character.
+    Free,
+    /// Hub id lists: hex digits, `-` and `,` only.
+    Ids,
+    /// Dispatch scopes and inbound roots: ids plus `project:<uuid>` entries,
+    /// so additionally the letters of `project` and `:`.
+    Scope,
+}
+
+impl FieldAlphabet {
+    fn accepts(self, c: char) -> bool {
+        if c.is_control() {
+            return false;
+        }
+        match self {
+            Self::Free => true,
+            Self::Ids => c.is_ascii_hexdigit() || c == '-' || c == ',',
+            Self::Scope => {
+                c.is_ascii_hexdigit() || matches!(c, '-' | ',' | ':' | ' ') || "project".contains(c)
+            }
+        }
+    }
+}
+
+/// Longest id-list field: a `project:<uuid>` entry plus its comma.
+const ID_LIST_LIMIT: usize = 46 * 64;
+
+/// The active text field's character limit and alphabet (`None` on toggle and
+/// numeric fields).
+fn active_text_limit(form: &SatelliteRegistryForm) -> Option<(usize, FieldAlphabet)> {
     match form {
         SatelliteRegistryForm::Peer { field, .. } => match *field {
-            0 => Some((120, false)),
-            1 => Some((36, false)),
-            5 => Some((37 * 64, true)),
+            0 => Some((120, FieldAlphabet::Free)),
+            1 => Some((36, FieldAlphabet::Free)),
+            5 => Some((ID_LIST_LIMIT, FieldAlphabet::Scope)),
             _ => None,
         },
-        SatelliteRegistryForm::Inbound { .. } => Some((37 * 64, true)),
+        SatelliteRegistryForm::Inbound { field, .. } => Some((
+            ID_LIST_LIMIT,
+            if *field == 0 {
+                FieldAlphabet::Ids
+            } else {
+                FieldAlphabet::Scope
+            },
+        )),
         SatelliteRegistryForm::Link { field, .. } => match *field {
-            0 => Some((512, false)),
-            1 | 2 => Some((256, false)),
+            0 => Some((512, FieldAlphabet::Free)),
+            1 | 2 => Some((256, FieldAlphabet::Free)),
             _ => None,
         },
     }
@@ -474,7 +517,7 @@ fn active_text_mut(form: &mut SatelliteRegistryForm) -> Option<&mut String> {
 async fn handle_form_key(app: &mut App, key: KeyEvent) {
     // Standard editing: a real cursor and selection in the active text field
     // (Enter, Esc, Tab, toggles and the numeric priority keep their handling).
-    if let Some((cap, hex)) = state(app)
+    if let Some((cap, alphabet)) = state(app)
         .and_then(|state| state.form.as_ref())
         .and_then(active_text_limit)
         && app.edit_field_capped(
@@ -485,7 +528,7 @@ async fn handle_form_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => None,
             },
-            move |c| !c.is_control() && (!hex || c.is_ascii_hexdigit() || c == '-' || c == ','),
+            move |c| alphabet.accepts(c),
             cap,
         ) != crate::field_edit::FieldKey::Ignored
     {
@@ -596,20 +639,21 @@ fn edit_form(app: &mut App, ch: char) {
             2 if ch == ' ' => *enabled = !*enabled,
             3 if ch == ' ' => *read_enabled = !*read_enabled,
             4 if ch == ' ' => *dispatch_enabled = !*dispatch_enabled,
-            5 if (ch.is_ascii_hexdigit() || ch == '-' || ch == ',')
-                && dispatch_scope.len() < 37 * 64 =>
-            {
+            5 if FieldAlphabet::Scope.accepts(ch) && dispatch_scope.len() < ID_LIST_LIMIT => {
                 dispatch_scope.push(ch);
             }
             6 if ch == ' ' => *repair_quarantine = !*repair_quarantine,
             _ => {}
         },
         SatelliteRegistryForm::Inbound { hubs, roots, field } => {
-            if ch.is_ascii_hexdigit() || ch == '-' || ch == ',' {
-                let target = if *field == 0 { hubs } else { roots };
-                if target.len() < 37 * 64 {
-                    target.push(ch);
-                }
+            let alphabet = if *field == 0 {
+                FieldAlphabet::Ids
+            } else {
+                FieldAlphabet::Scope
+            };
+            let target = if *field == 0 { hubs } else { roots };
+            if alphabet.accepts(ch) && target.len() < ID_LIST_LIMIT {
+                target.push(ch);
             }
         }
         SatelliteRegistryForm::Link {
@@ -686,7 +730,7 @@ async fn save_form(app: &mut App) {
             };
             let scope = parse_dispatch_scope(dispatch_scope);
             match (expected, scope) {
-                (Ok(expected_installation_id), Ok(scope_ids)) => {
+                (Ok(expected_installation_id), Ok((scope_ids, scope_projects))) => {
                     let saved = app
                         .client
                         .put_satellite_peer(SatellitePutPeerRequestV1 {
@@ -710,6 +754,7 @@ async fn save_form(app: &mut App) {
                                 expected_registry_revision: new_revision,
                                 peer_id: *peer_id,
                                 remote_session_ids: scope_ids,
+                                remote_project_ids: scope_projects,
                             })
                             .await
                             .map_err(|error| error.to_string()),
@@ -721,12 +766,13 @@ async fn save_form(app: &mut App) {
             }
         }
         SatelliteRegistryForm::Inbound { hubs, roots, .. } => {
-            match (parse_dispatch_scope(hubs), parse_dispatch_scope(roots)) {
-                (Ok(allowed_hub_installations), Ok(scope_roots)) => app
+            match (parse_id_list(hubs), parse_dispatch_scope(roots)) {
+                (Ok(allowed_hub_installations), Ok((scope_roots, scope_projects))) => app
                     .client
                     .put_satellite_inbound_policy(SatelliteInboundPolicyV1 {
                         allowed_hub_installations,
                         scope_roots,
+                        scope_projects,
                     })
                     .await
                     .map(|()| revision)
@@ -787,11 +833,24 @@ mod tests {
     fn dispatch_scope_field_parses_ids_and_rejects_garbage() {
         let a = uuid::Uuid::new_v4();
         let b = uuid::Uuid::new_v4();
-        let parsed = parse_dispatch_scope(&format!("{a}, {b},")).unwrap();
+        let (parsed, projects) = parse_dispatch_scope(&format!("{a}, {b},")).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[1].0, b);
-        assert!(parse_dispatch_scope("").unwrap().is_empty());
+        assert!(projects.is_empty());
+        assert!(parse_dispatch_scope("").unwrap().0.is_empty());
         assert!(parse_dispatch_scope("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn dispatch_scope_field_accepts_project_entries_but_hub_lists_do_not() {
+        let session = uuid::Uuid::new_v4();
+        let project = uuid::Uuid::new_v4();
+        let (sessions, projects) =
+            parse_dispatch_scope(&format!("{session},project:{project}")).unwrap();
+        assert_eq!(sessions, vec![SatelliteUuidV1(session)]);
+        assert_eq!(projects, vec![SatelliteUuidV1(project)]);
+        assert!(parse_id_list(&format!("project:{project}")).is_err());
+        assert_eq!(parse_id_list(&session.to_string()).unwrap().len(), 1);
     }
 
     #[test]
@@ -809,6 +868,7 @@ mod tests {
             links: Vec::new(),
             observation: None,
             dispatch_scope: Vec::new(),
+            dispatch_project_scope: Vec::new(),
         };
         let request = toggle_peer_request(&peer, 3);
         assert!(!request.peer.enabled);
@@ -836,6 +896,7 @@ mod tests {
             links: vec![],
             observation: None,
             dispatch_scope: Vec::new(),
+            dispatch_project_scope: Vec::new(),
         };
         let request = toggle_peer_request(&peer, 7);
         assert_eq!(request.expected_registry_revision, 7);
@@ -853,6 +914,7 @@ mod tests {
         let remote_id = SatelliteUuidV1(uuid::Uuid::new_v4());
         let now = chrono::Utc::now();
         let observation = SatelliteObservationV1 {
+            platform: None,
             state: "healthy".into(),
             installation_id: None,
             incarnation_id: None,
@@ -860,6 +922,7 @@ mod tests {
             last_error: None,
             cached_session_count: 1,
             stale: false,
+            manager_launches: Vec::new(),
         };
         app.overlay = OverlayState::SatelliteRegistry(Box::new(SatelliteRegistryOverlayState {
             registry: SatelliteRegistryV1 {
@@ -877,6 +940,7 @@ mod tests {
                     links: vec![],
                     observation: Some(observation.clone()),
                     dispatch_scope: Vec::new(),
+                    dispatch_project_scope: Vec::new(),
                 }],
             },
             selected_peer: 0,
@@ -906,6 +970,7 @@ mod tests {
             }),
             form: None,
             last_probe: None,
+            scope_status: None,
             last_error: None,
         }));
         let before = app.pending_lc_actions.len();
@@ -924,5 +989,124 @@ mod tests {
                 if state.tab == SatelliteRegistryTab::Sessions
                     && state.sessions.as_ref().is_some_and(|page| page.sessions[0].key.remote_session_id == remote_id)
         ));
+    }
+
+    fn form_overlay(form: SatelliteRegistryForm) -> OverlayState {
+        OverlayState::SatelliteRegistry(Box::new(SatelliteRegistryOverlayState {
+            registry: SatelliteRegistryV1 {
+                revision: 1,
+                peers: Vec::new(),
+            },
+            selected_peer: 0,
+            selected_link: 0,
+            selected_session: 0,
+            tab: SatelliteRegistryTab::Peers,
+            sessions: None,
+            form: Some(form),
+            last_probe: None,
+            scope_status: None,
+            last_error: None,
+        }))
+    }
+
+    fn peer_form(field: usize) -> SatelliteRegistryForm {
+        SatelliteRegistryForm::Peer {
+            peer_id: SatelliteUuidV1(uuid::Uuid::new_v4()),
+            label: String::new(),
+            expected_installation_id: String::new(),
+            enabled: false,
+            read_enabled: false,
+            dispatch_enabled: true,
+            dispatch_scope: String::new(),
+            repair_quarantine: false,
+            field,
+        }
+    }
+
+    fn peer_scope_text(app: &mut App) -> String {
+        match state(app).and_then(|state| state.form.as_ref()) {
+            Some(SatelliteRegistryForm::Peer { dispatch_scope, .. }) => dispatch_scope.clone(),
+            _ => panic!("peer form is open"),
+        }
+    }
+
+    /// Pasting `<session>,project:<uuid>` into the dispatch-scope field keeps
+    /// the whole text, and the saved scope parses to both entries (#2829).
+    #[test]
+    fn pasted_project_scope_entry_survives_the_dispatch_scope_field() {
+        let mut app = crate::app::app_test_helpers::with_session_list(1);
+        let session = uuid::Uuid::new_v4();
+        let project = uuid::Uuid::new_v4();
+        app.overlay = form_overlay(peer_form(5));
+        let pasted = format!("{session},project:{project}");
+        assert!(paste_text(&mut app, &pasted));
+        let text = peer_scope_text(&mut app);
+        assert_eq!(text, pasted);
+        let (sessions, projects) = parse_dispatch_scope(&text).unwrap();
+        assert_eq!(sessions, vec![SatelliteUuidV1(session)]);
+        assert_eq!(projects, vec![SatelliteUuidV1(project)]);
+    }
+
+    /// Typing `project:<uuid>` key by key reaches the field unchanged.
+    #[tokio::test]
+    async fn typed_project_scope_entry_reaches_the_dispatch_scope_field() {
+        let mut app = crate::app::app_test_helpers::with_session_list(1);
+        let project = uuid::Uuid::new_v4();
+        app.overlay = form_overlay(peer_form(5));
+        let typed = format!("project:{project}");
+        for ch in typed.chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch))).await;
+        }
+        let text = peer_scope_text(&mut app);
+        assert_eq!(text, typed);
+        let (sessions, projects) = parse_dispatch_scope(&text).unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(projects, vec![SatelliteUuidV1(project)]);
+    }
+
+    /// The inbound roots field takes project entries; the hub list keeps the
+    /// narrow id alphabet.
+    #[test]
+    fn inbound_roots_accept_project_entries_and_hubs_keep_the_id_alphabet() {
+        let mut app = crate::app::app_test_helpers::with_session_list(1);
+        let project = uuid::Uuid::new_v4();
+        app.overlay = form_overlay(SatelliteRegistryForm::Inbound {
+            hubs: String::new(),
+            roots: String::new(),
+            field: 1,
+        });
+        let pasted = format!("project:{project}");
+        assert!(paste_text(&mut app, &pasted));
+        let roots = match state(&mut app).and_then(|state| state.form.as_ref()) {
+            Some(SatelliteRegistryForm::Inbound { roots, .. }) => roots.clone(),
+            _ => panic!("inbound form is open"),
+        };
+        assert_eq!(roots, pasted);
+        assert_eq!(
+            parse_dispatch_scope(&roots).unwrap().1,
+            vec![SatelliteUuidV1(project)]
+        );
+
+        let hub = uuid::Uuid::new_v4();
+        let hub_form = |field| SatelliteRegistryForm::Inbound {
+            hubs: String::new(),
+            roots: String::new(),
+            field,
+        };
+        assert!(matches!(
+            active_text_limit(&hub_form(0)),
+            Some((_, FieldAlphabet::Ids))
+        ));
+        assert!(matches!(
+            active_text_limit(&hub_form(1)),
+            Some((_, FieldAlphabet::Scope))
+        ));
+        app.overlay = form_overlay(hub_form(0));
+        assert!(paste_text(&mut app, &hub.to_string()));
+        let hubs = match state(&mut app).and_then(|state| state.form.as_ref()) {
+            Some(SatelliteRegistryForm::Inbound { hubs, .. }) => hubs.clone(),
+            _ => panic!("inbound form is open"),
+        };
+        assert_eq!(parse_id_list(&hubs).unwrap(), vec![SatelliteUuidV1(hub)]);
     }
 }

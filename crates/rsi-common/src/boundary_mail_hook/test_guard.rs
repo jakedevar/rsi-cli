@@ -21,7 +21,9 @@ fn unscoped(script: &str, full_suite: bool, depth: usize) -> bool {
     if depth > 4 {
         return false;
     }
-    shell_commands(script).iter().any(|words| {
+    // The shared lexer splits only shell syntax, preserving quoted search
+    // arguments and handling heredoc bodies before classifying executables.
+    simple_commands(script).iter().any(|words| {
         let Some((program, args)) = command_word(words) else {
             return false;
         };
@@ -55,57 +57,6 @@ fn unscoped(script: &str, full_suite: bool, depth: usize) -> bool {
             .collect();
         inspect(program, &args, opted_out, depth)
     })
-}
-
-/// The shell lexer is intentionally small and does not parse here-documents.
-/// Remove their bodies before inspecting command words so code passed to
-/// `python3 - <<'EOF'` (or a script written with `cat <<'EOF'`) is not treated
-/// as a sequence of shell commands.
-fn shell_commands(script: &str) -> Vec<Vec<String>> {
-    let mut shell_input = String::with_capacity(script.len());
-    let mut heredocs = Vec::<(String, bool)>::new();
-    for line in script.lines() {
-        if !heredocs.is_empty() {
-            let (delimiter, strip_tabs) = &heredocs[0];
-            let terminator = if *strip_tabs {
-                line.trim_start_matches('\t')
-            } else {
-                line
-            };
-            if terminator == delimiter {
-                heredocs.remove(0);
-            }
-            shell_input.push('\n');
-            continue;
-        }
-
-        let words = simple_commands(line);
-        for command in &words {
-            let mut index = 0;
-            while index < command.len() {
-                let word = &command[index];
-                if let Some(delimiter) = word.strip_prefix("<<-") {
-                    if !delimiter.is_empty() {
-                        heredocs.push((delimiter.to_owned(), true));
-                    } else if let Some(delimiter) = command.get(index + 1) {
-                        heredocs.push((delimiter.clone(), true));
-                        index += 1;
-                    }
-                } else if let Some(delimiter) = word.strip_prefix("<<") {
-                    if !delimiter.is_empty() {
-                        heredocs.push((delimiter.to_owned(), false));
-                    } else if let Some(delimiter) = command.get(index + 1) {
-                        heredocs.push((delimiter.clone(), false));
-                        index += 1;
-                    }
-                }
-                index += 1;
-            }
-        }
-        shell_input.push_str(line);
-        shell_input.push('\n');
-    }
-    simple_commands(&shell_input)
 }
 
 fn inspect(program: &str, args: &[String], full_suite: bool, depth: usize) -> bool {
@@ -195,7 +146,16 @@ fn cargo_unscoped(args: &[String]) -> bool {
         .unwrap_or(args.len());
     let cargo = &args[..split];
     let libtest = args.get(split + 1..).unwrap_or_default();
-    if !cargo.iter().any(|arg| arg == "--lib")
+    // With no target selector Cargo includes the library tests too. Only an
+    // explicit non-library target avoids the protected libtest filter rules.
+    let other_target = !cargo.iter().any(|arg| arg == "--lib")
+        && cargo.iter().any(|arg| {
+            matches!(arg.as_str(), "--test" | "--bin" | "--bench" | "--example")
+                || ["--test=", "--bin=", "--bench=", "--example="]
+                    .iter()
+                    .any(|prefix| arg.starts_with(prefix))
+        });
+    if other_target
         || cargo.iter().any(|arg| arg == "--no-run")
         || listing_or_help(cargo)
         || listing_or_help(libtest)
@@ -452,6 +412,7 @@ mod tests {
             "cargo nextest run -p rsid --no-run",
             "cargo nextest list -p rsid",
             "cargo test -p rsid --test rpc_integration",
+            "cargo test -p rsid --test=rpc_integration",
             "cargo test -p rsid --lib --no-run",
             "cargo test -p rsid --lib -- --list",
             "cargo test -p rsi-common --lib",
@@ -471,6 +432,50 @@ mod tests {
     }
 
     #[test]
+    fn source_searches_and_compound_reads_are_allowed() {
+        for command in [
+            "rg 'cargo test -p rsid foo' tools/",
+            "rg \"cargo test -p rsid-store --lib review\" .claude/hooks",
+            "rg 'cargo test -p rsid foo; cargo nextest run -p rsid' tools/ | head -20",
+            "rg 'cargo test -p rsid foo && cargo test -p rsid-store review || cargo test -p rsid' tools/",
+            "rg 'cargo test -p rsid foo\ncargo nextest run -p rsid' tools/",
+            "sed -n '/cargo test -p rsid foo/p' tools/hook.rs | head -20",
+        ] {
+            assert!(decision(command, false).is_none(), "{command}");
+        }
+        for separator in [";", "&&", "||", "|", "\n"] {
+            let command = format!(
+                "sed -n '1,40p' tools/hook.rs {separator} rg 'cargo test -p rsid foo' tools/ {separator} head -20 tools/hook.rs"
+            );
+            assert!(decision(&command, false).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn quoted_source_searches_do_not_hide_test_runners() {
+        for runner in [
+            "cargo test -p rsid --lib review",
+            "cargo test -p rsid-store --lib store::tests::",
+            "cargo nextest run -p rsid -E 'test(store::tests::)'",
+            "scripts/run-rsid-test-shards.sh full",
+            "bash scripts/run-rsid-test-shards.sh fast",
+        ] {
+            for separator in [";", "&&", "||", "|", "\n"] {
+                let command = format!(
+                    "rg 'cargo test -p rsid foo' tools/ {separator} {runner} {separator} head -20 tools/hook.rs"
+                );
+                assert_eq!(refusal(&command, false), Some(REFUSAL), "{command}");
+            }
+            // Quote removal must not turn an rg pattern into a heredoc opener
+            // and discard the following real invocation (#414).
+            for quote in ["'", "\""] {
+                let command = format!("rg {quote}<<EOF{quote} tools/\n{runner}");
+                assert_eq!(refusal(&command, false), Some(REFUSAL), "{command}");
+            }
+        }
+    }
+
+    #[test]
     fn hook_ignores_test_like_text_in_heredocs() {
         for command in [
             "python3 - <<'EOF'\nfrom glob import glob\npaths = glob('/tmp/rsi-scoped-test-*/rsid-store.json')\n# Example command text: cargo test -p rsid-store --lib\nEOF",
@@ -478,6 +483,74 @@ mod tests {
             "cat > /tmp/inspect.py <<'EOF'\nprint('rsid-store test output')\nEOF\npython3 /tmp/inspect.py",
         ] {
             assert!(decision(command, false).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn completed_test_log_inspection_is_allowed() {
+        // Exact denied command recorded in #389's originating session.
+        let evidence = "python3 - <<'PY'\nimport json\nx=json.load(open('/tmp/issue-367-authority-result.json'))['result']\nprint(json.dumps({'roles':x['roles'],'guidance':x['guidance']},indent=2))\nPY\nrg -n 'resolved_coordinator_budget_explains|rotated_codex_pm_budget|operator_context_settings_expose|context_settings_render|Summary|test result:' /tmp/rsi-scoped-test-js5x9zha/{rsid-store,rsid,rsi}.log | tail -24";
+        for command in [
+            evidence,
+            "grep -n -e 'test result:' /tmp/{rsid-store,rsid,rsi}.log",
+            "python3 -c 'from pathlib import Path; print(Path(\"/tmp/rsid.log\").read_text())'",
+            "rg 'cargo test -p rsid foo; cargo nextest run -p rsid -E test(topology::)' /tmp/tests.log",
+            "cat /tmp/{rsid-store,rsid,rsi}.log | grep -e 'test result:' && sed -n '/store::tests/p' /tmp/rsid.log",
+            "env LOG=test sudo -u worker rg 'test result:' /tmp/{rsid-store,rsid}.log; jq '.test' /tmp/receipt.json",
+            "rg 'test result:' {rsid-store,rsid,rsi}.log",
+            "rg 'test result:' ${LOG_DIR}/rsid.log",
+            "rg 'test result:' /tmp/{rsid-store,rsid}.log && cargo test -p rsid --lib -- --exact store::tests::one",
+        ] {
+            assert!(decision(command, false).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn log_inspection_does_not_hide_unscoped_runners() {
+        for runner in [
+            "cargo test -p rsid foo",
+            "cargo test -p rsid --lib store::tests::",
+            "cargo nextest run -p rsid -E 'test(store::tests::)'",
+            "target/debug/deps/rsid-01234 store::tests::",
+            "env LOG=test sudo -u worker cargo test -p rsid foo",
+        ] {
+            for command in [
+                runner.to_owned(),
+                format!("rg -e 'test result:' /tmp/{{rsid-store,rsid}}.log | {runner}"),
+                format!("{runner} | grep -e 'test result:'"),
+                format!("rg 'test result:' /tmp/rsid.log && {runner}"),
+                format!("{runner}; python3 -c 'print(\"test result:\")'"),
+                format!("{{ {runner}; }}"),
+            ] {
+                let output =
+                    decision(&command, false).unwrap_or_else(|| panic!("allowed: {command}"));
+                assert_eq!(
+                    output["hookSpecificOutput"]["permissionDecisionReason"],
+                    REFUSAL
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_inspection_keeps_other_shell_refusals() {
+        for forbidden in [
+            "pkill -f cargo",
+            "git push --force origin HEAD",
+            "git stash",
+        ] {
+            let command = format!("rg 'test result:' /tmp/{{rsid-store,rsid}}.log; {forbidden}");
+            // The explicit custody base keeps this independent of the test host.
+            assert!(
+                crate::kill_guard::broad_kill_refusal(&command).is_some()
+                    || super::super::custody_refusal(
+                        &command,
+                        std::path::Path::new("/tmp/rsi-guard/sandboxes/worker"),
+                        std::path::Path::new("/tmp/rsi-guard/sandboxes"),
+                    )
+                    .is_some(),
+                "{command}"
+            );
         }
     }
 

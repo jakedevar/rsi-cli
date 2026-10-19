@@ -78,6 +78,15 @@ class ShardEnvironmentTest(unittest.TestCase):
             result = QA.run("rsi", [sys.executable, "-c", "pass"], Path(directory))
         self.assertNotIn("environment", result)
 
+    def test_the_sweep_runs_the_slow_tier_of_every_shard(self):
+        # #2270: the full QA is where the released-migration history tests run; the shard
+        # runner leaves them out of a plain run.
+        source = SCRIPT.read_text()
+        self.assertRegex(
+            source,
+            r'"scripts/run-rsid-test-shards.sh", "shard", shard,\s+"--jobs", args.jobs, "--evidence-dir", shard_dir, "--slow-tier"',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

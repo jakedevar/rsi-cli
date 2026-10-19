@@ -110,17 +110,20 @@ impl StoreProbe {
 
 /// Wait until the launch of `id` is parked in `phase` (its breadcrumb), the
 /// readiness handshake that proves the probe window overlaps the stuck state.
-async fn wait_for_launch_phase(id: Uuid, phase: &'static str) {
+/// `false` means the phase never appeared: the caller must not open a probe
+/// window then, or an unreached state would count as observed (#1174).
+async fn wait_for_launch_phase(id: Uuid, phase: &'static str) -> bool {
     let needle = format!("{id} {phase} ");
     for _ in 0..4000 {
         if crate::launch_breadcrumbs::snapshot()
             .iter()
             .any(|line| line.starts_with(&needle))
         {
-            return;
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    false
 }
 
 /// Drive `work` with a Store probe running. `ready` is the launch phase that
@@ -138,7 +141,9 @@ async fn run_with_probe<T>(
         *ready_at.lock().unwrap() = None;
         let ready_at = ready_at.clone();
         tokio::spawn(async move {
-            wait_for_launch_phase(id, phase).await;
+            if !wait_for_launch_phase(id, phase).await {
+                return;
+            }
             // Settle: let the launch be parked there for a moment before sampling.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             *ready_at.lock().unwrap() = Some(std::time::Instant::now());
@@ -260,17 +265,9 @@ async fn create_session_behind_a_held_repository_mutex_keeps_the_store_free() {
     report.assert_live("a launch behind a held repository mutex");
 }
 
-/// Hold this fixture's exact custody root on a plain maintenance thread.
-fn hold_root(custody_id: Uuid, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let _guard = crate::store::sandbox_custody::lock_custody_root(custody_id);
-        held_tx.send(()).unwrap();
-        std::thread::sleep(hold);
-    });
-    held_rx.recv().unwrap();
-    handle
-}
+/// How long a maintenance proof keeps its stripes after the path under test
+/// acknowledged contention (inside the 5 s admission budget).
+const STRIPE_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// #1166: the launch binds its session through a Store method that needs the
 /// new custody root's stripe. With a maintenance proof holding that stripe the
@@ -286,10 +283,18 @@ async fn create_session_behind_held_stripes_keeps_the_store_free_and_establishes
     let child = queued_create(&p, "liveness-stripes").await;
     let (fresh_root, _reservation) =
         crate::store::stripe_liveness_support::reserve_fresh_root(child);
-    let holder = hold_root(fresh_root, std::time::Duration::from_secs(3));
-    let (launched, report) = execute_with_probe(&p, Some((child, "custody_bind"))).await;
-    holder.join().unwrap();
-    report.assert_live("a launch blocked on a custody stripe");
+    // The stripe is held (readiness handshake) before the launch starts, the
+    // probe samples only inside the hold that follows the launch's own
+    // contention acknowledgement, and the run proves the launch waited behind
+    // the stripe (#1174).
+    let run = crate::store::stripe_liveness_support::run_behind_held_stripes(
+        &p.manager.store,
+        Some(vec![fresh_root]),
+        STRIPE_HOLD,
+        p.execute(),
+    )
+    .await;
+    let launched = run.assert_store_stayed_free("a launch blocked on a custody stripe");
     launched.unwrap();
     assert!(
         wait_for_running(&p, child).await,
@@ -357,14 +362,46 @@ async fn replace_lead_assignment_commit_behind_held_stripes_keeps_the_store_free
         .live_custody_for_session(successor)
         .unwrap()
         .custody_id;
-    let holder = hold_root(custody_id, std::time::Duration::from_secs(3));
+    // The replacement waits for the successor's stripe somewhere after the
+    // pause, but never under the Store. That path does not use the contention
+    // handshake, so the proof is built from plain-thread facts: the stripe is
+    // held (readiness handshake) and the probe has sampled before the pause is
+    // released, the replacement finishes only after the holder released
+    // (`released` is set before the guard drops), and the probe, timed on its
+    // own thread, completed samples and never waited long while it was held.
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let released = released.clone();
+        std::thread::spawn(move || {
+            let guard = crate::store::sandbox_custody::lock_custody_root(custody_id);
+            held_tx.send(()).unwrap();
+            std::thread::sleep(STRIPE_HOLD);
+            released.store(true, Ordering::SeqCst);
+            drop(guard);
+        })
+    };
+    held_rx.recv().unwrap();
     let probe = StoreProbe::start(p.manager.store.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while probe.samples.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the probe sampled the Store before the pause was released");
+    let since = std::time::Instant::now();
     resume.send(()).unwrap();
     let launched = tokio::time::timeout(std::time::Duration::from_secs(60), exec)
         .await
         .expect("the replacement finished instead of hanging");
-    let report = probe.report(probe.started);
+    let finished_after_release = released.load(Ordering::SeqCst);
+    let report = probe.report(since);
     holder.join().unwrap();
+    assert!(
+        finished_after_release,
+        "the replacement finished before the stripe was released, so it never waited on it"
+    );
     report.assert_live("an assignment commit blocked on a custody stripe");
     launched.unwrap();
 }
@@ -460,10 +497,14 @@ async fn resume_lead_behind_held_stripes_keeps_the_store_free_and_resumes() {
         .live_custody_for_session(id)
         .unwrap()
         .custody_id;
-    let holder = hold_root(custody_id, std::time::Duration::from_secs(3));
-    let (resumed, report) = execute_with_probe(&p, None).await;
-    holder.join().unwrap();
-    report.assert_live("a resume blocked on a custody stripe");
+    let run = crate::store::stripe_liveness_support::run_behind_held_stripes(
+        &p.manager.store,
+        Some(vec![custody_id]),
+        STRIPE_HOLD,
+        p.execute(),
+    )
+    .await;
+    let resumed = run.assert_store_stayed_free("a resume blocked on a custody stripe");
     resumed.unwrap();
     assert_eq!(
         p.receipt(resume.operation_id).await.state,

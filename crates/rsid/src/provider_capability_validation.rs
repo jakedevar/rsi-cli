@@ -911,7 +911,7 @@ const CONSUMER_INVENTORY: &[ConsumerContract] = &[
     ConsumerContract {
         role: ConsumerRole::ContextInjection,
         path: "crates/rsid/src/session/launch.rs",
-        symbol: "SessionManager::launch_session_with_retry_admission",
+        symbol: "SessionManager::compose_launch_system_prompt",
         source: FlowSource::Call("context_injection_allowance"),
         sinks: &[FlowSink::Call("assemble")],
     },
@@ -2056,6 +2056,7 @@ fn render_documentation(snapshot: &CodexCatalogSnapshot) -> String {
         ));
     }
     output.push_str("| Session compaction limit | runtime/configured when present | The installed 0.155.1 catalog omits a context-compaction threshold; `comp_hash` and `truncation_policy` are preserved metadata, not token capacity |\n");
+    output.push_str(&render_harness_routes());
     output.push_str("\n## Catalog field classification\n\n");
     output.push_str("| Field | Category | Handling | Detail |\n| --- | --- | --- | --- |\n");
     for contract in CODEX_CATALOG_MODEL_FIELDS {
@@ -2092,6 +2093,65 @@ fn render_documentation(snapshot: &CodexCatalogSnapshot) -> String {
     output
 }
 
+/// The Harness direct-API routes section (#2259), rendered from the compatible
+/// table entry so the document is the wire profile the provider sends and
+/// cannot drift from it.
+fn render_harness_routes() -> String {
+    use crate::session::harness::compatible_table::{ReasoningEffortWire, lookup};
+    let entry = lookup("mercury-2").expect("the Mercury route is in the compatible table");
+    let quirks = &entry.quirks;
+    let effort_wire = match quirks.reasoning_effort {
+        ReasoningEffortWire::None => "none".to_string(),
+        ReasoningEffortWire::OpenAi => "`reasoning_effort`: low, medium, high".to_string(),
+        ReasoningEffortWire::OpenAiWithInstant => {
+            "`reasoning_effort`: instant, low, medium, high".to_string()
+        }
+        ReasoningEffortWire::OpenAiWithNone => {
+            "`reasoning_effort`: none, low, medium, high".to_string()
+        }
+    };
+    let output_budget = quirks.default_max_output_tokens.map_or_else(
+        || "route default".to_string(),
+        |tokens| format!("{tokens}, reasoning included"),
+    );
+    let mut output = String::from("\n## Harness direct-API routes\n\n");
+    output.push_str("Rendered from the Harness compatible table, so each row is the wire profile the provider sends. Mercury is Inception's diffusion model (`mercury-2`).\n\n");
+    output.push_str("| Property | Mercury (`mercury-2`) |\n| --- | --- |\n");
+    output.push_str(&format!(
+        "| Route | `{}` at `{}` |\n",
+        entry.name, entry.base_url
+    ));
+    output.push_str(&format!(
+        "| Key | Provider Keys vault slot; env fallbacks `{}` |\n",
+        entry.env_vars.join("`, `")
+    ));
+    output.push_str(&format!(
+        "| Native tool calls | {} |\n",
+        if quirks.native_tools { "yes" } else { "no" }
+    ));
+    output.push_str(&format!("| Reasoning effort | {effort_wire} |\n"));
+    output.push_str(&format!(
+        "| Output cap | `{}` ({output_budget}) |\n",
+        quirks.max_tokens_field.field_name()
+    ));
+    output.push_str(&format!(
+        "| `tool_choice: \"none\"` beside `tools` | {} |\n",
+        if quirks.tool_choice_none {
+            "accepted"
+        } else {
+            "refused"
+        }
+    ));
+    output.push_str("\n| RSI effort | Mercury `reasoning_effort` |\n| --- | --- |\n");
+    for level in ["minimal", "none", "low", "medium", "high", "xhigh", "max"] {
+        output.push_str(&format!(
+            "| `{level}` | {} |\n",
+            quirks.reasoning_effort.wire_value(level).unwrap_or("—")
+        ));
+    }
+    output
+}
+
 fn fixture_observed_at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
         .expect("fixture timestamp is valid")
@@ -2124,7 +2184,7 @@ mod tests {
     use super::*;
 
     fn production_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        PathBuf::from(rsi_common::manifest_dir!())
             .parent()
             .and_then(Path::parent)
             .expect("repository root")

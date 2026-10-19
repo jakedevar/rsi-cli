@@ -146,6 +146,7 @@ fn work_view_shows_granted_ownership_to_manager_created_worker() {
                         artifact_commit: sha.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "alpha-stage",
             ),

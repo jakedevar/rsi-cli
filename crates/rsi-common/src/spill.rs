@@ -373,6 +373,23 @@ pub fn store(root: &Path, key: &str, meta: &SpillMeta<'_>, data: &[u8]) -> std::
     Ok(handle)
 }
 
+/// Appended to the stub of a Bash command that printed file content (#2133):
+/// the provider's Read dedupe can treat that file as already read, but this
+/// stub is only a head and tail, so a Read of it may be refused.
+const READ_HINT: &str = "note: this stub is head+tail only; if Read refuses the file as already read, use rsi-spill show above.";
+
+/// True when a command prints file content (`cat`, `sed`, `head`, ...), the
+/// case where a later `Read` of the same file may be refused (#2133).
+fn reads_file_content(command: &str) -> bool {
+    use std::sync::OnceLock;
+    static READER: OnceLock<Regex> = OnceLock::new();
+    let re = READER.get_or_init(|| {
+        Regex::new(r"(?:^|[\s;&|(])(?:cat|sed|head|tail|nl|less|more|bat|awk)\s")
+            .expect("file reader regex")
+    });
+    re.is_match(&shell_code_text(command))
+}
+
 /// Store `text` and return `(handle, stub)` when it is over the thresholds and
 /// the stub actually saves space; `None` means "leave the output alone".
 #[must_use]
@@ -386,7 +403,11 @@ pub fn spill_text(
         return None;
     }
     let handle = store(&cfg.root, key, meta, text.as_bytes()).ok()?;
-    let stub = build_stub(&handle, meta.tool, meta.exit, text);
+    let mut stub = build_stub(&handle, meta.tool, meta.exit, text);
+    if meta.tool == "Bash" && meta.command.is_some_and(reads_file_content) {
+        stub.push('\n');
+        stub.push_str(READ_HINT);
+    }
     if stub.len() * 4 > text.len() * 3 {
         // No real saving: keep the output inline; the stored copy is harmless.
         return None;
@@ -1058,6 +1079,38 @@ mod tests {
         assert_eq!(ranged, "   Compiling rsid v0.1.0\nrunning 5000 tests\n");
         let (handle2, _) = spill_text(&c, "sess1234", &meta, &text).unwrap();
         assert_eq!(handle2, "sess1234/2");
+    }
+
+    /// #2133: a spilled file print tells the reader how to get the rest when
+    /// the provider's Read dedupe refuses the file; other commands get no hint.
+    #[test]
+    fn file_print_stub_names_the_spill_show_fallback_for_a_refused_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = cfg(tmp.path());
+        let text = "diff line\n".repeat(3000);
+        let meta = |command| SpillMeta {
+            tool: "Bash",
+            command: Some(command),
+            exit: Some(0),
+        };
+        let (handle, stub) = spill_text(
+            &c,
+            "sess1234",
+            &meta("sed -n 1,3000p /tmp/full.diff"),
+            &text,
+        )
+        .unwrap();
+        assert!(
+            stub.contains(&format!("full: rsi-spill show {handle}")),
+            "{stub}"
+        );
+        assert!(
+            stub.contains("Read refuses the file as already read"),
+            "{stub}"
+        );
+        assert!(stub.len() < 2000, "{}", stub.len());
+        let (_, other) = spill_text(&c, "sess1234", &meta("ls -R /tmp"), &text).unwrap();
+        assert!(!other.contains("already read"), "{other}");
     }
 
     #[test]

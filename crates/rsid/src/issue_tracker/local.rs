@@ -467,6 +467,7 @@ mod tests {
                 issue_id,
                 expected_row_version,
                 status: IssueStatus::Closed,
+                ..
             } if issue_id == issue.id && expected_row_version == issue.row_version
         ));
     }

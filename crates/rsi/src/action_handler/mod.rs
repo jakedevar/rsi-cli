@@ -14,6 +14,7 @@ mod cohort_settlement;
 pub(crate) mod daemon_config;
 pub(crate) mod mcp_servers;
 mod navigation;
+pub(crate) mod operator_config;
 mod overlay;
 pub(crate) mod provider_credentials;
 pub(crate) mod session;
@@ -115,9 +116,22 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::ToggleTestingNeeded
         | LcAction::ToggleRotationDisabled
         | LcAction::CancelRetry
+        | LcAction::ToggleTodoPanel
+        | LcAction::TodoNext
+        | LcAction::TodoPrev
+        | LcAction::TodoOpenLink
+        | LcAction::TodoDone
+        | LcAction::TodoDismiss
+        | LcAction::TodoCopy
+        | LcAction::TodoAcknowledge
+        | LcAction::TodoPopup
+        | LcAction::TodoUndo
         | LcAction::ReassignSessionProject
         | LcAction::RotateSession
         | LcAction::AbandonRotation(_)
+        | LcAction::ReseatManager(_)
+        | LcAction::ColdRestoreSession
+        | LcAction::ColdArchive(_)
         | LcAction::CommitAndPush
         | LcAction::ExecuteDocRegBlocks
         | LcAction::YankEventContent
@@ -132,6 +146,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::CreateBug
         // Phase 5 epic lead assignment
         | LcAction::SetEpicLead
+        | LcAction::LandSessionBranch
         // P1.12 — fire focused Epic's bound topology
         | LcAction::RunEpicTopology => session::dispatch(app, action).await,
 
@@ -254,6 +269,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::AddProjectCardFact(_)
         | LcAction::AddUserCardFact(_)
         | LcAction::OpenIssuesWorkspace
+        | LcAction::OpenIssueNumber(_)
         | LcAction::OpenDialectic
         | LcAction::AskQuery(_)
         | LcAction::OpenScheduleBrowser
@@ -323,15 +339,28 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::EnterSessionNormalMode
         | LcAction::OpenSettings
         | LcAction::OpenSettingsAt(_)
-        | LcAction::OpenPromptCreator
         | LcAction::CloseFocusedPane
         | LcAction::GrowSidebar
         | LcAction::ShrinkSidebar
         | LcAction::Quit => window::dispatch(app, action),
 
+        // hub #3040: opening the prompt creator loads its list from the daemon.
+        LcAction::OpenPromptCreator => {
+            window::dispatch(app, action);
+            if matches!(
+                app.focused_pane(),
+                Some(crate::types::Pane::PromptCreator)
+            ) {
+                app.refresh_prompts().await;
+            }
+        }
+
         // Daemon config: toggle a feature flag or refresh the feature list
         LcAction::ToggleDaemonFeature(idx) => {
             daemon_config::toggle_daemon_feature(app, idx).await;
+        }
+        LcAction::ApplyPendingSettings => {
+            daemon_config::apply_pending_settings(app).await;
         }
         LcAction::EmergencyStopAll => {
             daemon_config::emergency_stop_all(app).await;
@@ -378,6 +407,12 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         LcAction::RefreshProviderCredentials => {
             provider_credentials::refresh_provider_credentials(app).await;
         }
+        LcAction::RefreshProviderLogin { probe } => {
+            provider_credentials::refresh_provider_login(app, probe).await;
+        }
+        LcAction::RefreshProviderContract { probe } => {
+            provider_credentials::refresh_provider_contract(app, probe).await;
+        }
         LcAction::SetProviderCredentialSecret { slot, secret } => {
             provider_credentials::set_provider_credential(app, slot, secret).await;
         }
@@ -410,6 +445,31 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::ClearMcpServerSecret { id } => {
             mcp_servers::clear_mcp_server_secret(app, id).await;
+        }
+        LcAction::RefreshCustomProviders => {
+            operator_config::refresh_custom_providers(app).await;
+        }
+        LcAction::PutCustomProvider { params } => {
+            operator_config::put_custom_provider(app, params).await;
+        }
+        LcAction::DeleteCustomProvider { id } => {
+            operator_config::delete_custom_provider(app, id).await;
+        }
+        LcAction::RefreshClaudeHooks => {
+            operator_config::refresh_claude_hooks(app).await;
+        }
+        LcAction::SaveClaudeHooks {
+            expected_revision,
+            hooks,
+            edit,
+        } => {
+            operator_config::save_claude_hooks(app, expected_revision, hooks, edit).await;
+        }
+        LcAction::OpenMessageBridgeForm(bridge) => {
+            operator_config::open_message_bridge_form(app, bridge).await;
+        }
+        LcAction::PutMessageBridge { bridge, settings } => {
+            operator_config::put_message_bridge(app, bridge, settings).await;
         }
     }
 }
@@ -503,6 +563,9 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::SettingsEnable
         | ActionId::SettingsMoveColumnUp
         | ActionId::SettingsMoveColumnDown
+        | ActionId::SettingsStepNext
+        | ActionId::SettingsStepPrevious
+        | ActionId::SettingsApply
         | ActionId::SettingsRefresh
         | ActionId::ProviderKeySet
         | ActionId::ProviderKeyRotate
@@ -524,6 +587,9 @@ pub(crate) async fn dispatch_registered_action(
                 ActionId::SettingsEnable => KeyCode::Char('e'),
                 ActionId::SettingsMoveColumnUp => KeyCode::Char('K'),
                 ActionId::SettingsMoveColumnDown => KeyCode::Char('J'),
+                ActionId::SettingsStepNext => KeyCode::Char('+'),
+                ActionId::SettingsStepPrevious => KeyCode::Char('-'),
+                ActionId::SettingsApply => KeyCode::Char('w'),
                 ActionId::SettingsRefresh => KeyCode::Char('R'),
                 ActionId::ProviderKeySet => KeyCode::Char('s'),
                 ActionId::ProviderKeyRotate => KeyCode::Char('r'),
@@ -569,6 +635,12 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::IssuePreviousTab
         | ActionId::IssueNextTab
         | ActionId::IssueSearch
+        | ActionId::IssueGoToNumber
+        | ActionId::IssueOperatorFilter
+        | ActionId::IssueDetailNext
+        | ActionId::IssueDetailPrevious
+        | ActionId::IssueDetailActivate
+        | ActionId::IssueDetailBack
         | ActionId::IssueFilter
         | ActionId::IssueSort
         | ActionId::IssueJumpArm

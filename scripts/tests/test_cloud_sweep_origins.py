@@ -3,8 +3,11 @@
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "cloud-sweep.sh"
@@ -12,29 +15,30 @@ SCRIPT = Path(__file__).resolve().parents[1] / "cloud-sweep.sh"
 
 class CloudSweepOriginsTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = scratch_tempdir(prefix="cloud-sweep-origins-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.allowed = self.root / "allowed"
         self.allowed.mkdir()
         self.origin = self.allowed / "origin.git"
         self.caller = self.root / "caller"
-        self.git("init", "-q", "--bare", str(self.origin))
-        self.git("init", "-q", "-b", "rolling", str(self.caller))
-        self.git("-C", str(self.caller), "commit", "-q", "--allow-empty", "-m", "tip")
-        self.sha = self.git("-C", str(self.caller), "rev-parse", "HEAD").stdout.strip()
-        self.git("-C", str(self.caller), "push", "-q", str(self.origin), "rolling")
-        self.git("-C", str(self.caller), "remote", "add", "origin", str(self.origin))
+        self.origin.mkdir()
+        self.caller.mkdir()
+        self.git(self.origin, "init", "-q", "--bare")
+        self.git(self.caller, "init", "-q", "-b", "rolling")
+        self.git(self.caller, "commit", "-q", "--allow-empty", "-m", "tip")
+        self.sha = self.git(self.caller, "rev-parse", "HEAD").stdout.strip()
+        self.git(self.caller, "push", "-q", str(self.origin), "rolling")
+        self.git(self.caller, "remote", "add", "origin", str(self.origin))
 
-    def git(self, *args):
-        return subprocess.run(
-            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+    def git(self, directory, *args):
+        return scratch_git(
+            directory, "-c", "user.name=t", "-c", "user.email=t@example.com", *args,
             env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
-            check=True, capture_output=True, text=True,
         )
 
     def bundle(self, origin, *roots):
-        self.git("-C", str(self.caller), "config", "remote.origin.url", str(origin))
+        self.git(self.caller, "config", "remote.origin.url", str(origin))
         command = ["bash", str(SCRIPT), "bundle", self.sha, str(self.root / "tip.bundle"),
                    "--repo", str(self.caller), "--mirror", str(self.root / "mirror.git")]
         for root in roots:
@@ -45,7 +49,7 @@ class CloudSweepOriginsTest(unittest.TestCase):
     def assert_bundled(self, origin, *roots):
         result = self.bundle(origin, *roots)
         self.assertEqual(result.returncode, 0, result.stderr)
-        heads = self.git("bundle", "list-heads", str(self.root / "tip.bundle")).stdout
+        heads = self.git(self.root, "bundle", "list-heads", str(self.root / "tip.bundle")).stdout
         self.assertEqual(heads.strip(), f"{self.sha} refs/remotes/origin/rolling")
 
     def assert_refused(self, origin, *roots):

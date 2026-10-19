@@ -5,9 +5,10 @@
 use super::Store;
 use super::harness_manager_v2::{ManagerAuthorityV2, fingerprint, now, refused};
 use super::sessions::historical_session_restore_blocked_on;
-use crate::error::Result;
+use crate::error::{DaemonError, Result};
 use chrono::Utc;
 use rsi_common::harness_manager_v2::*;
+use rsi_common::manager_budget::{BudgetNodeKindV1, CreationCapRefusalV1};
 use rsi_common::manager_operator_delegation::DelegatedOperatorCallV1;
 use rsi_common::types::{SandboxCleanupState, SandboxKind, Session, SessionKind, SessionStatus};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -16,14 +17,42 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// #1301: the charged creations `head` pays for: those since its epoch
+/// began whose origin lineage includes it (or that no node originated).
+pub(crate) fn head_created_count(
+    charges: &[(String, Option<Vec<Uuid>>)],
+    head: &super::harness_manager_v2::PortfolioHead,
+) -> i64 {
+    charges
+        .iter()
+        .filter(|(created, lineage)| {
+            created.as_str() >= head.started.as_str()
+                && lineage
+                    .as_ref()
+                    .is_none_or(|lineage| lineage.contains(&head.node_id))
+        })
+        .count() as i64
+}
+
+/// The policy field a creation budget charges (#2502).
+fn creation_cap_field(container: bool) -> &'static str {
+    if container {
+        "max_created_containers"
+    } else {
+        "max_created_sessions"
+    }
+}
+
 pub mod fence;
 mod issue_worker;
+pub mod issue_worker_capacity;
+mod issue_worker_evidence;
 mod operator_delegation;
 mod recovery;
 mod sandbox_source;
 mod superseded_wakes;
 
-const ACTION_KIND: &str = "lifecycle_action";
+pub(crate) const ACTION_KIND: &str = "lifecycle_action";
 /// #1118: independent `create_session` launches in one project may be
 /// `running` at once up to this many; every other action keeps the
 /// one-active-command-per-project fence.
@@ -134,6 +163,13 @@ pub(crate) enum RecoveryOwnerMode {
     /// Effect and publication gates still enforce the operator pause: provider
     /// establishment is productive work, not just a metadata handoff.
     /// Every other human/operator owner still refuses.
+    ///
+    /// The seat's own ordinary `resume` wakes (backstops, job-outcome and
+    /// predicate waits) do not hold it: the publication commit hands them to the
+    /// successor and retires what cannot follow, so a manager no longer cancels
+    /// its own wakes before a baton pass. Wakes owned by the daemon (`keepalive-*`
+    /// child valves, `background-process-*` wakes, the wakes of an open capacity
+    /// incident) still refuse.
     ManagerSuccession,
 }
 
@@ -208,8 +244,7 @@ pub struct ManagerActionSourceV2 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagerFrozenSandboxSourceV1 {
     /// Resolved at launch to the fetched `origin/rolling` tip; `commit` is
-    /// the checkout `HEAD` used only when the checkout is not on `rolling`
-    /// or no published tip can be observed.
+    /// the checkout `HEAD` used only when no published tip can be observed.
     Rolling,
     /// `commit` is the caller-named commit.
     Commit,
@@ -262,6 +297,33 @@ pub struct ManagerIssueBindingV1 {
     /// reuses the original brief.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_of: Option<i64>,
+    /// #218: the same-project Issues the manager attached as read-only context
+    /// (`related`). Their texts are copied into the brief as a snapshot; the
+    /// worker may also read each live. Old bindings default to none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<i64>,
+    /// #218: the reference selectors (`#N`, `#A-#B`) the manager's own brief
+    /// named, snapshotted at launch (and unioned with a predecessor's on
+    /// `continue_from`). The worker may read each selected Issue read-only. Only
+    /// the manager's brief is scanned, never the Issue texts the daemon copies
+    /// into the query, so references do not chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brief_refs: Vec<(i64, i64)>,
+    /// #275: the `related` Issues of this Issue's earlier launches that a plain
+    /// relaunch carried over (read-only, also folded into `brief_refs`). The
+    /// manager's own `related` stays in `related`, so a replay compares equal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_related: Vec<i64>,
+    /// #275: earlier related Issues that were not carried (the Issue no longer
+    /// exists, is archived, or the bound is full); named in the brief and the
+    /// launch result. Never refuses the launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_related: Vec<i64>,
+    /// #1930: set on a daemon-issued relaunch after the predecessor worker
+    /// failed on provider capacity before its first turn. Journalled so the
+    /// substitution (if any) is visible on the action record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_retry: Option<issue_worker_capacity::CapacityRetryV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,8 +646,17 @@ impl Store {
     /// the caller's lineage tip: the seat that holds the caller's authority
     /// now. A caller with no live successor is refused with
     /// `manager_v2_actor_seat_retired`, a clear class the receipt and the
-    /// manager notice carry. Admission ([`Self::manager_action_authority`])
-    /// never takes this path: only a stored request is inherited.
+    /// manager notice carry.
+    ///
+    /// #1716: a live caller that another session was appointed over (the
+    /// operator replaced the project manager while the create was held) is
+    /// denied `manager_scope_denied`, not `manager_current_session_required`.
+    /// It has no successor either, so the stored action is refused with
+    /// `manager_v2_actor_seat_replaced` (revoked, nothing launched; the
+    /// current manager relaunches) instead of the generic blocked
+    /// `manager_v2_lifecycle_unconfirmed` no verb could settle.
+    /// Admission ([`Self::manager_action_authority`]) never takes this path:
+    /// only a stored request is inherited.
     pub(super) fn manager_stored_action_authority(
         &self,
         origin: &ManagerActionOriginV2,
@@ -614,6 +685,9 @@ impl Store {
                     .contains("manager_current_session_required") =>
             {
                 Err(refused("manager_v2_actor_seat_retired"))
+            }
+            None if denial.to_string().contains("manager_scope_denied") => {
+                Err(refused("manager_v2_actor_seat_replaced"))
             }
             None => Err(denial),
         }
@@ -1421,17 +1495,23 @@ impl Store {
             RecoveryOwnerMode::AgentArchive => (false, true, true, false, false),
             RecoveryOwnerMode::ManagerLeadHandover => (true, true, false, false, true),
             RecoveryOwnerMode::ManagerLeadPause => (true, true, false, false, false),
-            RecoveryOwnerMode::ManagerSuccession => (true, false, true, false, false),
+            RecoveryOwnerMode::ManagerSuccession => (true, false, false, false, false),
         };
+        // The seat's own ordinary resume wakes move with a succession, but a
+        // resume wake owned by the daemon never does.
+        let hold_on_daemon_resume = matches!(mode, RecoveryOwnerMode::ManagerSuccession);
         let held: bool = self.conn.query_row(
             "SELECT pending_question_json IS NOT NULL OR pending_archive=1 OR status='WaitingApproval'
              OR EXISTS(SELECT 1 FROM approvals a WHERE session_id=?1 AND status='Pending' AND NOT EXISTS(SELECT 1 FROM appserver_approval_publications p WHERE p.approval_id=a.id AND (p.closure_state='closed' OR p.state='superseded')))
              OR EXISTS(SELECT 1 FROM appserver_approval_publications WHERE session_id=?1 AND closure_state<>'closed' AND state<>'superseded')
              OR EXISTS(SELECT 1 FROM daemon_settings WHERE (?5 AND key=?3) OR (?6 AND key=?2 AND value<>'false' AND (NOT ?7 OR value<>'soft')))
              OR EXISTS(SELECT 1 FROM scheduled_jobs WHERE ?8 AND enabled=1 AND wake_mode='resume' AND wake_session_id=?1 AND id<>?4)
+             OR EXISTS(SELECT 1 FROM scheduled_jobs j WHERE ?9 AND j.enabled=1 AND j.wake_mode='resume' AND j.wake_session_id=?1 AND j.id<>?4
+                 AND (j.name LIKE 'keepalive-%' OR j.name LIKE 'background-process-%'
+                      OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents i WHERE i.state='open' AND (i.wake_job_id=j.id OR i.program_guard_job_id=j.id))))
              OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents WHERE state='open' AND controller_session_id=?1)
              OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents i JOIN model_invocations m ON m.id=i.last_capacity_model_invocation_id WHERE i.state='open' AND m.session_id=?1)
-             FROM sessions WHERE id=?1", params![target.to_string(), format!("manager_operator_pause:{target}"), super::daemon_settings::c5_autofile_pending_key(target), crate::store_support::schedule_wake_job::deterministic_program_guard_job_id(target).to_string(), hold_on_c5_marker, hold_on_operator_pause, allow_soft_operator_pause, hold_on_resume], |r| r.get(0))?;
+             FROM sessions WHERE id=?1", params![target.to_string(), format!("manager_operator_pause:{target}"), super::daemon_settings::c5_autofile_pending_key(target), crate::store_support::schedule_wake_job::deterministic_program_guard_job_id(target).to_string(), hold_on_c5_marker, hold_on_operator_pause, allow_soft_operator_pause, hold_on_resume, hold_on_daemon_resume], |r| r.get(0))?;
         if held {
             return Err(refused("manager_v2_human_or_recovery_owner"));
         }
@@ -1500,6 +1580,7 @@ impl Store {
         let topology = crate::store_support::topology_usage::topology_created_usage(
             &self.conn,
             config.project_id,
+            config.manager_session_id,
             config.row_version,
         )?;
         Ok(count + retained + topology)
@@ -1507,6 +1588,10 @@ impl Store {
 
     /// Test fixture: journal a lifecycle operation in an exact state for the
     /// current seat and scope without running admission or execution.
+    ///
+    /// Writes only the operation row, as the older tests expect. A reader that
+    /// needs the durable target (the `lifecycle_context` record) must use
+    /// [`Self::seed_manager_action_with_context_for_test`].
     #[cfg(any(test, feature = "test-seam"))]
     pub fn seed_manager_action_for_test(
         &self,
@@ -1514,6 +1599,44 @@ impl Store {
         operation: ManagerActionV2,
         state: ManagerActionStateV2,
         target_session_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        self.seed_manager_action_inner(
+            config,
+            operation,
+            state,
+            target_session_id,
+            config.manager_session_id,
+            false,
+        )
+    }
+
+    /// Test fixture: [`Self::seed_manager_action_for_test`] plus the
+    /// `lifecycle_context` record that `enqueue_manager_action` journals beside
+    /// the operation row, written the same way (`ManagerActionContextV2`
+    /// through `manager_v2_put_record`). The operation row's `payload_json`
+    /// stays `{origin, request}`; the target lives only in the context record.
+    /// `caller` is the acting agent in the origin and `actor_session_id`.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn seed_manager_action_with_context_for_test(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        operation: ManagerActionV2,
+        state: ManagerActionStateV2,
+        target_session_id: Option<Uuid>,
+        caller: Uuid,
+    ) -> Result<Uuid> {
+        self.seed_manager_action_inner(config, operation, state, target_session_id, caller, true)
+    }
+
+    #[cfg(any(test, feature = "test-seam"))]
+    fn seed_manager_action_inner(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        operation: ManagerActionV2,
+        state: ManagerActionStateV2,
+        target_session_id: Option<Uuid>,
+        caller: Uuid,
+        with_context: bool,
     ) -> Result<Uuid> {
         let id = Uuid::new_v4();
         let receipt = ManagerActionReceiptV2 {
@@ -1528,22 +1651,39 @@ impl Store {
             deduplicated: false,
             operator_result: None,
             sandbox_source: None,
+            cancelled_wakes: None,
         };
-        let request = AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
+        let request = AgentManagerControlRequestV2::new(
+            ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: 1,
             },
-            idempotency_key: format!("seeded:{id}"),
+            format!("seeded:{id}"),
             operation,
-        };
-        let origin = ManagerActionOriginV2::Agent {
-            caller: config.manager_session_id,
-        };
+        );
+        let origin = ManagerActionOriginV2::Agent { caller };
         let payload = json!({"origin":origin,"request":request});
         let stamp = now();
-        self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?3,?5,?6,?7,?8,?9,1,?10,?11,?12,?12,?12)", params![id.to_string(),config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,request.idempotency_key,fingerprint(&payload)?,ACTION_KIND,serde_json::to_string(&payload)?,state_name(state),target_session_id.map(|v|v.to_string()),serde_json::to_string(&receipt)?,stamp])?;
+        self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at) VALUES(?1,?2,?3,?4,1,?13,?5,?6,?7,?8,?9,1,?10,?11,?12,?12,?12)", params![id.to_string(),config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,request.idempotency_key,fingerprint(&payload)?,ACTION_KIND,serde_json::to_string(&payload)?,state_name(state),target_session_id.map(|v|v.to_string()),serde_json::to_string(&receipt)?,stamp,caller.to_string()])?;
+        if with_context {
+            let context = ManagerActionContextV2 {
+                origin,
+                request,
+                target_session_id,
+                source: None,
+                launch: None,
+                manager_pause_version: 0,
+                issue_binding: None,
+            };
+            self.manager_v2_put_record(
+                config,
+                CONTEXT_KIND,
+                &id.to_string(),
+                action_epic(&context.request.operation),
+                0,
+                &serde_json::to_value(context)?,
+            )?;
+        }
         Ok(id)
     }
 
@@ -1560,7 +1700,7 @@ impl Store {
             authority.grant.policy.max_created_sessions
         };
         if count >= i64::from(cap) {
-            return Err(refused("manager_v2_creation_limit"));
+            return Err(self.own_creation_refusal(&authority.config, container, count, cap)?);
         }
         self.manager_ancestor_creation_budget(authority, container)?;
         if epic && !authority.config.has_dynamic_scope() {
@@ -1570,6 +1710,61 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// #2502: the caller's own created-sessions (or containers) cap is
+    /// spent. The refusal names the principal's node (its portfolio node,
+    /// its project, or the delegate seat), the cap, used/limit and the TUI
+    /// path that raises it. The count runs over the current scope.
+    pub(super) fn own_creation_refusal(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        used: i64,
+        cap: u16,
+    ) -> Result<DaemonError> {
+        let (_, own) = self.portfolio_ancestors_of(config)?;
+        let (node_kind, node_id, window_start) = match own {
+            Some(head) => (
+                BudgetNodeKindV1::Portfolio,
+                head.node_id,
+                Some(head.started),
+            ),
+            None if self
+                .get_harness_manager(config.project_id)?
+                .is_some_and(|root| root.manager_session_id == config.manager_session_id) =>
+            {
+                (BudgetNodeKindV1::Project, config.project_id, None)
+            }
+            None => (BudgetNodeKindV1::Delegate, config.manager_session_id, None),
+        };
+        let cap_field = creation_cap_field(container);
+        let mut raise_in = CreationCapRefusalV1::raise_path(node_kind, node_id, cap_field);
+        // #3028: a satellite seat whose policy a hub pushed is raised by the
+        // hub's PM, not the operator; the operator path stays as the fallback.
+        if node_kind == BudgetNodeKindV1::Project
+            && CreationCapRefusalV1::hub_can_raise(cap_field)
+            && self.project_policy_pushed_by_hub(config.project_id)?
+        {
+            raise_in =
+                CreationCapRefusalV1::hub_report_path(cap_field, used, i64::from(cap), &raise_in);
+        }
+        Ok(DaemonError::InvalidParam(
+            CreationCapRefusalV1 {
+                code: rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT.to_string(),
+                node_kind,
+                node_id,
+                project_id: config.project_id,
+                cap_field: cap_field.to_string(),
+                used,
+                limit: i64::from(cap),
+                needed: 1,
+                counted: 0,
+                window_start,
+                raise_in,
+            }
+            .message(),
+        ))
     }
 
     /// #1235 rule (d), budgets are charged up the chain: an admission in a
@@ -1620,21 +1815,36 @@ impl Store {
             } else {
                 policy.max_created_sessions
             };
-            let count = charges
-                .iter()
-                .filter(|(created, lineage)| {
-                    created.as_str() >= head.started.as_str()
-                        && lineage
-                            .as_ref()
-                            .is_none_or(|lineage| lineage.contains(&head.node_id))
-                })
-                .count() as i64;
+            let count = head_created_count(&charges, head);
             if (count - counted).saturating_add(needed) > i64::from(cap) {
-                return Err(refused(if is_own {
-                    "manager_v2_creation_limit"
+                // #2502: name the node, the cap, used/limit and where to
+                // raise it, whether it is the caller's own node or above it.
+                let code = if is_own {
+                    rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT
                 } else {
                     rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
-                }));
+                };
+                let cap_field = creation_cap_field(container);
+                return Err(DaemonError::InvalidParam(
+                    CreationCapRefusalV1 {
+                        code: code.to_string(),
+                        node_kind: BudgetNodeKindV1::Portfolio,
+                        node_id: head.node_id,
+                        project_id: config.project_id,
+                        cap_field: cap_field.to_string(),
+                        used: count,
+                        limit: i64::from(cap),
+                        needed,
+                        counted,
+                        window_start: Some(head.started.clone()),
+                        raise_in: CreationCapRefusalV1::raise_path(
+                            BudgetNodeKindV1::Portfolio,
+                            head.node_id,
+                            cap_field,
+                        ),
+                    }
+                    .message(),
+                ));
             }
         }
         Ok(())
@@ -1646,7 +1856,7 @@ impl Store {
     /// Lifecycle operations are attributed by their ledger principal, topology
     /// session attempts and delegated appointments (sessions only) by their
     /// requesting seat and scope, or their grantor node (#1314).
-    fn portfolio_creation_charges(
+    pub(crate) fn portfolio_creation_charges(
         &self,
         project: Uuid,
         container: bool,
@@ -1721,6 +1931,36 @@ impl Store {
                     .ok_or_else(|| refused("manager_v2_source_custody_changed"))?
             }
         })
+    }
+
+    /// #1640: the fork source of a lead handover (`replace_lead`,
+    /// `retry_lead`). The predecessor's own worktree and branch when its
+    /// custody is live. When it holds none (cleanup failed or purged, so every
+    /// fork of it is refused `sandbox_custody:*`), the successor forks from the
+    /// Epic's published `rolling` exactly like a `create_session`: the
+    /// predecessor's branch stays in the repository, only its dead sandbox is
+    /// not needed. Every other classification refusal (an incomplete tuple, a
+    /// live tuple that fails authentication) still refuses.
+    fn manager_lead_handover_source(
+        &self,
+        authority: &ManagerAuthorityV2,
+        lead: &Session,
+        epic: Uuid,
+    ) -> Result<ManagerActionSourceV2> {
+        match crate::sandbox::custody::CustodyService::classify(lead) {
+            Ok(_) => return self.manager_action_freeze_source(lead),
+            // Only these two establish that the predecessor holds no custody.
+            // Any other refusal (notably `tuple_incomplete`, a partial tuple
+            // whose sandbox may still exist) must not abandon its work.
+            Err(DaemonError::StructuredRpc { message, .. })
+                if matches!(
+                    message.strip_prefix("sandbox_custody:"),
+                    Some("cleanup_failed" | "historical_purged")
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        let container = self.manager_v2_require_epic(authority, epic)?;
+        self.manager_action_selected_source(&container, None)
     }
 
     pub(super) fn manager_action_freeze_source(
@@ -1885,7 +2125,10 @@ impl Store {
                                 source_session,
                                 sandbox_source.as_ref(),
                             )?,
-                        _ => self.manager_action_freeze_source(source_session)?,
+                        _ => {
+                            let epic = action_epic(&request.operation).expect("replace epic");
+                            self.manager_lead_handover_source(authority, source_session, epic)?
+                        }
                     }
                 });
                 launch = Some(choice.clone());
@@ -1913,10 +2156,10 @@ impl Store {
                         launch = Some(choice.clone());
                     }
                     self.manager_action_creation_budget(authority, false, false)?;
-                    source = Some(self.manager_action_freeze_source(lead)?);
+                    let epic = action_epic(&request.operation).expect("retry epic");
+                    source = Some(self.manager_lead_handover_source(authority, lead, epic)?);
                     id = allocate_target_identity.then(Uuid::new_v4);
                     delay_seconds = authority.grant.policy.retry_delay_seconds;
-                    let epic = action_epic(&request.operation).expect("retry epic");
                     let attempts:i64=self.conn.query_row("SELECT count(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind=?4 AND json_extract(payload_json,'$.request.operation.action')='retry_lead' AND json_extract(payload_json,'$.request.operation.epic_id')=?5",params![authority.config.project_id.to_string(),authority.config.manager_session_id.to_string(),authority.config.row_version,ACTION_KIND,epic.to_string()],|r|r.get(0))?;
                     if attempts >= i64::from(authority.grant.policy.max_recovery_attempts) {
                         return Err(refused("manager_v2_retry_budget_exhausted"));
@@ -2115,6 +2358,7 @@ impl Store {
                 .source
                 .as_ref()
                 .and_then(sandbox_source::sandbox_source_receipt),
+            cancelled_wakes: None,
         };
         let stamp = now();
         let due = (Utc::now() + chrono::Duration::seconds(i64::from(admission.delay_seconds)))
@@ -2371,6 +2615,52 @@ impl Store {
         hold_creates: bool,
         admit: Option<&dyn Fn(Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>) -> bool>,
     ) -> Result<Option<ManagerActionClaimV2>> {
+        // Avoid an immediate write transaction and the full conflict/admission
+        // query on idle ticks. The due index excludes settled history and
+        // future retries; a later enqueue is picked up by the next event/tick.
+        // A positive probe still goes through every existing live claim fence.
+        let due: bool = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM harness_manager_v2_operations
+             WHERE state='queued' AND not_before<=?1 AND kind=?2)",
+            )?
+            .query_row(params![now(), ACTION_KIND], |row| row.get(0))?;
+        if !due {
+            return Ok(None);
+        }
+        // #2494: a backlog of creates the host gate holds is otherwise
+        // rescanned in full every tick. When nothing was written since a scan
+        // found only a refused create to claim, ask the gate about that create
+        // again and skip the scans. Every other input of the scans is a table
+        // row (covered by the version) or a queued `not_before` (covered by the
+        // memo's expiry), so the skipped scans would repeat their answer.
+        let version = if admit.is_some() && !hold_creates {
+            self.manager_intent_observation_version()?
+        } else {
+            None
+        };
+        let mut admitted_create: Option<String> = None;
+        if let (Some(version), Some(admit)) = (version, admit) {
+            let held = self.manager_intent_idle.borrow().held_claim(
+                version,
+                hold_worker_starts,
+                chrono::Utc::now(),
+            );
+            if let Some(held) = held {
+                let since = chrono::DateTime::parse_from_rfc3339(&held.not_before)
+                    .map_err(|_| refused("manager_v2_action_invalid_not_before"))?
+                    .with_timezone(&chrono::Utc);
+                if !admit(parse_id(&held.operation_id)?, since, held.target) {
+                    self.manager_intent_idle.borrow_mut().held_claim_reuses += 1;
+                    return Ok(None);
+                }
+                // Admitted now (and recorded by the gate): the full scan
+                // below must not ask again for the same create.
+                self.manager_intent_idle.borrow_mut().forget_held_claim();
+                admitted_create = Some(held.operation_id);
+            }
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // One active command per project, even across independent daemon handles.
         // An uncertain command fences only conflicting targets, not all future work.
@@ -2427,13 +2717,25 @@ impl Store {
             let since = chrono::DateTime::parse_from_rfc3339(&not_before)
                 .map_err(|_| refused("manager_v2_action_invalid_not_before"))?
                 .with_timezone(&chrono::Utc);
-            if !admit(id, since, operation.receipt.target_session_id) {
+            let asked = admitted_create.as_deref() == Some(id.to_string().as_str());
+            if !asked && !admit(id, since, operation.receipt.target_session_id) {
                 drop(tx);
-                return self.claim_manager_action_holding_creates(
-                    boot_id,
-                    hold_worker_starts,
-                    true,
-                );
+                let other =
+                    self.claim_manager_action_holding_creates(boot_id, hold_worker_starts, true)?;
+                if other.is_none()
+                    && let Some(version) = version
+                {
+                    let valid_until = self.next_manager_action_due(chrono::Utc::now())?;
+                    self.manager_intent_idle.borrow_mut().remember_held_claim(
+                        version,
+                        hold_worker_starts,
+                        valid_until,
+                        id.to_string(),
+                        not_before,
+                        operation.receipt.target_session_id,
+                    );
+                }
+                return Ok(other);
             }
         }
         operation.receipt.state = ManagerActionStateV2::Running;
@@ -2447,6 +2749,28 @@ impl Store {
         self.claim_manager_succession_on(id, boot_id)?;
         tx.commit()?;
         Ok(Some(ManagerActionClaimV2 { operation, boot_id }))
+    }
+
+    /// When a scan of the action queue can next give a different answer
+    /// without a write: the earliest queued `not_before` still in the future,
+    /// or the memo backstop.
+    fn next_manager_action_due(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chrono::DateTime<chrono::Utc>> {
+        let mut next = at
+            + chrono::Duration::seconds(super::manager_intent::idle::HELD_CLAIM_BACKSTOP_SECONDS);
+        let later: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT MIN(not_before) FROM harness_manager_v2_operations
+                 WHERE state='queued' AND kind=?1 AND not_before>?2",
+            )?
+            .query_row(params![ACTION_KIND, now()], |row| row.get(0))?;
+        if let Some(later) = later.and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok()) {
+            next = next.min(later.with_timezone(&chrono::Utc));
+        }
+        Ok(next)
     }
 
     /// #1073: hand a claimed action back to the queue when the deploy drain
@@ -2932,10 +3256,27 @@ impl Store {
         receipt.outcome = Some(outcome.into());
         receipt.refresh_action_metadata(&op.context.request.operation);
         receipt.operator_result = operator_result.map(Box::new);
+        // #2652: a succeeded `succeed_manager` names the wakes its publication
+        // cancelled, read back from that transaction's audit event, so the
+        // stored receipt (every later read and replay) carries the same ids.
+        receipt.cancelled_wakes = match (&op.context.request.operation, state) {
+            (ManagerActionV2::SucceedManager { .. }, ManagerActionStateV2::Succeeded) => {
+                self.succession_cancelled_wakes(claim.id())?
+            }
+            _ => None,
+        };
         let changed=self.conn.execute("UPDATE harness_manager_v2_operations SET state=?2,row_version=?3,outcome_json=?4,updated_at=?5 WHERE id=?1 AND state='running' AND row_version=?6 AND claim_boot_id=?7",params![claim.id().to_string(),state_name(state),receipt.row_version,serde_json::to_string(&receipt)?,now(),claim.operation.receipt.row_version,claim.boot_id.to_string()])?;
         if changed != 1 {
             return Err(refused("manager_v2_claim_changed"));
         }
+        // #2455: a failure that finishes after its scope changed is retired
+        // by the queue trigger; hand it to the current owner in this commit.
+        self.escalate_manager_action_failure_if_retired(
+            op.project_id,
+            op.manager_session_id,
+            op.scope_version,
+            &receipt,
+        )?;
         // #1042: the pause's success and the suspension of the lead's resume
         // wakes commit together; `resume_lead` restores exactly that record.
         if state == ManagerActionStateV2::Succeeded {
@@ -3323,6 +3664,11 @@ impl Store {
             {
                 return Err(refused("manager_v2_candidate_changed"));
             }
+            // #2815: an Issue-bound or topology worker (or a rotation child of
+            // one) is never an Epic lead, whichever path writes the pointer.
+            if self.is_non_lead_worker_session(target)? {
+                return Err(refused("manager_v2_candidate_changed"));
+            }
         }
         let expected = action_fence(claim.action()).expect("lead fence");
         self.reject_nonterminal_agent_successor_epic_lead_mutation(epic)?;
@@ -3352,6 +3698,7 @@ impl Store {
         Ok(jobs)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_manager_created_session(
         &self,
         claim: &ManagerActionClaimV2,

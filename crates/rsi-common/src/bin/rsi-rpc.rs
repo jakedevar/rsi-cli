@@ -20,6 +20,8 @@ fn print_usage(writer: &mut impl std::io::Write) -> std::io::Result<()> {
          usage: rsi-rpc [--socket PATH] -- <METHOD> [--params JSON]\n\
          usage: rsi-rpc [--socket PATH] <AGENT_VERB> --schema\n\
          usage: rsi-rpc <AGENT_VERB> --params JSON --validate\n\
+         usage: rsi-rpc scratch-quota [PATH]   (scratch filesystem quota options and your usage)\n\
+         --params takes inline JSON, @FILE, or - (stdin; needs no scratch file).\n\
          \n\
          Socket resolution: --socket, then RSI_DAEMON_SOCKET_PATH, then RSI_SOCKET/default.\n\
          Schema discovery is offline and applies only to the closed Agent* catalog.\n\
@@ -108,6 +110,16 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
+    // #565: `rsi-rpc scratch-quota [PATH]` reads a scratch filesystem's quota
+    // options and the caller's usage offline; not a daemon verb.
+    if raw_args.first().map(String::as_str) == Some("scratch-quota") {
+        let code = rsi_common::scratch_pressure::cli_main(
+            &raw_args[1..],
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        );
+        return ExitCode::from(code);
+    }
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     let code = run(raw_args, &mut stdout.lock(), &mut stderr.lock(), dispatch);
@@ -174,11 +186,9 @@ fn validate_agent_params(args: &Args, stdout: &mut impl std::io::Write) -> u8 {
     match verb.validate_params(&args.params) {
         Ok(()) => 0,
         Err(error) => {
-            let _ = writeln!(
-                stdout,
-                "{{\"error\":{{\"code\":\"invalid_input\",\"class\":\"{}\",\"field\":\"{}\"}}}}",
-                error.class, error.field
-            );
+            let mut envelope = serde_json::json!({"code":"invalid_input"});
+            error.enrich(&mut envelope);
+            let _ = writeln!(stdout, "{}", serde_json::json!({"error": envelope}));
             1
         }
     }
@@ -205,10 +215,7 @@ where
     let _ = writeln!(stderr, "rsi-rpc socket: {}", socket.display());
     let response = match dispatch_fn(&socket, &args.method, args.params) {
         Ok(response) => response,
-        Err(error) => {
-            let _ = writeln!(stderr, "RPC transport error: {error}");
-            return 1;
-        }
+        Err(error) => return report_transport_error(&error, stderr),
     };
     match serde_json::to_string_pretty(&response) {
         Ok(json) => {
@@ -226,6 +233,20 @@ where
         }
     }
     if response.error.is_some() { 2 } else { 0 }
+}
+
+/// Exit code for a response timeout (#2357): the request was sent and may have
+/// been applied, so it is neither a plain transport failure (1) nor a daemon
+/// refusal (2). Callers replay it under the same `idempotency_key`.
+const EXIT_RESPONSE_TIMEOUT: u8 = 3;
+
+fn report_transport_error(error: &std::io::Error, stderr: &mut impl std::io::Write) -> u8 {
+    let _ = writeln!(stderr, "RPC transport error: {error}");
+    if rsi_common::agent_rpc_client::response_timeout(error).is_some() {
+        EXIT_RESPONSE_TIMEOUT
+    } else {
+        1
+    }
 }
 
 fn parse_operation(raw_args: Vec<String>) -> Result<Operation, String> {
@@ -360,9 +381,35 @@ where
 }
 
 fn parse_params(value: &str) -> Result<Value, String> {
-    if let Some(path) = value.strip_prefix('@') {
-        let content = std::fs::read_to_string(path)
-            .map_err(|err| format!("failed to read params file `{path}`: {err}"))?;
+    parse_params_from(value, &mut std::io::stdin().lock())
+}
+
+/// `--params` is inline JSON, `@FILE`, or `-` (stdin). Stdin needs no scratch
+/// file, so a control payload never depends on a quota-limited filesystem
+/// (#565). A file that cannot be read says so with the disk-pressure hint.
+fn parse_params_from(value: &str, stdin: &mut dyn std::io::Read) -> Result<Value, String> {
+    if value == "-" {
+        let mut content = String::new();
+        stdin
+            .read_to_string(&mut content)
+            .map_err(|err| format!("failed to read --params from stdin: {err}"))?;
+        serde_json::from_str(&content)
+            .map_err(|err| format!("--params from stdin is not valid JSON: {err}"))
+    } else if let Some(path) = value.strip_prefix('@') {
+        let content = std::fs::read_to_string(path).map_err(|err| {
+            let hint = match rsi_common::scratch_pressure::classify(&err) {
+                Some(kind) => format!(" [{}: {}]", kind.code(), kind.next_action()),
+                None if err.kind() == std::io::ErrorKind::NotFound => {
+                    " [the file does not exist: if the write that should have created it \
+                     failed with `Disk quota exceeded` (EDQUOT) or `No space left on device`, \
+                     the cause is the scratch filesystem, not these params; pipe the JSON with \
+                     `--params -` or write it under an owned directory outside /tmp]"
+                        .to_string()
+                }
+                None => String::new(),
+            };
+            format!("failed to read params file `{path}`: {err}{hint}")
+        })?;
         serde_json::from_str(&content)
             .map_err(|err| format!("--params file `{path}` is not valid JSON: {err}"))
     } else {
@@ -461,6 +508,7 @@ mod tests {
             "GetHarnessManagerState",
             "AnswerHarnessManagerDecision",
             "GetRollingQueue",
+            "EnqueueRollingQueueSource",
         ] {
             assert!(!stdout.contains(operator_method));
             let (code, _, _, dispatched) = run_offline(&[operator_method, "--schema"]);
@@ -508,6 +556,30 @@ mod tests {
             assert_eq!(envelope["method"], descriptor.method);
             assert_eq!(envelope["parameters"], descriptor.parameters());
         }
+    }
+
+    #[test]
+    fn params_read_from_stdin_without_a_scratch_file() {
+        let mut stdin = std::io::Cursor::new(br#"{"a":1}"#.to_vec());
+        assert_eq!(
+            parse_params_from("-", &mut stdin).unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        let mut bad = std::io::Cursor::new(b"nope".to_vec());
+        assert!(
+            parse_params_from("-", &mut bad)
+                .unwrap_err()
+                .contains("stdin")
+        );
+    }
+
+    #[test]
+    fn missing_params_file_names_the_scratch_filesystem_cause() {
+        let mut stdin = std::io::empty();
+        let message = parse_params_from("@/nonexistent-dir-565/p.json", &mut stdin).unwrap_err();
+        assert!(message.contains("failed to read params file"));
+        assert!(message.contains("Disk quota exceeded"));
+        assert!(message.contains("--params -"));
     }
 
     #[test]
@@ -605,6 +677,68 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn response_timeout_prints_replay_hint_and_has_its_own_exit_code() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run(
+            [
+                "--socket",
+                "/tmp/rsi-rpc-test.sock",
+                "GetSession",
+                "--params",
+                "{}",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            &mut stdout,
+            &mut stderr,
+            |socket, method, _| {
+                // The real client's slow-response path, via a throwaway server.
+                let _ = socket;
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("d.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                let server = std::thread::spawn(move || {
+                    let (stream, _) = listener.accept().unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    drop(stream);
+                });
+                let result = rsi_common::agent_rpc_client::dispatch_with_timeout(
+                    &path,
+                    method,
+                    Value::Null,
+                    std::time::Duration::from_millis(150),
+                );
+                server.join().unwrap();
+                result
+            },
+        );
+        assert_eq!(code, EXIT_RESPONSE_TIMEOUT);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            stderr.contains("rpc_response_timeout: GetSession"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("same idempotency_key"), "{stderr}");
+        assert!(!stderr.contains("os error 11"), "{stderr}");
+    }
+
+    #[test]
+    fn plain_transport_errors_keep_exit_code_one() {
+        let mut stderr = Vec::new();
+        let code = report_transport_error(&std::io::Error::other("boom"), &mut stderr);
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("RPC transport error: boom")
+        );
+    }
+
     #[test]
     fn omitted_agent_params_dispatch_an_empty_object() {
         let mut stdout = Vec::new();
@@ -644,12 +778,34 @@ mod tests {
             r#"{"fence":{"scope_version":0,"policy_version":1},"idempotency_key":"x","operation":{"action":"create_container","kind":"Group","parent_id":null,"name":"group","tags":[]}}"#,
         ]);
         assert_eq!(code, 1);
-        assert_eq!(
-            stdout,
-            "{\"error\":{\"code\":\"invalid_input\",\"class\":\"invalid_input\",\"field\":\"params\"}}\n"
-        );
+        let envelope: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(envelope["error"]["code"], "invalid_input");
+        assert_eq!(envelope["error"]["class"], "invalid_input");
+        assert_eq!(envelope["error"]["field"], "params");
+        assert_eq!(envelope["error"]["path"], "params.fence.scope_version");
+        assert_eq!(envelope["error"]["constraint"], "minimum 1");
+        assert_eq!(envelope["error"]["value"], 0);
         assert!(stderr.is_empty());
         assert!(!dispatched);
+    }
+
+    #[test]
+    fn nested_job_limit_is_visible_in_offline_cli_refusal() {
+        let (code, stdout, stderr, dispatched) = run_offline(&[
+            "AgentSubmitJob",
+            "--params",
+            r#"{"kind":"test","params":{"package":"rsi","timeout_minutes":181}}"#,
+            "--validate",
+        ]);
+        assert_eq!(code, 1);
+        assert!(stderr.is_empty());
+        assert!(!dispatched);
+        let envelope: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(envelope["error"]["code"], "invalid_input");
+        assert_eq!(envelope["error"]["field"], "params");
+        assert_eq!(envelope["error"]["path"], "params.params.timeout_minutes");
+        assert_eq!(envelope["error"]["constraint"], "maximum 180");
+        assert_eq!(envelope["error"]["value"], 181);
     }
 
     #[test]

@@ -323,9 +323,14 @@ pub struct SettingsState {
     pub query_active: bool,
     /// Armed clear of one provider credential slot.
     pub provider_key_clear_confirmation: Option<ProviderKeyClearConfirmation>,
+    /// Armed permanent delete of one user skill (Settings -> Skills, `d`).
+    pub skill_delete_confirmation: Option<SkillDeleteConfirmation>,
     /// Panel geometry of the last rendered frame; the resize keys (`<` /
     /// `>`) step from what the operator actually sees.
     pub rendered_layout: SettingsRenderedLayout,
+    /// Edits staged by the step keys and not yet applied (#2241). Leaving the
+    /// panel discards them.
+    pub pending: crate::settings_staging::PendingSettings,
 }
 
 impl Default for SettingsState {
@@ -341,7 +346,9 @@ impl Default for SettingsState {
             query: String::new(),
             query_active: false,
             provider_key_clear_confirmation: None,
+            skill_delete_confirmation: None,
             rendered_layout: SettingsRenderedLayout::default(),
+            pending: crate::settings_staging::PendingSettings::default(),
         }
     }
 }
@@ -376,7 +383,9 @@ impl SettingsState {
         self.query.clear();
         self.query_active = false;
         self.provider_key_clear_confirmation = None;
+        self.skill_delete_confirmation = None;
         self.rendered_layout = SettingsRenderedLayout::default();
+        self.pending.clear();
     }
 
     pub fn navigation(&self) -> SettingsNavigation {
@@ -426,6 +435,17 @@ pub struct SettingsRenderedLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderKeyClearConfirmation {
     pub slot: rsi_common::provider_credentials::ProviderCredentialSlot,
+    pub armed_at_ms: i64,
+}
+
+/// Armed skill-delete confirmation (Settings -> Skills, `d`).
+///
+/// First `d` arms it; a second `d` on the SAME skill within the TTL deletes
+/// the skill directory permanently (no trash). Same shape as
+/// `ProviderKeyClearConfirmation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDeleteConfirmation {
+    pub name: String,
     pub armed_at_ms: i64,
 }
 
@@ -1546,7 +1566,7 @@ pub enum PromptPurpose {
 /// prompt. The prompt text lives on the front; `Ctrl+O` (or `Tab` in normal
 /// mode) flips between the two. Nothing here outlives the prompt: a reopened
 /// prompt starts on its front with no manager appointment planned.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PromptLaunchSettings {
     /// The prompt is flipped to its settings side.
     pub open: bool,
@@ -1554,12 +1574,39 @@ pub struct PromptLaunchSettings {
     pub selected: usize,
     /// Appoint the launched session as its project's manager.
     pub manager: Option<ManagerLaunchPlan>,
+    /// #2237: the grant editor behind the settings side's second page. Created
+    /// the first time the operator opens the page; `None` means the preset's
+    /// policy is granted as is.
+    pub grant: Option<crate::overlay::grant_editor::GrantEditor>,
+    /// The settings side shows the grant page instead of the launch rows.
+    pub grant_open: bool,
+}
+
+impl PromptLaunchSettings {
+    /// The appointment to run once the launch is accepted: the planned scope
+    /// plus the grant the operator edited (`None` = the preset's policy).
+    #[must_use]
+    pub fn appointment(&self) -> Option<ManagerAppointment> {
+        self.manager.map(|plan| ManagerAppointment {
+            plan,
+            grant: self.grant.as_ref().map(|editor| editor.finish()),
+        })
+    }
+}
+
+/// A planned manager appointment ready to run: the scope and preset plus the
+/// edited grant, when the operator opened the grant page (#2237).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagerAppointment {
+    pub plan: ManagerLaunchPlan,
+    /// The policy to grant instead of `plan.policy()`.
+    pub grant: Option<rsi_common::harness_manager_v2::ManagerPolicyV2>,
 }
 
 /// Operator choice to appoint a new session as its project's manager once
 /// the daemon accepts the launch: the appointment scope plus the policy
-/// preset granted to it (`ConfigureHarnessManager` then
-/// `ConfigureHarnessManagerPolicy`).
+/// preset granted to it (`ConfigureHarnessManagerWithPolicy`, one atomic
+/// step).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManagerLaunchPlan {
     /// Project the manager is appointed for (the launch's project).
@@ -2546,7 +2593,7 @@ impl GraphDraft {
 
 /// Identifies a particular (event, entry_index, hook_index) cell in the
 /// hooks BTreeMap, used as the edit target for `OverlayState::HookForm`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookFormEditingTarget {
     pub event: crate::claude_config::HookEvent,
     pub entry_index: usize,
@@ -2557,6 +2604,7 @@ pub struct HookFormEditingTarget {
 /// daemon reports remain authoritative; the TUI never synthesizes eligibility
 /// or removes a cohort optimistically.
 pub struct SourceWorktreeSettlementOverlayState {
+    pub recent_runs: Vec<rsi_common::cohort_settlement::SourceWorktreeSettlementRunSummaryV1>,
     pub cohorts: Vec<rsi_common::cohort_settlement::SourceWorktreeCohortSummaryV1>,
     pub selected_index: usize,
     pub scroll_offset: usize,
@@ -2613,6 +2661,9 @@ pub struct SatelliteRegistryOverlayState {
     pub sessions: Option<rsi_common::satellite::SatelliteHubSessionsPageV1>,
     pub form: Option<SatelliteRegistryForm>,
     pub last_probe: Option<rsi_common::satellite::SatelliteProbeLinkResultV1>,
+    /// This host's declared inbound scope, resolved live (#1928). `None` when
+    /// the daemon could not answer.
+    pub scope_status: Option<rsi_common::satellite_dispatch::SatelliteScopeStatusV1>,
     pub last_error: Option<String>,
 }
 
@@ -2632,7 +2683,9 @@ pub enum SatelliteRegistryForm {
         read_enabled: bool,
         /// Queued hub-manager delivery switch (#1017 slice 3).
         dispatch_enabled: bool,
-        /// Comma-separated remote session ids the hub manager may message.
+        /// Comma-separated scope entries the hub manager may message: a bare
+        /// remote session id, or `project:<id>` for a project's current
+        /// appointed manager (#1928).
         dispatch_scope: String,
         repair_quarantine: bool,
         field: usize,
@@ -2653,7 +2706,8 @@ pub enum SatelliteRegistryForm {
     Inbound {
         /// Comma-separated hub installation ids.
         hubs: String,
-        /// Comma-separated scope-root session ids.
+        /// Comma-separated scope entries: a root session id, or `project:<id>`
+        /// for a project's current appointed manager (#1928).
         roots: String,
         field: usize,
     },
@@ -2661,11 +2715,12 @@ pub enum SatelliteRegistryForm {
 
 /// A zeroized-on-drop MCP credential buffer whose debug output is redacted.
 #[derive(Clone, Default, Eq)]
-pub(crate) struct McpSecretString {
+pub struct McpSecretString {
     value: zeroize::Zeroizing<String>,
 }
 
 impl McpSecretString {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(value: String) -> Self {
         Self {
@@ -2766,6 +2821,18 @@ pub enum OverlayState {
         input: String,
         /// Whether the current input failed to parse.
         error: bool,
+    },
+    /// Single-field editor for a free-text daemon setting (#2393; the
+    /// cold-storage archive directory `cold_archive_dir`, #2438, the SearXNG URL
+    /// `harness_searxng_url`): Enter writes it through `UpdateDaemonConfig` and
+    /// shows the daemon's refusal in `error`.
+    DaemonTextEditor {
+        /// The daemon field being edited (an entry of `DAEMON_TEXT_FIELDS`).
+        field: &'static str,
+        /// The text being typed; empty selects the default.
+        input: String,
+        /// Why the daemon refused the last save.
+        error: Option<String>,
     },
     /// Prompt popup for entering a new session query.
     Prompt {
@@ -2888,7 +2955,8 @@ pub enum OverlayState {
         allow_from: String,
         working_dir: String,
     },
-    /// Claude Code hook add/edit form. Edits ~/.claude/settings.json.
+    /// Claude Code hook add/edit form. Saves through the daemon's
+    /// `PutClaudeHooks` (hub #3039).
     HookForm {
         /// Which field is focused (0=Event, 1=Matcher, 2=Command, 3=Timeout).
         focused_field: usize,
@@ -2907,10 +2975,11 @@ pub enum OverlayState {
         /// If editing, the (event, entry_index, hook_index) tuple identifying the row.
         /// `None` = new entry.
         editing: Option<HookFormEditingTarget>,
-        /// Snapshot of (mtime, original raw bytes) at form-open time, for Q7
-        /// conflict detection. Bytes compared verbatim at save (no hash).
-        snapshot_mtime: Option<std::time::SystemTime>,
-        snapshot_bytes: Vec<u8>,
+        /// The daemon's hooks and file revision at form-open time. The save
+        /// applies the edit to this snapshot and names the revision; a
+        /// stale one opens the Q7 conflict prompt.
+        snapshot_revision: String,
+        snapshot_hooks: crate::claude_config::ClaudeHooks,
     },
     /// Budget policy add/edit form (Settings -> Budgets). Submits via
     /// `LcAction::SubmitBudgetPolicy` — the daemon's `UpdateModelControlPolicy`
@@ -2994,6 +3063,9 @@ pub enum OverlayState {
         content: String,
         scroll_offset: usize,
     },
+    /// The operator to-do pop-up (#2950): the selected item in full, its
+    /// actions and the y/n prompt guarding a close.
+    TodoPopup(crate::todo_panel::TodoPopupState),
     /// Diagnostics overlay — displays AppMetrics (render/poll timings, cache hit rate).
     /// Only meaningful when RSI_PROFILE=1; shows zeroes otherwise.
     Diagnostics,

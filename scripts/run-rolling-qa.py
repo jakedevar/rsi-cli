@@ -254,8 +254,9 @@ def main():
             shard_dir = directory / shard
             if shard_dir.exists() and not any(row["label"] == shard for row in results):
                 shard_dir = directory / f"{shard}-retry-{time.time_ns()}"
+            # The sweep is the full QA: it runs the slow tier (#2270).
             record(shard, [SLOT, "scripts/run-rsid-test-shards.sh", "shard", shard,
-                   "--jobs", args.jobs, "--evidence-dir", shard_dir], SHARD_SPEC_ENV)
+                   "--jobs", args.jobs, "--evidence-dir", shard_dir, "--slow-tier"], SHARD_SPEC_ENV)
         integrations = sorted(path.stem for path in (ROOT / "crates/rsid/tests").glob("*.rs"))
         record("integrations", [SLOT, "cargo", "nextest", "run", "--profile", "rsid-fast",
                "-p", "rsid", *(part for name in integrations for part in ("--test", name)),
@@ -266,7 +267,10 @@ def main():
         for label, command in [
             ("rsid-doc", ["cargo", "test", "-p", "rsid", "--doc", "--", f"--test-threads={args.jobs}"]),
             ("rsi", ["cargo", "test", "-p", "rsi", "--lib", "--", f"--test-threads={args.jobs}"]),
-            ("rsi-common", ["cargo", "test", "-p", "rsi-common", "--", f"--test-threads={args.jobs}"]),
+            # #2410: rsid-remote-read (the Remote read core split out of rsid) declares no shard
+            # feature, so no shard lists its tests; it rides this lane to keep the five-lane schema.
+            ("rsi-common", ["cargo", "test", "-p", "rsi-common", "-p", "rsid-remote-read", "--",
+                            f"--test-threads={args.jobs}"]),
         ]:
             record(label, [SLOT, *command])
     git("fetch", "origin")

@@ -101,24 +101,28 @@ async fn codegraph_custody_pages_keep_historical_reads_and_find_later_active_own
         updated_at: chrono::Utc::now(),
     };
     store.insert_project(&first_project).unwrap();
-    let mut runtime = crate::codegraph::IndexRuntime::start_from_store(
+    let mut runtime = crate::codegraph::IndexRuntime::start_deferred(
         index_root.path().to_path_buf(),
-        &store,
-        &[],
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
-    assert_eq!(
-        runtime
+    let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+    runtime.attach_registry(std::sync::Arc::clone(&store), Vec::new());
+    // The registry task's first step registers the startup snapshot.
+    tokio::time::timeout(std::time::Duration::from_secs(7), async {
+        while runtime
             .handle()
             .registered_project_workspaces(first_project.id)
             .unwrap()
-            .len(),
-        1
-    );
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
-    runtime.attach_registry(std::sync::Arc::clone(&store), Vec::new());
+            .len()
+            != 1
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let second_root = tempfile::tempdir().unwrap();
     let second_project = rsi_common::types::Project {
         id: Uuid::new_v4(),
@@ -182,7 +186,7 @@ async fn terminal_custody_keeps_snapshot_reads_and_resume_tools_before_starting(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory().unwrap();
     store.insert_project(&project).unwrap();
     let mut session = make_test_session();
     session.project_id = Some(project_id);
@@ -605,6 +609,156 @@ fn codegraph_workspace_cursor_covers_more_than_128_dormant_custodies() {
         service.list_workspaces(CodegraphWorkspacePageRequestV1 {
             project_id,
             cursor: Some(old_cursor),
+            limit: 32,
+        }),
+        Err(CodegraphServiceError::CursorExpired)
+    ));
+}
+
+/// #306: a full custody traversal pays O(1) registry digests however many
+/// unrelated writes land between its pages, and still refuses a registry
+/// change made after the fence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn codegraph_full_custody_traversal_computes_constant_digests_under_unrelated_writes() {
+    use crate::codegraph::{
+        CodegraphReadService, CodegraphServiceError, IndexManager, RegisteredWorkspace,
+    };
+    use rsi_common::codegraph::CodegraphWorkspacePageRequestV1;
+    use rsid_store::store::codegraph_registry_digest_count;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let repo = tempfile::tempdir().unwrap();
+    let checkouts = tempfile::tempdir().unwrap();
+    let indexes = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let project_id = Uuid::new_v4();
+    let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    {
+        let guard = store.blocking_lock();
+        guard
+            .insert_project(&rsi_common::types::Project {
+                id: project_id,
+                name: "digest count".into(),
+                path: Some(repo.path().to_path_buf()),
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        for ordinal in 0..130_u128 {
+            let root = checkouts.path().join(format!("checkout-{ordinal:03}"));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(
+                root.join(".git"),
+                format!("gitdir: {}\n", repo.path().join(".git").display()),
+            )
+            .unwrap();
+            let mut session = make_test_session();
+            session.id = Uuid::from_u128(ordinal + 1);
+            session.project_id = Some(project_id);
+            session.status = SessionStatus::Completed;
+            session.working_dir = root.clone();
+            guard.insert_session(&session).unwrap();
+            let custody_id = Uuid::from_u128(ordinal + 1000);
+            guard.conn.execute(
+                "INSERT INTO sandbox_custody_roots
+                 (custody_id,allocation_id,canonical_repo_dir,sandbox_root,sandbox_branch,
+                  repository_identity,source_commit,state,owner_session_id,generation,
+                  event_sequence,validation_state,validated_generation,validated_at,created_at,updated_at)
+                 VALUES (?1,?1,?2,?3,'rsi/history','repo',
+                         '0000000000000000000000000000000000000000',
+                         'live',?4,1,1,'verified',1,?5,?5,?5)",
+                params![custody_id.to_string(), repo.path().to_str().unwrap(), root.to_str().unwrap(), session.id.to_string(), now],
+            ).unwrap();
+            guard.conn.execute(
+                "UPDATE sessions SET sandbox_custody_id=?1,sandbox_kind='GitWorktree',
+                 sandbox_root=?2,sandbox_branch='rsi/history',sandbox_cleanup_state='Live' WHERE id=?3",
+                params![custody_id.to_string(), root.to_str().unwrap(), session.id.to_string()],
+            ).unwrap();
+        }
+    }
+    let primary = RegisteredWorkspace::primary(project_id, repo.path()).unwrap();
+    let (_manager, handle) =
+        IndexManager::new(indexes.path().to_path_buf(), vec![primary]).unwrap();
+    let service = CodegraphReadService::with_store(&handle, store.clone());
+    let request = || CodegraphWorkspacePageRequestV1 {
+        project_id,
+        cursor: None,
+        limit: 32,
+    };
+
+    // Unrelated session inserts land on the shared Store for the whole walk.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writes = std::sync::Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let (store, stop, writes) = (store.clone(), stop.clone(), writes.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                store
+                    .blocking_lock()
+                    .insert_session(&make_test_session())
+                    .unwrap();
+                writes.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        })
+    };
+    while writes.load(Ordering::SeqCst) == 0 {
+        std::thread::yield_now();
+    }
+    let before = codegraph_registry_digest_count();
+    let page = service.list_workspaces(request());
+    let digests = codegraph_registry_digest_count() - before;
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    let page = page.unwrap();
+    assert_eq!(page.workspaces.len(), 32);
+    assert!(writes.load(Ordering::SeqCst) > 0);
+    // 130 custodies are three pages; the fence digest plus the final check are
+    // all a walk may pay, never one per page.
+    assert!(
+        (1..=2).contains(&digests),
+        "custody traversal computed {digests} registry digests"
+    );
+
+    // A dormant binding walks the same pages and pays the same constant.
+    let target = Uuid::from_u128(1000 + 129);
+    let workspace_id =
+        rsi_codegraph::CodegraphStore::workspace_id(project_id, &format!("rsi-sandbox:{target}"))
+            .unwrap();
+    let before = codegraph_registry_digest_count();
+    service
+        .resolve_operator_scope(
+            rsi_common::codegraph::CodegraphScopeV1 {
+                project_id,
+                workspace_id: Some(workspace_id),
+            },
+            false,
+        )
+        .unwrap();
+    assert!(codegraph_registry_digest_count() - before <= 2);
+
+    // The no-mixed-registry guarantee survives: a change after the fence is
+    // refused, not accepted from pages read on either side of it.
+    let ahead = service.list_workspaces(CodegraphWorkspacePageRequestV1 {
+        project_id,
+        cursor: None,
+        limit: 32,
+    });
+    assert!(ahead.is_ok());
+    store.blocking_lock().conn.execute(
+        "UPDATE sandbox_custody_roots SET generation=2,validated_generation=2 WHERE custody_id=?1",
+        [target.to_string()],
+    ).unwrap();
+    let cursor = ahead.unwrap().next_cursor.unwrap();
+    assert!(matches!(
+        service.list_workspaces(CodegraphWorkspacePageRequestV1 {
+            project_id,
+            cursor: Some(cursor),
             limit: 32,
         }),
         Err(CodegraphServiceError::CursorExpired)

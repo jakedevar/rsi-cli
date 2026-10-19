@@ -10,6 +10,7 @@ use rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE;
 use rsi_common::harness_manager_v2::{
     ManagerActionStateV2, ManagerActionV2, ManagerCapabilityV2, ManagerOperatingModeV2,
 };
+use rsi_common::manager_budget::{BUDGET_PANEL_PATH, BudgetNodeKindV1, CreationCapRefusalV1};
 use rsi_common::portfolio_nodes::{
     MANAGER_CAPABILITY_WIDENED, MANAGER_SCOPE_WIDENED, PORTFOLIO_ADOPT_NOT_ROOT,
     PORTFOLIO_COVERAGE_NOT_SUPERSET, PORTFOLIO_IDEMPOTENCY_CONFLICT, PORTFOLIO_PARENT_IMMUTABLE,
@@ -616,7 +617,7 @@ fn depth_three_siblings_and_ancestors_stay_out_of_reach() {
         request.policy.max_active_sessions = 6;
         create(&store, &request).unwrap()
     };
-    let left = region(seats[3], &[a], "left");
+    let _left = region(seats[3], &[a], "left");
     let right = region(seats[4], &[b], "right");
     assert_eq!(chain(&store, b).last(), Some(&(3, right.node_id)));
     // A third sibling over A at depth 3 overlaps the left region (it asks
@@ -828,14 +829,16 @@ fn creation_budgets_charge_the_origin_and_its_ancestors_never_a_descendant() {
     allowance(&configs[1]).unwrap();
     // The global's own two fill its cap and charge both ancestors.
     reserve_sessions(&store, &configs[2], 2);
-    assert_eq!(refusal(allowance(&configs[2])), "manager_v2_creation_limit");
+    assert_creation_limit(refusal(allowance(&configs[2])), nodes[2].node_id, 2, 2);
     // The pinnacle holds the global's 2 and its own 2 of its 5: one more
     // fits, two do not. The swarm holds 6 of its 9.
     reserve_sessions(&store, &configs[1], 2);
     allowance(&configs[1]).unwrap();
-    assert_eq!(
+    assert_creation_limit(
         refusal(store.manager_ancestor_creation_allowance(&configs[1], false, 2, 0)),
-        "manager_v2_creation_limit"
+        nodes[1].node_id,
+        4,
+        5,
     );
     allowance(&configs[0]).unwrap();
     // A project-level principal under the chain is charged to every node:
@@ -846,20 +849,49 @@ fn creation_budgets_charge_the_origin_and_its_ancestors_never_a_descendant() {
         current_session_id: None,
         ..configs[2].clone()
     };
-    assert_eq!(
-        refusal(allowance(&pm)),
-        rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
-    );
+    let allowance_error = allowance(&pm).unwrap_err().to_string();
+    assert!(allowance_error.contains("manager_ancestor_allowance_exceeded: node_kind=portfolio"));
+    assert!(allowance_error.contains(&format!("node_id={}", nodes[2].node_id)));
+    assert!(allowance_error.contains("cap_field=max_created_sessions used=2 limit=2"));
+    assert!(allowance_error.contains("needed=1 counted=0 window_start="));
+    // #2502: the typed detail names the node to raise and the TUI path.
+    let detail = CreationCapRefusalV1::parse(&allowance_error).expect("typed refusal detail");
+    assert_eq!(detail.node_kind, BudgetNodeKindV1::Portfolio);
+    assert_eq!(detail.node_id, nodes[2].node_id);
+    assert_eq!(detail.project_id, a);
+    assert_eq!((detail.used, detail.limit), (2, 2));
+    assert!(detail.raise_in.starts_with(BUDGET_PANEL_PATH));
     reserve_sessions(&store, &pm, 1);
     // The swarm now holds 2 + 2 + 2 + 1 = 7 of 9: one more fits, two do not.
     store
         .manager_ancestor_creation_allowance(&configs[0], false, 2, 0)
         .unwrap();
-    assert_eq!(
+    assert_creation_limit(
         refusal(store.manager_ancestor_creation_allowance(&configs[0], false, 3, 0)),
-        "manager_v2_creation_limit"
+        nodes[0].node_id,
+        7,
+        9,
     );
     let _ = nodes;
+}
+
+/// #2502: an own-node creation refusal names the node, the cap field,
+/// used/limit and the TUI path that raises it.
+fn assert_creation_limit(message: String, node: Uuid, used: i64, limit: i64) {
+    let detail = CreationCapRefusalV1::parse(&message).unwrap_or_else(|| panic!("{message}"));
+    assert_eq!(detail.code, "manager_v2_creation_limit");
+    assert_eq!(detail.node_kind, BudgetNodeKindV1::Portfolio);
+    assert_eq!(detail.node_id, node);
+    assert_eq!(detail.cap_field, "max_created_sessions");
+    assert_eq!((detail.used, detail.limit), (used, limit));
+    assert_eq!(
+        detail.raise_in,
+        CreationCapRefusalV1::raise_path(BudgetNodeKindV1::Portfolio, node, "max_created_sessions")
+    );
+    assert!(
+        detail.raise_in.contains("b Budget > portfolio "),
+        "{message}"
+    );
 }
 
 /// #1302, plan §2.2: the finite allowances of a parent's active children sum

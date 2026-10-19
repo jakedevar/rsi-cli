@@ -362,7 +362,7 @@ default off).
 | [topology-on-epic/README.md](topology-on-epic/README.md) | Architecture overview, quickstart, phase history |
 | [topology-on-epic/spawn-child-grammar.md](topology-on-epic/spawn-child-grammar.md) | Full `/spawn_child` directive grammar |
 | [topology-on-epic/rpc-reference.md](topology-on-epic/rpc-reference.md) | Topology / workflow RPC params and returns |
-| [topology-on-epic/topology-validation.md](topology-on-epic/topology-validation.md) | DAG validators, cycle detection, loop rules |
-| [topology-on-epic/topology-workflow-bridge.md](topology-on-epic/topology-workflow-bridge.md) | How `ExecuteTopology` bridges a topology to a workflow |
+| [topology-on-epic/topology-validation.md](topology-on-epic/topology-validation.md) | DAG validators, loop rules, typed steps (command/gate/review/land), edge routing, custody |
+| [topology-on-epic/topology-workflow-bridge.md](topology-on-epic/topology-workflow-bridge.md) | How `ExecuteTopology` bridges a topology to a workflow (historical; legacy runner notes) |
 | [recursive-dag.md](recursive-dag.md) | The separate recursive task-graph operator engine (`:dag`) |
 | [keybindings.md](keybindings.md) | Complete keybinding table |

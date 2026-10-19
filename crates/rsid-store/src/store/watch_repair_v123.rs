@@ -158,7 +158,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("test directory");
         let database = directory.path().join("v121-to-v123.sqlite");
         {
-            let store = Store::open(&database).expect("create current database");
+            let store = Store::open_test_fixture(&database).expect("create current database");
             crate::store::tests::rewind_post_v121_tail_to(&store.conn, 121);
         }
 
@@ -200,7 +200,7 @@ mod tests {
     fn v123_reopen_rejects_witness_catalog_drift() {
         let directory = tempfile::tempdir().expect("test directory");
         let database = directory.path().join("v123-witness-drift.sqlite");
-        let store = Store::open(&database).expect("create V123 database");
+        let store = Store::open_test_fixture(&database).expect("create V123 database");
         store
             .conn
             .execute_batch("ALTER TABLE agent_child_watch_witness ADD COLUMN stray TEXT")

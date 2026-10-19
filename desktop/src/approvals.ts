@@ -5,6 +5,7 @@ import {
   type Answer, DECLINE_RESPONSE, type PauseLevel, attentionCount, formatAnswers, needsAttention,
   pauseLabel, pendingQuestions, questionKey,
 } from './approvals-model.js';
+import { uiChanged } from './state.js';
 
 export interface ApprovalDeps {
   toast: (msg: string, ok?: boolean) => void;
@@ -149,9 +150,20 @@ export function renderControls(s: Session | undefined): void {
   state.textContent = pauseLabel(level);
   state.hidden = level === 'none';
   clearBtn.hidden = level === 'none';
+  uiChanged();
 }
 
-async function hardPause(): Promise<void> {
+/** Forget the cached pause so the next render re-reads it from the daemon. */
+export function forgetPause(): void {
+  pause = undefined;
+}
+
+/** The open session's operator pause, as last fetched ('none' until known). */
+export function pauseLevel(sessionId: string): PauseLevel {
+  return pause && pause.id === sessionId ? pause.level : 'none';
+}
+
+export async function hardPause(): Promise<void> {
   const s = deps.selected();
   if (!s) return;
   try {
@@ -164,7 +176,7 @@ async function hardPause(): Promise<void> {
   }
 }
 
-async function clearPause(): Promise<void> {
+export async function clearPause(): Promise<void> {
   const s = deps.selected();
   if (!s) return;
   try {
@@ -177,7 +189,7 @@ async function clearPause(): Promise<void> {
   }
 }
 
-function confirmDialog(message: string, confirmLabel: string): Promise<boolean> {
+export function confirmDialog(message: string, confirmLabel: string): Promise<boolean> {
   return new Promise((resolve) => {
     const dlg = el('dialog', 'confirm');
     const form = el('form', 'launch-form');
@@ -200,7 +212,7 @@ function confirmDialog(message: string, confirmLabel: string): Promise<boolean> 
   });
 }
 
-async function archive(): Promise<void> {
+export async function archive(): Promise<void> {
   const s = deps.selected();
   if (!s) return;
   const name = s.title?.trim() || s.id.slice(0, 8);
@@ -224,9 +236,7 @@ export function updateAttention(all: Session[]): void {
   api.setAttentionCount(n).catch(() => { lastCount = -1; });
 }
 
+/** The pause and archive buttons run through the action registry (commands.ts). */
 export function initApprovals(d: ApprovalDeps): void {
   deps = d;
-  $('hard-pause').addEventListener('click', () => void hardPause());
-  $('clear-pause').addEventListener('click', () => void clearPause());
-  $('archive').addEventListener('click', () => void archive());
 }

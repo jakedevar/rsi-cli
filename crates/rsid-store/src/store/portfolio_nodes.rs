@@ -23,12 +23,13 @@ use rsi_common::grant_narrowing::{
 };
 use rsi_common::harness_manager_v2::ManagerPolicyV2;
 use rsi_common::portfolio_nodes::{
-    ConfigurePortfolioNodeRequestV1, GLOBAL_MANAGER_AMBIGUOUS, GLOBAL_MANAGER_SEAT_UNAVAILABLE,
-    GLOBAL_TIER_LABEL, MANAGER_ALLOWANCE_EXCEEDED, MANAGER_ANCESTOR_REVOKED,
-    MANAGER_NODE_ROOT_OPERATOR_ONLY, MANAGER_NODE_STALE, MANAGER_SCOPE_OVERLAP,
-    PORTFOLIO_ADOPT_NOT_ROOT, PORTFOLIO_COVERAGE_NOT_SUPERSET, PORTFOLIO_IDEMPOTENCY_CONFLICT,
-    PORTFOLIO_NODE_NOT_FOUND, PORTFOLIO_PARENT_IMMUTABLE, PORTFOLIO_TIER_LABEL_IMMUTABLE,
-    PortfolioCoverageV1, PortfolioNodeV1, RevokePortfolioNodeRequestV1,
+    ConfigurePortfolioNodeLaunchesRequestV1, ConfigurePortfolioNodeRequestV1,
+    GLOBAL_MANAGER_AMBIGUOUS, GLOBAL_MANAGER_SEAT_UNAVAILABLE, GLOBAL_TIER_LABEL,
+    MANAGER_ALLOWANCE_EXCEEDED, MANAGER_ANCESTOR_REVOKED, MANAGER_NODE_ROOT_OPERATOR_ONLY,
+    MANAGER_NODE_STALE, MANAGER_SCOPE_OVERLAP, PORTFOLIO_ADOPT_NOT_ROOT,
+    PORTFOLIO_COVERAGE_NOT_SUPERSET, PORTFOLIO_IDEMPOTENCY_CONFLICT, PORTFOLIO_NODE_NOT_FOUND,
+    PORTFOLIO_PARENT_IMMUTABLE, PORTFOLIO_TIER_LABEL_IMMUTABLE, PortfolioCoverageV1,
+    PortfolioNodeV1, RevokePortfolioNodeRequestV1,
 };
 use rsi_common::types::SessionStatus;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -1031,6 +1032,41 @@ impl Store {
         self.configure_portfolio_node_confirmed(request, grantor, operator_origin, false)
     }
 
+    /// #2103: apply a one-launch edit to a node's current grant. The full
+    /// configure request is rebuilt from the node inside one transaction, so
+    /// the edit and its version check cannot interleave with another write.
+    ///
+    /// # Errors
+    /// `portfolio_invalid_request`, `portfolio_node_not_found`,
+    /// `manager_node_stale`, plus every refusal of
+    /// [`Self::configure_portfolio_node_confirmed`].
+    pub fn configure_portfolio_node_launches(
+        &self,
+        request: &ConfigurePortfolioNodeLaunchesRequestV1,
+        operator_origin: &str,
+        confirm_cap_reductions: bool,
+    ) -> Result<PortfolioNodeV1> {
+        request
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let node = self
+            .get_portfolio_node(request.node_id)?
+            .ok_or_else(|| DaemonError::InvalidParam(PORTFOLIO_NODE_NOT_FOUND.into()))?;
+        let full = request
+            .apply_to(&node)
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        let view = self.configure_portfolio_node_as_in_tx_confirmed(
+            &full,
+            PortfolioGrantor::Operator,
+            operator_origin,
+            None,
+            confirm_cap_reductions,
+        )?;
+        tx.commit()?;
+        Ok(view)
+    }
+
     /// Operator acknowledgment of the reduction preview; no grant is written
     /// until the same transaction has validated topology and project impacts.
     pub fn configure_portfolio_node_confirmed(
@@ -1623,7 +1659,7 @@ impl Store {
             "UPDATE global_manager_grants SET state='revoked',updated_at=?2 WHERE id=?1 AND state='active'",
             params![active.grant.grant_id.to_string(), now],
         )?;
-        self.retire_global_grant_messages(active.grant.grant_id, &now)?;
+        self.disable_global_grant_messages(active.grant.grant_id, &now)?;
         let next = self.portfolio_next_version()?;
         self.conn.execute(
             "INSERT INTO global_manager_grants(id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,idempotency_key,created_at,updated_at,node_id,parent_node_id,grantor,child_policy_json,max_direct_reports)
@@ -1644,7 +1680,15 @@ impl Store {
             "UPDATE manager_portfolio_nodes SET updated_at=?2 WHERE id=?1",
             params![node.to_string(), now],
         )?;
-        super::agent_jobs::transfer_manager_jobs_on(&self.conn, predecessor, successor)?;
+        // #2468: the node and its epoch survive, so its queued tier mail and
+        // open escalation hops follow it to the successor seat.
+        self.rehome_tier_grant(active.grant.grant_id, &now)?;
+        super::manager_obligations::transfer_manager_obligations_on(
+            &self.conn,
+            predecessor,
+            successor,
+            true,
+        )?;
         Ok(true)
     }
 
@@ -1655,7 +1699,8 @@ impl Store {
     /// predecessor launched; the predecessor seat loses authority in the same
     /// commit (`manager_node_custody_changed`). Unlike a transfer, the new
     /// seat need not continue the old one. `key` is the new grant's replay
-    /// key. Queued mail of the old grant is retired.
+    /// key. Queued tier mail and open escalation hops of the old grant follow the
+    /// node to the new seat (#2468).
     pub(crate) fn replace_portfolio_seat_in_tx(
         &self,
         node: Uuid,
@@ -1669,7 +1714,7 @@ impl Store {
             "UPDATE global_manager_grants SET state='revoked',updated_at=?2 WHERE id=?1 AND state='active'",
             params![active.grant.grant_id.to_string(), now],
         )?;
-        self.retire_global_grant_messages(active.grant.grant_id, &now)?;
+        self.disable_global_grant_messages(active.grant.grant_id, &now)?;
         let next = self.portfolio_next_version()?;
         self.conn.execute(
             "INSERT INTO global_manager_grants(id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,idempotency_key,created_at,updated_at,node_id,parent_node_id,grantor,child_policy_json,max_direct_reports)
@@ -1689,13 +1734,28 @@ impl Store {
             "UPDATE manager_portfolio_nodes SET updated_at=?2 WHERE id=?1",
             params![node.to_string(), now],
         )?;
-        super::agent_jobs::transfer_manager_jobs_on(
+        super::manager_obligations::transfer_manager_obligations_on(
             &self.conn,
             active.grant.seat_session_id,
             seat,
+            false,
         )?;
+        self.rehome_tier_grant(active.grant.grant_id, &now)?;
         node_grant_on(&self.conn, node)?
             .ok_or_else(|| DaemonError::Store("a replaced portfolio seat lost its grant".into()))
+    }
+
+    /// #2472: the session that holds the portfolio seat now, for a `session`
+    /// that held it at some point of the node's current authority epoch (its
+    /// active seat or a retired link of the transfer chain). `None` when the
+    /// session is not in an active node's current epoch chain: a seat of an
+    /// older epoch, a revoked node, or no portfolio seat at all, so a caller
+    /// that falls back to `session` itself keeps the old fences.
+    pub fn portfolio_seat_now(&self, session: Uuid) -> Result<Option<Uuid>> {
+        let Some(node) = chain_seat_node_on(&self.conn, session)? else {
+            return Ok(None);
+        };
+        Ok(node_grant_on(&self.conn, node)?.map(|record| record.grant.seat_session_id))
     }
 
     /// The node whose active seat is `predecessor`, then its transfer.

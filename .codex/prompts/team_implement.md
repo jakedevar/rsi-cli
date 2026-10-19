@@ -219,11 +219,11 @@ After all Tier 0 phases are complete, proceed to worker dispatch.
 
 ## Step 4: Worker Agent Dispatch
 
-For each tier (starting from Tier 1), spawn one background worker agent per phase using the `Agent` tool with `run_in_background: true`.
+For each tier (starting from Tier 1), dispatch one worker per phase, following `.claude/commands/_shared/team_dispatch.md`: RSI controls (`rsi_control_spawn` / `AgentSpawnChild`) inside an RSI session, native background agents only outside RSI. With no spawn authority, implement the phases yourself in this session in tier order and do not claim workers ran.
 
-**Fire all workers in a tier in a single message** (true parallel launch). Do not wait for one to finish before launching the others in the same tier.
+**Dispatch all workers in a tier as one batch** (true parallel launch). Do not wait for one to finish before launching the others in the same tier.
 
-Assign each worker a descriptive `name` so you can track them: e.g., `"worker-phase-2"`, `"worker-phase-3"`.
+Assign each worker a descriptive `name` where the control accepts one, so you can track them: e.g., `"worker-phase-2"`, `"worker-phase-3"`.
 
 ### Worker Prompt Template
 
@@ -272,7 +272,8 @@ If the codebase does not match the plan (file missing, type changed, API shifted
 do NOT guess or improvise. Stop and include the mismatch in your WORKER REPORT.
 
 YOUR FINAL MESSAGE TO THE MASTER MUST CONTAIN ONLY THE WORKER REPORT BLOCK BELOW.
-Nothing before it. Nothing after it. The master reads only your report and accesses
+Nothing else, except the worker preamble's `PIPELINE HANDOFF — IMPLEMENTATION:` first
+line, which the master accepts. The master reads only your report and accesses
 your actual changes via the shared git worktree.
 
 <return_schema role="implementation">
@@ -284,7 +285,7 @@ your actual changes via the shared git worktree.
 
 <forbidden_content>
 (Extends the shared preamble's forbidden list — role-specific additions only.)
-- Any field that exceeds its max_words / max_items cap — over-budget returns will be rejected and the worker re-dispatched.
+- Any field that exceeds its max_words / max_items cap — over-budget fields are trimmed by the master during synthesis; do not redispatch a completed worker for budget or formatting alone.
 </forbidden_content>
 
 **Rule:** `files_modified` and `VERIFICATION_ITEMS` are the ONLY substantive
@@ -315,21 +316,24 @@ VERIFICATION_ITEMS:
 
 ## Step 5: Worker Monitoring + Tier Advancement
 
-After dispatching a tier's workers, wait for `TaskOutput` notifications as workers complete.
+After dispatching a tier's workers, end your turn and wait for the terminal-watch wake (`AgentScheduleWake` `mode:"on_terminal"` / `mode:"when"`) as workers complete; read each final message with `AgentReadSessionEvents`.
 
-For each completed worker, validate their reply via the contract binary
-(RSI-021):
+For each completed worker, read its final message and normalize the report
+yourself: take `status`, `phase`, `files_modified`, `blocker` and the
+`VERIFICATION_ITEMS:` block from whatever shape the worker used (the canonical
+`PIPELINE HANDOFF — IMPLEMENTATION:` marker or the `WORKER REPORT:` block), and
+fill anything recoverable from `git log` / `git diff` on the worker's commits.
+`cargo run -q -p rsi-common --bin rsi-contract-validate -- --worker-report < reply.txt`
+is an optional check on the normalized text, not a gate.
 
-  cargo run -q -p rsi-common --bin rsi-contract-validate -- --worker-report < reply.txt
+Never redispatch a completed worker only to fix report formatting or marker
+placement; accept the work and record the normalization in your log. Contact the
+worker only when substance is missing that you cannot recover from the commits
+(for example no commit for a `complete` status, or no verification items for a
+phase whose checks you cannot rerun), and then ask for just that substance once.
+If it is still missing, treat the worker as BLOCKED per the schema below.
 
-If exit != 0, use SendMessage to dispatch a single corrective directive to the
-worker ("Your WORKER REPORT block was malformed: $err. Re-emit with ONLY the
-report block as your final message — nothing before, nothing after.") and wait
-for the second reply. If the second reply also fails, escalate the worker as
-BLOCKED per the schema below.
-
-On exit 0, parse the structured `WorkerReport` JSON the binary emits to stdout
-for {status, phase, files_modified, blocker?}, then apply the rules below:
+Then apply the rules below:
 
 **If `Status: DONE`:**
 - Verify their files were committed: check `git log --oneline -5`
@@ -351,23 +355,26 @@ for {status, phase, files_modified, blocker?}, then apply the rules below:
 
 **If `Status: BLOCKED`:**
 
-Stop the current tier and present this to the user:
+Do not stop and do not ask the user. Decide, record the decision and the reason
+in the report, and continue:
 
 ```
 Worker Blocked — Phase [N]: [Title]
-
-Worker report:
   blocker: [worker's blocker field]
-
-Options:
-  1. Skip this phase (mark it deferred, continue with other tiers)
-  2. Tell me what to adjust in the plan and I will re-dispatch
-  3. Handle this phase manually and let me know when done
-
-How should I proceed?
+  Decision: [one of the three below]
+  Reason: [one line]
 ```
 
-Wait for user input before continuing.
+Pick one:
+1. **Adapt** the plan within its stated intent (fix the brief, the dependency
+   or the assumption the worker hit) and re-dispatch the phase once with the
+   corrected brief.
+2. **Defer** the phase: mark it deferred in the plan, file an Issue for it
+   (`AgentCreateIssue`) with the blocker, and continue with the other phases
+   and tiers. Do not start a tier that depends on a deferred phase.
+3. **Do it yourself** when the blocker is small and in the master's reach.
+
+A real gate (main or a release, real money, credentials, deleting user data) goes to the manager through the RSI report-up controls, never to a chat prompt. Report it, defer the affected phase, and continue with the rest.
 
 **Tier Advancement Rule:**
 Only advance to the next tier after ALL workers in the current tier are resolved (DONE, master-fixed, skipped, or manually handled). Never start a dependent tier while its prerequisites are incomplete.
@@ -391,52 +398,25 @@ For each: read fully → implement → run checks → fix → commit → mark `[
 
 ## Step 7: Final Verification
 
-After all phases are complete, run the full workspace test suite:
+Verify only what the change touched. Verification is one
+`scoped_test` job (`scripts/scoped-test --base origin/rolling`; in an RSI session
+submit it as an `AgentSubmitJob` test job and wait on one `mode:"when"` wake).
+Landing filters come from the merge queue, not from you. Do not run
+workspace-wide `cargo test --workspace` or `cargo clippy --workspace`; the lander
+and QA sweep own the wider gates. Fix failures from your change before
+continuing; name baseline reds you did not cause.
 
-```bash
-cargo test --workspace
-cargo clippy --workspace
-```
-
-Fix any failures before proceeding to the human gate.
-
-Then pause and present the verification summary:
-
-```
-All Phases Complete — Ready for Manual Verification
-
-Team summary:
-  Tier 0 (master, sequential): Phase [N]
-  Tier 1 (parallel, [M] workers): Phases [list]
-  Tier 2 (parallel, [M] workers): Phases [list]
-  Sequential final: Phase [N]
-
-Automated checks: PASS
-  cargo test --workspace: PASS
-  cargo clippy --workspace: PASS
-
-Please perform only the TUI manual verification items from the manifest:
-
-Phase [N]: [Title]
-  - [ ] [manual step 1]
-  - [ ] [manual step 2]
-
-Phase [M]: [Title]
-  - [ ] [manual step 1]
-
-Let me know when manual testing is complete.
-```
-
-Do NOT check off manual testing items until the user confirms.
+Do not pause for the user. TUI manual items stay recorded as pending in
+`MANIFEST_PATH`; the user checks them whenever they review. Only a manifest item
+that genuinely needs a human observation is surfaced, and it is surfaced in the
+report, never as a blocking prompt.
 
 ---
 
 ## Step 8: Commit and Push — MANDATORY
 
-After the user confirms manual verification:
-
-1. Mark confirmed TUI manual items checked in `MANIFEST_PATH`, flip manifest
-   status to `verified`, and validate with `rsi-manifest-validate`
+1. Validate `MANIFEST_PATH` with `rsi-manifest-validate`; leave pending TUI
+   manual items unchecked
 2. Stage and commit all task-owned changes using explicit paths; directly related `thoughts/` files belong in this commit, but never stage the entire `thoughts/` directory or unrelated edits
 3. Create a final summary commit:
    ```
@@ -444,7 +424,7 @@ After the user confirms manual verification:
 
    Phases completed: [list]
    Workers used: [N]
-   Automated checks: all pass
+   Verification: scoped (touched modules)
    ```
 4. Push only if the user explicitly asked; then push the current branch as a safe fast-forward, never `main`
 
@@ -473,10 +453,12 @@ Planned behavior: [specific plan claim]
 Found: [actual situation]
 Effect on this phase: [what changes or becomes blocked]
 
-How should I proceed?
+Decision: [adapt the plan within its intent | defer the phase and file an Issue | re-dispatch with a corrected brief]
+Reason: [one line]
 ```
 
-Stop and wait for guidance before continuing.
+Do not stop and do not ask the user. Make the decision, record it and the
+reason in the report, and continue. A real gate (main or a release, real money, credentials, deleting user data) goes to the manager through the RSI report-up controls, never to a chat prompt.
 
 ---
 
@@ -495,8 +477,8 @@ Team execution summary:
   Sequential final: [phases]
 
 Files modified: [total count]
-Automated checks: all pass
-Manual verification: confirmed by user
+Verification: scoped, touched modules pass
+Manual verification: pending items listed in the manifest
 
 Ready for review and merge.
 ```
@@ -510,11 +492,11 @@ If your invocation prompt includes `PIPELINE MODE: true`, you are being called f
 1. Override the Final Response Format entirely
 2. Your **terminal message MUST contain ONLY the PIPELINE HANDOFF block** that the master defined in your prompt — nothing before it, nothing after it
 3. All reasoning, worker reports, and phase narration belong in your working process — the master reads only the handoff block
-4. **Skip Step 8 (the final git push)** — the master handles the push after Jake confirms manual verification
+4. **Skip Step 8 (the final git push)** — the master handles the push
 5. Include `Manifest path:` in your PIPELINE HANDOFF block. Do not include
    inline manual verification items; the master reads TUI manual items from the
    manifest after daemon verification.
-6. The master parses your handoff to gate daemon verification, Jake's TUI-only
+6. The master parses your handoff to gate daemon verification, any TUI-only
    verification, and the final push
 
 This keeps the master's context clean across all three pipeline stages.

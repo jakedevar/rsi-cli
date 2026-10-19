@@ -1,4 +1,13 @@
 node_modules/
 dist/
 src-tauri/gen/
+!src-tauri/gen/
+src-tauri/gen/*
+!src-tauri/gen/schemas/
+src-tauri/gen/schemas/*
+# These generated schemas are maintained in the repository.
+!src-tauri/gen/schemas/acl-manifests.json
+!src-tauri/gen/schemas/capabilities.json
+!src-tauri/gen/schemas/desktop-schema.json
+!src-tauri/gen/schemas/linux-schema.json
 src-tauri/target/

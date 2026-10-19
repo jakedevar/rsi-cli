@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:archive": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "archives the open session after a confirm dialog"
+    },
+    "cmd:commands": {
+      "status": "substitute",
+      "location": "src/palette.ts",
+      "note": "opens the command palette; it lists desktop actions, and : queries run TUI commands"
+    },
+    "cmd:kill": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "soft interrupt of the open session"
+    },
+    "cmd:pause-clear": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "clears the operator pause of the open session"
+    },
+    "cmd:quit": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src-tauri/src/menu.rs",
+      "note": "quits the app (aliases too)"
+    },
+    "cmd:refresh": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "refresh"
+    },
+    "cmd:sessions": {
+      "status": "substitute",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "shows the Active sessions view"
+    },
+    "global:backspace/command-line": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": ": command line deletes the last character"
+    },
+    "global:char/command-line": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": ": command line appends the typed character"
+    },
+    "global:enter/command-line": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": ": command line runs the ex command"
+    },
+    "global:esc/command-line": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": ": command line discards the command"
+    },
+    "key:<Space>N": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "launch dialog (File > New session…)"
+    },
+    "key:<Space>a": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/approvals.ts",
+      "note": "archive with a confirm dialog; also Session menu, right-click, Archive button"
+    },
+    "key:<Space>c": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "sends \"continue\" to the open session; also Session menu, right-click"
+    },
+    "key:<Space>hc": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/approvals.ts",
+      "note": "clear pause after a second press within 5 s; also Session menu, right-click, Clear pause button"
+    },
+    "key:Ctrl-N": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "launch dialog; Cmd-N on macOS; File > New session…, New session button"
+    },
+    "key:Enter": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "opens the session under the list cursor (Go menu, palette)"
+    },
+    "key:L": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "opens the session under the list cursor (Go menu, palette)"
+    },
+    "key:X": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/approvals.ts",
+      "note": "hard pause after a second press within 5 s; also Session menu, right-click, Hard pause button"
+    },
+    "key:ZQ": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src-tauri/src/menu.rs",
+      "note": "quits the app"
+    },
+    "key:ZZ": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src-tauri/src/menu.rs",
+      "note": "quits the app"
+    },
+    "key:[a": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "previous session needing you (Go menu, palette)"
+    },
+    "key:]a": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "next session needing you (Go menu, palette)"
+    },
+    "key:l": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "opens the session under the list cursor (Go menu, palette)"
+    },
+    "key:r": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "refresh (File menu, palette)"
+    },
+    "key:x": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions.ts",
+      "note": "soft interrupt; every surface runs the same registry action (src/registry.ts): key, palette, menu bar, right-click, Interrupt button"
+    },
+    "module:ui/content.rs": {
+      "status": "done",
+      "location": "src/conversation.ts, src/markdown.ts, src/codeblocks.ts, src/model.ts",
+      "note": "event content: Markdown through the sanitizing backend with fenced code blocks coloured by language (G4), tool / thinking collapse, blob elision, long-message folds"
+    },
+    "module:ui/overlay/command_palette.rs": {
+      "status": "done",
+      "location": "src/palette.ts, src/registry.ts",
+      "note": "the palette over the desktop action registry; see overlay-ref:command-palette"
+    },
+    "module:ui/overlay/prompt.rs": {
+      "status": "substitute",
+      "location": "src/prompts.ts, src/prompt-model.ts, src/launch.ts, src-tauri/src/prompts.rs, src/actions/detail.ts",
+      "note": "see overlay:prompt-overlay-new-session-continue-session"
+    },
+    "module:ui/session.rs": {
+      "status": "substitute",
+      "location": "src/conversation.ts, src/sessions.ts, src/actions/detail.ts, src/actions/input.ts",
+      "note": "the TUI's session pane is drawn cell by cell; the desktop's is an HTML header (status, model, pending messages, markers), the transcript and the message box, each listed under its own feature rows"
+    },
+    "overlay-ref:command-palette": {
+      "status": "done",
+      "location": "src/palette.ts, src/overlay-keys.ts",
+      "note": "typing filters, Backspace, Down / Ctrl-N and Up / Ctrl-P move, Tab puts the highlighted action's : command on the line to edit its argument, Enter runs, Esc leaves the argument edit first and then closes; : queries run TUI command lines"
+    },
+    "overlay:prompt-overlay-new-session-continue-session": {
+      "status": "substitute",
+      "location": "src/prompts.ts, src/prompt-model.ts, src/launch.ts, src-tauri/src/prompts.rs, src/actions/detail.ts, src/actions/input.ts",
+      "note": "the New session and continue prompts with the TUI's modes (G1's vim editor and NORMAL / INSERT badge), contextual help on ?, the launch header row, the settings side with a manager appointment, compile / grammar / AI helpers, paste with image references and the modal geometry keys (G1). Substitute: one New session dialog, no stacked prompts, tabs or splits (see overlay-ref:new-session-prompt), and the grant page is the full policy editor (see overlay-ref:new-session-settings)"
+    },
+    "section:quit": {
+      "status": "done",
+      "location": "src/keybindings.ts, src-tauri/src/menu.rs",
+      "note": "ZQ, ZZ, :quit, and the OS Quit menu item"
+    }
+  }
+}

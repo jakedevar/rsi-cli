@@ -314,6 +314,7 @@ fn snap_launch_session_request() {
         parent_id: None,
         openai_base_url: None,
         openai_api_key: None,
+        custom_provider_id: None,
         workflow_id: None,
         max_retries: Some(0),
         group_id: None,
@@ -440,6 +441,8 @@ fn snap_get_model_control_status_response() {
 #[test]
 fn snap_get_health_status_response() {
     let body = HealthStatusResponse {
+        daemon_pid: Some(1234),
+        daemon_started_at: Some("2026-10-12T00:00:00.000000000Z".to_string()),
         persistence_queue_depth: 0,
         persistence_queue_capacity: 1024,
         last_command_duration_ms: 12,
@@ -474,6 +477,7 @@ fn snap_get_health_status_response() {
             missing: Vec::new(),
         }),
         supervisor_mode: None,
+        codegraph_unhealthy: Vec::new(),
         // V99/P1-B: a populated snapshot, so the wire shape of the new field is
         // pinned rather than only its empty-vec default.
         rate_limits: vec![ProviderRateLimitSnapshot {
@@ -495,6 +499,7 @@ fn snap_get_health_status_response() {
                     resets_at_epoch: Some(1_788_883_200),
                 },
             ],
+            stale_reason: None,
         }],
     };
     let response = RpcResponse::success(

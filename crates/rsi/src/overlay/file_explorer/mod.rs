@@ -28,8 +28,9 @@ pub use state::{
     ExplorerFinder, ExplorerPrompt, FileExplorerState, PromptKind, RESIZE_STEP, drawer_width,
 };
 
-/// Trash batches older than this are pruned when the explorer first opens.
-const TRASH_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Trash batches older than this are pruned when the explorer first opens
+/// (the rule the daemon's project-file trash shares, local #120).
+const TRASH_MAX_AGE: Duration = rsi_common::trash_prune::TRASH_MAX_AGE;
 /// Rows moved per mouse-wheel notch.
 const MOUSE_SCROLL_ROWS: isize = 3;
 /// Finder results kept after scoring.

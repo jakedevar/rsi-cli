@@ -13,11 +13,15 @@
 //! - `title`        — AI-generated session title helpers
 //! - `types`        — supporting enums and structs
 
+mod agent_id_prefix;
 mod agent_jobs_verb;
+mod agent_landing_candidate_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
 mod agent_projects; // #1626
 mod effect_fence;
+mod operator_todos; // #1747
+pub(crate) mod standing_directives; // #2649
 pub(crate) mod tree_admission;
 pub(crate) use rsid_store::store::{agent_message_dispatcher, agent_message_reconciler};
 mod agent_read_events;
@@ -34,6 +38,7 @@ mod context_cap;
 mod context_pipeline;
 mod context_succession;
 mod daemon_info_verb;
+pub(crate) mod daemon_wait; // #2353
 mod delegated_operator;
 pub(crate) mod deploy_verb;
 mod esp_games;
@@ -43,32 +48,42 @@ pub(crate) mod graph_executions;
 pub(crate) mod graph_runner;
 pub(crate) mod harness;
 pub(crate) mod harness_hash;
+mod health_live; // #2747
 pub mod hierarchy;
 mod hierarchy_ops;
 mod index_status;
 mod labels;
 mod launch;
 pub(crate) mod lifecycle;
+pub use lifecycle::OperatorDrainDecision;
 pub(crate) mod manager_actions;
 mod manager_coordinator;
 mod manager_issue_worker; // #1100
 pub(crate) mod manager_ledger;
 mod manager_node_overview; // #1240
+mod manager_reseat; // #2750
 pub(crate) mod manager_reviews;
 mod manager_succession;
 mod monitor;
 mod outcome;
 mod pending_approvals;
+pub(crate) mod rpc_admission;
 pub(crate) use pending_approvals::remote_selected_native_approval;
+pub(crate) mod branch_custody;
 mod persistence;
 pub(crate) mod post_handoff;
 pub mod preamble;
 mod projects;
+pub(crate) mod provider_lifecycle_events;
 mod provider_model_validation;
 mod provider_spawn;
 mod provider_status_verb;
 mod queries;
 pub(crate) mod question;
+// On macOS the `/proc` holder inventory below is reachable only from tests (the
+// fake-proc seam); production uses the libproc scan in `reaper/holders_macos.rs`
+// (#102). Linux keeps the full dead-code check.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 mod reaper;
 mod remote_answers;
 pub mod retention;
@@ -76,15 +91,19 @@ mod rolling_queue_verb;
 mod satellite_message_verb;
 mod satellite_report_verb;
 mod tool_policy_launch;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 #[cfg(test)]
 pub(crate) use reaper::fail_runtime_orphan_reap_for_test;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use reaper::scoped_archive_cleanup_test_proc;
+pub(crate) mod cold_archive;
 pub(crate) mod recursive_bridge;
 pub(crate) mod retry_policy;
 mod rotation;
 mod rotation_coordinator;
 pub(crate) mod sandbox_purge;
+mod sandbox_purge_fence;
+mod settlement_audit_fence;
 pub mod spawn_coordinator;
 pub mod spawn_directive;
 mod spawn_single_flight;
@@ -97,9 +116,12 @@ pub(crate) mod topology_agent_verbs;
 pub(crate) mod topology_bridge;
 pub(crate) mod topology_ops;
 pub(crate) use rsid_store::store::session_transient_heal as transient_heal;
+mod list_wakes_verb; // #2389: AgentListWakes
+pub(crate) mod manager_question_stall;
 pub mod types;
 pub(crate) mod until_evaluator;
 pub(crate) mod worker_result_guard;
+mod worker_roster_verb; // #2311: AgentWorkerRoster
 mod workflows;
 
 #[cfg(test)]
@@ -153,75 +175,280 @@ use tokio::sync::RwLock;
 use types::{CompletedSession, TrackedSession};
 use uuid::Uuid;
 
-/// In-memory A6 authority registry with bounded lookup in both directions.
-/// Production establishment keeps exactly one current token per session.
-#[derive(Debug, Default)]
-pub(crate) struct AgentTokenRegistry {
-    by_token: HashMap<String, Uuid>,
-    by_session: HashMap<Uuid, String>,
+// Keep witness fields and issuance private to the registry, including from
+// other session submodules. Consumers can only copy an installed witness.
+mod agent_token_registry {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    /// Domain-separated verifier, never a transport credential. Validation
+    /// bounds hashing and preserves the exact minted lowercase-hex spelling.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct AgentTransportVerifier([u8; 32]);
+
+    impl AgentTransportVerifier {
+        fn from_bearer(token: &str) -> Option<Self> {
+            let bytes = token.as_bytes();
+            if bytes.len() != 64
+                || !bytes
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return None;
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"rsi-agent-transport-v1\0");
+            hash.update(bytes);
+            Some(Self(hash.finalize().into()))
+        }
+    }
+
+    /// Non-secret identity of one in-memory launch incarnation. This is neither
+    /// a transport credential nor an adopted activation or controller grant.
+    /// No serialization, Default, or constructor from caller-provided IDs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct AgentTransportWitness {
+        incarnation_id: Uuid,
+    }
+
+    /// Copied RPC identity. Only a registry resolution can create one; it
+    /// contains no bearer, verifier, serialized input or lock guard.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct BoundAgentCaller {
+        session_id: Uuid,
+        witness: AgentTransportWitness,
+        fresh_launch: bool,
+    }
+
+    impl BoundAgentCaller {
+        pub(crate) fn session_id(self) -> Uuid {
+            self.session_id
+        }
+
+        /// Unconverted UUID routes must never authorize adopted activations.
+        pub(crate) fn legacy_session_id(self) -> Option<Uuid> {
+            self.fresh_launch.then_some(self.session_id)
+        }
+    }
+
+    struct AgentTokenBinding {
+        verifier: AgentTransportVerifier,
+        witness: AgentTransportWitness,
+        // Non-secret launch provenance, not a credential or activation grant.
+        // Legacy UUID routes use it to refuse adopted callers.
+        fresh_launch: bool,
+    }
+
+    /// In-memory A6 authority registry with bounded lookup in both directions.
+    /// Production establishment keeps exactly one current token per session.
+    #[derive(Default)]
+    pub(crate) struct AgentTokenRegistry {
+        by_verifier: HashMap<AgentTransportVerifier, Uuid>,
+        by_session: HashMap<Uuid, AgentTokenBinding>,
+        // Synthetic launch capture for existing fixtures only. Production
+        // bindings have no bearer readback or retained credential strings.
+        #[cfg(test)]
+        fixture_tokens: HashMap<Uuid, rsi_common::rpc::AgentTransportBearer>,
+    }
+
+    impl std::fmt::Debug for AgentTokenBinding {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("AgentTokenBinding")
+                .field("verifier", &"<redacted>")
+                .field("witness", &self.witness)
+                .finish()
+        }
+    }
+
+    impl std::fmt::Debug for AgentTokenRegistry {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("AgentTokenRegistry")
+                .field("bindings", &self.by_session)
+                .finish()
+        }
+    }
+
+    impl crate::idea_control::AgentTransportBinding for AgentTokenRegistry {
+        type Witness = AgentTransportWitness;
+
+        fn binding_matches(&self, session_id: Uuid, expected: &Self::Witness) -> bool {
+            self.binding_matches(session_id, *expected)
+        }
+    }
+
+    impl AgentTokenRegistry {
+        pub(crate) fn get(&self, token: &str) -> Option<&Uuid> {
+            self.by_verifier
+                .get(&AgentTransportVerifier::from_bearer(token)?)
+        }
+
+        pub(crate) fn resolve_bound(&self, token: &str) -> Option<BoundAgentCaller> {
+            let session_id = *self.get(token)?;
+            let binding = self.by_session.get(&session_id)?;
+            Some(BoundAgentCaller {
+                session_id,
+                witness: binding.witness,
+                fresh_launch: binding.fresh_launch,
+            })
+        }
+
+        pub(crate) fn caller_matches(&self, caller: BoundAgentCaller) -> bool {
+            self.by_session
+                .get(&caller.session_id)
+                .is_some_and(|binding| {
+                    binding.witness == caller.witness && binding.fresh_launch == caller.fresh_launch
+                })
+        }
+
+        // There is deliberately no production adopted establishment API yet.
+        // The future activation gate must opt into fenced routes separately.
+        #[cfg(test)]
+        pub(crate) fn mark_adopted_for_test(&mut self, session_id: Uuid) {
+            self.by_session
+                .get_mut(&session_id)
+                .expect("seeded binding")
+                .fresh_launch = false;
+        }
+
+        #[cfg(test)]
+        pub(crate) fn token_for_session(&self, session_id: Uuid) -> Option<&str> {
+            self.fixture_tokens
+                .get(&session_id)
+                .map(|token| token.expose_for_transport())
+        }
+
+        #[cfg(test)]
+        pub(crate) fn verifier_for_session(&self, session_id: Uuid) -> Option<[u8; 32]> {
+            self.by_session
+                .get(&session_id)
+                .map(|binding| binding.verifier.0)
+        }
+
+        pub(crate) fn binding_for_session(
+            &self,
+            session_id: Uuid,
+        ) -> Option<AgentTransportWitness> {
+            self.by_session
+                .get(&session_id)
+                .map(|binding| binding.witness)
+        }
+
+        /// Compare while holding the registry guard at the admission boundary;
+        /// a copied witness alone carries no authority.
+        pub(crate) fn binding_matches(
+            &self,
+            session_id: Uuid,
+            expected: AgentTransportWitness,
+        ) -> bool {
+            self.binding_for_session(session_id) == Some(expected)
+        }
+
+        /// Called only by the production remint seam under its write guard.
+        pub(super) fn remint(
+            &mut self,
+            token: rsi_common::rpc::AgentTransportBearer,
+            session_id: Uuid,
+        ) -> AgentTransportWitness {
+            self.insert_binding(token, session_id);
+            self.binding_for_session(session_id)
+                .expect("just installed binding")
+        }
+
+        /// Test-only seeding also issues a fresh witness through the registry.
+        #[cfg(test)]
+        pub(crate) fn insert(&mut self, token: String, session_id: Uuid) -> Option<Uuid> {
+            self.insert_binding(token.into(), session_id)
+        }
+
+        fn insert_binding(
+            &mut self,
+            token: rsi_common::rpc::AgentTransportBearer,
+            session_id: Uuid,
+        ) -> Option<Uuid> {
+            let verifier = AgentTransportVerifier::from_bearer(token.expose_for_transport())
+                .expect("minted agent bearer must be 64 lowercase hexadecimal bytes");
+            let binding = AgentTokenBinding {
+                verifier,
+                witness: AgentTransportWitness {
+                    incarnation_id: Uuid::new_v4(),
+                },
+                fresh_launch: true,
+            };
+            if let Some(previous_binding) = self.by_session.insert(session_id, binding) {
+                self.by_verifier.remove(&previous_binding.verifier);
+            }
+            let previous_session = self.by_verifier.get(&verifier).copied();
+            if let Some(previous_session) = previous_session
+                && previous_session != session_id
+                && self
+                    .by_session
+                    .get(&previous_session)
+                    .is_some_and(|binding| binding.verifier == verifier)
+            {
+                self.by_session.remove(&previous_session);
+                #[cfg(test)]
+                self.fixture_tokens.remove(&previous_session);
+            }
+            self.by_verifier.insert(verifier, session_id);
+            #[cfg(test)]
+            self.fixture_tokens.insert(session_id, token);
+            previous_session
+        }
+
+        pub(crate) fn revoke_session(&mut self, session_id: Uuid) {
+            if let Some(binding) = self.by_session.remove(&session_id) {
+                self.by_verifier.remove(&binding.verifier);
+                #[cfg(test)]
+                self.fixture_tokens.remove(&session_id);
+            }
+        }
+
+        /// Revoke only the authority minted for one observed launch incarnation.
+        /// A later remint for the same logical Session must survive stale cleanup.
+        #[cfg(test)]
+        pub(crate) fn revoke_session_if_token(&mut self, session_id: Uuid, expected: &str) -> bool {
+            if self.get(expected) != Some(&session_id) {
+                return false;
+            }
+            self.revoke_session(session_id);
+            true
+        }
+
+        pub(crate) fn revoke_session_if_binding(
+            &mut self,
+            session_id: Uuid,
+            expected: AgentTransportWitness,
+        ) -> bool {
+            if !self.binding_matches(session_id, expected) {
+                return false;
+            }
+            self.revoke_session(session_id);
+            true
+        }
+
+        #[cfg(test)]
+        pub(crate) fn values(&self) -> impl Iterator<Item = &Uuid> {
+            self.by_verifier.values()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn len(&self) -> usize {
+            self.by_verifier.len()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn is_empty(&self) -> bool {
+            self.by_verifier.is_empty()
+        }
+    }
 }
 
-impl crate::idea_control::AgentTokenLookup for AgentTokenRegistry {
-    fn session_for_token(&self, token: &str) -> Option<Uuid> {
-        self.get(token).copied()
-    }
-}
-
-impl AgentTokenRegistry {
-    pub(crate) fn get(&self, token: &str) -> Option<&Uuid> {
-        self.by_token.get(token)
-    }
-
-    pub(crate) fn token_for_session(&self, session_id: Uuid) -> Option<&str> {
-        self.by_session.get(&session_id).map(String::as_str)
-    }
-
-    pub(crate) fn insert(&mut self, token: String, session_id: Uuid) -> Option<Uuid> {
-        if let Some(previous_token) = self.by_session.insert(session_id, token.clone()) {
-            self.by_token.remove(&previous_token);
-        }
-        let previous_session = self.by_token.get(&token).copied();
-        if let Some(previous_session) = previous_session
-            && previous_session != session_id
-            && self.by_session.get(&previous_session) == Some(&token)
-        {
-            self.by_session.remove(&previous_session);
-        }
-        self.by_token.insert(token, session_id);
-        previous_session
-    }
-
-    pub(crate) fn revoke_session(&mut self, session_id: Uuid) {
-        if let Some(token) = self.by_session.remove(&session_id) {
-            self.by_token.remove(&token);
-        }
-    }
-
-    /// Revoke only the authority minted for one observed launch incarnation.
-    /// A later remint for the same logical Session must survive stale cleanup.
-    pub(crate) fn revoke_session_if_token(&mut self, session_id: Uuid, expected: &str) -> bool {
-        if self.token_for_session(session_id) != Some(expected) {
-            return false;
-        }
-        self.revoke_session(session_id);
-        true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Uuid> {
-        self.by_token.values()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.by_token.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.by_token.is_empty()
-    }
-}
+pub(crate) use agent_token_registry::{
+    AgentTokenRegistry, AgentTransportWitness, BoundAgentCaller,
+};
 
 #[derive(Debug)]
 pub(super) enum ControllerCandidateCommitError {
@@ -283,6 +510,14 @@ pub async fn run_bounded_retry_dispatch<F, Fut>(
 pub(crate) type TopologyAgentSelf = Arc<std::sync::OnceLock<std::sync::Weak<SessionManager>>>;
 
 pub struct SessionManager {
+    /// Consecutive-pass memory of the automatic source-worktree settlement
+    /// outcomes (#2630): an outcome files an Issue only once it persists.
+    pub(crate) settlement_persistence:
+        Arc<std::sync::Mutex<crate::store::settlement_notice::SettlementPersistence>>,
+    /// Cohorts whose last automatic audit found nothing to apply, skipped while
+    /// their inputs stay identical inside a capped backoff (hub #3031). In
+    /// memory only; separate from the persistence streak above.
+    pub(crate) settlement_audit_fence: Arc<std::sync::Mutex<settlement_audit_fence::AuditFence>>,
     /// Deploy drain (#1073): holds new child work while a deploy waits.
     pub(crate) deploy_drain: Arc<crate::deploy_drain::DeployDrain>,
     /// Host-load admission (#1417): holds manager launches while the host's
@@ -292,6 +527,9 @@ pub struct SessionManager {
     pub(super) restart_draining: std::sync::atomic::AtomicBool,
     /// Operator-requested DRAIN restart, distinct from the hard signal path.
     pub(super) drain_restart_requested: std::sync::atomic::AtomicBool,
+    /// Control calls the daemon is serving, per session: a turn blocked only
+    /// on one of them does not hold up the DRAIN wait (#2353).
+    pub(crate) daemon_wait: Arc<daemon_wait::DaemonWaitRegistry>,
     pub(super) active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     pub(super) completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache,
@@ -357,10 +595,22 @@ pub struct SessionManager {
     /// Live runtime config for daemon-tunable values (e.g. retry_max_backoff_ms).
     /// Shared with RpcServer; reads are lock-free via atomics.
     pub(super) runtime_config: Arc<RuntimeConfig>,
+    /// Provider CLI login probes (#2753): a launch needing a logged-out CLI is
+    /// refused `provider_login_required` before any side effect.
+    pub(crate) provider_login: Arc<crate::provider_login::ProviderLoginService>,
+    /// Provider CLI contract canary (#2755): a Codex launch whose custody hook
+    /// the installed codex-cli does not trust is refused (setting-gated).
+    pub(crate) provider_contract: Arc<crate::provider_contract::ProviderContractService>,
     /// Serialises daemon-config writes (the operator `UpdateDaemonConfig`
     /// handler and the manager's `ProposeDaemonSetting`, #1046) so a
     /// read-modify-write of one setting cannot lose a concurrent write.
     pub(crate) daemon_config_update: tokio::sync::Mutex<()>,
+    /// Whether a cold-archive pass (#2384) is running; one at a time.
+    pub(crate) cold_archive_running: std::sync::atomic::AtomicBool,
+    /// Admission, cancel and quiescence of the cold-archive pass threads: a
+    /// supervised restart closes it, and the compaction helper starts only after
+    /// every pass thread has returned (#2384 review, #205).
+    pub(crate) cold_archive_lifecycle: Arc<crate::cold_archive_lifecycle::ArchiveLifecycle>,
     /// Per-session sandbox allocator. Consulted by launch_session when
     /// `LaunchConfig.sandbox` is `Some` and by Phase 3 cleanup hooks.
     pub(crate) sandbox_allocator: Arc<SandboxAllocator>,
@@ -370,6 +620,9 @@ pub struct SessionManager {
     pub(crate) sandbox_allocation_test_capacities: std::sync::Mutex<VecDeque<SandboxCapacity>>,
     #[cfg(test)]
     pub(crate) sandbox_allocation_test_pressure_pages: std::sync::atomic::AtomicUsize,
+    /// #2604: the cached `GetSandboxStorageStatus` preview.
+    pub(crate) sandbox_storage_preview: launch::SandboxStoragePreviewCache,
+    pub(crate) launch_hold_reclaim: launch::LaunchHoldReclaim,
     /// Daemon-global spawn coordinator. Consulted by `monitor_session` when
     /// it sees a `<docregblock>/spawn_child …</docregblock>` directive in
     /// assistant text. Holds per-Epic token buckets across sessions.
@@ -399,6 +652,13 @@ pub struct SessionManager {
     successor_reconcile_cursor:
         tokio::sync::Mutex<Option<crate::store::successor_reservations::AgentSuccessorCursor>>,
     manager_coordinator_cursor: tokio::sync::Mutex<Option<Uuid>>,
+    /// #2939: the coordinator's read-only connection (opened on first use) for
+    /// manager intent observations computed without the shared Store lock.
+    manager_intent_observer: Arc<std::sync::Mutex<Option<crate::store::Store>>>,
+    /// #333: the database file and a read-only connection of its own (opened on
+    /// first use) for whole-store aggregates read without the shared Store lock.
+    database_path: Option<std::path::PathBuf>,
+    aggregate_observer: Arc<std::sync::Mutex<Option<crate::store::Store>>>,
     /// #669: wrapping keyset cursor over policy-less V1 manager seats.
     manager_seat_v1_cursor: tokio::sync::Mutex<Option<Uuid>>,
     /// Successful durable baton commits whose exact Epic projection has not
@@ -436,6 +696,9 @@ pub struct SessionManager {
     pub(crate) manager_action_reconcile: tokio::sync::Mutex<()>,
     /// #1118: per-step launch deadline for manager create/replace actions.
     pub(crate) manager_launch_step_deadline: std::sync::Mutex<std::time::Duration>,
+    /// #2285 test-only trigger that expires a waiting launch step's deadline.
+    #[cfg(test)]
+    pub(crate) manager_launch_deadline_trigger: tokio::sync::Notify,
     /// Restart evidence is fixed for this daemon incarnation. A health read
     /// can return it even while another task holds the Store mutex.
     pub(crate) latest_daemon_restart: Option<rsi_common::rpc::DaemonRestartRecordV1>,
@@ -505,11 +768,30 @@ impl SessionManager {
         &self,
         reason: CatalogRefreshReason,
     ) -> Result<Vec<(String, String)>> {
+        Ok(self.discover_codex_catalog(reason).await?.models)
+    }
+
+    /// The Codex menu with this login's live catalog joined in (#2752).
+    pub(crate) async fn discover_codex_catalog(
+        &self,
+        reason: CatalogRefreshReason,
+    ) -> Result<crate::codex::CodexDiscovery> {
         if let Some(client) = self.codex_client.as_ref() {
-            return Ok(client.discover_models_with_reason(reason).await);
+            return Ok(client.discover_catalog_with_reason(reason).await);
         }
         let client = CodexClient::new(Arc::clone(&self.runtime_config))?;
-        Ok(client.discover_models_with_reason(reason).await)
+        Ok(client.discover_catalog_with_reason(reason).await)
+    }
+
+    /// This login's live Codex model list, or `None` when no Codex CLI can be
+    /// resolved (nothing to probe, so nothing to refuse).
+    pub(crate) async fn codex_live_catalog_view(
+        &self,
+    ) -> Option<crate::codex_live_catalog::CatalogView> {
+        // Resolved per lookup, like the launch-time catalog refresh, so the
+        // probe reads the CLI a launch would run.
+        let client = CodexClient::new(Arc::clone(&self.runtime_config)).ok()?;
+        Some(client.live_catalog_view().await)
     }
 
     /// Version-change refresh seam for launch/resume integration. A matching
@@ -588,6 +870,7 @@ impl SessionManager {
         // a boot-id MISMATCH may later be trusted as durable proof that a
         // crashed attempt produced no external effect.
         store.set_delivery_boot_id(Uuid::new_v4())?;
+        let database_path = store.database_path().map(std::path::PathBuf::from);
         let store = Arc::new(tokio::sync::Mutex::new(store));
         let (custody_settlements, custody_settlement_worker) =
             crate::sandbox::custody::CustodySettlementService::new(Arc::clone(&store))?;
@@ -677,12 +960,15 @@ impl SessionManager {
         }
 
         Ok(Self {
+            settlement_persistence: Arc::default(),
+            settlement_audit_fence: Arc::default(),
             deploy_drain: Arc::new(crate::deploy_drain::DeployDrain::new()),
             host_load: Arc::new(crate::host_load::HostLoadAdmission::new(Arc::clone(
                 &runtime_config,
             ))),
             restart_draining: std::sync::atomic::AtomicBool::new(false),
             drain_restart_requested: std::sync::atomic::AtomicBool::new(false),
+            daemon_wait: Arc::new(daemon_wait::DaemonWaitRegistry::default()),
             active: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
             completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache::new(),
@@ -720,18 +1006,27 @@ impl SessionManager {
             workspace_roots,
             tool_registry,
             runtime_config,
+            provider_login: crate::provider_login::ProviderLoginService::for_manager(),
+            provider_contract: crate::provider_contract::ProviderContractService::for_manager(),
             daemon_config_update: tokio::sync::Mutex::new(()),
+            cold_archive_running: std::sync::atomic::AtomicBool::new(false),
+            cold_archive_lifecycle: Arc::default(),
             sandbox_allocator,
             #[cfg(test)]
             sandbox_allocation_test_capacities: std::sync::Mutex::new(VecDeque::new()),
             #[cfg(test)]
             sandbox_allocation_test_pressure_pages: std::sync::atomic::AtomicUsize::new(0),
+            sandbox_storage_preview: launch::SandboxStoragePreviewCache::default(),
+            launch_hold_reclaim: launch::LaunchHoldReclaim::default(),
             spawn_coordinator,
             app_server_control,
             spawn_rx: Some(spawn_rx),
             successor_rx: Some(successor_rx),
             successor_reconcile_cursor: tokio::sync::Mutex::new(None),
             manager_coordinator_cursor: tokio::sync::Mutex::new(None),
+            manager_intent_observer: Arc::new(std::sync::Mutex::new(None)),
+            database_path,
+            aggregate_observer: Arc::new(std::sync::Mutex::new(None)),
             manager_seat_v1_cursor: tokio::sync::Mutex::new(None),
             successor_projection_pending: std::sync::Mutex::new(HashSet::new()),
             successor_uncertain_attempts: std::sync::Mutex::new(HashMap::new()),
@@ -742,6 +1037,8 @@ impl SessionManager {
             manager_launch_step_deadline: std::sync::Mutex::new(
                 manager_actions::MANAGER_LAUNCH_STEP_DEADLINE,
             ),
+            #[cfg(test)]
+            manager_launch_deadline_trigger: tokio::sync::Notify::new(),
             latest_daemon_restart,
             spawn_epoch: Arc::new(AtomicU64::new(1)),
             agent_message_arbiter,
@@ -770,9 +1067,91 @@ impl SessionManager {
         &self.sandbox_allocator
     }
 
+    /// The provider CLI login probes (#2753).
+    #[must_use]
+    pub fn provider_login(&self) -> &Arc<crate::provider_login::ProviderLoginService> {
+        &self.provider_login
+    }
+
+    /// The provider CLI contract canary (#2755).
+    #[must_use]
+    pub fn provider_contract(&self) -> &Arc<crate::provider_contract::ProviderContractService> {
+        &self.provider_contract
+    }
+
+    /// Run the provider CLI contract canary in the background for every CLI
+    /// whose cached result does not answer for the installed binary (#2755):
+    /// at daemon start (nothing cached) and on each manager-coordinator pass
+    /// (a stat of each binary; the CLI runs only when its version changed). The
+    /// Claude login probe finishes first, so the non-`--bare` OAuth check knows
+    /// whether the host logs in with OAuth.
+    pub fn spawn_provider_contract_check(&self) {
+        let contract = Arc::clone(&self.provider_contract);
+        let login = Arc::clone(&self.provider_login);
+        let runtime_config = Arc::clone(&self.runtime_config);
+        tokio::spawn(async move {
+            let enabled = runtime_config.provider_contract_canary_enabled();
+            let context = crate::provider_contract::CheckContext {
+                enabled,
+                claude_oauth_login: enabled
+                    && crate::provider_contract::claude_oauth_login(&login).await,
+                force: false,
+            };
+            contract.ensure_current_all(context).await;
+        });
+    }
+
     /// Access the backing store (for direct queries like model segments).
     pub fn store(&self) -> &Arc<tokio::sync::Mutex<Store>> {
         &self.store
+    }
+
+    /// #333 (hub #2998): run a read-only whole-store aggregate without the
+    /// shared Store lock. The read happens on a second, read-only connection to
+    /// the database file (WAL: it neither blocks nor is blocked by the daemon's
+    /// writers) and sees committed rows. A store with no file (an in-memory
+    /// fixture), or a read-only connection that cannot be opened, reads under
+    /// the Store lock as before.
+    pub async fn read_aggregate_off_store_lock<R, F>(&self, read: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: Fn(&Store) -> Result<R> + Send + 'static,
+    {
+        let store = Arc::clone(&self.store);
+        let observer = Arc::clone(&self.aggregate_observer);
+        let path = self.database_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = path else {
+                return read(&store.blocking_lock());
+            };
+            let mut slot = observer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                match Store::open_read_only_observer(&path) {
+                    Ok(opened) => *slot = Some(opened),
+                    Err(error) => {
+                        tracing::debug!(%error, "aggregate observer unavailable; reading under the Store lock");
+                        drop(slot);
+                        return read(&store.blocking_lock());
+                    }
+                }
+            }
+            let observed = match slot.as_ref() {
+                Some(observer) => read(observer),
+                None => return read(&store.blocking_lock()),
+            };
+            if observed.is_ok() {
+                return observed;
+            }
+            // Reopen on the next call rather than reuse a broken handle, and
+            // answer this one from the authoritative connection.
+            *slot = None;
+            drop(slot);
+            read(&store.blocking_lock())
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("Task join error: {error}")))?
     }
 
     /// Install the live Codegraph handle before this manager is published.
@@ -781,7 +1160,7 @@ impl SessionManager {
         self.codegraph_handle = Some(handle);
     }
 
-    /// Run one bounded, awaited Closure terminal-output recovery pass.
+    /// Run one bounded Closure terminal-output recovery pass.
     pub async fn reconcile_closure_outputs_after_restart(
         &self,
     ) -> Result<rsi_common::closure_kernel::ClosureOutputRecoveryResultV1> {
@@ -792,6 +1171,38 @@ impl SessionManager {
             None,
         )
         .await
+    }
+
+    /// #2375: the Closure startup recovery pass, then the periodic sweep loop.
+    /// Called from a task spawned after `request_ready`: it never gates RPC
+    /// acceptance, and the loop starts only after the startup pass so the two
+    /// never sweep concurrently.
+    pub async fn run_closure_output_recovery_after_readiness(self: Arc<Self>) {
+        match self.reconcile_closure_outputs_after_restart().await {
+            Ok(report)
+                if report.examined > 0
+                    || report.committed > 0
+                    || report.replayed > 0
+                    || report.deferred > 0 =>
+            {
+                tracing::info!(
+                    examined = report.examined,
+                    committed = report.committed,
+                    replayed = report.replayed,
+                    deferred = report.deferred,
+                    deadline_reached = report.deadline_reached,
+                    "Closure terminal-output startup reconciliation pass complete"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Closure terminal-output startup reconciliation deferred"
+                )
+            }
+        }
+        self.run_closure_output_reconciliation_loop();
     }
 
     /// Retry bounded Closure sweeps every five seconds. The cursor is retained
@@ -1004,13 +1415,20 @@ impl SessionManager {
 
     /// Resolve a `RpcRequest.session_token` to the session id it was minted
     /// for. Returns `None` for an unknown/stale token (e.g. daemon restarted
-    /// since the token was minted — agents re-read env on their next call).
+    /// since the token was minted). The inherited environment still contains
+    /// the old token; fresh process establishment is required to replace it.
     pub async fn resolve_agent_token(&self, token: &str) -> Option<Uuid> {
-        self.agent_tokens.read().await.get(token).copied()
+        self.resolve_bound_agent_caller(token)
+            .await?
+            .legacy_session_id()
+    }
+
+    pub(crate) async fn resolve_bound_agent_caller(&self, token: &str) -> Option<BoundAgentCaller> {
+        self.agent_tokens.read().await.resolve_bound(token)
     }
 
     /// Bind `ProgramRun` controller authority from the live incarnation, D03
-    /// semantic grant, and A6 token registries in the global lock order.
+    /// semantic grant, and exact A6 binding registries in the global lock order.
     pub(crate) async fn bind_program_run_controller_authority(
         &self,
         session_id: Uuid,
@@ -1027,9 +1445,8 @@ impl SessionManager {
             .controller_grant_witness_v1(session_id)
             .ok_or(crate::program_run_control::ProgramRunControlError::Forbidden)?;
         let tokens = self.agent_tokens.read().await;
-        let a6_token = tokens
-            .token_for_session(session_id)
-            .map(str::to_owned)
+        let a6_binding = tokens
+            .binding_for_session(session_id)
             .ok_or(crate::program_run_control::ProgramRunControlError::Forbidden)?;
         let handle = crate::program_run_control::ProgramRunControlHandle::new_with_live_witnesses(
             Arc::clone(&self.store),
@@ -1038,7 +1455,7 @@ impl SessionManager {
             Arc::clone(&self.agent_tokens),
             self.program_run_boot_id,
         );
-        let bound = handle.bind_controller(&grant, grant_incarnation, a6_token);
+        let bound = handle.bind_controller(&grant, grant_incarnation, a6_binding);
         drop(tokens);
         drop(store);
         drop(active);
@@ -1074,9 +1491,8 @@ impl SessionManager {
             .controller_grant_witness_v1(session_id)
             .ok_or(crate::program_run_control::ProgramRunControlError::Forbidden)?;
         let tokens = self.agent_tokens.read().await;
-        let a6_token = tokens
-            .token_for_session(session_id)
-            .map(str::to_owned)
+        let a6_binding = tokens
+            .binding_for_session(session_id)
             .ok_or(crate::program_run_control::ProgramRunControlError::Forbidden)?;
         let handle = crate::program_run_control::ProgramRunControlHandle::new_with_live_witnesses(
             Arc::clone(&self.store),
@@ -1085,7 +1501,7 @@ impl SessionManager {
             Arc::clone(&self.agent_tokens),
             self.program_run_boot_id,
         );
-        let bound = handle.bind_scheduler(&grant, boot_id, grant_incarnation, a6_token);
+        let bound = handle.bind_scheduler(&grant, boot_id, grant_incarnation, a6_binding);
         drop(tokens);
         drop(store);
         drop(active);
@@ -1229,7 +1645,11 @@ impl SessionManager {
 
     /// Thin `&self` convenience over [`remint_agent_token`] for call sites
     /// that hold the manager (fresh launch, continue).
-    pub(crate) async fn remint_session_token(&self, session_id: Uuid) -> String {
+    #[cfg(test)]
+    pub(crate) async fn remint_session_token(
+        &self,
+        session_id: Uuid,
+    ) -> rsi_common::rpc::AgentTransportBearer {
         remint_agent_token(&self.agent_tokens, session_id).await
     }
 
@@ -1244,7 +1664,7 @@ impl SessionManager {
         session_id: Uuid,
         project_id: Option<Uuid>,
         established_provider: rsi_common::types::SessionProvider,
-        prospective_token: &str,
+        prospective_binding: AgentTransportWitness,
     ) -> SameIdControllerGrantOutcome {
         let Some(project_id) = project_id else {
             store.lock().await.remove_controller_grant_v1(session_id);
@@ -1270,7 +1690,7 @@ impl SessionManager {
         let grant =
             store.reestablish_idea_controller_v1(session_id, project_id, established_provider);
         let a6 = agent_tokens.read().await;
-        if a6.get(prospective_token).copied() != Some(session_id) {
+        if !a6.binding_matches(session_id, prospective_binding) {
             store.remove_controller_grant_v1(session_id);
             return SameIdControllerGrantOutcome::EstablishmentInvalid;
         }
@@ -1308,14 +1728,45 @@ impl SessionManager {
         transfer: &crate::idea_control::IdeaControllerTransferHandle,
         reservation: &rsi_common::types::IdeaControllerReservationV1,
         confirmation: &rsi_common::types::IdeaControllerLaunchConfirmationV1,
-        prospective_token: &str,
+        prospective_binding: AgentTransportWitness,
         agent_tokens: &RwLock<AgentTokenRegistry>,
     ) -> std::result::Result<
         rsi_common::types::IdeaControllerControlResultV1,
         ControllerCandidateCommitError,
     > {
         let mut active_guard = active.write().await;
-        let Some(tracked) = active_guard.get_mut(&reservation.candidate_session_id) else {
+        Self::require_live_controller_candidate(&mut active_guard, reservation, confirmation)?;
+
+        #[cfg(test)]
+        launch::pause_controller_candidate_test(
+            reservation.candidate_session_id,
+            launch::ControllerCandidateTestPhase::AssignmentWitnessHeld,
+        )
+        .await;
+
+        let result = transfer
+            .assign_confirmed_guarded(
+                reservation,
+                confirmation,
+                &prospective_binding,
+                agent_tokens,
+            )
+            .await
+            .map_err(ControllerCandidateCommitError::Confirmation);
+        drop(active_guard);
+        result
+    }
+
+    /// The candidate's exact provider incarnation is installed, live and not
+    /// interrupted. Callers hold the Active write guard across the commit that
+    /// depends on it, so `interrupt_requested` is the shared cancellation
+    /// witness.
+    fn require_live_controller_candidate(
+        active: &mut HashMap<Uuid, TrackedSession>,
+        reservation: &rsi_common::types::IdeaControllerReservationV1,
+        confirmation: &rsi_common::types::IdeaControllerLaunchConfirmationV1,
+    ) -> std::result::Result<(), ControllerCandidateCommitError> {
+        let Some(tracked) = active.get_mut(&reservation.candidate_session_id) else {
             return Err(ControllerCandidateCommitError::Confirmation(
                 crate::idea_control::IdeaControlError::LaunchNotConfirmed,
             ));
@@ -1339,6 +1790,43 @@ impl SessionManager {
                 crate::idea_control::IdeaControlError::LaunchNotConfirmed,
             ));
         }
+        Ok(())
+    }
+
+    /// #1186: publish a live rotation whose successor is the reserved Idea
+    /// controller candidate. The controller assignment commits inside the
+    /// publication transaction (with the Epic lead pointer and the global
+    /// grant) and only while the exact installed provider incarnation stays
+    /// live and cannot be interrupted: the Active write guard is held across
+    /// the commit, as for [`Self::assign_live_controller_candidate`]. Before
+    /// the commit the candidate holds no controller authority, so a refused
+    /// publication leaves the predecessor's controller, epoch and grant as
+    /// they were. A failed candidate check or assignment is a
+    /// `rotation_controller_assignment_failed:<why>` `PolicyDenied`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn publish_rotation_assigning_live_controller_candidate(
+        active: &RwLock<HashMap<Uuid, TrackedSession>>,
+        transfer: &crate::idea_control::IdeaControllerTransferHandle,
+        reservation: &rsi_common::types::IdeaControllerReservationV1,
+        confirmation: &rsi_common::types::IdeaControllerLaunchConfirmationV1,
+        prospective_binding: AgentTransportWitness,
+        agent_tokens: &RwLock<AgentTokenRegistry>,
+        guards: &RotationPublicationGuards,
+        rotation_id: &str,
+        metadata: &str,
+    ) -> Result<crate::store::rotation_abandon::RotationPublication> {
+        let mut active_guard = active.write().await;
+        if let Err(error) =
+            Self::require_live_controller_candidate(&mut active_guard, reservation, confirmation)
+        {
+            let why = match error {
+                ControllerCandidateCommitError::Cancelled => "cancelled".to_string(),
+                ControllerCandidateCommitError::Confirmation(error) => error.to_string(),
+            };
+            return Err(DaemonError::PolicyDenied(format!(
+                "rotation_controller_assignment_failed:{why}"
+            )));
+        }
 
         #[cfg(test)]
         launch::pause_controller_candidate_test(
@@ -1348,11 +1836,86 @@ impl SessionManager {
         .await;
 
         let result = transfer
-            .assign_confirmed_guarded(reservation, confirmation, prospective_token, agent_tokens)
-            .await
-            .map_err(ControllerCandidateCommitError::Confirmation);
+            .publish_rotation_assigning(
+                guards,
+                rotation_id,
+                metadata,
+                reservation,
+                confirmation,
+                &prospective_binding,
+                agent_tokens,
+            )
+            .await;
         drop(active_guard);
         result
+    }
+
+    /// #1186: follow a rotation publication that moved an Idea controller to
+    /// the published successor. The durable move is already committed with the
+    /// lead pointer and the grant; this settles the process-local half. The
+    /// former holder's semantic grant is dropped (its epoch is stale), the
+    /// successor's is re-established from the durable assignment when its
+    /// provider is live (a successor that is not live gets its grant at its
+    /// next same-ID continuation), and subscribers see the committed event.
+    pub(super) async fn settle_rotation_controller_moves(
+        active: &RwLock<HashMap<Uuid, TrackedSession>>,
+        store: &tokio::sync::Mutex<Store>,
+        agent_tokens: &RwLock<AgentTokenRegistry>,
+        event_bus: &EventBus,
+        moves: &[crate::store::rotation_abandon::RotationControllerMove],
+    ) {
+        for moved in moves {
+            store
+                .lock()
+                .await
+                .remove_controller_grant_v1(moved.former_session_id);
+            // A live rotation's assignment installed the successor's grant in
+            // the publication; do not replace it (that would change its
+            // incarnation for no reason).
+            let grant_installed = store
+                .lock()
+                .await
+                .controller_grant_v1(moved.successor_session_id)
+                .is_some_and(|grant| grant.controller_epoch() == moved.controller_epoch);
+            let live_provider = if grant_installed {
+                None
+            } else {
+                active
+                    .read()
+                    .await
+                    .get(&moved.successor_session_id)
+                    .map(|tracked| tracked.session.provider)
+            };
+            if let Some(provider) = live_provider {
+                let binding = agent_tokens
+                    .read()
+                    .await
+                    .binding_for_session(moved.successor_session_id);
+                if let Some(binding) = binding {
+                    let outcome = Self::reconstruct_live_same_id_controller_grant(
+                        active,
+                        store,
+                        agent_tokens,
+                        moved.successor_session_id,
+                        Some(moved.project_id),
+                        provider,
+                        binding,
+                    )
+                    .await;
+                    if outcome != SameIdControllerGrantOutcome::Installed {
+                        tracing::warn!(
+                            idea_id = %moved.idea_id,
+                            successor = %moved.successor_session_id,
+                            "Rotation moved the Idea controller to a successor whose semantic grant was not installed"
+                        );
+                    }
+                }
+            }
+            event_bus.publish(crate::bus::DaemonEvent::SystemMessage {
+                level: "info".to_string(),
+                message: format!("idea_controller_assigned:{}", moved.event_id),
+            });
+        }
     }
 }
 
@@ -1362,8 +1925,8 @@ impl SessionManager {
 /// guard against a *confused* agent calling raw daemon verbs. Composed from
 /// two v4 UUIDs (256 bits from the OS CSPRNG via `getrandom`) to keep
 /// guessability negligible without adding a new dependency.
-fn generate_session_token() -> String {
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+fn generate_session_token() -> rsi_common::rpc::AgentTransportBearer {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).into()
 }
 
 /// Revoke-then-mint a session's authority token (A6 re-mint semantics,
@@ -1382,12 +1945,22 @@ fn generate_session_token() -> String {
 pub(super) async fn remint_agent_token(
     agent_tokens: &RwLock<AgentTokenRegistry>,
     session_id: Uuid,
-) -> String {
+) -> rsi_common::rpc::AgentTransportBearer {
+    remint_agent_token_with_witness(agent_tokens, session_id)
+        .await
+        .0
+}
+
+/// Capture the opaque launch incarnation atomically with token issuance.
+/// Coordinators retain this copy, never the bearer, for later establishment.
+pub(super) async fn remint_agent_token_with_witness(
+    agent_tokens: &RwLock<AgentTokenRegistry>,
+    session_id: Uuid,
+) -> (rsi_common::rpc::AgentTransportBearer, AgentTransportWitness) {
     let token = generate_session_token();
     let mut map = agent_tokens.write().await;
-    map.revoke_session(session_id);
-    map.insert(token.clone(), session_id);
-    token
+    let witness = map.remint(token.clone(), session_id);
+    (token, witness)
 }
 
 /// Drop every token registered for `session_id` without minting a
@@ -1544,6 +2117,15 @@ fn compose_watch_line(
     if question_pending {
         annotations.push("question-pending: true".to_string());
     }
+    // #31: the provider ended the turn at a rejected tool call. The lead
+    // gets the typed cause and the exact id to continue before it archives
+    // the child; a dirty sandbox is named just below.
+    if session.terminal_reason.as_deref() == Some(crate::monitor::PROVIDER_TOOL_REJECTED_REASON) {
+        annotations.push(format!(
+            "stopped-at-rejected-tool: true; recover: AgentContinueChild {}",
+            session.id
+        ));
+    }
     if sandbox_worktree_dirty == Some(true) {
         annotations.push("sandbox-worktree-dirty: true".to_string());
     }
@@ -1577,6 +2159,7 @@ impl SessionManager {
         &self,
         watched: Uuid,
         ordinary_child_watch: bool,
+        watch_owner: Uuid,
     ) -> Result<(WatchDecision, Option<rsi_common::types::Session>)> {
         let row = {
             let store = self.store.lock().await;
@@ -1597,6 +2180,22 @@ impl SessionManager {
             retry_eligible,
             live_retry_timer,
         );
+        // #1930, #2109: a worker that failed on provider capacity is resumed
+        // (same session) and then relaunched by the daemon; hold the watch so
+        // the manager hears only once every attempt failed.
+        if matches!(decision, WatchDecision::Fire { .. })
+            && row
+                .as_ref()
+                .is_some_and(|s| s.status == rsi_common::types::SessionStatus::Failed)
+            && self
+                .store
+                .lock()
+                .await
+                .capacity_recovery_holds_watch(watched, chrono::Utc::now())
+                .unwrap_or(false)
+        {
+            decision = WatchDecision::NotReady;
+        }
         // #1109: a Completed worker whose automatic no-result continuation is
         // still armed is not done: hold the watch. It fires on the final
         // Completed, or once the continuation is retired or declined.
@@ -1626,6 +2225,22 @@ impl SessionManager {
                 .worker_terminal_watch_pending(session)?
         {
             decision = WatchDecision::NotReady;
+        }
+        // #1755: portfolio watches observe the manager's lifetime, including
+        // idle turns spent waiting on its children. Keep the worker no-result
+        // and durable manager-notice policies independent.
+        if ordinary_child_watch
+            && matches!(decision, WatchDecision::Fire { .. })
+            && let Some(session) = row.as_ref()
+            && session.status == rsi_common::types::SessionStatus::Completed
+        {
+            let store = self.store.lock().await;
+            if (store.global_seat_reads_manager(watch_owner, watched)?
+                || store.portfolio_seat_reach(watch_owner, watched, false)?)
+                && store.portfolio_terminal_watch_pending(session)?
+            {
+                decision = WatchDecision::NotReady;
+            }
         }
         Ok((decision, row))
     }
@@ -1763,7 +2378,9 @@ impl SessionManager {
                 "watched session {watched} no longer exists"
             )));
         };
-        let (decision, row) = self.watch_decision_for(subject, !manager_notice).await?;
+        let (decision, row) = self
+            .watch_decision_for(subject, !manager_notice, master)
+            .await?;
         let mut recipient_idle_wake = false;
         let (retry_eligible, question_pending) = match decision {
             WatchDecision::NotReady => {
@@ -1808,6 +2425,63 @@ impl SessionManager {
                 "wake target {master} no longer exists"
             )));
         };
+
+        // 2.0 #2422/#2463: a manager whose `succeed_manager` is queued or
+        // executing is handing the seat over, and resuming it for a ROUTINE
+        // notice (#2322 classification) starts a needless invocation that
+        // refuses the succession as `manager_succession_predecessor_changed`.
+        // Routine notices stay durable and pending for the successor, so the
+        // transport stays armed but quiet. A notice that needs a decision (a
+        // terminal event, an operator answer, an approval, a question, a
+        // failure) is never held: the manager must see it, and a succession
+        // it disturbs is refused retryably.
+        if durable_manager_notice {
+            let store = self.store.lock().await;
+            if store.manager_notice_undelivered_wake_count(job.id)? == 0
+                && (store.session_has_unresolved_manager_succession(tip)?
+                    || store.session_has_unresolved_manager_succession(master)?)
+            {
+                return Ok(WatchFirePlan::NotReady);
+            }
+        }
+
+        // 2.1 #2038: an Archived or Deleted wake target can never be resumed,
+        // so retire the ordinary watch once, typed, instead of refusing the
+        // delivery every tick forever. Busy and other transient states fall
+        // through to the normal retry path. The same check retires watches
+        // already stuck before this check shipped, on their next fire.
+        if manager_route.is_none() {
+            let status = self
+                .store
+                .lock()
+                .await
+                .get_session(tip)?
+                .map(|session| session.status);
+            if let Some(
+                status @ (rsi_common::types::SessionStatus::Archived
+                | rsi_common::types::SessionStatus::Deleted),
+            ) = status
+            {
+                return Ok(WatchFirePlan::Abandon(format!(
+                    "{WATCH_ABANDON_WAKE_TARGET_RETIRED}: wake target {master} (tip {tip}) is {status:?}"
+                )));
+            }
+        }
+
+        // 2.2 #2501: a worker that already wrote its final handoff is not
+        // resumed to hear that its manager or launcher ended. Retire the watch.
+        if manager_route.is_none() && !manager_notice {
+            let finished = self.store.lock().await.finished_worker_launcher_watch(
+                tip,
+                &[watched, subject],
+                &job.name,
+            )?;
+            if finished {
+                return Ok(WatchFirePlan::Abandon(format!(
+                    "{WATCH_ABANDON_OWNER_FINISHED}: wake target {tip} already handed off"
+                )));
+            }
+        }
 
         // 2a. Delivery confirmation (issue #12).
         //
@@ -1982,7 +2656,7 @@ impl SessionManager {
                 continue;
             };
             let (mut sib_decision, sib_row) = self
-                .watch_decision_for(sib_subject, !sibling_managed)
+                .watch_decision_for(sib_subject, !sibling_managed, sib_master)
                 .await?;
             if sib_decision == WatchDecision::NotReady
                 && sibling_durable_manager_notice
@@ -2195,6 +2869,12 @@ impl SessionManager {
     }
 }
 
+/// #2038: typed prefix of the abandon reason for a watch whose wake target is
+/// permanently unable to continue (Archived or Deleted).
+pub(crate) const WATCH_ABANDON_WAKE_TARGET_RETIRED: &str = "wake_target_archived";
+/// #2501: the watch owner already handed off, so a launcher notice is moot.
+pub(crate) const WATCH_ABANDON_OWNER_FINISHED: &str = "owner_handed_off";
+
 /// Typed code of a refused watch delivery: the continuation fence code, else
 /// the `sandbox_custody:<code>` token the launch refusal carries, else
 /// `continue_failed`.
@@ -2331,6 +3011,18 @@ impl crate::issue_tracker::poller::SessionLauncher for SessionManager {
         if !active {
             transient_heal::heal_failed_session(&self.store, &self.event_bus, target).await;
         }
+    }
+
+    fn restart_draining(&self) -> bool {
+        self.restart_draining
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn health_live_inputs(
+        &self,
+        scope: &crate::health_anomaly::Scope,
+    ) -> crate::health_anomaly::LiveHealthInputs {
+        self.health_live_inputs_for(scope).await
     }
 
     async fn deploy_holds_resume(&self, target: Uuid) -> bool {

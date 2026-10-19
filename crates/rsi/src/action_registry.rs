@@ -31,6 +31,9 @@ pub enum ActionId {
     SettingsEnable,
     SettingsMoveColumnUp,
     SettingsMoveColumnDown,
+    SettingsStepNext,
+    SettingsStepPrevious,
+    SettingsApply,
     SettingsRefresh,
     ProviderKeySet,
     ProviderKeyRotate,
@@ -42,6 +45,7 @@ pub enum ActionId {
     Refresh,
     OpenThemePicker,
     OpenIssuesWorkspace,
+    OpenIssueNumber,
     /// Harness manager views reached through the `<Space>g` leader subnamespace.
     ManagerPolicy,
     ManagerBoard,
@@ -81,6 +85,12 @@ pub enum ActionId {
     IssuePreviousTab,
     IssueNextTab,
     IssueSearch,
+    IssueGoToNumber,
+    IssueOperatorFilter,
+    IssueDetailNext,
+    IssueDetailPrevious,
+    IssueDetailActivate,
+    IssueDetailBack,
     IssueFilter,
     IssueSort,
     IssueJumpArm,
@@ -111,6 +121,9 @@ pub enum ActionId {
     DeleteSession,
     RotateSession,
     AbandonRotation,
+    ReseatManager,
+    ColdRestore,
+    ColdArchive,
     Archives,
     Model,
     Sessions,
@@ -197,6 +210,16 @@ pub enum ActionId {
     ReassignProject,
     ToggleRotation,
     CancelRetry,
+    TodoPanel,
+    TodoNext,
+    TodoPrev,
+    TodoOpenLink,
+    TodoDone,
+    TodoDismiss,
+    TodoCopy,
+    TodoAcknowledge,
+    TodoPopup,
+    TodoUndo,
     CommitAndPush,
     OpenSessionInNewTab,
     GitPanel,
@@ -211,6 +234,7 @@ pub enum ActionId {
     ScheduleBrowserOpen,
     EspSquare,
     RunEpicTopology,
+    LandSession,
     CreateGroup,
     CreateEpic,
     CreateStory,
@@ -295,6 +319,7 @@ pub enum AvailabilitySelector {
     SettingsDelete,
     SettingsEnable,
     SettingsMoveColumn,
+    SettingsApply,
     SettingsRefresh,
     ProviderKeys,
     Navigation,
@@ -516,6 +541,8 @@ pub struct ActionContext {
     pub settings_row_editable: bool,
     pub settings_row_deletable: bool,
     pub settings_row_enableable: bool,
+    /// Staged Settings edits not yet applied (#2241).
+    pub settings_pending: usize,
 }
 
 impl Default for ActionContext {
@@ -573,6 +600,7 @@ impl Default for ActionContext {
             settings_row_editable: false,
             settings_row_deletable: false,
             settings_row_enableable: false,
+            settings_pending: 0,
         }
     }
 }
@@ -712,12 +740,25 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
         }
         SettingsSection::EditingMode
         | SettingsSection::ModelControl
+        | SettingsSection::CloudSpend
         | SettingsSection::RetriesRecovery
+        | SettingsSection::ContextRotation
         | SettingsSection::StallDetection
-        | SettingsSection::Orchestration
+        | SettingsSection::Scheduling
+        | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
         | SettingsSection::ProviderIsolation
-        | SettingsSection::SandboxStorage => {
+        | SettingsSection::ProviderSubagents
+        | SettingsSection::ProviderSkills
+        | SettingsSection::ApiRoutes
+        | SettingsSection::HarnessTools
+        | SettingsSection::ResourceLimits
+        | SettingsSection::BuildGovernor
+        | SettingsSection::MergeQueue
+        | SettingsSection::SandboxStorage
+        | SettingsSection::ColdStorage
+        | SettingsSection::BuildCache
+        | SettingsSection::AgentBuilds => {
             unreachable!("handled by the DAEMON_FEATURE_SECTIONS early return above")
         }
     }
@@ -879,6 +920,7 @@ impl ActionContext {
                 context.settings_row_editable = facts.editable;
                 context.settings_row_deletable = facts.deletable;
                 context.settings_row_enableable = facts.enableable;
+                context.settings_pending = crate::settings_staging::pending_count(app);
                 if app.settings_state.section == SettingsSection::ThemeColors {
                     context.selected_theme_role =
                         crate::settings_keys::theme_role_for_settings_index(
@@ -925,7 +967,8 @@ impl ActionContext {
                         .as_ref()
                         .is_some_and(|editor| match editor.mode {
                             crate::types::IssueEditorMode::Filter => {
-                                matches!(editor.active_field, 0 | 4 | 8)
+                                // Field 1 is the search: Enter applies it (#2381).
+                                matches!(editor.active_field, 0 | 1 | 4 | 8)
                             }
                             crate::types::IssueEditorMode::Status { .. } => true,
                             crate::types::IssueEditorMode::Dependency { .. } => {
@@ -1164,6 +1207,9 @@ const SETTINGS_DELETE_ITEM: &[ActionBinding] = &[binding("d", ActionRoute::Setti
 const SETTINGS_ENABLE: &[ActionBinding] = &[binding("e", ActionRoute::Settings)];
 const SETTINGS_MOVE_COLUMN_UP: &[ActionBinding] = &[binding("K", ActionRoute::Settings)];
 const SETTINGS_MOVE_COLUMN_DOWN: &[ActionBinding] = &[binding("J", ActionRoute::Settings)];
+const SETTINGS_STEP_NEXT: &[ActionBinding] = &[binding("+", ActionRoute::Settings)];
+const SETTINGS_STEP_PREVIOUS: &[ActionBinding] = &[binding("-", ActionRoute::Settings)];
+const SETTINGS_APPLY: &[ActionBinding] = &[binding("w", ActionRoute::Settings)];
 const SETTINGS_REFRESH: &[ActionBinding] = &[binding("R", ActionRoute::Settings)];
 const PROVIDER_KEY_SET: &[ActionBinding] = &[binding("s", ActionRoute::Settings)];
 const PROVIDER_KEY_ROTATE: &[ActionBinding] = &[binding("r", ActionRoute::Settings)];
@@ -1272,6 +1318,19 @@ const NORMAL_SWITCH_SESSION_MODEL: &[ActionBinding] = &[binding("<Space>mm", Act
 const NORMAL_REASSIGN_PROJECT: &[ActionBinding] = &[binding("<Space>C", ActionRoute::Normal)];
 const NORMAL_TOGGLE_ROTATION: &[ActionBinding] = &[binding("<Space>r", ActionRoute::Normal)];
 const NORMAL_CANCEL_RETRY: &[ActionBinding] = &[binding("<Space>k", ActionRoute::Normal)];
+const NORMAL_TODO_PANEL: &[ActionBinding] = &[binding("<Space>dt", ActionRoute::Normal)];
+const NORMAL_TODO_NEXT: &[ActionBinding] = &[binding("<Space>dj", ActionRoute::Normal)];
+const NORMAL_TODO_PREV: &[ActionBinding] = &[binding("<Space>dk", ActionRoute::Normal)];
+const NORMAL_TODO_OPEN_LINK: &[ActionBinding] = &[binding("<Space>do", ActionRoute::Normal)];
+const NORMAL_TODO_DONE: &[ActionBinding] = &[binding("<Space>dd", ActionRoute::Normal)];
+const NORMAL_TODO_DISMISS: &[ActionBinding] = &[binding("<Space>dx", ActionRoute::Normal)];
+const NORMAL_TODO_COPY: &[ActionBinding] = &[
+    binding("<Space>dy", ActionRoute::Normal),
+    binding("<Space>dc", ActionRoute::Normal),
+];
+const NORMAL_TODO_POPUP: &[ActionBinding] = &[binding("<Space>dv", ActionRoute::Normal)];
+const NORMAL_TODO_UNDO: &[ActionBinding] = &[binding("<Space>du", ActionRoute::Normal)];
+const NORMAL_TODO_ACKNOWLEDGE: &[ActionBinding] = &[binding("<Space>da", ActionRoute::Normal)];
 const NORMAL_COMMIT_AND_PUSH: &[ActionBinding] = &[binding("<Space>x", ActionRoute::Normal)];
 const NORMAL_OPEN_SESSION_IN_NEW_TAB: &[ActionBinding] =
     &[binding("<Space>T", ActionRoute::Normal)];
@@ -1297,6 +1356,7 @@ const NORMAL_MEMORY_SEARCH: &[ActionBinding] = &[binding("<Space>M", ActionRoute
 const NORMAL_SCHEDULE_BROWSER_OPEN: &[ActionBinding] = &[binding("<Space>K", ActionRoute::Normal)];
 const NORMAL_ESP_SQUARE: &[ActionBinding] = &[binding("<Space>gc", ActionRoute::Normal)];
 const NORMAL_RUN_EPIC_TOPOLOGY: &[ActionBinding] = &[binding("gR", ActionRoute::Normal)];
+const NORMAL_LAND_SESSION: &[ActionBinding] = &[binding("<Space>gl", ActionRoute::Normal)];
 const NORMAL_CREATE_GROUP: &[ActionBinding] = &[binding("<Space>G", ActionRoute::Normal)];
 const NORMAL_CREATE_EPIC: &[ActionBinding] = &[binding("<Space>E", ActionRoute::Normal)];
 const NORMAL_CREATE_STORY: &[ActionBinding] = &[binding("<Space>gS", ActionRoute::Normal)];
@@ -1337,6 +1397,12 @@ const ISSUE_COPY_NUMBER: &[ActionBinding] = &[binding("y#", ActionRoute::IssueTr
 const ISSUE_PREVIOUS_TAB: &[ActionBinding] = &[binding("[", ActionRoute::IssueTracker)];
 const ISSUE_NEXT_TAB: &[ActionBinding] = &[binding("]", ActionRoute::IssueTracker)];
 const ISSUE_SEARCH: &[ActionBinding] = &[binding("/", ActionRoute::IssueTracker)];
+const ISSUE_GO_TO_NUMBER: &[ActionBinding] = &[binding("#", ActionRoute::IssueTracker)];
+const ISSUE_OPERATOR_FILTER: &[ActionBinding] = &[binding("O", ActionRoute::IssueTracker)];
+const ISSUE_DETAIL_NEXT: &[ActionBinding] = &[binding("}", ActionRoute::IssueTracker)];
+const ISSUE_DETAIL_PREVIOUS: &[ActionBinding] = &[binding("{", ActionRoute::IssueTracker)];
+const ISSUE_DETAIL_ACTIVATE: &[ActionBinding] = &[binding("o", ActionRoute::IssueTracker)];
+const ISSUE_DETAIL_BACK: &[ActionBinding] = &[binding("B", ActionRoute::IssueTracker)];
 const ISSUE_FILTER: &[ActionBinding] = &[binding("f", ActionRoute::IssueTracker)];
 const ISSUE_SORT: &[ActionBinding] = &[binding("s", ActionRoute::IssueTracker)];
 const ISSUE_JUMP_ARM: &[ActionBinding] = &[binding("g", ActionRoute::IssueTracker)];
@@ -1604,6 +1670,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         bindings: NORMAL_ISSUES_WORKSPACE,
         command_aliases: &["issues"],
         command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::OpenIssueNumber,
+        label: "Open an issue by number",
+        summary: "Opens the Issues workspace on the issue with the given number (`:issue 2377` or `:issue #2377`), including closed and archived issues; without a number it opens the go-to-number prompt.",
+        category: "OPERATOR VIEWS",
+        bindings: &[],
+        command_aliases: &["issue"],
+        command_argument: CommandArgument::Optional,
         availability: AvailabilitySelector::Always,
         show_in_help: true,
     },
@@ -1880,6 +1957,39 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::SettingsMoveColumn,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::SettingsStepNext,
+        label: "Step setting up",
+        summary: "Moves the selected setting to its next value (switches on): numeric rows stop at their maximum, choices wrap. The value is staged until you apply with w.",
+        category: "SETTINGS",
+        bindings: SETTINGS_STEP_NEXT,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::SettingsEditable,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::SettingsStepPrevious,
+        label: "Step setting down",
+        summary: "Moves the selected setting to its previous value (switches off): numeric rows stop at their minimum, choices wrap. The value is staged until you apply with w.",
+        category: "SETTINGS",
+        bindings: SETTINGS_STEP_PREVIOUS,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::SettingsEditable,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::SettingsApply,
+        label: "Apply pending settings",
+        summary: "Applies every staged setting at once: ONE atomic daemon update carries every changed field with its final value (all of them take effect or none do), plus the local preferences. Esc or q discards them instead.",
+        category: "SETTINGS",
+        bindings: SETTINGS_APPLY,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::SettingsApply,
         show_in_help: true,
     },
     ActionDescriptor {
@@ -2301,6 +2411,72 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::IssueGoToNumber,
+        label: "Go to issue number",
+        summary: "Prompts for an issue number and opens that issue, including closed and archived ones.",
+        category: "ISSUES",
+        bindings: ISSUE_GO_TO_NUMBER,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocal,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueOperatorFilter,
+        label: "Show only operator requests and decisions",
+        summary: "Toggles a filter that keeps only Issues labelled operator-request or operator-decision; press again to show every Issue.",
+        category: "ISSUES",
+        bindings: ISSUE_OPERATOR_FILTER,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocal,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueDetailNext,
+        label: "Next detail item",
+        summary: "Moves the inspector cursor to the next folding handoff or review section or related Issue.",
+        category: "ISSUES",
+        bindings: ISSUE_DETAIL_NEXT,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocalInspector,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueDetailPrevious,
+        label: "Previous detail item",
+        summary: "Moves the inspector cursor to the previous folding section or related Issue.",
+        category: "ISSUES",
+        bindings: ISSUE_DETAIL_PREVIOUS,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocalInspector,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueDetailActivate,
+        label: "Open or fold detail item",
+        summary: "Folds or unfolds the section under the inspector cursor, or opens the related Issue under it.",
+        category: "ISSUES",
+        bindings: ISSUE_DETAIL_ACTIVATE,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocalInspector,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueDetailBack,
+        label: "Back to the previous Issue",
+        summary: "Returns to the Issue you followed a related link from.",
+        category: "ISSUES",
+        bindings: ISSUE_DETAIL_BACK,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocalInspector,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::IssueFilter,
         label: "Edit filters and saved views",
         summary: "Edits the issue filters and saved views.",
@@ -2520,6 +2696,39 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &["rotation-abandon"],
         command_argument: CommandArgument::Optional,
         availability: AvailabilitySelector::SessionList,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ReseatManager,
+        label: "Reseat failed manager",
+        summary: "Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm.",
+        category: "SESSION",
+        bindings: &[],
+        command_aliases: &["manager-reseat"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::SessionList,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ColdRestore,
+        label: "Restore from cold storage",
+        summary: "Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way.",
+        category: "SESSION",
+        bindings: &[],
+        command_aliases: &["cold-restore"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ColdArchive,
+        label: "Cold-storage archive",
+        summary: "`:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart.",
+        category: "OPERATOR VIEWS",
+        bindings: &[],
+        command_aliases: &["cold-archive"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
         show_in_help: true,
     },
     ActionDescriptor {
@@ -2910,7 +3119,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::ManagerPortfolio,
         label: "Manager portfolio nodes",
-        summary: "Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one.",
+        summary: "Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `launch add|remove <node> <Provider/model[/effort]>...` (adds or removes launches on the node's current grant), `configure <JSON>` and `revoke <node>` inspect or change one.",
         category: "MANAGER",
         bindings: &[],
         command_aliases: &["manager portfolio"],
@@ -3436,6 +3645,116 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::TodoPanel,
+        label: "Operator to-do panel",
+        summary: "Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_PANEL,
+        command_aliases: &["todo"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoNext,
+        label: "To-do: next item",
+        summary: "Moves the operator to-do cursor to the next item (opens the panel first when it is hidden).",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_NEXT,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoPrev,
+        label: "To-do: previous item",
+        summary: "Moves the operator to-do cursor to the previous item.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_PREV,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoOpenLink,
+        label: "To-do: open link",
+        summary: "Opens the selected to-do item's linked Issue, session or URL.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_OPEN_LINK,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoDone,
+        label: "To-do: mark done",
+        summary: "Marks the selected operator to-do item done after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_DONE,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoDismiss,
+        label: "To-do: dismiss",
+        summary: "Dismisses the selected operator to-do item without doing it after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_DISMISS,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoCopy,
+        label: "To-do: copy command",
+        summary: "Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_COPY,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoPopup,
+        label: "To-do: open pop-up",
+        summary: "Opens the selected operator to-do item in a pop-up with its full title, priority, link and the complete command text, and the yank, done, dismiss and open-link actions.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_POPUP,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoUndo,
+        label: "To-do: undo close",
+        summary: "Reopens the operator to-do item you just marked done or dismissed, within 60 seconds of the close.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_UNDO,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::TodoAcknowledge,
+        label: "To-do: caught up",
+        summary: "Clears the new and closed-since-last-visit highlights in the operator to-do panel.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_TODO_ACKNOWLEDGE,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::CommitAndPush,
         label: "Commit and push",
         summary: "Continues the selected session with `/ci_commit` to commit and push its work.",
@@ -3585,6 +3904,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         category: "HIERARCHY",
         bindings: NORMAL_RUN_EPIC_TOPOLOGY,
         command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::LandSession,
+        label: "Land session branch",
+        summary: "Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it.",
+        category: "OPERATOR VIEWS",
+        bindings: NORMAL_LAND_SESSION,
+        command_aliases: &["land"],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
         show_in_help: true,
@@ -4055,6 +4385,7 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 && context.settings_category == SettingsSection::ProviderKeys
                 && context.settings_row_exists
         }
+        SettingsApply => context.surface == ActionSurface::Settings && context.settings_pending > 0,
         SettingsRefresh => {
             context.surface == ActionSurface::Settings
                 && context.settings_focus == SettingsFocus::Items
@@ -4095,6 +4426,7 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
                 ContextualOpen => "no selection to open",
                 ContextHelp => "text entry owns printable question marks",
                 SettingsRefresh => "daemon-backed settings are unavailable while disconnected",
+                SettingsApply => "no pending settings changes",
                 _ => "action is unavailable in this context",
             },
         }
@@ -4248,7 +4580,10 @@ fn normalized_key(key: KeyEvent, context: &ActionContext) -> Option<&'static str
         return Some("Ctrl-Alt-G");
     }
     let shifted_uppercase = key.modifiers == KeyModifiers::SHIFT
-        && matches!(key.code, KeyCode::Char(value) if value.is_ascii_uppercase());
+        && matches!(
+            key.code,
+            KeyCode::Char(value) if value.is_ascii_uppercase() || matches!(value, '{' | '}')
+        );
     if key.modifiers != KeyModifiers::NONE && !shifted_uppercase {
         return None;
     }
@@ -4281,13 +4616,22 @@ fn normalized_key(key: KeyEvent, context: &ActionContext) -> Option<&'static str
         KeyCode::Char('s') => Some("s"),
         KeyCode::Char('g') => Some("g"),
         KeyCode::Char('G') => Some("G"),
+        KeyCode::Char('O') => Some("O"),
+        KeyCode::Char('o') => Some("o"),
+        KeyCode::Char('B') => Some("B"),
+        KeyCode::Char('{') => Some("{"),
+        KeyCode::Char('}') => Some("}"),
         KeyCode::Char('t') => Some("t"),
         KeyCode::Char('d') => Some("d"),
         KeyCode::Char('x') => Some("x"),
         KeyCode::Char('X') => Some("X"),
         KeyCode::Char('P') => Some("P"),
         KeyCode::Char('U') => Some("U"),
+        KeyCode::Char('T') => Some("T"),
         KeyCode::Char('/') => Some("/"),
+        KeyCode::Char('-') => Some("-"),
+        KeyCode::Char('+') => Some("+"),
+        KeyCode::Char('w') => Some("w"),
         KeyCode::Enter => Some("Enter"),
         KeyCode::Tab => Some("Tab"),
         KeyCode::PageUp => Some("PageUp"),
@@ -4396,6 +4740,7 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::RefreshNavigation => ActionId::Refresh,
         LcAction::OpenThemePicker => ActionId::OpenThemePicker,
         LcAction::OpenIssuesWorkspace => ActionId::OpenIssuesWorkspace,
+        LcAction::OpenIssueNumber(_) => ActionId::OpenIssueNumber,
         LcAction::InterruptSession => ActionId::InterruptSession,
         LcAction::HardInterruptSession => ActionId::HardInterruptSession,
         LcAction::DowngradeOperatorPause => ActionId::DowngradeOperatorPause,
@@ -4574,8 +4919,10 @@ pub enum OverlayHelpClass {
     ScheduleForm,
     RenameSession,
     TextAreaBgEditor,
+    DaemonTextEditor,
     PromptPreview,
     SkillPreview,
+    TodoPopup,
     Diagnostics,
     SessionInfo,
     Rating,
@@ -4667,6 +5014,8 @@ impl OverlayHelpClass {
         Self::FleetSort,
         Self::FleetGroups,
         Self::ModelSwitch,
+        Self::DaemonTextEditor,
+        Self::TodoPopup,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -4738,6 +5087,8 @@ impl OverlayHelpClass {
             Self::FleetSort => 62,
             Self::FleetGroups => 63,
             Self::ModelSwitch => 64,
+            Self::DaemonTextEditor => 65,
+            Self::TodoPopup => 66,
         }
     }
 }
@@ -5489,7 +5840,18 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 act("x", "Halt the selected seat session (soft stop)"),
                 act("X", "Halt the selected seat session now (press twice)"),
                 act("a", "Archive the selected earlier seat session"),
-                act("n", "Launch and appoint a manager (seat, launch, scope)"),
+                act(
+                    "n",
+                    "Launch and appoint a manager (seat, launch, scope, grant)",
+                ),
+                act(
+                    "b",
+                    "Budget panel: every cap of the global node and each PM as used / limit, binding cap marked",
+                ),
+                act(
+                    "b: + / 0-9",
+                    "Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back",
+                ),
                 act(
                     "Tab",
                     "Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends",
@@ -5661,6 +6023,18 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         ],
     },
     OverlayHelpRoute {
+        class: OverlayHelpClass::DaemonTextEditor,
+        title: "Daemon Text Setting",
+        groups: &[
+            DIALOG_TEXT,
+            &[
+                act("Enter", "Save value"),
+                act("Delete", "Clear (use the default)"),
+                close("Esc", "Cancel"),
+            ],
+        ],
+    },
+    OverlayHelpRoute {
         class: OverlayHelpClass::PromptPreview,
         title: "Prompt Preview",
         groups: &[
@@ -5683,6 +6057,27 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 nav("Ctrl-D / Ctrl-U", "Half page down / up"),
                 nav("g / Home, G / End", "Jump to top / bottom"),
                 close("Esc / q", "Close"),
+            ],
+            OVERLAY_LEADER,
+        ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::TodoPopup,
+        title: "To-do Pop-up",
+        groups: &[
+            &[
+                act("y", "Yank the command (the item stays open)"),
+                act("d", "Mark done (asks y/n first)"),
+                act("x", "Dismiss (asks y/n first)"),
+                act("u", "Undo the last close (60 s)"),
+                act("o", "Open the item's link"),
+                nav("n / p", "Show next / previous item"),
+                nav("j / k, Down / Up", "Scroll"),
+                nav("Ctrl-D / Ctrl-U", "Scroll ten rows down / up"),
+                nav("g / Home", "Jump to top"),
+                act("y / Enter", "At the prompt: confirm the close"),
+                close("n / Esc", "At the prompt: cancel; otherwise close"),
+                close("q", "Close"),
             ],
             OVERLAY_LEADER,
         ],
@@ -5850,6 +6245,14 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             nav("j / k, Down / Up", "Move between settings"),
             edit("h / l, Left / Right", "Change the selected setting"),
             edit("Space / Enter", "Toggle or open the selected setting"),
+            edit(
+                "p, Enter on Grant",
+                "Open the manager's grant page: preset, mode, capabilities, allowances, launches",
+            ),
+            edit(
+                "Grant page: j / k, h / l, Space, digits",
+                "Move between rows, step or toggle a row, type a number; Esc returns to the launch rows",
+            ),
             edit("Ctrl-E / Ctrl-B", "Cycle effort / toggle sandbox"),
             act("Ctrl-M", "Open model picker"),
             act("Ctrl-Enter", "Launch the session"),
@@ -6243,8 +6646,10 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::ScheduleForm { .. } => Routed(C::ScheduleForm),
         OverlayState::RenameSession { .. } => Routed(C::RenameSession),
         OverlayState::TextAreaBgEditor { .. } => Routed(C::TextAreaBgEditor),
+        OverlayState::DaemonTextEditor { .. } => Routed(C::DaemonTextEditor),
         OverlayState::PromptPreview { .. } => Routed(C::PromptPreview),
         OverlayState::SkillPreview { .. } => Routed(C::SkillPreview),
+        OverlayState::TodoPopup(..) => Routed(C::TodoPopup),
         OverlayState::Diagnostics => Routed(C::Diagnostics),
         OverlayState::SessionInfoPanel { .. } => Routed(C::SessionInfo),
         OverlayState::RatingOverlay { .. } => Routed(C::Rating),
@@ -6617,6 +7022,7 @@ mod tests {
             ActionId::IssueCopyUuid,
             ActionId::IssueCopyNumber,
             ActionId::IssueSearch,
+            ActionId::IssueGoToNumber,
             ActionId::IssueFilter,
             ActionId::IssueSort,
             ActionId::IssueJumpArm,
@@ -6682,6 +7088,11 @@ mod tests {
                 ActionMode::PendingYank,
                 KeyCode::Char('#'),
                 ActionId::IssueCopyNumber,
+            ),
+            (
+                ActionMode::Normal,
+                KeyCode::Char('#'),
+                ActionId::IssueGoToNumber,
             ),
             (
                 ActionMode::PendingJump,
@@ -6837,6 +7248,13 @@ mod tests {
             }
         }
 
+        let active = cases[0].1;
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                request_for_key(&active, KeyEvent::new(KeyCode::Char('T'), modifiers)),
+                ActionAvailability::Available(materialize(&active, ActionId::IssueRunTopology))
+            );
+        }
         let terminal = cases[1].1;
         assert_eq!(
             request_for_key(
@@ -7801,6 +8219,16 @@ mod tests {
                 ActionId::ReassignProject,
                 ActionId::ToggleRotation,
                 ActionId::CancelRetry,
+                ActionId::TodoPanel,
+                ActionId::TodoNext,
+                ActionId::TodoPrev,
+                ActionId::TodoOpenLink,
+                ActionId::TodoDone,
+                ActionId::TodoDismiss,
+                ActionId::TodoCopy,
+                ActionId::TodoPopup,
+                ActionId::TodoUndo,
+                ActionId::TodoAcknowledge,
                 ActionId::CommitAndPush,
                 ActionId::OpenSessionInNewTab,
                 ActionId::GitPanel,
@@ -7814,6 +8242,7 @@ mod tests {
                 ActionId::ScheduleBrowserOpen,
                 ActionId::EspSquare,
                 ActionId::RunEpicTopology,
+                ActionId::LandSession,
                 ActionId::CreateGroup,
                 ActionId::CreateEpic,
                 ActionId::CreateStory,
@@ -7896,6 +8325,7 @@ mod tests {
             OverlayState::ThemePicker { .. } => "ThemePicker",
             OverlayState::ThemeRoleEditor { .. } => "ThemeRoleEditor",
             OverlayState::TextAreaBgEditor { .. } => "TextAreaBgEditor",
+            OverlayState::DaemonTextEditor { .. } => "DaemonTextEditor",
             OverlayState::Prompt { .. } => "Prompt",
             OverlayState::ProjectPicker { .. } => "ProjectPicker",
             OverlayState::KeybindingsHelp { .. } => "KeybindingsHelp",
@@ -7922,6 +8352,7 @@ mod tests {
             OverlayState::BudgetPolicyForm { .. } => "BudgetPolicyForm",
             OverlayState::HookConflictPrompt { .. } => "HookConflictPrompt",
             OverlayState::SkillPreview { .. } => "SkillPreview",
+            OverlayState::TodoPopup(..) => "TodoPopup",
             OverlayState::Diagnostics => "Diagnostics",
             OverlayState::RecursiveDagBrowser(..) => "RecursiveDagBrowser",
             OverlayState::MemorySearch { .. } => "MemorySearch",
@@ -8034,6 +8465,7 @@ mod tests {
 
     fn settlement(authorization_active: bool) -> OverlayState {
         OverlayState::SourceWorktreeSettlement(crate::types::SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -8378,6 +8810,7 @@ mod tests {
                     sessions: None,
                     form: None,
                     last_probe: None,
+                    scope_status: None,
                     last_error: None,
                 },
             )),
@@ -8790,6 +9223,16 @@ mod tests {
             Routed(C::TextAreaBgEditor),
         );
         push(
+            "DaemonTextEditor",
+            &app,
+            OverlayState::DaemonTextEditor {
+                field: "cold_archive_dir",
+                input: String::new(),
+                error: None,
+            },
+            Routed(C::DaemonTextEditor),
+        );
+        push(
             "ProjectPicker",
             &app,
             OverlayState::ProjectPicker {
@@ -8968,8 +9411,8 @@ mod tests {
                 command: String::new(),
                 timeout: String::new(),
                 editing: None,
-                snapshot_mtime: None,
-                snapshot_bytes: Vec::new(),
+                snapshot_revision: String::new(),
+                snapshot_hooks: crate::claude_config::ClaudeHooks::new(),
             },
             Routed(C::HookForm),
         );
@@ -8989,7 +9432,15 @@ mod tests {
             &app,
             OverlayState::HookConflictPrompt {
                 pending: Box::new(crate::claude_config::PendingHookSave {
-                    data: crate::claude_config::ClaudeSettings::default(),
+                    edit: crate::claude_config::HookEdit::Delete {
+                        event: crate::claude_config::HookEvent::Known(
+                            crate::claude_config::KnownHookEvent::Stop,
+                        ),
+                        entry_index: 0,
+                        hook_index: 0,
+                    },
+                    revision: String::new(),
+                    hooks: crate::claude_config::ClaudeHooks::new(),
                 }),
             },
             Routed(C::HookConflict),
@@ -9003,6 +9454,12 @@ mod tests {
                 scroll_offset: 0,
             },
             Routed(C::SkillPreview),
+        );
+        push(
+            "TodoPopup",
+            &app,
+            OverlayState::TodoPopup(crate::todo_panel::TodoPopupState::default()),
+            Routed(C::TodoPopup),
         );
     }
 

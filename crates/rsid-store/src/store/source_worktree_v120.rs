@@ -32,9 +32,74 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+// V175 (#2050) versions the dependency-health relevance classifier; the V120
+// helper below stays byte-identical for the released catalog.
+pub(crate) mod health_v175;
+
 const PAGE_SIZE: usize = SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS;
 const RECONCILE_LIMIT: usize = SOURCE_WORKTREE_BATCH_MAX_SCAN_ROOTS;
 const CURSOR_PREFIX: &str = "rsi-swc2:";
+
+/// Work one targeted dependency proof did (hub #2940). Counts are exact and
+/// deterministic, so a test can pin them and a pass summary can show which
+/// part of the proof a burst of CPU belongs to. It is evidence about cost
+/// only: no verdict reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DependencyProofWork {
+    /// Enabled scheduled jobs freshly validated by the proof.
+    pub enabled_jobs_validated: u64,
+    /// Relevant Session rows freshly validated by the proof.
+    pub relevant_sessions_validated: u64,
+    /// Scheduled-job rows loaded after the indexed path/link lookups.
+    pub indexed_job_rows_loaded: u64,
+    /// Session rows loaded after the indexed path/custody lookups.
+    pub indexed_session_rows_loaded: u64,
+    /// `canonicalize(2)`-style resolutions done to match paths against the
+    /// candidate roots (cached-projection freshness checks are not included).
+    pub path_canonicalizations: u64,
+}
+
+impl DependencyProofWork {
+    pub fn add(&mut self, other: Self) {
+        self.enabled_jobs_validated += other.enabled_jobs_validated;
+        self.relevant_sessions_validated += other.relevant_sessions_validated;
+        self.indexed_job_rows_loaded += other.indexed_job_rows_loaded;
+        self.indexed_session_rows_loaded += other.indexed_session_rows_loaded;
+        self.path_canonicalizations += other.path_canonicalizations;
+    }
+}
+
+thread_local! {
+    /// Accumulator of the proof running on this thread. The proof is
+    /// synchronous and never changes threads, so a thread-local needs no lock
+    /// and cannot mix two passes.
+    static PROOF_WORK: std::cell::Cell<DependencyProofWork> =
+        const { std::cell::Cell::new(DependencyProofWork {
+            enabled_jobs_validated: 0,
+            relevant_sessions_validated: 0,
+            indexed_job_rows_loaded: 0,
+            indexed_session_rows_loaded: 0,
+            path_canonicalizations: 0,
+        }) };
+}
+
+fn count_proof_work(update: impl FnOnce(&mut DependencyProofWork)) {
+    PROOF_WORK.with(|cell| {
+        let mut work = cell.get();
+        update(&mut work);
+        cell.set(work);
+    });
+}
+
+fn take_proof_work() -> DependencyProofWork {
+    PROOF_WORK.with(|cell| cell.replace(DependencyProofWork::default()))
+}
+
+/// `std::fs::canonicalize`, counted into the running proof's work.
+fn counted_canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    count_proof_work(|work| work.path_canonicalizations += 1);
+    std::fs::canonicalize(path)
+}
 
 // RSI-RELEASED-MIGRATION-BEGIN: v120-source-worktree-batch-catalog
 pub(crate) const V120_CATALOG_OBJECTS: [(&str, &str); 49] = [
@@ -1060,6 +1125,43 @@ impl Store {
         self.source_worktree_targeted_dependencies_impl(custody_id, generation, false)
     }
 
+    /// The same proof, with the work it did (hub #2940). The count is reset on
+    /// entry and taken on exit, so it covers exactly this one proof, also when
+    /// the proof refuses.
+    pub fn source_worktree_targeted_dependencies_with_work(
+        &self,
+        custody_id: Uuid,
+        generation: u64,
+    ) -> Result<(SourceWorktreeTargetedDependenciesV2, DependencyProofWork)> {
+        self.metered_dependencies(custody_id, generation, false)
+    }
+
+    /// [`Store::source_worktree_targeted_dependencies_for_absent_root`] with
+    /// the work it did.
+    pub fn source_worktree_targeted_dependencies_for_absent_root_with_work(
+        &self,
+        custody_id: Uuid,
+        generation: u64,
+    ) -> Result<(SourceWorktreeTargetedDependenciesV2, DependencyProofWork)> {
+        self.metered_dependencies(custody_id, generation, true)
+    }
+
+    fn metered_dependencies(
+        &self,
+        custody_id: Uuid,
+        generation: u64,
+        absent_root_proven: bool,
+    ) -> Result<(SourceWorktreeTargetedDependenciesV2, DependencyProofWork)> {
+        let _ = take_proof_work();
+        let result = self.source_worktree_targeted_dependencies_impl(
+            custody_id,
+            generation,
+            absent_root_proven,
+        );
+        let work = take_proof_work();
+        result.map(|dependencies| (dependencies, work))
+    }
+
     /// Dependency proof for the absent-root adoption path. The caller must
     /// already have proved that the canonical sandbox path and Git worktree
     /// registration are both absent. Custody participants are omitted from
@@ -1172,6 +1274,7 @@ impl Store {
                 Some(job) => job,
                 None => continue,
             };
+            count_proof_work(|work| work.indexed_job_rows_loaded += 1);
             if !job.projection_is_current() {
                 return Ok(SourceWorktreeTargetedDependenciesV2::incomplete(
                     "scheduled_job_projection_stale",
@@ -1263,7 +1366,8 @@ impl Store {
             let Some(session) = load_session_dependency(&self.conn, &session_id)? else {
                 continue;
             };
-            match session.relevance() {
+            count_proof_work(|work| work.indexed_session_rows_loaded += 1);
+            match session.relevance_v175() {
                 SessionDependencyRelevance::ProvenIrrelevant => continue,
                 SessionDependencyRelevance::Invalid => {
                     return Ok(SourceWorktreeTargetedDependenciesV2::incomplete(
@@ -1683,7 +1787,7 @@ fn dependency_roots(
     }
     let mut canonical = BTreeSet::new();
     for path in &raw {
-        if let Ok(value) = std::fs::canonicalize(path) {
+        if let Ok(value) = counted_canonicalize(path) {
             if value.is_dir() {
                 canonical.insert(value);
             }
@@ -1891,6 +1995,7 @@ fn fresh_enabled_job_path_dependencies(
             let Some(job) = load_job_dependency(connection, id)? else {
                 return Ok(Err("scheduled_job_projection_missing"));
             };
+            count_proof_work(|work| work.enabled_jobs_validated += 1);
             let reaches_roots = if job.projection_is_current() {
                 job.raw_working_dir
                     .as_deref()
@@ -1983,7 +2088,8 @@ fn fresh_session_path_dependencies(
             let Some(session) = load_session_dependency(connection, id)? else {
                 return Ok(Err("session_projection_missing"));
             };
-            let relevance = session.relevance();
+            count_proof_work(|work| work.relevant_sessions_validated += 1);
+            let relevance = session.relevance_v175();
             if relevance.database_code() != *stored_relevance {
                 return Ok(Err(refuse_session_scan(
                     &session,
@@ -2085,7 +2191,7 @@ fn participant_ids(connection: &Connection, custody_id: Uuid) -> Result<BTreeSet
 }
 
 fn path_matches_roots(path: &Path, roots: &DependencyRoots) -> bool {
-    path_matches_roots_with(path, roots, &|candidate| std::fs::canonicalize(candidate))
+    path_matches_roots_with(path, roots, &|candidate| counted_canonicalize(candidate))
 }
 
 type Canonicalize<'a> = &'a dyn Fn(&Path) -> std::io::Result<PathBuf>;
@@ -2124,7 +2230,7 @@ fn has_parent_dir(path: &Path) -> bool {
 /// component also counts: the `..` could hide a restorable directory, so
 /// `/p/missing/../sandbox/work` reaches `/p/sandbox` once `/p/missing` exists.
 fn fresh_raw_path_reaches_roots(raw: &Path, roots: &DependencyRoots) -> Option<bool> {
-    fresh_raw_path_reaches_roots_with(raw, roots, &|path| std::fs::canonicalize(path))
+    fresh_raw_path_reaches_roots_with(raw, roots, &|path| counted_canonicalize(path))
 }
 
 fn fresh_raw_path_reaches_roots_with(
@@ -2342,7 +2448,7 @@ impl JobDependency {
             return false;
         }
         let current_canonical = self.raw_working_dir.as_deref().and_then(|raw| {
-            std::fs::canonicalize(raw)
+            counted_canonicalize(raw)
                 .ok()
                 .filter(|path| path.is_dir())
                 .map(|path| path.to_string_lossy().into_owned())
@@ -3264,17 +3370,20 @@ mod tests {
         working_dir: &Path,
         status: &str,
     ) {
+        // Cached: the 16k-row ceiling fixtures call this in a loop, and every
+        // fresh prepare recompiles the Session trigger programs.
         connection
-            .execute(
+            .prepare_cached(
                 "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at)
                  VALUES(?1,'V120 source-worktree fixture',?2,?3,?4,?4)",
-                params![
-                    session_id.to_string(),
-                    working_dir.to_string_lossy().into_owned(),
-                    status,
-                    TEST_NOW,
-                ],
             )
+            .expect("prepare V120 fixture Session insert")
+            .execute(params![
+                session_id.to_string(),
+                working_dir.to_string_lossy().into_owned(),
+                status,
+                TEST_NOW,
+            ])
             .expect("insert V120 fixture Session");
     }
 
@@ -3425,7 +3534,7 @@ mod tests {
     #[test]
     fn v120_cursor_rejects_tamper_cross_repository_and_oversize() {
         let store = Store::open_in_memory().expect("open V120 store");
-        validate_v120_catalog(&store.conn).expect("V120 catalog");
+        health_v175::validate_current_catalog(&store.conn).expect("V120 catalog");
         let snapshot = store
             .source_worktree_snapshot_capture("repo:v120", None)
             .expect("capture empty cursor snapshot");
@@ -3556,8 +3665,8 @@ mod tests {
     #[test]
     fn v120_snapshot_page_uses_repository_keyset_index() {
         let directory = tempfile::tempdir().expect("create V120 test directory");
-        let store =
-            Store::open(&directory.path().join("snapshot.sqlite")).expect("open V120 store");
+        let store = Store::open_test_fixture(&directory.path().join("snapshot.sqlite"))
+            .expect("open V120 store");
         let plan: String = store
             .conn
             .query_row(
@@ -3592,7 +3701,7 @@ mod tests {
         let roots_dir = directory.path().join("roots");
         fs::create_dir_all(&repository_dir).expect("create repository fixture");
         fs::create_dir_all(&roots_dir).expect("create root fixture base");
-        let store = Store::open(&directory.path().join("snapshot-513.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("snapshot-513.sqlite"))
             .expect("open V120 snapshot fixture");
         let repository_identity = "repo:v120:snapshot-513";
         let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)
@@ -3699,7 +3808,7 @@ mod tests {
         let roots_dir = directory.path().join("roots");
         fs::create_dir_all(&repository_dir).expect("create concurrent repository");
         fs::create_dir_all(&roots_dir).expect("create concurrent roots base");
-        let store = Store::open(&database).expect("open concurrent snapshot Store");
+        let store = Store::open_test_fixture(&database).expect("open concurrent snapshot Store");
         let repository_identity = "repo:v120:snapshot-concurrent";
         let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)
             .expect("open concurrent snapshot seed transaction");
@@ -3951,7 +4060,7 @@ mod tests {
         let sandbox_base = directory.path().join("sandboxes");
         fs::create_dir_all(&repository_dir).expect("create candidate repository");
         fs::create_dir_all(&sandbox_base).expect("create candidate sandbox base");
-        let store = Store::open(&directory.path().join("candidate.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("candidate.sqlite"))
             .expect("open V120 candidate fixture");
         let first_owner = Uuid::from_u128(0x201);
         let current_owner = Uuid::from_u128(0x202);
@@ -4161,7 +4270,7 @@ mod tests {
         fs::create_dir_all(&repository_dir).expect("create dependency repository");
         fs::create_dir_all(outside.join("nested")).expect("create unrelated directory");
         fs::create_dir_all(&sandbox_base).expect("create dependency sandbox base");
-        let store = Store::open(&directory.path().join("dependencies.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("dependencies.sqlite"))
             .expect("open V120 dependency fixture");
         let owner = Uuid::from_u128(0x5001);
         let wake_target = Uuid::from_u128(0x5002);
@@ -4478,7 +4587,7 @@ mod tests {
         for path in [&repository_dir, &elsewhere, &sandbox_root] {
             fs::create_dir_all(path).expect("create scoped-projection fixture directory");
         }
-        let store = Store::open(&directory.path().join("scoped-projection.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("scoped-projection.sqlite"))
             .expect("open scoped-projection Store");
         let owner = Uuid::from_u128(0x9a01);
         let custody_id = Uuid::from_u128(0x9a02);
@@ -4607,7 +4716,7 @@ mod tests {
         for path in [&repository_dir, &elsewhere, &sandbox_root] {
             fs::create_dir_all(path).expect("create Invalid-Session fixture directory");
         }
-        let store = Store::open(&directory.path().join("invalid-session.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("invalid-session.sqlite"))
             .expect("open Invalid-Session Store");
         let owner = Uuid::from_u128(0xa101);
         let custody_id = Uuid::from_u128(0xa102);
@@ -4878,7 +4987,7 @@ mod tests {
         for path in [&repository_dir, &elsewhere, &sandbox_root] {
             fs::create_dir_all(path).expect("create stale-Session fixture directory");
         }
-        let store = Store::open(&directory.path().join("stale-session.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("stale-session.sqlite"))
             .expect("open stale-Session Store");
         let owner = Uuid::from_u128(0xb101);
         let custody_id = Uuid::from_u128(0xb102);
@@ -5067,7 +5176,7 @@ mod tests {
         for path in [&repository_dir, &outside, &sandbox_root] {
             fs::create_dir_all(path).expect("create inward-repoint fixture directory");
         }
-        let store = Store::open(&directory.path().join("inward-repoint.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("inward-repoint.sqlite"))
             .expect("open inward-repoint Store");
         let owner = Uuid::from_u128(0x8a01);
         let custody_id = Uuid::from_u128(0x8a02);
@@ -5292,8 +5401,9 @@ mod tests {
         let sandbox_root = directory.path().join("sandbox");
         fs::create_dir_all(&repository_dir).expect("create bound repository");
         fs::create_dir_all(&sandbox_root).expect("create bound sandbox root");
-        let store = Store::open(&directory.path().join("dependency-health-bound.sqlite"))
-            .expect("open dependency-health bound Store");
+        let store =
+            Store::open_test_fixture(&directory.path().join("dependency-health-bound.sqlite"))
+                .expect("open dependency-health bound Store");
         let owner = Uuid::from_u128(0x8b01);
         let custody_id = Uuid::from_u128(0x8b02);
         insert_test_session(&store.conn, owner, &repository_dir, "Archived");
@@ -5318,16 +5428,25 @@ mod tests {
 
         let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)
             .expect("open enabled-job bound transaction");
-        for ordinal in 1..=(SOURCE_WORKTREE_BATCH_MAX_SCAN_ROOTS + 1) as u128 {
-            tx.execute(
-                "INSERT INTO scheduled_jobs(
-                    id,name,message,schedule_json,last_fired_at,next_fire_at,enabled,working_dir,
-                    provider,model,project_id,created_at,updated_at,wake_mode,wake_session_id)
-                 VALUES(?1,'health-bound','health-bound','{}',NULL,?2,1,NULL,
-                        NULL,NULL,NULL,?2,?2,'fresh',NULL)",
-                params![Uuid::from_u128(0x10000 + ordinal).to_string(), TEST_NOW],
-            )
-            .expect("insert enabled dependency-health job");
+        {
+            let mut insert_job = tx
+                .prepare(
+                    "INSERT INTO scheduled_jobs(
+                        id,name,message,schedule_json,last_fired_at,next_fire_at,enabled,
+                        working_dir,provider,model,project_id,created_at,updated_at,wake_mode,
+                        wake_session_id)
+                     VALUES(?1,'health-bound','health-bound','{}',NULL,?2,1,NULL,
+                            NULL,NULL,NULL,?2,?2,'fresh',NULL)",
+                )
+                .expect("prepare enabled dependency-health job insert");
+            for ordinal in 1..=(SOURCE_WORKTREE_BATCH_MAX_SCAN_ROOTS + 1) as u128 {
+                insert_job
+                    .execute(params![
+                        Uuid::from_u128(0x10000 + ordinal).to_string(),
+                        TEST_NOW
+                    ])
+                    .expect("insert enabled dependency-health job");
+            }
         }
         tx.commit().expect("commit enabled-job bound fixture");
         reconcile_scheduled_job_path_projections(&store.conn)
@@ -5350,18 +5469,19 @@ mod tests {
         for ordinal in 1..=(SOURCE_WORKTREE_BATCH_MAX_SCAN_ROOTS + 1) as u128 {
             let session_id = Uuid::from_u128(0x100000 + ordinal);
             insert_test_session(&tx, session_id, &sandbox_root, "Deleted");
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE session_execution_projections
                     SET execution_state='historical_purged',freshness='verified',
                         canonical_repo_dir=?1,effective_cwd=NULL,custody_id=NULL,
                         custody_generation=NULL,validated_at=?2,error_code=NULL,updated_at=?2
                   WHERE session_id=?3",
-                params![
-                    sandbox_root.to_string_lossy().into_owned(),
-                    TEST_NOW,
-                    session_id.to_string()
-                ],
             )
+            .expect("prepare irrelevant removed Session history update")
+            .execute(params![
+                sandbox_root.to_string_lossy().into_owned(),
+                TEST_NOW,
+                session_id.to_string()
+            ])
             .expect("authenticate irrelevant removed Session history");
         }
         tx.commit().expect("commit irrelevant Session history");
@@ -5411,7 +5531,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("create V120 writer fixture");
         let working = directory.path().join("working");
         fs::create_dir_all(&working).expect("create V120 writer directory");
-        let store = Store::open(&directory.path().join("writers.sqlite"))
+        let store = Store::open_test_fixture(&directory.path().join("writers.sqlite"))
             .expect("open V120 writer fixture");
 
         let ordinary = test_job(
@@ -5772,5 +5892,121 @@ mod tests {
                 .contains("V120 catalog fingerprint mismatch"),
             "{error}"
         );
+    }
+
+    fn relevant_session_rows(connection: &Connection) -> u64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_worktree_session_dependency_health
+                  WHERE relevance IN (1,2)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count relevant dependency-health rows") as u64
+    }
+
+    /// Hub #2940: the proof's cost is exactly the relevant Sessions plus the
+    /// enabled jobs it freshly validates for every candidate, so a pass over
+    /// N candidates repeats that scan N times. The counters make that a
+    /// deterministic fact instead of a CPU anecdote.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn targeted_dependency_proof_reports_the_work_it_did() {
+        let directory = tempfile::tempdir().expect("create V120 work fixture");
+        let repository_dir = directory.path().join("repository");
+        let sandbox_base = directory.path().join("sandboxes");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&repository_dir).expect("create repository");
+        fs::create_dir_all(&outside).expect("create unrelated directory");
+        fs::create_dir_all(&sandbox_base).expect("create sandbox base");
+        let store = Store::open_test_fixture(&directory.path().join("work.sqlite"))
+            .expect("open V120 work fixture");
+        let owner = Uuid::from_u128(0x8001);
+        let custody_id = Uuid::from_u128(0x8002);
+        let branch = "rsi/v120-work";
+        let sandbox_root = sandbox_base.join(owner.to_string());
+        fs::create_dir_all(&sandbox_root).expect("create candidate root");
+        insert_test_session(&store.conn, owner, &repository_dir, "Archived");
+        insert_test_root(
+            &store.conn,
+            owner,
+            custody_id,
+            1,
+            "repo:v120:work",
+            &repository_dir,
+            &sandbox_root,
+            branch,
+        );
+        link_test_session_to_root(&store.conn, owner, custody_id, &sandbox_root, branch);
+        verify_test_session_projection(&store.conn, owner, &sandbox_root, Some((custody_id, 1)));
+        for ordinal in 0..3_u128 {
+            let bystander = Uuid::from_u128(0x8100 + ordinal);
+            insert_test_session(&store.conn, bystander, &outside, "Completed");
+            verify_test_session_projection(&store.conn, bystander, &outside, None);
+        }
+        for name in ["first", "second"] {
+            let job = test_job(name, Some(outside.clone()), WakeMode::Fresh, None, true);
+            store
+                .insert_scheduled_job(&job)
+                .expect("insert enabled job");
+        }
+        let disabled = test_job("off", Some(outside.clone()), WakeMode::Fresh, None, false);
+        store
+            .insert_scheduled_job(&disabled)
+            .expect("insert disabled job");
+
+        let relevant = relevant_session_rows(&store.conn);
+        assert!(
+            relevant >= 2,
+            "fixture needs several relevant rows: {relevant}"
+        );
+        let (proof, work) = store
+            .source_worktree_targeted_dependencies_with_work(custody_id, 1)
+            .expect("metered proof");
+        assert!(proof.complete, "{:?}", proof.reason);
+        assert_eq!(
+            work.relevant_sessions_validated, relevant,
+            "every relevant Session is freshly validated"
+        );
+        assert_eq!(
+            work.enabled_jobs_validated, 2,
+            "only enabled jobs are freshly validated"
+        );
+        assert!(work.path_canonicalizations > 0, "{work:?}");
+        assert_eq!(
+            store
+                .source_worktree_targeted_dependencies(custody_id, 1)
+                .expect("plain proof"),
+            proof,
+            "metering never changes the verdict"
+        );
+
+        // The count is taken on exit: a second proof reports its own work, not
+        // the sum of both.
+        let (_, again) = store
+            .source_worktree_targeted_dependencies_with_work(custody_id, 1)
+            .expect("second metered proof");
+        assert_eq!(again, work);
+
+        // The cost grows with the relevant Sessions, which is why the same
+        // scan repeated for every candidate of a pass is the lever.
+        for ordinal in 0..2_u128 {
+            let extra = Uuid::from_u128(0x8200 + ordinal);
+            insert_test_session(&store.conn, extra, &outside, "Completed");
+            verify_test_session_projection(&store.conn, extra, &outside, None);
+        }
+        let grown = relevant_session_rows(&store.conn);
+        assert_eq!(grown, relevant + 2);
+        let (_, grown_work) = store
+            .source_worktree_targeted_dependencies_with_work(custody_id, 1)
+            .expect("grown metered proof");
+        assert_eq!(grown_work.relevant_sessions_validated, grown);
+
+        // A proof refused at once (stale generation) did no scan and says so.
+        let (refused, partial) = store
+            .source_worktree_targeted_dependencies_with_work(custody_id, 2)
+            .expect("refused metered proof");
+        assert!(!refused.complete);
+        assert_eq!(partial, DependencyProofWork::default());
     }
 }

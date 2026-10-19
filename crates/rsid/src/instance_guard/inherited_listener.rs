@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::fd::BorrowedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 fn invalid(message: &str) -> io::Error {
@@ -61,9 +61,27 @@ fn listener_fd(
     }
 }
 
+#[derive(Debug)]
+pub struct InheritedListener {
+    pub listener: UnixListener,
+    // An ENOPROTOOPT accept probe may dequeue a client. Preserve it for rsid.
+    pub pending: Option<UnixStream>,
+}
+
+impl std::ops::Deref for InheritedListener {
+    type Target = UnixListener;
+    fn deref(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
 /// Return a validated listener, or None for the ordinary daemon-owned socket.
 /// Invalid activation always fails before store open; it never falls back to bind.
-pub fn inherited_daemon_listener(path: &Path) -> io::Result<Option<UnixListener>> {
+///
+/// # Safety
+/// Call only during single-threaded startup, before any environment readers or
+/// subprocesses exist: successful adoption removes process environment entries.
+pub unsafe fn inherited_daemon_listener(path: &Path) -> io::Result<Option<InheritedListener>> {
     let explicit = std::env::var_os("RSI_LISTEN_FD");
     let count = std::env::var_os("LISTEN_FDS");
     let owner = std::env::var_os("LISTEN_PID");
@@ -73,10 +91,21 @@ pub fn inherited_daemon_listener(path: &Path) -> io::Result<Option<UnixListener>
         owner.as_deref(),
         std::process::id(),
     )?;
-    fd.map(|fd| validated_listener(fd, path)).transpose()
+    let listener = fd.map(|fd| validated_listener(fd, path)).transpose()?;
+    // Consume activation metadata even when it addresses a different process.
+    // The supervisor keeps its own environment for the next daemon lifetime.
+    for key in [
+        "RSI_LISTEN_FD",
+        "LISTEN_FDS",
+        "LISTEN_PID",
+        "LISTEN_FDNAMES",
+    ] {
+        unsafe { std::env::remove_var(key) };
+    }
+    Ok(listener)
 }
 
-fn validated_listener(fd: i32, path: &Path) -> io::Result<UnixListener> {
+fn validated_listener(fd: i32, path: &Path) -> io::Result<InheritedListener> {
     // Check the raw descriptor before constructing a borrowed Rust descriptor.
     let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
     if flags < 0 {
@@ -93,12 +122,11 @@ fn validated_listener(fd: i32, path: &Path) -> io::Result<UnixListener> {
             &mut len,
         )
     };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if accepting != 1 {
-        return Err(invalid("inherited descriptor must be a listening socket"));
-    }
+    let accepting = if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(accepting)
+    };
     let mut address: nix::libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut address_len = std::mem::size_of_val(&address) as nix::libc::socklen_t;
     if unsafe {
@@ -154,7 +182,32 @@ fn validated_listener(fd: i32, path: &Path) -> io::Result<UnixListener> {
         return Err(io::Error::last_os_error());
     }
     listener.set_nonblocking(true)?;
-    Ok(listener)
+    let pending = verify_accepting(&listener, accepting)?;
+    Ok(InheritedListener { listener, pending })
+}
+
+fn verify_accepting(
+    listener: &UnixListener,
+    accepting: io::Result<i32>,
+) -> io::Result<Option<UnixStream>> {
+    match accepting {
+        Ok(value) if value != 0 => Ok(None),
+        Ok(_) => Err(invalid("inherited descriptor must be a listening socket")),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ENOPROTOOPT) => {
+            // BSD kernels may not expose SO_ACCEPTCONN. On a validated Unix
+            // stream, nonblocking accept distinguishes listening from bound or
+            // connected sockets. Keep an accepted client instead of dropping it.
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true)?;
+                    Ok(Some(stream))
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +215,100 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    #[ignore = "isolated activation environment fixture"]
+    fn activation_child_environment_fixture() {
+        let path = std::path::PathBuf::from(std::env::var_os("RSI_TEST_LISTENER_PATH").unwrap());
+        // Only this test runs in the child; no runtime or other env readers.
+        let listener = unsafe { inherited_daemon_listener(&path) }
+            .unwrap()
+            .unwrap();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "test -z \"${RSI_LISTEN_FD+x}${LISTEN_FDS+x}${LISTEN_PID+x}${LISTEN_FDNAMES+x}\"",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(listener.local_addr().unwrap().as_pathname() == Some(path.as_path()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn adopted_activation_is_consumed_before_spawning_children() {
+        use std::os::unix::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("daemon.sock");
+        let holder = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let fd = holder.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "instance_guard::inherited_listener::tests::activation_child_environment_fixture",
+                "--test-threads=1",
+            ])
+            .env("RSI_TEST_LISTENER_PATH", &path)
+            .env("RSI_LISTEN_FD", fd.to_string())
+            .env("LISTEN_FDS", "1")
+            .env("LISTEN_PID", "1")
+            .env("LISTEN_FDNAMES", "daemon");
+        unsafe {
+            command.pre_exec(move || {
+                if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(command.status().unwrap().success());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn bsd_acceptconn_values_and_probe_preserve_queued_clients() {
+        use std::io::{Read, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(verify_accepting(&listener, Ok(2)).unwrap().is_none());
+        assert!(verify_accepting(&listener, Ok(0)).is_err());
+        let unsupported = || Err(io::Error::from_raw_os_error(nix::libc::ENOPROTOOPT));
+        assert!(
+            verify_accepting(&listener, unsupported())
+                .unwrap()
+                .is_none()
+        );
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(b"queued").unwrap();
+        let mut pending = verify_accepting(&listener, unsupported()).unwrap().unwrap();
+        let mut bytes = [0; 6];
+        pending.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"queued");
+        assert!(
+            verify_accepting(
+                &listener,
+                Err(io::Error::from_raw_os_error(nix::libc::EBADF))
+            )
+            .is_err()
+        );
+        // A stream that never called listen must fail the probe. Use libc,
+        // like production, so this test needs no extra nix socket feature.
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let fd = unsafe { nix::libc::socket(nix::libc::AF_UNIX, nix::libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let raw = unsafe { OwnedFd::from_raw_fd(fd) };
+        let unbound = UnixListener::from(raw);
+        unbound.set_nonblocking(true).unwrap();
+        assert!(verify_accepting(&unbound, unsupported()).is_err());
+    }
+
     fn os(value: &str) -> Option<&OsStr> {
         Some(OsStr::new(value))
     }

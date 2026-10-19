@@ -18,6 +18,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 // The provisional number is assigned at landing.
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: satellite-inbound-attempts-migration
 /// Provisional schema version of the attempts catalog; the lander renumbers it.
 pub(crate) const SATELLITE_INBOUND_ATTEMPTS_SCHEMA_VERSION: i32 = 147;

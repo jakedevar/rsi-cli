@@ -104,7 +104,7 @@ mod tests {
     };
 
     fn workspace_path(relative: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        std::path::Path::new(rsi_common::manifest_dir!())
             .join("../..")
             .join(relative)
     }

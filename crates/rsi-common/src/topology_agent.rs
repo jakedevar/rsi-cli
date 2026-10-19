@@ -137,6 +137,12 @@ pub struct AgentTopologyListRequestV1 {
     pub epic_id: Option<Uuid>,
     #[serde(default)]
     pub include_executions: bool,
+    /// #2264: also list settled executions (`succeeded`, `failed`,
+    /// `cancelled`), so a manager can read a topology's run history. Implies
+    /// `include_executions`. The default is live-only (accepted, running,
+    /// cancelling, blocked).
+    #[serde(default)]
+    pub include_settled: bool,
     /// `next_cursor` of the previous page (a topology name).
     #[serde(default)]
     pub cursor: Option<String>,
@@ -184,6 +190,74 @@ pub struct AgentTopologySummaryV1 {
     pub definition_digest: String,
     pub shared: bool,
     pub updated_at: String,
+    /// #2660: set when the name is a daemon-shipped starter and the stored
+    /// definition is not the shipped one (edited, or an older text the daemon
+    /// does not upgrade). Absent when the row follows the shipped definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_drift: Option<StarterDriftV1>,
+}
+
+/// How a stored starter differs from what the daemon ships (#2660).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StarterDriftV1 {
+    /// Canonical digest of the definition this daemon build ships under the
+    /// row's name. The row's own `definition_digest` is the stored side.
+    pub shipped_digest: String,
+}
+
+/// `AgentTopologyGet`: one visible topology with its full definition (#2414).
+/// Exactly one of `topology_id` and `name` selects it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTopologyGetRequestV1 {
+    #[serde(default)]
+    pub topology_id: Option<Uuid>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+}
+
+impl AgentTopologyGetRequestV1 {
+    /// # Errors
+    /// A stable code naming the malformed field.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (&self.topology_id, &self.name) {
+            (Some(id), None) if !id.is_nil() => Ok(()),
+            (None, Some(name))
+                if !name.trim().is_empty()
+                    && name.len() <= AGENT_TOPOLOGY_NAME_MAX
+                    && !name.contains('\0') =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err("topology_get_selector_ambiguous"),
+            (None, None) => Err("topology_get_selector_missing"),
+            _ => Err("topology_invalid_name"),
+        }
+    }
+}
+
+/// `AgentTopologyGet` result: the summary fields plus the stored definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyGetResultV1 {
+    pub topology: AgentTopologySummaryV1,
+    /// The stored definition as JSON. `topology.definition_digest` is the
+    /// digest of the stored text (not of this value's re-serialization) and is
+    /// what fences `AgentTopologyExecute`. Fork it by passing it, with a new
+    /// name, to `AgentTopologyUpsert`; revise it by passing the edited
+    /// definition with `expected_revision = topology.revision`.
+    pub definition: serde_json::Value,
+    /// The session that last wrote the topology (a retired seat session
+    /// is normal; revising is keyed to scope, not to this session).
+    #[serde(default)]
+    pub owner_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    pub created_at: String,
 }
 
 /// One durable execution visible to the caller.
@@ -211,13 +285,100 @@ pub struct AgentTopologyExecutionSummaryV1 {
     pub created_at: String,
     #[serde(default)]
     pub finished_at: Option<String>,
+    /// #2559: what the run did, so a settled execution is readable without
+    /// further reads. Present on `AgentTopologyGetExecution` for a settled
+    /// (`succeeded`, `failed`, `cancelled` or `blocked`) execution only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AgentTopologyOutcomeV1>,
+}
+
+/// #2559: the bounded digest of a settled execution: the facts a manager
+/// otherwise reads the node list, the Issue and the Issue list for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeV1 {
+    /// The `inputs.issue` and its status after the settle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<AgentTopologyOutcomeIssueV1>,
+    /// One per land node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lands: Vec<AgentTopologyOutcomeLandV1>,
+    /// One per review node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<AgentTopologyOutcomeReviewV1>,
+    /// Issues the run's node sessions filed (other than `inputs.issue`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<AgentTopologyOutcomeFollowupV1>,
+    /// One per node whose latest attempt failed or is blocked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<AgentTopologyOutcomeFailureV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeIssueV1 {
+    pub display_number: i64,
+    #[serde(default)]
+    pub title: String,
+    /// `Open`, `InProgress`, `Closed` or `Cancelled`; absent when unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeLandV1 {
+    pub node_id: String,
+    /// The queue entry state (`published`, `refused`, ...) or the attempt
+    /// status when no output was recorded.
+    pub state: String,
+    /// The SHA the landing published on `rolling`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<Uuid>,
+    /// Queue wall time: enqueued to finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_wall_secs: Option<i64>,
+    /// The code of a refused Issue close (#2578): the landing published but the
+    /// execution's owner could not close the input Issue, which stays open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_close_refused: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeReviewV1 {
+    pub node_id: String,
+    /// `approved`, `changes_requested`, `rounds_exhausted` or `unsettled`.
+    pub verdict: String,
+    /// The settling attempt's number within its round (2 = one earlier
+    /// attempt gave no usable verdict).
+    pub attempts: u32,
+    /// 1-based review round (loop iteration) of the settling attempt.
+    pub round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeFollowupV1 {
+    pub display_number: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyOutcomeFailureV1 {
+    pub node_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    pub attempt_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTopologyListResultV1 {
     pub topologies: Vec<AgentTopologySummaryV1>,
-    /// Present only with `include_executions`: active and blocked
-    /// executions in the caller's scope, newest first, at most 32.
+    /// Present only with `include_executions` or `include_settled`: live
+    /// (active and blocked) executions in the caller's scope first, then, with
+    /// `include_settled`, settled ones, each group newest first, at most 32 in
+    /// all.
     #[serde(default)]
     pub executions: Vec<AgentTopologyExecutionSummaryV1>,
     #[serde(default)]
@@ -252,6 +413,17 @@ pub struct AgentTopologyExecuteRequestV1 {
     /// portfolio seat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_call: Option<crate::types::TopologyOnCallSeat>,
+    /// #2427: the live execution that holds `inputs.issue`, to interrupt and
+    /// replace. Without it a live holder refuses `topology_issue_already_live`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_execution: Option<Uuid>,
+    /// Who is woken when the execution settles (hub #2967), like
+    /// `AgentSubmitJob.wake`. `owner` (the default) arms one
+    /// `topology_execution_settled` resume wake for the requester, as
+    /// `AgentEnqueueLandingSource` does for its outcome (#2405); `none`
+    /// arms nothing. A replay of an accepted request never arms a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<crate::agent_jobs::JobWake>,
 }
 
 impl AgentTopologyExecuteRequestV1 {
@@ -305,6 +477,17 @@ pub struct AgentTopologyExecuteResultV1 {
     pub base_commit: String,
     /// True when the idempotency key replayed an earlier acceptance.
     pub deduplicated: bool,
+    /// True when this call armed the requester's `topology_execution_settled`
+    /// wake (hub #2967). False on a replay, on `wake:"none"`, and when arming
+    /// was refused (then arm it yourself with `AgentScheduleWake`).
+    #[serde(default)]
+    pub settle_wake_armed: bool,
+    /// The stable refusal code (for example `wake_when_cap_reached`) when the
+    /// daemon tried to arm the settle wake and was refused (#3019): the
+    /// execution is accepted and unwatched, so arm your own wake or poll it.
+    /// Absent when the wake was armed, replayed, covered or `wake:"none"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_wake_refusal: Option<String>,
 }
 
 /// `AgentTopologyGetExecution`: one execution with its attempts and a page
@@ -355,10 +538,82 @@ pub struct AgentTopologyEventV1 {
     pub created_at: String,
 }
 
+/// Most receipts of each kind one execution view carries.
+pub const REVIEW_RECEIPTS_MAX: usize = 32;
+
+/// A failure an open known-failure record already names (#3020).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyKnownFailureV1 {
+    pub test: String,
+    pub issue: u64,
+}
+
+/// The author's `scoped_test` receipt the daemon verified for one node attempt
+/// (#3020): the job, the exact commit it verified and its verdict. Keyed to
+/// `head`; a reviewer compares it with the commit it reviews.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyScopedTestReceiptV1 {
+    pub attempt_id: Uuid,
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+    /// The commit the job's receipt verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// `precise` or `targeted_subset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub failing_tests: Vec<String>,
+    /// Baseline reds: failures an open known-failure record names.
+    #[serde(default)]
+    pub known_failures: Vec<AgentTopologyKnownFailureV1>,
+    #[serde(default)]
+    pub new_failures: Vec<String>,
+    /// Why the daemon did not accept the receipt, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_reason: Option<String>,
+}
+
+/// The merge-queue gate's receipt for a land node's published entry (#3020).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyGateReceiptV1 {
+    /// The land attempt that enqueued the entry.
+    pub attempt_id: Uuid,
+    pub entry_id: Uuid,
+    /// The source commit the entry landed.
+    pub commit: String,
+    pub state: String,
+    /// The filters the gate ran.
+    #[serde(default)]
+    pub test_filters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_glob: Option<String>,
+}
+
+/// The test evidence of one execution, for its assigned reviewer only (#3020).
+/// Each list is bounded by [`REVIEW_RECEIPTS_MAX`], newest attempts kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTopologyReviewReceiptsV1 {
+    #[serde(default)]
+    pub scoped_test: Vec<AgentTopologyScopedTestReceiptV1>,
+    #[serde(default)]
+    pub gate: Vec<AgentTopologyGateReceiptV1>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTopologyGetExecutionResultV1 {
     pub execution: AgentTopologyExecutionSummaryV1,
     pub nodes: Vec<TopologyAttemptSummary>,
+    /// The author's `scoped_test` and the merge-queue gate receipts (#3020).
+    /// Present only for the assigned reviewer of this execution; a manager or
+    /// lead reading the execution gets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts: Option<AgentTopologyReviewReceiptsV1>,
     pub events: Vec<AgentTopologyEventV1>,
     /// Pass as `after_sequence` to continue; equals the last returned
     /// event's sequence (or the request's cursor when none were returned).
@@ -453,6 +708,8 @@ mod tests {
             base_commit: None,
             idempotency_key: "run-1".into(),
             on_call: None,
+            supersedes_execution: None,
+            wake: None,
         };
         assert_eq!(execute.validate(), Ok(()));
         let mut bad = execute.clone();

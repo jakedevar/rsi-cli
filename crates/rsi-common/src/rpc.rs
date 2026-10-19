@@ -38,6 +38,58 @@ use serde_json::Value;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// A transient agent transport credential. Diagnostics always redact its value;
+/// only a transport boundary may explicitly expose it. Deliberately has no
+/// Display, Deref, or serde implementation for use in internal/persisted types.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct AgentTransportBearer(String);
+
+impl AgentTransportBearer {
+    pub fn expose_for_transport(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AgentTransportBearer {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for AgentTransportBearer {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl std::fmt::Debug for AgentTransportBearer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AgentTransportBearer(<redacted>)")
+    }
+}
+
+// Wire serde belongs to the request envelope, never to the credential type.
+mod transport_bearer_wire {
+    use super::AgentTransportBearer;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        bearer: &Option<AgentTransportBearer>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        bearer
+            .as_ref()
+            .map(AgentTransportBearer::expose_for_transport)
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<AgentTransportBearer>, D::Error> {
+        Option::<String>::deserialize(deserializer).map(|value| value.map(Into::into))
+    }
+}
+
 /// JSON-RPC 2.0 Request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -51,8 +103,12 @@ pub struct RpcRequest {
     /// keeps the token out of persisted request params. `rsi-rpc` sets this
     /// from `$RSI_SESSION_TOKEN`; unattributed (TUI/operator) callers leave
     /// it `None` and are unaffected by the gate in `handle_request_inner`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_token: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "transport_bearer_wire"
+    )]
+    pub session_token: Option<AgentTransportBearer>,
 }
 
 impl RpcRequest {
@@ -125,6 +181,9 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+/// Server error: a read-only Remote read was refused because the daemon is
+/// busy (Store held, permit cap, deadline). The daemon is up; retry shortly.
+pub const REMOTE_BUSY: i32 = -32001;
 
 /// RPC Method Parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +223,11 @@ pub struct LaunchSessionParams {
     /// Override API key for OpenAI-compatible providers (custom provider config).
     #[serde(default)]
     pub openai_api_key: Option<String>,
+    /// hub #3039: a custom provider (`ListCustomProviders`) the daemon
+    /// resolves itself: its base URL fills an absent `openai_base_url` and
+    /// its vault key an absent `openai_api_key`, so no frontend holds the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_provider_id: Option<Uuid>,
     /// Workflow to associate this session with (pipeline propagation).
     #[serde(default)]
     pub workflow_id: Option<Uuid>,
@@ -210,11 +274,14 @@ pub struct LaunchSessionParams {
     /// that omit it.
     #[serde(default)]
     pub workflow_id_override: Option<Uuid>,
-    /// Operator-only per-session Harness tool policy (#792): tool enablement,
+    /// Operator-only per-session tool policy (#792): tool enablement,
     /// `web_access` and budgets, enforced when the catalog is built and again
-    /// at execution. Refused for providers that do not run the Harness loop
-    /// (`tool_policy_unsupported_provider`). Agents cannot set it: no spawn
-    /// verb carries it, and a spawned child inherits its emitter's policy.
+    /// at execution by the Harness loop, plus `cli_access` (#2758), the one
+    /// field the Claude and Codex CLIs enforce (read-only sandbox). A provider
+    /// that cannot enforce a field is refused with
+    /// `tool_policy_unsupported_for_provider:<what>`, never silently widened.
+    /// Agents cannot set it: no spawn verb carries it, and a spawned child
+    /// inherits its emitter's policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<crate::harness_tool_policy::HarnessToolPolicy>,
     /// Operator-only per-session Harness completion gates (#794). Refused for
@@ -1274,6 +1341,13 @@ pub struct ProcessMemoryReport {
 /// Response payload for GetHealthStatus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatusResponse {
+    /// The process answering this RPC, including with an inherited listener.
+    /// Optional when reading replies from a daemon predating #1872.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    /// Process-lifetime startup time, RFC3339 with nanoseconds (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_started_at: Option<String>,
     pub persistence_queue_depth: usize,
     pub persistence_queue_capacity: usize,
     pub last_command_duration_ms: u64,
@@ -1352,6 +1426,10 @@ pub struct HealthStatusResponse {
     /// cannot tell, and from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_mode: Option<String>,
+    /// Projects whose codegraph has been Degraded or Failed for over 24 hours
+    /// (#2246); empty when every graph is healthy and from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codegraph_unhealthy: Vec<crate::codegraph::CodegraphHealthNoticeV1>,
 }
 
 /// One credential slot's resolved state and its accepted environment names.
@@ -1411,9 +1489,60 @@ pub struct ProviderRateLimitSnapshot {
     pub observed_at: DateTime<Utc>,
     #[serde(default)]
     pub windows: Vec<ProviderRateLimitWindow>,
+    /// Set when the provider's latest refresh failed (for Codex, a plan-window
+    /// poll that errored): the windows are the LAST KNOWN values, not current
+    /// ones. The value is a stable reason code such as `probe_timeout`. Never
+    /// persisted: the daemon overlays it on read, so a store row is always the
+    /// last good observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+}
+
+/// Request for `GetProviderRateLimits` (operator RPC). Params may be omitted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetProviderRateLimitsParams {
+    /// Restrict the answer to one provider; absent lists every provider.
+    #[serde(default)]
+    pub provider: Option<SessionProvider>,
+}
+
+/// How a provider's plan windows are being refreshed (Codex only today; Claude
+/// windows arrive on its own stream and have no poll).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRateLimitPollStatus {
+    pub provider: SessionProvider,
+    /// Operator setting `codex_rate_limit_poll_secs`; 0 means polling is off.
+    pub poll_secs: u32,
+    #[serde(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// Reason code of the latest failed attempt; cleared by the next success.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// The latest attempt found no signed-in plan account: no windows exist
+    /// and that is not an error.
+    #[serde(default)]
+    pub logged_out: bool,
+}
+
+/// Response of `GetProviderRateLimits`: the same snapshot shape
+/// `GetHealthStatus.rate_limits` carries, plus the refresh status.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GetProviderRateLimitsResponse {
+    #[serde(default)]
+    pub rate_limits: Vec<ProviderRateLimitSnapshot>,
+    #[serde(default)]
+    pub polls: Vec<ProviderRateLimitPollStatus>,
 }
 
 impl ProviderRateLimitSnapshot {
+    /// True when the windows are last-known values after a failed refresh.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.stale_reason.is_some()
+    }
+
     /// The most-consumed window, which is the one that will throttle first and
     /// therefore the one worth showing the operator.
     pub fn peak_window(&self) -> Option<&ProviderRateLimitWindow> {
@@ -1663,6 +1792,10 @@ pub struct GenerateTextParams {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// hub #3039: a custom provider the daemon resolves (base URL and vault
+    /// key) when `base_url` / `api_key` are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_provider_id: Option<uuid::Uuid>,
 }
 
 /// Response for `GenerateText` RPC.
@@ -1686,6 +1819,10 @@ pub struct CompilePromptParams {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// hub #3039: a custom provider the daemon resolves (base URL and vault
+    /// key) when `base_url` / `api_key` are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_provider_id: Option<uuid::Uuid>,
     /// TUI-stable identity for supersede cancellation. A second CompilePrompt
     /// request from the same caller aborts the first.
     pub caller_id: Uuid,
@@ -2588,8 +2725,8 @@ pub struct AgentCreateIssueResult {
     pub deduplicated: bool,
 }
 
-/// Strict lead-scoped Issue list request. The project is intentionally absent:
-/// it is derived from the authenticated caller's persisted owning Epic.
+/// Strict project-scoped Issue list request. Bound workers must supply a
+/// title filter and omit project_id; their live binding supplies the project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentListIssuesRequestV1 {
@@ -2610,15 +2747,36 @@ pub struct AgentListIssuesRequestV1 {
     /// Optional case-insensitive substring filter over the Issue title.
     #[serde(default)]
     pub title_contains: Option<String>,
+    /// Require every supplied label to be present (exact, case-sensitive).
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// #1235: the target project of a global manager seat acting inside its
     /// operator grant. Omitted means the caller's own project. A target the
     /// daemon checks against the grant, never caller identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// #2052: `summary` returns metadata rows only (no bodies); `full` returns
+    /// whole records. Omitted: summary when `title_contains` is set (a
+    /// dedupe search), full otherwise. A live Issue-bound worker always
+    /// receives summary rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<IssueListFieldsV1>,
+}
+
+/// Row projection of `AgentListIssues` (#2052).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueListFieldsV1 {
+    Summary,
+    Full,
 }
 
 /// Maximum accepted length (bytes) of `AgentListIssuesRequestV1::title_contains`.
 pub const AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES: usize = 128;
+/// Maximum number of labels accepted by `AgentListIssues`.
+pub const AGENT_ISSUE_LIST_LABELS_MAX_COUNT: usize = 16;
+/// Maximum accepted length (bytes) of each `AgentListIssues` label.
+pub const AGENT_ISSUE_LIST_LABEL_MAX_BYTES: usize = 64;
 
 /// Sort direction for `AgentListIssues`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2640,6 +2798,8 @@ impl Default for AgentListIssuesRequestV1 {
             ready: false,
             order: IssueListOrderV1::Asc,
             title_contains: None,
+            labels: Vec::new(),
+            fields: None,
         }
     }
 }
@@ -2661,6 +2821,17 @@ impl AgentListIssuesRequestV1 {
                 ));
             }
         }
+        if self.labels.len() > AGENT_ISSUE_LIST_LABELS_MAX_COUNT
+            || self.labels.iter().any(|label| {
+                label.trim().is_empty()
+                    || label.len() > AGENT_ISSUE_LIST_LABEL_MAX_BYTES
+                    || label.contains('\0')
+            })
+        {
+            return Err(format!(
+                "labels must contain at most {AGENT_ISSUE_LIST_LABELS_MAX_COUNT} nonblank, NUL-free values of at most {AGENT_ISSUE_LIST_LABEL_MAX_BYTES} bytes each"
+            ));
+        }
         let limit = self.limit.unwrap_or(64);
         if !(1..=256).contains(&limit) {
             return Err("Issue list limit must be 1..=256".to_string());
@@ -2670,7 +2841,7 @@ impl AgentListIssuesRequestV1 {
 }
 
 /// Strict lead-scoped Issue lookup request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGetIssueRequestV1 {
     /// Exactly one of `issue_id` and `display_number` must be set.
@@ -2703,6 +2874,9 @@ pub struct AgentUpdateIssueRequestV1 {
     pub display_number: Option<i64>,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// Include the full Issue snapshot in the mutation receipt when needed.
+    #[serde(default)]
+    pub include_issue: bool,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -2722,12 +2896,60 @@ pub struct AgentUpdateIssueRequestV1 {
     /// daemon checks against the grant, never caller identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// #1750: an Issue-bound worker's complete handoff, stored as its own
+    /// append-only record (up to 65536 bytes) instead of growing the body, so
+    /// it publishes even when the body is at its ceiling. Bound workers only;
+    /// no other field may be set. `expected_row_version` is not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
 }
 
 impl AgentUpdateIssueRequestV1 {
+    /// Build an Issue mutation with an explicit optimistic-concurrency fence
+    /// and idempotency key. The target and patch fields remain unset.
+    pub fn new(expected_row_version: i64, idempotency_key: String) -> Self {
+        Self {
+            issue_id: None,
+            display_number: None,
+            expected_row_version,
+            idempotency_key,
+            include_issue: false,
+            title: None,
+            body: None,
+            labels: None,
+            priority: None,
+            clear_priority: false,
+            assignee: None,
+            clear_assignee: false,
+            project_id: None,
+            handoff: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         validate_issue_target(self.issue_id, self.display_number)?;
         validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)?;
+        if let Some(handoff) = &self.handoff {
+            if self.title.is_some()
+                || self.body.is_some()
+                || self.labels.is_some()
+                || self.priority.is_some()
+                || self.clear_priority
+                || self.assignee.is_some()
+                || self.clear_assignee
+            {
+                return Err("handoff cannot be combined with another field".to_string());
+            }
+            if handoff.trim().is_empty()
+                || handoff.len() > crate::types::ISSUE_HANDOFF_MAX_BYTES_V1
+                || handoff.as_bytes().contains(&0)
+            {
+                return Err(
+                    "Issue handoff must be nonblank, NUL-free, and at most 65536 bytes".into(),
+                );
+            }
+            return Ok(());
+        }
         self.content_patch().validate()
     }
 
@@ -2776,6 +2998,15 @@ pub struct AgentUpdateIssueStatusRequestV1 {
     pub status: IssueStatus,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// Include the full Issue snapshot in the mutation receipt when needed.
+    #[serde(default)]
+    pub include_issue: bool,
+    /// #2329: optional why (covered-by SHA, duplicate of #N, moot, reopen
+    /// reason), at most 2048 bytes. Recorded on the status-change Issue event
+    /// and returned by `AgentGetIssue` (`status_note`) and
+    /// `AgentListIssueEvents` (`request.note`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// #1235: the target project of a global manager seat acting inside its
     /// operator grant. Omitted means the caller's own project. A target the
     /// daemon checks against the grant, never caller identity.
@@ -2786,6 +3017,9 @@ pub struct AgentUpdateIssueStatusRequestV1 {
 impl AgentUpdateIssueStatusRequestV1 {
     pub fn validate(&self) -> Result<(), String> {
         validate_issue_target(self.issue_id, self.display_number)?;
+        if let Some(note) = &self.note {
+            crate::types::validate_issue_status_note(note)?;
+        }
         validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)
     }
 
@@ -2803,6 +3037,7 @@ impl AgentUpdateIssueStatusRequestV1 {
                 issue_id,
                 expected_row_version: self.expected_row_version,
                 status: self.status,
+                note: self.note.clone(),
             },
         ))
     }
@@ -2967,6 +3202,10 @@ pub enum AgentIssueValidationFieldV1 {
     TitleContains,
     /// #1235: the optional target project of a global manager seat.
     ProjectId,
+    /// The optional full-Issue-snapshot flag of a mutation receipt.
+    IncludeIssue,
+    /// #2329: the optional status-change note.
+    Note,
 }
 
 /// One bounded, allowlisted hint for a malformed guarded Issue request.
@@ -3234,6 +3473,51 @@ pub struct LinkIssueToIdeaResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_transport_bearer_request_wire_and_nested_debug() {
+        let marker = format!("synthetic-bearer-{}", Uuid::new_v4());
+        let mut request = RpcRequest::new("AgentGetAuthorityCatalog", serde_json::json!({}));
+        request.session_token = Some(marker.clone().into());
+        let wire = serde_json::to_value(&request).expect("encode envelope");
+        assert!(
+            wire["session_token"].as_str() == Some(marker.as_str()),
+            "wire credential changed"
+        );
+        assert_eq!(wire["params"], serde_json::json!({}));
+        let decoded: RpcRequest = serde_json::from_value(wire).expect("decode envelope");
+        assert!(
+            decoded
+                .session_token
+                .as_ref()
+                .unwrap()
+                .expose_for_transport()
+                == marker,
+            "wire round-trip changed the credential"
+        );
+        let diagnostic = format!("{:?}", Err::<(), _>(vec![request, decoded]));
+        assert!(
+            !diagnostic.contains(&marker),
+            "nested error diagnostics exposed a credential"
+        );
+        assert!(diagnostic.contains("AgentTransportBearer(<redacted>)"));
+
+        for token in [None, Some(serde_json::Value::Null)] {
+            let mut wire =
+                serde_json::json!({"jsonrpc":"2.0", "method":"AgentGetAuthorityCatalog"});
+            if let Some(token) = token {
+                wire["session_token"] = token;
+            }
+            let decoded: RpcRequest = serde_json::from_value(wire).expect("decode absent token");
+            assert!(decoded.session_token.is_none());
+            assert!(
+                serde_json::to_value(decoded)
+                    .unwrap()
+                    .get("session_token")
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn idea_kernel_get_idea_params_round_trip_and_reject_unknown_fields() -> Result<(), String> {
@@ -4586,6 +4870,22 @@ mod tests {
         let ready: AgentListIssuesRequestV1 =
             serde_json::from_value(serde_json::json!({"ready":true})).unwrap();
         assert!(ready.ready);
+        let accepted_labels = (0..16)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>();
+        let labels: AgentListIssuesRequestV1 =
+            serde_json::from_value(serde_json::json!({"labels": accepted_labels})).unwrap();
+        assert!(labels.validated_limit().is_ok());
+        for labels in [
+            (0..17)
+                .map(|index| format!("label-{index}"))
+                .collect::<Vec<_>>(),
+            vec!["x".repeat(65)],
+        ] {
+            let request: AgentListIssuesRequestV1 =
+                serde_json::from_value(serde_json::json!({"labels": labels})).unwrap();
+            assert!(request.validated_limit().is_err());
+        }
         let issue_id = Uuid::new_v4();
         let events: IssueEventPageRequestV1 = serde_json::from_value(serde_json::json!({
             "issue_id": issue_id
@@ -4672,8 +4972,37 @@ mod tests {
     }
 
     #[test]
+    fn health_status_identity_round_trips_and_accepts_legacy_replies() {
+        let legacy = serde_json::json!({
+            "persistence_queue_depth": 0,
+            "persistence_queue_capacity": 1,
+            "last_command_duration_ms": 0,
+            "project_cache_size": 0
+        });
+        let old: HealthStatusResponse = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!((old.daemon_pid, old.daemon_started_at), (None, None));
+        let mut current = legacy;
+        current["daemon_pid"] = serde_json::json!(1234);
+        current["daemon_started_at"] = serde_json::json!("2026-10-12T00:00:00.000000000Z");
+        let parsed: HealthStatusResponse = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(parsed.daemon_pid, Some(1234));
+        assert_eq!(
+            parsed.daemon_started_at.as_deref(),
+            current["daemon_started_at"].as_str()
+        );
+        let serialized = serde_json::to_value(parsed).unwrap();
+        assert_eq!(serialized["daemon_pid"], current["daemon_pid"]);
+        assert_eq!(
+            serialized["daemon_started_at"],
+            current["daemon_started_at"]
+        );
+    }
+
+    #[test]
     fn health_status_round_trips_provider_credential_summary() {
         let response = HealthStatusResponse {
+            daemon_pid: None,
+            daemon_started_at: None,
             persistence_queue_depth: 0,
             persistence_queue_capacity: 1,
             last_command_duration_ms: 0,
@@ -4712,6 +5041,7 @@ mod tests {
                 missing: Vec::new(),
             }),
             supervisor_mode: Some("none".to_string()),
+            codegraph_unhealthy: Vec::new(),
         };
 
         let parsed: HealthStatusResponse =

@@ -58,7 +58,7 @@ impl Fx {
         std::fs::create_dir(&sandbox).unwrap();
         let manager = SessionManager::new(
             Arc::new(crate::bus::EventBus::new(64)),
-            Store::open(&dir.path().join("rsi.db")).unwrap(),
+            Store::open_test_fixture(&dir.path().join("rsi.db")).unwrap(),
             false,
             dir.path().join("daemon.sock"),
             None,

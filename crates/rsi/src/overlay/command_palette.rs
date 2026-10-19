@@ -38,18 +38,24 @@ fn score_text(descriptor: &ActionDescriptor) -> String {
     )
 }
 
-/// True when an alias literally starts with the query and has the same number
-/// of words, so `mana` prefers `:manager` over `:manager policy` until the
-/// operator types a space and starts the next word.
-fn word_prefix_match(descriptor: &ActionDescriptor, query: &str) -> bool {
+/// Length of the shortest alias that literally starts with the query and has
+/// the same number of words, so `mana` prefers `:manager` over `:manager policy`
+/// until the operator types a space and starts the next word.
+fn word_prefix_len(descriptor: &ActionDescriptor, query: &str) -> Option<usize> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return false;
+        return None;
     }
     let query_words = query.split_whitespace().count();
-    descriptor.command_aliases.iter().any(|alias| {
-        alias.split_whitespace().count() == query_words && alias.to_lowercase().starts_with(&query)
-    })
+    descriptor
+        .command_aliases
+        .iter()
+        .filter(|alias| {
+            alias.split_whitespace().count() == query_words
+                && alias.to_lowercase().starts_with(&query)
+        })
+        .map(|alias| alias.len())
+        .min()
 }
 
 fn ranked(origin: &ActionContext, query: &str) -> Vec<ActionId> {
@@ -60,10 +66,22 @@ fn ranked(origin: &ActionContext, query: &str) -> Vec<ActionId> {
         entries.iter().map(|descriptor| score_text(descriptor)),
         usize::MAX,
     );
-    // Stable partition: word-count-matching prefix hits first, fuzzy order kept.
-    let (mut front, back): (Vec<usize>, Vec<usize>) = fuzzy
-        .into_iter()
-        .partition(|&index| word_prefix_match(entries[index], query));
+    // Word-count-matching prefix hits first, shortest alias leading (so a
+    // hyphenated `manager-reseat` never outranks `manager` for `mana`); fuzzy
+    // order is kept among equals (stable sort) and for the remaining hits.
+    let (mut front, back): (Vec<(usize, usize)>, Vec<usize>) = {
+        let mut front = Vec::new();
+        let mut back = Vec::new();
+        for index in fuzzy {
+            match word_prefix_len(entries[index], query) {
+                Some(len) => front.push((len, index)),
+                None => back.push(index),
+            }
+        }
+        (front, back)
+    };
+    front.sort_by_key(|&(len, _)| len);
+    let mut front: Vec<usize> = front.into_iter().map(|(_, index)| index).collect();
     front.extend(back);
     front.truncate(LIMIT);
     front.into_iter().map(|index| entries[index].id).collect()

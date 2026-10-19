@@ -25,6 +25,14 @@ use std::{
 };
 
 pub const UNIT_NAME: &str = "rsi-remote.service";
+/// Remote's gateway is a systemd user unit; every other platform is refused
+/// explicitly instead of failing in a missing `systemctl` (#1096).
+fn unsupported_platform_message() -> String {
+    "RSI Remote's managed gateway needs systemd user units, which are only available on Linux; \
+     it is unsupported on this platform"
+        .to_string()
+}
+
 /// The one-time step that lets `tailscale serve` run without sudo.
 pub const OPERATOR_COMMAND: &str = "sudo tailscale set --operator=$USER";
 
@@ -273,6 +281,8 @@ pub fn status(system: &dyn RemoteSystem, projects: &[(String, String)]) -> Remot
         tailscale,
         peers,
         projects: project_rows,
+        allow_answers: policy.allow_answers,
+        allow_messages: policy.allow_messages,
         errors,
     }
 }
@@ -537,6 +547,12 @@ pub fn set_config(
     let disable_only = request.enabled == Some(false)
         && request.allowed_node_ids.is_none()
         && request.project_ids.is_none();
+    // A write switch alone changes policy bytes the gateway re-reads per
+    // request: persist it and return, without touching the unit or the route.
+    let switches_only = request.enabled.is_none()
+        && request.allowed_node_ids.is_none()
+        && request.project_ids.is_none()
+        && (request.allow_answers.is_some() || request.allow_messages.is_some());
     let mut recovering = false;
     let mut policy = if std::fs::symlink_metadata(&policy_path).is_err() {
         Config::default()
@@ -552,6 +568,16 @@ pub fn set_config(
         }
     };
     let known: BTreeSet<&str> = projects.iter().map(|(id, _)| id.as_str()).collect();
+    if let Some(allow) = request.allow_answers {
+        policy.allow_answers = allow;
+    }
+    if let Some(allow) = request.allow_messages {
+        policy.allow_messages = allow;
+    }
+    if switches_only {
+        write_policy(system, &policy)?;
+        return Ok(status(system, projects));
+    }
     if let Some(nodes) = &request.allowed_node_ids {
         policy.allowed_node_ids = dedup(nodes);
     }
@@ -1114,6 +1140,9 @@ impl RemoteSystem for HostSystem {
     }
 
     fn unit_install_and_start(&self, unit_text: &str) -> Result<(), String> {
+        if !cfg!(target_os = "linux") {
+            return Err(unsupported_platform_message());
+        }
         // A hand-started transient unit of the same name would shadow ours;
         // stop it only when it is plainly the rsi-remote gateway.
         let transient = run(
@@ -1254,6 +1283,22 @@ mod tests {
     const STRANGER: &str = "nSTRANGER";
     const PROJECT_A: &str = "550e8400-e29b-41d4-a716-446655440000";
     const PROJECT_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn unsupported_platform_error_names_systemd_and_linux() {
+        let message = unsupported_platform_message();
+        assert!(message.contains("systemd user units"), "{message}");
+        assert!(message.contains("only available on Linux"), "{message}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn host_system_refuses_gateway_unit_off_linux() {
+        let error = HostSystem.unit_install_and_start("[Unit]\n").unwrap_err();
+        assert_eq!(error, unsupported_platform_message());
+    }
 
     #[derive(Default)]
     struct FakeState {
@@ -1450,6 +1495,7 @@ mod tests {
             enabled: Some(true),
             allowed_node_ids: Some(vec![PHONE.into()]),
             project_ids: Some(vec![PROJECT_A.into()]),
+            ..Default::default()
         }
     }
 
@@ -1766,6 +1812,68 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn write_switches_default_off_persist_and_never_restart_the_gateway() {
+        let fake = Fake::new();
+        let out = set_config(&fake, &projects(), &enable_request()).unwrap();
+        assert!(out.enabled);
+        assert!(
+            !out.allow_answers && !out.allow_messages,
+            "both writes are off until the operator opts in"
+        );
+        let calls_before = fake.calls().len();
+
+        let out = set_config(
+            &fake,
+            &projects(),
+            &RemoteSetConfigRequestV1 {
+                allow_messages: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            out.allow_messages && !out.allow_answers,
+            "independent switches"
+        );
+        assert!(out.enabled, "a switch never changes the enabled state");
+        assert_eq!(
+            fake.calls().len(),
+            calls_before,
+            "a switch edit touches neither the unit nor the serve route"
+        );
+        let policy = config::read(&fake.policy_path()).unwrap();
+        assert!(policy.enabled && policy.allow_messages && !policy.allow_answers);
+        assert_eq!(policy.project_ids, vec![PROJECT_A.to_string()]);
+
+        let out = set_config(
+            &fake,
+            &projects(),
+            &RemoteSetConfigRequestV1 {
+                allow_answers: Some(true),
+                allow_messages: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.allow_answers && !out.allow_messages);
+
+        // The switches survive disabling and re-enabling Remote.
+        set_config(&fake, &projects(), &disable_request()).unwrap();
+        assert!(config::read(&fake.policy_path()).unwrap().allow_answers);
+        let out = set_config(
+            &fake,
+            &projects(),
+            &RemoteSetConfigRequestV1 {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.enabled && out.allow_answers && !out.allow_messages);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn selections_persist_while_disabled_without_starting_anything() {
         let fake = Fake::new();
         let out = set_config(
@@ -1775,6 +1883,7 @@ mod tests {
                 enabled: None,
                 allowed_node_ids: Some(vec![PHONE.into(), LAPTOP.into()]),
                 project_ids: Some(vec![PROJECT_B.into()]),
+                ..Default::default()
             },
         )
         .unwrap();

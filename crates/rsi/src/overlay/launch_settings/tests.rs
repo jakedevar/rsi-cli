@@ -12,7 +12,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::harness_manager::HarnessManagerConfigV1;
 use rsi_common::harness_manager_presets::classify_manager_policy;
 use rsi_common::harness_manager_v2::{
-    HarnessManagerPolicyConfigV2, ManagerCapabilityV2, ManagerOperatingModeV2,
+    ConfigureHarnessManagerWithPolicyResultV2, HarnessManagerPolicyConfigV2, ManagerCapabilityV2,
+    ManagerOperatingModeV2,
 };
 use rsi_common::types::SessionProvider;
 use std::path::PathBuf;
@@ -736,7 +737,8 @@ fn manager_config(project_id: Uuid, session_id: Uuid, row_version: i64) -> Harne
 }
 
 /// Serve `LaunchSession` on the first connection, then answer the manager
-/// RPCs on the second. `refuse_scope` rejects `ConfigureHarnessManager`.
+/// RPCs on the second. `refuse_scope` rejects the atomic
+/// `ConfigureHarnessManagerWithPolicy` (#2237).
 fn spawn_launch_daemon(
     listener: tokio::net::UnixListener,
     project_id: Uuid,
@@ -770,23 +772,28 @@ fn spawn_launch_daemon(
             let request: serde_json::Value = serde_json::from_str(&line).unwrap();
             let result = match request["method"].as_str().unwrap() {
                 "GetHarnessManager" | "GetHarnessManagerPolicy" => Ok(serde_json::Value::Null),
-                "ConfigureHarnessManager" if refuse_scope => Err("manager_project_limit_reached"),
-                "ConfigureHarnessManager" => {
-                    Ok(serde_json::to_value(manager_config(project_id, returned_id, 1)).unwrap())
+                "ConfigureHarnessManagerWithPolicy" if refuse_scope => {
+                    Err("manager_project_limit_reached")
                 }
-                "ConfigureHarnessManagerPolicy" => {
+                "ConfigureHarnessManagerWithPolicy" => {
                     let policy: ManagerPolicyV2 =
                         serde_json::from_value(request["params"]["policy"].clone()).unwrap();
-                    Ok(serde_json::to_value(HarnessManagerPolicyConfigV2 {
-                        project_id,
-                        manager_session_id: returned_id,
-                        scope_version: 1,
-                        row_version: 1,
-                        policy,
-                        updated_at: chrono::Utc::now(),
-                        revoked: false,
-                    })
-                    .unwrap())
+                    Ok(
+                        serde_json::to_value(ConfigureHarnessManagerWithPolicyResultV2 {
+                            config: manager_config(project_id, returned_id, 1),
+                            scope_outcome: Default::default(),
+                            policy: HarnessManagerPolicyConfigV2 {
+                                project_id,
+                                manager_session_id: returned_id,
+                                scope_version: 1,
+                                row_version: 1,
+                                policy,
+                                updated_at: chrono::Utc::now(),
+                                revoked: false,
+                            },
+                        })
+                        .unwrap(),
+                    )
                 }
                 other => panic!("unexpected manager RPC {other}"),
             };
@@ -875,21 +882,187 @@ async fn launch_appoints_the_new_session_and_grants_the_planned_policy() {
         vec![
             "LaunchSession",
             "GetHarnessManager",
-            "ConfigureHarnessManager",
             "GetHarnessManagerPolicy",
-            "ConfigureHarnessManagerPolicy",
-        ]
+            "ConfigureHarnessManagerWithPolicy",
+        ],
+        "one atomic call carries the scope and the policy (#2237)"
     );
     assert_eq!(seen[0]["params"]["project_id"], project_id.to_string());
-    let scope = &seen[2]["params"];
+    let call = &seen[3]["params"];
+    let scope = &call["scope"];
     assert_eq!(scope["session_id"], returned_id.to_string());
     assert_eq!(scope["project_id"], project_id.to_string());
     assert_eq!(scope["expected_row_version"], 0);
     assert!(scope.get("epic_ids").is_none(), "project scope omits Epics");
-    let policy = &seen[4]["params"];
-    assert_eq!(policy["expected_scope_version"], 1);
-    assert_eq!(policy["expected_policy_version"], 0);
-    assert_eq!(policy["policy"]["mode"], "execute");
+    assert_eq!(call["expected_policy_version"], 0);
+    assert_eq!(call["policy"]["mode"], "execute");
+}
+
+/// Plan a manager and open its grant page from the settings side.
+async fn open_grant_page_with_manager(app: &mut App) {
+    crate::overlay::open_blank_popup(app);
+    type_text(app, "run the project").await;
+    press(app, ctrl(KeyCode::Char('o'))).await;
+    press(app, key(KeyCode::Char('G'))).await;
+    press(app, key(KeyCode::Char(' '))).await;
+    press(app, key(KeyCode::Char('p'))).await;
+}
+
+#[tokio::test]
+async fn the_grant_page_edits_the_grant_and_launch_sends_it_in_the_one_atomic_call() {
+    let temp_dir = tempfile::tempdir().expect("socket directory");
+    let socket_path = temp_dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+    let project_id = Uuid::new_v4();
+    let returned_id = Uuid::new_v4();
+    let server = spawn_launch_daemon(listener, project_id, returned_id, false);
+
+    let mut app = test_app_at(socket_path);
+    app.poll.connected = true;
+    app.poll.authoritative_config_ready = true;
+    app.current_project_id = Some(project_id);
+    open_grant_page_with_manager(&mut app).await;
+    assert!(launch(&app).grant_open, "p opens the grant page");
+    assert_eq!(
+        launch(&app).grant.as_ref().map(|editor| editor.preset()),
+        Some(ManagerPolicyPreset::Execute),
+        "the editor starts from the planned preset"
+    );
+    // Preset, Mode, then the capabilities: Deploy is the fifteenth.
+    for _ in 0..16 {
+        press(&mut app, key(KeyCode::Char('j'))).await;
+    }
+    press(&mut app, key(KeyCode::Char(' '))).await;
+    // The first catalog launch becomes an allowed launch of this manager.
+    press(&mut app, key(KeyCode::Char('G'))).await;
+    for _ in 0..9 {
+        press(&mut app, key(KeyCode::Char('k'))).await;
+    }
+    press(&mut app, key(KeyCode::Char(' '))).await;
+    // Esc returns to the launch rows, still on the settings side.
+    press(&mut app, key(KeyCode::Esc)).await;
+    assert!(launch(&app).open && !launch(&app).grant_open);
+    let chosen = launch(&app)
+        .grant
+        .as_ref()
+        .expect("an edited grant")
+        .clone();
+    assert_eq!(chosen.preset(), ManagerPolicyPreset::Custom);
+    assert!(
+        chosen
+            .policy()
+            .capabilities
+            .contains(&ManagerCapabilityV2::Deploy)
+    );
+    assert_eq!(chosen.launches().len(), 1);
+
+    press(&mut app, ctrl(KeyCode::Enter)).await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.interactive_launch_rx.recv(),
+    )
+    .await
+    .expect("launch result deadline")
+    .expect("launch result");
+    let summary = result
+        .manager
+        .clone()
+        .expect("a manager outcome")
+        .expect("appointment succeeds");
+    assert_eq!(
+        summary,
+        "Manager appointed for the whole project with the Custom policy"
+    );
+    drop(app);
+    let seen = server.await.expect("daemon");
+    let call = &seen.last().expect("the appointment call")["params"];
+    assert_eq!(
+        call["policy"]["capabilities"].as_array().map(Vec::len),
+        Some(9)
+    );
+    assert!(
+        call["policy"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "deploy")
+    );
+    assert_eq!(
+        call["policy"]["allowed_launches"].as_array().map(Vec::len),
+        Some(1),
+        "the checked launch is granted"
+    );
+}
+
+#[tokio::test]
+async fn the_grant_page_needs_a_planned_manager_and_flips_back_like_the_rest() {
+    let mut app = test_app();
+    app.current_project_id = Some(Uuid::new_v4());
+    crate::overlay::open_blank_popup(&mut app);
+    press(&mut app, ctrl(KeyCode::Char('o'))).await;
+    // Without a manager the Grant row does not exist and `p` does nothing.
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    assert!(!launch(&app).grant_open && launch(&app).grant.is_none());
+    press(&mut app, key(KeyCode::Char('G'))).await;
+    press(&mut app, key(KeyCode::Char(' '))).await;
+    assert_eq!(selected(&app), Some(LaunchSettingRow::Manager));
+    // With one planned, the last row is the Grant row and Enter opens it.
+    press(&mut app, key(KeyCode::Char('G'))).await;
+    assert_eq!(selected(&app), Some(LaunchSettingRow::ManagerGrant));
+    press(&mut app, key(KeyCode::Enter)).await;
+    assert!(launch(&app).grant_open);
+    let rows = render_rows(&mut app);
+    for needle in ["GRANT · Execute", "AUTHORITY", "CAPABILITIES"] {
+        row_containing(&rows, needle);
+    }
+    // Esc leaves the page, a second Esc leaves the settings side.
+    press(&mut app, key(KeyCode::Esc)).await;
+    assert!(launch(&app).open && !launch(&app).grant_open);
+    press(&mut app, key(KeyCode::Esc)).await;
+    assert!(!launch(&app).open);
+    // Flipping away from the page lands on the rows next time.
+    press(&mut app, ctrl(KeyCode::Char('o'))).await;
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    assert!(launch(&app).grant_open);
+    press(&mut app, key(KeyCode::Tab)).await;
+    assert!(!launch(&app).open && !launch(&app).grant_open);
+}
+
+#[tokio::test]
+async fn choosing_a_preset_resets_the_edited_grant_and_unplanning_drops_it() {
+    let mut app = test_app();
+    app.current_project_id = Some(Uuid::new_v4());
+    open_grant_page_with_manager(&mut app).await;
+    // Edit the draft: lift the cap on Spend by one step.
+    press(&mut app, key(KeyCode::Char('G'))).await;
+    assert!(launch(&app).grant.is_some());
+    press(&mut app, key(KeyCode::Esc)).await;
+    // Policy row: Execute -> Full project control resets the editor to it.
+    press(&mut app, key(KeyCode::Char('g'))).await;
+    for _ in 0..5 {
+        press(&mut app, key(KeyCode::Char('j'))).await;
+    }
+    assert_eq!(selected(&app), Some(LaunchSettingRow::ManagerPolicy));
+    press(&mut app, key(KeyCode::Char('l'))).await;
+    assert_eq!(
+        launch(&app).grant.as_ref().map(|editor| editor.preset()),
+        Some(ManagerPolicyPreset::FullProjectControl)
+    );
+    assert_eq!(
+        launch(&app)
+            .appointment()
+            .and_then(|a| a.grant)
+            .map(|policy| policy.capabilities.len()),
+        Some(15)
+    );
+    // Turning the manager off drops the grant with the plan.
+    for _ in 0..2 {
+        press(&mut app, key(KeyCode::Char('k'))).await;
+    }
+    assert_eq!(selected(&app), Some(LaunchSettingRow::Manager));
+    press(&mut app, key(KeyCode::Char(' '))).await;
+    assert!(launch(&app).manager.is_none() && launch(&app).grant.is_none());
+    assert_eq!(launch(&app).appointment(), None);
 }
 
 #[tokio::test]

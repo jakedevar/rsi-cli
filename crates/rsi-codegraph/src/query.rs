@@ -10,9 +10,9 @@ use uuid::Uuid;
 use crate::{
     CodegraphError, CodegraphStore, EvidenceView, FactProvenance, MAX_EVIDENCE_PER_FACT,
     MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_QUERY_LIMIT, MAX_QUERY_OUTPUT_BYTES, NodeKind, NodeView,
-    ReadySnapshot, RelationKind, RelationView, Result, UnresolvedReferenceView, node_from_row,
-    parse_provenance, parse_relation, parse_unresolved_kind, parse_uuid, read_snapshot,
-    validate_path,
+    ReadySnapshot, RelationKind, RelationView, Result, UnresolvedReferenceView, blocks::scope_sql,
+    node_from_row, parse_provenance, parse_relation, parse_unresolved_kind, parse_uuid,
+    read_snapshot, validate_path,
 };
 
 /// A caller-selected ready generation. Authorization of historical reads belongs to the service.
@@ -405,8 +405,15 @@ impl QuerySession {
         Ok(self
             .connection
             .query_row(
-                "SELECT source_digest FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
-                params![self.snapshot.workspace_id.to_string(), self.snapshot.generation, path],
+                &format!(
+                    "SELECT b.source_digest FROM cg_blocks b WHERE b.kind='S' AND b.path=?3 AND {}",
+                    scope_sql("b")
+                ),
+                params![
+                    self.snapshot.workspace_id.to_string(),
+                    self.snapshot.generation,
+                    path
+                ],
                 |row| row.get(0),
             )
             .optional()?)
@@ -419,7 +426,7 @@ impl QuerySession {
         mode: ProvenanceMode,
     ) -> Result<Option<NodeView>> {
         let mut node = read_or_timeout(self.connection.query_row(
-            "SELECT node_id,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance FROM cg_nodes WHERE workspace_id=?1 AND generation=?2 AND node_id=?3",
+            &format!("SELECT n.node_id,n.kind,n.name,b.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance FROM cg_block_nodes n JOIN cg_blocks b ON b.block_id=n.block_id WHERE n.node_id=?3 AND {}", scope_sql("n")),
             params![self.snapshot.workspace_id.to_string(), self.snapshot.generation, id.to_string()], node_from_row,
         ).optional(), budget)?.flatten();
         if let Some(ref mut node) = node {
@@ -447,11 +454,12 @@ impl QuerySession {
         fact_type: &str,
         budget: &mut Budget,
     ) -> Result<Vec<EvidenceView>> {
-        let Some(mut stmt) = read_or_timeout(self.connection.prepare(
+        let Some(mut stmt) = read_or_timeout(self.connection.prepare(&format!(
             "SELECT label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest
-             FROM cg_evidence WHERE workspace_id=?1 AND generation=?2 AND fact_id=?3 AND fact_type=?4
+             FROM cg_block_evidence e WHERE e.fact_id=?3 AND e.fact_type=?4 AND {}
              ORDER BY path,start_byte,end_byte,label,ordinal LIMIT ?5",
-        ), budget)? else {
+            scope_sql("e")
+        )), budget)? else {
             return Ok(Vec::new());
         };
         let rows = stmt.query_map(
@@ -509,11 +517,13 @@ impl QuerySession {
     }
 
     fn unresolved(&self, owner: Uuid, budget: &mut Budget) -> Result<Vec<UnresolvedReferenceView>> {
-        let Some(mut stmt) = read_or_timeout(self.connection.prepare(
-            "SELECT kind,owner_id,raw_target,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,reference_digest
-             FROM cg_unresolved_references WHERE workspace_id=?1 AND generation=?2 AND owner_id=?3
-             ORDER BY path,start_byte,unresolved_id LIMIT ?4",
-        ), budget)? else {
+        let Some(mut stmt) = read_or_timeout(self.connection.prepare(&format!(
+            "SELECT u.kind,u.owner_id,u.raw_target,b.path,u.start_byte,u.end_byte,u.start_line,u.start_column,u.end_line,u.end_column,u.source_digest,u.reference_digest
+             FROM cg_block_unresolved u JOIN cg_blocks b ON b.block_id=u.block_id
+             WHERE u.owner_id=?3 AND {}
+             ORDER BY b.path,u.start_byte,u.unresolved_id LIMIT ?4",
+            scope_sql("u")
+        )), budget)? else {
             return Ok(Vec::new());
         };
         let rows = stmt.query_map(
@@ -643,19 +653,23 @@ impl QuerySession {
                     .join(" AND ")
             }
         };
+        let node_columns = "n.node_id,n.kind,n.name,b.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance";
+        let scope = scope_sql("n");
+        // Point lookups drive from the node, name or path index and probe the
+        // manifest; scans drive from the generation's manifest.
         let sql = match mode {
-            SearchMode::ExactName => {
-                "SELECT n.node_id,n.kind,n.name,n.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance FROM cg_nodes n WHERE n.workspace_id=?1 AND n.generation=?2 AND n.name=?3 AND (?4=0 OR n.provenance='Extracted') ORDER BY n.path,n.start_byte,n.node_id LIMIT ?5"
-            }
-            SearchMode::ExactPath => {
-                "SELECT n.node_id,n.kind,n.name,n.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance FROM cg_nodes n WHERE n.workspace_id=?1 AND n.generation=?2 AND n.path=?3 AND (?4=0 OR n.provenance='Extracted') ORDER BY n.path,n.start_byte,n.node_id LIMIT ?5"
-            }
-            SearchMode::NameContains => {
-                "SELECT n.node_id,n.kind,n.name,n.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance FROM cg_nodes n WHERE n.workspace_id=?1 AND n.generation=?2 AND n.name LIKE ?3 ESCAPE '\\' AND (?4=0 OR n.provenance='Extracted') ORDER BY n.path,n.start_byte,n.node_id LIMIT ?5"
-            }
-            SearchMode::Fts => {
-                "SELECT n.node_id,n.kind,n.name,n.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance FROM cg_fts_nodes JOIN cg_nodes n ON n.workspace_id=cg_fts_nodes.workspace_id AND n.generation=cg_fts_nodes.generation AND n.node_id=cg_fts_nodes.node_id WHERE cg_fts_nodes MATCH ?3 AND n.workspace_id=?1 AND n.generation=?2 AND (?4=0 OR n.provenance='Extracted') ORDER BY n.path,n.start_byte,n.node_id LIMIT ?5"
-            }
+            SearchMode::ExactName => format!(
+                "SELECT {node_columns} FROM cg_block_nodes n JOIN cg_blocks b ON b.block_id=n.block_id WHERE n.name=?3 AND (?4=0 OR n.provenance='Extracted') AND {scope} ORDER BY b.path,n.start_byte,n.node_id LIMIT ?5"
+            ),
+            SearchMode::ExactPath => format!(
+                "SELECT {node_columns} FROM cg_blocks b JOIN cg_block_nodes n ON n.block_id=b.block_id WHERE b.path=?3 AND (?4=0 OR n.provenance='Extracted') AND {scope} ORDER BY b.path,n.start_byte,n.node_id LIMIT ?5"
+            ),
+            SearchMode::NameContains => format!(
+                "SELECT {node_columns} FROM cg_manifest m JOIN cg_block_nodes n ON n.block_id=m.block_id JOIN cg_blocks b ON b.block_id=n.block_id WHERE m.workspace_id=?1 AND m.generation=?2 AND n.name LIKE ?3 ESCAPE '\\' AND (?4=0 OR n.provenance='Extracted') ORDER BY b.path,n.start_byte,n.node_id LIMIT ?5"
+            ),
+            SearchMode::Fts => format!(
+                "SELECT {node_columns} FROM cg_fts_blocks JOIN cg_block_nodes n ON n.node_ix=cg_fts_blocks.rowid JOIN cg_blocks b ON b.block_id=n.block_id WHERE cg_fts_blocks MATCH ?3 AND {scope} AND (?4=0 OR n.provenance='Extracted') ORDER BY b.path,n.start_byte,n.node_id LIMIT ?5"
+            ),
         };
         let kind_clause = if node_kinds.is_empty() {
             String::new()
@@ -670,7 +684,7 @@ impl QuerySession {
         let sql = sql.replacen(
             " ORDER BY",
             &format!(
-                "{kind_clause} AND (?6 IS NULL OR n.path=?6 OR n.path LIKE ?7 ESCAPE '\\') ORDER BY"
+                "{kind_clause} AND (?6 IS NULL OR b.path=?6 OR b.path LIKE ?7 ESCAPE '\\') ORDER BY"
             ),
             1,
         );
@@ -744,8 +758,14 @@ impl QuerySession {
             Direction::Incoming => "r.target_id=?3",
             Direction::Both => "(r.source_id=?3 OR r.target_id=?3)",
         };
-        let provenance = if filter.provenance == ProvenanceMode::Strict {
-            "AND r.provenance='Extracted' AND src.provenance='Extracted' AND dst.provenance='Extracted'"
+        let strict = filter.provenance == ProvenanceMode::Strict;
+        let provenance = if strict {
+            "AND r.provenance='Extracted'"
+        } else {
+            ""
+        };
+        let endpoint_provenance = if strict {
+            " AND e.provenance='Extracted'"
         } else {
             ""
         };
@@ -760,11 +780,13 @@ impl QuerySession {
                 .join(",");
             format!(" AND r.kind IN ({items})")
         };
+        let relation_scope = scope_sql("r");
+        let endpoint_scope = scope_sql("e");
         let sql = format!(
-            "SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_relations r \
-             JOIN cg_nodes src ON src.workspace_id=r.workspace_id AND src.generation=r.generation AND src.node_id=r.source_id \
-             JOIN cg_nodes dst ON dst.workspace_id=r.workspace_id AND dst.generation=r.generation AND dst.node_id=r.target_id \
-             WHERE r.workspace_id=?1 AND r.generation=?2 AND {endpoint} {provenance} {kinds} \
+            "SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_block_relations r \
+             WHERE {endpoint} AND {relation_scope} {provenance} {kinds} \
+             AND EXISTS (SELECT 1 FROM cg_block_nodes e WHERE e.node_id=r.source_id AND {endpoint_scope}{endpoint_provenance}) \
+             AND EXISTS (SELECT 1 FROM cg_block_nodes e WHERE e.node_id=r.target_id AND {endpoint_scope}{endpoint_provenance}) \
              ORDER BY r.kind,r.source_id,r.target_id,r.relation_id LIMIT ?4"
         );
         let Some(mut stmt) = read_or_timeout(self.connection.prepare(&sql), budget)? else {
@@ -821,7 +843,7 @@ impl QuerySession {
         let mut relation = read_or_timeout(
             self.connection
                 .query_row(
-                    "SELECT relation_id,kind,source_id,target_id,provenance FROM cg_relations WHERE workspace_id=?1 AND generation=?2 AND relation_id=?3",
+                    &format!("SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_block_relations r WHERE r.relation_id=?3 AND {}", scope_sql("r")),
                     params![
                         self.snapshot.workspace_id.to_string(),
                         self.snapshot.generation,
@@ -1410,12 +1432,14 @@ impl QuerySession {
         filter: &QueryFilter,
         budget: &mut Budget,
     ) -> Result<Option<RelationView>> {
+        let relation_scope = scope_sql("r");
+        let endpoint_scope = scope_sql("e");
         let mut relation = read_or_timeout(self.connection.query_row(
-            "SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_relations r \
-             JOIN cg_nodes src ON src.workspace_id=r.workspace_id AND src.generation=r.generation AND src.node_id=r.source_id \
-             JOIN cg_nodes dst ON dst.workspace_id=r.workspace_id AND dst.generation=r.generation AND dst.node_id=r.target_id \
-             WHERE r.workspace_id=?1 AND r.generation=?2 AND r.relation_id=?3 \
-             AND (?4=0 OR (r.provenance='Extracted' AND src.provenance='Extracted' AND dst.provenance='Extracted'))",
+            &format!("SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_block_relations r \
+             WHERE r.relation_id=?3 AND {relation_scope} \
+             AND (?4=0 OR r.provenance='Extracted') \
+             AND EXISTS (SELECT 1 FROM cg_block_nodes e WHERE e.node_id=r.source_id AND {endpoint_scope} AND (?4=0 OR e.provenance='Extracted')) \
+             AND EXISTS (SELECT 1 FROM cg_block_nodes e WHERE e.node_id=r.target_id AND {endpoint_scope} AND (?4=0 OR e.provenance='Extracted'))"),
             params![self.snapshot.workspace_id.to_string(), self.snapshot.generation, id.to_string(), i64::from(filter.provenance == ProvenanceMode::Strict)], relation_from_row,
         ).optional(), budget)?.flatten();
         if let Some(ref mut item) = relation {

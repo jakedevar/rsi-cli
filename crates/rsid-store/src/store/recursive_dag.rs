@@ -18642,7 +18642,7 @@ mod tests {
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         (dir, store)
     }
 

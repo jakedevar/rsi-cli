@@ -174,7 +174,7 @@ pub(crate) fn validate_v134_catalog(conn: &Connection) -> Result<()> {
 
 /// Test fixtures that rewind V133 must first remove the V134 successor
 /// catalog and restore the exact released V121 trigger text.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn rewind_v134_fixture_to_v133(conn: &Connection) {
     conn.execute_batch(
         "DROP TRIGGER manager_review_assignments_v121_forward;
@@ -313,6 +313,25 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM daemon_restart_intents i JOIN sessions s ON s.id=i.session_id
              WHERE i.session_id=?1 AND i.invocation_id=s.model_invocation_id
                AND i.state IN ('pending','claimed','delivered'))",
+            [session.to_string()], |r| r.get(0),
+        )?)
+    }
+
+    /// The journal will continue this interrupted turn, so a terminal watch on
+    /// it stays armed (hub #2987). Narrower than [`Self::restart_intent_owns_session`]:
+    /// a `pending` intent whose claim a hold refused (`operator_paused`,
+    /// `pending_question`, `custody_changed`, `competing_owner`) keeps its state
+    /// but nothing resumes the session until the hold lifts, so the watch must
+    /// report why the turn stopped (#1504). The progress outcomes
+    /// `shutdown_cancelled` and `restart_reconciled_interrupted` are not holds.
+    /// A claim clears no outcome, so a `claimed` intent continues whatever a
+    /// previous attempt left behind.
+    pub(crate) fn restart_intent_will_continue_session(&self, session: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM daemon_restart_intents i JOIN sessions s ON s.id=i.session_id
+             WHERE i.session_id=?1 AND i.invocation_id=s.model_invocation_id
+               AND (i.state IN ('claimed','delivered') OR (i.state='pending' AND COALESCE(i.outcome,'') NOT IN
+                 ('pending_question','operator_paused','custody_changed','competing_owner'))))",
             [session.to_string()], |r| r.get(0),
         )?)
     }
@@ -598,11 +617,68 @@ mod tests {
         validate_v134_catalog(&reopened.conn).expect("authenticate V134 catalog at head");
     }
 
+    /// Hub #2987 / #1504: a terminal watch stays armed only for an intent the
+    /// journal will continue; a hold-refused intent (`pending` with a hold outcome)
+    /// still owns the turn but nothing resumes it until the hold lifts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_hold_refused_intent_does_not_keep_the_terminal_watch_armed() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let store =
+            Store::open_test_fixture(&directory.path().join("restart.sqlite")).expect("store");
+        let (session, _) = session_with_invocation(&store);
+        assert!(!store.restart_intent_will_continue_session(session).unwrap());
+        assert!(
+            store
+                .record_restart_intent(session, Uuid::new_v4())
+                .expect("record")
+        );
+        let set = |state: &str, outcome: Option<&str>| {
+            store
+                .conn
+                .execute(
+                    "UPDATE daemon_restart_intents SET state=?2,outcome=?3,
+                     continuation_invocation_id=CASE WHEN ?2='delivered' THEN invocation_id END
+                     WHERE session_id=?1",
+                    params![session.to_string(), state, outcome],
+                )
+                .expect("set intent");
+        };
+        for (state, outcome, owns, continues) in [
+            ("pending", None, true, true),
+            ("pending", Some("shutdown_cancelled"), true, true),
+            (
+                "pending",
+                Some("restart_reconciled_interrupted"),
+                true,
+                true,
+            ),
+            ("pending", Some("operator_paused"), true, false),
+            ("pending", Some("pending_question"), true, false),
+            ("claimed", Some("operator_paused"), true, true),
+            ("delivered", None, true, true),
+            ("failed", Some("not_resumable"), false, false),
+        ] {
+            set(state, outcome);
+            assert_eq!(
+                store.restart_intent_owns_session(session).unwrap(),
+                owns,
+                "owns {state} {outcome:?}"
+            );
+            assert_eq!(
+                store.restart_intent_will_continue_session(session).unwrap(),
+                continues,
+                "continues {state} {outcome:?}"
+            );
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn exact_restart_owner_excludes_finished_and_crash_only_turns() {
         let directory = tempfile::tempdir().expect("database directory");
-        let store = Store::open(&directory.path().join("restart.sqlite")).expect("store");
+        let store =
+            Store::open_test_fixture(&directory.path().join("restart.sqlite")).expect("store");
         let boot = Uuid::new_v4();
         let next_boot = Uuid::new_v4();
         let (session, invocation) = session_with_invocation(&store);

@@ -134,6 +134,10 @@ pub struct ManagerTreeRowV1 {
     /// rows that launch nothing (Epic) or whose set is unrestricted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launches: Vec<ManagerLaunchChoiceV2>,
+    /// #2031: a portfolio row's latest seat self-handoff (old seat, new seat,
+    /// bounded handoff reference, time); `None` when its seat never handed on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seat_handoff: Option<crate::manager_node_workspace::ManagerNodeSeatHandoffV1>,
     pub load: ManagerTreeLoadV1,
     /// False when this row's children could not be listed completely.
     pub complete: bool,

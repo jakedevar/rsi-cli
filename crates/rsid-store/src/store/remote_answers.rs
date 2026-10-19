@@ -37,6 +37,15 @@ fn request_fingerprint(request: &AnswerPendingDecisionV1) -> Result<String> {
     fingerprint(&value)
 }
 
+/// One bounded page of the producer-published pending inventory.
+#[derive(Debug, Clone)]
+pub struct RemotePendingScan {
+    pub targets: Vec<(String, Value)>,
+    /// Candidate id to continue after; `Some` only when the scan hit its cap
+    /// with candidates still unexamined.
+    pub next_after: Option<String>,
+}
+
 impl RemoteAnswerDelivery {
     pub fn session_id(&self) -> Uuid {
         uuid(&self.request.session_id)
@@ -80,24 +89,54 @@ impl Store {
 
     /// Bounded producer-publication inventory for one project/session. Legacy
     /// snapshots and partial publications never become answer targets.
+    ///
+    /// Candidates are walked in a stable order (the pending question first,
+    /// then open approvals by `created_at,publication_id`) from just after the
+    /// `after` candidate id. At most `scan_limit` candidates are examined;
+    /// `next_after` is `Some` exactly when the scan stopped at that cap with
+    /// candidates left, so a caller can tell a capped scan from an exhausted
+    /// one and continue from the cursor (#1720).
     pub fn remote_pending_decision_targets(
         &self,
         project: Uuid,
         session: Uuid,
-        limit: usize,
-    ) -> Result<Vec<(String, Value)>> {
+        after: Option<&str>,
+        scan_limit: usize,
+    ) -> Result<RemotePendingScan> {
+        let (skip_question, approval_after) = match after {
+            None => (false, None),
+            Some(cursor) => match cursor.split_once(':') {
+                Some(("pending-question", _)) => (true, None),
+                Some(("pending-approval", publication)) => {
+                    let position: Option<String> = self
+                        .conn
+                        .query_row(
+                            "SELECT created_at FROM appserver_approval_publications WHERE session_id=?1 AND publication_id=?2",
+                            params![session.to_string(), publication],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let created_at = position.ok_or_else(|| refused("decision_changed"))?;
+                    (true, Some((created_at, publication.to_owned())))
+                }
+                _ => return Err(refused("decision_changed")),
+            },
+        };
         let mut ids = Vec::new();
-        if let Ok(Some(target)) = self.pending_question_target(session) {
+        if !skip_question && let Ok(Some(target)) = self.pending_question_target(session) {
             ids.push(format!(
                 "pending-question:{}",
                 target["publication_id"].as_str().unwrap_or_default()
             ));
         }
+        let room = scan_limit.saturating_sub(ids.len()) + 1;
         let approvals = {
-            let mut stmt = self.conn.prepare("SELECT publication_id FROM appserver_approval_publications WHERE session_id=?1 AND state='published' AND closure_state='open' ORDER BY created_at,publication_id LIMIT ?2")?;
-            stmt.query_map(params![session.to_string(), limit.min(17) as i64], |r| {
-                r.get::<_, String>(0)
-            })?
+            let (created_at, publication) = approval_after.unwrap_or_default();
+            let mut stmt = self.conn.prepare("SELECT publication_id FROM appserver_approval_publications WHERE session_id=?1 AND state='published' AND closure_state='open' AND (created_at,publication_id)>(?2,?3) ORDER BY created_at,publication_id LIMIT ?4")?;
+            stmt.query_map(
+                params![session.to_string(), created_at, publication, room as i64],
+                |r| r.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         ids.extend(
@@ -105,15 +144,21 @@ impl Store {
                 .into_iter()
                 .map(|id| format!("pending-approval:{id}")),
         );
-        Ok(ids
+        let more = ids.len() > scan_limit;
+        ids.truncate(scan_limit);
+        let next_after = more.then(|| ids.last().cloned()).flatten();
+        let targets = ids
             .into_iter()
             .filter_map(|id| {
                 self.remote_pending_decision_target(project, session, &id)
                     .ok()
                     .map(|target| (id, target))
             })
-            .take(limit.min(17))
-            .collect())
+            .collect();
+        Ok(RemotePendingScan {
+            targets,
+            next_after,
+        })
     }
 
     pub fn remote_answer_receipt_for_target(

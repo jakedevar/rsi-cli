@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:continue": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/detail.ts",
+      "note": ":continue <text> sends the text; bare :continue opens the continue dialog (Ctrl+Enter sends, Esc closes and keeps the draft)"
+    },
+    "cmd:rate": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": ":rate N rates the open session 1-10 through UpdateSessionRating; bare :rate (or :r) opens the rating dialog"
+    },
+    "global:shift-down/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "Shift-Down selects the next transcript event when no dialog or text field has the keys (also the Go menu and palette)"
+    },
+    "global:shift-up/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "Shift-Up selects the previous transcript event when no dialog or text field has the keys (also the Go menu and palette)"
+    },
+    "key:<Space>mm": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "Switch model / effort dialog from GetSessionModelSwitchOptions: the discovered models narrowed by the operator allowlist; effort rows from the ladder discovery reported for the model, else the compiled per-model ladder (rsi_common effort_ladder, G2), limited to the provider's switchable levels; Enter queues the switch for the next turn"
+    },
+    "key:F2": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "Rename session dialog (Enter renames through UpdateSessionTitle, Esc cancels); also the Session menu and the row context menu"
+    },
+    "key:[u": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "selects the previous user message in the transcript, wrapping to the last"
+    },
+    "key:]u": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "selects the next user message in the transcript, wrapping to the first"
+    },
+    "key:p": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "prompt preview dialog: the full launch prompt of the cursor session; j/k/G change session, Ctrl-D/U scroll, Enter opens it, p/q/Esc close"
+    },
+    "key:yy": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/commands.ts",
+      "note": "copies the selected event text when the keys are in the transcript (after Shift-Down, ]u, a fold key or a click on an event), else the open session ID; also the Session menu"
+    },
+    "key:zs": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "shows or hides system events in the open transcript (View menu check item, palette)"
+    },
+    "key:zt": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "shows or hides thinking events in the open transcript (the TUI description says expand or collapse; the keymap table says show or hide, which is what the desktop does)"
+    },
+    "module:ui/overlay/model_switch.rs": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/model-dropdown.ts, src/model-dropdown-model.ts",
+      "note": "the switch model / effort dialog (<Space>mm) and the launch model picker (Ctrl-M, :model; the model dropdown)"
+    },
+    "module:ui/overlay/prompt_preview.rs": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/skills.ts",
+      "note": "prompt preview dialog (detail) and the Skill Preview over GetSkill (overlay-ref:skill-preview, hub #3062)"
+    },
+    "module:ui/overlay/rating.rs": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "rating dialog"
+    },
+    "module:ui/overlay/rename_session.rs": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "rename dialog"
+    },
+    "overlay-ref:continue-prompt": {
+      "status": "done",
+      "location": "src/actions/detail.ts, src/prompts.ts, src/assist.ts, src/vim-field.ts",
+      "note": "Ctrl-Enter (Cmd-Enter) sends the follow-up; ? (normal) help; Ctrl-Q closes keeping the draft; Ctrl-Y compile and Ctrl-Shift-G grammar into a preview with a / d; Ctrl-Alt-A AI command (Ctrl-A stays select-all) and Ctrl-Shift-A AI chat; Ctrl-V paste with images as @path (G1); the vim editor (G1)"
+    },
+    "overlay-ref:prompt-preview": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "prompt preview dialog: j/k/G, Ctrl-D/U, Enter, p/q/Esc, Space N, Space ;"
+    },
+    "overlay-ref:rate-session": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "rating dialog: 1-9 and 0 (= 10) pick, h/l and arrows step, Enter saves, Esc/q close, Space N, Space ;"
+    },
+    "overlay-ref:rename-session": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "rename dialog: type, Enter renames, Esc cancels"
+    },
+    "overlay-ref:switch-model-effort": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "switch dialog: j/k and g/G pick the model, h/l the effort, Enter queues for the next turn, Esc/q close, Space N, Space ;"
+    },
+    "overlay:prompt-preview-overlay": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "prompt preview dialog: j/k/G, Ctrl-D/U, Enter, p/q/Esc, Space N, Space ;"
+    },
+    "section:navigation-events-detail-view": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "Shift-Down/Up, ]u/[u and Up/Down scroll (slice 5); the mouse wheel scrolls natively; Ctrl-Shift-Right / Left grow and shrink the session list by 3 points between 20 % and 55 % (G2, remembered)"
+    },
+    "section:session-detail-input-bar-priority": {
+      "status": "substitute",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "substitute: the message box is a native text field. Focused, it owns every key; Esc hands the keyboard back to the app keys and keeps the draft; Up/Down scroll the transcript from a one-line draft; i / a / o / O enter it with the TUI caret placement (G2). The Space and g leaders reach the app whenever the box is not focused, so the TUI's pass-through exceptions are not needed; vim editing inside the box is the input-bar sweep's (G1, local #70)"
+    },
+    "section:visibility-toggles-detail-view": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts",
+      "note": "Show tool events, Show system events and Show thinking events: View menu check items, palette, zs / zt keys, right-click a message for tools"
+    },
+    "section:yank": {
+      "status": "done",
+      "location": "src/actions/detail-spec.ts, src/actions/detail.ts",
+      "note": "yy copies the open session ID, or the selected event text once the keys are in the transcript; right-click a message copies its text"
+    }
+  }
+}

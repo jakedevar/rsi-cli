@@ -1,0 +1,27 @@
+[package]
+name = "rsid-remote-read"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# Internal to the daemon: never published. Bounded Remote V1 source reads over a
+# borrowed `rusqlite::Connection` and value observations (#2410). It depends on
+# `rsi-common` and third-party libraries only: never on `rsid`, `rsid-store` or
+# `rsid-core` (crates/rsid/tests/store_crate_seal.rs keeps those sealed).
+publish = false
+
+[dependencies]
+rsi-common = { path = "../rsi-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true, features = ["blob"] }
+zeroize = "1"
+hex = "0.4"
+blake3 = "1"
+rand = { workspace = true }
+
+[lints]
+workspace = true

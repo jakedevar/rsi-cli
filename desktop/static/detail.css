@@ -1,0 +1,18 @@
+/* Session detail (slice 5): event cursor, visibility toggles, detail dialogs. */
+.ev.ev-cursor { outline: 2px solid var(--blue); outline-offset: 1px; }
+.events.hide-system .ev-system, .events.hide-thinking .ev-thinking { display: none; }
+.meta-detail { color: var(--yellow); }
+dialog.detail-dialog { width: min(560px, 92vw); }
+dialog.detail-dialog:focus { outline: none; }
+.dialog-note { font-size: 12px; color: var(--subtext); }
+.form-error { color: var(--red); font-size: 12px; }
+.rate-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.rate-btn { min-width: 36px; padding: 5px 0; text-align: center; }
+.rate-btn.sel { background: var(--blue); color: var(--crust); border-color: var(--blue); }
+.pick-list { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow-y: auto; border: 1px solid var(--surface1); border-radius: 6px; }
+.pick-item { display: flex; justify-content: space-between; gap: 12px; padding: 5px 10px; cursor: pointer; }
+.pick-item:hover { background: var(--surface0); }
+.pick-item.sel { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
+.pick-id { color: var(--overlay0); font-family: var(--mono); font-size: 12px; }
+.effort-row { display: flex; align-items: center; gap: 10px; }
+.preview-body { margin: 0; max-height: 55vh; overflow: auto; padding: 10px 12px; background: var(--mantle); border: 1px solid var(--surface0); border-radius: 6px; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }

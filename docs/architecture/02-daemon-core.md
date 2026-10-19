@@ -191,8 +191,9 @@ predecessor's committed HEAD, sets `continued_from` and prepends its final
 message and the Issue's latest handoff to the brief. When a coordinating seat
 (the project manager seat, the live seat of an area manager node, an Epic
 lead, the global manager seat) reaches the hard context cap
-(`coordinator_context_cap_tokens`, default 0 = off until #1156 closes, then
-200000; `0` off, with
+(`coordinator_context_cap_tokens`, default 60% of the session's known context
+window to match worker and manager baton guidance; `0` off, `1..=100` percent
+(no cap while the window is unknown), or 32000–2000000 absolute tokens, with
 `coordinator_context_cap.<Provider>[/<model>]` overrides set by
 `:context-cap`), `session/context_cap.rs` records one durable cap rotation.
 At the seat's next idle boundary, the daemon writes a handoff from typed
@@ -237,11 +238,16 @@ Safety of the automatic rotation (#1142):
   only when it carries that request's own `rotation_id`; another rotation's
   refusal of the same seat does not (#1155).
 - If the daemon dies after a sandboxed seat's successor was bound to the seat's
-  transferred sandbox custody (transfers are forward-only) and before it was
-  published, restart fails the child but recovery keeps the intent open
+  transferred sandbox custody and before it was published, restart fails the
+  child. For a cap-triggered rotation whose exact reservation provably never
+  executed, recovery returns custody to the predecessor at a new generation
+  and refuses the intent atomically; its seat and grant remain usable there.
+  Spawn attempts without a matching failure receipt, provider threads/output,
+  live effects, changed custody and changed reservations prevent that return.
+  Otherwise recovery keeps the intent open
   (`recovery_blocked`) and tells the operator once: it never closes the
-  rotation over a custody it did not reconcile, never moves the sandbox back and
-  never allocates a second successor (#1156). The operator's Continue of that
+  rotation over custody it did not reconcile and never allocates a second
+  successor (#1156). The operator's Continue of that
   failed successor (it holds the sandbox; custody only moves forward) finishes
   the rotation (#1158): a successor that never reported a provider thread starts
   in a new thread from its own recorded query, and once any operator
@@ -256,7 +262,7 @@ Safety of the automatic rotation (#1142):
   (idempotency key in its metadata) and runs the ordinary rotation decider
   with the `Failed` custody holder as predecessor: a fresh replacement becomes
   its `continued_from` successor, takes the sandbox forward (cause `rotation`;
-  every session owns the root once, custody never moves back) and starts on
+  each abandon transfers to a new session) and starts on
   the holder's first prompt with the operator's provider/model. Its
   publication settles the whole chain in one commit: each unpublished hop
   P → S (→ …) → holder gets its `completed{successor_id}`, the global grant
@@ -265,7 +271,32 @@ Safety of the automatic rotation (#1142):
   the replacement was reserved closes the request (`refused:abandon_interrupted`)
   and the rotation stays blocked on the same holder; a crash after the custody
   bind blocks it on the replacement (escalated once per holder), which the
-  operator abandons in turn. The idea controller is not moved yet (#1186).
+  operator abandons in turn.
+- The Idea controller follows the seat (#1186) in the publication transaction on
+  every path, so it commits together with the Epic lead pointer and the global
+  grant and a refused publication leaves controller, epoch and lead as they
+  were. A live rotation reserves the controller for its successor before it
+  starts (the reservation fixes the successor's id) and confirms the provider
+  is live, but the candidate holds no controller authority until the commit:
+  the typed `assign` runs inside the publication, under the Active write guard
+  (the cancellation witness) and the Store -> A6 guards, and the candidate's
+  semantic grant is installed after the commit. A refused publication releases
+  only the reservation. Restart recovery, the operator's Continue of a blocked
+  successor and an abandon chain never reserved a candidate, so they find the
+  controller on the rotated-away holder and move it to the exact published
+  successor in the same commit with a typed `transfer_to_rotation_successor`
+  event (`controller_assigned`, system actor, next epoch). Both rebind an
+  active ProgramRun. The process-local grant follows the commit: the former
+  holder's is dropped and a live successor's is re-established from the durable
+  assignment (a successor that is not live gets it at its next same-ID
+  continuation).
+  A live successor that fails before its publication (the controller
+  assignment inside it failed, or the final lead fence refused it) settles the
+  rotation by what it holds: an ordinary successor is refused with one terminal
+  `refused:<code>` event, but a successor holding the transferred sandbox
+  custody keeps it (custody only moves forward) and the rotation stays open
+  with a `recovery_blocked` event naming that exact holder, so Continue and
+  abandon find it at once and restart recovery keeps it (#2195, #2196).
 - A rotation acts only on the successor it reserved (#1153). Its own
   `successor_reserved` marker names that row exactly, whatever status a restart
   left it in (`rotation_request_successor`); no newer row, timestamp or other

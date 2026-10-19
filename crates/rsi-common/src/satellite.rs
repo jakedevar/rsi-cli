@@ -107,6 +107,21 @@ impl SatelliteReadLimitsV1 {
 pub struct SatelliteCapabilitiesV1 {
     pub session_read: bool,
     pub limits: SatelliteReadLimitsV1,
+    /// #2120: serves the hub's full-library QA runs
+    /// (`satellite_qa::REQUEST_HUB_QA_RUN_METHOD`). Absent (false) from older
+    /// builds, which the hub treats as an incompatible build for QA.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub qa_run: bool,
+    /// Accepts the hub's `outcomes` on the report pull (why a pulled report
+    /// was held or refused). Absent (false) from older builds, which would
+    /// refuse the unknown field, so the hub then sends acknowledgements only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_outcomes: bool,
+    /// #2587: accepts `interrupt_workers` on a hub deploy request. Absent
+    /// (false) from older builds, which would refuse the unknown field, so the
+    /// hub refuses an interrupting deploy for them instead of sending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deploy_interrupt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,10 +140,22 @@ pub const SATELLITE_MAX_HEALTH_TEXT_BYTES: usize = 64;
 /// Bound on the provider CLI names a satellite health report may list.
 pub const SATELLITE_MAX_MISSING_PROVIDER_CLIS: usize = 8;
 
+/// Host target reported by `GetSatelliteIdentity` in its health. QA placement
+/// compares OS only; architecture is operational information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatellitePlatformV1 {
+    pub os: String,
+    pub arch: String,
+}
+
 /// Non-secret operational facts a satellite reports beside its identity.
-/// Every field is optional or bounded; the hub only displays them.
+/// Every field is optional or bounded; QA placement also consumes admission
+/// and platform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SatelliteHealthV1 {
+    /// #2935: absent on older builds, which cannot take a new hub QA run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<SatellitePlatformV1>,
     /// Cargo package version of the satellite's rsid.
     pub daemon_version: String,
     /// Lowercase hex SHA-256 of the running rsid binary, once computed.
@@ -162,6 +189,120 @@ pub struct SatelliteHealthV1 {
     /// (#1087). Names only, never paths; absent when all are found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_provider_clis: Vec<String>,
+    /// Effective launch choices per manager seat (#1941); absent when the
+    /// satellite seats no manager or is older.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manager_launches: Vec<crate::satellite_manager_policy::SatelliteManagerLaunchesV1>,
+    /// #2120: whether a hub full-library QA run would enter now, from the
+    /// same gates its job meets (build governor floor included). Absent from
+    /// satellites that do not serve hub QA runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa_admission: Option<crate::satellite_qa::SatelliteQaAdmissionV1>,
+    /// #2753: the satellite's own provider CLI login probes (`claude`,
+    /// `codex`): state, method and check time only, never account text. The
+    /// hub shows them per host. Absent from older satellites and while no
+    /// probe finished.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_logins: Vec<crate::provider_login::ProviderLoginHealthV1>,
+    /// #2747: provider faults the satellite's own launches hit (an auth
+    /// rejection, a refused model), for the hub's `when.health_anomaly`.
+    /// Bounded by [`SATELLITE_MAX_PROVIDER_FAULTS`]; absent from older satellites.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_faults: Vec<SatelliteProviderFaultV1>,
+    /// Latest persisted watchdog trip, including after the daemon restarts.
+    /// Historical evidence, not a statement of current reachability; absent
+    /// on older satellites or when no watchdog trip has been recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_watchdog_trip: Option<SatelliteWatchdogTripV1>,
+    /// Successful satellite-local health-count store read (excludes lock wait).
+    /// Absent on old peers; no independent store evidence on an RPC timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_probe_elapsed_ms: Option<u32>,
+}
+
+/// Closed watchdog causes: never carry logs, paths or arbitrary error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SatelliteWatchdogProbeV1 {
+    RpcTimeout,
+    StoreProbeTimeout,
+    SchedulerTickStale,
+    ReconciliationTickStale,
+}
+
+/// One durable watchdog restart, bounded to the four independent probes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteWatchdogTripV1 {
+    pub restart_id: SatelliteUuidV1,
+    #[serde(with = "canonical_timestamp")]
+    pub observed_at: DateTime<Utc>,
+    #[serde(with = "canonical_timestamp")]
+    pub last_healthy_at: DateTime<Utc>,
+    pub failed_probes: Vec<SatelliteWatchdogProbeV1>,
+}
+
+impl SatelliteWatchdogTripV1 {
+    fn validate(&self) -> Result<(), SatelliteValidationError> {
+        if self.restart_id.0.is_nil()
+            || self.last_healthy_at > self.observed_at
+            || self.failed_probes.is_empty()
+            || self.failed_probes.len() > 4
+            || self
+                .failed_probes
+                .iter()
+                .enumerate()
+                .any(|(index, probe)| self.failed_probes[..index].contains(probe))
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<crate::rpc::DaemonRestartRecordV1> for SatelliteWatchdogTripV1 {
+    type Error = SatelliteValidationError;
+
+    fn try_from(record: crate::rpc::DaemonRestartRecordV1) -> Result<Self, Self::Error> {
+        let failed_probes = record
+            .failed_probes
+            .iter()
+            .map(|code| match code.as_str() {
+                "rpc_timeout" => Ok(SatelliteWatchdogProbeV1::RpcTimeout),
+                "store_probe_timeout" => Ok(SatelliteWatchdogProbeV1::StoreProbeTimeout),
+                "scheduler_tick_stale" => Ok(SatelliteWatchdogProbeV1::SchedulerTickStale),
+                "reconciliation_tick_stale" => {
+                    Ok(SatelliteWatchdogProbeV1::ReconciliationTickStale)
+                }
+                _ => Err(SatelliteValidationError::InvalidIdentity),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let trip = Self {
+            restart_id: SatelliteUuidV1(record.id),
+            observed_at: record.observed_at,
+            last_healthy_at: record.last_healthy_at,
+            failed_probes,
+        };
+        trip.validate()?;
+        Ok(trip)
+    }
+}
+
+/// Most provider faults a satellite health report carries.
+pub const SATELLITE_MAX_PROVIDER_FAULTS: usize = 8;
+/// [`SatelliteProviderFaultV1::kind`]: the provider rejected the credential.
+pub const SATELLITE_FAULT_AUTH: &str = "auth_failure";
+/// [`SatelliteProviderFaultV1::kind`]: the provider refused a model.
+pub const SATELLITE_FAULT_MODEL_UNAVAILABLE: &str = "model_unavailable";
+
+/// One provider fault on a satellite (#2747): which provider, which fault and,
+/// for a refused model, which model. Names only, never a message or a key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteProviderFaultV1 {
+    pub provider: String,
+    /// [`SATELLITE_FAULT_AUTH`] or [`SATELLITE_FAULT_MODEL_UNAVAILABLE`].
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The newest `agent_deploys` row of a satellite, without any path or reason
@@ -171,7 +312,21 @@ pub struct SatelliteDeployStatusV1 {
     pub deploy_id: SatelliteUuidV1,
     pub state: crate::agent_deploy::DeployState,
     pub sha: String,
+    /// #2056: while the deploy is `staged`, what holds its quiet point (ids
+    /// only, no text; at most `SATELLITE_MAX_DEPLOY_BLOCKERS` kinds).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<crate::agent_deploy::DeployBlockerV1>,
+    /// #2056: RFC3339 nanos the staged deploy was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since: Option<String>,
+    /// RFC3339 nanos the deploy settled (`succeeded`, `failed` or `timed_out`);
+    /// absent while it is `staged` or `restarting`, and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
+
+/// Most blocker kinds a satellite deploy status carries.
+pub const SATELLITE_MAX_DEPLOY_BLOCKERS: usize = 8;
 
 impl SatelliteHealthV1 {
     /// # Errors
@@ -182,7 +337,21 @@ impl SatelliteHealthV1 {
                 && value.len() <= SATELLITE_MAX_HEALTH_TEXT_BYTES
                 && value.bytes().all(|byte| byte.is_ascii_graphic())
         };
+        if self
+            .store_probe_elapsed_ms
+            .is_some_and(|ms| ms > crate::satellite_diagnostics::MAX_STAGE_ELAPSED_MS)
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if let Some(trip) = &self.latest_watchdog_trip {
+            trip.validate()?;
+        }
         if !text_ok(&self.daemon_version) {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if let Some(platform) = &self.platform
+            && (!text_ok(&platform.os) || !text_ok(&platform.arch))
+        {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
         for text in [&self.build_sha, &self.started_at, &self.supervisor_mode]
@@ -198,12 +367,51 @@ impl SatelliteHealthV1 {
         {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
+        if self.provider_logins.len() > crate::provider_login::PROVIDER_LOGIN_NAMES.len()
+            || !self.provider_logins.iter().all(|login| login.is_valid())
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if self.provider_faults.len() > SATELLITE_MAX_PROVIDER_FAULTS
+            || self.provider_faults.iter().any(|fault| {
+                !text_ok(&fault.provider)
+                    || ![SATELLITE_FAULT_AUTH, SATELLITE_FAULT_MODEL_UNAVAILABLE]
+                        .contains(&fault.kind.as_str())
+                    || fault.model.as_deref().is_some_and(|model| !text_ok(model))
+            })
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if self.manager_launches.len()
+            > crate::satellite_manager_policy::SATELLITE_MAX_MANAGER_LAUNCH_ROWS
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
         if let Some(deploy) = &self.last_deploy
             && !(deploy.sha.len() == 40
                 && deploy
                     .sha
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
+        if let Some(deploy) = &self.last_deploy
+            && (deploy.blockers.len() > SATELLITE_MAX_DEPLOY_BLOCKERS
+                || deploy.blockers.iter().any(|blocker| {
+                    !text_ok(&blocker.kind)
+                        || blocker.subjects.len() > crate::agent_deploy::DEPLOY_BLOCKER_SUBJECTS_MAX
+                        || blocker.subjects.iter().any(|subject| {
+                            [&subject.queue_state, &subject.job_kind, &subject.since]
+                                .into_iter()
+                                .flatten()
+                                .any(|text| !text_ok(text))
+                        })
+                })
+                || deploy
+                    .waiting_since
+                    .as_deref()
+                    .is_some_and(|at| !text_ok(at)))
         {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
@@ -326,6 +534,9 @@ pub struct SatellitePutLinkRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SatelliteObservationV1 {
+    /// Process-local platform from the last successful identity poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<SatellitePlatformV1>,
     pub state: String,
     pub installation_id: Option<SatelliteUuidV1>,
     pub incarnation_id: Option<SatelliteUuidV1>,
@@ -335,6 +546,10 @@ pub struct SatelliteObservationV1 {
     pub cached_session_count: u32,
     /// Cached data is stale after a hub restart until a fresh identity check.
     pub stale: bool,
+    /// Effective launch choices per satellite manager seat, from the satellite's
+    /// last reported health (#1941). Empty when none is known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manager_launches: Vec<crate::satellite_manager_policy::SatelliteManagerLaunchesV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +562,11 @@ pub struct SatellitePeerV1 {
     /// Operator-declared remote sessions the hub manager may message.
     #[serde(default)]
     pub dispatch_scope: Vec<SatelliteUuidV1>,
+    /// Operator-declared remote projects (#1928): the project's current
+    /// appointed manager (and its descendants) is the target, resolved live by
+    /// the satellite. The hub verifies only the declared project id.
+    #[serde(default)]
+    pub dispatch_project_scope: Vec<SatelliteUuidV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +900,9 @@ mod tests {
             capabilities: SatelliteCapabilitiesV1 {
                 session_read: true,
                 limits: SatelliteReadLimitsV1::default(),
+                qa_run: false,
+                report_outcomes: false,
+                deploy_interrupt: false,
             },
             health: None,
         }
@@ -708,6 +931,69 @@ mod tests {
             observed_at: DateTime::from_timestamp(1_790_000_002, 0).unwrap(),
             sessions: vec![session(uuid("dddddddd-dddd-4ddd-8ddd-dddddddddddd"))],
             next_cursor: Some("opaque-v1".into()),
+        }
+    }
+
+    #[test]
+    fn watchdog_health_round_trips_and_old_peers_remain_compatible() {
+        let mut wire = serde_json::to_value(identity()).unwrap();
+        wire["health"] = json!({
+            "daemon_version": "1.0.0", "uptime_seconds": 1,
+            "sessions_running": 0, "sessions_waiting_approval": 0
+        });
+        let legacy: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+        legacy.validate().unwrap();
+        let legacy_health = legacy.health.unwrap();
+        assert_eq!(legacy_health.latest_watchdog_trip, None);
+        assert_eq!(legacy_health.store_probe_elapsed_ms, None);
+        wire["health"]["store_probe_elapsed_ms"] = json!(17);
+        let measured: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+        measured.validate().unwrap();
+        assert_eq!(measured.health.unwrap().store_probe_elapsed_ms, Some(17));
+        let mut excessive = wire.clone();
+        excessive["health"]["store_probe_elapsed_ms"] = json!(300_001);
+        assert!(
+            serde_json::from_value::<SatelliteIdentityV1>(excessive)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        wire["health"]["latest_watchdog_trip"] = json!({
+            "restart_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "observed_at": "2026-10-19T04:17:24.000000000Z",
+            "last_healthy_at": "2026-10-19T04:15:24.000000000Z",
+            "failed_probes": ["rpc_timeout", "store_probe_timeout"]
+        });
+        let decoded: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["health"]["latest_watchdog_trip"],
+            wire["health"]["latest_watchdog_trip"]
+        );
+        // Only closed causes and canonical identity/time enter the hub cache.
+        for (key, value) in [
+            ("restart_id", json!("CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC")),
+            ("observed_at", json!("2026-10-19T04:17:24Z")),
+            ("failed_probes", json!(["arbitrary remote error text"])),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["health"]["latest_watchdog_trip"][key] = value;
+            assert!(serde_json::from_value::<SatelliteIdentityV1>(invalid).is_err());
+        }
+        for (key, value) in [
+            ("restart_id", json!("00000000-0000-0000-0000-000000000000")),
+            ("last_healthy_at", json!("2026-10-19T04:18:24.000000000Z")),
+            ("failed_probes", json!([])),
+            ("failed_probes", json!(["rpc_timeout", "rpc_timeout"])),
+            ("failed_probes", json!(vec!["rpc_timeout"; 5])),
+        ] {
+            let mut invalid = wire.clone();
+            invalid["health"]["latest_watchdog_trip"][key] = value;
+            let invalid: SatelliteIdentityV1 = serde_json::from_value(invalid).unwrap();
+            assert_eq!(
+                invalid.validate(),
+                Err(SatelliteValidationError::InvalidIdentity)
+            );
         }
     }
 
@@ -841,5 +1127,75 @@ mod tests {
             decode_satellite_json_with_limit::<SatelliteIdentityV1>(small_payload, 1),
             Err(SatelliteDecodeError::PayloadTooLarge)
         ));
+    }
+
+    #[test]
+    fn identity_platform_round_trips_new_and_older_health() {
+        let mut old = identity();
+        old.health = Some(
+            serde_json::from_value(json!({
+                "daemon_version": "1.0.0",
+                "uptime_seconds": 1,
+                "sessions_running": 0,
+                "sessions_waiting_approval": 0
+            }))
+            .unwrap(),
+        );
+        let old_wire = serde_json::to_value(&old).unwrap();
+        assert!(old_wire["health"].get("platform").is_none());
+        let decoded: SatelliteIdentityV1 = serde_json::from_value(old_wire.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, old);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old_wire);
+
+        let mut new_wire = old_wire;
+        new_wire["health"]["platform"] = json!({"os": "linux", "arch": "aarch64"});
+        let decoded: SatelliteIdentityV1 = serde_json::from_value(new_wire.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            decoded.health.as_ref().unwrap().platform,
+            Some(SatellitePlatformV1 {
+                os: "linux".into(),
+                arch: "aarch64".into()
+            })
+        );
+        assert_eq!(serde_json::to_value(decoded).unwrap(), new_wire);
+    }
+
+    #[test]
+    fn report_outcomes_capability_is_absent_when_false_and_defaults_off() {
+        let mut older = identity();
+        let value = serde_json::to_value(&older).unwrap();
+        assert!(
+            value["capabilities"]
+                .as_object()
+                .unwrap()
+                .get("report_outcomes")
+                .is_none()
+        );
+        // An older satellite's identity (no key) decodes as not advertising it.
+        let back: SatelliteIdentityV1 = serde_json::from_value(value).unwrap();
+        assert!(!back.capabilities.report_outcomes);
+        older.capabilities.report_outcomes = true;
+        let advertised = serde_json::to_value(&older).unwrap();
+        assert_eq!(advertised["capabilities"]["report_outcomes"], true);
+    }
+
+    #[test]
+    fn deploy_interrupt_capability_is_absent_when_false_and_defaults_off() {
+        let mut older = identity();
+        let value = serde_json::to_value(&older).unwrap();
+        assert!(
+            value["capabilities"]
+                .as_object()
+                .unwrap()
+                .get("deploy_interrupt")
+                .is_none()
+        );
+        let back: SatelliteIdentityV1 = serde_json::from_value(value).unwrap();
+        assert!(!back.capabilities.deploy_interrupt);
+        older.capabilities.deploy_interrupt = true;
+        let advertised = serde_json::to_value(&older).unwrap();
+        assert_eq!(advertised["capabilities"]["deploy_interrupt"], true);
     }
 }

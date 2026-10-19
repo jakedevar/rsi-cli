@@ -322,8 +322,14 @@ impl RpcServer {
         request: &RpcRequest,
     ) -> Result<serde_json::Value> {
         // params defaults to Null via serde - no unwrap_or needed
-        let params: LaunchSessionParams = serde_json::from_value(request.params.clone())
+        let mut params: LaunchSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
+        self.resolve_custom_provider(
+            params.custom_provider_id,
+            &mut params.openai_base_url,
+            &mut params.openai_api_key,
+        )
+        .await?;
 
         // TaskRabbit was removed as a launchable kind: refuse before any
         // path resolution, custody or persistence side effect.
@@ -410,20 +416,25 @@ impl RpcServer {
             out
         };
 
-        // #792: the operator-only Harness tool policy is validated before any
-        // launch effect, and only for providers that run the Harness loop
-        // (the only place it can be enforced).
+        // #792: the operator-only tool policy is validated before any launch
+        // effect, and only for a provider that can enforce every field it sets:
+        // the Harness loop enforces the Harness fields, the Claude and Codex
+        // CLIs enforce `cli_access` (#2758). Anything else is refused typed.
         if let Some(policy) = &params.tool_policy {
             policy
                 .validate()
                 .map_err(|code| DaemonError::InvalidParam(code.to_string()))?;
-            if !params
-                .provider
-                .is_some_and(rsi_common::harness_tool_policy::provider_runs_harness_loop)
-            {
-                return Err(DaemonError::InvalidParam(
-                    rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_PROVIDER.to_string(),
-                ));
+            let refusal = match params.provider {
+                Some(provider) => {
+                    rsi_common::harness_tool_policy::provider_policy_refusal(provider, Some(policy))
+                }
+                None => Some(format!(
+                    "{}:unspecified_provider",
+                    rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER
+                )),
+            };
+            if let Some(refusal) = refusal {
+                return Err(DaemonError::InvalidParam(refusal));
             }
         }
         if let Some(gates) = &params.completion_gates {
@@ -493,6 +504,7 @@ impl RpcServer {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         };
 
         let session_id = self.session_manager.launch_session(config).await?;
@@ -532,6 +544,8 @@ impl RpcServer {
             .await
             .ok_or(DaemonError::SessionNotFound(params.session_id))?;
 
+        self.require_attributed_read(request, vec![params.session_id], AgentReadClass::Metadata)
+            .await?;
         Ok(serde_json::to_value(&session)?)
     }
 
@@ -566,6 +580,8 @@ impl RpcServer {
             .session_manager
             .get_conversation_since(params.session_id, params.since_sequence)
             .await?;
+        self.require_attributed_read(request, vec![params.session_id], AgentReadClass::Content)
+            .await?;
         Ok(serde_json::to_value(&events)?)
     }
 
@@ -585,6 +601,8 @@ impl RpcServer {
         let next_after_id = (diagnostics.len() == params.limit as usize)
             .then(|| diagnostics.last().map(|diagnostic| diagnostic.id))
             .flatten();
+        self.require_attributed_read(request, vec![params.session_id], AgentReadClass::Content)
+            .await?;
         Ok(serde_json::to_value(
             rsi_common::types::SessionDiagnosticsPageV1 {
                 diagnostics,
@@ -625,6 +643,12 @@ impl RpcServer {
             });
         }
 
+        self.require_attributed_read(
+            request,
+            conversations.iter().map(|entry| entry.session_id).collect(),
+            AgentReadClass::Content,
+        )
+        .await?;
         Ok(serde_json::to_value(ConversationBatchResponse {
             conversations,
         })?)
@@ -643,6 +667,8 @@ impl RpcServer {
         let metrics = self
             .session_manager
             .get_turn_metrics(params.session_id)
+            .await?;
+        self.require_attributed_read(request, vec![params.session_id], AgentReadClass::Content)
             .await?;
         Ok(serde_json::to_value(&metrics)?)
     }
@@ -1219,6 +1245,7 @@ impl RpcServer {
         let reader = self.attributed_read_caller(request).await?;
         let store = self.session_manager.store().clone();
         let parent_id = params.parent_id;
+        let admission = crate::session::rpc_admission::current();
         let mut children = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
             let Some(caller) = reader else {
@@ -1240,7 +1267,10 @@ impl RpcServer {
                     readable.push(child);
                 }
             }
-            Ok(readable)
+            match admission {
+                Some(admission) => admission.with_admission(caller, || readable),
+                None => Ok(readable),
+            }
         })
         .await
         .map_err(|e| DaemonError::Store(e.to_string()))??;
@@ -1373,6 +1403,8 @@ impl RpcServer {
         .await
         .map_err(|e| DaemonError::Rpc(format!("Store task failed: {}", e)))??;
 
+        self.require_attributed_read(request, vec![session_id], AgentReadClass::Metadata)
+            .await?;
         Ok(result)
     }
 }

@@ -116,15 +116,18 @@ pub(super) fn project_manager() -> WorkflowDefinition {
             stage(
                 "land",
                 "Land On Rolling",
-                "Publish through rsi-rolling-land with accepted SHAs and touched-module \
-                 filters. Fast-forward only: fetch, integrate and retry a rejected push. \
+                "Enqueue accepted SHAs with AgentEnqueueLandingSource {derive_filters:true}; \
+                 the daemon queue gates and publishes them. For queue_disabled, keep the \
+                 commit pushed and report with AgentReportUp, or AgentReportToHub on a \
+                 satellite; the operator enables the queue or lands with rsi land or \
+                 EnqueueRollingQueueSource. Agents never run the lander directly. \
                  Confirm each source SHA is an ancestor of origin/rolling; close its Issue.",
             ),
             stage(
                 "qa",
                 "QA Sweep",
-                "Run rolling-tip QA on the satellite or as a cloud_sweep job. GREEN lands \
-                 thoughts/shared/qa/qa-green.sha; RED files new regression Issues; \
+                "The daemon runs full-library QA after each landing. GREEN is the qa_green SHA \
+                 AgentListRollingQueue returns; RED files new regression Issues; \
                  INCOMPLETE requires reading evidence and resubmitting.",
             ),
             stage(

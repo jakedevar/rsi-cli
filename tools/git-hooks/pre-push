@@ -68,6 +68,147 @@ operator_identifier_check() {
   return 0
 }
 
+# Fast static guards for a push to refs/heads/rolling that the lander did not
+# mark (#2055): the operator's hand merge-and-push. Landing through the queue
+# (`rsi land <session-id|branch>`) gates the change; this catches the cheap,
+# repo-breaking mistakes (a Python syntax error in scripts/ or tools/, a broken
+# released migration, an identity assertion) when someone pushes by hand anyway.
+# It runs against the pushed commit, exported with `git archive` into a
+# temporary directory, and takes about a second. It refuses on a failure and
+# always prints the one-line queue command. RSI_SKIP_STATIC_GUARDS=1 is the
+# operator's override; this hook is guidance, not a security boundary.
+queue_hint() {
+  echo "pre-push: land through the merge queue instead of a manual merge and push: rsi land <session-id|branch>   (RSI_SKIP_STATIC_GUARDS=1 overrides these guards)" >&2
+}
+
+find_python() {
+  for candidate in "${PYTHON:-}" python3 python; do
+    [ -n "$candidate" ] || continue
+    if command -v "$candidate" >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+static_guards() {
+  oid=$1
+  remote=$2
+  case "$oid" in
+    0000000000000000000000000000000000000000) return 0 ;;
+  esac
+  queue_hint
+  [ "${RSI_SKIP_STATIC_GUARDS:-}" = "1" ] && return 0
+  py=$(find_python) || {
+    echo "pre-push: python not found; skipping the static guards" >&2
+    return 0
+  }
+  # The history this push adds is measured from the remote tip when this clone
+  # has it, else from the merge base with origin/rolling (#2070). With neither,
+  # the whole tree is checked rather than none of it.
+  base=
+  case "$remote" in
+    0000000000000000000000000000000000000000) ;;
+    *) git cat-file -e "$remote^{commit}" 2>/dev/null && base=$remote ;;
+  esac
+  if [ -z "$base" ] && git rev-parse --verify -q origin/rolling >/dev/null 2>&1; then
+    base=$(git merge-base origin/rolling "$oid" 2>/dev/null) || base=
+  fi
+  paths=
+  for path in scripts tools crates; do
+    if git cat-file -e "$oid:$path" 2>/dev/null; then paths="$paths $path"; fi
+  done
+  [ -n "$paths" ] || return 0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/rsi-pre-push-static-XXXXXX") || return 0
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'rm -rf "$tmp"; exit 130' HUP INT TERM
+  # shellcheck disable=SC2086
+  if ! git archive "$oid" $paths | tar -x -C "$tmp"; then
+    echo "pre-push: cannot export $oid for the static guards; skipping them" >&2
+    rm -rf "$tmp"
+    trap - EXIT HUP INT TERM
+    return 0
+  fi
+  status=0
+  # 1. Python syntax of the scripts/ and tools/ files the push changes (every
+  # one when no base is known or the diff cannot be read). The list is
+  # NUL-separated end to end so a file name with spaces or newlines is checked
+  # as one path (#2071).
+  list="$tmp/.rsi-pre-push-changed-py"
+  if [ -n "$base" ] && git diff -z --name-only --diff-filter=ACMR "$base" "$oid" -- 'scripts/*.py' 'tools/*.py' >"$list" 2>/dev/null; then
+    :
+  else
+    (cd "$tmp" && find scripts tools -name '*.py' -print0 2>/dev/null) >"$list"
+  fi
+  if [ -s "$list" ]; then
+    (cd "$tmp" && "$py" -I -c '
+import sys
+bad = 0
+for raw in sys.stdin.buffer.read().split(b"\0"):
+    if not raw:
+        continue
+    path = raw.decode("utf-8", "surrogateescape")
+    try:
+        with open(path, "rb") as handle:
+            compile(handle.read(), path, "exec")
+    except FileNotFoundError:
+        pass
+    except SyntaxError as error:
+        print(f"{path}:{error.lineno}: {error.__class__.__name__}: {error.msg}", file=sys.stderr)
+        bad = 1
+sys.exit(bad)
+' <"$list") || {
+      echo "pre-push: a Python file this push changes does not compile; refusing to update refs/heads/rolling" >&2
+      status=1
+    }
+  fi
+  # 2. The released-migration guard, run from the pushed commit against the
+  # remote tip, only when the Python above compiled.
+  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/tools/check-released-migrations.py" ]; then
+    if ! "$py" "$tmp/tools/check-released-migrations.py" "$base" "$oid" >&2; then
+      echo "pre-push: check-released-migrations.py fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # 2b. The starter digest guard (#3070): a changed starter JSON moves its digest
+  # fixture and SHIPPED_BEFORE together. Needs the base to compare against.
+  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/tools/check_starter_pins.py" ]; then
+    if ! "$py" "$tmp/tools/check_starter_pins.py" "$base" "$oid" >&2; then
+      echo "pre-push: check_starter_pins.py fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # 3. The identity-assertion guard over the pushed crates.
+  if [ "$status" -eq 0 ] && [ -f "$tmp/tools/check_identity_assertions.py" ] && [ -d "$tmp/crates" ]; then
+    if ! (cd "$tmp" && "$py" tools/check_identity_assertions.py crates) >&2; then
+      echo "pre-push: check-identity-assertions fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # 4. The portable-shell guard over the pushed scripts/ (local #322): no BSD-only
+  # or GNU-only form above tools/portable-shell-baseline.json. The exported tree
+  # has no .git, so the "baseline may only go down" comparison against the merge
+  # base runs in scripts/scoped-test (the lander gate), not here. A stale (too-high)
+  # count is judged only for the scripts/ files this push changes, so a push of an
+  # unrelated change is never blocked by a sibling landing that fixed a use; with no
+  # readable base every stale count is judged.
+  if [ "$status" -eq 0 ] && [ -f "$tmp/tools/check_portable_shell.py" ] && [ -d "$tmp/scripts" ]; then
+    touched="$tmp/.rsi-pre-push-touched-scripts"
+    set --
+    if [ -n "$base" ] && git diff -z --name-only --no-renames "$base" "$oid" -- scripts >"$touched" 2>/dev/null; then
+      set -- --touched-from "$touched"
+    fi
+    if ! (cd "$tmp" && "$py" tools/check_portable_shell.py "$@") >&2; then
+      echo "pre-push: check-portable-shell fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  rm -rf "$tmp"
+  trap - EXIT HUP INT TERM
+  return "$status"
+}
+
 agent_session=0
 if [ -n "${RSI_SESSION_ID:-}" ] || [ -n "${RSI_SESSION_TOKEN:-}" ]; then
   agent_session=1
@@ -77,14 +218,17 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   case "$remote_ref" in
     refs/heads/main)
       if [ "$agent_session" = 1 ]; then
-        echo "pre-push: agent sessions may not update $remote_ref; land with rsi-rolling-land after an ACCEPTED review" >&2
+        echo "pre-push: agent sessions may not update $remote_ref; main is operator-only" >&2
         exit 1
       fi
       ;;
     refs/heads/rolling)
       if [ "$agent_session" = 1 ] && [ "${RSI_ROLLING_LANDER:-}" != "1" ]; then
-        echo "pre-push: agent sessions may not update $remote_ref; land with rsi-rolling-land after an ACCEPTED review" >&2
+        echo "pre-push: agent sessions may not update $remote_ref; land through the merge queue (AgentEnqueueLandingSource from a manager; the operator uses rsi land <session-id|branch>)" >&2
         exit 1
+      fi
+      if [ "${RSI_ROLLING_LANDER:-}" != "1" ]; then
+        static_guards "$local_oid" "$remote_oid" || exit 1
       fi
       shard_check "$local_oid" || exit 1
       operator_identifier_check "$local_oid" "$remote_oid" || exit 1

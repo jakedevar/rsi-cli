@@ -10,7 +10,10 @@ use super::{IndexError, Result};
 
 pub const MAX_READY_GENERATIONS: usize = 20;
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Floor of the global ceiling: what every host gets, however little disk is free.
 pub const GLOBAL_DETAIL_CEILING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Most the ceiling is raised to on a host with ample free disk.
+pub const MAX_GLOBAL_DETAIL_CEILING_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const WRITE_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,36 @@ pub struct RetentionPlan {
     /// Physical bytes still above the ceiling after attempted reclamation,
     /// including each project database and its WAL/SHM sidecars.
     pub physical_over_ceiling_bytes: u64,
+}
+
+/// The ceiling for all project databases together. A repository-sized workspace
+/// needs a few gigabytes while it stages and publishes its first graph, so the
+/// fixed floor is raised toward what the databases already hold plus a quarter
+/// of the free disk, never past [`MAX_GLOBAL_DETAIL_CEILING_BYTES`] (#2245). A
+/// host without a free-space reading keeps the floor.
+pub fn effective_ceiling_bytes(index_root: &Path) -> u64 {
+    let held = physical_bytes(index_root).unwrap_or(0);
+    let free = crate::satellite::disk_free_bytes(index_root).unwrap_or(0);
+    held.saturating_add(free / 4)
+        .clamp(GLOBAL_DETAIL_CEILING_BYTES, MAX_GLOBAL_DETAIL_CEILING_BYTES)
+}
+
+/// A write that ran into the page limit or a full disk mid-run is a budget
+/// refusal, not an anonymous `SQLite` failure: name it as the typed notice.
+pub(super) fn typed_budget_failure(
+    error: IndexError,
+    index_root: &Path,
+    ceiling: u64,
+) -> IndexError {
+    if let IndexError::Store(store) = &error
+        && store.is_disk_full()
+    {
+        return IndexError::DiskBudget {
+            used_bytes: physical_bytes(index_root).unwrap_or(0),
+            ceiling_bytes: ceiling,
+        };
+    }
+    error
 }
 
 /// Reserve room for the current write, WAL, and a later diagnostic update.
@@ -173,7 +206,7 @@ pub fn plan_retention(
 pub fn enforce(index_root: &Path) -> Result<RetentionPlan> {
     enforce_with_policy(
         index_root,
-        RetentionPolicy::new(GLOBAL_DETAIL_CEILING_BYTES),
+        RetentionPolicy::new(effective_ceiling_bytes(index_root)),
     )
 }
 
@@ -246,10 +279,12 @@ fn enforce_with_policy(index_root: &Path, policy: RetentionPolicy) -> Result<Ret
             .join(project_id.to_string())
             .join("codegraph.sqlite");
         let main_bytes = std::fs::metadata(&db)?.len();
-        // SQLite VACUUM can need a replacement image and WAL before reclaiming
-        // the old one. Defer it when that temporary space crosses the cap.
+        // SQLite VACUUM builds a replacement image and WAL of the data that
+        // survives, not of the free pages it is about to return (#2245). Defer
+        // it when that temporary space crosses the cap.
+        let live_bytes = main_bytes.saturating_sub(reclaimable);
         let enough_vacuum_room = physical_bytes(index_root)?
-            .saturating_add(main_bytes.saturating_mul(2))
+            .saturating_add(live_bytes.saturating_mul(2))
             <= policy.global_disk_ceiling_bytes;
         let threshold = if enough_vacuum_room {
             reclaim_threshold
@@ -268,6 +303,34 @@ fn enforce_with_policy(index_root: &Path, policy: RetentionPolicy) -> Result<Ret
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn disk_full_mid_run_is_the_typed_budget_notice_and_other_failures_pass_through() {
+        let root = tempfile::tempdir().unwrap();
+        let full = IndexError::Store(rsi_codegraph::CodegraphError::Sqlite(
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(13), None),
+        ));
+        assert!(matches!(
+            typed_budget_failure(full, root.path(), 4096),
+            IndexError::DiskBudget {
+                ceiling_bytes: 4096,
+                ..
+            }
+        ));
+        assert!(matches!(
+            typed_budget_failure(IndexError::SourceChanged, root.path(), 4096),
+            IndexError::SourceChanged
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn global_ceiling_is_the_floor_raised_by_free_disk_within_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let ceiling = effective_ceiling_bytes(root.path());
+        assert!((GLOBAL_DETAIL_CEILING_BYTES..=MAX_GLOBAL_DETAIL_CEILING_BYTES).contains(&ceiling));
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]

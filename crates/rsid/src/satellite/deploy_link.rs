@@ -12,10 +12,11 @@ use std::time::Duration;
 use chrono::{SecondsFormat, Utc};
 use rsi_common::agent_daemon_info::SatelliteDaemonInfoV1;
 use rsi_common::agent_deploy::{
-    AgentRequestDeployReceiptV1, DEPLOY_BUILD_NOT_SUPPORTED, DEPLOY_DIR_NOT_ALLOWED,
-    DEPLOY_EXECUTE_REQUIRED, DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT, DEPLOY_NEEDS_SUPERVISOR,
-    DEPLOY_RESTART_BUDGET, DEPLOY_SCHEMA_DOWNGRADE, DEPLOY_SHA_INVALID, DEPLOY_SHA_MISMATCH,
-    DEPLOY_STAGE_FAILED, DEPLOY_TARGET_MISMATCH, SATELLITE_DEPLOY_OWNER_REQUIRED,
+    AgentRequestDeployReceiptV1, DEPLOY_BUILD_NOT_SUPPORTED, DEPLOY_CANCEL_TOO_LATE,
+    DEPLOY_DIR_NOT_ALLOWED, DEPLOY_EXECUTE_REQUIRED, DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT,
+    DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_FOUND, DEPLOY_RESTART_BUDGET, DEPLOY_SCHEMA_DOWNGRADE,
+    DEPLOY_SHA_INVALID, DEPLOY_SHA_MISMATCH, DEPLOY_STAGE_FAILED, DEPLOY_TARGET_MISMATCH,
+    SATELLITE_DEPLOY_INTERRUPT_UNSUPPORTED, SATELLITE_DEPLOY_OWNER_REQUIRED,
     SATELLITE_DEPLOY_UNREACHABLE,
 };
 use rsi_common::satellite::{SatelliteIdentityV1, SatelliteUuidV1};
@@ -24,9 +25,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 
 use super::link::connect_owned_socket;
-use super::poll::{
-    DeployReply, MAX_RPC_ENVELOPE_BYTES, RPC_DEADLINE, call_deploy_rpc, call_read_rpc,
-};
+use super::poll::{DeployReply, MAX_RPC_ENVELOPE_BYTES, RPC_DEADLINE, call_deploy_rpc};
 use super::registry::{ContinuityResult, PeerContinuity, RegistryLink, RegistryPeer};
 use crate::error::{DaemonError, Result};
 
@@ -53,9 +52,12 @@ const PASS_THROUGH: &[&str] = &[
     DEPLOY_STAGE_FAILED,
     DEPLOY_BUILD_NOT_SUPPORTED,
     DEPLOY_EXECUTE_REQUIRED,
+    DEPLOY_CANCEL_TOO_LATE,
+    DEPLOY_NOT_FOUND,
     "deploy_binary_missing",
     "deploy_idempotency_key_invalid",
     "deploy_invalid_request",
+    SATELLITE_DEPLOY_INTERRUPT_UNSUPPORTED,
     "satellite_message_invalid",
 ];
 
@@ -68,6 +70,10 @@ fn classify_refusal(message: &str) -> &'static str {
         .rsplit_once(": ")
         .map_or(message, |(_, code)| code)
         .trim();
+    // #1777: the budget refusal appends ` retry_after=<RFC3339>` to its code.
+    let code = code
+        .split_once(rsi_common::agent_deploy::DEPLOY_RETRY_AFTER_MARKER)
+        .map_or(code, |(code, _)| code);
     PASS_THROUGH
         .iter()
         .find(|known| code == **known)
@@ -75,7 +81,7 @@ fn classify_refusal(message: &str) -> &'static str {
         .unwrap_or("satellite_deploy_refused")
 }
 
-fn links(peer: &RegistryPeer) -> Vec<&RegistryLink> {
+pub(crate) fn links(peer: &RegistryPeer) -> Vec<&RegistryLink> {
     let mut links: Vec<_> = peer.links.iter().filter(|link| link.enabled).collect();
     links.sort_by_key(|link| (link.priority, link.id));
     links
@@ -83,11 +89,13 @@ fn links(peer: &RegistryPeer) -> Vec<&RegistryLink> {
 
 /// One verified stream to the peer: owner-owned socket, identity handshake and
 /// installation continuity against the operator-paired identity.
-async fn open_verified(
+pub(crate) async fn open_verified(
     root: &Path,
     peer: &RegistryPeer,
     link: &RegistryLink,
 ) -> std::io::Result<(BufReader<UnixStream>, SatelliteIdentityV1)> {
+    let mut attempt = super::diagnostics::Attempt::new(peer.id, link);
+    attempt.observe_tunnel(link).await;
     peer.validate(root).map_err(std::io::Error::other)?;
     if !peer.enabled || !peer.read_enabled || peer.expected_installation_id.is_none() {
         return Err(std::io::Error::new(
@@ -95,19 +103,12 @@ async fn open_verified(
             "satellite peer is disabled or unpaired",
         ));
     }
-    let socket = connect_owned_socket(root, &link.socket_path, RPC_DEADLINE).await?;
-    let mut rpc = BufReader::new(socket);
-    let value = call_read_rpc(
-        &mut rpc,
-        "GetSatelliteIdentity",
-        serde_json::Value::Null,
-        MAX_RPC_ENVELOPE_BYTES,
-        RPC_DEADLINE,
-    )
-    .await?;
-    let identity: SatelliteIdentityV1 =
-        serde_json::from_value(value).map_err(std::io::Error::other)?;
-    identity.validate().map_err(std::io::Error::other)?;
+    let start = std::time::Instant::now();
+    let socket = connect_owned_socket(root, &link.socket_path, RPC_DEADLINE).await;
+    attempt.value.connect = super::diagnostics::measured(start, &socket);
+    let mut rpc = BufReader::new(socket?);
+    let identity =
+        super::poll::read_identity_diagnosed(&mut rpc, &mut attempt, RPC_DEADLINE).await?;
     let mut continuity = PeerContinuity::new(peer.expected_installation_id);
     continuity.begin_round();
     if continuity.observe(
@@ -116,11 +117,15 @@ async fn open_verified(
         identity.daemon_incarnation_id.0,
     ) != ContinuityResult::Matched
     {
+        attempt.value.daemon_rpc.state =
+            rsi_common::satellite_diagnostics::SatelliteStageStateV1::Refused;
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "satellite installation identity requires review",
         ));
     }
+    attempt.identity(&identity);
+    super::record_reported_health(peer.id, identity.health.as_ref());
     Ok((rpc, identity))
 }
 
@@ -136,9 +141,16 @@ pub(crate) async fn request_hub_deploy(
     wire: &SatelliteDeployRequestV1,
 ) -> Result<AgentRequestDeployReceiptV1> {
     for link in links(peer) {
-        let Ok((mut rpc, _identity)) = open_verified(root, peer, link).await else {
+        let Ok((mut rpc, identity)) = open_verified(root, peer, link).await else {
             continue;
         };
+        // #2587: an older satellite refuses the unknown field. Say so rather
+        // than send nothing useful or drop the option and time out waiting.
+        if wire.interrupt_workers == Some(true) && !identity.capabilities.deploy_interrupt {
+            return Err(DaemonError::PolicyDenied(
+                SATELLITE_DEPLOY_INTERRUPT_UNSUPPORTED.into(),
+            ));
+        }
         return match call_deploy_rpc(&mut rpc, wire, DEPLOY_RPC_DEADLINE).await {
             Ok(DeployReply::Accepted(receipt)) => Ok(receipt),
             Ok(DeployReply::Refused(message)) => {
@@ -154,6 +166,123 @@ pub(crate) async fn request_hub_deploy(
     ))
 }
 
+/// Policy writes use the same custody and paired-identity handshake as deploy.
+pub(crate) async fn push_manager_policy(
+    root: &Path,
+    peer: &RegistryPeer,
+    wire: &rsi_common::satellite_manager_policy::SatelliteManagerPolicyRequestV1,
+) -> Result<rsi_common::satellite_manager_policy::SatelliteManagerPolicyReceiptV1> {
+    use rsi_common::satellite_manager_policy::*;
+    for link in links(peer) {
+        let Ok((mut rpc, _)) = open_verified(root, peer, link).await else {
+            continue;
+        };
+        let response = super::poll::exchange(
+            &mut rpc,
+            REQUEST_HUB_MANAGER_POLICY_METHOD,
+            serde_json::to_value(wire)?,
+            MAX_RPC_ENVELOPE_BYTES,
+            RPC_DEADLINE,
+        )
+        .await
+        .map_err(|_| DaemonError::PolicyDenied(POLICY_UNREACHABLE.into()))?;
+        if let Some(error) = response.error {
+            let code = error
+                .message
+                .rsplit_once(": ")
+                .map_or(error.message.as_str(), |(_, code)| code)
+                .trim();
+            let safe = [
+                SATELLITE_TARGET_NOT_AUTHORIZED,
+                POLICY_INVALID,
+                POLICY_STALE,
+                POLICY_KEY_CONFLICT,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+            .unwrap_or(POLICY_REFUSED);
+            return Err(DaemonError::PolicyDenied(safe.into()));
+        }
+        return serde_json::from_value(
+            response
+                .result
+                .ok_or_else(|| DaemonError::PolicyDenied(POLICY_UNREACHABLE.into()))?,
+        )
+        .map_err(|_| DaemonError::PolicyDenied(POLICY_UNREACHABLE.into()));
+    }
+    Err(DaemonError::PolicyDenied(POLICY_UNREACHABLE.into()))
+}
+
+/// #2750: a manager reseat uses the same custody and paired-identity
+/// handshake as a policy push. Only the stable refusal codes the satellite
+/// can raise pass through; anything else is `satellite_reseat_refused`.
+pub(crate) async fn reseat_manager(
+    root: &Path,
+    peer: &RegistryPeer,
+    wire: &rsi_common::manager_reseat::SatelliteManagerReseatRequestV1,
+) -> Result<rsi_common::manager_reseat::SatelliteManagerReseatReceiptV1> {
+    use rsi_common::manager_reseat::*;
+    for link in links(peer) {
+        let Ok((mut rpc, _)) = open_verified(root, peer, link).await else {
+            continue;
+        };
+        let response = super::poll::exchange(
+            &mut rpc,
+            REQUEST_HUB_MANAGER_RESEAT_METHOD,
+            serde_json::to_value(wire)?,
+            MAX_RPC_ENVELOPE_BYTES,
+            RPC_DEADLINE,
+        )
+        .await
+        .map_err(|_| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()))?;
+        if let Some(error) = response.error {
+            let code = error
+                .message
+                .rsplit_once(": ")
+                .map_or(error.message.as_str(), |(_, code)| code)
+                .trim();
+            let safe = [
+                rsi_common::satellite_dispatch::SATELLITE_TARGET_NOT_AUTHORIZED,
+                SATELLITE_RESEAT_INVALID,
+                RESEAT_NOT_CONFIGURED,
+                RESEAT_REVOKED,
+                RESEAT_NO_SEAT,
+                RESEAT_SEAT_LIVE,
+                RESEAT_SEAT_NOT_FAILED,
+                RESEAT_ROOT_REQUIRED,
+            ]
+            .into_iter()
+            .find(|known| *known == code)
+            .unwrap_or(SATELLITE_RESEAT_REFUSED);
+            return Err(DaemonError::PolicyDenied(safe.into()));
+        }
+        return serde_json::from_value(
+            response
+                .result
+                .ok_or_else(|| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()))?,
+        )
+        .map_err(|_| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()));
+    }
+    Err(DaemonError::PolicyDenied(
+        SATELLITE_RESEAT_UNREACHABLE.into(),
+    ))
+}
+
+/// The health a peer reports on its identity over the first link that
+/// verifies; `None` when none does or the peer reports none (#2747).
+pub(crate) async fn read_peer_health(
+    root: &Path,
+    peer: &RegistryPeer,
+) -> Option<rsi_common::satellite::SatelliteHealthV1> {
+    for link in links(peer) {
+        let Ok((_rpc, identity)) = open_verified(root, peer, link).await else {
+            continue;
+        };
+        return identity.health;
+    }
+    None
+}
+
 /// Read one peer's daemon info over the link now. Any failure is a
 /// `reachable:false` row with a stable error code, never a stale identity.
 pub(crate) async fn read_peer_daemon_info(
@@ -162,6 +291,9 @@ pub(crate) async fn read_peer_daemon_info(
 ) -> SatelliteDaemonInfoV1 {
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
     let unreachable = |error: &str| SatelliteDaemonInfoV1 {
+        diagnostics: crate::store_support::satellite::reachability(peer.id),
+        latest_watchdog_trip: crate::store_support::satellite::latest_watchdog_trip(peer.id),
+        platform: None,
         peer_id: SatelliteUuidV1(peer.id),
         label: peer.label.clone(),
         reachable: false,
@@ -173,6 +305,7 @@ pub(crate) async fn read_peer_daemon_info(
         schema_version: None,
         supervisor_mode: None,
         last_deploy: None,
+        launches: None,
         error: Some(error.to_owned()),
     };
     for link in links(peer) {
@@ -183,6 +316,9 @@ pub(crate) async fn read_peer_daemon_info(
             return unreachable("satellite_reports_no_health");
         };
         return SatelliteDaemonInfoV1 {
+            diagnostics: crate::store_support::satellite::reachability(peer.id),
+            latest_watchdog_trip: health.latest_watchdog_trip,
+            platform: health.platform,
             peer_id: SatelliteUuidV1(peer.id),
             label: peer.label.clone(),
             reachable: true,
@@ -194,6 +330,9 @@ pub(crate) async fn read_peer_daemon_info(
             schema_version: health.schema_version,
             supervisor_mode: health.supervisor_mode,
             last_deploy: health.last_deploy,
+            launches: rsi_common::satellite_manager_policy::launches_summary(
+                &health.manager_launches,
+            ),
             error: None,
         };
     }
@@ -205,11 +344,151 @@ mod tests {
     use super::*;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn delayed_daemon_and_connection_refusal_have_distinct_diagnostics_through_recovery() {
+        use rsi_common::satellite_diagnostics::{
+            SatelliteStageStateV1 as State, SatelliteTunnelStateV1 as Tunnel,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+        use uuid::Uuid;
+
+        let temp = crate::test_support::socket_tempdir("sat-diag-");
+        let root = temp.path().join("satellites");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("peer.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let installation = Uuid::new_v4();
+        let peer = RegistryPeer {
+            id: Uuid::new_v4(),
+            label: "fixture".into(),
+            expected_installation_id: Some(installation),
+            enabled: true,
+            read_enabled: true,
+            launch_enabled: false,
+            dispatch_enabled: false,
+            links: vec![RegistryLink {
+                id: Uuid::new_v4(),
+                direction: super::super::registry::LinkDirection::DialHomeReverse,
+                socket_path: socket.clone(),
+                ssh_target: None,
+                trust_reference: "fixture".into(),
+                enabled: true,
+                priority: 0,
+            }],
+        };
+        let restart_id = Uuid::new_v4();
+        let mut identity = crate::satellite::identity(installation, Uuid::new_v4());
+        identity.health = Some(
+            serde_json::from_value(serde_json::json!({
+                "daemon_version":"1.0.0", "uptime_seconds":1,
+                "sessions_running":0, "sessions_waiting_approval":0,
+                "store_probe_elapsed_ms":17,
+                "latest_watchdog_trip": {
+                    "restart_id":restart_id,
+                    "observed_at":"2026-10-19T04:17:24.000000000Z",
+                    "last_healthy_at":"2026-10-19T04:15:24.000000000Z",
+                    "failed_probes":["rpc_timeout", "store_probe_timeout"]
+                }
+            }))
+            .unwrap(),
+        );
+        let good_identity = identity.clone();
+        let server = tokio::spawn(async move {
+            // Healthy response, then a connection whose daemon reply is delayed.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut rpc = BufReader::new(stream);
+            let mut line = String::new();
+            rpc.read_line(&mut line).await.unwrap();
+            let request: rsi_common::rpc::RpcRequest = serde_json::from_str(&line).unwrap();
+            let response = rsi_common::rpc::RpcResponse::success(
+                request.id,
+                serde_json::to_value(good_identity).unwrap(),
+            );
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            rpc.get_mut().write_all(&bytes).await.unwrap();
+            let (delayed, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(RPC_DEADLINE + Duration::from_millis(100)).await;
+            drop(delayed);
+            // Dropping listener leaves a refused socket for the next attempt.
+        });
+        let healthy = read_peer_daemon_info(&root, &peer).await;
+        assert!(healthy.reachable);
+        let diagnostics = healthy.diagnostics.unwrap();
+        assert_eq!(diagnostics.connect.state, State::Succeeded);
+        assert_eq!(diagnostics.daemon_rpc.state, State::Succeeded);
+        assert_eq!(diagnostics.store_probe.elapsed_ms, Some(17));
+        assert_eq!(diagnostics.auth.state, State::Unobserved);
+        assert_eq!(diagnostics.tunnel_service, Tunnel::RemoteService);
+        let trip = healthy.latest_watchdog_trip.unwrap();
+
+        let delayed = read_peer_daemon_info(&root, &peer).await;
+        assert!(!delayed.reachable);
+        let diagnostics = delayed.diagnostics.unwrap();
+        assert_eq!(diagnostics.connect.state, State::Succeeded);
+        assert_eq!(diagnostics.transport.state, State::Succeeded);
+        assert_eq!(diagnostics.daemon_rpc.state, State::TimedOut);
+        assert!(diagnostics.daemon_rpc.elapsed_ms.unwrap() >= 2_900);
+        assert_eq!(diagnostics.store_probe.state, State::Unobserved);
+        assert_eq!(diagnostics.auth.state, State::Unobserved);
+        assert_eq!(delayed.latest_watchdog_trip, Some(trip.clone()));
+        server.await.unwrap();
+
+        let refused = read_peer_daemon_info(&root, &peer).await;
+        assert!(!refused.reachable);
+        let diagnostics = refused.diagnostics.unwrap();
+        assert_eq!(diagnostics.connect.state, State::Refused);
+        assert_eq!(diagnostics.daemon_rpc.state, State::NotAttempted);
+        assert_eq!(refused.latest_watchdog_trip, Some(trip.clone()));
+
+        std::fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let recovered = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut rpc = BufReader::new(stream);
+            let mut line = String::new();
+            rpc.read_line(&mut line).await.unwrap();
+            let request: rsi_common::rpc::RpcRequest = serde_json::from_str(&line).unwrap();
+            let response = rsi_common::rpc::RpcResponse::success(
+                request.id,
+                serde_json::to_value(identity).unwrap(),
+            );
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            rpc.get_mut().write_all(&bytes).await.unwrap();
+        });
+        let recovered_info = read_peer_daemon_info(&root, &peer).await;
+        recovered.await.unwrap();
+        assert!(recovered_info.reachable);
+        assert_eq!(
+            recovered_info.diagnostics.unwrap().daemon_rpc.state,
+            State::Succeeded
+        );
+        assert_eq!(recovered_info.latest_watchdog_trip, Some(trip));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn refusal_codes_pass_through_only_as_the_exact_code_after_the_error_prefix() {
         let prefixed = format!("Policy denied: {DEPLOY_IN_PROGRESS}");
         assert_eq!(classify_refusal(&prefixed), DEPLOY_IN_PROGRESS);
         assert_eq!(classify_refusal(DEPLOY_SHA_MISMATCH), DEPLOY_SHA_MISMATCH);
+        assert_eq!(
+            classify_refusal("Invalid parameter: deploy_not_found"),
+            DEPLOY_NOT_FOUND
+        );
+        // #1777: the budget refusal's retry_after suffix keeps its code.
+        assert_eq!(
+            classify_refusal(
+                "Policy denied: deploy_restart_budget retry_after=2026-10-08T10:12:00Z"
+            ),
+            DEPLOY_RESTART_BUDGET
+        );
         let embedded = format!("Policy denied: remote said {DEPLOY_IN_PROGRESS} and more");
         assert_eq!(classify_refusal(&embedded), "satellite_deploy_refused");
         assert_eq!(

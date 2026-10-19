@@ -110,6 +110,16 @@ If user approves:
 7. **Check for identity loss** - if the plan removes a user-visible name,
    title, label, or identifier, confirm it names where the user finds it
    instead. Unreachable entities are a critical issue.
+8. **Check for in-flight slices (#2431)** - when a fix changes a slice a worker
+   is already building (the plan, its Issues or the manager say which are
+   live), the plan file alone never reaches that worker. Record an
+   "S<n> impact" note per amended slice (what changed, new commit) and say in
+   the report that the live worker must be messaged with it (or relaunched
+   from the new pin) before the review counts as delivered.
+9. **Check compile-time guards are writable** - a plan that asks for an
+   exhaustive `match` over an enum must confirm the enum is not
+   `#[non_exhaustive]` (for example `SessionStatus` in
+   `crates/rsi-common/src/types.rs`); otherwise name the fail-safe alternative.
 
 ## Example Usage
 

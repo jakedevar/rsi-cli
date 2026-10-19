@@ -11,6 +11,7 @@ use super::Store;
 use crate::error::Result;
 use rsi_common::types::{ModelUsage, UsageBucket, UsageStats};
 use rusqlite::params;
+use std::collections::BTreeMap;
 
 impl Store {
     /// Aggregate lifetime usage stats across sessions, optionally scoped to a
@@ -29,13 +30,19 @@ impl Store {
         let session_where =
             "s.status != 'Deleted' AND s.is_eval = 0 AND s.session_kind NOT IN ('Group', 'Epic')";
         let rollup_cte = format!(
-            "WITH linked_session_rollup AS (
+            "WITH ids(id) AS (
+                SELECT s.id FROM sessions s
+                WHERE {session_where}
+                  AND s.model_invocation_id IS NOT NULL
+                  AND (?1 IS NULL OR s.project_id = ?1)
+            ),
+            linked_session_rollup AS (
                 SELECT
                     s.id AS session_id,
                     mi.model AS model,
                     substr(COALESCE(mi.created_at, s.created_at), 1, 10) AS day,
                     CASE WHEN mi.id = s.model_invocation_id THEN 1 ELSE 0 END AS chat_count,
-                    COALESCE(mi.estimated_cost_usd, 0) AS cost_usd,
+                    COALESCE(ci.cost_increment_usd, 0) AS cost_usd,
                     COALESCE(mi.input_tokens, 0) AS input_tokens,
                     COALESCE(mi.output_tokens, 0) AS output_tokens,
                     COALESCE(mi.cache_creation_tokens, 0) AS cache_creation_tokens,
@@ -45,6 +52,7 @@ impl Store {
                 JOIN model_invocations mi
                   ON mi.session_id = s.id
                  AND mi.admission_status = 'admitted'
+                JOIN ({cost_increment}) ci ON ci.invocation_id = mi.id
                 WHERE {session_where}
                   AND s.model_invocation_id IS NOT NULL
                   AND (?1 IS NULL OR s.project_id = ?1)
@@ -89,96 +97,84 @@ impl Store {
                 SELECT * FROM legacy_session_rollup
                 UNION ALL
                 SELECT * FROM background_rollup
-            )"
+            )",
+            // Own cost per invocation, not the session running total (#2593).
+            // The predecessor window sorts only the counted sessions `ids`
+            // names (the same set `linked_session_rollup` joins), not every
+            // admitted invocation of the store (#330, hub #2972).
+            cost_increment = crate::model_control::cost::cost_increment_for_ids_sql!()
         );
-        let totals_sql = format!(
+        // One pass over the rollup (#333, hub #2998): the cost window under it
+        // is the expensive part, and the three aggregates (totals, per model,
+        // per day) used to evaluate it once each. Group by (model, day) once
+        // and fold the three views from those rows. `substr(created_at, 1, 10)`
+        // rather than `date(created_at)`: RFC3339 with nanosecond fractions
+        // ("...T12:00:00.123456789+00:00") is not guaranteed to round-trip
+        // through SQLite's date/time parser, but the `YYYY-MM-DD` prefix is
+        // always exactly the first 10 bytes.
+        let sql = format!(
             "{rollup_cte}
-             SELECT COALESCE(SUM(chat_count), 0), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0), \
-                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(work_time_ms), 0)
-             FROM usage_rollup"
+             SELECT model, day, COALESCE(SUM(chat_count), 0), COALESCE(SUM(cost_usd), 0), \
+                    COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                    COALESCE(SUM(cache_creation_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), \
+                    COALESCE(SUM(work_time_ms), 0)
+             FROM usage_rollup GROUP BY model, day"
         );
-        let (
-            lifetime_chats,
-            total_cost_usd,
-            total_input_tokens,
-            total_output_tokens,
-            total_cache_creation_tokens,
-            total_cache_read_tokens,
-            total_work_time_ms,
-        ): (i64, f64, i64, i64, i64, i64, i64) =
-            self.conn
-                .query_row(&totals_sql, params![project_id], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                })?;
-
-        let model_sql = format!(
-            "{rollup_cte}
-             SELECT model, COALESCE(SUM(chat_count), 0), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0), \
-                    COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(work_time_ms), 0) \
-             FROM usage_rollup WHERE model IS NOT NULL GROUP BY model ORDER BY model ASC"
-        );
-        let mut model_stmt = self.conn.prepare(&model_sql)?;
-        let per_model = model_stmt
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
             .query_map(params![project_id], |row| {
-                Ok(ModelUsage {
-                    model: row.get(0)?,
-                    chats: row.get::<_, i64>(1)? as u64,
-                    cost_usd: row.get(2)?,
-                    input_tokens: row.get::<_, i64>(3)? as u64,
-                    output_tokens: row.get::<_, i64>(4)? as u64,
-                    cache_creation_tokens: row.get::<_, i64>(5)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(6)? as u64,
-                    work_time_ms: row.get::<_, i64>(7)? as u64,
-                })
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, i64>(5)? as u64,
+                    row.get::<_, i64>(6)? as u64,
+                    row.get::<_, i64>(7)? as u64,
+                    row.get::<_, i64>(8)? as u64,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        // `substr(created_at, 1, 10)` rather than `date(created_at)`: RFC3339
-        // with nanosecond fractions ("...T12:00:00.123456789+00:00") is not
-        // guaranteed to round-trip through SQLite's date/time parser, but the
-        // `YYYY-MM-DD` prefix is always exactly the first 10 bytes.
-        let day_sql = format!(
-            "{rollup_cte}
-             SELECT day, COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), \
-                    COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0), \
-                    COALESCE(SUM(cache_read_tokens), 0)
-             FROM usage_rollup GROUP BY day ORDER BY day ASC"
-        );
-        let mut day_stmt = self.conn.prepare(&day_sql)?;
-        let timeline = day_stmt
-            .query_map(params![project_id], |row| {
-                Ok(UsageBucket {
-                    day: row.get(0)?,
-                    cost_usd: row.get(1)?,
-                    input_tokens: row.get::<_, i64>(2)? as u64,
-                    output_tokens: row.get::<_, i64>(3)? as u64,
-                    cache_creation_tokens: row.get::<_, i64>(4)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(5)? as u64,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(UsageStats {
-            lifetime_chats: lifetime_chats as u64,
-            total_cost_usd,
-            total_input_tokens: total_input_tokens as u64,
-            total_output_tokens: total_output_tokens as u64,
-            total_cache_creation_tokens: total_cache_creation_tokens as u64,
-            total_cache_read_tokens: total_cache_read_tokens as u64,
-            total_work_time_ms: total_work_time_ms as u64,
-            per_model,
-            timeline,
-        })
+        let mut stats = UsageStats::default();
+        let mut per_model: BTreeMap<String, ModelUsage> = BTreeMap::new();
+        let mut timeline: BTreeMap<String, UsageBucket> = BTreeMap::new();
+        for (model, day, chats, cost, input, output, creation, read, work) in rows {
+            stats.lifetime_chats += chats;
+            stats.total_cost_usd += cost;
+            stats.total_input_tokens += input;
+            stats.total_output_tokens += output;
+            stats.total_cache_creation_tokens += creation;
+            stats.total_cache_read_tokens += read;
+            stats.total_work_time_ms += work;
+            if let Some(model) = model {
+                let usage = per_model
+                    .entry(model.clone())
+                    .or_insert_with(|| ModelUsage {
+                        model,
+                        ..ModelUsage::default()
+                    });
+                usage.chats += chats;
+                usage.cost_usd += cost;
+                usage.input_tokens += input;
+                usage.output_tokens += output;
+                usage.cache_creation_tokens += creation;
+                usage.cache_read_tokens += read;
+                usage.work_time_ms += work;
+            }
+            let bucket = timeline.entry(day.clone()).or_insert_with(|| UsageBucket {
+                day,
+                ..UsageBucket::default()
+            });
+            bucket.cost_usd += cost;
+            bucket.input_tokens += input;
+            bucket.output_tokens += output;
+            bucket.cache_creation_tokens += creation;
+            bucket.cache_read_tokens += read;
+        }
+        stats.per_model = per_model.into_values().collect();
+        stats.timeline = timeline.into_values().collect();
+        Ok(stats)
     }
 }
 
@@ -642,5 +638,360 @@ mod tests {
             .find(|usage| usage.model == "ledger-model")
             .expect("ledger model present");
         assert_eq!(ledger_model.input_tokens, 42);
+    }
+
+    /// A session of project `project` with `rows` cumulative resume rows (a
+    /// restart every seventh row) that `usage_stats` counts as a linked session.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    fn seed_cumulative_session(
+        store: &Store,
+        project: Uuid,
+        tag: &str,
+        rows: usize,
+        status: SessionStatus,
+    ) {
+        let mut session = base_session();
+        session.project_id = Some(project);
+        session.status = status;
+        store.insert_session(&session).unwrap();
+        for row in 0..rows {
+            let cost = if row % 7 == 6 {
+                0.05
+            } else {
+                0.1 * (row + 1) as f64
+            };
+            store
+                .conn
+                .execute(
+                    "INSERT INTO model_invocations(id, purpose, invocation_kind, foreground,
+                                                   paid_risk, admission_status, status, provider,
+                                                   model, trigger_source, session_id, project_id,
+                                                   estimated_cost_usd, created_at)
+                     VALUES(?1, 'session.continue.resume', 'session_lifecycle', 'foreground',
+                            'paid_capable', 'admitted', 'completed', 'Claude', 'claude-opus-test',
+                            'test', ?2, ?3, ?4, ?5)",
+                    params![
+                        format!("{tag}-{row}"),
+                        session.id.to_string(),
+                        project.to_string(),
+                        cost,
+                        format!("2026-10-14T10:{:02}:00.000000000Z", row % 50)
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET model_invocation_id = ?1 WHERE id = ?2",
+                params![format!("{tag}-0"), session.id.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// The pre-#330 result: the counted sessions' own invocation costs read
+    /// through the UNRESTRICTED derived table, summed in SQL.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    fn unrestricted_usage_cost(store: &Store, project: Option<&str>) -> f64 {
+        store
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(ci.cost_increment_usd), 0)
+                     FROM sessions s
+                     JOIN model_invocations mi ON mi.session_id = s.id
+                      AND mi.admission_status = 'admitted'
+                     JOIN ({}) ci ON ci.invocation_id = mi.id
+                     WHERE s.status != 'Deleted' AND s.is_eval = 0
+                       AND s.session_kind NOT IN ('Group', 'Epic')
+                       AND s.model_invocation_id IS NOT NULL
+                       AND (?1 IS NULL OR s.project_id = ?1)",
+                    crate::model_control::cost::COST_INCREMENT_SQL
+                ),
+                params![project],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// #330 (hub #2972): `usage_stats` sorts the predecessor window of the
+    /// counted sessions only. Its cost equals the unrestricted window's, for the
+    /// whole store and for one project, and the project-scoped call's VM steps
+    /// (not wall clock) do not grow with another project's invocations.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn usage_stats_cost_equals_the_unrestricted_window_and_ignores_other_projects_330() {
+        use crate::sandbox::startup_restore_tests::vm_ops_during;
+
+        let project = Uuid::new_v4();
+        let project_text = project.to_string();
+        let measure = |other_rows: usize| {
+            let mut store = Store::open_in_memory().unwrap();
+            let other = Uuid::new_v4();
+            seed_cumulative_session(&store, project, "p1", 9, SessionStatus::Completed);
+            seed_cumulative_session(&store, project, "p2", 4, SessionStatus::Completed);
+            // Deleted sessions are not counted and must not change the cost.
+            seed_cumulative_session(&store, project, "pd", 5, SessionStatus::Deleted);
+            for session in 0..20 {
+                seed_cumulative_session(
+                    &store,
+                    other,
+                    &format!("q{session}"),
+                    other_rows,
+                    SessionStatus::Completed,
+                );
+            }
+            for filter in [None, Some(project_text.as_str())] {
+                let got = store.usage_stats(filter).unwrap();
+                let want = unrestricted_usage_cost(&store, filter);
+                assert!(want > 0.0, "the fixture must price something: {want}");
+                assert!(
+                    (got.total_cost_usd - want).abs() < 1e-9,
+                    "{filter:?}: {} vs {want}",
+                    got.total_cost_usd
+                );
+                let by_day: f64 = got.timeline.iter().map(|bucket| bucket.cost_usd).sum();
+                assert!(
+                    (by_day - want).abs() < 1e-9,
+                    "{filter:?}: {by_day} vs {want}"
+                );
+            }
+            let (_, scoped_ops) =
+                vm_ops_during(&mut store, |store| store.usage_stats(Some(&project_text)));
+            let (_, full_ops) = vm_ops_during(&mut store, |store| {
+                unrestricted_usage_cost(store, Some(&project_text))
+            });
+            (scoped_ops, full_ops)
+        };
+        let (scoped_small, full_small) = measure(2);
+        let (scoped_large, full_large) = measure(30);
+        eprintln!(
+            "330 usage_stats vm ops: scoped {scoped_small} -> {scoped_large}, \
+             unrestricted {full_small} -> {full_large}"
+        );
+        assert!(
+            scoped_large <= scoped_small + scoped_small / 20,
+            "usage_stats(project) must not grow with another project's invocations: \
+             {scoped_small} -> {scoped_large}"
+        );
+        assert!(
+            full_large > full_small * 2,
+            "the probe must see the unrestricted window grow: {full_small} -> {full_large}"
+        );
+    }
+
+    /// One counted session of `rows` cumulative resume rows on `day`, priced
+    /// 0.1, 0.2, ... (so the session's own spend is `0.1 * rows`), with 10 input
+    /// tokens, 3 output tokens and 5 ms of wall time per row.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    fn seed_priced_session(store: &Store, project: Uuid, model: &str, day: &str, rows: usize) {
+        let mut session = base_session();
+        session.project_id = Some(project);
+        store.insert_session(&session).unwrap();
+        let tag = Uuid::new_v4();
+        for row in 0..rows {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO model_invocations(id, purpose, invocation_kind, foreground,
+                                                   paid_risk, admission_status, status, provider,
+                                                   model, trigger_source, session_id, project_id,
+                                                   estimated_cost_usd, input_tokens, output_tokens,
+                                                   wall_time_ms, created_at)
+                     VALUES(?1, 'session.continue.resume', 'session_lifecycle', 'foreground',
+                            'paid_capable', 'admitted', 'completed', 'Claude', ?2,
+                            'test', ?3, ?4, ?5, 10, 3, 5, ?6)",
+                    params![
+                        format!("{tag}-{row}"),
+                        model,
+                        session.id.to_string(),
+                        project.to_string(),
+                        0.1 * (row + 1) as f64,
+                        format!("{day}T10:{:02}:00.000000000Z", row % 50)
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET model_invocation_id = ?1 WHERE id = ?2",
+                params![format!("{tag}-0"), session.id.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// What the seeded sessions must add up to, worked out from the seed
+    /// parameters alone: `(model, day, rows)` per session.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    fn assert_usage_equals_seeded(stats: &UsageStats, seeded: &[(&str, &str, usize)]) {
+        use std::collections::BTreeMap;
+        let mut models: BTreeMap<&str, (u64, f64, u64)> = BTreeMap::new();
+        let mut days: BTreeMap<&str, (f64, u64)> = BTreeMap::new();
+        for (model, day, rows) in seeded {
+            let entry = models.entry(model).or_default();
+            entry.0 += 1;
+            entry.1 += 0.1 * *rows as f64;
+            entry.2 += 10 * *rows as u64;
+            let entry = days.entry(day).or_default();
+            entry.0 += 0.1 * *rows as f64;
+            entry.1 += 10 * *rows as u64;
+        }
+        let rows: u64 = seeded.iter().map(|(_, _, rows)| *rows as u64).sum();
+        assert_eq!(stats.lifetime_chats, seeded.len() as u64);
+        assert!((stats.total_cost_usd - models.values().map(|m| m.1).sum::<f64>()).abs() < 1e-9);
+        assert_eq!(stats.total_input_tokens, 10 * rows);
+        assert_eq!(stats.total_output_tokens, 3 * rows);
+        assert_eq!(stats.total_work_time_ms, 5 * rows);
+        assert_eq!(
+            stats
+                .per_model
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            models.keys().copied().collect::<Vec<_>>(),
+            "per-model rows are sorted by model"
+        );
+        for usage in &stats.per_model {
+            let want = models[usage.model.as_str()];
+            assert_eq!(usage.chats, want.0, "{}", usage.model);
+            assert!((usage.cost_usd - want.1).abs() < 1e-9, "{}", usage.model);
+            assert_eq!(usage.input_tokens, want.2, "{}", usage.model);
+        }
+        assert_eq!(
+            stats
+                .timeline
+                .iter()
+                .map(|b| b.day.as_str())
+                .collect::<Vec<_>>(),
+            days.keys().copied().collect::<Vec<_>>(),
+            "timeline buckets are sorted by day"
+        );
+        for bucket in &stats.timeline {
+            let want = days[bucket.day.as_str()];
+            assert!((bucket.cost_usd - want.0).abs() < 1e-9, "{}", bucket.day);
+            assert_eq!(bucket.input_tokens, want.1, "{}", bucket.day);
+        }
+    }
+
+    /// #333 (hub #2998): the totals, the per-model rows and the timeline all come
+    /// from ONE evaluation of the rollup, and equal what the seeded sessions add
+    /// up to after inserts, an update and a restart of the database file.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn usage_stats_single_pass_equals_the_seeded_totals_across_updates_and_restart_333() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let project = Uuid::new_v4();
+        let mut seeded = vec![
+            ("model-a", "2026-10-14", 9),
+            ("model-a", "2026-10-15", 4),
+            ("model-b", "2026-10-14", 6),
+        ];
+        let store = Store::open_test_fixture(&path).unwrap();
+        for (model, day, rows) in &seeded {
+            seed_priced_session(&store, project, model, day, *rows);
+        }
+        assert_usage_equals_seeded(&store.usage_stats(None).unwrap(), &seeded);
+
+        // Insert: a later session on a new day and a new model.
+        seed_priced_session(&store, project, "model-c", "2026-10-16", 5);
+        seeded.push(("model-c", "2026-10-16", 5));
+        assert_usage_equals_seeded(&store.usage_stats(None).unwrap(), &seeded);
+
+        // Update: the newest row of one session settles at a higher cumulative
+        // figure, so the session's own spend grows by exactly the difference.
+        let before = store.usage_stats(None).unwrap().total_cost_usd;
+        store
+            .conn
+            .execute(
+                "UPDATE model_invocations SET estimated_cost_usd = estimated_cost_usd + 0.25
+                 WHERE model = 'model-b' AND created_at = (
+                    SELECT max(created_at) FROM model_invocations WHERE model = 'model-b')",
+                [],
+            )
+            .unwrap();
+        let after = store.usage_stats(None).unwrap();
+        assert!(
+            (after.total_cost_usd - before - 0.25).abs() < 1e-9,
+            "{before} -> {}",
+            after.total_cost_usd
+        );
+        let b = after
+            .per_model
+            .iter()
+            .find(|m| m.model == "model-b")
+            .unwrap();
+        assert!((b.cost_usd - (0.6 + 0.25)).abs() < 1e-9, "{}", b.cost_usd);
+        store
+            .conn
+            .execute(
+                "UPDATE model_invocations SET estimated_cost_usd = estimated_cost_usd - 0.25
+                 WHERE model = 'model-b' AND created_at = (
+                    SELECT max(created_at) FROM model_invocations WHERE model = 'model-b')",
+                [],
+            )
+            .unwrap();
+
+        // A project filter that names no session adds up to nothing.
+        let none = store
+            .usage_stats(Some(&Uuid::new_v4().to_string()))
+            .unwrap();
+        assert_eq!(
+            (
+                none.lifetime_chats,
+                none.per_model.len(),
+                none.timeline.len()
+            ),
+            (0, 0, 0)
+        );
+
+        // Restart: the reopened file yields the same aggregate.
+        drop(store);
+        let reopened = Store::open_test_fixture(&path).unwrap();
+        assert_usage_equals_seeded(&reopened.usage_stats(None).unwrap(), &seeded);
+        assert_usage_equals_seeded(
+            &reopened.usage_stats(Some(&project.to_string())).unwrap(),
+            &seeded,
+        );
+    }
+
+    /// #333: `usage_stats` evaluates the cost window once, not once per view.
+    /// Its VM steps (not wall clock) stay within twice one evaluation of the
+    /// same rollup's grand total, where the three-view version needed about three.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn usage_stats_evaluates_the_rollup_once_333() {
+        use crate::sandbox::startup_restore_tests::vm_ops_during;
+
+        let mut store = Store::open_in_memory().unwrap();
+        let project = Uuid::new_v4();
+        for session in 0..40 {
+            seed_priced_session(&store, project, "model-a", "2026-10-14", 25 + session % 3);
+        }
+        let (stats, ops) = vm_ops_during(&mut store, |store| store.usage_stats(None).unwrap());
+        assert_eq!(stats.lifetime_chats, 40);
+        let (_, one_pass) = vm_ops_during(&mut store, |store| {
+            store
+                .conn
+                .query_row(
+                    &format!(
+                        "WITH ids(id) AS (SELECT id FROM sessions WHERE model_invocation_id IS NOT NULL)
+                         SELECT COALESCE(SUM(ci.cost_increment_usd), 0)
+                         FROM sessions s
+                         JOIN model_invocations mi ON mi.session_id = s.id
+                         JOIN ({}) ci ON ci.invocation_id = mi.id
+                         WHERE s.model_invocation_id IS NOT NULL",
+                        crate::model_control::cost::cost_increment_for_ids_sql!()
+                    ),
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .unwrap()
+        });
+        assert!(
+            ops < one_pass * 2,
+            "usage_stats ({ops}) must cost about one evaluation of the rollup ({one_pass}), not one per view"
+        );
     }
 }

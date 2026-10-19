@@ -402,7 +402,7 @@ mod tests {
     fn pending_question_publication_failed_event_insert_stays_unresolved_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("questions.db");
-        let store = Store::open(&path).unwrap();
+        let store = Store::open_test_fixture(&path).unwrap();
         let session = fixture(&store).id;
         store
             .publish_pending_question_event(&event(session, 1, "ask-old"), None, &question())
@@ -506,7 +506,7 @@ mod tests {
     fn pending_question_publication_interrupted_reservation_survives_restart_without_inference() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("questions.db");
-        let store = Store::open(&path).unwrap();
+        let store = Store::open_test_fixture(&path).unwrap();
         let session = fixture(&store).id;
         store
             .publish_pending_question_event(&event(session, 1, "ask-old"), None, &question())
@@ -638,7 +638,7 @@ mod tests {
     fn pending_question_publication_current_survives_reopen_but_later_user_input_is_stale() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("questions.db");
-        let store = Store::open(&path).unwrap();
+        let store = Store::open_test_fixture(&path).unwrap();
         let session = fixture(&store).id;
         store
             .publish_pending_question_event(&event(session, 1, "ask-current"), None, &question())

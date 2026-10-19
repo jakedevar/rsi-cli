@@ -750,6 +750,83 @@ mod tests {
         ));
     }
 
+    /// Driven only by scripts/watchdog-compile-pressure.py inside a durable job.
+    /// Uses the production challenges without daemon startup, scheduler, units,
+    /// credentials or the operator's database. This is a small warm-store fixture,
+    /// not a simulation of the production database's working set.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    #[ignore = "bounded compile-pressure experiment; use the declared job recipe"]
+    fn compile_pressure_probe_fixture() {
+        let directory =
+            PathBuf::from(std::env::var_os("RSI_PRESSURE_FIXTURE").expect("fixture path"));
+        let socket = directory.join("probe.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_read_timeout(Some(PROBE_DEADLINE)).unwrap();
+                        stream.set_write_timeout(Some(PROBE_DEADLINE)).unwrap();
+                        let mut reader = std::io::BufReader::new(stream);
+                        let mut request = String::new();
+                        if reader.read_line(&mut request).is_ok() {
+                            let _ = reader
+                                .get_mut()
+                                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("fixture listener: {error}"),
+                }
+            }
+        });
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let database = PathBuf::from(
+            std::env::var_os("RSI_PRESSURE_DATABASE").expect("disposable on-disk database path"),
+        );
+        let store = Arc::new(Mutex::new(Store::open_test_fixture(&database).unwrap()));
+        let rpc_running = Arc::new(AtomicBool::new(false));
+        let store_running = Arc::new(AtomicBool::new(false));
+        let mut samples = std::fs::File::create(directory.join("probes.jsonl")).unwrap();
+        std::fs::write(directory.join("ready"), b"ready").unwrap();
+        let started = Instant::now();
+        while !directory.join("stop").exists() && started.elapsed() < Duration::from_secs(1140) {
+            let phase = std::fs::read_to_string(directory.join("phase")).unwrap_or_default();
+            let rpc_start = Instant::now();
+            let rpc_ok = rpc_probe_single_flight(&socket, &rpc_running, PROBE_DEADLINE);
+            let rpc_ms = rpc_start.elapsed().as_secs_f64() * 1000.0;
+            let store_start = Instant::now();
+            let outcome = store_probe(runtime.handle(), &store, &store_running, PROBE_DEADLINE);
+            let store_ms = store_start.elapsed().as_secs_f64() * 1000.0;
+            writeln!(
+                samples,
+                "{}",
+                serde_json::json!({
+                    "at": Utc::now().to_rfc3339(), "phase": phase.trim(),
+                    "rpc_ms": rpc_ms, "rpc_ok": rpc_ok,
+                    "store_ms": store_ms, "store_outcome": format!("{outcome:?}"),
+                    "deadline_ms": PROBE_DEADLINE.as_millis(),
+                })
+            )
+            .unwrap();
+            samples.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn blocked_store_probe_keeps_one_pending_challenge() {
@@ -801,7 +878,7 @@ mod tests {
     async fn fast_store_write_error_is_reported_without_a_timeout() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("watchdog.sqlite");
-        let store = Arc::new(Mutex::new(Store::open(&database).unwrap()));
+        let store = Arc::new(Mutex::new(Store::open_test_fixture(&database).unwrap()));
         rusqlite::Connection::open(&database)
             .unwrap()
             .execute_batch(

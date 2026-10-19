@@ -735,7 +735,7 @@ mod tests {
 
     fn fresh_store() -> (TempDir, Arc<Mutex<Store>>) {
         let dir = TempDir::new().expect("tempdir");
-        let store = Store::open(&dir.path().join("classifier_test.db")).expect("open");
+        let store = Store::open_test_fixture(&dir.path().join("classifier_test.db")).expect("open");
         (dir, Arc::new(Mutex::new(store)))
     }
 

@@ -566,3 +566,72 @@ fn repeated_tool_error_friction_insert_failure_preserves_ingestion() {
     }
     assert_eq!(store.load_events(worker).unwrap().len(), 6);
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn andon_without_any_recorded_evidence_cites_the_triggering_sessions_2307() {
+    let store = Store::open_in_memory().unwrap();
+    let project_id = project(&store);
+    let first = session(&store, Some(project_id));
+    let second = session(&store, Some(project_id));
+    let now = Utc::now();
+    // Every event lacks evidence or carries an unclean reference (dropped).
+    record(
+        &store,
+        refusal("no_evidence"),
+        first,
+        now - Duration::minutes(30),
+    );
+    record(
+        &store,
+        refusal("no_evidence"),
+        first,
+        now - Duration::minutes(20),
+    );
+    let mut unclean = refusal("no_evidence");
+    unclean.evidence_ref = Some("not a clean reference!".into());
+    record(&store, unclean, second, now - Duration::minutes(10));
+
+    let filed = store.andon_sweep(now).unwrap();
+    assert_eq!(filed.len(), 1);
+    let issue = store
+        .get_issue(filed[0].issue_id)
+        .unwrap()
+        .expect("filed Issue");
+    assert!(
+        issue.body.contains(&format!(
+            "- evidence: `session:{second}`, `session:{first}`"
+        )),
+        "{}",
+        issue.body
+    );
+    assert!(!issue.body.contains("evidence: none recorded"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn andon_filing_with_no_evidence_and_no_session_is_refused_with_a_typed_error_2307() {
+    let store = Store::open_in_memory().unwrap();
+    let project_id = project(&store);
+    let candidate = Candidate {
+        project_id,
+        signature: "agent_refusal:AgentGetIssue:orphan".into(),
+        occurrences: 3,
+        sessions: 2,
+        first_at: stamp(Utc::now()),
+        last_at: stamp(Utc::now()),
+    };
+    let error = store
+        .file_andon_issue(&candidate, &[], &[], Utc::now())
+        .expect_err("an evidence-free filing is refused");
+    assert!(
+        matches!(&error, DaemonError::InvalidParam(code) if code == ANDON_EVIDENCE_MISSING),
+        "{error:?}"
+    );
+    assert_eq!(andon_issue_count(&store), 0);
+    let filings: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM andon_filings", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(filings, 0);
+}

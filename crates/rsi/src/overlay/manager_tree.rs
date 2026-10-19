@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rsi_common::manager_budget::GlobalManagerBudgetV1;
 use rsi_common::manager_tier_routing::ManagerNodeRefV1;
 use rsi_common::manager_tree::{
     GetManagerTreeRequestV1, GetManagerTreeResultV1, ManagerTreeKindV1, ManagerTreeRowV1,
@@ -81,6 +82,10 @@ pub struct ManagerTreeState {
     /// #1237: the portfolio node a pending "move under" moves (id, label).
     pub move_source: Option<(Uuid, String)>,
     pub loaded_at: Option<DateTime<Utc>>,
+    /// #2521: the Budget snapshot read when the tree opened, so a project
+    /// row's parent-binds indication uses remaining headroom (`None`: usage
+    /// unavailable, the row shows raw limits).
+    pub budget: Option<GlobalManagerBudgetV1>,
     /// Body rows drawn last frame (page size); written by the renderer.
     pub viewport: Cell<usize>,
     /// First drawn body row; the renderer keeps the selection inside it.
@@ -317,11 +322,26 @@ pub fn launches_text(row: &ManagerTreeRowV1) -> Option<String> {
             };
             match &launch.effort {
                 Some(effort) => format!("{provider}{model}/{effort}"),
-                None => format!("{provider}{model}"),
+                None => format!("{provider}{model}/any effort"),
             }
         })
         .collect();
     Some(format!("launches {}", launches.join(" ")))
+}
+
+/// #2031: a portfolio row's latest seat self-handoff, bounded for one line.
+pub fn handoff_text(row: &ManagerTreeRowV1) -> Option<String> {
+    let handoff = row.last_seat_handoff.as_ref()?;
+    let short = |id: Uuid| id.to_string()[..8].to_string();
+    let reference = handoff.handoff.as_deref().map_or_else(String::new, |text| {
+        format!(" · handoff {}", text.chars().take(80).collect::<String>())
+    });
+    Some(format!(
+        "seat handed on {} -> {} at {}{reference}",
+        short(handoff.old_seat),
+        short(handoff.new_seat),
+        handoff.handed_at.format("%Y-%m-%d %H:%MZ"),
+    ))
 }
 
 /// Workload counts; `?` marks a count the daemon could not traverse.
@@ -347,6 +367,9 @@ pub fn row_text(row: &ManagerTreeRowV1) -> String {
     }
     if let Some(launches) = launches_text(row) {
         parts.push(launches);
+    }
+    if let Some(handoff) = handoff_text(row) {
+        parts.push(handoff);
     }
     parts.push(load_text(row));
     if !row.complete {
@@ -446,10 +469,20 @@ pub fn console_target(row: &ManagerTreeRowV1) -> Option<Console> {
     }
 }
 
+/// The Budget snapshot, best effort: the tree labels raw limits when usage
+/// cannot be read.
+pub(super) async fn load_budget(app: &mut App) -> Option<GlobalManagerBudgetV1> {
+    app.client.get_global_manager_budget(None).await.ok()
+}
+
 pub async fn open(app: &mut App) {
     match fetch(app, None, Vec::new(), AUTO_PAGES).await {
         Ok((rows, page)) => {
-            let mut tree = ManagerTreeState::default();
+            let budget = load_budget(app).await;
+            let mut tree = ManagerTreeState {
+                budget,
+                ..ManagerTreeState::default()
+            };
             tree.install(rows, &page);
             if let Some(memory) = &app.manager_tree_memory {
                 tree.restore(memory);

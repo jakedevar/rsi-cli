@@ -74,9 +74,12 @@ pub(crate) fn seat(
         provider: SessionProvider::Claude,
         model: Some("claude-opus-5-5".into()),
         context_fill_pct: Some(37.4),
+        rotation_threshold_pct: Some(40.0),
+        coordinator_budget: None,
         cost_usd: Some(4.2),
         updated_at: Utc::now(),
         pending_question: false,
+        succession_refusal: None,
         predecessors: Vec::new(),
         predecessors_truncated: false,
     }
@@ -90,10 +93,13 @@ pub(crate) fn pm(id: Uuid, status: SessionStatus) -> GlobalPmSeatV1 {
         model: Some("claude-opus-5-5".into()),
         effort: Some("high".into()),
         context_fill_pct: Some(52.0),
+        rotation_threshold_pct: Some(40.0),
+        coordinator_budget: None,
         cost_usd: Some(1.5),
         updated_at: Utc::now(),
         scope_version: 2,
         pending_question: false,
+        succession_refusal: None,
     }
 }
 
@@ -130,6 +136,8 @@ pub(crate) fn portfolio(
             waiting_approval_sessions: 1,
             pending_questions: 0,
             pending_approvals: 2,
+            standing_directives: Vec::new(),
+            rolling_health: None,
         },
         scope_revoked,
     }
@@ -234,6 +242,10 @@ pub(crate) async fn fake_daemon(app: &mut App) -> FakeDaemon {
                         .push((method.clone(), request["params"].clone()));
                     let answer = served.lock().unwrap().get(&method).cloned();
                     let response = match answer {
+                        Some(result) if result.get("__error").is_some() => {
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "error":{"code":-32602,"message":result["__error"]}})
+                        }
                         // #1544: refuse with `message` until the request
                         // carries confirm_cap_reductions:true, then answer.
                         Some(result) if result.get("__refuse_unless_confirmed").is_some() => {
@@ -283,6 +295,11 @@ impl FakeDaemon {
             method,
             serde_json::json!({"__refuse_unless_confirmed": message, "result": result}),
         );
+    }
+
+    /// Refuse every call to `method` with `message`.
+    pub(crate) fn serve_error(&self, method: &str, message: &str) {
+        self.serve(method, serde_json::json!({"__error": message}));
     }
 
     pub(crate) fn calls(&self, method: &str) -> usize {
@@ -1004,6 +1021,65 @@ async fn a_refused_appointment_stays_inline_and_enter_retries_only_the_appointme
     assert!(workspace(&app).launch.is_none());
 }
 
+/// #1902: the launch form shows the prefill and its diff from the defaults
+/// before saving, and the appointment sends the revoked grant's policy.
+#[tokio::test]
+async fn launch_form_prefills_the_global_appointment_from_the_revoked_grant() {
+    use rsi_common::harness_manager_v2::ManagerCapabilityV2;
+
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    app.projects = vec![f.a.clone(), f.b.clone()];
+    let daemon = fake_daemon(&mut app).await;
+    let new_seat = Uuid::new_v4();
+    let mut revoked = f.snapshot.grant.clone().unwrap();
+    revoked.state = "revoked".into();
+    revoked.grant_version = 9;
+    revoked.project_ids = vec![f.a.id, f.b.id];
+    revoked.project_policy.capabilities = vec![ManagerCapabilityV2::Deploy];
+    revoked.project_policy.max_active_sessions = 20;
+    daemon.serve("LaunchSession", serde_json::json!({"session_id": new_seat}));
+    daemon.serve("GetGlobalManager", serde_json::to_value(&revoked).unwrap());
+    daemon.serve(
+        "ListPortfolioNodes",
+        serde_json::json!({ "nodes": [revoked_root(&revoked)] }),
+    );
+    let mut granted = revoked.clone();
+    granted.state = "active".into();
+    granted.seat_session_id = new_seat;
+    granted.grant_version = 10;
+    daemon.serve(
+        "ConfigureGlobalManager",
+        serde_json::to_value(&granted).unwrap(),
+    );
+    daemon.serve(
+        "GetGlobalManagerWorkspace",
+        serde_json::to_value(launched_snapshot(&f, new_seat)).unwrap(),
+    );
+    let mut snapshot = f.snapshot.clone();
+    snapshot.grant = Some(revoked.clone());
+    open_with(&mut app, snapshot);
+
+    handle_key(&mut app, key(KeyCode::Char('n'))).await;
+    let note = workspace(&app)
+        .launch
+        .clone()
+        .and_then(|form| form.prefill_note)
+        .expect("the form shows the prefill");
+    assert!(
+        note.contains("Prefilled from grant v9") && note.contains("+deploy"),
+        "{note}"
+    );
+
+    handle_key(&mut app, key(KeyCode::Enter)).await;
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        sent["project_policy"],
+        serde_json::json!(revoked.project_policy)
+    );
+    assert_eq!(sent["expected_grant_version"], 0);
+}
+
 /// Focus `id` in the session list so `:manager ... appoint` picks it as the seat.
 fn focus_session(app: &mut App, id: Uuid) {
     if let Pane::SessionList {
@@ -1091,6 +1167,258 @@ async fn n_leaves_the_cap_preview_and_esc_keeps_the_session_unappointed() {
 }
 
 #[tokio::test]
+async fn manager_global_appoint_reseats_with_the_existing_grant() {
+    use rsi_common::harness_manager_v2::ManagerCapabilityV2;
+
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let successor = Uuid::new_v4();
+    let mut session = baseline_session(successor, SessionKind::Standard);
+    session.project_id = Some(f.a.id);
+    app.sessions.insert(successor, SessionState::new(session));
+    focus_session(&mut app, successor);
+    let daemon = fake_daemon(&mut app).await;
+    let mut current = f.snapshot.grant.clone().unwrap();
+    // Keep coverage narrower than the available projects, and policy wider
+    // than the first-appointment defaults that caused #1751.
+    current.project_ids = vec![f.a.id];
+    current.grant_version = 6;
+    current.allowed_launches.push(ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-haiku-4-5".into(),
+        effort: None,
+    });
+    current.project_policy.capabilities = vec![
+        ManagerCapabilityV2::Deploy,
+        ManagerCapabilityV2::Topology,
+        ManagerCapabilityV2::GitEffect,
+    ];
+    current.project_policy.allow_create_groups = true;
+    current.project_policy.max_active_sessions = 20;
+    current.project_policy.max_created_sessions = 512;
+    current.project_policy.max_created_containers = 32;
+    current.project_policy.max_spend_usd = Some(125.0);
+    current.project_policy.allowed_launches = current.allowed_launches.clone();
+    current.project_policy.paused = true;
+    current.project_policy.validate().unwrap();
+
+    // Bare appoint carries coverage; named projects are an explicit coverage
+    // edit. Both keep every policy field and fence on the current version.
+    for (command, projects) in [
+        ("appoint".to_string(), vec![f.a.id]),
+        (format!("appoint {}", f.b.name), vec![f.b.id]),
+    ] {
+        daemon.serve("GetGlobalManager", serde_json::to_value(&current).unwrap());
+        let mut saved = current.clone();
+        saved.seat_session_id = successor;
+        saved.project_ids = projects.clone();
+        saved.grant_version += 1;
+        daemon.serve(
+            "ConfigureGlobalManager",
+            serde_json::to_value(&saved).unwrap(),
+        );
+
+        crate::overlay::global_manager_command::dispatch_global_command(&mut app, &command).await;
+
+        let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+        assert_eq!(sent["session_id"], serde_json::json!(successor));
+        assert_eq!(sent["project_ids"], serde_json::json!(projects));
+        assert_eq!(
+            sent["allowed_launches"],
+            serde_json::json!(current.allowed_launches)
+        );
+        assert_eq!(
+            sent["project_policy"],
+            serde_json::json!(current.project_policy)
+        );
+        assert_eq!(sent["expected_grant_version"], current.grant_version);
+        current = saved;
+    }
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 2);
+}
+
+fn last_notification(app: &App) -> (crate::types::NotificationKind, String) {
+    let last = app.notifications.back().expect("a notification");
+    (last.kind, last.message.clone())
+}
+
+/// A revoked global root over `projects` as `ListPortfolioNodes` serves it.
+fn revoked_root(revoked: &GlobalManagerGrantV1) -> rsi_common::portfolio_nodes::PortfolioNodeV1 {
+    rsi_common::portfolio_nodes::PortfolioNodeV1 {
+        node_id: Uuid::new_v4(),
+        tier_label: "global".into(),
+        state: "revoked".into(),
+        authority_epoch: 3,
+        parent_node_id: None,
+        grantor: "operator".into(),
+        seat_root_session_id: revoked.seat_session_id,
+        max_direct_reports: 5,
+        child_policy: None,
+        grant: revoked.clone(),
+        created_at: revoked.created_at,
+        updated_at: revoked.updated_at,
+    }
+}
+
+/// #1902: appointing after a revoke is prefilled from the last revoked root
+/// grant over the same coverage and shows the diff from the defaults;
+/// `--defaults` is the explicit opt-out; no overlapping grant means defaults.
+#[tokio::test]
+async fn manager_global_appoint_after_revoke_prefills_from_the_last_revoked_grant() {
+    use rsi_common::harness_manager_v2::ManagerCapabilityV2;
+
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let successor = Uuid::new_v4();
+    let mut session = baseline_session(successor, SessionKind::Standard);
+    session.project_id = Some(f.a.id);
+    app.sessions.insert(successor, SessionState::new(session));
+    focus_session(&mut app, successor);
+    let daemon = fake_daemon(&mut app).await;
+    // A revoked grant over both projects with a widened policy and launches.
+    let mut revoked = f.snapshot.grant.clone().unwrap();
+    revoked.state = "revoked".into();
+    revoked.grant_version = 9;
+    revoked.project_ids = vec![f.a.id, f.b.id];
+    revoked.allowed_launches.push(ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-haiku-4-5".into(),
+        effort: None,
+    });
+    revoked.project_policy.capabilities = vec![ManagerCapabilityV2::Deploy];
+    revoked.project_policy.max_active_sessions = 20;
+    daemon.serve("GetGlobalManager", serde_json::to_value(&revoked).unwrap());
+    let node = revoked_root(&revoked);
+    daemon.serve("ListPortfolioNodes", serde_json::json!({ "nodes": [node] }));
+    let mut saved = revoked.clone();
+    saved.state = "active".into();
+    saved.seat_session_id = successor;
+    saved.grant_version = 10;
+    daemon.serve(
+        "ConfigureGlobalManager",
+        serde_json::to_value(&saved).unwrap(),
+    );
+
+    // The preview writes nothing.
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "prefill").await;
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 0);
+    let (_, preview) = last_notification(&app);
+    assert!(preview.contains("Prefilled from grant v9"), "{preview}");
+
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "appoint").await;
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(sent["session_id"], serde_json::json!(successor));
+    assert_eq!(sent["project_ids"], serde_json::json!([f.a.id, f.b.id]));
+    assert_eq!(
+        sent["allowed_launches"],
+        serde_json::json!(revoked.allowed_launches)
+    );
+    assert_eq!(
+        sent["project_policy"],
+        serde_json::json!(revoked.project_policy)
+    );
+    assert_eq!(sent["expected_grant_version"], 0);
+    let (kind, message) = last_notification(&app);
+    assert_eq!(kind, crate::types::NotificationKind::OperationSuccess);
+    assert!(message.contains("Global manager appointed:"), "{message}");
+    assert!(
+        message.contains("Prefilled from grant v9")
+            && message.contains("+deploy")
+            && message.contains("max active sessions 4 → 20"),
+        "{message}"
+    );
+
+    // An explicit `--defaults` wins over the prefill.
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "appoint --defaults")
+        .await;
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        sent["allowed_launches"],
+        serde_json::json!(crate::overlay::global_manager_command::default_allowed_launches())
+    );
+    assert_eq!(
+        sent["project_policy"],
+        serde_json::json!(crate::overlay::global_manager_command::default_project_policy())
+    );
+    let (_, message) = last_notification(&app);
+    assert!(message.contains("first-appointment defaults"), "{message}");
+    assert!(!message.contains("Prefilled"), "{message}");
+
+    // No revoked root overlaps the coverage: defaults.
+    daemon.serve("ListPortfolioNodes", serde_json::json!({ "nodes": [] }));
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "appoint").await;
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        sent["project_policy"],
+        serde_json::json!(crate::overlay::global_manager_command::default_project_policy())
+    );
+}
+
+#[tokio::test]
+async fn manager_global_appoint_surfaces_a_stale_version_refusal_without_retrying() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let successor = Uuid::new_v4();
+    let mut session = baseline_session(successor, SessionKind::Standard);
+    session.project_id = Some(f.a.id);
+    app.sessions.insert(successor, SessionState::new(session));
+    focus_session(&mut app, successor);
+    let daemon = fake_daemon(&mut app).await;
+    let mut current = f.snapshot.grant.clone().unwrap();
+    current.grant_version = 6;
+    daemon.serve("GetGlobalManager", serde_json::to_value(&current).unwrap());
+    daemon.serve_error("ConfigureGlobalManager", "global_manager_stale_version");
+
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "appoint").await;
+
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 1, "no blind retry");
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        sent["expected_grant_version"], 6,
+        "fenced on the read version"
+    );
+    let (kind, message) = last_notification(&app);
+    assert_eq!(kind, crate::types::NotificationKind::OperationFailed);
+    assert!(
+        message.starts_with("Global manager:") && message.contains("global_manager_stale_version"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn manager_global_appoint_with_empty_coverage_is_refused_not_widened() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let successor = Uuid::new_v4();
+    let mut session = baseline_session(successor, SessionKind::Standard);
+    session.project_id = Some(f.a.id);
+    app.sessions.insert(successor, SessionState::new(session));
+    focus_session(&mut app, successor);
+    let daemon = fake_daemon(&mut app).await;
+    let mut current = f.snapshot.grant.clone().unwrap();
+    current.grant_version = 4;
+    current.project_ids = Vec::new();
+    daemon.serve("GetGlobalManager", serde_json::to_value(&current).unwrap());
+    daemon.serve_error("ConfigureGlobalManager", "global_manager_invalid_request");
+
+    crate::overlay::global_manager_command::dispatch_global_command(&mut app, "appoint").await;
+
+    let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        sent["project_ids"],
+        serde_json::json!([]),
+        "bare appoint carries the (empty) coverage instead of widening to every project"
+    );
+    assert_eq!(sent["expected_grant_version"], 4);
+    let (kind, message) = last_notification(&app);
+    assert_eq!(kind, crate::types::NotificationKind::OperationFailed);
+    assert!(
+        message.contains("global_manager_invalid_request"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn manager_global_appoint_opens_the_cap_preview_and_y_resends_confirmed() {
     use crate::overlay::manager_tree::TreeModal;
     let f = fixture();
@@ -1120,6 +1448,17 @@ async fn manager_global_appoint_opens_the_cap_preview_and_y_resends_confirmed() 
     assert!(text.contains("Koplik: active sessions: 20 → 4"), "{text}");
     assert!(pending.destructive);
     assert_eq!(daemon.calls("ConfigureGlobalManager"), 1);
+    let first = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(first["expected_grant_version"], 0);
+    assert_eq!(first["project_ids"], serde_json::json!([f.a.id, f.b.id]));
+    assert_eq!(
+        first["allowed_launches"],
+        serde_json::json!(crate::overlay::global_manager_command::default_allowed_launches())
+    );
+    assert_eq!(
+        first["project_policy"],
+        serde_json::json!(crate::overlay::global_manager_command::default_project_policy())
+    );
 
     crate::overlay::manager_tree::handle_key(&mut app, key(KeyCode::Enter)).await;
     assert_eq!(
@@ -1232,32 +1571,34 @@ async fn n_on_a_project_row_launches_and_appoints_its_pm() {
     daemon.serve("LaunchSession", serde_json::json!({"session_id": new_pm}));
     daemon.serve("GetHarnessManager", Value::Null);
     daemon.serve("GetHarnessManagerPolicy", Value::Null);
+    // #2237: the PM appointment is one atomic call carrying scope and policy.
     daemon.serve(
-        "ConfigureHarnessManager",
-        serde_json::to_value(HarnessManagerConfigV1 {
-            project_id: f.b.id,
-            manager_session_id: new_pm,
-            current_session_id: Some(new_pm),
-            epic_ids: Vec::new(),
-            scope_mode: HarnessManagerScopeModeV1::Project,
-            selected_epic_ids: None,
-            group_ids: Vec::new(),
-            row_version: 1,
-            updated_at: Utc::now(),
-        })
-        .unwrap(),
-    );
-    daemon.serve(
-        "ConfigureHarnessManagerPolicy",
-        serde_json::to_value(HarnessManagerPolicyConfigV2 {
-            project_id: f.b.id,
-            manager_session_id: new_pm,
-            scope_version: 1,
-            row_version: 1,
-            policy: crate::overlay::global_manager_command::default_project_policy(),
-            updated_at: Utc::now(),
-            revoked: false,
-        })
+        "ConfigureHarnessManagerWithPolicy",
+        serde_json::to_value(
+            rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyResultV2 {
+                config: HarnessManagerConfigV1 {
+                    project_id: f.b.id,
+                    manager_session_id: new_pm,
+                    current_session_id: Some(new_pm),
+                    epic_ids: Vec::new(),
+                    scope_mode: HarnessManagerScopeModeV1::Project,
+                    selected_epic_ids: None,
+                    group_ids: Vec::new(),
+                    row_version: 1,
+                    updated_at: Utc::now(),
+                },
+                scope_outcome: Default::default(),
+                policy: HarnessManagerPolicyConfigV2 {
+                    project_id: f.b.id,
+                    manager_session_id: new_pm,
+                    scope_version: 1,
+                    row_version: 1,
+                    policy: crate::overlay::global_manager_command::default_project_policy(),
+                    updated_at: Utc::now(),
+                    revoked: false,
+                },
+            },
+        )
         .unwrap(),
     );
     let mut snapshot = f.snapshot.clone();
@@ -1279,10 +1620,21 @@ async fn n_on_a_project_row_launches_and_appoints_its_pm() {
 
     let launch = daemon.last_params("LaunchSession").unwrap();
     assert_eq!(launch["project_id"], serde_json::json!(f.b.id));
-    let scope = daemon.last_params("ConfigureHarnessManager").unwrap();
+    let call = daemon
+        .last_params("ConfigureHarnessManagerWithPolicy")
+        .unwrap();
+    let scope = &call["scope"];
     assert_eq!(scope["project_id"], serde_json::json!(f.b.id));
     assert_eq!(scope["session_id"], serde_json::json!(new_pm));
-    assert_eq!(daemon.calls("ConfigureHarnessManagerPolicy"), 1);
+    assert_eq!(daemon.calls("ConfigureHarnessManagerWithPolicy"), 1);
+    assert_eq!(
+        call["policy"],
+        serde_json::to_value(crate::overlay::global_manager_command::default_project_policy())
+            .unwrap(),
+        "an unvisited grant sends the Execute defaults"
+    );
+    assert_eq!(daemon.calls("ConfigureHarnessManager"), 0);
+    assert_eq!(daemon.calls("ConfigureHarnessManagerPolicy"), 0);
     let state = workspace(&app);
     assert!(
         state.launch.is_none(),
@@ -1570,5 +1922,25 @@ async fn a_refuses_the_current_seat_and_archives_an_earlier_session() {
     assert!(
         !app.sessions.contains_key(&older),
         "archived session leaves the live set"
+    );
+}
+
+#[test]
+fn workspace_grant_display_and_overview_show_any_effort() {
+    let mut f = fixture();
+    f.snapshot.grant.as_mut().unwrap().allowed_launches[0].effort = None;
+    let value = serde_json::to_value(&f.snapshot).unwrap();
+    assert_eq!(
+        value["launches_display"][0],
+        "Claude/claude-opus-5-5/any effort"
+    );
+    let restored: GlobalManagerWorkspaceV1 = serde_json::from_value(value).unwrap();
+    assert_eq!(restored, f.snapshot);
+    let mut state = GlobalManagerWorkspaceState::default();
+    state.install(f.snapshot.clone(), Utc::now());
+    assert!(
+        state
+            .grant_line(&[f.a.clone(), f.b.clone()])
+            .contains("any effort")
     );
 }

@@ -302,7 +302,7 @@ fn tool_schemas() -> &'static Value {
 // Tool execution (sandboxed to working_dir)
 // ---------------------------------------------------------------------------
 
-use crate::path_safety::resolve_sandboxed_path;
+use rsid_harness::paths::resolve_sandboxed_path;
 
 const MAX_READ_BYTES: usize = LOCAL_TOOL_MAX_STREAM_BYTES;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;

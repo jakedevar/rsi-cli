@@ -312,3 +312,78 @@ This project includes code derived from [Ratatui](https://github.com/ratatui/rat
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
 ````
+
+## openai/codex (history normalization)
+
+- Project: https://github.com/openai/codex
+- License: Apache-2.0
+- Upstream commit read: `f5f08c54cb7a774594d3579c5731ea3e87f01c48`
+- Upstream paths:
+  - `codex-rs/core/src/context_manager/normalize.rs`
+- RSI paths:
+  - `crates/rsid/src/session/harness/normalize.rs`
+- Modified: the algorithm that drops orphan tool results and synthesizes
+  missing ones is re-expressed over RSI's `ChatMessage` history; it is not a
+  verbatim copy.
+
+This file was changed from the upstream (see Modified above), as Apache-2.0 section 4(b) requires.
+
+The Apache-2.0 license text and the upstream `NOTICE` text are those
+reproduced in the `openai/codex` entry above; both match `LICENSE` and `NOTICE`
+at `f5f08c54` byte for byte (checked 2026-10-13).
+
+## PrimeIntellect-ai/prime-agent (Serper result normalization)
+
+- Project: https://github.com/PrimeIntellect-ai/prime-agent
+- License: MIT
+- Upstream commit read: `cd1f215cffd09223316c54dddae5e1b654718c31`
+- Upstream paths:
+  - `packages/coding-agent/skills/websearch/src/websearch/websearch.py`
+    (`_format_serper_results`)
+- RSI paths:
+  - `crates/rsid/src/session/harness/tools/web_search/serper.rs`
+- Modified: the Python formatter that writes answer, knowledge-graph, organic
+  and "people also ask" text is re-expressed as a normalizer into RSI's
+  `SearchResults`; the text layout is RSI's own.
+
+The MIT license text and both copyright lines (Mario Zechner 2025, Prime
+Intellect 2026) are those reproduced in the `PrimeIntellect-ai/prime-agent`
+entry above (same commit `cd1f215c`).
+
+## openai/codex (Harness base instructions)
+
+- Project: https://github.com/openai/codex
+- License: Apache-2.0
+- Upstream commit read: `dfdb40cd0b72dfba3293db5c7c441232e8ef1a60`
+- Upstream paths:
+  - `codex-rs/protocol/src/prompts/base_instructions/default.md`
+- RSI paths:
+  - `crates/rsid/assets/harness/base_instructions.md`
+  - `crates/rsid/src/session/harness/base_prompt.rs`
+- Modified: the section on planning, task execution and validation is rewritten
+  for RSI's typed tools (`apply_patch`, `file_edit`, `update_plan`, `grep`,
+  `glob`), its sandbox rules and low-latency chat-completions models; it is
+  not a verbatim copy.
+
+This file was changed from the upstream (see Modified above), as Apache-2.0 section 4(b) requires.
+
+The Apache-2.0 license text and the upstream `NOTICE` text are those
+reproduced in the `openai/codex` entry above; `LICENSE` and `NOTICE` are
+unchanged between `f5f08c54` and `dfdb40cd` (checked 2026-10-13).
+
+## PrimeIntellect-ai/prime-agent (Harness base instructions)
+
+- Project: https://github.com/PrimeIntellect-ai/prime-agent
+- License: MIT
+- Upstream commit read: `cd1f215cffd09223316c54dddae5e1b654718c31`
+- Upstream paths:
+  - `packages/coding-agent/src/core/prompts/rlm.ts`
+- RSI paths:
+  - `crates/rsid/assets/harness/base_instructions.md`
+  - `crates/rsid/src/session/harness/base_prompt.rs`
+- Modified: the wording on exploring before editing and on finishing is
+  re-expressed for typed tools instead of a Python REPL; the text is RSI's own.
+
+The MIT license text and both copyright lines (Mario Zechner 2025, Prime
+Intellect 2026) are those reproduced in the `PrimeIntellect-ai/prime-agent`
+entry above (same commit `cd1f215c`).

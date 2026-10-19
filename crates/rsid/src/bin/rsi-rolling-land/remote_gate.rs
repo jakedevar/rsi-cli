@@ -764,7 +764,7 @@ mod tests {
         let identity = PathBuf::from(
             std::env::var("RSI_REMOTE_GATE_SMOKE_IDENTITY").expect("smoke SSH identity"),
         );
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = PathBuf::from(rsi_common::manifest_dir!()).join("../..");
         let sha = std::env::var("RSI_REMOTE_GATE_SMOKE_SHA").expect("exact smoke SHA");
         let shard = "other-01";
         let jobs = 4;

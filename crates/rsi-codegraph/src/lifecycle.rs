@@ -51,6 +51,57 @@ impl IndexLifecyclePhase {
     }
 }
 
+/// Why a run published (or attempted) a snapshot that omits part of the
+/// workspace's structure. A partial run is still usable; the reason says which
+/// facts are absent so a reader never mistakes the gap for "nothing there".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPartialReason {
+    /// Resolved `cargo metadata` failed (for example an uncached dependency);
+    /// workspace packages and targets came from `--no-deps`, dependency edges
+    /// are absent.
+    CargoMetadataNoDeps,
+    /// `cargo metadata` failed in both modes; the snapshot has no Cargo facts.
+    CargoMetadataUnavailable,
+}
+
+impl IndexPartialReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CargoMetadataNoDeps => "cargo_metadata_no_deps",
+            Self::CargoMetadataUnavailable => "cargo_metadata_unavailable",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "cargo_metadata_no_deps" => Ok(Self::CargoMetadataNoDeps),
+            "cargo_metadata_unavailable" => Ok(Self::CargoMetadataUnavailable),
+            _ => Err(CodegraphError::InvalidInput(
+                "invalid durable partial reason".into(),
+            )),
+        }
+    }
+
+    fn encode(reasons: &[Self]) -> Option<String> {
+        (!reasons.is_empty()).then(|| {
+            reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+
+    fn decode(value: Option<&str>) -> Result<Vec<Self>> {
+        value.filter(|value| !value.is_empty()).map_or_else(
+            || Ok(Vec::new()),
+            |value| value.split(',').map(Self::parse).collect(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRunMetrics {
     pub files_discovered: usize,
@@ -64,6 +115,12 @@ pub struct IndexRunMetrics {
     pub overflow_count: u64,
     pub pending_rescan: bool,
     pub rescan_reason: Option<String>,
+    /// Included-extension paths skipped because they are symlinks. A skipped
+    /// link is never read or followed; it is counted so the gap is visible.
+    #[serde(default)]
+    pub skipped_symlinks: usize,
+    #[serde(default)]
+    pub partial_reasons: Vec<IndexPartialReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,7 +330,9 @@ impl CodegraphStore {
         Ok(run_id)
     }
 
-    /// Finish a run and replace its exact-byte manifest after successful publish.
+    /// Finish a run. `manifest` is the inventory a successful publish made the
+    /// head; it is not stored, because the head's structure blocks already carry
+    /// every file's path and source digest (#2351, see `index_manifest`).
     pub fn finish_index_run(
         &mut self,
         run_id: Uuid,
@@ -330,25 +389,13 @@ impl CodegraphStore {
                 "index run is not active".into(),
             ));
         }
-        if let Some(manifest) = manifest {
-            transaction.execute(
-                "DELETE FROM cg_index_manifest WHERE workspace_id=?1",
-                [workspace_id.to_string()],
-            )?;
-            for owner in manifest {
-                transaction.execute(
-                    "INSERT INTO cg_index_manifest(workspace_id,path,source_digest) VALUES (?1,?2,?3)",
-                    params![workspace_id.to_string(), owner.relative_path, owner.source_digest],
-                )?;
-            }
-        }
         let state_updated = transaction.execute(
             "UPDATE cg_index_state SET phase=?3,run_id=NULL,
                 last_success_at=CASE WHEN ?4=1 THEN ?5 ELSE last_success_at END,
                 last_duration_ms=?6,files_discovered=?7,bytes_discovered=?8,
                 changed_paths=?9,staged_files=?10,overflow_count=?11,pending_rescan=?12,
                 last_error=?13,files_hashed=?14,files_reused=?15,files_extracted=?16,
-                rescan_reason=?17,updated_at=?5
+                rescan_reason=?17,skipped_symlinks=?18,partial_reasons=?19,updated_at=?5
              WHERE workspace_id=?1 AND run_id=?2",
             params![
                 workspace_id.to_string(),
@@ -367,7 +414,9 @@ impl CodegraphStore {
                 count(metrics.files_hashed)?,
                 count(metrics.files_reused)?,
                 count(metrics.files_extracted)?,
-                metrics.rescan_reason.as_deref()
+                metrics.rescan_reason.as_deref(),
+                count(metrics.skipped_symlinks)?,
+                IndexPartialReason::encode(&metrics.partial_reasons)
             ],
         )?;
         if state_updated != 1 {
@@ -394,15 +443,16 @@ impl CodegraphStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let count_rows = |table: &str| -> Result<usize> {
-            let rows: i64 = self.connection.query_row(
-                &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1 AND generation=?2"),
-                params![workspace, generation],
-                |row| row.get(0),
-            )?;
+        let count_rows = |sql: &str| -> Result<usize> {
+            let rows: i64 =
+                self.connection
+                    .query_row(sql, params![workspace, generation], |row| row.get(0))?;
             usize_count(rows)
         };
-        let files = count_rows("cg_files")?;
+        let files = count_rows(
+            "SELECT count(*) FROM cg_manifest m JOIN cg_blocks b ON b.block_id=m.block_id
+             WHERE m.workspace_id=?1 AND m.generation=?2 AND b.kind='S'",
+        )?;
         let (parsed_files, degraded_files) = match completeness {
             Some((total, parsed, degraded)) => {
                 if usize_count(total)? != files {
@@ -418,9 +468,18 @@ impl CodegraphStore {
             files,
             parsed_files,
             degraded_files,
-            nodes: count_rows("cg_nodes")?,
-            relations: count_rows("cg_relations")?,
-            unresolved_references: count_rows("cg_unresolved_references")?,
+            nodes: count_rows(
+                "SELECT count(*) FROM cg_manifest m JOIN cg_block_nodes n ON n.block_id=m.block_id
+                 WHERE m.workspace_id=?1 AND m.generation=?2",
+            )?,
+            relations: count_rows(
+                "SELECT count(*) FROM cg_manifest m JOIN cg_block_relations r ON r.block_id=m.block_id
+                 WHERE m.workspace_id=?1 AND m.generation=?2",
+            )?,
+            unresolved_references: count_rows(
+                "SELECT count(*) FROM cg_manifest m JOIN cg_block_unresolved u ON u.block_id=m.block_id
+                 WHERE m.workspace_id=?1 AND m.generation=?2",
+            )?,
         })
     }
 
@@ -432,7 +491,8 @@ impl CodegraphStore {
                     recovery_action,files_discovered,bytes_discovered,changed_paths,
                     staged_files,last_duration_ms,overflow_count,pending_rescan,
                     extractor_version,grammar_version,rule_version,normalization_version,config_digest,
-                    files_hashed,files_reused,files_extracted,rescan_reason
+                    files_hashed,files_reused,files_extracted,rescan_reason,
+                    skipped_symlinks,partial_reasons
              FROM cg_index_state WHERE workspace_id=?1",
                 [workspace_id.to_string()],
                 |row| {
@@ -460,6 +520,8 @@ impl CodegraphStore {
                         row.get::<_, i64>(20)?,
                         row.get::<_, i64>(21)?,
                         row.get::<_, Option<String>>(22)?,
+                        row.get::<_, i64>(23)?,
+                        row.get::<_, Option<String>>(24)?,
                     ))
                 },
             )
@@ -488,6 +550,8 @@ impl CodegraphStore {
             reused,
             extracted,
             rescan_reason,
+            skipped_symlinks,
+            partial_reasons,
         )) = row
         else {
             return Ok(None);
@@ -539,14 +603,22 @@ impl CodegraphStore {
                     .map_err(|_| CodegraphError::InvalidInput("invalid overflow count".into()))?,
                 pending_rescan: pending != 0,
                 rescan_reason,
+                skipped_symlinks: usize_count(skipped_symlinks)?,
+                partial_reasons: IndexPartialReason::decode(partial_reasons.as_deref())?,
             },
         }))
     }
 
-    /// Exact source bytes represented by the last successfully published head.
+    /// Exact source bytes represented by the last successfully published head,
+    /// read from the head's structure blocks (#2351): a workspace stores no
+    /// manifest of its own.
     pub fn index_manifest(&self, workspace_id: Uuid) -> Result<Vec<SourceVersion>> {
         let mut statement = self.connection.prepare(
-            "SELECT path,source_digest FROM cg_index_manifest WHERE workspace_id=?1 ORDER BY path",
+            "SELECT b.path,b.source_digest
+             FROM cg_workspace_heads h
+               JOIN cg_manifest m ON m.workspace_id=h.workspace_id AND m.generation=h.generation
+               JOIN cg_blocks b ON b.block_id=m.block_id
+             WHERE h.workspace_id=?1 AND b.kind='S' ORDER BY b.path",
         )?;
         let rows = statement.query_map([workspace_id.to_string()], |row| {
             Ok(SourceVersion {
@@ -586,15 +658,7 @@ impl CodegraphStore {
              detailed_bytes=excluded.detailed_bytes",
             params![workspace_id.to_string(), generation, now(), bytes],
         )?;
-        transaction.execute(
-            "UPDATE cg_retained_nodes SET tombstoned=1 WHERE workspace_id=?1 AND tombstoned=0",
-            [workspace_id.to_string()],
-        )?;
-        transaction.execute(
-            "UPDATE cg_retained_relations SET tombstoned=1 WHERE workspace_id=?1 AND tombstoned=0",
-            [workspace_id.to_string()],
-        )?;
-        retain_generation_identities(&transaction, workspace_id, generation, false)?;
+        release_returning_identities(&transaction, workspace_id, generation)?;
         transaction.commit()?;
         Ok(())
     }
@@ -623,15 +687,7 @@ impl CodegraphStore {
         for (id, generation) in unaccounted_heads {
             let workspace_id = Uuid::parse_str(&id)
                 .map_err(|error| CodegraphError::InvalidInput(error.to_string()))?;
-            transaction.execute(
-                "UPDATE cg_retained_nodes SET tombstoned=1 WHERE workspace_id=?1 AND tombstoned=0",
-                [&id],
-            )?;
-            transaction.execute(
-                "UPDATE cg_retained_relations SET tombstoned=1 WHERE workspace_id=?1 AND tombstoned=0",
-                [&id],
-            )?;
-            retain_generation_identities(&transaction, workspace_id, generation, false)?;
+            release_returning_identities(&transaction, workspace_id, generation)?;
         }
         let rows = {
             let mut statement = transaction.prepare(
@@ -715,17 +771,13 @@ impl CodegraphStore {
                 "generation is not retained ready history".into(),
             ));
         }
-        retain_generation_identities(&transaction, workspace_id, generation, true)?;
+        tombstone_leaving_identities(&transaction, workspace_id, generation)?;
         let id = workspace_id.to_string();
+        // The generation's manifest goes first; only blocks that no other
+        // generation or workspace shares are deleted with it.
+        crate::blocks::detach_generation(&transaction, &id, generation)?;
         for table in [
-            "cg_fts_nodes",
-            "cg_unresolved_references",
-            "cg_evidence",
-            "cg_relations",
-            "cg_nodes",
-            "cg_file_diagnostics",
             "cg_snapshot_completeness",
-            "cg_files",
             "cg_generation_detail",
             "cg_snapshots",
         ] {
@@ -858,105 +910,128 @@ impl CodegraphStore {
     }
 }
 
+/// Bytes this generation adds to the database. Blocks shared with another
+/// generation or workspace are counted where they were first stored, so the sum
+/// over retained generations tracks the physical size instead of repeating one
+/// graph per generation.
 fn measure_generation(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: Uuid,
     generation: i64,
 ) -> Result<i64> {
-    let mut total = 0i64;
-    for (table, fields) in [
-        ("cg_files", "path, file_id, source_digest"),
-        (
-            "cg_nodes",
-            "node_id, node_key, kind, name, path, provenance",
-        ),
-        (
-            "cg_relations",
-            "relation_id, relation_key, kind, source_id, target_id, provenance",
-        ),
-        (
-            "cg_evidence",
-            "fact_id, label, path, source_digest, evidence_digest, fact_type",
-        ),
-        (
-            "cg_unresolved_references",
-            "unresolved_id, site_key, kind, owner_id, raw_target, path, source_digest, reference_digest, provenance",
-        ),
-        ("cg_file_diagnostics", "path, diagnostic"),
-        ("cg_fts_nodes", "name, path, node_id, owner_path"),
-    ] {
-        let expression = fields
-            .split(", ")
-            .map(|field| format!("length({field})"))
-            .collect::<Vec<_>>()
-            .join("+");
-        let bytes: i64 = transaction.query_row(
-            &format!("SELECT COALESCE(SUM({expression}+32),0) FROM {table} WHERE workspace_id=?1 AND generation=?2"),
-            params![workspace_id.to_string(),generation], |row| row.get(0),
-        )?;
-        total = total
-            .checked_add(bytes)
-            .ok_or_else(|| CodegraphError::InvalidInput("detailed byte count overflow".into()))?;
-    }
-    Ok(total)
+    crate::blocks::marginal_generation_bytes(transaction, &workspace_id.to_string(), generation)
 }
 
-fn retain_generation_identities(
+/// SQL predicate (#2351, replacing the head-only probe of #2464): the node
+/// `n` is still held by a retained generation of workspace `?1` other than the
+/// pruned `?2`. The probe starts from the node's own blocks
+/// (`cg_block_nodes_id`) and checks each against the primary key of the
+/// workspace's other retained manifests, so one prune stays linear in the
+/// generation's identities (generations x blocks per node, not nodes x blocks
+/// of a manifest: the old head walk ran about 20 minutes on the hub's 12k-block,
+/// 218k-node rsi index).
+const OTHER_GENERATION_HOLDS_NODE_SQL: &str = "EXISTS (
+            SELECT 1 FROM cg_block_nodes other
+             WHERE other.node_id=n.node_id
+               AND EXISTS (SELECT 1 FROM cg_snapshots s
+                             JOIN cg_manifest om
+                               ON om.workspace_id=s.workspace_id
+                              AND om.generation=s.generation
+                              AND om.block_id=other.block_id
+                            WHERE s.workspace_id=?1 AND s.ready=1 AND s.generation<>?2)
+          )";
+
+/// [`OTHER_GENERATION_HOLDS_NODE_SQL`] for relations (`cg_block_relations_id`).
+const OTHER_GENERATION_HOLDS_RELATION_SQL: &str = "EXISTS (
+            SELECT 1 FROM cg_block_relations other
+             WHERE other.relation_id=r.relation_id
+               AND EXISTS (SELECT 1 FROM cg_snapshots s
+                             JOIN cg_manifest om
+                               ON om.workspace_id=s.workspace_id
+                              AND om.generation=s.generation
+                              AND om.block_id=other.block_id
+                            WHERE s.workspace_id=?1 AND s.ready=1 AND s.generation<>?2)
+          )";
+
+/// A generation is about to be pruned. The identity ledger (#2351) holds only
+/// identities that left every retained generation, so the ones this generation
+/// alone still holds are recorded as tombstones; identities another retained
+/// generation holds are derived from its blocks and need no row.
+fn tombstone_leaving_identities(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: Uuid,
     generation: i64,
-    pruned: bool,
 ) -> Result<()> {
     let id = workspace_id.to_string();
-    // Historical rows cannot change the current-head tombstone state of an
-    // identity already observed at a newer generation.
-    let conflict = if pruned {
-        "DO UPDATE SET last_detailed_generation=MAX(cg_retained_nodes.last_detailed_generation,
-            excluded.last_detailed_generation)"
-    } else {
-        "DO UPDATE SET node_key=excluded.node_key,kind=excluded.kind,name=excluded.name,
-         last_detailed_generation=excluded.last_detailed_generation,tombstoned=0"
-    };
-    let tombstoned = if pruned {
-        "CASE WHEN EXISTS (
-            SELECT 1 FROM cg_workspace_heads h JOIN cg_nodes current_node
-              ON current_node.workspace_id=h.workspace_id AND current_node.generation=h.generation
-             WHERE h.workspace_id=n.workspace_id AND current_node.node_id=n.node_id
-          ) THEN 0 ELSE 1 END"
-    } else {
-        "0"
-    };
     transaction.execute(
         &format!("INSERT INTO cg_retained_nodes(workspace_id,node_id,node_key,kind,name,last_detailed_generation,tombstoned)
-          SELECT n.workspace_id,n.node_id,n.node_key,n.kind,n.name,n.generation,{tombstoned} FROM cg_nodes n
-          WHERE n.workspace_id=?1 AND n.generation=?2
-          ON CONFLICT(workspace_id,node_id) {conflict}"),
+          SELECT ?1,n.node_id,n.node_key,n.kind,n.name,?2,1
+          FROM cg_manifest m JOIN cg_block_nodes n ON n.block_id=m.block_id
+          WHERE m.workspace_id=?1 AND m.generation=?2 AND NOT {OTHER_GENERATION_HOLDS_NODE_SQL}
+          ON CONFLICT(workspace_id,node_id) DO UPDATE SET
+            last_detailed_generation=MAX(cg_retained_nodes.last_detailed_generation,
+              excluded.last_detailed_generation)"),
         params![id,generation],
     )?;
-    let conflict = if pruned {
-        "DO UPDATE SET last_detailed_generation=MAX(cg_retained_relations.last_detailed_generation,
-            excluded.last_detailed_generation)"
-    } else {
-        "DO UPDATE SET relation_key=excluded.relation_key,kind=excluded.kind,
-         source_id=excluded.source_id,target_id=excluded.target_id,
-         last_detailed_generation=excluded.last_detailed_generation,tombstoned=0"
-    };
-    let tombstoned = if pruned {
-        "CASE WHEN EXISTS (
-            SELECT 1 FROM cg_workspace_heads h JOIN cg_relations current_relation
-              ON current_relation.workspace_id=h.workspace_id AND current_relation.generation=h.generation
-             WHERE h.workspace_id=r.workspace_id AND current_relation.relation_id=r.relation_id
-          ) THEN 0 ELSE 1 END"
-    } else {
-        "0"
-    };
     transaction.execute(
         &format!("INSERT INTO cg_retained_relations(workspace_id,relation_id,relation_key,kind,source_id,target_id,last_detailed_generation,tombstoned)
-          SELECT r.workspace_id,r.relation_id,r.relation_key,r.kind,r.source_id,r.target_id,r.generation,{tombstoned} FROM cg_relations r
-          WHERE r.workspace_id=?1 AND r.generation=?2
-          ON CONFLICT(workspace_id,relation_id) {conflict}"),
+          SELECT ?1,r.relation_id,r.relation_key,r.kind,r.source_id,r.target_id,?2,1
+          FROM cg_manifest m JOIN cg_block_relations r ON r.block_id=m.block_id
+          WHERE m.workspace_id=?1 AND m.generation=?2 AND NOT {OTHER_GENERATION_HOLDS_RELATION_SQL}
+          ON CONFLICT(workspace_id,relation_id) DO UPDATE SET
+            last_detailed_generation=MAX(cg_retained_relations.last_detailed_generation,
+              excluded.last_detailed_generation)"),
         params![id,generation],
     )?;
+    Ok(())
+}
+
+/// A generation was published. Identities live in the head's blocks and have
+/// no ledger row (#2351); the only rows that can be wrong are tombstones of
+/// identities this generation brings back. Those can only be in blocks the
+/// previous retained generation did not hold, so a publish of unchanged content
+/// reads no identity at all, and a workspace with no tombstones skips the work.
+fn release_returning_identities(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: Uuid,
+    generation: i64,
+) -> Result<()> {
+    let id = workspace_id.to_string();
+    let previous: Option<i64> = transaction.query_row(
+        "SELECT MAX(generation) FROM cg_snapshots WHERE workspace_id=?1 AND ready=1 AND generation<?2",
+        params![id, generation],
+        |row| row.get(0),
+    )?;
+    let previous = previous.unwrap_or(-1);
+    for (ledger, key, source, source_key) in [
+        ("cg_retained_nodes", "node_id", "cg_block_nodes", "node_id"),
+        (
+            "cg_retained_relations",
+            "relation_id",
+            "cg_block_relations",
+            "relation_id",
+        ),
+    ] {
+        let tombstones: bool = transaction.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM {ledger} WHERE workspace_id=?1)"),
+            [&id],
+            |row| row.get(0),
+        )?;
+        if !tombstones {
+            continue;
+        }
+        transaction.execute(
+            &format!(
+                "DELETE FROM {ledger} WHERE workspace_id=?1 AND {key} IN (
+                   SELECT x.{source_key} FROM cg_manifest m JOIN {source} x ON x.block_id=m.block_id
+                   WHERE m.workspace_id=?1 AND m.generation=?2
+                     AND NOT EXISTS (SELECT 1 FROM cg_manifest p
+                                      WHERE p.workspace_id=?1 AND p.generation=?3
+                                        AND p.block_id=m.block_id))"
+            ),
+            params![id, generation, previous],
+        )?;
+    }
     Ok(())
 }
 
@@ -997,7 +1072,7 @@ mod tests {
             assert_eq!(status.run_id, Some(run_id));
             assert_eq!(status.project_id, project_id);
             assert_eq!(status.extractor_version.as_deref(), Some("1"));
-            assert_eq!(status.schema_version, 6);
+            assert_eq!(status.schema_version, 10);
             run_id
         };
         let mut reopened = CodegraphStore::open(&path, project_id).unwrap();
@@ -1041,6 +1116,8 @@ mod tests {
             overflow_count: 0,
             pending_rescan: true,
             rescan_reason: Some("run_failed".into()),
+            skipped_symlinks: 0,
+            partial_reasons: Vec::new(),
         };
         for workspace_id in [first, second] {
             for _ in 0..25 {
@@ -1071,6 +1148,93 @@ mod tests {
             let status = store.index_status(workspace_id).unwrap().unwrap();
             assert_eq!(status.last_error.unwrap().len(), MAX_DIAGNOSTIC_BYTES);
         }
+    }
+
+    /// #2464: seed `blocks` one-node, one-relation blocks; generation 1 holds
+    /// the first `blocks`, the head (generation 2) the last `blocks`, so half of
+    /// generation 1 is still current and half is gone. Returns the SQLite VM
+    /// instructions retaining generation 1's identities took, and how many of
+    /// its nodes and relations were tombstoned.
+    fn prune_identity_cost(blocks: i64) -> (u64, i64, i64) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let mut store =
+            CodegraphStore::open(root.path().join("codegraph.sqlite"), Uuid::new_v4()).unwrap();
+        let workspace = Uuid::new_v4();
+        let id = workspace.to_string();
+        store
+            .connection
+            .execute_batch(&format!(
+                "WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM k WHERE i < {total})
+                 INSERT INTO cg_blocks(block_id,kind,digest,path,source_digest,bytes,refs)
+                   SELECT i,'S','d'||i,'p'||i,'s'||i,1,1 FROM k;
+                 INSERT INTO cg_block_nodes(block_id,node_id,node_key,kind,name,start_byte,end_byte,
+                     start_line,start_column,end_line,end_column,provenance)
+                   SELECT block_id,'n'||block_id,'k'||block_id,'fn','f'||block_id,0,1,0,0,0,1,'Extracted'
+                   FROM cg_blocks;
+                 INSERT INTO cg_block_relations(block_id,relation_id,relation_key,kind,source_id,target_id,provenance)
+                   SELECT block_id,'r'||block_id,'rk'||block_id,'calls','n'||block_id,'n1','Extracted'
+                   FROM cg_blocks;
+                 INSERT INTO cg_snapshots(project_id,repository_id,workspace_id,generation,
+                     snapshot_digest,graph_digest,ready)
+                   VALUES('p','r','{id}',1,'a','b',1),('p','r','{id}',2,'a','b',1);
+                 INSERT INTO cg_workspace_heads(workspace_id,generation) VALUES('{id}',2);
+                 INSERT INTO cg_manifest SELECT '{id}',1,block_id FROM cg_blocks WHERE block_id<={blocks};
+                 INSERT INTO cg_manifest SELECT '{id}',2,block_id FROM cg_blocks WHERE block_id>{half};",
+                total = blocks + blocks / 2,
+                half = blocks / 2,
+            ))
+            .unwrap();
+        let counter = Arc::new(AtomicU64::new(0));
+        let handle = Arc::clone(&counter);
+        store.connection.progress_handler(
+            1,
+            Some(move || {
+                handle.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        );
+        let transaction = store.connection.transaction().unwrap();
+        tombstone_leaving_identities(&transaction, workspace, 1).unwrap();
+        transaction.commit().unwrap();
+        store.connection.progress_handler(1, None::<fn() -> bool>);
+        let tombstoned = |table: &str| -> i64 {
+            store
+                .connection
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE tombstoned=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        (
+            counter.load(Ordering::Relaxed),
+            tombstoned("cg_retained_nodes"),
+            tombstoned("cg_retained_relations"),
+        )
+    }
+
+    /// #2464: pruning a generation is linear in its identities, not
+    /// identities x head blocks. Quadrupling the blocks quadruples the work
+    /// (the old head-manifest walk grew 15x here), and the tombstones stay
+    /// exact: only identities the head no longer holds are tombstoned.
+    #[test]
+    fn prune_identity_retention_is_linear_in_the_generation_2464() {
+        let (small, small_nodes, small_relations) = prune_identity_cost(100);
+        let (large, large_nodes, large_relations) = prune_identity_cost(400);
+        assert_eq!((small_nodes, small_relations), (50, 50));
+        assert_eq!((large_nodes, large_relations), (200, 200));
+        assert!(
+            large < small * 6,
+            "prune cost grew {large} / {small} for 4x the blocks: not linear"
+        );
+        assert!(
+            large < 400 * 2 * 250,
+            "{large} VM instructions for 800 identities: a per-identity walk of the head"
+        );
     }
 
     #[test]

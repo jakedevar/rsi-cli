@@ -20,7 +20,7 @@ use tempfile::TempDir;
 /// Path to the tracked hook source. Resolves from the test crate's manifest
 /// dir up to the workspace root, then into `tools/git-hooks/pre-commit`.
 fn hook_source() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(rsi_common::manifest_dir!())
         .parent()
         .and_then(|p| p.parent())
         .map(|root| root.join("tools/git-hooks/pre-commit"))

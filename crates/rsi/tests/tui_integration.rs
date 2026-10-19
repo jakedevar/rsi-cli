@@ -20,6 +20,10 @@ fn test_app() -> App {
     PersistedState::default().save();
     emergency_drafts::save(None, &HashMap::new());
     let mut app = App::new(client);
+    // The operator to-do panel (#1747) is open by default and takes a 41-column
+    // strip off wide session details; these tests pin the detail geometry
+    // itself, and the panel's own layout is covered in ui/todo_panel.rs.
+    app.todo_panel.open = false;
     let initial_pane_id = PaneId(0);
     app.tabs = vec![Tab {
         name: "[1]".to_string(),
@@ -966,7 +970,7 @@ fn settings_menu_200x58_explains_the_selected_setting_beside_the_list() {
         "Submit on Enter",
         "Plain Enter submits multiline text",
         "Toggle OFF when the terminal cannot deliver",
-        "✓ applies now",
+        "✓ on apply (w)",
         "⌂ state.json",
         "Owner",
         "TUI (state.json)",

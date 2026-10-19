@@ -959,3 +959,80 @@ fn imported_entry_keeps_its_source_env_name() {
     assert_eq!(resolved.source, CredentialSource::Vault);
     assert_eq!(resolved.env_var, Some("PIONEER_API_KEY"));
 }
+
+/// hub #3039: custom-provider keys persist in their own 0600 file, reload
+/// from disk, show only metadata, and never change `credentials.json`, so an
+/// older daemon (whose `VaultFile` refuses unknown fields) still reads it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+#[test]
+fn custom_provider_keys_persist_in_their_own_file_and_leave_credentials_json_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const KEY: &str = "sk-test-custom-provider-3039";
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("vault");
+    let open = || {
+        VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+            .dir(&dir)
+            .env(|_| None)
+            .open()
+            .unwrap()
+    };
+    let vault = open();
+    vault.set(Slot::Openai, VAULT_SECRET).unwrap();
+    let credentials = std::fs::read(dir.join(store::VAULT_FILE_NAME)).unwrap();
+
+    let id = uuid::Uuid::new_v4();
+    let metadata = vault.set_custom_provider_key(id, KEY).unwrap();
+    assert_eq!(
+        metadata.state,
+        rsi_common::operator_config::CustomProviderKeyState::Set
+    );
+    assert_eq!(
+        metadata.fingerprint.as_deref(),
+        Some(secret::fingerprint(KEY).as_str())
+    );
+    assert!(!serde_json::to_string(&metadata).unwrap().contains(KEY));
+    assert!(
+        vault
+            .known_secret_values()
+            .iter()
+            .any(|secret| secret.expose() == KEY)
+    );
+
+    let key_path = dir.join(store::CUSTOM_PROVIDER_KEYS_FILE_NAME);
+    assert_eq!(
+        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::read(dir.join(store::VAULT_FILE_NAME)).unwrap(),
+        credentials
+    );
+
+    let reopened = open();
+    assert_eq!(reopened.custom_provider_key(id).unwrap().expose(), KEY);
+    assert_eq!(
+        reopened
+            .resolve(Slot::Openai)
+            .unwrap()
+            .unwrap()
+            .secret
+            .expose(),
+        VAULT_SECRET
+    );
+
+    reopened.clear_custom_provider_key(id).unwrap();
+    assert!(reopened.custom_provider_key(id).is_none());
+    assert!(!std::fs::read_to_string(&key_path).unwrap().contains(KEY));
+    assert!(open().custom_provider_key(id).is_none());
+
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let error = VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+        .dir(&dir)
+        .open()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("custom-provider-keys.json"),
+        "{error}"
+    );
+}

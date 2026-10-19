@@ -24,10 +24,13 @@
 //! held, so `debug/` is either whole or absent, never half-deleted. The stage
 //! is then removed within a time budget; a later pass finishes any remainder.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use rsi_common::sandbox_storage::{
@@ -107,12 +110,11 @@ pub fn reclaim_shared_debug(
     params: &ReclaimParams,
 ) -> SandboxSharedTargetReclaimV1 {
     let deadline = Instant::now() + params.max_remove_duration;
-    let (mut staged_bytes, mut staged_pending) = (0, false);
-    if !params.dry_run {
-        (staged_bytes, staged_pending) = finish_staged(target_dir, deadline);
+    let (staged_bytes, staged_pending) = if !params.dry_run {
+        finish_staged(target_dir, deadline)
     } else {
-        staged_pending = has_staged(target_dir);
-    }
+        (0, has_staged(target_dir))
+    };
     let mut result = inspect_and_reclaim(target_dir, params, deadline);
     result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(staged_bytes);
     result.staged_pending |= staged_pending;
@@ -208,6 +210,7 @@ fn inspect_and_reclaim(
                 Some(idle),
             );
         }
+        #[cfg(not(target_os = "linux"))]
         Err(ConsumerScanError::Unsupported) => {
             return report(
                 params,
@@ -317,7 +320,7 @@ fn newest_write(debug: &Path, budget: u64) -> Result<SystemTime, &'static str> {
 }
 
 /// Allocated bytes under `path`, stopping after `budget` entries.
-fn measure(path: &Path, budget: u64) -> (u64, bool) {
+pub(crate) fn measure(path: &Path, budget: u64) -> (u64, bool) {
     fn walk(path: &Path, remaining: &mut u64, total: &mut u64) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -382,7 +385,7 @@ fn finish_staged(target_dir: &Path, deadline: Instant) -> (u64, bool) {
 /// Remove `path` without following symlinks, summing allocated bytes of what
 /// was unlinked. Returns `(bytes, complete)`; `complete` is false when the
 /// deadline or an error stopped the removal, leaving the remainder in place.
-fn remove_tree_budgeted(path: &Path, deadline: Instant) -> (u64, bool) {
+pub(crate) fn remove_tree_budgeted(path: &Path, deadline: Instant) -> (u64, bool) {
     use std::os::unix::fs::MetadataExt;
     fn remove(path: &Path, deadline: Instant, bytes: &mut u64, depth: u32) -> bool {
         let Ok(meta) = fs::symlink_metadata(path) else {
@@ -417,18 +420,21 @@ fn remove_tree_budgeted(path: &Path, deadline: Instant) -> (u64, bool) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ConsumerScanError {
+pub(crate) enum ConsumerScanError {
+    /// No process inventory on this platform (non-Linux).
+    #[cfg(not(target_os = "linux"))]
     Unsupported,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Unreadable(u32),
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_live_consumer(_debug: &Path) -> Result<Option<u32>, ConsumerScanError> {
+pub(crate) fn find_live_consumer(_debug: &Path) -> Result<Option<u32>, ConsumerScanError> {
     Err(ConsumerScanError::Unsupported)
 }
 
 #[cfg(target_os = "linux")]
-fn find_live_consumer(debug: &Path) -> Result<Option<u32>, ConsumerScanError> {
+pub(crate) fn find_live_consumer(debug: &Path) -> Result<Option<u32>, ConsumerScanError> {
     scan_processes(Path::new("/proc"), debug)
 }
 
@@ -599,6 +605,7 @@ mod tests {
         params
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn idle_cache_under_pressure_is_removed_and_release_is_untouched() {
@@ -612,6 +619,7 @@ mod tests {
         assert!(dir.path().join("release/deps/rsi").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn without_pressure_the_idle_cache_is_kept() {
@@ -631,6 +639,7 @@ mod tests {
         assert!(dir.path().join("debug/deps/libx.rlib").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn pressure_bypasses_the_ttl_but_without_pressure_it_labels_the_cache_fresh() {
@@ -647,6 +656,7 @@ mod tests {
         assert_eq!(result.min_idle_secs, MIN_IDLE.as_secs());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_held_cargo_lock_keeps_the_cache() {
@@ -739,6 +749,7 @@ mod tests {
         assert!(elsewhere.path().join("keep").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn dry_run_measures_without_changing_anything() {
@@ -760,6 +771,7 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Absent);
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_exhausted_removal_budget_leaves_a_stage_the_next_pass_finishes() {
@@ -789,5 +801,25 @@ mod tests {
         let result = reclaim_shared_debug(dir.path(), &p);
         assert_eq!(result.outcome, Outcome::Unreadable, "{result:?}");
         assert!(dir.path().join("debug/deps/libx.rlib").is_file());
+    }
+
+    /// Off Linux there is no process scan, so an idle cache under pressure is
+    /// reported unsupported and kept, never reclaimed unproven.
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn without_a_process_scan_an_idle_cache_is_kept_as_unsupported() {
+        let dir = target_with_debug();
+        for dry_run in [false, true] {
+            let result = reclaim_shared_debug(dir.path(), &params(5, true, dry_run));
+            assert_eq!(result.outcome, Outcome::Unsupported, "{result:?}");
+            assert_eq!(
+                result.check.as_deref(),
+                Some("process_scan_unsupported"),
+                "{result:?}"
+            );
+            assert_eq!(result.reclaimed_bytes, 0, "{result:?}");
+            assert!(dir.path().join("debug/deps/libx.rlib").is_file());
+        }
     }
 }

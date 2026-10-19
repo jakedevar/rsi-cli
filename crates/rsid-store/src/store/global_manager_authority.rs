@@ -22,12 +22,13 @@
 //! a target checked against the grant.
 
 use rsi_common::global_manager::{GlobalManagerGrantV1, MANAGER_PROJECT_NOT_IN_SCOPE};
-use rsi_common::grant_narrowing::portfolio_effective_launches;
+use rsi_common::grant_narrowing::{intersect_launches, portfolio_effective_launches};
 use rsi_common::harness_manager::{HarnessManagerConfigV1, HarnessManagerScopeModeV1};
 use rsi_common::harness_manager_v2::{
     HarnessManagerPolicyConfigV2, ManagerCapabilityV2, ManagerFenceV2, ManagerLaunchChoiceV2,
     ManagerOperatingModeV2, ManagerPolicyV2,
 };
+use rsi_common::satellite_manager_policy::NO_LAUNCH_CHOICES_HINT;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -402,10 +403,7 @@ impl Store {
             let effective =
                 portfolio_effective_launches(&grant.allowed_launches, &grant.project_policy);
             launches = Some(match launches {
-                Some(current) => current
-                    .into_iter()
-                    .filter(|launch| effective.contains(launch))
-                    .collect(),
+                Some(current) => intersect_launches(&current, &effective),
                 None => effective,
             });
         }
@@ -421,9 +419,15 @@ impl Store {
         launch: &ManagerLaunchChoiceV2,
     ) -> Result<()> {
         let allowed = self.manager_effective_launches(config, own)?;
-        if !allowed.contains(launch) {
+        if !allowed.iter().any(|choice| choice.allows(launch)) {
+            let hint = if allowed.is_empty() && self.portfolio_ancestors_of(config)?.0.is_empty() {
+                // #1941: name the fix; the stable code prefix stays first.
+                format!("; {NO_LAUNCH_CHOICES_HINT}")
+            } else {
+                String::new()
+            };
             return Err(refused(&format!(
-                "manager_v2_launch_not_granted: allowed_launches={}",
+                "manager_v2_launch_not_granted: allowed_launches={}{hint}",
                 serde_json::to_string(&allowed)?
             )));
         }
@@ -473,11 +477,7 @@ impl Store {
             let granted =
                 portfolio_effective_launches(&grant.allowed_launches, &grant.project_policy)
                     .iter()
-                    .any(|l| {
-                        l.provider == launch.provider
-                            && l.model == launch.model
-                            && l.effort == launch.effort
-                    });
+                    .any(|choice| choice.allows(launch));
             if !granted {
                 return Err(refused("manager_v2_launch_not_granted"));
             }

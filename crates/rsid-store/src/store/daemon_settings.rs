@@ -878,6 +878,11 @@ fn daemon_setting_text_to_json(field: &str, raw: &str) -> serde_json::Value {
         | "prompt_compile_model_provider"
         | "codex_sandbox_mode"
         | "claude_config_isolation"
+        | "codex_config_isolation"
+        | "claude_subagent_model"
+        | "codex_subagent_model"
+        | "claude_fallback_models"
+        | "provider_skill_delivery"
         | "system_prompt_preset"
         | "editing_mode"
         | "stall_classifier_model"
@@ -911,6 +916,9 @@ pub fn persist_runtime_config_field(
     };
     let text = daemon_setting_json_to_text(&value);
     store.set_daemon_setting(field, &text)?;
+    if let Some(alias) = crate::config::bedrock_fallback_alias(field) {
+        store.set_daemon_setting(alias, &text)?;
+    }
     Ok(true)
 }
 
@@ -925,7 +933,11 @@ pub fn persist_runtime_config_value(
     if !crate::config::is_persisted_runtime_config_field(field) {
         return Ok(false);
     }
-    store.set_daemon_setting(field, &daemon_setting_json_to_text(value))?;
+    let text = daemon_setting_json_to_text(value);
+    store.set_daemon_setting(field, &text)?;
+    if let Some(alias) = crate::config::bedrock_fallback_alias(field) {
+        store.set_daemon_setting(alias, &text)?;
+    }
     Ok(true)
 }
 
@@ -975,6 +987,97 @@ pub fn persist_sandbox_build_cache_config_update(
     }
     tx.commit()?;
     Ok(true)
+}
+
+/// The durable value of one 69A field in `config`, in the form the single
+/// field RPC persists it.
+fn sandbox_build_cache_field_value(
+    field: &str,
+    config: &rsi_common::sandbox_storage::SandboxBuildCacheReclaimConfig,
+) -> Option<serde_json::Value> {
+    Some(match field {
+        "sandbox_build_cache_reclaim_enabled" => serde_json::json!(config.enabled),
+        "sandbox_build_cache_reclaim_ttl_secs" => serde_json::json!(config.ttl_secs),
+        "sandbox_build_cache_reclaim_interval_secs" => {
+            serde_json::json!(config.interval_secs)
+        }
+        "sandbox_build_cache_reclaim_high_watermark_pct" => {
+            serde_json::json!(config.high_watermark_pct)
+        }
+        "sandbox_build_cache_reclaim_low_watermark_pct" => {
+            serde_json::json!(config.low_watermark_pct)
+        }
+        "sandbox_build_cache_reclaim_max_candidates" => {
+            serde_json::json!(config.max_candidates)
+        }
+        _ => return None,
+    })
+}
+
+/// The rows a batch of 69A updates writes: every named field with its value in
+/// the final `config`. The watermarks are one invariant-bearing pair, so naming
+/// either writes both (as [`persist_sandbox_build_cache_config_update`] does).
+#[must_use]
+pub fn sandbox_build_cache_batch_rows(
+    fields: &[&str],
+    config: &rsi_common::sandbox_storage::SandboxBuildCacheReclaimConfig,
+) -> Vec<(String, serde_json::Value)> {
+    const HIGH: &str = "sandbox_build_cache_reclaim_high_watermark_pct";
+    const LOW: &str = "sandbox_build_cache_reclaim_low_watermark_pct";
+    let mut named: Vec<&str> = fields.to_vec();
+    if named.iter().any(|field| *field == HIGH || *field == LOW) {
+        for pair in [HIGH, LOW] {
+            if !named.contains(&pair) {
+                named.push(pair);
+            }
+        }
+    }
+    named
+        .into_iter()
+        .filter_map(|field| {
+            sandbox_build_cache_field_value(field, config).map(|value| (field.to_string(), value))
+        })
+        .collect()
+}
+
+/// Persist a batch of already validated canonical values in ONE transaction:
+/// either every durable row lands or none does. A field that is runtime-only
+/// (not durable) is skipped. Returns the number of rows written.
+///
+/// # Errors
+/// Returns the store error of the first failing write; the transaction is
+/// rolled back on drop.
+pub fn persist_runtime_config_batch(
+    store: &Store,
+    rows: &[(String, serde_json::Value)],
+) -> Result<usize> {
+    let tx = store.conn.unchecked_transaction()?;
+    let updated_at = now_nanos();
+    let mut written = 0usize;
+    for (field, value) in rows {
+        if !crate::config::is_persisted_runtime_config_field(field) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO daemon_settings (key, value, updated_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                                            updated_at = excluded.updated_at",
+            params![field, daemon_setting_json_to_text(value), updated_at],
+        )?;
+        written += 1;
+        if let Some(alias) = crate::config::bedrock_fallback_alias(field) {
+            tx.execute(
+                "INSERT INTO daemon_settings (key, value, updated_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                                                updated_at = excluded.updated_at",
+                params![alias, daemon_setting_json_to_text(value), updated_at],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(written)
 }
 
 /// Replay a memory high/max pair together so either legitimate update order
@@ -1298,7 +1401,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_store(dir: &std::path::Path) -> Store {
-        Store::open(&dir.join("rsi.db")).expect("Store::open")
+        Store::open_test_fixture(&dir.join("rsi.db")).expect("Store::open")
     }
 
     #[allow(clippy::unwrap_used)]

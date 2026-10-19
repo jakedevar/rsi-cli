@@ -6,7 +6,8 @@ use super::{JOB_TIMEOUT_UNIT_GRACE_SECS, JobCommand, JobTools, MIB, s};
 use crate::error::{DaemonError, Result};
 use rsi_common::agent_jobs::{
     JOB_INVALID_PARAMS, JOB_MAX_TOKEN_BYTES, JOB_RECIPE_INVALID, JOB_RECIPE_NOT_ALLOWED,
-    JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMEOUT_MIN_MINS, TestJobParams,
+    JOB_RECIPE_USE_SCOPED_TEST, JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMEOUT_MIN_MINS,
+    TestJobParams,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -95,6 +96,23 @@ fn load(cwd: &Path) -> Result<Manifest> {
     Ok(manifest)
 }
 
+fn declared_recipe(cwd: &Path, name: &str) -> Result<Recipe> {
+    let retired = |value: &str| matches!(value, "scoped-test" | "scoped-test-tmpfs");
+    // Refuse even in a stale sandbox with the old declarations, or no manifest.
+    // Aliases targeting the same gate must also use the rolling-tool job path.
+    if retired(name) {
+        return Err(DaemonError::InvalidParam(JOB_RECIPE_USE_SCOPED_TEST.into()));
+    }
+    let recipe = load(cwd)?
+        .recipes
+        .remove(name)
+        .ok_or_else(|| DaemonError::InvalidParam(JOB_RECIPE_NOT_ALLOWED.into()))?;
+    if retired(&recipe.target) {
+        return Err(DaemonError::InvalidParam(JOB_RECIPE_USE_SCOPED_TEST.into()));
+    }
+    Ok(recipe)
+}
+
 /// The operator's default timeout is stamped before the manifest is read, so a
 /// recipe that declares less than that default would be refused for a request
 /// that named no timeout. Clamp the stored timeout to the declaration (never
@@ -110,20 +128,19 @@ pub(super) fn fit_timeout(
     let Some(name) = test.recipe.as_ref() else {
         return Ok(());
     };
-    let manifest = load(cwd)?;
-    if let (Some(recipe), Some(minutes)) = (manifest.recipes.get(name), test.timeout_minutes) {
+    let recipe = declared_recipe(cwd, name)?;
+    if let Some(minutes) = test.timeout_minutes {
         test.timeout_minutes = Some(minutes.min(recipe.timeout_minutes));
     }
     Ok(())
 }
 
 pub(super) fn command(tools: &JobTools, test: &TestJobParams, cwd: &Path) -> Result<JobCommand> {
-    let manifest = load(cwd)?;
-    let recipe = test
+    let name = test
         .recipe
-        .as_ref()
-        .and_then(|name| manifest.recipes.get(name))
+        .as_deref()
         .ok_or_else(|| DaemonError::InvalidParam(JOB_RECIPE_NOT_ALLOWED.into()))?;
+    let recipe = declared_recipe(cwd, name)?;
     let timeout_minutes = test.timeout_minutes.unwrap_or(recipe.timeout_minutes);
     if timeout_minutes > recipe.timeout_minutes {
         return Err(DaemonError::InvalidParam(JOB_INVALID_PARAMS.into()));
@@ -157,11 +174,15 @@ pub(super) fn command(tools: &JobTools, test: &TestJobParams, cwd: &Path) -> Res
     argv.extend([s("--"), recipe.target.clone()]);
     Ok(JobCommand {
         argv,
-        runtime_max_secs: u64::from(timeout_minutes) * 60 + JOB_TIMEOUT_UNIT_GRACE_SECS,
+        runtime_max_secs: u64::from(timeout_minutes) * 60
+            + JOB_TIMEOUT_UNIT_GRACE_SECS
+            + super::JOB_SLOT_WAIT_ALLOWANCE_SECS,
         stop_timeout_secs: 60,
         log_max_bytes: 64 * MIB,
         memory_max_gib: 24,
         cpu_quota_percent: recipe.cpu_quota_percent,
+        background: false,
+        admission_max_secs: None,
     })
 }
 
@@ -227,7 +248,10 @@ mod tests {
                     s("check-cpu")
                 ]
             );
-            assert_eq!(result.runtime_max_secs, 600 + JOB_TIMEOUT_UNIT_GRACE_SECS);
+            assert_eq!(
+                result.runtime_max_secs,
+                600 + JOB_TIMEOUT_UNIT_GRACE_SECS + super::super::JOB_SLOT_WAIT_ALLOWANCE_SECS
+            );
             assert_eq!(result.cpu_quota_percent, 200);
             assert_eq!(result.memory_max_gib, 24);
             let mut too_long = test_params();
@@ -278,6 +302,48 @@ mod tests {
             refusal(command(&tools, &missing, dir.path()).unwrap_err()),
             JOB_RECIPE_NOT_ALLOWED
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_test_recipes_and_target_aliases_direct_callers_to_scoped_test() {
+        let dir = crate::test_support::disk_backed_tempdir("recipe-retired-scoped-test");
+        let tools = JobTools {
+            cargo_slot: "slot".into(),
+            lander: "lander".into(),
+        };
+        for target in ["scoped-test", "scoped-test-tmpfs"] {
+            let mut test = test_params();
+            test.recipe = Some(target.into());
+            // No manifest still gives the migration hint, rather than a hint
+            // to declare a recipe that would run a stale verification tool.
+            assert_eq!(
+                refusal(command(&tools, &test, dir.path()).unwrap_err()),
+                JOB_RECIPE_USE_SCOPED_TEST
+            );
+            for runner in ["make", "just"] {
+                let stale = manifest(runner).replace("check-cpu", target);
+                write_manifest(dir.path(), &stale);
+                for name in [target, "verify"] {
+                    write_manifest(
+                        dir.path(),
+                        &stale
+                            .replace(&format!("[recipes.{target}]"), &format!("[recipes.{name}]")),
+                    );
+                    test.recipe = Some(name.into());
+                    assert_eq!(
+                        refusal(command(&tools, &test, dir.path()).unwrap_err()),
+                        JOB_RECIPE_USE_SCOPED_TEST
+                    );
+                    let mut params = JobParams::Test(test.clone());
+                    assert_eq!(
+                        refusal(fit_timeout(&mut params, dir.path()).unwrap_err()),
+                        JOB_RECIPE_USE_SCOPED_TEST
+                    );
+                }
+            }
+            std::fs::remove_file(dir.path().join(".rsi/jobs.toml")).unwrap();
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

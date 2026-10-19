@@ -16,7 +16,8 @@
 /// When a persisted daemon field's new value takes effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyClass {
-    /// Read at use time; applies immediately.
+    /// Read at use time; takes effect as soon as the change is applied (the
+    /// Settings page applies on `w`), with no restart.
     Live,
     /// Read when a provider process is spawned.
     NextSpawn,
@@ -35,7 +36,7 @@ impl ApplyClass {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Live => "immediately",
+            Self::Live => "when applied · no restart",
             Self::NextSpawn => "next spawn",
             Self::PartialLive => "new launches now · resumed sessions after restart",
             Self::LiveOffRestartOn => "off now · on after restart",
@@ -80,11 +81,9 @@ const fn page(field: &'static str, apply: ApplyClass) -> DaemonFieldSpec {
     }
 }
 
-/// Builds a `NoTuiEditor` entry. Currently unused (slice (c) wired the last
-/// two gap fields, `gv_render_recursive_origin`/`gv_info_dashboard`, onto
-/// real settings rows) but kept for the next Issue #35 gap, so a future entry
-/// doesn't have to reintroduce this constructor from scratch.
-#[allow(dead_code)]
+/// Builds a `NoTuiEditor` entry: a persisted field with no settings row.
+/// (Slice (c) of Issue #35 wired its last two gap fields onto rows; #2236 made
+/// `retry_max_default` a field that has none.)
 const fn no_tui_editor(
     field: &'static str,
     apply: ApplyClass,
@@ -116,7 +115,16 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // returns 0 for every SessionKind, and `effective_default` (:28-34) reads
     // this field and discards it. Default launches get zero automatic retries
     // unless the launch carries an explicit retry policy (fail-closed; kept).
-    page("retry_max_default", ApplyClass::NotApplied),
+    // #2236: the settings row is gone (it only showed a stored number nothing
+    // reads for launches). The key survives as the boot seed of the retry
+    // kill-switch (`RSI_RETRY_MAX_DEFAULT` > 0 turns `retry_enabled` on) and a
+    // nonzero write still re-enables `retry_enabled`.
+    no_tui_editor(
+        "retry_max_default",
+        ApplyClass::NotApplied,
+        "`RSI_RETRY_MAX_DEFAULT` at daemon start, or `UpdateDaemonConfig`; stored, not applied to default launches (only seeds the retry kill-switch)",
+        "#2236",
+    ),
     // The subscriber stays alive; runtime retry_on_stall gates each event.
     page("retry_on_stall", LIVE),
     // rsid session/lifecycle.rs:4206 loads the atomic per backoff.
@@ -175,6 +183,13 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("codex_sandbox_mode", NextSpawn),
     // S-049 (rsid claude.rs:484).
     page("claude_config_isolation", NextSpawn),
+    // #2760 (rsid codex.rs, read per spawn).
+    page("codex_config_isolation", NextSpawn),
+    // hub #2765: the Claude and Codex CLI launches read it per spawn.
+    page("provider_launch_overrides", NextSpawn),
+    // #2762 (rsid claude.rs, read per Claude CLI spawn).
+    page("claude_fallback_models", NextSpawn),
+    page("claude_max_budget_usd", NextSpawn),
     // The TUI updates its cache after save and includes the preset in launches.
     page("system_prompt_preset", NextSpawn),
     // #1626: the TUI reads it from GetDaemonConfig when a `project_created`
@@ -201,7 +216,7 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("recursive_dag_max_concurrent_graphs", LIVE),
     // Graph view capabilities: rsid rpc.rs:7254 reads them per capability
     // request. The graph overlay only reads them, but slice (c) adds a real
-    // settings row (AGENT AUTOMATION > Orchestration) that writes them via
+    // settings row (PROVIDERS & SANDBOXES > API Routes / Harness Tools) that writes them via
     // `update_daemon_config` (confirmed validating `RuntimeConfig::update_field`
     // arms at rsid config.rs:1148 and :1153).
     page("gv_render_recursive_origin", LIVE),
@@ -241,15 +256,59 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("sandbox_build_cache_reclaim_max_candidates", LIVE),
     page("sandbox_max_source_roots", LIVE),
     page("sandbox_min_free_gib", LIVE),
+    // Issue #2384: the cold-archive loop reads the toggle at every 10-minute tick,
+    // and the age and directory at the start of each pass (rsid
+    // session/cold_archive.rs).
+    page("cold_archive_enabled", LIVE),
+    page("cold_archive_after_days", LIVE),
+    // The settings row opens a text editor overlay (#2438).
+    page("cold_archive_dir", LIVE),
+    // Issue #1882: read when a seed starts a pool build and on every reclaim pass.
+    page("target_pool_keep", LIVE),
     // Issue #955: the purge worker reads the toggle at every 10-minute tick.
     page("archived_sandbox_purge_enabled", LIVE),
+    // Settlement reads both at each tick, before intent and before removal.
+    page("source_worktree_auto_settlement_enabled", LIVE),
+    page("disk_pressure_min_free_gb", LIVE),
     // Issue #1007: the queue runner reads the toggle at every tick; batch size
-    // and speculation depth are read when a batch is formed.
+    // is read when a batch is formed. (#2236: the speculation-depth setting is
+    // gone; no queue code read it.)
     page("rolling_queue_enabled", LIVE),
     page("rolling_queue_batch_size", LIVE),
-    page("rolling_queue_speculation_depth", LIVE),
     // Issue #1208: read when a batch is claimed (its gate deadline).
     page("rolling_queue_gate_timeout_mins", LIVE),
+    // Issue #2112: the full-library QA task reads it before each dispatch.
+    page("rolling_queue_full_qa_interval_mins", LIVE),
+    // Issue #2509: the job launcher reads the QA target size cap at each
+    // full-library QA start.
+    page("qa_target_max_gib", LIVE),
+    // Issue #2752: the Codex live-catalog cache reads its TTL at each lookup.
+    page("codex_live_catalog_ttl_secs", LIVE),
+    // Issue #2757: the Codex plan-window poll loop reads its interval each cycle.
+    page("codex_rate_limit_poll_secs", LIVE),
+    // Issue #2763: each Claude/Codex spawn reads the subagent model and cap.
+    page("claude_subagent_model", NextSpawn),
+    page("claude_max_concurrent_subagents", NextSpawn),
+    page("codex_subagent_model", NextSpawn),
+    page("codex_max_concurrent_subagents", NextSpawn),
+    // Issue #2766: a Claude or Codex launch reads the lifecycle hook set.
+    page("provider_lifecycle_hooks", NextSpawn),
+    // Issue #2767: a Claude or Codex launch reads how its skills are delivered.
+    page("provider_skill_delivery", NextSpawn),
+    // Issue #2755: the canary reads its switch at each run and the launch
+    // refusal reads its switch at each Codex launch.
+    page("provider_contract_canary", LIVE),
+    page("codex_refuse_untrusted_custody_hook", LIVE),
+    // Issue #2759: the topology executor reads it when it opens a node's
+    // handoff turn.
+    page("structured_handoff_default", LIVE),
+    // Issue #2524: the job launcher reads the thermal ceiling at each job start.
+    page("job_thermal_ceiling_c", LIVE),
+    // Issue #2747: the scheduler reads the health thresholds at each
+    // `when.health_anomaly` evaluation.
+    page("health_disk_used_pct", LIVE),
+    page("health_thermal_c", LIVE),
+    page("health_stuck_minutes", LIVE),
     // Issue #1337: AgentSubmitJob reads the test-job timeout default at each
     // submit; the CPU-time andon reads its two thresholds at every sample.
     page("job_test_timeout_mins", LIVE),
@@ -260,8 +319,22 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("deploy_drain_enabled", LIVE),
     // Issue #1320/#1311: the deploy loop reads the hold cap at every 5 s poll.
     page("deploy_drain_hold_secs", LIVE),
+    // Issue #1777: every deploy request and quiet-point restart reads the
+    // budget (the deploy loop refreshes it every 5 s poll).
+    page("deploy_restarts_per_hour", LIVE),
+    // Issue #2561: the supervisor re-reads the published grace period when a
+    // daemon shutdown begins (the snapshot is rewritten on every accepted change).
+    page("supervisor_shutdown_grace_secs", LIVE),
     // Issue #1417: every manager create_session admission reads the threshold.
     page("host_load_admission_threshold", LIVE),
+    // Issue #1992: each worker scope reads the quota when it is created.
+    page("worker_cpu_quota_percent", LIVE),
+    // Issue #2119: the daemon rewrites rsi-build.slice's CPUQuota on every
+    // accepted change; job launchers read the share for their own ceilings.
+    page("hub_build_cpu_percent", LIVE),
+    // Issue #2373: the event writer reads the cap for every ToolResult it
+    // stores; rows already stored keep the body they have.
+    page("tool_result_storage_cap_kib", LIVE),
     // Issue #794 S3: the scheduler reads these settings on every tick.
     page("program_hold_while_children_run", LIVE),
     page("child_keepalive_enabled", LIVE),
@@ -269,6 +342,7 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // #1014: rsid governor.rs reads the policy per admission.
     page("governor_build_slots", LIVE),
     page("governor_lander_slots", LIVE),
+    page("governor_check_slots", LIVE),
     page("governor_max_load", LIVE),
     page("governor_min_free_disk_gb", LIVE),
     page("governor_min_avail_mem_gb", LIVE),
@@ -277,6 +351,11 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // at launch), so a change reaches the next Harness launch.
     page("harness_web_access", NextSpawn),
     page("harness_egress_mode", NextSpawn),
+    // Issue #2251: read when a Harness session launches (it decides whether
+    // the native `web_search` tool is advertised).
+    page("harness_web_search_backend", NextSpawn),
+    // Issue #2315: the SearXNG base URL, read at the same launch.
+    page("harness_searxng_url", NextSpawn),
     // #1111: the Harness context-editing default, read at launch.
     page("harness_context_editing", NextSpawn),
     page("harness_max_search_calls", NextSpawn),
@@ -311,7 +390,16 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // #694: dispatch reads these when a provider session starts.
     page("api_route.openrouter", NextSpawn),
     page("api_route.bedrock", NextSpawn),
-    page("api_route.fallback", NextSpawn),
+    // #3141: one opt-in per provider. The legacy `api_route.fallback` is kept
+    // as an alias of the Bedrock value only (it has no row of its own).
+    no_tui_editor(
+        "api_route.fallback",
+        NextSpawn,
+        "`UpdateDaemonConfig` (legacy alias of `api_route.fallback.bedrock`; never touches OpenRouter); the Bedrock fallback row is the editor",
+        "#3141",
+    ),
+    page("api_route.fallback.openrouter", NextSpawn),
+    page("api_route.fallback.bedrock", NextSpawn),
     // #966: the Codex CLI launch and the Harness launch read it per turn.
     page("openrouter_context_budget_tokens", NextSpawn),
     // #1050: the Harness turn reads the iteration cap when it starts.

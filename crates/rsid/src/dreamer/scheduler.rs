@@ -255,6 +255,7 @@ pub fn spawn_dreamer_with_model_control_runtime(
     )
 }
 
+#[cfg(test)]
 fn spawn_dreamer_with_clock(
     store: Arc<Mutex<Store>>,
     event_bus: Arc<EventBus>,
@@ -2209,15 +2210,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dream_respects_idle_window_before_auto_run() {
         let store = store();
+        let now = Utc::now();
         insert_explicit_observation(&store, "fact one").await;
         {
             let guard = store.lock().await;
             guard
-                .insert_session(&test_session(SessionStatus::Completed, Utc::now()))
+                .insert_session(&test_session(SessionStatus::Completed, now))
                 .unwrap();
         }
         let backend = FakeDreamBackend::with_steps([BackendStep::Return(Ok(String::new()))]);
-        let (clock, control) = DreamClock::manual(Utc::now());
+        let (clock, control) = DreamClock::manual(now);
         let handle = spawn_dreamer_with_clock(
             Arc::clone(&store),
             Arc::new(EventBus::new(16)),
@@ -2228,9 +2230,9 @@ mod tests {
             clock,
         );
 
-        drive_scheduler(&handle, &control, 400).await;
+        drive_scheduler(&handle, &control, 999).await;
         assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
-        drive_scheduler(&handle, &control, 1500).await;
+        drive_scheduler(&handle, &control, 1).await;
         drive_until(&handle, &control, || {
             let store = Arc::clone(&store);
             async move {
@@ -2240,6 +2242,122 @@ mod tests {
         })
         .await;
         assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dream_control_tick_sqlite_work_is_independent_of_session_history() {
+        use std::sync::atomic::AtomicU64;
+
+        let mut measurements = Vec::new();
+        for history in [10, 10_000] {
+            let store = store();
+            {
+                let guard = store.lock().await;
+                guard
+                    .conn
+                    .execute(
+                        "WITH RECURSIVE history(n) AS (
+                        SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n < ?1
+                     ) INSERT INTO sessions (id, query, working_dir, status, created_at, updated_at)
+                       SELECT printf('00000000-0000-4000-8000-%012d', n),
+                              printf('%1024s', 'history'), '/tmp', 'Archived',
+                              '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z'
+                       FROM history",
+                        [history],
+                    )
+                    .unwrap();
+            }
+            let active = Arc::new(RwLock::new(HashMap::new()));
+            let runtime = runtime_config(true);
+            let llm = local_llm(&store, FakeDreamBackend::with_steps([]));
+            let (clock, _) = DreamClock::manual(Utc::now());
+            let steps = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&steps);
+            store.lock().await.conn.progress_handler(
+                1,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            // Include the one-time seed separately to prove the meter detects
+            // a historical scan, rather than merely counting statements.
+            compute_control_state(&store, &active, &runtime, &llm, &clock)
+                .await
+                .unwrap();
+            let seed = steps.swap(0, Ordering::Relaxed);
+            let mut ticks = Vec::new();
+            for foreground in [false, true] {
+                if foreground {
+                    active
+                        .write()
+                        .await
+                        .insert(Uuid::new_v4(), tracked_session(clock.now()));
+                }
+                for _ in 0..4 {
+                    let control = compute_control_state(&store, &active, &runtime, &llm, &clock)
+                        .await
+                        .unwrap();
+                    ticks.push(steps.swap(0, Ordering::Relaxed));
+                    assert_eq!(control.has_active_foreground, foreground);
+                    assert_eq!(
+                        control.idle_blocked_until,
+                        Some(
+                            DateTime::parse_from_rfc3339("2000-01-01T00:00:01Z")
+                                .unwrap()
+                                .with_timezone(&Utc)
+                        )
+                    );
+                }
+            }
+            // Unrelated writes leave the cache warm; one real session write
+            // costs one rowid lookup, regardless of archived session count.
+            {
+                let guard = store.lock().await;
+                guard.set_dream_state("cost_test", "changed").unwrap();
+            }
+            steps.store(0, Ordering::Relaxed);
+            compute_control_state(&store, &active, &runtime, &llm, &clock)
+                .await
+                .unwrap();
+            ticks.push(steps.swap(0, Ordering::Relaxed));
+            {
+                let guard = store.lock().await;
+                guard
+                    .update_session_title(
+                        Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+                        "activity",
+                    )
+                    .unwrap();
+            }
+            steps.store(0, Ordering::Relaxed);
+            let control = compute_control_state(&store, &active, &runtime, &llm, &clock)
+                .await
+                .unwrap();
+            let changed_tick = steps.swap(0, Ordering::Relaxed);
+            assert!(control.idle_blocked_until.unwrap() > clock.now());
+            runtime.dream_enabled.store(false, Ordering::Relaxed);
+            let control = compute_control_state(&store, &active, &runtime, &llm, &clock)
+                .await
+                .unwrap();
+            ticks.push(steps.swap(0, Ordering::Relaxed));
+            assert!(!control.enabled);
+            store
+                .lock()
+                .await
+                .conn
+                .progress_handler(1, None::<fn() -> bool>);
+            assert!(ticks.iter().all(|&work| work > 0 && work < 100));
+            assert!(changed_tick < 150);
+            eprintln!(
+                "Dream history={history}: seed={seed}, ticks={ticks:?}, changed_tick={changed_tick}"
+            );
+            measurements.push((seed, ticks, changed_tick));
+        }
+        assert!(measurements[1].0 > measurements[0].0 * 100);
+        assert_eq!(measurements[0].1, measurements[1].1);
+        assert_eq!(measurements[0].2, measurements[1].2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

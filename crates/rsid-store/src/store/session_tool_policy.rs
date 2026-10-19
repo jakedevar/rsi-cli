@@ -14,6 +14,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
 // The provisional number is assigned at landing.
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: session-tool-policy-migration
 /// Provisional schema version of the tool-policy catalog.
 pub(crate) const SESSION_TOOL_POLICY_SCHEMA_VERSION: i32 = 143;

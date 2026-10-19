@@ -76,6 +76,30 @@ pub(crate) fn digest(text: &str) -> String {
     )
 }
 
+/// The text a topology definition is stored as: keys sorted recursively (node
+/// `params` is a `HashMap`, so the struct's own serialization order varies per
+/// call). The one text every topology digest is taken over (#2693).
+pub(crate) fn canonical_definition_text(
+    definition: &rsi_common::types::TopologyDefinition,
+) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::to_value(definition)?)?)
+}
+
+/// The one digest of a topology definition, however its object keys were
+/// ordered when the text was written: `validate_only`, the stored
+/// `definition_digest`, `expected_digest`, `starter_drift.shipped_digest` and
+/// the `SHIPPED_BEFORE` pins all use it (#2693). Text this build cannot read as
+/// a definition falls back to the digest of the text itself.
+pub(crate) fn definition_digest(text: &str) -> String {
+    canonical_digest(text).unwrap_or_else(|| digest(text))
+}
+
+/// [`definition_digest`], `None` when the text is not a definition.
+pub(crate) fn canonical_digest(text: &str) -> Option<String> {
+    let definition: rsi_common::types::TopologyDefinition = serde_json::from_str(text).ok()?;
+    Some(digest(&canonical_definition_text(&definition).ok()?))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionStatus {
     Accepted,
@@ -229,6 +253,11 @@ pub(crate) mod failure {
     /// The review service could not give a usable verdict; one new
     /// assignment is tried, then the node blocks.
     pub(crate) const REVIEW_UNSETTLED: &str = "review_unsettled";
+    /// The reviewer reported that a check it needed could not run (no build
+    /// slot, a missing runner): no verdict on the code (#2570). An
+    /// infrastructure loss, retried with a fresh review and never charged
+    /// against the execution's attempt cap or the review's `max_rounds`.
+    pub(crate) const REVIEW_INFRASTRUCTURE: &str = "review_infrastructure";
     /// The review node reached `max_rounds` (or its loop bound) with changes
     /// still requested.
     pub(crate) const REVIEW_ROUNDS_EXHAUSTED: &str = "review_rounds_exhausted";
@@ -248,13 +277,25 @@ pub(crate) mod failure {
     pub(crate) const LAND_REFUSED: &str = "land_refused";
     /// The operator disabled the merge queue; visible, nothing was enqueued.
     pub(crate) const QUEUE_DISABLED: &str = "queue_disabled";
+    /// A land admitted by a verified session found a migration in its source:
+    /// AGENTS.md reserves pre-land review for those, so nothing is enqueued
+    /// (#2249). Relaunch through a topology with a review node.
+    pub(crate) const LAND_REQUIRES_REVIEW: &str = "land_requires_review";
+    /// A `require_verified` session finished its handoff, but the daemon found
+    /// no terminal `scoped_test` job of its own whose receipt verifies the
+    /// result commit (#2249). Routable by a `failure` edge; never retried.
+    pub(crate) const VERIFICATION_FAILED: &str = "verification_failed";
     /// Every incoming edge of the node was untaken.
     pub(crate) const DEAD_PATH: &str = "dead_path";
 
     /// Losses that are not the node's fault: bounded per instance, never
     /// charged against the execution's attempt cap.
-    pub(crate) const INFRASTRUCTURE: [&str; 3] =
-        [LOST_BEFORE_SESSION, LOST_AFTER_SESSION, INTERRUPTED];
+    pub(crate) const INFRASTRUCTURE: [&str; 4] = [
+        LOST_BEFORE_SESSION,
+        LOST_AFTER_SESSION,
+        INTERRUPTED,
+        REVIEW_INFRASTRUCTURE,
+    ];
 
     pub(crate) fn is_infrastructure(class: Option<&str>) -> bool {
         class.is_some_and(|class| INFRASTRUCTURE.contains(&class))
@@ -826,6 +867,23 @@ pub(crate) fn load_attempts(store: &Store, execution_id: Uuid) -> Result<Vec<Att
     Ok(attempts)
 }
 
+/// When an attempt settled (`finished_at`), for the backoff before an
+/// automatic retry (#2280).
+pub(crate) fn attempt_finished_at(
+    store: &Store,
+    attempt_id: Uuid,
+) -> Result<Option<DateTime<Utc>>> {
+    let finished: Option<Option<String>> = store
+        .conn
+        .query_row(
+            "SELECT finished_at FROM topology_node_attempts WHERE id=?1",
+            [attempt_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    finished.flatten().as_deref().map(parse_time).transpose()
+}
+
 pub(crate) fn load_attempt(store: &Store, attempt_id: Uuid) -> Result<Option<(Uuid, AttemptRow)>> {
     let mut statement = store.conn.prepare(&format!(
         "SELECT {ATTEMPT_COLUMNS},execution_id FROM topology_node_attempts WHERE id=?1"
@@ -974,13 +1032,14 @@ fn insert_attempts<'a>(
 ) -> Result<Vec<GraphExecutionUpdate>> {
     let (status, stored_cap, definition, existing): (String, u32, String, i64) = tx.query_row(
         "SELECT status,max_node_attempts,definition_json,(SELECT count(*) FROM topology_node_attempts \
-            WHERE execution_id=?1 AND (failure_class IS NULL OR failure_class NOT IN (?2,?3,?4))) \
+            WHERE execution_id=?1 AND (failure_class IS NULL OR failure_class NOT IN (?2,?3,?4,?5))) \
          FROM topology_executions WHERE id=?1",
         params![
             execution_id.to_string(),
             failure::INFRASTRUCTURE[0],
             failure::INFRASTRUCTURE[1],
             failure::INFRASTRUCTURE[2],
+            failure::INFRASTRUCTURE[3],
         ],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
@@ -1140,6 +1199,105 @@ pub(crate) fn note_admission_hold(
     )?;
     tx.commit()?;
     Ok(Some(update))
+}
+
+/// #2260: record what a published land did to its input Issue: one
+/// `topology_landed` event when this execution closed it, one
+/// `issue_close_refused` when the owner could not. At most one event of a
+/// `kind` per attempt (`None` when it already exists), so the close re-run
+/// after a crash between the Issue write and the land's settlement writes no
+/// second note.
+pub(crate) fn note_land_issue(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    owner: Option<Uuid>,
+    kind: &str,
+    detail: Value,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    let noted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM topology_events WHERE attempt_id=?1 AND kind=?2)",
+        params![attempt.id.to_string(), kind],
+        |row| row.get(0),
+    )?;
+    if noted {
+        return Ok(None);
+    }
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            detail,
+            actor_session_id: owner,
+            ..EventSpec::execution(kind)
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
+/// #3036: the event a land attempt refused `queue_batch_merge_conflict`
+/// records when it waits for conflicting queue entries ahead of it.
+pub(crate) const LAND_CONFLICT_WAIT: &str = "land_conflict_wait";
+
+/// #3036: record that the land attempt waits for queue entries `waiting_for`
+/// to settle before it settles its refusal. At most one per attempt (written
+/// through [`note_land_issue`]'s once-per-kind rule), so the scan that chose
+/// them runs once and a restart reads the same set back.
+pub(crate) fn note_land_conflict_wait(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    entry_id: Uuid,
+    waiting_for: &[Uuid],
+) -> Result<Option<GraphExecutionUpdate>> {
+    note_land_issue(
+        store,
+        execution_id,
+        attempt,
+        None,
+        LAND_CONFLICT_WAIT,
+        serde_json::json!({
+            "node_id": attempt.node_id,
+            "iteration": attempt.iteration,
+            "attempt_no": attempt.attempt_no,
+            "entry_id": entry_id,
+            "waiting_for": waiting_for,
+        }),
+    )
+}
+
+/// #3036: the queue entries the attempt's `land_conflict_wait` event names,
+/// or `None` when it recorded no wait.
+pub(crate) fn land_conflict_wait(store: &Store, attempt_id: Uuid) -> Result<Option<Vec<Uuid>>> {
+    let payload: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM topology_events WHERE attempt_id=?1 AND kind=?2 \
+             ORDER BY execution_seq LIMIT 1",
+            params![attempt_id.to_string(), LAND_CONFLICT_WAIT],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    // An unreadable record holds nothing: the refusal settles.
+    let payload: Value = serde_json::from_str(&payload).unwrap_or_default();
+    let entries = payload["detail"]["waiting_for"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(entries))
 }
 
 pub(crate) fn mark_running(
@@ -1841,6 +1999,10 @@ pub(crate) struct ResolutionWrite<'a> {
     pub(crate) failure_class: Option<&'static str>,
     pub(crate) result_commit: Option<String>,
     pub(crate) pin_ref: Option<String>,
+    /// A ruled review attempt (#2280): the typed review output the edges read.
+    pub(crate) output: Option<Value>,
+    /// A ruled review attempt (#2280): the assignment the ruling admits.
+    pub(crate) review_assignment: Option<Uuid>,
     pub(crate) retry: Option<NewAttempt>,
     pub(crate) event_kind: &'a str,
     pub(crate) detail: Value,
@@ -1947,10 +2109,21 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
         ));
     }
     let now = now_text();
+    let output = write.output.as_ref().map(Value::to_string);
+    if output
+        .as_ref()
+        .is_some_and(|text| text.len() > OUTPUT_INLINE_LIMIT)
+    {
+        return Err(DaemonError::Store(
+            "topology output exceeds the inline limit".into(),
+        ));
+    }
     let changed = tx.execute(
         "UPDATE topology_node_attempts SET status=?2,resolution=COALESCE(?3,resolution),failure_class=COALESCE(?4,failure_class),\
             result_commit=COALESCE(?5,result_commit),pin_ref=COALESCE(?6,pin_ref),resolved_by_kind=?8,\
-            resolved_by_session_id=?9,resolved_at=?7,updated_at=?7 WHERE id=?1 AND status='blocked'",
+            resolved_by_session_id=?9,resolved_at=?7,updated_at=?7,\
+            output_json=COALESCE(?10,output_json),output_digest=COALESCE(?11,output_digest),\
+            review_assignment_id=COALESCE(?12,review_assignment_id) WHERE id=?1 AND status='blocked'",
         params![
             write.attempt.id.to_string(),
             write.attempt_status.as_str(),
@@ -1961,6 +2134,9 @@ pub(crate) fn write_resolution(store: &Store, write: ResolutionWrite<'_>) -> Res
             now,
             write.actor.kind,
             write.actor.session_id.map(|id| id.to_string()),
+            output,
+            output.as_deref().map(digest),
+            write.review_assignment.map(|id| id.to_string()),
         ],
     )?;
     if changed != 1 {
@@ -2384,6 +2560,241 @@ pub(crate) fn record_node_resume(
     Ok(update)
 }
 
+/// #2263: a `require_verified` node whose commit the daemon could not verify
+/// is continued, as the same session, with its missing evidence. The event is
+/// the durable claim, recorded before the provider effect: a claim whose effect
+/// cannot be shown is uncertain and is never sent again.
+pub(crate) const NODE_VERIFICATION_CONTINUED: &str = "node_verification_continued";
+/// A claim that a typed fence refusal proved had no effect; it no longer counts.
+const NODE_VERIFICATION_CONTINUATION_WITHDRAWN: &str = "node_verification_continuation_withdrawn";
+/// How many times one attempt is continued with its missing evidence.
+pub(crate) const MAX_VERIFICATION_CONTINUATIONS: u32 = 2;
+
+/// #2563: a finished node that left uncommitted paths behind is continued once,
+/// as the same session, to commit or discard them. Its claims are counted
+/// apart from the verification ones: one never spends the other's budget.
+pub(crate) const NODE_UNCOMMITTED_CONTINUED: &str = "node_uncommitted_continued";
+const NODE_UNCOMMITTED_CONTINUATION_WITHDRAWN: &str = "node_uncommitted_continuation_withdrawn";
+/// How many times one attempt is asked to settle its dirty tree.
+pub(crate) const MAX_UNCOMMITTED_CONTINUATIONS: u32 = 1;
+
+/// #2584: a finished node whose last message does not open with the pipeline
+/// handoff marker is continued once, as the same session, with the parser's
+/// error and the required first line. Counted apart from the other two.
+pub(crate) const NODE_HANDOFF_FORMAT_CONTINUED: &str = "node_handoff_format_continued";
+const NODE_HANDOFF_FORMAT_CONTINUATION_WITHDRAWN: &str =
+    "node_handoff_format_continuation_withdrawn";
+/// How many times one attempt is asked to repeat a malformed handoff.
+pub(crate) const MAX_HANDOFF_FORMAT_CONTINUATIONS: u32 = 1;
+
+/// One family of at-most-once node continuations: the durable claim event, the
+/// event that takes a provably ineffective claim back, and the per-attempt cap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContinuationKind {
+    continued: &'static str,
+    withdrawn: &'static str,
+    pub(crate) max: u32,
+    /// Names the continuation in operator-facing text.
+    pub(crate) label: &'static str,
+}
+
+pub(crate) const VERIFICATION_CONTINUATION: ContinuationKind = ContinuationKind {
+    continued: NODE_VERIFICATION_CONTINUED,
+    withdrawn: NODE_VERIFICATION_CONTINUATION_WITHDRAWN,
+    max: MAX_VERIFICATION_CONTINUATIONS,
+    label: "verification",
+};
+
+pub(crate) const UNCOMMITTED_CONTINUATION: ContinuationKind = ContinuationKind {
+    continued: NODE_UNCOMMITTED_CONTINUED,
+    withdrawn: NODE_UNCOMMITTED_CONTINUATION_WITHDRAWN,
+    max: MAX_UNCOMMITTED_CONTINUATIONS,
+    label: "uncommitted-work",
+};
+
+pub(crate) const HANDOFF_FORMAT_CONTINUATION: ContinuationKind = ContinuationKind {
+    continued: NODE_HANDOFF_FORMAT_CONTINUED,
+    withdrawn: NODE_HANDOFF_FORMAT_CONTINUATION_WITHDRAWN,
+    max: MAX_HANDOFF_FORMAT_CONTINUATIONS,
+    label: "handoff-format",
+};
+
+/// One live claim of a verification continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VerificationContinuation {
+    pub(crate) n: u32,
+    /// Names the continuation's user turn in the session's conversation.
+    pub(crate) delivery_id: Uuid,
+}
+
+/// The attempt's claims that were not withdrawn, oldest first.
+#[cfg(test)]
+pub(crate) fn verification_continuations(
+    store: &Store,
+    attempt_id: Uuid,
+) -> Result<Vec<VerificationContinuation>> {
+    continuations_of(store, attempt_id, &VERIFICATION_CONTINUATION)
+}
+
+/// The attempt's live claims of one continuation `kind`, oldest first.
+pub(crate) fn continuations_of(
+    store: &Store,
+    attempt_id: Uuid,
+    kind: &ContinuationKind,
+) -> Result<Vec<VerificationContinuation>> {
+    let mut statement = store.conn.prepare(
+        "SELECT kind,json_extract(payload_json,'$.detail.n'),\
+                json_extract(payload_json,'$.detail.delivery_id') \
+         FROM topology_events WHERE attempt_id=?1 AND kind IN (?2,?3) ORDER BY execution_seq",
+    )?;
+    let rows = statement.query_map(
+        params![attempt_id.to_string(), kind.continued, kind.withdrawn],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let mut live: Vec<VerificationContinuation> = Vec::new();
+    for row in rows {
+        let (event, n, delivery_id) = row?;
+        let Some(delivery_id) = delivery_id.and_then(|id| Uuid::parse_str(&id).ok()) else {
+            continue;
+        };
+        if event == kind.withdrawn {
+            live.retain(|claim| claim.delivery_id != delivery_id);
+        } else {
+            live.push(VerificationContinuation {
+                n: u32::try_from(n.unwrap_or_default()).unwrap_or_default(),
+                delivery_id,
+            });
+        }
+    }
+    Ok(live)
+}
+
+/// What claiming a verification continuation decided.
+pub(crate) enum VerificationClaim {
+    /// Claimed: the claim is durable; the effect may now be attempted.
+    Claimed {
+        continuation: VerificationContinuation,
+        update: GraphExecutionUpdate,
+    },
+    /// The execution is cancelling or settled, or its deadline passed.
+    Stopped,
+    /// The attempt used all its continuations.
+    Exhausted,
+}
+
+/// Record, in one transaction, that the attempt is about to be continued with
+/// its missing evidence (`node_verification_continued {attempt_id, n, reason}`).
+/// Rechecks that the execution is live and inside its deadline and that fewer
+/// than [`MAX_VERIFICATION_CONTINUATIONS`] claims exist. The attempt stays
+/// `running`; nothing about its wall time changes.
+#[cfg(test)]
+pub(crate) fn claim_verification_continuation(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    reason: &str,
+) -> Result<VerificationClaim> {
+    claim_continuation(
+        store,
+        execution_id,
+        attempt,
+        &VERIFICATION_CONTINUATION,
+        reason,
+    )
+}
+
+/// [`claim_verification_continuation`] for any continuation `kind`.
+pub(crate) fn claim_continuation(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    kind: &ContinuationKind,
+    reason: &str,
+) -> Result<VerificationClaim> {
+    let tx = immediate(store)?;
+    let (status, deadline, attempt_status): (String, Option<String>, String) = tx.query_row(
+        "SELECT e.status,e.deadline_at,a.status FROM topology_node_attempts a \
+         JOIN topology_executions e ON e.id=a.execution_id WHERE a.id=?1 AND a.execution_id=?2",
+        params![attempt.id.to_string(), execution_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if attempt_status != "running"
+        || !matches!(status.as_str(), "accepted" | "running" | "blocked")
+        || deadline
+            .as_deref()
+            .map(parse_time)
+            .transpose()?
+            .is_some_and(|deadline| deadline <= Utc::now())
+    {
+        return Ok(VerificationClaim::Stopped);
+    }
+    let claims = continuations_of(store, attempt.id, kind)?;
+    let claimed = u32::try_from(claims.len()).unwrap_or(u32::MAX);
+    if claimed >= kind.max {
+        return Ok(VerificationClaim::Exhausted);
+    }
+    let continuation = VerificationContinuation {
+        n: claims.last().map_or(0, |claim| claim.n) + 1,
+        delivery_id: Uuid::new_v4(),
+    };
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            detail: serde_json::json!({
+                "attempt_id": attempt.id,
+                "n": continuation.n,
+                "reason": reason,
+                "delivery_id": continuation.delivery_id,
+            }),
+            ..EventSpec::execution(kind.continued)
+        },
+    )?;
+    tx.commit()?;
+    Ok(VerificationClaim::Claimed {
+        continuation,
+        update,
+    })
+}
+
+/// A typed fence refusal proved the continuation had no effect: take the claim
+/// back so it does not count and the next completion can be continued.
+pub(crate) fn withdraw_continuation(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    kind: &ContinuationKind,
+    continuation: &VerificationContinuation,
+    why: &str,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            detail: serde_json::json!({
+                "attempt_id": attempt.id,
+                "n": continuation.n,
+                "delivery_id": continuation.delivery_id,
+                "why": why,
+            }),
+            ..EventSpec::execution(kind.withdrawn)
+        },
+    )?;
+    tx.commit()?;
+    Ok(update)
+}
+
 /// Event kinds of a node session's wait on an answer (#1641 S3b). The executor
 /// opens one when it first sees the node session waiting and closes it when the
 /// session is running again, so the paused wall time survives a restart and a
@@ -2675,17 +3086,20 @@ pub(crate) fn execution_snapshot(
         current_nodes: Vec::new(),
         on_call: None,
         rulings: Vec::new(),
+        node_attempts: Vec::new(),
     }))
 }
 
 /// Settlement cleanup still owed by a terminal execution (plan §4 rules 3
-/// and 5). Completion is recorded as `pins_released` / `sessions_released`
-/// events, so a crash between settling and cleaning is replayed by recovery.
+/// and 5). Completion is recorded as `pins_released` / `sessions_released` /
+/// `review_work_settled` events, so a crash between settling and cleaning is replayed by recovery.
 pub(crate) struct CleanupDue {
     pub(crate) execution_id: Uuid,
     pub(crate) repo_root: PathBuf,
     pub(crate) pins: bool,
     pub(crate) sessions: bool,
+    /// #2607: the execution's review Work rows are not settled yet.
+    pub(crate) review_work: bool,
 }
 
 /// Success releases pins and archives node sessions at once; cancellation
@@ -2697,13 +3111,14 @@ pub(crate) fn cleanup_due(
     limit: usize,
 ) -> Result<Vec<CleanupDue>> {
     let mut statement = store.conn.prepare(
-        "SELECT id,repo_root,pins_due,sessions_due FROM (SELECT e.id,e.repo_root,\
+        "SELECT id,repo_root,pins_due,sessions_due,work_due FROM (SELECT e.id,e.repo_root,\
             (NOT EXISTS (SELECT 1 FROM topology_events v WHERE v.execution_id=e.id AND v.kind='pins_released') \
                 AND (e.status='succeeded' OR e.finished_at < ?1)) AS pins_due,\
             (NOT EXISTS (SELECT 1 FROM topology_events v WHERE v.execution_id=e.id AND v.kind='sessions_released') \
-                AND (e.status IN ('succeeded','cancelled') OR e.finished_at < ?1)) AS sessions_due \
+                AND (e.status IN ('succeeded','cancelled') OR e.finished_at < ?1)) AS sessions_due,\
+            NOT EXISTS (SELECT 1 FROM topology_events v WHERE v.execution_id=e.id AND v.kind='review_work_settled') AS work_due \
          FROM topology_executions e WHERE e.status IN ('succeeded','failed','cancelled')) \
-         WHERE pins_due OR sessions_due LIMIT ?2",
+         WHERE pins_due OR sessions_due OR work_due LIMIT ?2",
     )?;
     let rows = statement
         .query_map(
@@ -2717,17 +3132,19 @@ pub(crate) fn cleanup_due(
                     row.get::<_, String>(1)?,
                     row.get::<_, bool>(2)?,
                     row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(id, repo, pins, sessions)| {
+        .map(|(id, repo, pins, sessions, review_work)| {
             Ok(CleanupDue {
                 execution_id: parse_uuid(&id)?,
                 repo_root: PathBuf::from(repo),
                 pins,
                 sessions,
+                review_work,
             })
         })
         .collect()

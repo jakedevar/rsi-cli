@@ -35,7 +35,7 @@ represent. Prefer caller-owned `AgentSubmitJob` jobs with `wake:"none"` and ONE
 `mode:"when"` `when.jobs_terminal` completion wake with `timeout_seconds`.
 Inspect the deployed catalog before deciding; a recipe must already be
 declared in the allowed source and supported by the daemon. Worker `worktree`
-selection is unavailable; `sandbox_session_id` cannot target test jobs.
+selection is unavailable; `source_session_id` cannot target test jobs.
 Delegated `qa_lane` is known-shard-only and does not enable companion targets
 or recipes. Do not treat its longer timeout as companion authorization.
 

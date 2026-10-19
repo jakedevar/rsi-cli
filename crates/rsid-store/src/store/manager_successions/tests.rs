@@ -19,7 +19,7 @@ impl World {
     }
     fn with_active_limit(sandbox: bool, max_active_sessions: u16) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("store.db")).unwrap();
+        let mut store = Store::open_test_fixture(&dir.path().join("store.db")).unwrap();
         let project = Uuid::new_v4();
         let now = chrono::Utc::now();
         store
@@ -130,25 +130,26 @@ impl World {
             .unwrap()
             .unwrap();
         AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
-                scope_version: config.row_version,
-                policy_version: grant.row_version,
-            },
-            idempotency_key: key.into(),
-            operation: ManagerActionV2::SucceedManager {
-                expected: self
-                    .store
-                    .manager_succession_observation(self.owner)
-                    .unwrap()
-                    .expected,
-                launch: ManagerLaunchChoiceV2 {
-                    provider: SessionProvider::Codex,
-                    model: "gpt-6-astra".into(),
-                    effort: Some("medium".into()),
+            ..AgentManagerControlRequestV2::new(
+                ManagerFenceV2 {
+                    scope_version: config.row_version,
+                    policy_version: grant.row_version,
                 },
-                handoff: self.handoff.clone(),
-            },
+                key.into(),
+                ManagerActionV2::SucceedManager {
+                    expected: self
+                        .store
+                        .manager_succession_observation(self.owner)
+                        .unwrap()
+                        .expected,
+                    launch: ManagerLaunchChoiceV2 {
+                        provider: SessionProvider::Codex,
+                        model: "gpt-6-astra".into(),
+                        effort: Some("medium".into()),
+                    },
+                    handoff: self.handoff.clone(),
+                },
+            )
         }
     }
     fn proof(&self) -> VerifiedManagerHandoff {
@@ -304,7 +305,7 @@ fn root_succession_drain_defers_same_occurrence_after_v110_migration_and_reopen(
     crate::store::tests::rewind_store_to_schema_version(&w.store.conn, 110);
     w.store.init_schema().unwrap();
     // Complete legacy invocation repair before freezing the source identity.
-    let other = Store::open(&w.dir.path().join("store.db")).unwrap();
+    let other = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
     let receipt = w.enqueue("drain-reopen");
     let original = w
         .store
@@ -709,7 +710,7 @@ fn root_succession_two_connections_reopen_share_reservation_and_single_claim() {
     let w = World::new(false);
     // Legacy-open repair may attach the previously absent invocation. Observe
     // both connections before admission; a later identity change is tested below.
-    let other = Store::open(&w.dir.path().join("store.db")).unwrap();
+    let other = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
     let receipt = w.enqueue("first");
     assert!(
         other
@@ -987,6 +988,121 @@ fn root_succession_busy_exact_root_releases_partial_locks_before_publication() {
     );
 }
 
+/// #1174: a second-shard root (the later one in the deterministic acquisition
+/// order) held by a maintenance proof past the publisher's deadline. Every
+/// attempt takes the first root, finds the second busy and releases the first
+/// before it returns the typed retryable `root_busy`; the deadline surrender
+/// leaves the seat, epoch, journal and receipt exactly as they were, and the
+/// publication still commits once the proof ends.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_held_second_root_past_the_deadline_surrenders_with_authority_unchanged() {
+    let mut w = World::new(true);
+    let receipt = w.enqueue("busy-second-root-deadline");
+    let claim = w.claim(&receipt);
+    let claim = w.admit(&claim);
+    let claim = w.bound(&claim);
+    let mut ids = [
+        claim
+            .reservation
+            .frozen
+            .predecessor_custody
+            .as_ref()
+            .unwrap()
+            .custody_id,
+        claim
+            .reservation
+            .candidate_custody
+            .as_ref()
+            .unwrap()
+            .custody_id,
+    ];
+    ids.sort_unstable();
+    assert_ne!(ids[0], ids[1], "two distinct exact roots");
+    let (first, second) = (ids[0], ids[1]);
+    let epoch = w.store.manager_authority_epoch(w.project).unwrap();
+    let appointment = w.store.get_harness_manager(w.project).unwrap().unwrap();
+
+    // The maintenance proof holds the second root on a plain thread; the
+    // readiness handshake returns only once it is held.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let proof = std::thread::spawn(move || {
+        let _held = crate::store::sandbox_custody::lock_custody_root(second);
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+
+    // The publisher's retry loop, with a short deadline: the hold outlasts it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let mut attempts = 0_usize;
+    let surrendered = loop {
+        let error = w
+            .store
+            .commit_manager_succession(&claim, &World::publication(&claim))
+            .expect_err("the held second root refuses every attempt");
+        assert!(
+            crate::store::custody_lock_order::is_lock_order_busy_error(&error),
+            "{error}"
+        );
+        attempts += 1;
+        // The partial guard on the first root is gone after every refusal.
+        drop(
+            crate::store::sandbox_custody::try_lock_custody_root(first)
+                .expect("the first root is released when the second is busy"),
+        );
+        if std::time::Instant::now() >= deadline {
+            break error;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(attempts >= 2, "the loop retried before surrendering");
+    assert!(crate::store::custody_lock_order::is_lock_order_busy_error(
+        &surrendered
+    ));
+
+    // Surrender changed no authority.
+    assert_eq!(w.store.manager_authority_epoch(w.project).unwrap(), epoch);
+    assert_eq!(
+        w.store.get_harness_manager(w.project).unwrap().unwrap(),
+        appointment
+    );
+    assert_eq!(
+        w.store.get_session(w.owner).unwrap().unwrap().status,
+        SessionStatus::Completed
+    );
+    assert_eq!(
+        w.store
+            .manager_succession(receipt.operation_id)
+            .unwrap()
+            .unwrap()
+            .row_version,
+        claim.reservation.row_version
+    );
+    assert_eq!(
+        w.store
+            .manager_action_operation(receipt.operation_id)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .state,
+        ManagerActionStateV2::Running
+    );
+    assert_eq!(w.count("harness_manager_rotation_edges"), 0);
+
+    release_tx.send(()).unwrap();
+    proof.join().unwrap();
+    assert_eq!(
+        w.store
+            .commit_manager_succession(&claim, &World::publication(&claim))
+            .unwrap()
+            .state,
+        ManagerActionStateV2::Succeeded,
+        "the publication commits once the proof ends"
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn root_succession_epoch_covers_normal_rotation_restore_retirement_foreign_project_and_overflow() {
@@ -1245,7 +1361,7 @@ fn root_succession_concurrent_connections_admit_only_one_occurrence() {
             let barrier = barrier.clone();
             let caller = w.owner;
             std::thread::spawn(move || {
-                let store = Store::open(&path).unwrap();
+                let store = Store::open_test_fixture(&path).unwrap();
                 barrier.wait();
                 store
                     .enqueue_manager_succession(caller, &request, &proof)
@@ -1306,7 +1422,7 @@ fn root_succession_real_pending_mail_survives_publication_and_reopen() {
     w.store
         .commit_manager_succession(&claim, &World::publication(&claim))
         .unwrap();
-    let reopened = Store::open(&w.dir.path().join("store.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
     let inbox = reopened
         .manager_inbox(
             claim.reservation.candidate_session_id,
@@ -1416,7 +1532,7 @@ fn root_succession_reopen_changed_legacy_invocation_refuses_old_settlement() {
         .unwrap()
         .unwrap();
     assert_eq!(original.frozen.predecessor_invocation_id, None);
-    let other = Store::open(&w.dir.path().join("store.db")).unwrap();
+    let other = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
     w.store
         .update_session_status(w.owner, SessionStatus::Completed)
         .unwrap();
@@ -1483,7 +1599,7 @@ fn root_succession_original_spend_floor_never_resets_or_asserts_zero_history() {
         .unwrap();
     assert_eq!(origins[0].known_floor_usd, 3.25);
     assert!(!origins[0].zero_origin);
-    let reopened = Store::open(&w.dir.path().join("store.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
     assert_eq!(
         reopened
             .manager_root_resource_origins(w.project, None, 256)
@@ -1814,7 +1930,7 @@ fn root_succession_operator_pause_holds_queue_until_operator_clear() {
         w.store
             .update_session_status(w.owner, SessionStatus::Completed)
             .unwrap();
-        drop(Store::open(&w.dir.path().join("store.db")).unwrap());
+        drop(Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap());
         w.store.set_operator_pause(w.owner, pause).unwrap();
         let receipt = w.enqueue("paused-handoff");
         w.store
@@ -1970,7 +2086,7 @@ fn root_succession_operator_pause_blocks_publication_and_survives_recovery() {
                 SessionStatus::Completed
             );
         }
-        let reopened = Store::open(&w.dir.path().join("store.db")).unwrap();
+        let reopened = Store::open_test_fixture(&w.dir.path().join("store.db")).unwrap();
         assert_eq!(
             reopened
                 .recover_manager_actions_startup(Uuid::new_v4())
@@ -2028,7 +2144,7 @@ fn operator_pause_detail_shows_age_and_held_succession_then_clears() {
     use crate::store::manager_actions::OperatorPause;
     // #1541: the operator can see a pause, how long ago it was written, and
     // that a succession is queued behind it; clearing removes all of it.
-    let mut w = World::new(false);
+    let w = World::new(false);
     assert_eq!(
         w.store.get_operator_pause_detail(w.owner).unwrap().level,
         OperatorPause::None

@@ -1,13 +1,15 @@
 //! Real detached Claude handles through deploy shutdown and startup restore.
 use super::*;
-use crate::claude::{ClaudeProcess, LaunchConfig, turn_spool::DetachedTurn};
+#[cfg(target_os = "linux")]
+use crate::claude::ClaudeProcess;
+use crate::claude::{LaunchConfig, turn_spool::DetachedTurn};
 use crate::session::types::ProviderProcess;
 use crate::store::provider_turn_custody::ProviderTurnCustodyState;
 
 fn reopened(dir: &std::path::Path) -> SessionManager {
     SessionManager::new(
         Arc::new(EventBus::new(32)),
-        Store::open(&dir.join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&dir.join("rsi.db")).unwrap(),
         false,
         dir.join("daemon.sock"),
         None,
@@ -344,11 +346,13 @@ async fn deploy_shutdown_adopts_real_detached_turn_twice_and_finishes_once() {
         .unwrap()
         .unwrap();
     assert_eq!(settled.state, ProviderTurnCustodyState::Finished);
-    assert_eq!(
-        settled.stdout_offset,
-        std::fs::metadata(settled.spool_dir.join("stdout"))
-            .unwrap()
-            .len()
+    assert!(
+        settled.stdout_offset > 0,
+        "the consumed cursor remains durable"
+    );
+    assert!(
+        !settled.spool_dir.exists(),
+        "Finished custody removes the spool"
     );
     assert!(
         !store
@@ -757,6 +761,7 @@ async fn detached_cli_deploy_fixture(provider: SessionProvider) {
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     };
     {
         let store = old.store.lock().await;
@@ -772,7 +777,12 @@ async fn detached_cli_deploy_fixture(provider: SessionProvider) {
     let (process, rx) = if provider == SessionProvider::Codex {
         crate::codex::CodexClient::with_paths_for_test(
             binary,
-            "/bin/true".into(),
+            // `true` lives in `/usr/bin` on macOS; the sibling must be a real file.
+            ["/bin/true", "/usr/bin/true"]
+                .into_iter()
+                .find(|candidate| std::path::Path::new(candidate).is_file())
+                .expect("a `true` binary")
+                .into(),
             old.runtime_config.clone(),
         )
         .launch_inner(&config, execution, Some(&shim))
@@ -933,11 +943,10 @@ async fn assert_cli_completed_once(
         .unwrap()
         .unwrap();
     assert_eq!(row.state, ProviderTurnCustodyState::Finished);
-    assert_eq!(
-        row.stdout_offset,
-        std::fs::metadata(row.spool_dir.join("stdout"))
-            .unwrap()
-            .len()
+    assert!(row.stdout_offset > 0, "the consumed cursor remains durable");
+    assert!(
+        !row.spool_dir.exists(),
+        "Finished custody removes the spool"
     );
     let mut completions = 0;
     while let Ok(event) = notifications.try_recv() {

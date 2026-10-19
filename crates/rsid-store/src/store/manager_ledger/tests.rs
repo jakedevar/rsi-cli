@@ -18,6 +18,7 @@ mod mail_capacity;
 mod topology_review;
 mod work_identity;
 mod work_view;
+mod worker_view;
 
 struct Fixture {
     store: Store,
@@ -571,17 +572,20 @@ fn archive_restorable_fence_admits_restore_container() {
         .enqueue_manager_action(
             ManagerActionOriginV2::Agent { caller: f.manager },
             AgentManagerControlRequestV2 {
-                project_id: None,
-                fence: ManagerFenceV2 {
-                    scope_version: config.row_version,
-                    policy_version: policy.row_version,
-                },
-                idempotency_key: "restore-from-archive".into(),
-                operation: ManagerActionV2::RestoreContainer {
-                    container_id: group.id,
-                    expected_updated_at: serde_json::from_value(row["expected_updated_at"].clone())
+                ..AgentManagerControlRequestV2::new(
+                    ManagerFenceV2 {
+                        scope_version: config.row_version,
+                        policy_version: policy.row_version,
+                    },
+                    "restore-from-archive".into(),
+                    ManagerActionV2::RestoreContainer {
+                        container_id: group.id,
+                        expected_updated_at: serde_json::from_value(
+                            row["expected_updated_at"].clone(),
+                        )
                         .unwrap(),
-                },
+                    },
+                )
             },
         )
         .unwrap();
@@ -676,6 +680,7 @@ fn inspect(f: &Fixture, section: ManagerInspectSectionV2) -> ManagerInspectionV2
             f.manager,
             &AgentManagerInspectRequestV2 {
                 section,
+                include_history: section == ManagerInspectSectionV2::Workers,
                 ..Default::default()
             },
         )
@@ -939,6 +944,7 @@ fn reported_pass_and_completed_session_keep_partial_product_visible_without_acce
                         state: ManagerStageStateV2::Passed,
                         note: "reported progress".into(),
                         evidence: None,
+                        job_evidence: None,
                     },
                     &format!("stage{i}"),
                 ),
@@ -1083,6 +1089,7 @@ fn live_scope_and_target_are_checked_before_replay() {
             state: ManagerStageStateV2::Passed,
             note: "reported".into(),
             evidence: None,
+            job_evidence: None,
         },
         "retry",
     );
@@ -1396,6 +1403,7 @@ fn descendant_pages_preserve_parent_and_worker_names() {
         f.store.insert_session(&child).unwrap();
     }
     let mut query = AgentManagerInspectRequestV2 {
+        include_history: true,
         section: ManagerInspectSectionV2::Workers,
         limit: 1,
         ..Default::default()
@@ -1931,6 +1939,7 @@ fn descendant_live_cursor_tolerates_noise_and_refreshes_later_insertions() {
         )
         .unwrap();
     let query = AgentManagerInspectRequestV2 {
+        include_history: true,
         section: ManagerInspectSectionV2::Workers,
         limit: 1,
         ..Default::default()
@@ -2044,6 +2053,7 @@ fn collect_legal_pages(
 ) -> Vec<Value> {
     let mut query = AgentManagerInspectRequestV2 {
         section,
+        include_history: section == ManagerInspectSectionV2::Workers,
         epic_id: epic,
         limit: 64,
         ..Default::default()
@@ -2105,6 +2115,7 @@ fn live_keyset_reparenting_never_repeats_rows_and_logical_removal_retains_identi
     let outgoing = add_worker(&f, f.epic, "Moved to outside Epic");
     let incoming = add_worker(&f, outside.id, "Moved into selected Epic");
     let mut query = AgentManagerInspectRequestV2 {
+        include_history: true,
         section: ManagerInspectSectionV2::Workers,
         limit: 1,
         ..Default::default()
@@ -2173,6 +2184,7 @@ fn leaf_cursor_rechecks_scope_anchor_policy_and_container_structure() {
         let f = fixture();
         add_worker(&f, f.epic, "Another worker for pagination");
         let query = AgentManagerInspectRequestV2 {
+            include_history: true,
             section: ManagerInspectSectionV2::Workers,
             limit: 1,
             ..Default::default()
@@ -2279,6 +2291,7 @@ fn pending_reservations_page_past_1024_and_survive_rotation_and_publication() {
             .unwrap();
     }
     let mut query = AgentManagerInspectRequestV2 {
+        include_history: true,
         section: ManagerInspectSectionV2::Workers,
         limit: 64,
         ..Default::default()
@@ -2377,6 +2390,7 @@ fn sparse_reservation_pages_advance_without_widening_epic_scope() {
             .unwrap();
     }
     let mut query = AgentManagerInspectRequestV2 {
+        include_history: true,
         section: ManagerInspectSectionV2::Workers,
         ..Default::default()
     };
@@ -2449,6 +2463,7 @@ fn forged_leaf_cursor_cannot_enter_manager_owned_container_pages() {
     ] {
         let query = AgentManagerInspectRequestV2 {
             section,
+            include_history: section == ManagerInspectSectionV2::Workers,
             limit: 1,
             ..Default::default()
         };
@@ -2741,6 +2756,7 @@ fn request_cursor_detects_new_mail_and_lead_action_pages_include_its_work_update
                     state: ManagerStageStateV2::Running,
                     note: "Implementing product a".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "stage",
             ),
@@ -2781,6 +2797,7 @@ fn an_explicit_stage_blocker_owns_unfinished_work_until_it_is_cleared() {
                     state: ManagerStageStateV2::Blocked,
                     note: "Waiting for exact operator decision".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "stage-blocked",
             ),
@@ -2970,6 +2987,10 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
     }
     let (laptop, spare) = (peers[0].0, peers[1].0);
     let health = SatelliteHealthV1 {
+        platform: Some(rsi_common::satellite::SatellitePlatformV1 {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        }),
         daemon_version: "1.2.3".into(),
         binary_sha256: Some("ab".repeat(32)),
         uptime_seconds: 3_600,
@@ -2983,8 +3004,23 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
         supervisor_mode: None,
         last_deploy: None,
         missing_provider_clis: Vec::new(),
+        manager_launches: Vec::new(),
+        qa_admission: None,
+        provider_logins: Vec::new(),
+        provider_faults: Vec::new(),
+        store_probe_elapsed_ms: None,
+        latest_watchdog_trip: Some(rsi_common::satellite::SatelliteWatchdogTripV1 {
+            restart_id: rsi_common::satellite::SatelliteUuidV1(laptop),
+            observed_at: chrono::Utc::now(),
+            last_healthy_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+            failed_probes: vec![rsi_common::satellite::SatelliteWatchdogProbeV1::StoreProbeTimeout],
+        }),
     };
     crate::store_support::satellite::record_reported_health(laptop, Some(&health));
+    assert_eq!(
+        crate::store_support::satellite::reported_platform(laptop),
+        health.platform
+    );
     // The spare peer went dark after its good snapshot above.
     f.store
         .record_satellite_failure(spare, SatelliteFailure::Offline)
@@ -3002,6 +3038,18 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
     assert_eq!(laptop_row["state"], "healthy");
     assert!(laptop_row["last_contact_at"].is_string());
     assert_eq!(laptop_row["health"]["daemon_version"], "1.2.3");
+    assert_eq!(
+        laptop_row["health"]["latest_watchdog_trip"]["restart_id"],
+        laptop.to_string()
+    );
+    assert_eq!(
+        laptop_row["health"]["latest_watchdog_trip"]["failed_probes"],
+        serde_json::json!(["store_probe_timeout"])
+    );
+    assert_eq!(
+        laptop_row["health"]["platform"],
+        serde_json::json!({"os": "linux", "arch": "x86_64"})
+    );
     assert_eq!(laptop_row["health"]["binary_sha256"], "ab".repeat(32));
     assert_eq!(laptop_row["health"]["uptime_seconds"], 3_600);
     assert_eq!(laptop_row["health"]["schema_version"], 140);
@@ -3025,4 +3073,111 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
     );
     assert!(spare_row["health"].is_null());
     assert!(page.complete);
+
+    // A later outage carries current diagnostics beside the historical trip.
+    use rsi_common::satellite_diagnostics::{
+        SatelliteProbeRpcV1, SatelliteReachabilityV1, SatelliteStageStateV1 as Stage,
+        SatelliteStageV1, SatelliteTunnelStateV1,
+    };
+    let unobserved = SatelliteStageV1::unmeasured(Stage::Unobserved);
+    crate::store_support::satellite::record_reachability(
+        laptop,
+        SatelliteReachabilityV1 {
+            link_id: Uuid::new_v4(),
+            checked_at: chrono::Utc::now(),
+            elapsed_ms: 3_001,
+            connect: SatelliteStageV1 {
+                state: Stage::Succeeded,
+                elapsed_ms: Some(1),
+            },
+            transport: SatelliteStageV1 {
+                state: Stage::Succeeded,
+                elapsed_ms: Some(0),
+            },
+            daemon_rpc: SatelliteStageV1 {
+                state: Stage::TimedOut,
+                elapsed_ms: Some(3_000),
+            },
+            rpc: SatelliteProbeRpcV1::Identity,
+            store_probe: unobserved.clone(),
+            auth: unobserved,
+            tunnel_service: SatelliteTunnelStateV1::RemoteService,
+            tunnel_service_elapsed_ms: None,
+        },
+    );
+    f.store
+        .record_satellite_failure(laptop, SatelliteFailure::Offline)
+        .unwrap();
+    let offline = inspect(&f, ManagerInspectSectionV2::Satellites);
+    let laptop_offline = offline
+        .rows
+        .iter()
+        .find(|row| row["key"] == laptop.to_string())
+        .unwrap();
+    assert_eq!(laptop_offline["state"], "offline");
+    assert_eq!(
+        laptop_offline["diagnostics"]["daemon_rpc"]["state"],
+        "timed_out"
+    );
+    assert_eq!(
+        laptop_offline["diagnostics"]["daemon_rpc"]["elapsed_ms"],
+        3_000
+    );
+    assert_eq!(laptop_offline["diagnostics"]["auth"]["state"], "unobserved");
+    assert_eq!(
+        laptop_offline["health"]["latest_watchdog_trip"],
+        serde_json::to_value(health.latest_watchdog_trip).unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn overview_intent_versions_keep_the_newest_sixteen_unfinished_and_work_pages_all() {
+    let f = fixture();
+    for n in 0..20 {
+        let key = format!("item-{n:02}");
+        work(&f, &key);
+        f.store
+            .conn
+            .execute(
+                "UPDATE harness_manager_v2_work_facts SET updated_at=?2 WHERE record_key=?1",
+                params![key, format!("2026-10-19T00:00:{n:02}.000000000Z")],
+            )
+            .unwrap();
+    }
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    f.store
+        .manager_v2_put_record(
+            &config,
+            "intent",
+            &f.epic.to_string(),
+            Some(f.epic),
+            0,
+            &json!({"epic_id":f.epic,"work_versions":[{"key":"stale-snapshot","version":999}]}),
+        )
+        .unwrap();
+    let page = inspect(&f, ManagerInspectSectionV2::Overview);
+    let intent = page
+        .rows
+        .iter()
+        .find(|row| row["type"] == "intent")
+        .unwrap();
+    assert_eq!(intent["work_versions_format"], "work_summary_v1");
+    let counts: ManagerIntentWorkCountsV1 =
+        serde_json::from_value(intent["work_counts"].clone()).unwrap();
+    assert_eq!(counts.pending, 20);
+    assert_eq!(intent["work_versions_count"], 20);
+    assert_eq!(intent["work_versions_unfinished_count"], 20);
+    assert_eq!(intent["work_versions_limit"], MANAGER_INTENT_WORK_LIMIT);
+    assert_eq!(intent["work_versions_truncated"], true);
+    let versions = intent["work_versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 16);
+    assert_eq!(versions[0]["key"], "item-19");
+    assert_eq!(versions[15]["key"], "item-04");
+    assert!(serde_json::to_vec(intent).unwrap().len() < 4096);
+    let query: AgentManagerInspectRequestV2 =
+        serde_json::from_value(intent["work_query"].clone()).unwrap();
+    let work = f.store.manager_v2_inspect(f.manager, &query).unwrap();
+    assert_eq!(work.rows.len(), 20);
+    assert_eq!(work.complete, true);
 }

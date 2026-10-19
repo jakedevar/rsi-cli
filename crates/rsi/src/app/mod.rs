@@ -20,6 +20,7 @@ mod search;
 mod session_actions;
 mod sessions;
 mod state;
+pub(crate) mod todo;
 
 pub(crate) use handoff::{DocregOperationContext, DocregOperationResult, PendingDocregOperation};
 pub(crate) use navigation::SidebarFold;
@@ -583,6 +584,9 @@ pub struct App {
     /// Last-known render/poll metrics (RSI_PROFILE only).
     pub metrics: AppMetrics,
 
+    /// Draw counts by dirty reason (#332); always on, bounded, no payloads.
+    pub draw_stats: crate::draw_stats::DrawStats,
+
     // --- Notification System ---
     /// Active notifications (newest at back). TTL-expired entries pruned each render frame.
     pub notifications: std::collections::VecDeque<crate::types::Notification>,
@@ -631,6 +635,11 @@ pub struct App {
     /// Selected effort level for new reasoning-capable sessions.
     /// None = provider default. Claude uses "max"; Codex supports model-dependent top efforts.
     pub selected_effort: Option<String>,
+    /// #2758: new Claude/Codex sessions launch read-only (the operator-only
+    /// `cli_access` tool policy). Session-local and off by default; toggled with
+    /// `R` in the create-entity form. A provider that cannot enforce it is
+    /// refused by the daemon, never launched unrestricted.
+    pub launch_read_only: bool,
     /// Index into `settings.custom_providers` when a custom provider is selected.
     /// `None` means a built-in provider (Claude/Codex/Pioneer/Local/etc.) is active.
     pub custom_provider_index: Option<usize>,
@@ -650,6 +659,12 @@ pub struct App {
     /// rsid resource usage from the same background Health read, for the
     /// session browser's live-activity pane.
     pub(crate) daemon_resources: Option<crate::daemon_resources::DaemonResourceView>,
+    pub(crate) local_build_warning: Option<String>,
+    /// #2055: the operator landing flow (armed confirmation, watched entries).
+    pub(crate) land: crate::land::LandState,
+    /// #2384: which archived sessions have their rows in cold storage (the
+    /// conversation-header badge) and the channel its lazy reads answer on.
+    pub(crate) cold_storage: crate::cold_storage::ColdStorageState,
 
     /// Dynamically discovered models (model_id, display_name) for selected provider.
     /// Falls back to provider-specific static model lists if discovery fails.
@@ -730,6 +745,25 @@ pub struct App {
     /// the default). Persisted so the drawer reopens at the same width.
     pub file_explorer_width: Option<u16>,
 
+    /// Operator to-do panel state (#1747 S2).
+    pub todo_panel: crate::todo_panel::TodoPanel,
+    /// Background `OperatorTodoList` read, single flight.
+    pub(crate) todo_refresh_handle: Option<
+        tokio::task::JoinHandle<
+            Result<rsi_common::operator_todos::OperatorTodoListResultV1, String>,
+        >,
+    >,
+    /// Background `OperatorTodoClose` calls in flight.
+    pub(crate) todo_close_handles: Vec<
+        tokio::task::JoinHandle<
+            Result<rsi_common::operator_todos::OperatorTodoV1, (uuid::Uuid, String)>,
+        >,
+    >,
+    /// Background `OperatorTodoReopen` calls (the undo) in flight.
+    pub(crate) todo_reopen_handles:
+        Vec<tokio::task::JoinHandle<Result<rsi_common::operator_todos::OperatorTodoV1, String>>>,
+    pub(crate) todo_next_refresh_at: std::time::Instant,
+
     /// Last-used modal dropdown values (P2.4). Restored from `PersistedState`
     /// at startup; rewritten on every successful modal submit.
     pub modal_defaults: crate::state::ModalDefaults,
@@ -798,6 +832,7 @@ pub struct App {
     /// Cached daemon feature toggles for the DaemonFeatures settings category.
     /// Populated on first entry to the category; refreshed on each entry.
     pub daemon_features: Vec<crate::settings::DaemonFeatureEntry>,
+    pub coordinator_context_budgets: Vec<rsi_common::coordinator_budget::CoordinatorSeatBudgetV1>,
 
     /// One response-bearing classifier mutation. The daemon-owned mirror and
     /// dropdown lifecycle are committed only by its generation-matched result.
@@ -933,15 +968,19 @@ pub struct App {
     /// Receiver for PTY output bytes from the reader thread.
     pub terminal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 
-    /// Cached `~/.claude/settings.json` for the Settings -> Hooks category.
-    /// Populated on first read; invalidated after a successful save / external reload.
-    pub cached_claude_settings: Option<crate::claude_config::LoadedSettings>,
-    /// Flattened hook rows derived from `cached_claude_settings`. Recomputed
+    /// The daemon's view of `~/.claude/settings.json` hooks (`ListClaudeHooks`,
+    /// hub #3039) for the Settings -> Hooks category. Fetched on first read;
+    /// replaced by every save; cleared by an explicit reload.
+    pub cached_claude_hooks: Option<rsi_common::operator_config::ClaudeHooksView>,
+    /// A `ListClaudeHooks` was asked for since the cache was last cleared, so
+    /// render does not queue one per frame (also after a failed fetch).
+    pub claude_hooks_requested: bool,
+    /// Flattened hook rows derived from `cached_claude_hooks`. Recomputed
     /// on every `cached_claude_settings_rows()` call after the cache is
     /// (re)populated; `&[HookRow]` is returned to the renderer.
     pub cached_hook_rows: Vec<crate::claude_config::HookRow>,
     /// Cached `~/.claude/skills/` listing for the Settings -> Skills category.
-    /// Same lifecycle as `cached_claude_settings`.
+    /// Read from this host's skills directory.
     pub cached_user_skills: Option<Vec<crate::claude_config::SkillEntry>>,
 
     /// Cached lifetime usage aggregate for the Settings -> Stats category
@@ -964,6 +1003,13 @@ pub struct App {
     /// — `ListProviderCredentialsResult` is metadata-only by construction.
     pub cached_provider_credentials:
         Option<rsi_common::provider_credentials::ListProviderCredentialsResult>,
+    /// Cached provider CLI login state for the Provider Keys login rows
+    /// (#2753): state, method and check time per provider, never account text.
+    pub cached_provider_login: Option<rsi_common::provider_login::ProviderLoginStateResultV1>,
+    /// Cached provider CLI contract canary state for the Provider Keys contract
+    /// rows (#2755): state, reason code, CLI version and check time per provider.
+    pub cached_provider_contract:
+        Option<rsi_common::provider_contract::ProviderContractStateResultV1>,
     /// Cached MCP server definitions and secret-free credential metadata.
     pub cached_mcp_servers: Option<rsi_common::mcp::ListMcpServersResult>,
 }
@@ -1037,6 +1083,15 @@ pub(crate) fn replace_node(
 impl Drop for App {
     fn drop(&mut self) {
         if let Some(handle) = self.worker_pressure_refresh_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.todo_refresh_handle.take() {
+            handle.abort();
+        }
+        for handle in self.todo_close_handles.drain(..) {
+            handle.abort();
+        }
+        for handle in self.todo_reopen_handles.drain(..) {
             handle.abort();
         }
         if let Some(handle) = self.conversation_poll_handle.take() {
@@ -1314,6 +1369,7 @@ impl App {
             search_matches: Vec::new(),
             search_match_cursor: 0,
             metrics: AppMetrics::default(),
+            draw_stats: crate::draw_stats::DrawStats::new(),
             notifications: std::collections::VecDeque::new(),
             next_notification_id: 0,
             notification_history: Vec::new(),
@@ -1331,6 +1387,7 @@ impl App {
             selected_model,
             selected_provider,
             selected_effort,
+            launch_read_only: false,
             custom_provider_index: None,
             provider_availability,
             provider_rate_limits: HashMap::new(),
@@ -1338,6 +1395,9 @@ impl App {
             worker_pressure_refresh_handle: None,
             worker_pressure_next_refresh_at: std::time::Instant::now(),
             daemon_resources: None,
+            local_build_warning: None,
+            land: crate::land::LandState::default(),
+            cold_storage: crate::cold_storage::ColdStorageState::default(),
             available_models: models_for_provider(selected_provider),
             aws_setup_prompted: false,
             editing_mode_prompt: None,
@@ -1366,6 +1426,14 @@ impl App {
             pending_fold_states,
             modal_geometries: persisted.modal_geometries.clone(),
             file_explorer_width: persisted.file_explorer_width,
+            todo_panel: crate::todo_panel::TodoPanel::restored(
+                !persisted.todo_panel_hidden,
+                persisted.todo_last_visit,
+            ),
+            todo_refresh_handle: None,
+            todo_close_handles: Vec::new(),
+            todo_reopen_handles: Vec::new(),
+            todo_next_refresh_at: std::time::Instant::now(),
             modal_defaults: persisted.modal_defaults.clone(),
             blank_draft: Vec::new(),
             create_entity_draft: restored_create_entity_draft,
@@ -1394,6 +1462,7 @@ impl App {
             pre_prompt_creator_pane: None,
             pre_issues_panes: HashMap::new(),
             daemon_features: crate::settings::DaemonFeatureEntry::defaults(),
+            coordinator_context_budgets: Vec::new(),
             classifier_config_generation: 0,
             classifier_config_pending: None,
             classifier_config_handle: None,
@@ -1413,13 +1482,16 @@ impl App {
             workflow_statuses: HashMap::new(),
             terminal: None,
             terminal_rx: None,
-            cached_claude_settings: None,
+            cached_claude_hooks: None,
+            claude_hooks_requested: false,
             cached_hook_rows: Vec::new(),
             cached_user_skills: None,
             cached_usage_stats: None,
             cached_efficiency_metrics: None,
             cached_model_control_status: None,
             cached_provider_credentials: None,
+            cached_provider_login: None,
+            cached_provider_contract: None,
             cached_mcp_servers: None,
             children_by_parent: HashMap::new(),
             focus_fetch_inflight: HashSet::new(),
@@ -1463,9 +1535,23 @@ impl App {
         app
     }
 
-    /// Reload the prompt list from disk and clamp the selected index.
-    pub fn refresh_prompts(&mut self) {
-        self.prompt_creator_state.prompts = crate::prompt_creator::load_prompt_list();
+    /// Reload the prompt list from the daemon (`ListPromptFiles`) and clamp
+    /// the selected index. A failed read shows an error and an empty list.
+    pub async fn refresh_prompts(&mut self) {
+        self.prompt_creator_state.prompts = match self.client.list_prompt_files().await {
+            Ok(listing) => {
+                let dir = std::path::PathBuf::from(&listing.dir);
+                listing
+                    .files
+                    .iter()
+                    .map(|entry| crate::prompt_creator::prompt_meta_from_entry(&dir, entry))
+                    .collect()
+            }
+            Err(e) => {
+                self.notify_error(format!("Failed to list prompts: {e}"));
+                Vec::new()
+            }
+        };
         if !self.prompt_creator_state.prompts.is_empty() {
             self.prompt_creator_state.selected_index = self
                 .prompt_creator_state
@@ -1476,25 +1562,37 @@ impl App {
         }
     }
 
-    /// Lazy-load + cache the `~/.claude/settings.json` flattened hook rows.
-    /// Returns an empty slice on I/O / parse failure (the user is notified
-    /// via the open-form path; this getter is read-only and used by render).
+    /// The flattened hook rows of the daemon's hooks view. Asks the daemon
+    /// for the view on first use (render never blocks on it) and returns an
+    /// empty slice until it arrives.
     pub fn cached_claude_settings_rows(&mut self) -> &[crate::claude_config::HookRow] {
-        self.ensure_claude_settings_cache();
-        // Stash the rows alongside the loaded settings on demand. We recompute
-        // here because BTreeMap mutation through cache invalidation is rare
-        // (only after a save) and `flatten_hooks` is O(n) over a dozen rows.
-        // Alternatively we could memoize, but the file is ~1 KB and rows ~10.
-        match &self.cached_claude_settings {
-            Some(loaded) => {
-                // SAFETY: we cache the row vec on the App through a thread-local
-                // to avoid mutating cached_claude_settings here. Simpler: store
-                // rows separately. See `cached_claude_settings_rows_owned`.
-                self.cached_hook_rows = crate::claude_config::flatten_hooks(&loaded.data);
-                &self.cached_hook_rows
+        match &self.cached_claude_hooks {
+            Some(view) => {
+                self.cached_hook_rows = crate::claude_config::flatten_hooks(&view.hooks);
             }
-            None => &[],
+            None => {
+                self.request_claude_hooks_refresh();
+                self.cached_hook_rows.clear();
+            }
         }
+        &self.cached_hook_rows
+    }
+
+    /// Queue one `ListClaudeHooks` unless one was already asked for since the
+    /// cache was cleared.
+    pub fn request_claude_hooks_refresh(&mut self) {
+        if !self.claude_hooks_requested {
+            self.claude_hooks_requested = true;
+            self.pending_lc_actions
+                .push(crate::modalkit_types::LcAction::RefreshClaudeHooks);
+        }
+    }
+
+    /// Store a hooks view the daemon returned (a list or a save).
+    pub fn set_claude_hooks(&mut self, view: rsi_common::operator_config::ClaudeHooksView) {
+        self.cached_hook_rows = crate::claude_config::flatten_hooks(&view.hooks);
+        self.cached_claude_hooks = Some(view);
+        self.mark_dirty();
     }
 
     /// Lazy-load + cache the `~/.claude/skills/` listing.
@@ -1508,26 +1606,16 @@ impl App {
         self.cached_user_skills.as_deref().unwrap_or(&[])
     }
 
-    /// Invalidate the cached `~/.claude/settings.json` snapshot. Call after a
-    /// successful save or when the user requests an explicit reload.
+    /// Drop the cached hooks view so the next read asks the daemon again.
     pub fn invalidate_claude_settings_cache(&mut self) {
-        self.cached_claude_settings = None;
+        self.cached_claude_hooks = None;
+        self.claude_hooks_requested = false;
         self.cached_hook_rows.clear();
     }
 
     /// Invalidate the cached skills listing.
     pub fn invalidate_claude_skills_cache(&mut self) {
         self.cached_user_skills = None;
-    }
-
-    /// Ensure the cached settings are populated. Silently swallows I/O errors —
-    /// the form-open path surfaces them with `notify_error`.
-    fn ensure_claude_settings_cache(&mut self) {
-        if self.cached_claude_settings.is_none() {
-            if let Ok(loaded) = crate::claude_config::load_user_settings() {
-                self.cached_claude_settings = Some(loaded);
-            }
-        }
     }
 
     pub fn push_current_overlay(&mut self) {
@@ -1968,6 +2056,7 @@ impl App {
             OverlayState::ThemePicker { .. } => "ThemePicker",
             OverlayState::ThemeRoleEditor { .. } => "ThemeRoleEditor",
             OverlayState::TextAreaBgEditor { .. } => "TextAreaBgEditor",
+            OverlayState::DaemonTextEditor { .. } => "DaemonTextEditor",
             OverlayState::ProjectPicker { .. } => "ProjectPicker",
             OverlayState::KeybindingsHelp { .. } => "KeybindingsHelp",
             OverlayState::SortPicker { .. } => "SortPicker",
@@ -1993,6 +2082,7 @@ impl App {
             OverlayState::McpServerForm { .. } => "McpServerForm",
             OverlayState::McpServerSecretForm { .. } => "McpServerSecretForm",
             OverlayState::SkillPreview { .. } => "SkillPreview",
+            OverlayState::TodoPopup(..) => "TodoPopup",
             OverlayState::Diagnostics => "Diagnostics",
             OverlayState::RecursiveDagBrowser(..) => "RecursiveDagBrowser",
             OverlayState::MemorySearch { .. } => "MemorySearch",

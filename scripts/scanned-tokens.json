@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "_comment": "Source scanners whose reads cannot be inferred from direct source-tree literals (#2495). Both check-touched-shards (scoped-test and queue-derived filters) and the lander's test_impact read this registry from the candidate tree. A production edit in a file naming a token on either side selects every listed test; this deliberately includes companion behavioural tests, even for new sites. Test-only and comment-only edits retain ordinary selection. Add future scanners here, not as per-file exceptions.",
+  "tokens": {
+    "conversation_events": {
+      "packages": ["rsid-store", "rsid", "rsid-remote-read"],
+      "tests": [
+        {
+          "package": "rsid-store",
+          "name": "store::cold_archive::read_classes::cold_archive_reader_classification"
+        },
+        {
+          "package": "rsid-store",
+          "name": "store::cold_archive::read_tests::cold_archive_reader_invariance"
+        }
+      ]
+    }
+  }
+}

@@ -71,6 +71,14 @@ pub struct RemoteStatusV1 {
     pub tailscale: RemoteTailscaleV1,
     pub peers: Vec<RemotePeerV1>,
     pub projects: Vec<RemoteProjectV1>,
+    /// Answers to waiting decisions may be written from the phone. Off by
+    /// default; a separate opt-in from the read view.
+    #[serde(default)]
+    pub allow_answers: bool,
+    /// Messages to manager seats (API v2) may be written from the phone. Off
+    /// by default; a separate opt-in from the read view and from answers.
+    #[serde(default)]
+    pub allow_messages: bool,
     /// Human-readable problems (validation failures, missing binary...).
     pub errors: Vec<String>,
 }
@@ -86,6 +94,12 @@ pub struct RemoteSetConfigRequestV1 {
     pub allowed_node_ids: Option<Vec<String>>,
     #[serde(default)]
     pub project_ids: Option<Vec<String>>,
+    /// Allow or deny answering waiting decisions from the phone.
+    #[serde(default)]
+    pub allow_answers: Option<bool>,
+    /// Allow or deny messages to manager seats from the phone (API v2).
+    #[serde(default)]
+    pub allow_messages: Option<bool>,
 }
 
 #[cfg(test)]

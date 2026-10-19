@@ -52,7 +52,33 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| crate::error::DaemonError::Process(format!("Unknown tool: {}", name)))?;
-        (handler)(args).await
+        let diagnostic = crate::session::harness::tools::rsi_control::schema_error(name, &args);
+        (handler)(args).await.map_err(|error| {
+            let Some(diagnostic) = diagnostic else {
+                return error;
+            };
+            let (rpc_code, mut data) = match &error {
+                crate::error::DaemonError::StructuredRpc { rpc_code, data, .. } => {
+                    (*rpc_code, data.clone())
+                }
+                crate::error::DaemonError::InvalidParam(code) => (
+                    rsi_common::rpc::INVALID_PARAMS,
+                    serde_json::json!({"code":code,"message":error.to_string()}),
+                ),
+                _ => (
+                    rsi_common::rpc::INTERNAL_ERROR,
+                    serde_json::json!({"message":error.to_string()}),
+                ),
+            };
+            diagnostic.enrich(&mut data);
+            // App-server monitors send Display text to the provider. Include
+            // the same envelope there as well as in structured error data.
+            crate::error::DaemonError::StructuredRpc {
+                rpc_code,
+                message: data.to_string(),
+                data,
+            }
+        })
     }
 
     /// Whether any tools are registered.
@@ -212,6 +238,9 @@ fn register_rsi_control_tools(
         let handler: ToolHandler = Arc::new(move |args: Value| {
             let control = control.clone();
             Box::pin(async move {
+                let args = control
+                    .expand_id_prefixes(caller, AgentControlVerbV1::GetProgress, args)
+                    .await?;
                 let params = rsi_control::progress_params_from_args(&args)
                     .map_err(crate::error::DaemonError::InvalidParam)?;
                 let result = control
@@ -290,6 +319,9 @@ fn register_rsi_control_tools(
         let handler: ToolHandler = Arc::new(move |args: Value| {
             let control = control.clone();
             Box::pin(async move {
+                let args = control
+                    .expand_id_prefixes(caller, AgentControlVerbV1::GetStatus, args)
+                    .await?;
                 let target = rsi_control::resolve_target_id(&args, caller)
                     .map_err(crate::error::DaemonError::InvalidParam)?;
                 let session = control.agent_get_status(caller, target).await?;
@@ -317,6 +349,9 @@ fn register_rsi_control_tools(
         let handler: ToolHandler = Arc::new(move |args: Value| {
             let control = control.clone();
             Box::pin(async move {
+                let args = control
+                    .expand_id_prefixes(caller, AgentControlVerbV1::ReadSessionEvents, args)
+                    .await?;
                 let request: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
                     serde_json::from_value(args).map_err(|error| {
                         crate::error::DaemonError::InvalidParam(format!(
@@ -355,6 +390,63 @@ fn register_rsi_control_tools(
                 let result = control
                     .agent_query_failure_signatures(caller, request)
                     .await?;
+                Ok(serde_json::to_value(result).map_err(crate::error::DaemonError::Json)?)
+            })
+        });
+        registry.register(spec, handler);
+    }
+
+    // worker_roster (#2311)
+    {
+        let control = control.clone();
+        let spec = ToolSpec {
+            name: "rsi_control_worker_roster".to_string(),
+            description: "Read each worker's real state in one call: derived state \
+                 (running, parked_on_job, parked_on_wake, stranded, final_handoff, failed), \
+                 bound Issue, model/effort, newest job (kind, state, exit code, refusal, \
+                 receipt head), armed wakes, last activity and whether a final PIPELINE \
+                 HANDOFF was written. Scope: the workers you launched yourself; a project's \
+                 appointed manager (or a portfolio seat naming project_id) gets the project."
+                .to_string(),
+            parameters: AgentControlVerbV1::WorkerRoster.descriptor().parameters(),
+        };
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                let request: rsi_common::agent_worker_roster::AgentWorkerRosterRequestV1 =
+                    serde_json::from_value(args).map_err(|error| {
+                        crate::error::DaemonError::InvalidParam(format!(
+                            "invalid worker_roster arguments: {error}"
+                        ))
+                    })?;
+                let result = control.agent_worker_roster(caller, request).await?;
+                Ok(serde_json::to_value(result).map_err(crate::error::DaemonError::Json)?)
+            })
+        });
+        registry.register(spec, handler);
+    }
+
+    // list_wakes (#2389)
+    {
+        let control = control.clone();
+        let spec = ToolSpec {
+            name: "rsi_control_list_wakes".to_string(),
+            description: AgentControlVerbV1::ListWakes
+                .descriptor()
+                .description
+                .to_string(),
+            parameters: AgentControlVerbV1::ListWakes.descriptor().parameters(),
+        };
+        let handler: ToolHandler = Arc::new(move |args: Value| {
+            let control = control.clone();
+            Box::pin(async move {
+                let params: rsi_common::agent_control_schema::AgentListWakesParams =
+                    serde_json::from_value(args).map_err(|error| {
+                        crate::error::DaemonError::InvalidParam(format!(
+                            "invalid list_wakes arguments: {error}"
+                        ))
+                    })?;
+                let result = control.agent_list_wakes(caller, params).await?;
                 Ok(serde_json::to_value(result).map_err(crate::error::DaemonError::Json)?)
             })
         });
@@ -444,7 +536,7 @@ fn register_rsi_control_tools(
                 "Read one local Issue in the project owned by the Epic you currently lead."
             }
             rsi_control::IssueControlToolKind::Update => {
-                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may append to its own Issue's body only."
+                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may publish its handoff (handoff field, its own record) or append to the body of its own Issue only."
             }
             rsi_control::IssueControlToolKind::UpdateStatus => {
                 "CAS-update one Issue status as the current owning-Epic lead or manager with issue-coordinate authority."
@@ -636,6 +728,45 @@ pub fn register_codegraph_tools(
 mod tests {
     use super::*;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn dynamic_agent_schema_refusal_names_limit_and_preserves_envelope() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolSpec {
+            name: "rsi_control_read_session_events".into(), description: String::new(), parameters: serde_json::json!({}),
+        }, Arc::new(|_| Box::pin(async {
+            Err(crate::error::DaemonError::StructuredRpc {
+                rpc_code: rsi_common::rpc::INVALID_PARAMS, message: "existing".into(),
+                data: serde_json::json!({"code":"legacy","class":"invalid","field":"limit"}),
+            })
+        })));
+        let error = registry
+            .execute(
+                "rsi_control_read_session_events",
+                serde_json::json!({
+                    "session_id":uuid::Uuid::new_v4(), "limit":101
+                }),
+            )
+            .await
+            .unwrap_err();
+        let crate::error::DaemonError::StructuredRpc {
+            rpc_code,
+            data,
+            message,
+        } = error
+        else {
+            panic!("structured refusal");
+        };
+        assert_eq!(rpc_code, rsi_common::rpc::INVALID_PARAMS);
+        assert_eq!(data["code"], "legacy");
+        assert_eq!(data["class"], "invalid");
+        assert_eq!(data["field"], "limit");
+        assert_eq!(data["path"], "params.limit");
+        assert_eq!(data["constraint"], "maximum 100");
+        assert_eq!(data["value"], 101);
+        assert_eq!(serde_json::from_str::<Value>(&message).unwrap(), data);
+    }
+
     fn test_control_handle() -> crate::session::agent_verbs::AgentControlHandle {
         use crate::session::spawn_coordinator::SpawnCoordinator;
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -794,7 +925,6 @@ mod tests {
                 "AgentContinueChild",
                 "AgentArchiveChild",
                 "AgentCancelWake",
-                "AgentListWakes",
                 "AgentManagerDelegateNode",
                 "AgentManagerEscalate",
                 "AgentManagerListEscalations",
@@ -809,6 +939,8 @@ mod tests {
                 "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentPushSatelliteManagerPolicy",
+                "AgentReseatSatelliteManager",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
@@ -976,9 +1108,12 @@ mod tests {
             };
             args["sender_session_id"] = json!("/private/value token=secret");
             let error = registry.execute(kind.name(), args).await.unwrap_err();
-            assert!(
-                matches!(error, crate::error::DaemonError::InvalidParam(code) if code == "manager_invalid_request")
-            );
+            let crate::error::DaemonError::StructuredRpc { data, message, .. } = error else {
+                panic!("expected a schema diagnostic envelope");
+            };
+            assert_eq!(data["code"], "manager_invalid_request");
+            assert!(data["path"].as_str().unwrap().starts_with("params."));
+            assert_eq!(serde_json::from_str::<Value>(&message).unwrap(), data);
         }
     }
 
@@ -1062,8 +1197,13 @@ mod tests {
             let validation = envelope.validation.expect("bounded validation hint");
             assert_eq!(validation.class, expected_class, "tool: {name}");
             assert_eq!(validation.field, expected_field, "tool: {name}");
-            assert!(!encoded.contains("project_id/secret"));
-            assert!(!encoded.contains("never"));
+            let diagnostic: Value = serde_json::from_str(&encoded).unwrap();
+            assert!(diagnostic["path"].as_str().unwrap().starts_with("params"));
+            assert!(diagnostic["constraint"].is_string());
+            if name == "rsi_control_get_issue" {
+                assert_eq!(diagnostic["path"], "params[\"project_id/secret\"]");
+                assert_eq!(diagnostic["value"], "never");
+            }
         }
 
         let error = registry

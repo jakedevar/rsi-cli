@@ -93,9 +93,25 @@ fn manager_lineage_session_on(
     })
 }
 
-/// Committed successor edges of `predecessor` (at most two, so a fork is
-/// detectable without scanning further).
-fn manager_successors_on(conn: &rusqlite::Connection, predecessor: Uuid) -> Result<Vec<String>> {
+/// Published successor edges of `predecessor` (at most two, so a fork is
+/// detectable without scanning further): a committed reservation, or, with no
+/// reservation, an active receipt on an archived predecessor. Failed, reserved,
+/// launching and uncertain candidates, retired receipts and unarchived
+/// receipt-only edges are never published, whatever `continued_from` says.
+///
+/// `unreceipted_legacy` additionally admits a row with no reservation and no
+/// receipt at all (a rotation recorded before reservations existed). It is for
+/// readers of non-manager lineages (satellite mail to workers); the manager
+/// resolvers pass `false`. Like
+/// `find_published_rotation_successor`, it excludes a `Failed` child and a
+/// current-era ordinary reservation (a `successor_reserved{successor_id}`
+/// rotation event, which has no `agent_successor_reservations` row) until a
+/// `completed` event publishes it (#1998). A retired receipt is never admitted either way.
+pub(super) fn manager_successors_on(
+    conn: &rusqlite::Connection,
+    predecessor: Uuid,
+    unreceipted_legacy: bool,
+) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "SELECT child.id FROM sessions child
          JOIN sessions predecessor ON predecessor.id=child.continued_from
@@ -105,11 +121,29 @@ fn manager_successors_on(conn: &rusqlite::Connection, predecessor: Uuid) -> Resu
               AND edge.retired_at IS NULL
          WHERE child.continued_from=?1 AND
            (reservation.state='committed' OR (reservation.reservation_id IS NULL AND
-             edge.successor_session_id IS NOT NULL AND predecessor.status='Archived'))
+             ((edge.successor_session_id IS NOT NULL AND predecessor.status='Archived')
+              OR (?2 AND NOT EXISTS (
+                SELECT 1 FROM harness_manager_rotation_edges any_edge
+                WHERE any_edge.predecessor_session_id=predecessor.id
+                  AND any_edge.successor_session_id=child.id)
+               AND child.status<>'Failed'
+               AND (NOT EXISTS (
+                SELECT 1 FROM rotation_events marker
+                WHERE marker.session_id=predecessor.id AND marker.event_type='successor_reserved'
+                  AND json_valid(marker.metadata)
+                  AND json_extract(marker.metadata,'$.successor_id')=child.id)
+                OR EXISTS (
+                SELECT 1 FROM rotation_events done
+                WHERE done.session_id=predecessor.id AND done.event_type='completed'
+                  AND json_valid(done.metadata)
+                  AND json_extract(done.metadata,'$.successor_id')=child.id))))))
          ORDER BY child.id LIMIT 2",
     )?;
     Ok(statement
-        .query_map([predecessor.to_string()], |row| row.get::<_, String>(0))?
+        .query_map(
+            params![predecessor.to_string(), unreceipted_legacy],
+            |row| row.get::<_, String>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -124,7 +158,7 @@ pub(super) fn manager_lineage_tip_on(conn: &rusqlite::Connection, origin: Uuid) 
         if !seen.insert(current) {
             return Err(refused("manager_lineage_cycle"));
         }
-        let next = manager_successors_on(conn, current)?;
+        let next = manager_successors_on(conn, current, false)?;
         if next.is_empty() {
             return Ok(current);
         }
@@ -158,7 +192,7 @@ pub(super) fn manager_lineage_hops_on(
     let mut hops = vec![origin];
     let mut current = origin;
     for _ in 0..LINEAGE_LIMIT {
-        let Ok(next) = manager_successors_on(conn, current) else {
+        let Ok(next) = manager_successors_on(conn, current, false) else {
             break;
         };
         let [only] = next.as_slice() else {
@@ -1616,13 +1650,16 @@ impl Store {
              (SELECT job_id FROM harness_manager_watches WHERE project_id=?1)",
             params![project_id.to_string(), now],
         )?;
-        // #872: a displaced or cleared PM seat receives no queued global mail.
-        if request.is_revocation()
-            || previous
-                .as_ref()
-                .is_some_and(|config| config.manager_session_id != anchor)
-        {
+        // #872: a cleared PM seat receives no queued global mail; a displaced
+        // one hands its queued tier mail to the new seat (#2468) and loses
+        // the global-manager messages addressed to it.
+        if request.is_revocation() {
             self.retire_global_project_messages(project_id, &now)?;
+        } else if previous
+            .as_ref()
+            .is_some_and(|config| config.manager_session_id != anchor)
+        {
+            self.rehome_global_project_messages(project_id, &now)?;
         }
         // #1553: another session now holds the seat; what the displaced holder
         // left armed (terminal watches, deploy outcome wakes) follows the seat.
@@ -1668,6 +1705,13 @@ impl Store {
                 }
             }
         }
+        let config = self
+            .get_harness_manager(project_id)?
+            .ok_or_else(|| refused("manager_scope_missing"))?;
+        // #2469: open requests of the replaced tuple follow to the live seat.
+        if let Some(previous) = &previous {
+            self.adopt_open_manager_requests(previous, &config)?;
+        }
         self.sync_legacy_manager_root_on(tx, project_id)?;
         let config = self
             .get_harness_manager(project_id)?
@@ -1701,8 +1745,69 @@ impl Store {
         manager_lineage_tip_on(&self.conn, origin)
     }
 
+    /// #2532: the project manager's current seat for a session that held that
+    /// seat earlier in the appointment's rotation lineage (a context-cap
+    /// rotation, `succeed_manager`, a re-appointment). `None` when `session` is
+    /// the current seat itself, is not a project in a configured manager
+    /// appointment, or its lineage forks or does not lead to the appointed
+    /// seat: the caller then keeps `session` and every existing fence. The
+    /// result is only a name; the caller re-proves its live authority.
+    pub fn project_manager_seat_now(&self, session: Uuid) -> Result<Option<Uuid>> {
+        let Some(project) = self
+            .get_session(session)?
+            .and_then(|session| session.project_id)
+        else {
+            return Ok(None);
+        };
+        let Some(current) = self
+            .get_harness_manager(project)?
+            .and_then(|config| config.current_session_id)
+        else {
+            return Ok(None);
+        };
+        if current == session {
+            return Ok(None);
+        }
+        Ok(manager_lineage_hops_on(&self.conn, session, project)
+            .contains(&current)
+            .then_some(current))
+    }
+
+    /// #3241: the Epic lead's current seat for a session that led its Epic
+    /// earlier in the same rotation lineage (a context-cap rotation). `None`
+    /// when `session` is the current lead itself, is not a leaf directly under
+    /// a live Epic, the Epic has no other live lead, or the lineage forks or
+    /// does not lead to that lead: the caller then keeps `session` and every
+    /// existing fence. The result is only a name; the caller re-proves its
+    /// live authority.
+    pub fn epic_lead_seat_now(&self, session: Uuid) -> Result<Option<Uuid>> {
+        let Some(origin) = self.get_session(session)? else {
+            return Ok(None);
+        };
+        let (Some(project), Some(epic)) = (origin.project_id, origin.parent_id) else {
+            return Ok(None);
+        };
+        let Some(epic) = self.get_session(epic)? else {
+            return Ok(None);
+        };
+        if epic.session_kind != SessionKind::Epic
+            || matches!(
+                epic.status,
+                SessionStatus::Archived | SessionStatus::Deleted
+            )
+        {
+            return Ok(None);
+        }
+        let Some(current) = epic.lead_session_id.filter(|lead| *lead != session) else {
+            return Ok(None);
+        };
+        Ok(manager_lineage_hops_on(&self.conn, session, project)
+            .contains(&current)
+            .then_some(current))
+    }
+
     fn manager_successors(&self, predecessor: Uuid) -> Result<Vec<String>> {
-        manager_successors_on(&self.conn, predecessor)
+        manager_successors_on(&self.conn, predecessor, false)
     }
 
     /// Fixture-only receipt creation. Production must use the guarded custody
@@ -1793,7 +1898,12 @@ impl Store {
         if matches!(manager_lineage_tip_on(tx, anchor), Ok(tip) if tip == successor)
             && manager_lineage_hops_on(tx, anchor, project).contains(&predecessor)
         {
-            super::agent_jobs::transfer_manager_jobs_on(tx, predecessor, successor)?;
+            super::manager_obligations::transfer_manager_obligations_on(
+                tx,
+                predecessor,
+                successor,
+                true,
+            )?;
         }
         Ok(true)
     }
@@ -1957,6 +2067,27 @@ impl Store {
         Ok((config, true))
     }
 
+    /// #9: the start of the lead's newest real model turn: an admitted
+    /// invocation that is neither a background helper (title, summary,
+    /// memory, classifier) nor a compaction. Only the model-invocation ledger
+    /// feeds it, so session `updated_at` bumps, ledger notices, wakes and
+    /// metadata writes cannot move it.
+    fn manager_lead_last_model_turn_at(&self, lead_id: Uuid) -> Result<Option<DateTime<Utc>>> {
+        let helper_purposes =
+            rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array();
+        let started: Option<String> = self.conn.query_row(
+            "SELECT MAX(started_at) FROM model_invocations WHERE session_id=?1
+             AND admission_status='admitted' AND started_at IS NOT NULL
+             AND purpose<>'session.harness.compaction'
+             AND purpose NOT IN (SELECT value FROM json_each(?2))",
+            params![lead_id.to_string(), helper_purposes],
+            |row| row.get(0),
+        )?;
+        Ok(started
+            .and_then(|stamp| DateTime::parse_from_rfc3339(&stamp).ok())
+            .map(|stamp| stamp.with_timezone(&Utc)))
+    }
+
     #[cfg(any(test, feature = "test-seam"))]
     pub fn manager_progress(&self, caller: Uuid) -> Result<AgentManagerProgressResultV1> {
         self.manager_progress_page(caller, &AgentManagerProgressRequestV1::default())
@@ -2057,6 +2188,7 @@ impl Store {
                 lead_title: None,
                 status: None,
                 updated_at: None,
+                last_model_turn_at: None,
                 pending_question: None,
                 pipeline_artifact: None,
                 last_response: None,
@@ -2069,6 +2201,7 @@ impl Store {
                     row.lead_title = lead.title.clone();
                     row.status = Some(lead.status);
                     row.updated_at = Some(lead.updated_at);
+                    row.last_model_turn_at = self.manager_lead_last_model_turn_at(lead.id)?;
                     row.pipeline_artifact = lead.pipeline_artifact;
                     if serde_json::to_vec(&lead.pending_question)
                         .is_ok_and(|bytes| bytes.len() <= 8192)
@@ -2087,6 +2220,16 @@ impl Store {
                 Err(_) => {
                     row.safe_error_class = Some("manager_lead_unavailable_refresh_scope".into());
                 }
+            }
+            if request.fields == rsi_common::harness_manager::AgentManagerProgressFieldsV1::Compact
+            {
+                row.title = rsi_common::daemon_handoff::one_line(&row.title, 240);
+                row.lead_title = row
+                    .lead_title
+                    .map(|text| rsi_common::daemon_handoff::one_line(&text, 240));
+                row.last_response = row
+                    .last_response
+                    .map(|text| rsi_common::daemon_handoff::one_line(&text, 240));
             }
             rows.push(row);
         }
@@ -2191,11 +2334,28 @@ impl Store {
             .map(|id| self.manager_request_chain(&config, id))
             .transpose()?
             .map(|chain| chain.json());
+        // #3107: an exact notice re-read touches no messages: it queries,
+        // marks read, tracks and pages none, so it moves no message cursor.
+        let exact_read = !request.read_notice_ids.is_empty();
+        // Routine manager reads select incoming mail before LIMIT, including
+        // across seat succession. Direction is immutable: replies and lead
+        // notices are inbound; manager sends (informational or not) are not.
+        let include_sent = !is_manager
+            || request.include_sent
+            || request.request_id.is_some()
+            || request.fields == AgentManagerInboxFieldsV1::Full;
+        let read_messages = !exact_read
+            && request
+                .notice_kind
+                .as_deref()
+                .is_none_or(|kind| kind == "message");
         let query = format!(
             "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages m
             WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND sequence>?4
             AND (?5 IS NULL OR epic_id=?5) AND (?6 IS NULL
               OR id IN (SELECT value FROM json_each(?6)) OR request_id IN (SELECT value FROM json_each(?6)))
+            AND (?10 OR request_id IS NOT NULL
+                OR substr(request_fingerprint,1,length(?11))=?11)
             AND (?8=0 OR (?9 IS NULL AND NOT EXISTS (
                 SELECT 1 FROM harness_manager_v2_events a WHERE a.project_id=m.project_id
                 AND a.manager_session_id=m.manager_session_id AND a.scope_version=m.scope_version
@@ -2207,24 +2367,31 @@ impl Store {
                 AND json_extract(a.payload_json,'$.node_id')=?9)))
             ORDER BY sequence LIMIT ?7"
         );
-        let mut statement = self.conn.prepare(&query)?;
-        let records = statement
-            .query_map(
-                params![
-                    config.project_id.to_string(),
-                    config.manager_session_id.to_string(),
-                    config.row_version,
-                    request.after_sequence,
-                    epic.map(|id| id.to_string()),
-                    filter,
-                    i64::from(request.limit) + 1,
-                    is_manager as i64,
-                    node.map(|id| id.to_string())
-                ],
-                read_message,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+        let records = if !read_messages {
+            Vec::new()
+        } else {
+            let mut statement = self.conn.prepare(&query)?;
+            let records = statement
+                .query_map(
+                    params![
+                        config.project_id.to_string(),
+                        config.manager_session_id.to_string(),
+                        config.row_version,
+                        request.after_sequence,
+                        epic.map(|id| id.to_string()),
+                        filter,
+                        i64::from(request.limit) + 1,
+                        is_manager as i64,
+                        node.map(|id| id.to_string()),
+                        include_sent,
+                        LEAD_NOTICE_FINGERPRINT_PREFIX
+                    ],
+                    read_message,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            records
+        };
         let has_more = records.len() > usize::from(request.limit);
         let mut messages = Vec::new();
         let mut last_sequence = request.after_sequence;
@@ -2277,15 +2444,30 @@ impl Store {
         for (epic, node, to_manager) in routes_read {
             self.settle_manager_node_mail_watch(&config, epic, node, to_manager)?;
         }
-        if node.is_none() {
+        if node.is_none() && !exact_read {
             self.manager_v2_track_retrieval(&config, caller, &messages)?;
         }
         if node.is_some() && !request.settle_notice_ids.is_empty() {
             return Err(refused("manager_notice_not_authorized"));
         }
         self.settle_manager_notice_ids(&config, caller, is_manager, &request.settle_notice_ids)?;
+        if node.is_some() && !request.read_notice_ids.is_empty() {
+            return Err(refused("manager_notice_not_authorized"));
+        }
         let (notices, more_notices, next_after_notice_sequence) = if node.is_some() {
             (Vec::new(), false, None)
+        } else if !request.read_notice_ids.is_empty() {
+            // #3068: an exact re-read pages and drains nothing else.
+            (
+                self.read_manager_notice_ids(
+                    &config,
+                    caller,
+                    is_manager,
+                    &request.read_notice_ids,
+                )?,
+                false,
+                None,
+            )
         } else {
             self.retrieve_manager_notices_page(&config, caller, is_manager, request)?
         };
@@ -2300,6 +2482,19 @@ impl Store {
         // they are returned, so the next call (after the same cursor) reads the
         // next page. `more_notices` is therefore never true without a cursor.
         let next_after_sequence = (has_more || more_notices).then_some(last_sequence);
+        // #285: the notices above are already retrieved and settled; the
+        // summary form only trims what is returned.
+        let notices = match request.fields {
+            AgentManagerInboxFieldsV1::Compact => notices
+                .into_iter()
+                .map(HarnessManagerNoticeV1::into_compact)
+                .collect(),
+            AgentManagerInboxFieldsV1::Full => notices,
+            AgentManagerInboxFieldsV1::Summary => notices
+                .into_iter()
+                .map(HarnessManagerNoticeV1::into_summary)
+                .collect(),
+        };
         Ok(AgentManagerInboxResultV1 {
             messages,
             next_after_sequence,
@@ -4250,7 +4445,11 @@ impl Store {
 }
 
 // Recursive manager escalation store path. Node IDs remain stable across seat succession.
-fn escalation_path_on(tx: &Transaction<'_>, project: Uuid, node: Uuid) -> Result<Vec<AreaNode>> {
+fn escalation_path_on(
+    tx: &rusqlite::Connection,
+    project: Uuid,
+    node: Uuid,
+) -> Result<Vec<AreaNode>> {
     let mut path = Vec::new();
     let mut cursor = Some(node);
     for _ in 0..64 {
@@ -4404,7 +4603,7 @@ fn escalation_target_on(
 /// The escalation's source still holds the live grant, epoch and grant
 /// version it escalated under.
 pub(crate) fn escalation_source_current_on(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     current: &ManagerNodeEscalationV1,
 ) -> Result<()> {
     let source = escalation_path_on(tx, current.project_id, current.source_node_id)?
@@ -4419,7 +4618,7 @@ pub(crate) fn escalation_source_current_on(
 }
 
 pub(crate) fn escalation_on(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: Uuid,
 ) -> Result<Option<ManagerNodeEscalationV1>> {
     // #1238: the newest hop above the project root, if it ever crossed.
@@ -4721,6 +4920,8 @@ impl Store {
     }
 }
 
+mod seat_mail_adoption;
+
 #[cfg(test)]
 mod lead_notice_tests;
 
@@ -4881,6 +5082,73 @@ mod tests {
                 serde_json::to_string(&policy).unwrap(),stamp()],
         ).unwrap();
         (node, seat.id)
+    }
+
+    fn seed_lead_invocation(f: &Fixture, lead: Uuid, purpose: &str, started_at: DateTime<Utc>) {
+        let stamp = started_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations (
+                    id, purpose, invocation_kind, foreground, paid_risk, admission_status, status,
+                    trigger_source, session_id, policy_snapshot_json, created_at, started_at,
+                    usage_confidence
+                 ) VALUES (?1, ?2, 'direct_text', 'foreground', 'paid_capable', 'admitted',
+                    'completed', 'manager_test', ?3, '{}', ?4, ?4, 'unavailable')",
+                params![Uuid::new_v4().to_string(), purpose, lead.to_string(), stamp],
+            )
+            .unwrap();
+    }
+
+    fn progress_row_of(f: &Fixture, lead: Uuid) -> HarnessManagerEpicProgressV1 {
+        f.store
+            .manager_progress(f.manager)
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|row| row.lead_session_id == Some(lead))
+            .unwrap()
+    }
+
+    /// #9: `last_model_turn_at` follows real model turns only; bookkeeping
+    /// (title write that bumps `updated_at`, helper invocations, compaction)
+    /// leaves it where it was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn progress_last_model_turn_ignores_bookkeeping_writes_9() {
+        let f = fixture(Store::open_in_memory().unwrap());
+        let lead = f.leads[0];
+        assert_eq!(progress_row_of(&f, lead).last_model_turn_at, None);
+
+        let turn_at = Utc::now() - chrono::Duration::hours(6);
+        seed_lead_invocation(&f, lead, "session.continue.resume", turn_at);
+        let before = progress_row_of(&f, lead);
+        assert_eq!(before.last_model_turn_at, Some(turn_at));
+
+        // Bookkeeping: a title refinement (bumps updated_at), a title helper
+        // invocation and a compaction, all newer than the real turn.
+        let later = Utc::now();
+        f.store
+            .conn
+            .execute(
+                "UPDATE sessions SET title='Refined title', updated_at=?2 WHERE id=?1",
+                params![
+                    lead.to_string(),
+                    later.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        seed_lead_invocation(&f, lead, "session.title", later);
+        seed_lead_invocation(&f, lead, "session.harness.compaction", later);
+        let after = progress_row_of(&f, lead);
+        assert_ne!(after.updated_at, before.updated_at);
+        assert_eq!(after.last_model_turn_at, Some(turn_at));
+
+        // A real turn moves it.
+        let turn_two = Utc::now();
+        seed_lead_invocation(&f, lead, "session.harness.turn", turn_two);
+        assert_eq!(progress_row_of(&f, lead).last_model_turn_at, Some(turn_two));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -5296,7 +5564,13 @@ mod tests {
         );
         assert_eq!(
             f.store
-                .manager_inbox(seat, &AgentManagerInboxRequestV1::default())
+                .manager_inbox(
+                    seat,
+                    &AgentManagerInboxRequestV1 {
+                        include_sent: true,
+                        ..Default::default()
+                    },
+                )
                 .unwrap()
                 .messages[0]
                 .message_id,
@@ -5481,7 +5755,13 @@ mod tests {
         );
         assert_eq!(
             f.store
-                .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
+                .manager_inbox(
+                    f.manager,
+                    &AgentManagerInboxRequestV1 {
+                        include_sent: true,
+                        ..Default::default()
+                    },
+                )
                 .unwrap()
                 .messages[0]
                 .message_id,
@@ -5908,6 +6188,71 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
+    fn compact_progress_bounds_text_and_preserves_fences_and_live_work() {
+        use rsi_common::harness_manager::AgentManagerProgressFieldsV1;
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+        let f = fixture(Store::open_in_memory().unwrap());
+        let content = "Useful worker evidence. ".repeat(200);
+        f.store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: f.leads[0],
+                sequence: 1,
+                event_type: EventType::Message,
+                role: Some(Role::Assistant),
+                created_at: Utc::now(),
+                content,
+                tool_name: None,
+                tool_input: None,
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        let full = f
+            .store
+            .manager_progress_page(
+                f.manager,
+                &AgentManagerProgressRequestV1 {
+                    fields: AgentManagerProgressFieldsV1::Full,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let compact = f
+            .store
+            .manager_progress_page(f.manager, &Default::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&compact.config).unwrap(),
+            serde_json::to_value(&full.config).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&compact.fence).unwrap(),
+            serde_json::to_value(&full.fence).unwrap()
+        );
+        assert_eq!(compact.next_after_epic_id, full.next_after_epic_id);
+        assert_eq!(compact.rows.len(), full.rows.len());
+        for (compact, full) in compact.rows.iter().zip(&full.rows) {
+            assert_eq!(compact.epic_id, full.epic_id);
+            assert_eq!(compact.lead_session_id, full.lead_session_id);
+            assert_eq!(compact.pending_question, full.pending_question);
+            assert_eq!(compact.status, full.status);
+            assert!(
+                compact
+                    .last_response
+                    .as_ref()
+                    .is_none_or(|text| text.chars().count() <= 240)
+            );
+        }
+        let before = serde_json::to_vec(&full).unwrap().len();
+        let after = serde_json::to_vec(&compact).unwrap().len();
+        assert!(before > after + 1500);
+        eprintln!("bootstrap progress: before={before} after={after} bytes");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
     fn harness_manager_project_scope_pages_more_than_32_epics_and_defers_notice_overflow() {
         let f = fixture(Store::open_in_memory().unwrap());
         let group = f
@@ -5934,6 +6279,7 @@ mod tests {
         assert_eq!(config.epic_ids.len(), 67);
         assert_eq!(config.explicit_epic_ids(), &[] as &[Uuid]);
         let mut page = AgentManagerProgressRequestV1 {
+            fields: Default::default(),
             project_id: None,
             after_epic_id: None,
             limit: Some(16),
@@ -6519,7 +6865,7 @@ mod tests {
             .store
             .manager_inbox(f.manager, &AgentManagerInboxRequestV1::default())
             .unwrap();
-        assert_eq!(inbox.messages.len(), 4);
+        assert_eq!(inbox.messages.len(), 2);
         assert_eq!(
             inbox
                 .messages
@@ -7057,7 +7403,7 @@ mod tests {
                 .unwrap()
                 .messages
                 .len(),
-            2
+            1
         );
         let mut unrelated = next.clone();
         unrelated.id = Uuid::new_v4();

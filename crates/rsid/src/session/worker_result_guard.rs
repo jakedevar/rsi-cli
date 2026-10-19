@@ -4,9 +4,12 @@
 //! without a final `RESULT ...` line while a process it spawned or a daemon job
 //! it owns is still running gets exactly one automatic continuation: a one-shot
 //! same-session Resume wake telling it to wait for the run in the foreground
-//! and then report. A second miss settles the turn with
+//! and then report. A worker that ended its turn with an armed durable wake of
+//! its own (`when.jobs_terminal`, `resume`, `on_terminal`) is waiting correctly:
+//! the armed wake is the pending result and gets no nudge (#1734, #1958). A second miss settles the turn with
 //! `stop_reason = "no_result"` (surfaced as the terminal reason) and never
-//! continues again. Operator sessions, managers and Epic leads are untouched.
+//! continues again. A final report is also a result line the launch brief
+//! declares or a handoff the worker published to its Issue (#151). Operator sessions, managers and Epic leads are untouched.
 
 use std::sync::Arc;
 
@@ -68,6 +71,7 @@ pub(crate) fn turn_messages_report(events: &[rsi_common::types::ConversationEven
 /// MCP gateway, Codex's code-mode runner, other stdio MCP servers). They live
 /// as long as the provider, so counting them reported "your run is still
 /// going" after every command had exited. `comm` is the kernel's 15-byte name.
+#[cfg(target_os = "linux")]
 pub(crate) fn is_provider_helper_comm(comm: &str) -> bool {
     matches!(comm, "rsi-agent-mcp" | "codex-code-mode")
         || comm.ends_with("-mcp")
@@ -85,6 +89,7 @@ pub(crate) const DESCENDANT_SETTLE: std::time::Duration = std::time::Duration::f
 
 /// Live (non-zombie) descendants of `pid`, by the `/proc` parent chain,
 /// excluding provider helpers and everything below them (#1399).
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn live_descendant_count(pid: u32) -> usize {
     live_descendant_pids(pid).len()
 }
@@ -243,6 +248,21 @@ pub(crate) async fn worker_no_result_verdict(
     if !covered {
         return NoResultVerdict::NotApplicable;
     }
+    // #3218: a reviewer that submitted its receipt has delivered its result.
+    if guard
+        .worker_submitted_review_receipt(session.id)
+        .unwrap_or(false)
+    {
+        return NoResultVerdict::NotApplicable;
+    }
+    // #151: the launch brief's declared result format or a published Issue
+    // handoff is a final report, even without a `RESULT`/`PIPELINE HANDOFF` line.
+    if guard
+        .latest_turn_reported_in_declared_form(session.id)
+        .unwrap_or(false)
+    {
+        return NoResultVerdict::NotApplicable;
+    }
     match guard.worker_no_result_nudged(session.id) {
         Ok(true) => return NoResultVerdict::SecondMiss,
         Ok(false) => {}
@@ -250,6 +270,19 @@ pub(crate) async fn worker_no_result_verdict(
             tracing::warn!(session_id = %session.id, %error, "no-result nudge lookup failed");
             return NoResultVerdict::NotApplicable;
         }
+    }
+    // #1958 (and #1734): an armed durable wake the worker owns (a
+    // `when.jobs_terminal`, `resume` or `on_terminal` wake) is the pending
+    // result: the daemon resumes the worker when it fires, so ending the turn
+    // is a correct wait and gets no nudge, whatever else is still running.
+    if guard
+        .owner_has_armed_result_wake(session.id)
+        .unwrap_or(false)
+        || guard
+            .owner_running_job_has_completion_wake(session.id)
+            .unwrap_or(false)
+    {
+        return NoResultVerdict::NotApplicable;
     }
     let job_running = guard
         .owner_has_running_agent_job(session.id)

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Free a sandbox's build output without breaking the agent harness (#288).
+#
+#   scripts/clean-target [<sandbox-root>]
+#
+# Removes every top-level entry of <sandbox-root>/target except `.rsi-tmp`.
+# The sandbox TMPDIR is `<sandbox>/target/.rsi-tmp`: the Claude harness keeps
+# the running Bash call's output file there, so a plain `rm -rf target` makes
+# that call fail with ENOENT and the harness recreates the directory at once.
+# Build-cache reclaim and the target pool already count a target holding only
+# `.rsi-tmp` as empty. The root defaults to the git worktree around the current
+# directory. A missing target is a no-op; a symlinked target is refused.
+set -euo pipefail
+
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [<sandbox-root>]" >&2
+  exit 2
+fi
+
+if [ "$#" -eq 1 ]; then
+  root="$1"
+else
+  root="$(git rev-parse --show-toplevel)"
+fi
+
+target="$root/target"
+if [ -L "$target" ]; then
+  echo "clean-target: $target is a symlink; refusing" >&2
+  exit 1
+fi
+if [ ! -d "$target" ]; then
+  echo "clean-target: no target directory at $target; nothing to do" >&2
+  exit 0
+fi
+
+find "$target" -mindepth 1 -maxdepth 1 ! -name .rsi-tmp -exec rm -rf {} +

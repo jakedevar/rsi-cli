@@ -671,7 +671,8 @@ fn drain_queued_settlement(
                     .map_err(|error| (error, Some(status))),
                 AgentMessageDispatchEligibility::Ready
                 | AgentMessageDispatchEligibility::DeliverySessionMissing
-                | AgentMessageDispatchEligibility::RecoveryPending(_) => continue,
+                | AgentMessageDispatchEligibility::RecoveryPending(_)
+                | AgentMessageDispatchEligibility::AwaitingResume(_) => continue,
             };
 
             match outcome {
@@ -823,11 +824,13 @@ mod tests {
     #[test]
     fn the_store_guard_is_never_held_across_a_suspension_point() {
         // The wrapper lives in the session module (`rsid`), not next to this file.
-        let source = include_str!("../../../rsid/src/session/mod.rs");
-        let signature = format!(
-            "pub(crate) {} reconcile_agent_messages_once(",
-            concat!("async", " fn")
-        );
+        // Read at run time from the package directory: a relative `include_str!`
+        // breaks when this file moves, and the needle below names no visibility.
+        let session_module =
+            std::path::Path::new(rsi_common::manifest_dir!()).join("../rsid/src/session/mod.rs");
+        let source = std::fs::read_to_string(&session_module)
+            .unwrap_or_else(|error| panic!("read {}: {error}", session_module.display()));
+        let signature = format!("{} reconcile_agent_messages_once(", concat!("async", " fn"));
         let start = source
             .find(&signature)
             .expect("the reconciliation entry point moved; this assertion must follow it");

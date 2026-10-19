@@ -16,15 +16,19 @@
 //!   root, or under their shared parent) and is granted at least one unit
 //!   more than each of them in every allowance, so they narrow it;
 //! - `:manager portfolio configure <JSON>` sends a full typed request;
+//! - `:manager portfolio launch add|remove <node> <Provider/model[/effort]>...`
+//!   (#2103) adds or removes launches on a node's current grant, CAS on its
+//!   grant version, with everything else unchanged;
 //! - `:manager portfolio revoke <node>` revokes one node at its current
 //!   versions.
 
 use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
 use rsi_common::portfolio_nodes::{
-    ConfigurePortfolioNodeRequestV1, PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS,
-    PORTFOLIO_MAX_DIRECT_REPORTS, PortfolioNodeV1, RevokePortfolioNodeRequestV1, valid_tier_label,
+    ConfigurePortfolioNodeLaunchesRequestV1, ConfigurePortfolioNodeRequestV1,
+    PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS, PORTFOLIO_MAX_DIRECT_REPORTS, PortfolioNodeV1,
+    RevokePortfolioNodeRequestV1, prefill_from_revoked_root, valid_tier_label,
 };
-use rsi_common::types::Project;
+use rsi_common::types::{Project, SessionProvider};
 use uuid::Uuid;
 
 use crate::app::App;
@@ -32,7 +36,7 @@ use crate::overlay::global_manager_command::{
     default_allowed_launches, default_project_policy, resolve_projects,
 };
 
-const USAGE: &str = "Use :manager portfolio [list|show <node>|appoint <label> [--adopt <node,...>] [projects...]|configure <JSON>|revoke <node>].";
+const USAGE: &str = "Use :manager portfolio [list|show <node>|appoint <label> [--adopt <node,...>] [projects...]|configure <JSON>|launch add|remove <node> <Provider/model[/effort]>...|revoke <node>].";
 
 /// One parsed `:manager portfolio` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +50,58 @@ pub(crate) enum PortfolioCommand {
         adopt: Vec<String>,
     },
     Configure(String),
+    /// #2103: add (`true`) or remove launches on one node.
+    Launch {
+        add: bool,
+        node: String,
+        launches: Vec<ManagerLaunchChoiceV2>,
+    },
     Revoke(String),
+}
+
+/// Efforts a trailing `/segment` of a launch spelling may name; any other
+/// trailing segment is part of the model id (`openai/gpt-x`).
+const LAUNCH_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Parse `Provider/model[/effort]` (provider case-insensitive).
+pub(crate) fn parse_launch(spelling: &str) -> Result<ManagerLaunchChoiceV2, String> {
+    let bad = || format!("Invalid launch {spelling}; use Provider/model[/effort].");
+    let (provider, rest) = spelling.split_once('/').ok_or_else(bad)?;
+    let provider = SessionProvider::parse_name(provider).ok_or_else(bad)?;
+    let (model, effort) = match rest.rsplit_once('/') {
+        Some((model, effort)) if LAUNCH_EFFORTS.contains(&effort) => {
+            (model, Some(effort.to_string()))
+        }
+        _ => (rest, None),
+    };
+    if model.is_empty() {
+        return Err(bad());
+    }
+    Ok(ManagerLaunchChoiceV2 {
+        provider,
+        model: model.into(),
+        effort,
+    })
+}
+
+fn parse_launch_command(rest: &str) -> Result<PortfolioCommand, String> {
+    let usage = || "Use :manager portfolio launch add|remove <node> <Provider/model[/effort]>...";
+    let mut words = rest.split_whitespace();
+    let add = match words.next() {
+        Some("add") => true,
+        Some("remove") => false,
+        _ => return Err(usage().into()),
+    };
+    let node = words.next().ok_or_else(|| usage().to_string())?;
+    let launches = words.map(parse_launch).collect::<Result<Vec<_>, _>>()?;
+    if launches.is_empty() {
+        return Err(usage().into());
+    }
+    Ok(PortfolioCommand::Launch {
+        add,
+        node: node.into(),
+        launches,
+    })
 }
 
 pub(crate) fn parse(command: &str) -> Result<PortfolioCommand, String> {
@@ -59,6 +114,7 @@ pub(crate) fn parse(command: &str) -> Result<PortfolioCommand, String> {
         "show" if !rest.is_empty() => Ok(PortfolioCommand::Show(rest.into())),
         "revoke" if !rest.is_empty() => Ok(PortfolioCommand::Revoke(rest.into())),
         "configure" if !rest.is_empty() => Ok(PortfolioCommand::Configure(rest.into())),
+        "launch" if !rest.is_empty() => parse_launch_command(rest),
         "appoint" if !rest.is_empty() => {
             let (label, projects) = rest
                 .split_once(char::is_whitespace)
@@ -141,7 +197,12 @@ pub(crate) fn covering_policy(
             _ => None,
         };
         for launch in &child.allowed_launches {
-            if !policy.allowed_launches.is_empty() && !policy.allowed_launches.contains(launch) {
+            if !policy.allowed_launches.is_empty()
+                && !policy
+                    .allowed_launches
+                    .iter()
+                    .any(|entry| entry.allows(launch))
+            {
                 policy.allowed_launches.push(launch.clone());
             }
         }
@@ -159,7 +220,7 @@ pub(crate) fn covering_launches(
     let mut launches = base.to_vec();
     for child in children {
         for launch in &child.grant.allowed_launches {
-            if !launches.contains(launch) {
+            if !launches.iter().any(|entry| entry.allows(launch)) {
                 launches.push(launch.clone());
             }
         }
@@ -362,13 +423,25 @@ pub(crate) async fn run(app: &mut App, command: &str) -> Result<String, String> 
             let seat = app
                 .selected_session_id()
                 .ok_or_else(|| "Focus the session to appoint as the node's seat.".to_string())?;
-            let nodes = app
+            let all_nodes = app
                 .client
-                .list_portfolio_nodes(false)
+                .list_portfolio_nodes(true)
                 .await
                 .map_err(rpc_error)?;
+            let nodes: Vec<PortfolioNodeV1> = all_nodes
+                .iter()
+                .filter(|node| node.state == "active")
+                .cloned()
+                .collect();
+            // #1902: a new root starts from the most recent revoked root
+            // grant over the same coverage, not the defaults.
+            let mut prefill_note = None;
             let request = if adopt.is_empty() {
                 let project_ids = appoint_projects(&app.projects, &nodes, &projects)?;
+                let prefill = prefill_from_revoked_root(&all_nodes, &project_ids);
+                prefill_note = prefill
+                    .as_ref()
+                    .map(crate::overlay::global_manager_command::prefill_summary);
                 ConfigurePortfolioNodeRequestV1 {
                     node_id: None,
                     parent_node_id: None,
@@ -377,10 +450,22 @@ pub(crate) async fn run(app: &mut App, command: &str) -> Result<String, String> 
                     tier_label: label,
                     seat_session_id: seat,
                     project_ids,
-                    allowed_launches: default_allowed_launches(),
-                    policy: default_project_policy(),
-                    child_policy: None,
-                    max_direct_reports: PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS,
+                    allowed_launches: prefill
+                        .as_ref()
+                        .map_or_else(default_allowed_launches, |prefill| {
+                            prefill.allowed_launches.clone()
+                        }),
+                    policy: prefill
+                        .as_ref()
+                        .map_or_else(default_project_policy, |prefill| prefill.policy.clone()),
+                    child_policy: prefill
+                        .as_ref()
+                        .and_then(|prefill| prefill.child_policy.clone()),
+                    max_direct_reports: prefill
+                        .as_ref()
+                        .map_or(PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS, |prefill| {
+                            prefill.max_direct_reports
+                        }),
                     expected_node_grant_version: 0,
                     expected_authority_epoch: 0,
                     idempotency_key: Uuid::new_v4().to_string(),
@@ -433,8 +518,9 @@ pub(crate) async fn run(app: &mut App, command: &str) -> Result<String, String> 
             };
             Ok(if adopted == 0 {
                 format!(
-                    "Portfolio node appointed: {}",
-                    node_summary(&node, &app.projects)
+                    "Portfolio node appointed: {}{}",
+                    node_summary(&node, &app.projects),
+                    prefill_note.map_or_else(String::new, |note| format!(". {note}"))
                 )
             } else {
                 format!(
@@ -458,6 +544,47 @@ pub(crate) async fn run(app: &mut App, command: &str) -> Result<String, String> 
             Ok(format!(
                 "Portfolio node saved: {}",
                 node_summary(&node, &app.projects)
+            ))
+        }
+        PortfolioCommand::Launch {
+            add,
+            node,
+            launches,
+        } => {
+            let nodes = app
+                .client
+                .list_portfolio_nodes(false)
+                .await
+                .map_err(rpc_error)?;
+            let id = resolve_node(&nodes, &node)?;
+            let current = app
+                .client
+                .get_portfolio_node(id)
+                .await
+                .map_err(rpc_error)?
+                .ok_or_else(|| format!("No portfolio node {node}"))?;
+            let (add_launches, remove_launches) = if add {
+                (launches, Vec::new())
+            } else {
+                (Vec::new(), launches)
+            };
+            let request = ConfigurePortfolioNodeLaunchesRequestV1 {
+                node_id: current.node_id,
+                add: add_launches,
+                remove: remove_launches,
+                expected_node_grant_version: current.grant.grant_version,
+                idempotency_key: Uuid::new_v4().to_string(),
+            };
+            request.validate().map_err(rpc_error)?;
+            let saved = app
+                .client
+                .configure_portfolio_node_launches(request, false)
+                .await
+                .map_err(rpc_error)?;
+            Ok(format!(
+                "Portfolio launches updated ({} allowed): {}",
+                saved.grant.allowed_launches.len(),
+                node_summary(&saved, &app.projects)
             ))
         }
         PortfolioCommand::Revoke(arg) => {

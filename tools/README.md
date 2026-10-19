@@ -34,6 +34,14 @@ guarded `rsi-rolling-land` publisher uses a private clone and sets
 guard rail, not a security boundary: any agent can spoof the marker or bypass
 the hook. The lander enforces test gates and fast-forward publication.
 
+An operator push to `refs/heads/rolling` that the lander did not mark runs the
+fast static guards on the pushed commit (about a second): the Python syntax of
+the `scripts/` and `tools/` files the push changes, `check-released-migrations.py`
+against the remote tip, the identity-assertion guard, and the portable-shell guard. It refuses on a failure
+and always prints the one-line queue command (`rsi land <session-id|branch>`,
+#2055), because a manual merge and push skips every gate. `RSI_SKIP_STATIC_GUARDS=1`
+is the documented operator override.
+
 Run `python3 tools/test_pre_push.py` for real Git push checks.
 
 ## CI — `.github/workflows/test.yml` job `validators`
@@ -57,6 +65,12 @@ every new version. Refresh after adding a migration with:
 python3 tools/check-released-migrations.py --refresh
 ```
 
+The inventory is derived output: never hand-edit it. When a merge of
+`origin/rolling` conflicts on `tools/released-migrations.json`, leave the
+conflict markers and run the same command: `--refresh` unions the pins of both
+merge sides and appends the pins for your new versions from source (a version
+both sides pin differently still fails).
+
 When the migration adds a new helper file, include it in the refresh so its
 marked sections are pinned:
 
@@ -74,6 +88,12 @@ Never repair them in place; add a forward migration.
   (default `main`); `corpus` is a lenient advisory sweep that always exits 0.
 - **`check-released-migrations.py [BASE [HEAD]]`** — hard-fail retroactive
   edits to released migration blocks or protected catalog/helper regions.
+- **`check_starter_pins.py [BASE [HEAD]]`** (#3070) — hard-fail a changed starter
+  topology JSON (`crates/rsid/src/topology/starters/*.json`) whose digest fixture
+  in `starters_tests.rs` was not moved or whose replaced digest was not appended
+  to `SHIPPED_BEFORE` in `starters.rs`. A text-only comparison, no build; run by
+  `scripts/scoped-test` as the `starter_pins` static guard and by the pre-push
+  hook. Tests: `python3 -m unittest tools/test_check_starter_pins.py`.
 - **`check-command-mirrors.sh`** — CI entrypoint for the single command-mirror
   pipeline. It delegates to `scripts/sync-agent-commands.sh --check`, which
   renders every top-level Claude-canonical command as a Codex adapter
@@ -83,3 +103,29 @@ Never repair them in place; add a forward migration.
   files or rendered-content drift, so new Claude commands or skills cannot
   silently lack Codex equivalents.
 - **`install-hooks.sh`** — activate the git hooks (`core.hooksPath`).
+
+## Portable-shell guard — `check_portable_shell.py`
+
+Scripts under `scripts/` run on the Linux hub and the macOS satellite (bash 3.2, BSD
+userland), so a BSD-only or GNU-only form breaks one of them (#2936, local #322).
+`tools/check_portable_shell.py` (wrapper `scripts/check-portable-shell.sh`) flags
+`mktemp -t` without X's, `sed -i ''`, bare `sed -i`, `stat -f`/`-c`, `date -j`/`-d`,
+`readlink -f`, `grep -P`, `xargs -r` and bash 4+ (`declare -A`, `mapfile`, `${var,,}`,
+`wait -n`), and each finding names the portable alternative. It scans `*.sh`/`*.bash`
+and shebang-shell files under `scripts/`, including heredoc bodies that feed a shell
+(`ssh host bash -s <<EOF`, `cat > x.sh <<EOF`); heredocs to Python or plain text are skipped.
+
+A form is allowed inside an `if`/`case` that probes `uname`/`$OSTYPE`, when a BSD and a
+GNU form of one tool are joined by `||` in one command list (the `stat -c ... || stat -f ...`
+fallback, including a line ending in `||` or `\\` then `||`; adjacent lines alone are not),
+or under a marker: `# portability: linux-only` exempts GNU-only forms and
+`# portability: macos-only` exempts BSD-only forms, in the file's leading comment block
+(whole file), on the line, or on the comment line above it.
+
+Existing uses are counted per file in `tools/portable-shell-baseline.json`. The guard
+fails on a file above its count, on a stale (too high) count, and, with `--base REF`, on a
+baseline that raises any count over REF's. Lower the baseline after fixing a use with
+`python3 tools/check_portable_shell.py --refresh`; it refuses to raise it. It runs in the
+pre-commit hook (staged `scripts/` files), the pre-push static guards, and
+`scripts/scoped-test` (the lander's static guards, with the base comparison). Tests:
+`python3 -m unittest scripts/tests/test_check_portable_shell.py`.

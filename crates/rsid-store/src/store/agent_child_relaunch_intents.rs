@@ -70,7 +70,7 @@ pub(super) fn apply_v130_migration(store: &Store) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v130-agent-child-relaunch-intents
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) const V130_CATALOG_OBJECTS: [(&str, &str); 4] = [
     ("table", "agent_child_relaunch_intents"),
     ("index", "agent_child_relaunch_intents_one_open_per_tip"),
@@ -78,7 +78,7 @@ pub(crate) const V130_CATALOG_OBJECTS: [(&str, &str); 4] = [
     ("trigger", "agent_child_relaunch_intents_forward"),
 ];
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn rewind_v130_fixture_to_v129(connection: &rusqlite::Connection) {
     let tx = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)

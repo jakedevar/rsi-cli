@@ -1,0 +1,36 @@
+{
+  "name": "projects_without_global_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/projects"
+  },
+  "response": {
+    "body": {
+      "messages_enabled": true,
+      "projects": [
+        {
+          "global_manager": null,
+          "name": "Alpha",
+          "project_id": "550e8400-e29b-41d4-a716-446655440000",
+          "project_manager": {
+            "last_activity_at": "2026-10-17T09:30:00.000000000Z",
+            "model": "claude-opus-5-5",
+            "pending_decisions": 2,
+            "pending_decisions_truncated": false,
+            "provider": "Claude",
+            "role": "project_manager",
+            "session_id": "550e8400-e29b-41d4-a716-446655440001",
+            "status": "Running"
+          }
+        }
+      ]
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

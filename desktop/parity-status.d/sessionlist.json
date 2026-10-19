@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:group": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "opens the label picker for the open session (also :groups)"
+    },
+    "cmd:project": {
+      "status": "substitute",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": ":project <name> filters the list to that project (exact, then unique prefix or substring); without a name it opens the picker"
+    },
+    "cmd:project-delete": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "deletes the named project after a confirm; without a name it asks which"
+    },
+    "cmd:project-edit": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "edits the named project, else the filtered one, else asks which"
+    },
+    "cmd:project-new": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": ":project-new <name> [path] creates a blue project; without an argument it opens the form"
+    },
+    "cmd:projects": {
+      "status": "substitute",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "opens the project picker, which filters the list"
+    },
+    "global:backspace/search-line": {
+      "status": "done",
+      "location": "src/sessions.ts",
+      "note": "the filter box is a text input; the list re-filters on every keystroke"
+    },
+    "global:char/search-line": {
+      "status": "done",
+      "location": "src/sessions.ts",
+      "note": "the filter box is a text input; the list re-filters on every keystroke"
+    },
+    "global:enter/search-line": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "Enter in the filter box keeps the filter and returns to the list"
+    },
+    "global:esc/normal-mode-with-a-confirmed-search": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "Esc in the list (no field focused, no dialog) clears a confirmed filter"
+    },
+    "global:esc/search-line": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "Esc in the filter box clears it and returns to the list"
+    },
+    "key:-": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "moves the list cursor to the enclosing Group or Epic row (the tree shows containers inline, so there is no descent level)"
+    },
+    "key:<Space>1": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>2": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>3": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>4": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>5": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>6": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>7": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>8": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>9": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "jumps to the Nth session that needs you, in list order (needs-you sessions sort first)"
+    },
+    "key:<Space>C": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "picker that moves the open session to another project (or none)"
+    },
+    "key:<Space>p": {
+      "status": "substitute",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "project picker that filters the session list to one project (there are no workspace panes in the desktop)"
+    },
+    "key:<Space>s": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "sort picker with the TUI orders; the choice is kept in local storage"
+    },
+    "key:F3": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts, src/listmodel.ts, src/context-model.ts",
+      "note": "Session info dialog with the TUI rows (title, id, kind, status, provider, model, dir, project, created, the context-budget rows of types/context_budget.rs detail_rows, parent, lead, sandbox, rating, label, tags, description); R opens the rating dialog and G the label picker, as in the TUI panel"
+    },
+    "key:H": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "same as -: cursor to the parent row"
+    },
+    "key:N": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "the previous event, or with no session open the previous matching session (G2)"
+    },
+    "key:[g": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "cursor to the first row of the previous label group"
+    },
+    "key:]g": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "cursor to the first row of the next label group"
+    },
+    "key:mo": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "SetSessionParent with no parent; the daemon rejects kinds that cannot sit at the top level"
+    },
+    "key:mp": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "picker of Groups and Epics (not the session or its descendants); the daemon enforces the containment rules and its refusal is shown"
+    },
+    "key:n": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "with a session open, the next conversation event that contains the filter text (the TUI detail search); with none open, the next session the filter matches (G2)"
+    },
+    "module:ui/overlay/label_form.rs": {
+      "status": "done",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "Name, Description and Color dialog"
+    },
+    "module:ui/overlay/label_picker.rs": {
+      "status": "done",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "type-to-filter label picker"
+    },
+    "module:ui/overlay/project_form.rs": {
+      "status": "done",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "Name, Path and Color dialog"
+    },
+    "module:ui/overlay/project_picker.rs": {
+      "status": "substitute",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "project picker that filters the session list"
+    },
+    "module:ui/overlay/session_info.rs": {
+      "status": "done",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts, src/context-model.ts",
+      "note": "session info with the context-budget rows (G2) and R"
+    },
+    "module:ui/overlay/sort_picker.rs": {
+      "status": "done",
+      "location": "src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "sort picker dialog"
+    },
+    "overlay-ref:label-form": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "Name, Description and Color; Enter saves, Esc cancels"
+    },
+    "overlay-ref:label-picker": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "type-to-filter; Enter assigns; New / Edit / Delete buttons or Ctrl-N / Ctrl-E / Ctrl-D; a (none) entry clears"
+    },
+    "overlay-ref:project-form": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "see the project form overlay row"
+    },
+    "overlay-ref:project-picker": {
+      "status": "substitute",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "see the project picker overlay row"
+    },
+    "overlay-ref:session-info": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "F3: R rates, G opens the label picker, Esc / q close, Space N / Space ;; the context-budget rows (G2)"
+    },
+    "overlay-ref:sort-picker": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "see the sort picker overlay row"
+    },
+    "overlay:project-form-overlay-create-edit": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "Name, Path and Color (the TUI palette as radio swatches); Tab moves, Left/Right cycles the color, Enter saves, Esc cancels"
+    },
+    "overlay:project-picker-overlay-workspace-opener": {
+      "status": "substitute",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "type-to-filter picker; Enter filters the list to the project; New / Edit / Delete are buttons and Ctrl-N / Ctrl-E / Ctrl-D where the platform leaves them to the page"
+    },
+    "overlay:sort-picker-overlay-space-s": {
+      "status": "done",
+      "location": "src/listmodel.ts, src/actions/sessionlist-run.ts, src/pickers.ts",
+      "note": "j/k or arrows choose, Enter applies, Esc/q cancels; the current order is ticked"
+    },
+    "section:attention-jumps": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "]a / [a and <Space>1-9; digits stay vim counts"
+    },
+    "section:navigation-attention-queue": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "]a / [a and <Space>1-9 and the attention queue dialog"
+    },
+    "section:project-workspace-navigation": {
+      "status": "substitute",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "the project picker filters the list; the desktop has no per-project workspace panes"
+    },
+    "section:search": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "live list filter with Enter to confirm and Esc to clear; n / N step through the open conversation's matching events, or the matching sessions with none open. The TUI's file search is the files slice's <Space><Space> picker"
+    },
+    "section:session-labeling": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "label picker, label chips on rows, ]g / [g, grouped-by-label sort"
+    }
+  }
+}

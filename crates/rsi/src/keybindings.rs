@@ -204,6 +204,16 @@ fn registered_normal_effect(
             RegisteredNormalEffect::Application(LcAction::ToggleRotationDisabled)
         }
         ActionId::CancelRetry => RegisteredNormalEffect::Application(LcAction::CancelRetry),
+        ActionId::TodoPanel => RegisteredNormalEffect::Application(LcAction::ToggleTodoPanel),
+        ActionId::TodoNext => RegisteredNormalEffect::Application(LcAction::TodoNext),
+        ActionId::TodoPrev => RegisteredNormalEffect::Application(LcAction::TodoPrev),
+        ActionId::TodoOpenLink => RegisteredNormalEffect::Application(LcAction::TodoOpenLink),
+        ActionId::TodoDone => RegisteredNormalEffect::Application(LcAction::TodoDone),
+        ActionId::TodoDismiss => RegisteredNormalEffect::Application(LcAction::TodoDismiss),
+        ActionId::TodoCopy => RegisteredNormalEffect::Application(LcAction::TodoCopy),
+        ActionId::TodoAcknowledge => RegisteredNormalEffect::Application(LcAction::TodoAcknowledge),
+        ActionId::TodoPopup => RegisteredNormalEffect::Application(LcAction::TodoPopup),
+        ActionId::TodoUndo => RegisteredNormalEffect::Application(LcAction::TodoUndo),
         ActionId::CommitAndPush => RegisteredNormalEffect::Application(LcAction::CommitAndPush),
         ActionId::OpenSessionInNewTab => {
             RegisteredNormalEffect::Application(LcAction::OpenSessionInNewTab)
@@ -226,6 +236,7 @@ fn registered_normal_effect(
         }
         ActionId::EspSquare => RegisteredNormalEffect::Application(LcAction::OpenEspSquare),
         ActionId::RunEpicTopology => RegisteredNormalEffect::Application(LcAction::RunEpicTopology),
+        ActionId::LandSession => RegisteredNormalEffect::Application(LcAction::LandSessionBranch),
         ActionId::CreateGroup => RegisteredNormalEffect::Application(LcAction::CreateGroup),
         ActionId::CreateEpic => RegisteredNormalEffect::Application(LcAction::CreateEpic),
         ActionId::CreateStory => RegisteredNormalEffect::Application(LcAction::CreateStory),
@@ -546,6 +557,7 @@ mod tests {
             ("<Space>gg", &[ToggleGitPanel]),
             ("<Space>gb", &[OpenHarnessManagerBoard]),
             ("<Space>gd", &[OpenHarnessManagerDecisions]),
+            ("<Space>gl", &[LandSessionBranch]),
             ("<Space>gp", &[EditHarnessManagerPolicy]),
             ("<Space>gr", &[]),
             ("<Space>h", &[]),
@@ -553,6 +565,18 @@ mod tests {
             ("<Space>hs", &[DowngradeOperatorPause]),
             ("<Space>i", &[OpenIssuesWorkspace]),
             ("<Space>k", &[CancelRetry]),
+            ("<Space>d", &[]),
+            ("<Space>dt", &[ToggleTodoPanel]),
+            ("<Space>dj", &[TodoNext]),
+            ("<Space>dk", &[TodoPrev]),
+            ("<Space>do", &[TodoOpenLink]),
+            ("<Space>dv", &[TodoPopup]),
+            ("<Space>dy", &[TodoCopy]),
+            ("<Space>dc", &[TodoCopy]),
+            ("<Space>dd", &[TodoDone]),
+            ("<Space>dx", &[TodoDismiss]),
+            ("<Space>du", &[TodoUndo]),
+            ("<Space>da", &[TodoAcknowledge]),
             ("<Space>m", &[]),
             ("<Space>mm", &[OpenModelSwitchPicker]),
             ("<Space>M", &[OpenMemorySearch]),
@@ -879,6 +903,7 @@ mod tests {
             ("p", Dispatch(TogglePromptPreview)),
             ("ga", Dispatch(GoToArchiveZone)),
             ("<Space>gX", Dispatch(GoToTrash)),
+            ("<Space>gl", Dispatch(LandSessionBranch)),
             ("gt", Inert),
             ("gj", Dispatch(GoToJobsZone)),
             ("<Space>gq", Dispatch(OpenQuestionModal)),
@@ -902,6 +927,17 @@ mod tests {
             ("<Space>N", Dispatch(BlankPrompt)),
             ("<Space>r", Dispatch(ToggleRotationDisabled)),
             ("<Space>k", Dispatch(CancelRetry)),
+            ("<Space>dt", Dispatch(ToggleTodoPanel)),
+            ("<Space>dj", Dispatch(TodoNext)),
+            ("<Space>dk", Dispatch(TodoPrev)),
+            ("<Space>do", Dispatch(TodoOpenLink)),
+            ("<Space>dv", Dispatch(TodoPopup)),
+            ("<Space>dy", Dispatch(TodoCopy)),
+            ("<Space>dc", Dispatch(TodoCopy)),
+            ("<Space>dd", Dispatch(TodoDone)),
+            ("<Space>dx", Dispatch(TodoDismiss)),
+            ("<Space>du", Dispatch(TodoUndo)),
+            ("<Space>da", Dispatch(TodoAcknowledge)),
             ("<Space>S", Inert),
             ("<Space>T", Dispatch(OpenSessionInNewTab)),
             ("<Space>q", Dispatch(CloseFocusedPane)),
@@ -950,7 +986,10 @@ mod tests {
         // Blank launches from both `Ctrl-N` and `<Space>N`.
         // The four retired mini-DAG chords are excluded from the old 92-call
         // inventory; the three loops expand to 12 + 9 + 9 mappings.
-        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4 + 1);
+        // The eleven `<Space>d` operator to-do chords (#1747, #1903, #2950: eight
+        // actions, `dc` kept beside `dy`, plus view and undo) add 11 more,
+        // and the `<Space>gl` operator landing chord (#2055) adds 1.
+        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4 + 1 + 11 + 1);
 
         for (sequence, pin) in &cases {
             let actions = all_actions_for_events(&pinned_sequence_events(sequence));

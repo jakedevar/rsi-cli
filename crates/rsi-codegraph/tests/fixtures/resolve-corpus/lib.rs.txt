@@ -1,0 +1,7 @@
+//! Frozen resolution corpus: copies of `impact.rs`, `resolve.rs` and
+//! `bin/rsi-test-impact.rs` as of #2244, kept stable so the resolution rate is
+//! comparable across extractor changes. Items the real crate root defines are
+//! intentionally absent: references to them stay unresolved.
+
+pub mod impact;
+pub mod resolve;

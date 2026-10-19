@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:issue": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/issues.ts",
+      "note": ":issue 12 or :issue #12 finds the Issue wherever it lives, archived included; bare :issue asks for the number"
+    },
+    "cmd:issues": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/issues.ts",
+      "note": "opens the Issues workspace"
+    },
+    "key:<Space>i": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/issues.ts",
+      "note": "opens the Issues workspace for a project"
+    },
+    "module:ui/issue_detail.rs": {
+      "status": "substitute",
+      "location": "src/issues.ts, src/issues-tracker-model.ts",
+      "note": "the inspector with body, metadata, dependencies, events, handoffs and the associated-session selection (G2). Substitute for the fold cursor: handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole"
+    },
+    "module:ui/issues.rs": {
+      "status": "done",
+      "location": "src/issues.ts, src/issues-tracker-model.ts",
+      "note": "the Local, Dispatched and Sync tabs (G2)"
+    },
+    "section:issues-workspace-space-i-or-issues": {
+      "status": "done",
+      "location": "src/issues.ts, src/issues-model.ts, src/actions/issues.ts, src/issues-tracker-model.ts, src-tauri/src/issues_tracker.rs",
+      "note": "Local tab: bounded pages with j/k/gg/G, / and f filters, saved views Ready/Blocked/Mine/Recent, O operator filter, s sort, inspector with Blocked by, Blocks, Events and Handoffs (Tab, PageDown loads more, PageUp backs up), n/e/S/p/a/l/b/dd/A/U writes with the TUI retry rules (stale reload or rebase, also Ctrl-L / Ctrl-R in the form, identical retry key), yy and y# copy, the dependency form taking a number or words to search a bounded candidate page, T starting issue-implement-review-land on the Issue (slice 11's topology run), and the associated sessions (issue_tracker_id) in the inspector, Enter there opening the selected one. G2 adds the Dispatched tab (ListDispatchedIssues: j/k by session and tracker id, Enter inspects, Enter again opens or recovers the session) and the Sync tab (GetIssueTrackerStatus, P runs TriggerIssueTrackerPoll and shows every error, then Sync and Dispatched refresh), switched with [ / ] or the tab bar; r refreshes the active tab"
+    }
+  }
+}

@@ -1,15 +1,27 @@
 //! V94 retained journal and V95 hardening for source-worktree settlement.
 
+mod agent_scope;
+pub(crate) mod completion_retry;
+pub(crate) mod reproof;
+pub(crate) mod untouched_intent;
+pub use agent_scope::{agent_settlement_refusal, normalize_agent_settlement_error};
+
 use super::Store;
 use super::sandbox_custody::{self, CustodyCause};
+use super::terminal_custody_shape::{
+    TerminalCustodyFacts, TerminalCustodyShape, classify_terminal_custody_shape,
+};
 use crate::error::{DaemonError, Result};
 use chrono::{SecondsFormat, Utc};
 use rsi_common::cohort_settlement::{
-    SOURCE_WORKTREE_SETTLEMENT_MAX_IDENTITY_BYTES, SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS,
-    SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION, SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
-    SourceWorktreeCohortSummaryV1, SourceWorktreeGitOidV1, SourceWorktreeSettlementCountsV1,
-    SourceWorktreeSettlementItemV1, SourceWorktreeSettlementPhaseV1,
-    SourceWorktreeSettlementRefusalV1, SourceWorktreeSettlementRunStateV1,
+    SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES, SOURCE_WORKTREE_SETTLEMENT_MAX_IDENTITY_BYTES,
+    SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS, SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+    SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION, SourceWorktreeCohortSummaryV1,
+    SourceWorktreeDispositionV1, SourceWorktreeGitOidV1, SourceWorktreeRetainedRootV1,
+    SourceWorktreeSettlementAttributionV1, SourceWorktreeSettlementCountsV1,
+    SourceWorktreeSettlementItemV1, SourceWorktreeSettlementOriginV1,
+    SourceWorktreeSettlementPhaseV1, SourceWorktreeSettlementRefusalV1,
+    SourceWorktreeSettlementRunStateV1, SourceWorktreeSettlementRunSummaryV1,
     SourceWorktreeSettlementRunV1, validate_git_oid, validate_idempotency_key, validate_identity,
     validate_sha256_digest, validate_source_ref, validate_target_ref,
 };
@@ -19,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "test-seam"))]
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -31,12 +43,110 @@ const V94_DEPLOYED_SETTLEMENT_CATALOG_FINGERPRINT: &str =
 pub(crate) const V95_SETTLEMENT_CATALOG_FINGERPRINT: &str =
     "sha256:8735eede240ad2f1c0c98232796240ec951e686411297b19a1cfd4ad69c6b7bf";
 // RSI-RELEASED-MIGRATION-END: v94-v95-settlement-fingerprints
+#[cfg(test)]
+pub(crate) const SETTLEMENT_ATTRIBUTION_SCHEMA_VERSION: i32 = 167;
+#[cfg(test)]
+pub(crate) const SETTLEMENT_DELETED_OWNER_SCHEMA_VERSION: i32 = 168;
+const ORIGINAL_TERMINAL_STATUSES: &str =
+    "original_status IN ('Completed','Failed','Interrupted','Archived')";
+const INCLUDING_DELETED_TERMINAL_STATUS: &str =
+    "original_status IN ('Completed','Failed','Interrupted','Archived','Deleted')";
+/// Exact V95 catalog text of the retained journal table (original terminal statuses).
+const SETTLEMENT_ITEMS_TABLE_SQL_ORIGINAL: &str = "CREATE TABLE source_worktree_settlement_items (
+            run_id TEXT NOT NULL REFERENCES source_worktree_settlement_runs(run_id),
+            sequence INTEGER NOT NULL CHECK(sequence>=0),
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            original_status TEXT NOT NULL CHECK(original_status IN ('Completed','Failed','Interrupted','Archived')),
+            original_updated_at TEXT NOT NULL,
+            custody_id TEXT NOT NULL REFERENCES sandbox_custody_roots(custody_id),
+            custody_generation INTEGER NOT NULL CHECK(custody_generation>0),
+            canonical_repo_dir TEXT NOT NULL,
+            sandbox_root TEXT NOT NULL,
+            sandbox_branch TEXT NOT NULL,
+            repository_identity TEXT NOT NULL,
+            source_ref TEXT NOT NULL CHECK(source_ref GLOB 'refs/heads/rsi/*'),
+            source_oid TEXT NOT NULL CHECK(length(source_oid) IN (40,64) AND source_oid=lower(source_oid) AND source_oid NOT GLOB '*[^0-9a-f]*'),
+            target_oid TEXT NOT NULL CHECK(length(target_oid) IN (40,64) AND target_oid=lower(target_oid) AND target_oid NOT GLOB '*[^0-9a-f]*'),
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=71 AND evidence_digest GLOB 'sha256:*' AND substr(evidence_digest,8) NOT GLOB '*[^0-9a-f]*'),
+            clean_state_digest TEXT NOT NULL CHECK(length(clean_state_digest)=71 AND clean_state_digest GLOB 'sha256:*' AND substr(clean_state_digest,8) NOT GLOB '*[^0-9a-f]*'),
+            reserved_effects INTEGER NOT NULL CHECK(reserved_effects>=0),
+            active_effects INTEGER NOT NULL CHECK(active_effects>=0),
+            participant_count INTEGER NOT NULL CHECK(participant_count>0),
+            phase TEXT NOT NULL CHECK(phase IN ('planned','intent_committed','worktree_removed','branch_removed','settled','refused','recovery_required','unattempted')),
+            before_observation TEXT CHECK(before_observation IS NULL OR length(before_observation)<=16384),
+            after_observation TEXT CHECK(after_observation IS NULL OR length(after_observation)<=16384),
+            refusal_code TEXT CHECK(refusal_code IS NULL OR refusal_code IN (
+                'audit_drift','idempotency_conflict','custody_drift','runtime_owner_active',
+                'runtime_state_contended','worktree_remove_failed','worktree_residue',
+                'target_drift','source_ref_drift','source_ref_in_use','ref_delete_failed',
+                'external_registration_race','database_settlement_failed',
+                'recovery_target_unavailable','recovery_proof_failed'
+            )),
+            created_at TEXT NOT NULL CHECK(length(created_at)=30 AND created_at GLOB '????-??-??T??:??:??.?????????Z'),
+            updated_at TEXT NOT NULL CHECK(length(updated_at)=30 AND updated_at GLOB '????-??-??T??:??:??.?????????Z'),
+            PRIMARY KEY(run_id,sequence),
+            UNIQUE(run_id,session_id)
+        )";
+
+/// The same table with the additive `Deleted` terminal status (schema 168).
+const SETTLEMENT_ITEMS_TABLE_SQL_WITH_DELETED: &str = "CREATE TABLE source_worktree_settlement_items (
+            run_id TEXT NOT NULL REFERENCES source_worktree_settlement_runs(run_id),
+            sequence INTEGER NOT NULL CHECK(sequence>=0),
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            original_status TEXT NOT NULL CHECK(original_status IN ('Completed','Failed','Interrupted','Archived','Deleted')),
+            original_updated_at TEXT NOT NULL,
+            custody_id TEXT NOT NULL REFERENCES sandbox_custody_roots(custody_id),
+            custody_generation INTEGER NOT NULL CHECK(custody_generation>0),
+            canonical_repo_dir TEXT NOT NULL,
+            sandbox_root TEXT NOT NULL,
+            sandbox_branch TEXT NOT NULL,
+            repository_identity TEXT NOT NULL,
+            source_ref TEXT NOT NULL CHECK(source_ref GLOB 'refs/heads/rsi/*'),
+            source_oid TEXT NOT NULL CHECK(length(source_oid) IN (40,64) AND source_oid=lower(source_oid) AND source_oid NOT GLOB '*[^0-9a-f]*'),
+            target_oid TEXT NOT NULL CHECK(length(target_oid) IN (40,64) AND target_oid=lower(target_oid) AND target_oid NOT GLOB '*[^0-9a-f]*'),
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=71 AND evidence_digest GLOB 'sha256:*' AND substr(evidence_digest,8) NOT GLOB '*[^0-9a-f]*'),
+            clean_state_digest TEXT NOT NULL CHECK(length(clean_state_digest)=71 AND clean_state_digest GLOB 'sha256:*' AND substr(clean_state_digest,8) NOT GLOB '*[^0-9a-f]*'),
+            reserved_effects INTEGER NOT NULL CHECK(reserved_effects>=0),
+            active_effects INTEGER NOT NULL CHECK(active_effects>=0),
+            participant_count INTEGER NOT NULL CHECK(participant_count>0),
+            phase TEXT NOT NULL CHECK(phase IN ('planned','intent_committed','worktree_removed','branch_removed','settled','refused','recovery_required','unattempted')),
+            before_observation TEXT CHECK(before_observation IS NULL OR length(before_observation)<=16384),
+            after_observation TEXT CHECK(after_observation IS NULL OR length(after_observation)<=16384),
+            refusal_code TEXT CHECK(refusal_code IS NULL OR refusal_code IN (
+                'audit_drift','idempotency_conflict','custody_drift','runtime_owner_active',
+                'runtime_state_contended','worktree_remove_failed','worktree_residue',
+                'target_drift','source_ref_drift','source_ref_in_use','ref_delete_failed',
+                'external_registration_race','database_settlement_failed',
+                'recovery_target_unavailable','recovery_proof_failed'
+            )),
+            created_at TEXT NOT NULL CHECK(length(created_at)=30 AND created_at GLOB '????-??-??T??:??:??.?????????Z'),
+            updated_at TEXT NOT NULL CHECK(length(updated_at)=30 AND updated_at GLOB '????-??-??T??:??:??.?????????Z'),
+            PRIMARY KEY(run_id,sequence),
+            UNIQUE(run_id,session_id)
+        )";
+#[cfg(test)]
+pub(crate) const SETTLEMENT_ATTRIBUTION_CATALOG_OBJECTS: [(&str, &str); 4] = [
+    ("table", "source_worktree_settlement_attribution"),
+    (
+        "trigger",
+        "source_worktree_settlement_attribution_no_replace",
+    ),
+    (
+        "trigger",
+        "source_worktree_settlement_attribution_no_update",
+    ),
+    (
+        "trigger",
+        "source_worktree_settlement_attribution_no_delete",
+    ),
+];
+
 const SOURCE_WORKTREE_COHORT_LIST_MAX: usize = 4096;
 const STARTUP_SETTLEMENT_SCAN_PAGE: usize = 256;
 const STARTUP_SETTLEMENT_ROOT_MAX: usize = 8192;
 const STARTUP_SETTLEMENT_CANDIDATE_MAX: usize = 16_384;
 const STARTUP_SETTLEMENT_PATH_MAX_BYTES: usize = 4096;
-const SETTLEMENT_DEPENDENCY_SCAN_PAGE: usize = 256;
+// Bound startup recovery and custody participant sets, never unrelated dependency history.
 pub const SETTLEMENT_DEPENDENCY_SCAN_MAX_RECORDS: usize = 16_384;
 const SETTLEMENT_ITEM_LOAD_LIMIT: usize = SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS + 1;
 const SETTLEMENT_REF_MAX_BYTES: usize = SOURCE_WORKTREE_SETTLEMENT_MAX_IDENTITY_BYTES;
@@ -289,6 +399,35 @@ impl QuarantineRemoveAuthorityV1 {
         Ok(())
     }
 
+    /// Bind a fresh removal proof to the retained quarantine identity. The
+    /// target tip and holder inventory describe one observation, not identity:
+    /// callers must obtain a complete fresh proof and use its target OID for
+    /// the ref transaction. This comparison alone never authorizes removal.
+    pub fn matches_quarantine_identity(&self, fresh: &Self) -> bool {
+        self.schema_version == fresh.schema_version
+            && self.kind == fresh.kind
+            && self.run_id == fresh.run_id
+            && self.session_id == fresh.session_id
+            && self.custody_id == fresh.custody_id
+            && self.custody_generation == fresh.custody_generation
+            && self.original_path_digest == fresh.original_path_digest
+            && self.quarantine_path_digest == fresh.quarantine_path_digest
+            && self.repository_identity_digest == fresh.repository_identity_digest
+            && self.canonical_repo_dir_digest == fresh.canonical_repo_dir_digest
+            && self.source_ref_digest == fresh.source_ref_digest
+            && self.target_ref_digest == fresh.target_ref_digest
+            && self.admin_dir_digest == fresh.admin_dir_digest
+            && self.admin_id_digest == fresh.admin_id_digest
+            && self.source_oid == fresh.source_oid
+            && self.journal_target_oid == fresh.journal_target_oid
+            && self.journal_evidence_digest == fresh.journal_evidence_digest
+            && self.journal_clean_digest == fresh.journal_clean_digest
+            && self.removal_clean_digest == fresh.removal_clean_digest
+            && self.root_device == fresh.root_device
+            && self.root_inode == fresh.root_inode
+            && self.stable_tree_digest == fresh.stable_tree_digest
+    }
+
     pub fn run_id(&self) -> Uuid {
         self.run_id
     }
@@ -319,11 +458,20 @@ impl QuarantineRemoveAuthorityV1 {
     pub fn target_ref_digest(&self) -> &Sha256Digest {
         &self.target_ref_digest
     }
-    pub(crate) fn admin_dir_digest(&self) -> &Sha256Digest {
-        &self.admin_dir_digest
-    }
-    pub(crate) fn admin_id_digest(&self) -> &Sha256Digest {
-        &self.admin_id_digest
+    /// Whether `admin_dir` and `admin_id` are exactly the Git administration
+    /// this marker recorded for its quarantine (#2132). Callers use it to
+    /// authenticate a stale registration before removing that one directory.
+    pub fn matches_admin_identity(&self, admin_dir: &str, admin_id: &str) -> bool {
+        self.admin_dir_digest
+            == quarantine_remove_authority_field_digest(
+                QuarantineRemoveAuthorityDigestDomainV1::AdminDir,
+                admin_dir,
+            )
+            && self.admin_id_digest
+                == quarantine_remove_authority_field_digest(
+                    QuarantineRemoveAuthorityDigestDomainV1::AdminId,
+                    admin_id,
+                )
     }
     pub fn source_oid(&self) -> &SourceWorktreeGitOidV1 {
         &self.source_oid
@@ -342,27 +490,6 @@ impl QuarantineRemoveAuthorityV1 {
     }
     pub fn removal_clean_digest(&self) -> &Sha256Digest {
         &self.removal_clean_digest
-    }
-    pub(crate) fn root_device(&self) -> u64 {
-        self.root_device
-    }
-    pub(crate) fn root_inode(&self) -> u64 {
-        self.root_inode
-    }
-    pub(crate) fn stable_tree_digest(&self) -> &Sha256Digest {
-        &self.stable_tree_digest
-    }
-    pub(crate) fn holder_evidence_digest(&self) -> &Sha256Digest {
-        &self.holder_evidence_digest
-    }
-    pub(crate) fn holder_fixed_point_passes(&self) -> u32 {
-        self.holder_fixed_point_passes
-    }
-    pub(crate) fn trusted_platform_exemption_count(&self) -> u32 {
-        self.trusted_platform_exemption_count
-    }
-    pub(crate) fn trusted_platform_exemption_digest(&self) -> &Sha256Digest {
-        &self.trusted_platform_exemption_digest
     }
 }
 
@@ -413,8 +540,8 @@ pub(crate) enum SourceWorktreeSettlementV94BridgeFault {
     AfterShadowDrop,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
 impl SourceWorktreeSettlementV94BridgeFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 5] = [
         Self::AfterSourceObjectDrop,
         Self::AfterRename,
@@ -425,6 +552,7 @@ impl SourceWorktreeSettlementV94BridgeFault {
 }
 
 impl SourceWorktreeSettlementV95MigrationFault {
+    #[cfg(test)]
     #[cfg(any(test, feature = "test-seam"))]
     pub(crate) const ALL: [Self; 10] = [
         Self::AfterPreflight,
@@ -441,6 +569,7 @@ impl SourceWorktreeSettlementV95MigrationFault {
 }
 
 impl SourceWorktreeSettlementV94MigrationFault {
+    #[cfg(test)]
     #[cfg(any(test, feature = "test-seam"))]
     pub(crate) const ALL: [Self; 5] = [
         Self::AfterPreflight,
@@ -467,17 +596,17 @@ pub(crate) enum SettlementFinalizationFault {
     AfterCommit,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_v94_migration(fault: SourceWorktreeSettlementV94MigrationFault) {
     V94_MIGRATION_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_v95_migration(fault: SourceWorktreeSettlementV95MigrationFault) {
     V95_MIGRATION_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_v94_bridge(fault: SourceWorktreeSettlementV94BridgeFault) {
     V94_BRIDGE_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
@@ -1874,7 +2003,21 @@ pub(crate) fn v94_catalog_fingerprint(tx: &Transaction<'_>) -> Result<String> {
     let mut digest = Sha256::new();
     while let Some(row) = rows.next()? {
         for index in 0..4 {
-            let field: String = row.get(index)?;
+            let mut field: String = row.get(index)?;
+            if index == 3 {
+                field = reproof::historical_trigger_sql(&completion_retry::historical_trigger_sql(
+                    &field,
+                ))
+                .to_owned();
+            }
+            // Project the one additive terminal status to the immutable V95
+            // catalog. Every other byte, index and trigger remains pinned.
+            if index == 3 && row.get::<_, String>(1)? == "source_worktree_settlement_items" {
+                field = field.replace(
+                    INCLUDING_DELETED_TERMINAL_STATUS,
+                    ORIGINAL_TERMINAL_STATUSES,
+                );
+            }
             digest.update(field.as_bytes());
             if index != 3 {
                 digest.update(b"\0");
@@ -1885,8 +2028,93 @@ pub(crate) fn v94_catalog_fingerprint(tx: &Transaction<'_>) -> Result<String> {
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
-#[derive(Debug, Clone)]
+/// Rebuild the retained journal without altering any row or surrounding guard.
+/// The reverse projection is used only by historical migration fixtures.
+pub(crate) fn rebuild_settlement_status_constraint(
+    tx: &Transaction<'_>,
+    include_deleted: bool,
+) -> Result<()> {
+    validate_v95_catalog(tx)?;
+    let table_sql: String = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='source_worktree_settlement_items'",
+        [], |row| row.get(0),
+    )?;
+    // Constant statements, not `str::replace` output: the protected-DML scanner
+    // (p2_07) must trace every execution sink to constant text (#2033).
+    let (before, after) = match include_deleted {
+        true => (
+            SETTLEMENT_ITEMS_TABLE_SQL_ORIGINAL,
+            SETTLEMENT_ITEMS_TABLE_SQL_WITH_DELETED,
+        ),
+        false => (
+            SETTLEMENT_ITEMS_TABLE_SQL_WITH_DELETED,
+            SETTLEMENT_ITEMS_TABLE_SQL_ORIGINAL,
+        ),
+    };
+    if table_sql != before {
+        return Err(DaemonError::Store(
+            "settlement terminal status constraint drifted".into(),
+        ));
+    }
+    let dependent_tables: i64 = tx.query_row(
+        "SELECT count(*) FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) f
+         WHERE m.type='table' AND f.\"table\"='source_worktree_settlement_items'",
+        [],
+        |row| row.get(0),
+    )?;
+    if dependent_tables != 0 {
+        return Err(DaemonError::Store(
+            "settlement journal has unexpected foreign-key dependents".into(),
+        ));
+    }
+    // Creation order (rowid), not name: SQLite fires same-event triggers by creation order, so
+    // restoring alphabetically would change which guard reports first (e.g. item_bounds vs
+    // duplicate_custody) after the rebuild.
+    let guards = tx
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE tbl_name=?1
+         AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY rowid",
+        )?
+        .query_map(["source_worktree_settlement_items"], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    tx.execute_batch("CREATE TEMP TABLE settlement_items_status_copy AS SELECT * FROM source_worktree_settlement_items;
+                      DROP TABLE source_worktree_settlement_items;")?;
+    tx.execute_batch(after)?;
+    tx.execute_batch(
+        "INSERT INTO source_worktree_settlement_items SELECT * FROM settlement_items_status_copy;",
+    )?;
+    let changed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT * FROM settlement_items_status_copy EXCEPT SELECT * FROM source_worktree_settlement_items)
+             OR EXISTS(SELECT * FROM source_worktree_settlement_items EXCEPT SELECT * FROM settlement_items_status_copy)",
+        [], |row| row.get(0),
+    )?;
+    if changed {
+        return Err(DaemonError::Store(
+            "settlement journal rebuild changed retained rows".into(),
+        ));
+    }
+    for sql in guards {
+        // Whole-DDL replay of the validated V95 catalog's indexes/triggers.
+        tx.execute_batch(&sql)?;
+    }
+    tx.execute_batch("DROP TABLE settlement_items_status_copy;")?;
+    validate_v95_catalog(tx)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceWorktreeInventoryRow {
+    /// Agent-only exclusion, recomputed from current grants and root ownership.
+    /// Operator and automatic inventory leave this unset when the store builds
+    /// it; the daemon sets it for a root whose runtime completed entry drifted
+    /// from this row (#2650), so the audit never plans what the fence refuses.
+    pub agent_scope_disposition: Option<rsi_common::cohort_settlement::SourceWorktreeDispositionV1>,
+    /// Why `agent_scope_disposition` was set when the daemon (not the store)
+    /// set it (#2731): the stored vs observed values of the first field that
+    /// disagreed. The audit shows it as the item's diagnostic.
+    pub agent_scope_detail: Option<String>,
     pub custody_id: Uuid,
     pub canonical_repo_dir: String,
     pub sandbox_root: String,
@@ -1914,6 +2142,13 @@ pub struct SourceWorktreeInventoryRow {
     pub scheduled_dependency_digest: String,
     pub session_path_dependency_count: u64,
     pub session_path_dependency_digest: String,
+    /// Stable decoder branch when dependency evidence is ambiguous.
+    pub session_path_dependency_reason: Option<String>,
+    /// #247: why the Session is paused or unfinished work rather than a
+    /// finished one (`Store::automatic_reclaim_resume_hold`): its sandbox is
+    /// retained, never planned. Set only for a `Completed`/`Failed`/
+    /// `Interrupted` owner, so an explicitly archived Session settles normally.
+    pub resume_hold: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -1930,6 +2165,9 @@ pub struct NewSettlementRun {
     pub observed_count: u32,
     pub retained_count: u32,
     pub items: Vec<NewSettlementItem>,
+    /// The audit's retained roots (#2635): empty, or exactly `retained_count`
+    /// rows with canonical sequences.
+    pub retained: Vec<SourceWorktreeRetainedRootV1>,
 }
 
 #[derive(Debug, Clone)]
@@ -1980,6 +2218,8 @@ pub struct SourceWorktreeSettlementJournalItem {
     pub participant_count: u64,
     pub phase: SourceWorktreeSettlementPhaseV1,
     pub before_observation: Option<String>,
+    pub refusal_code: Option<String>,
+    pub after_observation: Option<String>,
 }
 
 fn validate_settlement_text(
@@ -2033,6 +2273,36 @@ fn validate_new_settlement_run(run: &NewSettlementRun) -> Result<()> {
         return Err(DaemonError::InvalidParam(
             "settlement run counts exceed or contradict the bounded inventory".into(),
         ));
+    }
+    if !run.retained.is_empty() && run.retained.len() != run.retained_count as usize {
+        return Err(DaemonError::InvalidParam(
+            "settlement retained roots do not match the retained count".into(),
+        ));
+    }
+    for (sequence, root) in run.retained.iter().enumerate() {
+        let mut shape = Vec::new();
+        if root.sequence as usize != sequence || root.disposition.is_eligible() {
+            shape.push("sequence or disposition");
+        }
+        if root.session_id.is_nil()
+            || root.custody_id.is_nil()
+            || root.sandbox_root.is_empty()
+            || root.sandbox_root.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES
+            || root.source_ref.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES
+            || root.session_status.len() > 64
+            || root
+                .diagnostic
+                .as_ref()
+                .is_some_and(|value| value.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES)
+        {
+            shape.push("identity or bound");
+        }
+        if !shape.is_empty() {
+            return Err(DaemonError::InvalidParam(format!(
+                "settlement retained root {sequence} is invalid: {}",
+                shape.join(", ")
+            )));
+        }
     }
     validate_identity(&run.repository_identity).map_err(DaemonError::InvalidParam)?;
     validate_settlement_text(
@@ -2396,7 +2666,7 @@ impl Store {
                     CASE WHEN typeof(r.canonical_repo_dir)='text' AND octet_length(r.canonical_repo_dir)<=4096
                          THEN r.canonical_repo_dir END,
                     count(*),
-                    sum(CASE WHEN s.status IN ('Completed','Failed','Interrupted','Archived') THEN 1 ELSE 0 END),
+                    sum(CASE WHEN s.status IN ('Completed','Failed','Interrupted','Archived','Deleted') THEN 1 ELSE 0 END),
                     typeof(r.repository_identity)!='text' OR octet_length(r.repository_identity)>4096
                       OR typeof(r.canonical_repo_dir)!='text' OR octet_length(r.canonical_repo_dir)>4096
              FROM sandbox_custody_roots r
@@ -2809,6 +3079,13 @@ impl Store {
                 }
             }
         }
+        let (job_candidates, session_candidates) = settlement_dependency_candidates(
+            &self.conn,
+            &raw_root_indexes,
+            &canonical_root_indexes,
+            &owner_indexes,
+            &custody_indexes,
+        )?;
         let mut counts = vec![0_u64; inventory.len()];
         let mut digests = (0..inventory.len())
             .map(|_| {
@@ -2817,10 +3094,8 @@ impl Store {
                 digest
             })
             .collect::<Vec<_>>();
-        let mut dependency_scan_overflow = false;
-        let mut dependency_records_scanned = 0_usize;
-        let mut after_job_id: Option<String> = None;
-        loop {
+        let mut dependency_evidence_ambiguous = false;
+        {
             let mut dependencies = self.conn.prepare(
                 "SELECT
                     CASE WHEN typeof(id)='text' AND octet_length(id)<=128 THEN id END,
@@ -2840,51 +3115,32 @@ impl Store {
                           (typeof(working_dir)!='text' OR octet_length(working_dir)>4096))
                  FROM scheduled_jobs
                  WHERE (enabled=1 OR typeof(enabled)!='integer')
-                   AND (?1 IS NULL OR id>?1)
-                 ORDER BY id LIMIT ?2",
+                   AND rowid IN (SELECT value FROM json_each(?1))
+                 ORDER BY id",
             )?;
-            let mut records = dependencies.query(params![
-                after_job_id.as_deref(),
-                i64::try_from(SETTLEMENT_DEPENDENCY_SCAN_PAGE + 1).map_err(|_| {
-                    DaemonError::Store("scheduled dependency page bound exceeds i64".into())
-                })?,
-            ])?;
-            let mut page_count = 0_usize;
-            let mut has_more = false;
+            let mut records = dependencies.query([job_candidates])?;
             while let Some(dependency) = records.next()? {
-                page_count = page_count.checked_add(1).ok_or_else(|| {
-                    DaemonError::Store("scheduled dependency page count overflowed".into())
-                })?;
-                if page_count > SETTLEMENT_DEPENDENCY_SCAN_PAGE {
-                    has_more = true;
-                    break;
-                }
-                dependency_records_scanned =
-                    dependency_records_scanned.checked_add(1).ok_or_else(|| {
-                        DaemonError::Store("scheduled dependency scan count overflowed".into())
-                    })?;
                 if dependency.get::<_, bool>(4)? {
-                    dependency_scan_overflow = true;
+                    dependency_evidence_ambiguous = true;
                     break;
                 }
                 let fields = (0..4)
                     .map(|column| dependency.get::<_, Option<String>>(column))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 let Some(job_id) = fields[0].as_ref() else {
-                    dependency_scan_overflow = true;
+                    dependency_evidence_ambiguous = true;
                     break;
                 };
                 if parse_canonical_uuid(job_id, "scheduled dependency job id").is_err() {
-                    dependency_scan_overflow = true;
+                    dependency_evidence_ambiguous = true;
                     break;
                 }
-                after_job_id = Some(job_id.clone());
                 let mut matched: Vec<usize> = Vec::new();
                 if let Some(wake_session_id) = fields[2].as_deref() {
                     if parse_canonical_uuid(wake_session_id, "scheduled dependency wake owner")
                         .is_err()
                     {
-                        dependency_scan_overflow = true;
+                        dependency_evidence_ambiguous = true;
                         break;
                     }
                     if let Some(indexes) = owner_indexes.get(wake_session_id) {
@@ -2897,7 +3153,7 @@ impl Store {
                 {
                     if parse_canonical_uuid(watched, "scheduled dependency watched owner").is_err()
                     {
-                        dependency_scan_overflow = true;
+                        dependency_evidence_ambiguous = true;
                         break;
                     }
                     if let Some(indexes) = owner_indexes.get(watched) {
@@ -2942,22 +3198,12 @@ impl Store {
                     }
                 }
             }
-            if dependency_scan_overflow {
-                break;
-            }
-            if has_more && dependency_records_scanned >= SETTLEMENT_DEPENDENCY_SCAN_MAX_RECORDS {
-                dependency_scan_overflow = true;
-                break;
-            }
-            if !has_more {
-                break;
-            }
         }
-        if dependency_scan_overflow {
+        if dependency_evidence_ambiguous {
             for (count, digest) in counts.iter_mut().zip(&mut digests) {
                 *count = u64::MAX;
                 *digest = Sha256::new();
-                digest.update(b"rsi-scheduled-dependencies-scan-bound-exceeded-v1\0");
+                digest.update(b"rsi-scheduled-dependencies-ambiguous-v1\0");
             }
         }
         for (index, row) in inventory.iter_mut().enumerate() {
@@ -2976,181 +3222,25 @@ impl Store {
                 digest
             })
             .collect::<Vec<_>>();
-        let mut session_scan_overflow = false;
-        let mut session_records_scanned = 0_usize;
-        let mut after_session_id: Option<String> = None;
-        loop {
-            let mut sessions = self.conn.prepare(
-                "SELECT
-                    CASE WHEN typeof(s.id)='text' AND octet_length(s.id)<=128 THEN s.id END,
-                    CASE WHEN typeof(s.status)='text' AND octet_length(s.status)<=64 THEN s.status END,
-                    CASE WHEN typeof(s.working_dir)='text' AND octet_length(s.working_dir)<=4096 THEN s.working_dir END,
-                    CASE WHEN s.sandbox_root IS NULL OR
-                                   (typeof(s.sandbox_root)='text' AND octet_length(s.sandbox_root)<=4096)
-                         THEN s.sandbox_root END,
-                    CASE WHEN p.effective_cwd IS NULL OR
-                                   (typeof(p.effective_cwd)='text' AND octet_length(p.effective_cwd)<=4096)
-                         THEN p.effective_cwd END,
-                    CASE WHEN s.sandbox_cleanup_state IS NULL OR
-                                   (typeof(s.sandbox_cleanup_state)='text' AND octet_length(s.sandbox_cleanup_state)<=64)
-                         THEN s.sandbox_cleanup_state END,
-                    CASE WHEN p.execution_state IS NULL OR
-                                   (typeof(p.execution_state)='text' AND octet_length(p.execution_state)<=64)
-                         THEN p.execution_state END,
-                    CASE WHEN p.freshness IS NULL OR
-                                   (typeof(p.freshness)='text' AND octet_length(p.freshness)<=64)
-                         THEN p.freshness END,
-                    CASE WHEN p.custody_id IS NULL OR
-                                   (typeof(p.custody_id)='text' AND octet_length(p.custody_id)<=128)
-                         THEN p.custody_id END,
-                    CASE WHEN p.custody_generation IS NULL THEN NULL
-                         WHEN typeof(p.custody_generation)='integer' AND p.custody_generation>0
-                         THEN printf('%lld',p.custody_generation) END,
-                    CASE WHEN r.state IS NULL OR
-                                   (typeof(r.state)='text' AND octet_length(r.state)<=64) THEN r.state END,
-                    CASE WHEN r.owner_session_id IS NULL OR
-                                   (typeof(r.owner_session_id)='text' AND octet_length(r.owner_session_id)<=128)
-                         THEN r.owner_session_id END,
-                    CASE WHEN r.generation IS NULL THEN NULL
-                         WHEN typeof(r.generation)='integer' AND r.generation>0
-                         THEN printf('%lld',r.generation) END,
-                    CASE WHEN p.error_code IS NULL OR
-                                   (typeof(p.error_code)='text' AND octet_length(p.error_code)<=128)
-                         THEN p.error_code END,
-                    CASE WHEN s.session_kind IS NULL OR
-                                   (typeof(s.session_kind)='text' AND octet_length(s.session_kind)<=64)
-                         THEN s.session_kind END,
-                    CASE WHEN s.sandbox_kind IS NULL OR
-                                   (typeof(s.sandbox_kind)='text' AND octet_length(s.sandbox_kind)<=64)
-                         THEN s.sandbox_kind END,
-                    CASE WHEN s.sandbox_branch IS NULL OR
-                                   (typeof(s.sandbox_branch)='text' AND octet_length(s.sandbox_branch)<=4096)
-                         THEN s.sandbox_branch END,
-                    CASE WHEN s.sandbox_custody_id IS NULL OR
-                                   (typeof(s.sandbox_custody_id)='text' AND octet_length(s.sandbox_custody_id)<=128)
-                         THEN s.sandbox_custody_id END,
-                    CASE WHEN p.canonical_repo_dir IS NULL OR
-                                   (typeof(p.canonical_repo_dir)='text' AND octet_length(p.canonical_repo_dir)<=4096)
-                         THEN p.canonical_repo_dir END,
-                    CASE WHEN r.custody_id IS NULL OR
-                                   (typeof(r.custody_id)='text' AND octet_length(r.custody_id)<=128)
-                         THEN r.custody_id END,
-                    CASE WHEN r.canonical_repo_dir IS NULL OR
-                                   (typeof(r.canonical_repo_dir)='text' AND octet_length(r.canonical_repo_dir)<=4096)
-                         THEN r.canonical_repo_dir END,
-                    CASE WHEN r.sandbox_root IS NULL OR
-                                   (typeof(r.sandbox_root)='text' AND octet_length(r.sandbox_root)<=4096)
-                         THEN r.sandbox_root END,
-                    CASE WHEN r.sandbox_branch IS NULL OR
-                                   (typeof(r.sandbox_branch)='text' AND octet_length(r.sandbox_branch)<=4096)
-                         THEN r.sandbox_branch END,
-                    CASE WHEN r.validation_state IS NULL OR
-                                   (typeof(r.validation_state)='text' AND octet_length(r.validation_state)<=64)
-                         THEN r.validation_state END,
-                    CASE WHEN r.validated_generation IS NULL THEN NULL
-                         WHEN typeof(r.validated_generation)='integer' AND r.validated_generation>0
-                         THEN printf('%lld',r.validated_generation) END,
-                    CASE WHEN r.validation_error_code IS NULL OR
-                                   (typeof(r.validation_error_code)='text' AND octet_length(r.validation_error_code)<=128)
-                         THEN r.validation_error_code END,
-                    CASE WHEN p.validated_at IS NULL OR
-                                   (typeof(p.validated_at)='text' AND octet_length(p.validated_at)<=64)
-                         THEN p.validated_at END,
-                    CASE WHEN typeof(p.schema_version)='integer' THEN printf('%lld',p.schema_version) END,
-                    CASE WHEN typeof(p.projection_version)='integer' THEN printf('%lld',p.projection_version) END,
-                    CASE WHEN typeof(p.updated_at)='text' AND octet_length(p.updated_at)<=64
-                         THEN p.updated_at END,
-                    typeof(s.id)!='text' OR octet_length(s.id)>128
-                      OR typeof(s.status)!='text' OR octet_length(s.status)>64
-                      OR typeof(s.working_dir)!='text' OR octet_length(s.working_dir)>4096
-                      OR (s.sandbox_root IS NOT NULL AND
-                          (typeof(s.sandbox_root)!='text' OR octet_length(s.sandbox_root)>4096))
-                      OR (p.effective_cwd IS NOT NULL AND
-                          (typeof(p.effective_cwd)!='text' OR octet_length(p.effective_cwd)>4096))
-                      OR (s.sandbox_cleanup_state IS NOT NULL AND
-                          (typeof(s.sandbox_cleanup_state)!='text' OR octet_length(s.sandbox_cleanup_state)>64))
-                      OR (p.execution_state IS NOT NULL AND
-                          (typeof(p.execution_state)!='text' OR octet_length(p.execution_state)>64))
-                      OR (p.freshness IS NOT NULL AND
-                          (typeof(p.freshness)!='text' OR octet_length(p.freshness)>64))
-                      OR (p.custody_id IS NOT NULL AND
-                          (typeof(p.custody_id)!='text' OR octet_length(p.custody_id)>128))
-                      OR (r.state IS NOT NULL AND
-                          (typeof(r.state)!='text' OR octet_length(r.state)>64))
-                      OR (r.owner_session_id IS NOT NULL AND
-                          (typeof(r.owner_session_id)!='text' OR octet_length(r.owner_session_id)>128))
-                      OR (p.error_code IS NOT NULL AND
-                          (typeof(p.error_code)!='text' OR octet_length(p.error_code)>128))
-                      OR (s.session_kind IS NOT NULL AND
-                          (typeof(s.session_kind)!='text' OR octet_length(s.session_kind)>64))
-                      OR (s.sandbox_kind IS NOT NULL AND
-                          (typeof(s.sandbox_kind)!='text' OR octet_length(s.sandbox_kind)>64))
-                      OR (s.sandbox_branch IS NOT NULL AND
-                          (typeof(s.sandbox_branch)!='text' OR octet_length(s.sandbox_branch)>4096))
-                      OR (s.sandbox_custody_id IS NOT NULL AND
-                          (typeof(s.sandbox_custody_id)!='text' OR octet_length(s.sandbox_custody_id)>128))
-                      OR (p.canonical_repo_dir IS NOT NULL AND
-                          (typeof(p.canonical_repo_dir)!='text' OR octet_length(p.canonical_repo_dir)>4096))
-                      OR (r.custody_id IS NOT NULL AND
-                          (typeof(r.custody_id)!='text' OR octet_length(r.custody_id)>128))
-                      OR (r.canonical_repo_dir IS NOT NULL AND
-                          (typeof(r.canonical_repo_dir)!='text' OR octet_length(r.canonical_repo_dir)>4096))
-                      OR (r.sandbox_root IS NOT NULL AND
-                          (typeof(r.sandbox_root)!='text' OR octet_length(r.sandbox_root)>4096))
-                      OR (r.sandbox_branch IS NOT NULL AND
-                          (typeof(r.sandbox_branch)!='text' OR octet_length(r.sandbox_branch)>4096))
-                      OR (r.validation_state IS NOT NULL AND
-                          (typeof(r.validation_state)!='text' OR octet_length(r.validation_state)>64))
-                      OR (r.validation_error_code IS NOT NULL AND
-                          (typeof(r.validation_error_code)!='text' OR octet_length(r.validation_error_code)>128))
-                      OR (p.validated_at IS NOT NULL AND
-                          (typeof(p.validated_at)!='text' OR octet_length(p.validated_at)>64))
-                      OR p.session_id IS NULL
-                      OR typeof(p.schema_version)!='integer'
-                      OR typeof(p.projection_version)!='integer'
-                      OR typeof(p.updated_at)!='text' OR octet_length(p.updated_at)>64
-                      OR (p.custody_generation IS NOT NULL AND
-                          (typeof(p.custody_generation)!='integer' OR p.custody_generation<=0))
-                      OR (r.generation IS NOT NULL AND
-                          (typeof(r.generation)!='integer' OR r.generation<=0))
-                      OR (r.validated_generation IS NOT NULL AND
-                          (typeof(r.validated_generation)!='integer' OR r.validated_generation<=0))
-                 FROM sessions s
-                 LEFT JOIN session_execution_projections p ON p.session_id=s.id
-                 LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id
+        let mut session_evidence_ambiguous: Option<String> = None;
+        {
+            let mut sessions = self.conn.prepare(&format!(
+                "{SETTLEMENT_SESSION_FIELDS_SELECT}
                  WHERE (s.session_kind IS NULL OR s.session_kind NOT IN ('Group','Epic'))
-                   AND (?1 IS NULL OR s.id>?1)
-                 ORDER BY s.id LIMIT ?2",
-            )?;
-            let mut session_rows = sessions.query(params![
-                after_session_id.as_deref(),
-                i64::try_from(SETTLEMENT_DEPENDENCY_SCAN_PAGE + 1).map_err(|_| {
-                    DaemonError::Store("Session dependency page bound exceeds i64".into())
-                })?,
-            ])?;
-            let mut page_count = 0_usize;
-            let mut has_more = false;
+                   AND s.rowid IN (SELECT value FROM json_each(?1))
+                 ORDER BY s.id"
+            ))?;
+            let mut session_rows = sessions.query([session_candidates])?;
             while let Some(session) = session_rows.next()? {
-                page_count = page_count.checked_add(1).ok_or_else(|| {
-                    DaemonError::Store("Session dependency page count overflowed".into())
-                })?;
-                if page_count > SETTLEMENT_DEPENDENCY_SCAN_PAGE {
-                    has_more = true;
-                    break;
-                }
-                session_records_scanned =
-                    session_records_scanned.checked_add(1).ok_or_else(|| {
-                        DaemonError::Store("Session dependency scan count overflowed".into())
-                    })?;
                 if session.get::<_, bool>(30)? {
-                    session_scan_overflow = true;
+                    session_evidence_ambiguous = Some("malformed_session_projection_fields".into());
                     break;
                 }
                 let fields = (0..30)
                     .map(|column| session.get::<_, Option<String>>(column))
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 let Some(session_id) = fields[0].as_deref() else {
-                    session_scan_overflow = true;
+                    session_evidence_ambiguous = Some("missing_session_id".into());
                     break;
                 };
                 for (column, label) in [
@@ -3164,14 +3254,13 @@ impl Store {
                         .as_deref()
                         .is_some_and(|value| parse_canonical_uuid(value, label).is_err())
                     {
-                        session_scan_overflow = true;
+                        session_evidence_ambiguous = Some("noncanonical_custody_identity".into());
                         break;
                     }
                 }
-                if session_scan_overflow {
+                if session_evidence_ambiguous.is_some() {
                     break;
                 }
-                after_session_id = Some(session_id.to_string());
                 if !matches!(
                     fields[14].as_deref(),
                     Some(
@@ -3185,19 +3274,14 @@ impl Store {
                             | "Research"
                     )
                 ) {
-                    session_scan_overflow = true;
+                    session_evidence_ambiguous = Some("unknown_session_kind".into());
                     break;
                 }
                 let persisted_active_like = matches!(
                     fields[1].as_deref(),
                     Some("Starting" | "Running" | "WaitingApproval")
                 );
-                let authenticated_projection = fields[26].is_some()
-                    && fields[27].as_deref() == Some("1")
-                    && fields[28].as_deref() == Some("1")
-                    && fields[29].is_some();
-                let rootless_projection = fields[10..=12].iter().all(Option::is_none)
-                    && fields[19..=25].iter().all(Option::is_none);
+                let mut scoped_ambiguity = None;
                 let can_execute_or_restore = persisted_active_like
                     || match fields[6].as_deref() {
                         // Executable states are dependencies whenever any of
@@ -3205,154 +3289,37 @@ impl Store {
                         // candidate. A malformed near-miss must never become
                         // inert merely because one publisher invariant drifted.
                         Some("ordinary_unsandboxed" | "live_sandboxed") => true,
-                        Some("historical_cleanup_failed") => {
-                            let common = authenticated_projection
-                                && fields[4].is_none()
-                                && fields[5].as_deref() == Some("Failed")
-                                && fields[7].as_deref() == Some("verified")
-                                && fields[13].is_none()
-                                && fields[15].as_deref() == Some("GitWorktree")
-                                && fields[18] == fields[2];
-                            let rootless = common
-                                && fields[3].is_none()
-                                && fields[16].is_none()
-                                && fields[17].is_none()
-                                && fields[8].is_none()
-                                && fields[9].is_none()
-                                && rootless_projection;
-                            let linked_failed = common
-                                && fields[3] == fields[21]
-                                && fields[16] == fields[22]
-                                && fields[17] == fields[8]
-                                && fields[8] == fields[19]
-                                && fields[9] == fields[12]
-                                && fields[9] == fields[24]
-                                && fields[2] == fields[20]
-                                && fields[18] == fields[20]
-                                && fields[10].as_deref() == Some("failed")
-                                && fields[11].is_none()
-                                && fields[23].as_deref() == Some("verified")
-                                && fields[25].is_none();
-                            if !(rootless || linked_failed) {
-                                session_scan_overflow = true;
+                        // The terminal shapes the startup publishers write are
+                        // classified once, with the dependency-health index
+                        // (#2050): settled history is inert, an ownerless
+                        // quarantine with cleared Session paths keeps
+                        // protecting its retained root, and anything else that
+                        // contradicts the publishers' invariants is ambiguous.
+                        Some(
+                            "historical_cleanup_failed"
+                            | "quarantined"
+                            | "historical_transferred"
+                            | "historical_purged"
+                            | "invalid",
+                        ) => match classify_terminal_custody_shape(
+                            &TerminalCustodyFacts::from_settlement_fields(&fields),
+                        ) {
+                            Some(TerminalCustodyShape::SettledHistory) => false,
+                            Some(TerminalCustodyShape::RetainedRootProtection) => {
+                                scoped_ambiguity = Some("quarantined_session_paths_cleared");
+                                true
+                            }
+                            Some(TerminalCustodyShape::Unproven) | None => true,
+                            Some(TerminalCustodyShape::Contradiction(reason)) => {
+                                session_evidence_ambiguous = Some(reason.into());
                                 break;
                             }
-                            false
-                        }
-                        Some("quarantined") => {
-                            if !authenticated_projection
-                                || fields[15].as_deref() != Some("GitWorktree")
-                                || fields[4].is_some()
-                                || fields[5].as_deref() != Some("Failed")
-                                || fields[7].as_deref() != Some("invalid")
-                                || fields[3] != fields[21]
-                                || fields[16] != fields[22]
-                                || fields[17] != fields[8]
-                                || fields[8] != fields[19]
-                                || fields[9] != fields[12]
-                                || fields[9] != fields[24]
-                                || fields[2] != fields[20]
-                                || fields[18] != fields[20]
-                                || fields[10].as_deref() != Some("quarantined")
-                                || fields[11].is_some()
-                                || fields[23].as_deref() != Some("invalid")
-                                || fields[13].is_none()
-                                || fields[13] != fields[25]
-                            {
-                                session_scan_overflow = true;
-                                break;
-                            }
-                            false
-                        }
-                        Some("historical_transferred") => {
-                            let projection_generation = fields[9]
-                                .as_deref()
-                                .and_then(|value| value.parse::<u64>().ok());
-                            let root_generation = fields[12]
-                                .as_deref()
-                                .and_then(|value| value.parse::<u64>().ok());
-                            if !authenticated_projection
-                                || fields[7].as_deref() != Some("verified")
-                                || fields[4].is_some()
-                                || fields[13].is_some()
-                                || fields[15].as_deref() != Some("GitWorktree")
-                                || fields[5].as_deref() != Some("Live")
-                                || fields[3] != fields[21]
-                                || fields[16] != fields[22]
-                                || fields[17] != fields[8]
-                                || fields[8] != fields[19]
-                                || fields[2] != fields[20]
-                                || fields[18] != fields[20]
-                                || fields[10].as_deref() != Some("live")
-                                || fields[11].as_deref() == Some(session_id)
-                                || fields[11].is_none()
-                                || fields[23].as_deref() != Some("verified")
-                                || fields[24] != fields[12]
-                                || fields[25].is_some()
-                                || !matches!((projection_generation, root_generation),
-                                    (Some(projection), Some(root)) if projection < root)
-                            {
-                                session_scan_overflow = true;
-                                break;
-                            }
-                            false
-                        }
-                        Some("historical_purged") => {
-                            let common = authenticated_projection
-                                && fields[7].as_deref() == Some("verified")
-                                && fields[4].is_none()
-                                && fields[13].is_none()
-                                && fields[18] == fields[2];
-                            let rootless = common
-                                && fields[3].is_none()
-                                && fields[16].is_none()
-                                && fields[17].is_none()
-                                && fields[8].is_none()
-                                && fields[9].is_none()
-                                && matches!(
-                                    (fields[15].as_deref(), fields[5].as_deref()),
-                                    (None, None) | (Some("GitWorktree"), Some("Purged"))
-                                )
-                                && rootless_projection;
-                            let linked = common
-                                && fields[15].as_deref() == Some("GitWorktree")
-                                && fields[5].as_deref() == Some("Purged")
-                                && fields[3].is_none()
-                                && fields[16].is_none()
-                                && fields[17] == fields[8]
-                                && fields[8] == fields[19]
-                                && fields[9] == fields[12]
-                                && fields[9] == fields[24]
-                                && fields[2] == fields[20]
-                                && fields[10].as_deref() == Some("purged")
-                                && fields[11].is_none()
-                                && fields[23].as_deref() == Some("verified")
-                                && fields[25].is_none();
-                            if !(rootless || linked) {
-                                session_scan_overflow = true;
-                                break;
-                            }
-                            false
-                        }
-                        Some("invalid") => {
-                            let inert = authenticated_projection
-                                && fields[7].as_deref() == Some("invalid")
-                                && fields[4].is_none()
-                                && fields[13].is_some()
-                                && fields[3].is_none()
-                                && fields[16].is_none()
-                                && fields[17].is_none()
-                                && fields[8].is_none()
-                                && fields[9].is_none()
-                                && fields[18] == fields[2]
-                                && rootless_projection;
-                            !inert
-                        }
+                        },
                         // Missing projection state is malformed/ambiguous. Retain a
                         // matching root rather than guessing that the row is inert.
                         None => true,
                         Some(_) => {
-                            session_scan_overflow = true;
+                            session_evidence_ambiguous = Some("unknown_execution_state".into());
                             break;
                         }
                     };
@@ -3364,6 +3331,7 @@ impl Store {
                     fields[2].as_deref(),
                     fields[3].as_deref(),
                     fields[4].as_deref(),
+                    scoped_ambiguity.and(fields[21].as_deref()),
                 ]
                 .into_iter()
                 .flatten()
@@ -3403,12 +3371,17 @@ impl Store {
                     {
                         continue;
                     }
-                    session_counts[index] =
-                        session_counts[index].checked_add(1).ok_or_else(|| {
-                            DaemonError::Store(
-                                "Session path dependency count overflowed u64".into(),
-                            )
-                        })?;
+                    if let Some(reason) = scoped_ambiguity {
+                        session_counts[index] = u64::MAX;
+                        inventory[index].session_path_dependency_reason = Some(reason.into());
+                    } else if session_counts[index] != u64::MAX {
+                        session_counts[index] =
+                            session_counts[index].checked_add(1).ok_or_else(|| {
+                                DaemonError::Store(
+                                    "Session path dependency count overflowed u64".into(),
+                                )
+                            })?;
+                    }
                     for field in &fields {
                         match field {
                             Some(field) => {
@@ -3430,38 +3403,70 @@ impl Store {
                     }
                 }
             }
-            if session_scan_overflow {
-                break;
-            }
-            if has_more && session_records_scanned >= SETTLEMENT_DEPENDENCY_SCAN_MAX_RECORDS {
-                session_scan_overflow = true;
-                break;
-            }
-            if !has_more {
-                break;
-            }
         }
-        if session_scan_overflow {
+        if session_evidence_ambiguous.is_some() {
             for (count, digest) in session_counts.iter_mut().zip(&mut session_digests) {
                 *count = u64::MAX;
                 *digest = Sha256::new();
-                digest.update(b"rsi-session-path-dependencies-scan-bound-exceeded-v1\0");
+                digest.update(b"rsi-session-path-dependencies-ambiguous-v1\0");
             }
         }
         for (index, row) in inventory.iter_mut().enumerate() {
+            if let Some(reason) = &session_evidence_ambiguous {
+                row.session_path_dependency_reason = Some(reason.clone());
+            }
             row.session_path_dependency_count = session_counts[index];
             row.session_path_dependency_digest = format!(
                 "sha256:{:x}",
                 std::mem::take(&mut session_digests[index]).finalize()
             );
         }
+        for row in &mut inventory {
+            row.resume_hold = self.settlement_resume_hold(row)?;
+        }
         Ok(inventory)
+    }
+
+    /// #247: the resume hold of one inventory row. Only a row whose Session is
+    /// the custody owner and is `Completed`, `Failed` or `Interrupted` can be
+    /// held; every other row keeps its existing disposition.
+    fn settlement_resume_hold(
+        &self,
+        row: &SourceWorktreeInventoryRow,
+    ) -> Result<Option<&'static str>> {
+        let Some(session_id) = row.session_id else {
+            return Ok(None);
+        };
+        if row.owner_session_id != Some(session_id)
+            || !matches!(
+                row.status.as_deref(),
+                Some("Completed" | "Failed" | "Interrupted")
+            )
+        {
+            return Ok(None);
+        }
+        self.automatic_reclaim_resume_hold(session_id)
     }
 
     pub fn insert_source_worktree_settlement_run(
         &mut self,
         run: &NewSettlementRun,
     ) -> Result<InsertSettlementRunOutcome> {
+        self.insert_source_worktree_settlement_run_as(
+            run,
+            &SourceWorktreeSettlementAttributionV1 {
+                origin: SourceWorktreeSettlementOriginV1::Operator,
+                agent_session_id: None,
+            },
+        )
+    }
+
+    pub fn insert_source_worktree_settlement_run_as(
+        &mut self,
+        run: &NewSettlementRun,
+        attribution: &SourceWorktreeSettlementAttributionV1,
+    ) -> Result<InsertSettlementRunOutcome> {
+        attribution.validate().map_err(DaemonError::InvalidParam)?;
         validate_new_settlement_run(run)?;
         let tx = self
             .conn
@@ -3587,8 +3592,89 @@ impl Store {
                 ],
             )?;
         }
+        for root in &run.retained {
+            tx.execute(
+                "INSERT INTO source_worktree_settlement_retained_roots (
+                    run_id,sequence,session_id,custody_id,session_status,sandbox_root,
+                    source_ref,disposition,diagnostic
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    run.run_id.to_string(),
+                    root.sequence,
+                    root.session_id.to_string(),
+                    root.custody_id.to_string(),
+                    root.session_status,
+                    root.sandbox_root,
+                    root.source_ref,
+                    disposition_as_str(&root.disposition)?,
+                    root.diagnostic,
+                ],
+            )?;
+        }
+        let origin = match attribution.origin {
+            SourceWorktreeSettlementOriginV1::Operator => "operator",
+            SourceWorktreeSettlementOriginV1::Agent => "agent",
+            SourceWorktreeSettlementOriginV1::Automatic => "automatic",
+        };
+        tx.execute(
+            "INSERT INTO source_worktree_settlement_attribution (run_id,origin,agent_session_id) VALUES (?1,?2,?3)",
+            params![run.run_id.to_string(), origin, attribution.agent_session_id.map(|id| id.to_string())],
+        )?;
         tx.commit()?;
         Ok(InsertSettlementRunOutcome::Inserted)
+    }
+
+    /// Bounded run history for the operator; no item observations are copied.
+    pub fn list_source_worktree_settlement_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<SourceWorktreeSettlementRunSummaryV1>> {
+        if !(1..=50).contains(&limit) {
+            return Err(DaemonError::InvalidParam(
+                "settlement run limit must be 1..=50".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT CASE WHEN typeof(run_id)='text' AND octet_length(run_id)=36 THEN run_id END,
+                    CASE WHEN typeof(repository_identity)='text' AND octet_length(repository_identity)<=4096 THEN repository_identity END,
+                    CASE WHEN typeof(state)='text' AND octet_length(state)<=32 THEN state END,
+                    observed_count,eligible_count,retained_count,
+                    settled_count,refused_count,recovery_required_count,unattempted_count,
+                    CASE WHEN typeof(created_at)='text' AND octet_length(created_at)=30 THEN created_at END
+               FROM source_worktree_settlement_current_runs ORDER BY created_at DESC,run_id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                SourceWorktreeSettlementCountsV1 {
+                    observed: row_u32(row, 3)?,
+                    eligible: row_u32(row, 4)?,
+                    retained: row_u32(row, 5)?,
+                    settled: row_u32(row, 6)?,
+                    refused: row_u32(row, 7)?,
+                    recovery_required: row_u32(row, 8)?,
+                    unattempted: row_u32(row, 9)?,
+                },
+                row.get::<_, String>(10)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, repository_identity, state, counts, created_at) = row?;
+            validate_identity(&repository_identity).map_err(DaemonError::Store)?;
+            validate_settlement_timestamp(&created_at, "created_at")?;
+            let run_id = Uuid::parse_str(&id).map_err(|e| DaemonError::Store(e.to_string()))?;
+            Ok(SourceWorktreeSettlementRunSummaryV1 {
+                run_id,
+                repository_identity,
+                state: parse_run_state(&state).map_err(DaemonError::Store)?,
+                counts,
+                created_at,
+                attribution: load_attribution_on(&self.conn, run_id)?,
+            })
+        })
+        .collect()
     }
 
     pub fn get_source_worktree_settlement_run(
@@ -3725,6 +3811,12 @@ impl Store {
                     CASE WHEN before_observation IS NULL OR
                                    (typeof(before_observation)='text' AND octet_length(before_observation)<=16384)
                          THEN before_observation END,
+                    CASE WHEN refusal_code IS NULL OR
+                                   (typeof(refusal_code)='text' AND octet_length(refusal_code)<=128)
+                         THEN refusal_code END,
+                    CASE WHEN after_observation IS NULL OR
+                                   (typeof(after_observation)='text' AND octet_length(after_observation)<=16384)
+                         THEN after_observation END,
                     typeof(sequence)!='integer'
                       OR typeof(session_id)!='text' OR octet_length(session_id)>128
                       OR typeof(original_status)!='text' OR octet_length(original_status)>32
@@ -3746,6 +3838,10 @@ impl Store {
                       OR typeof(phase)!='text' OR octet_length(phase)>64
                       OR (before_observation IS NOT NULL AND
                           (typeof(before_observation)!='text' OR octet_length(before_observation)>16384))
+                      OR (refusal_code IS NOT NULL AND
+                          (typeof(refusal_code)!='text' OR octet_length(refusal_code)>128))
+                      OR (after_observation IS NOT NULL AND
+                          (typeof(after_observation)!='text' OR octet_length(after_observation)>16384))
              FROM source_worktree_settlement_items WHERE run_id=?1 ORDER BY sequence
              LIMIT ?2",
         )?;
@@ -3757,9 +3853,9 @@ impl Store {
                 })?
             ],
             |row| {
-                if row.get::<_, bool>(20)? {
+                if row.get::<_, bool>(22)? {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
-                        20,
+                        22,
                         rusqlite::types::Type::Text,
                         Box::new(std::io::Error::other(
                             "settlement journal item exceeds byte bound",
@@ -3796,6 +3892,8 @@ impl Store {
                         )
                     })?,
                     before_observation: row.get(19)?,
+                    refusal_code: row.get(20)?,
+                    after_observation: row.get(21)?,
                 })
             },
         )?;
@@ -3814,16 +3912,21 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Uuid>> {
         let mut statement = self.conn.prepare(
-            "SELECT CASE WHEN typeof(r.run_id)='text' AND octet_length(r.run_id)<=128
+            &format!("SELECT CASE WHEN typeof(r.run_id)='text' AND octet_length(r.run_id)<=128
                          THEN r.run_id END,
                     typeof(r.run_id)!='text' OR octet_length(r.run_id)>128
                FROM source_worktree_settlement_runs r
              WHERE r.run_id>?1 AND EXISTS (
                  SELECT 1 FROM source_worktree_settlement_items i
                  WHERE i.run_id=r.run_id
-                   AND i.phase IN ('intent_committed','worktree_removed','branch_removed')
+                   AND (i.phase IN ('intent_committed','worktree_removed','branch_removed') OR (
+                       i.phase='recovery_required' AND i.refusal_code='recovery_proof_failed'
+                       AND i.before_observation IS NULL
+                       AND i.after_observation='quarantined worktree failed its removal-authority proof'
+                       AND NOT EXISTS (SELECT 1 FROM source_worktree_settlement_reproof_runs a WHERE a.run_id=i.run_id)) OR ({retry_fence}) OR ({untouched_fence}))
              )
-             ORDER BY r.run_id LIMIT ?2",
+             ORDER BY r.run_id LIMIT ?2", retry_fence=completion_retry::RETRY_FENCE_SQL,
+                untouched_fence=untouched_intent::RETAINED_INTENT_FENCE_SQL),
         )?;
         let rows = statement.query_map(
             params![
@@ -4111,7 +4214,7 @@ impl Store {
         }
         let now = timestamp();
         let changed = tx.execute(
-            "UPDATE sessions SET status='Archived',pending_archive=0,
+            "UPDATE sessions SET status=CASE WHEN status='Deleted' THEN 'Deleted' ELSE 'Archived' END,pending_archive=0,
                     retry_attempt=COALESCE(max_retries,retry_attempt),updated_at=?1
              WHERE id=?2 AND status=?3 AND updated_at=?4 AND sandbox_custody_id=?5
                AND sandbox_kind='GitWorktree' AND sandbox_root=?6 AND sandbox_branch=?7
@@ -4236,6 +4339,337 @@ impl Store {
             Some(SourceWorktreeSettlementRefusalV1::DatabaseSettlementFailed.as_str()),
         )
     }
+}
+
+/// Select proof rows by root using the V120 path/link indexes. History size is
+/// never evidence of a dependency. Keep the existing inventory proof decoder as
+/// the authority for terminal projections, custody and malformed records.
+/// The settlement decoder's per-Session columns and joins, in the order
+/// [`TerminalCustodyFacts::from_settlement_fields`] reads them (30 guarded text
+/// columns, then one malformed-field flag). Shared so tests load a Session
+/// exactly as the decoder does (#2050).
+pub(crate) const SETTLEMENT_SESSION_FIELDS_SELECT: &str = "SELECT
+                    CASE WHEN typeof(s.id)='text' AND octet_length(s.id)<=128 THEN s.id END,
+                    CASE WHEN typeof(s.status)='text' AND octet_length(s.status)<=64 THEN s.status END,
+                    CASE WHEN typeof(s.working_dir)='text' AND octet_length(s.working_dir)<=4096 THEN s.working_dir END,
+                    CASE WHEN s.sandbox_root IS NULL OR
+                                   (typeof(s.sandbox_root)='text' AND octet_length(s.sandbox_root)<=4096)
+                         THEN s.sandbox_root END,
+                    CASE WHEN p.effective_cwd IS NULL OR
+                                   (typeof(p.effective_cwd)='text' AND octet_length(p.effective_cwd)<=4096)
+                         THEN p.effective_cwd END,
+                    CASE WHEN s.sandbox_cleanup_state IS NULL OR
+                                   (typeof(s.sandbox_cleanup_state)='text' AND octet_length(s.sandbox_cleanup_state)<=64)
+                         THEN s.sandbox_cleanup_state END,
+                    CASE WHEN p.execution_state IS NULL OR
+                                   (typeof(p.execution_state)='text' AND octet_length(p.execution_state)<=64)
+                         THEN p.execution_state END,
+                    CASE WHEN p.freshness IS NULL OR
+                                   (typeof(p.freshness)='text' AND octet_length(p.freshness)<=64)
+                         THEN p.freshness END,
+                    CASE WHEN p.custody_id IS NULL OR
+                                   (typeof(p.custody_id)='text' AND octet_length(p.custody_id)<=128)
+                         THEN p.custody_id END,
+                    CASE WHEN p.custody_generation IS NULL THEN NULL
+                         WHEN typeof(p.custody_generation)='integer' AND p.custody_generation>0
+                         THEN printf('%lld',p.custody_generation) END,
+                    CASE WHEN r.state IS NULL OR
+                                   (typeof(r.state)='text' AND octet_length(r.state)<=64) THEN r.state END,
+                    CASE WHEN r.owner_session_id IS NULL OR
+                                   (typeof(r.owner_session_id)='text' AND octet_length(r.owner_session_id)<=128)
+                         THEN r.owner_session_id END,
+                    CASE WHEN r.generation IS NULL THEN NULL
+                         WHEN typeof(r.generation)='integer' AND r.generation>0
+                         THEN printf('%lld',r.generation) END,
+                    CASE WHEN p.error_code IS NULL OR
+                                   (typeof(p.error_code)='text' AND octet_length(p.error_code)<=128)
+                         THEN p.error_code END,
+                    CASE WHEN s.session_kind IS NULL OR
+                                   (typeof(s.session_kind)='text' AND octet_length(s.session_kind)<=64)
+                         THEN s.session_kind END,
+                    CASE WHEN s.sandbox_kind IS NULL OR
+                                   (typeof(s.sandbox_kind)='text' AND octet_length(s.sandbox_kind)<=64)
+                         THEN s.sandbox_kind END,
+                    CASE WHEN s.sandbox_branch IS NULL OR
+                                   (typeof(s.sandbox_branch)='text' AND octet_length(s.sandbox_branch)<=4096)
+                         THEN s.sandbox_branch END,
+                    CASE WHEN s.sandbox_custody_id IS NULL OR
+                                   (typeof(s.sandbox_custody_id)='text' AND octet_length(s.sandbox_custody_id)<=128)
+                         THEN s.sandbox_custody_id END,
+                    CASE WHEN p.canonical_repo_dir IS NULL OR
+                                   (typeof(p.canonical_repo_dir)='text' AND octet_length(p.canonical_repo_dir)<=4096)
+                         THEN p.canonical_repo_dir END,
+                    CASE WHEN r.custody_id IS NULL OR
+                                   (typeof(r.custody_id)='text' AND octet_length(r.custody_id)<=128)
+                         THEN r.custody_id END,
+                    CASE WHEN r.canonical_repo_dir IS NULL OR
+                                   (typeof(r.canonical_repo_dir)='text' AND octet_length(r.canonical_repo_dir)<=4096)
+                         THEN r.canonical_repo_dir END,
+                    CASE WHEN r.sandbox_root IS NULL OR
+                                   (typeof(r.sandbox_root)='text' AND octet_length(r.sandbox_root)<=4096)
+                         THEN r.sandbox_root END,
+                    CASE WHEN r.sandbox_branch IS NULL OR
+                                   (typeof(r.sandbox_branch)='text' AND octet_length(r.sandbox_branch)<=4096)
+                         THEN r.sandbox_branch END,
+                    CASE WHEN r.validation_state IS NULL OR
+                                   (typeof(r.validation_state)='text' AND octet_length(r.validation_state)<=64)
+                         THEN r.validation_state END,
+                    CASE WHEN r.validated_generation IS NULL THEN NULL
+                         WHEN typeof(r.validated_generation)='integer' AND r.validated_generation>0
+                         THEN printf('%lld',r.validated_generation) END,
+                    CASE WHEN r.validation_error_code IS NULL OR
+                                   (typeof(r.validation_error_code)='text' AND octet_length(r.validation_error_code)<=128)
+                         THEN r.validation_error_code END,
+                    CASE WHEN p.validated_at IS NULL OR
+                                   (typeof(p.validated_at)='text' AND octet_length(p.validated_at)<=64)
+                         THEN p.validated_at END,
+                    CASE WHEN typeof(p.schema_version)='integer' THEN printf('%lld',p.schema_version) END,
+                    CASE WHEN typeof(p.projection_version)='integer' THEN printf('%lld',p.projection_version) END,
+                    CASE WHEN typeof(p.updated_at)='text' AND octet_length(p.updated_at)<=64
+                         THEN p.updated_at END,
+                    typeof(s.id)!='text' OR octet_length(s.id)>128
+                      OR typeof(s.status)!='text' OR octet_length(s.status)>64
+                      OR typeof(s.working_dir)!='text' OR octet_length(s.working_dir)>4096
+                      OR (s.sandbox_root IS NOT NULL AND
+                          (typeof(s.sandbox_root)!='text' OR octet_length(s.sandbox_root)>4096))
+                      OR (p.effective_cwd IS NOT NULL AND
+                          (typeof(p.effective_cwd)!='text' OR octet_length(p.effective_cwd)>4096))
+                      OR (s.sandbox_cleanup_state IS NOT NULL AND
+                          (typeof(s.sandbox_cleanup_state)!='text' OR octet_length(s.sandbox_cleanup_state)>64))
+                      OR (p.execution_state IS NOT NULL AND
+                          (typeof(p.execution_state)!='text' OR octet_length(p.execution_state)>64))
+                      OR (p.freshness IS NOT NULL AND
+                          (typeof(p.freshness)!='text' OR octet_length(p.freshness)>64))
+                      OR (p.custody_id IS NOT NULL AND
+                          (typeof(p.custody_id)!='text' OR octet_length(p.custody_id)>128))
+                      OR (r.state IS NOT NULL AND
+                          (typeof(r.state)!='text' OR octet_length(r.state)>64))
+                      OR (r.owner_session_id IS NOT NULL AND
+                          (typeof(r.owner_session_id)!='text' OR octet_length(r.owner_session_id)>128))
+                      OR (p.error_code IS NOT NULL AND
+                          (typeof(p.error_code)!='text' OR octet_length(p.error_code)>128))
+                      OR (s.session_kind IS NOT NULL AND
+                          (typeof(s.session_kind)!='text' OR octet_length(s.session_kind)>64))
+                      OR (s.sandbox_kind IS NOT NULL AND
+                          (typeof(s.sandbox_kind)!='text' OR octet_length(s.sandbox_kind)>64))
+                      OR (s.sandbox_branch IS NOT NULL AND
+                          (typeof(s.sandbox_branch)!='text' OR octet_length(s.sandbox_branch)>4096))
+                      OR (s.sandbox_custody_id IS NOT NULL AND
+                          (typeof(s.sandbox_custody_id)!='text' OR octet_length(s.sandbox_custody_id)>128))
+                      OR (p.canonical_repo_dir IS NOT NULL AND
+                          (typeof(p.canonical_repo_dir)!='text' OR octet_length(p.canonical_repo_dir)>4096))
+                      OR (r.custody_id IS NOT NULL AND
+                          (typeof(r.custody_id)!='text' OR octet_length(r.custody_id)>128))
+                      OR (r.canonical_repo_dir IS NOT NULL AND
+                          (typeof(r.canonical_repo_dir)!='text' OR octet_length(r.canonical_repo_dir)>4096))
+                      OR (r.sandbox_root IS NOT NULL AND
+                          (typeof(r.sandbox_root)!='text' OR octet_length(r.sandbox_root)>4096))
+                      OR (r.sandbox_branch IS NOT NULL AND
+                          (typeof(r.sandbox_branch)!='text' OR octet_length(r.sandbox_branch)>4096))
+                      OR (r.validation_state IS NOT NULL AND
+                          (typeof(r.validation_state)!='text' OR octet_length(r.validation_state)>64))
+                      OR (r.validation_error_code IS NOT NULL AND
+                          (typeof(r.validation_error_code)!='text' OR octet_length(r.validation_error_code)>128))
+                      OR (p.validated_at IS NOT NULL AND
+                          (typeof(p.validated_at)!='text' OR octet_length(p.validated_at)>64))
+                      OR p.session_id IS NULL
+                      OR typeof(p.schema_version)!='integer'
+                      OR typeof(p.projection_version)!='integer'
+                      OR typeof(p.updated_at)!='text' OR octet_length(p.updated_at)>64
+                      OR (p.custody_generation IS NOT NULL AND
+                          (typeof(p.custody_generation)!='integer' OR p.custody_generation<=0))
+                      OR (r.generation IS NOT NULL AND
+                          (typeof(r.generation)!='integer' OR r.generation<=0))
+                      OR (r.validated_generation IS NOT NULL AND
+                          (typeof(r.validated_generation)!='integer' OR r.validated_generation<=0))
+                 FROM sessions s
+                 LEFT JOIN session_execution_projections p ON p.session_id=s.id
+                 LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id";
+
+fn settlement_dependency_candidates(
+    conn: &Connection,
+    raw_roots: &HashMap<PathBuf, Vec<usize>>,
+    canonical_roots: &HashMap<PathBuf, Vec<usize>>,
+    owners: &HashMap<String, Vec<usize>>,
+    custodies: &HashMap<String, Vec<usize>>,
+) -> Result<(String, String)> {
+    if raw_roots.is_empty() {
+        return Ok(("[]".into(), "[]".into()));
+    }
+    let mut jobs = BTreeSet::<i64>::new();
+    let mut sessions = BTreeSet::<i64>::new();
+    for root in raw_roots.keys().chain(canonical_roots.keys()) {
+        let exact = root
+            .to_str()
+            .ok_or_else(|| DaemonError::Store("settlement dependency root is not UTF-8".into()))?;
+        // SQLite BINARY ranges, not LIKE: %, _ and case retain path semantics.
+        // Windows accepts either separator; Rust repeats component containment.
+        let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+        for separator in separators {
+            let stem = exact.trim_end_matches(separators);
+            let lower = format!("{stem}{separator}");
+            let upper = format!("{stem}{}", char::from(*separator as u8 + 1));
+            let mut statement = conn.prepare(
+                "SELECT rowid FROM sessions INDEXED BY idx_swc_v120_sessions_working_dir
+                   WHERE working_dir=?1 OR (working_dir>=?2 AND working_dir<?3)
+                 UNION SELECT rowid FROM sessions INDEXED BY idx_swc_v120_sessions_sandbox_root
+                   WHERE sandbox_root=?1 OR (sandbox_root>=?2 AND sandbox_root<?3)
+                 UNION SELECT s.rowid FROM session_execution_projections p
+                       INDEXED BY idx_swc_v120_execution_cwd
+                   JOIN sessions s ON s.id=p.session_id
+                   WHERE p.effective_cwd=?1 OR (p.effective_cwd>=?2 AND p.effective_cwd<?3)",
+            )?;
+            for row in statement.query_map(params![exact, lower, upper], |row| row.get(0))? {
+                sessions.insert(row?);
+            }
+            let mut statement = conn.prepare(
+                "SELECT rowid FROM scheduled_jobs INDEXED BY idx_swc_v120_jobs_raw_path
+                   WHERE enabled=1 AND working_dir IS NOT NULL
+                     AND (working_dir=?1 OR (working_dir>=?2 AND working_dir<?3))",
+            )?;
+            for row in statement.query_map(params![exact, lower, upper], |row| row.get(0))? {
+                jobs.insert(row?);
+            }
+        }
+    }
+    for custody in custodies.keys() {
+        let mut statement = conn.prepare(
+            "SELECT rowid FROM sessions INDEXED BY idx_swc_v120_custody_participants
+               WHERE sandbox_custody_id=?1
+             UNION SELECT s.rowid FROM session_execution_projections p
+                   INDEXED BY idx_swc_v120_execution_custody_health
+               JOIN sessions s ON s.id=p.session_id WHERE p.custody_id=?1",
+        )?;
+        for row in statement.query_map([custody], |row| row.get(0))? {
+            sessions.insert(row?);
+        }
+    }
+    for owner in owners.keys() {
+        let mut statement = conn.prepare(
+            "SELECT rowid FROM scheduled_jobs INDEXED BY idx_swc_v120_jobs_wake_session
+               WHERE enabled=1 AND wake_session_id IS NOT NULL AND wake_session_id=?1
+             UNION SELECT rowid FROM scheduled_jobs INDEXED BY idx_swc_v120_jobs_wake_mode
+               WHERE enabled=1 AND wake_mode=?2",
+        )?;
+        for row in statement.query_map(params![owner, format!("on_terminal:{owner}")], |row| {
+            row.get(0)
+        })? {
+            jobs.insert(row?);
+        }
+    }
+
+    // A raw outside path can become an inward symlink without a database write.
+    // Recheck executable/ambiguous paths once per inventory, using the maintained
+    // relevance index to skip authenticated inert history. Never cap this scan:
+    // unrelated rows must not turn into a fleet-wide retention sentinel.
+    let mut statement = conn.prepare(
+        "SELECT s.rowid,h.relevance,
+                CASE WHEN typeof(s.working_dir)='text' AND octet_length(s.working_dir)<=4096 THEN s.working_dir END,
+                CASE WHEN typeof(s.sandbox_root)='text' AND octet_length(s.sandbox_root)<=4096 THEN s.sandbox_root END,
+                CASE WHEN typeof(p.effective_cwd)='text' AND octet_length(p.effective_cwd)<=4096 THEN p.effective_cwd END,
+                CASE WHEN p.execution_state='quarantined' AND typeof(r.sandbox_root)='text' AND octet_length(r.sandbox_root)<=4096 THEN r.sandbox_root END
+           FROM source_worktree_session_dependency_health h
+                INDEXED BY idx_swc_v120_sessions_dependency_health
+           JOIN sessions s ON s.id=h.session_id
+           LEFT JOIN session_execution_projections p ON p.session_id=s.id
+           LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id
+          WHERE h.relevance IN (1,2)",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let rowid = row.get(0)?;
+        if row.get::<_, i64>(1)? == 2 {
+            // Preserve the fail-closed decoder for genuinely ambiguous tuples.
+            sessions.insert(rowid);
+            continue;
+        }
+        // Column 5 is the retained root path of an ownerless quarantine whose
+        // Session paths were cleared (relevance 1, #2050): it cannot execute, but
+        // the decoder still protects that root from an overlapping candidate.
+        for column in 2..=5 {
+            if let Some(path) = row.get::<_, Option<String>>(column)? {
+                let path = Path::new(&path);
+                let canonical = std::fs::canonicalize(path).ok();
+                let mut matched = Vec::new();
+                extend_precomputed_root_matches(
+                    path,
+                    canonical.as_deref(),
+                    raw_roots,
+                    canonical_roots,
+                    &mut matched,
+                );
+                if !matched.is_empty() {
+                    sessions.insert(rowid);
+                }
+            }
+        }
+    }
+    // Legacy SQLite TEXT primary keys can contain NULL/empty ids. They cannot
+    // join the health projection and must still reach the fail-closed decoder.
+    let mut statement = conn.prepare("SELECT rowid FROM sessions WHERE id IS NULL OR id=''")?;
+    for row in statement.query_map([], |row| row.get(0))? {
+        sessions.insert(row?);
+    }
+
+    // Jobs have no terminal projection: all enabled paths need fresh alias
+    // observation. Decode only bounded fields and keep malformed identities as
+    // candidates so the existing scheduled proof validation retains them.
+    let mut statement = conn.prepare(
+        "SELECT rowid,
+                CASE WHEN typeof(id)='text' AND octet_length(id)<=128 THEN id END,
+                CASE WHEN typeof(working_dir)='text' AND octet_length(working_dir)<=4096 THEN working_dir END,
+                CASE WHEN typeof(wake_session_id)='text' AND octet_length(wake_session_id)<=128 THEN wake_session_id END,
+                CASE WHEN typeof(wake_mode)='text' AND octet_length(wake_mode)<=4096 THEN wake_mode END,
+                (working_dir IS NOT NULL AND (typeof(working_dir)!='text' OR octet_length(working_dir)>4096))
+                  OR (wake_session_id IS NOT NULL AND (typeof(wake_session_id)!='text' OR octet_length(wake_session_id)>128))
+                  OR typeof(wake_mode)!='text' OR octet_length(wake_mode)>4096
+           FROM scheduled_jobs INDEXED BY idx_swc_v120_jobs_enabled_id WHERE enabled=1",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let rowid = row.get(0)?;
+        let id = row.get::<_, Option<String>>(1)?;
+        let owner = row.get::<_, Option<String>>(3)?;
+        let mode = row.get::<_, Option<String>>(4)?;
+        let watched = mode
+            .as_deref()
+            .and_then(|mode| mode.strip_prefix("on_terminal:"));
+        if row.get::<_, bool>(5)?
+            || id
+                .as_deref()
+                .is_none_or(|id| parse_canonical_uuid(id, "job id").is_err())
+            || owner
+                .as_deref()
+                .is_some_and(|id| parse_canonical_uuid(id, "wake owner").is_err())
+            || watched.is_some_and(|id| parse_canonical_uuid(id, "watched owner").is_err())
+        {
+            jobs.insert(rowid);
+        }
+        if let Some(path) = row.get::<_, Option<String>>(2)? {
+            let path = Path::new(&path);
+            let canonical = std::fs::canonicalize(path).ok();
+            let mut matched = Vec::new();
+            extend_precomputed_root_matches(
+                path,
+                canonical.as_deref(),
+                raw_roots,
+                canonical_roots,
+                &mut matched,
+            );
+            if !matched.is_empty() {
+                jobs.insert(rowid);
+            }
+        }
+    }
+    let mut statement =
+        conn.prepare("SELECT rowid FROM scheduled_jobs WHERE typeof(enabled)!='integer'")?;
+    for row in statement.query_map([], |row| row.get(0))? {
+        jobs.insert(row?);
+    }
+    Ok((
+        serde_json::to_string(&jobs).map_err(|error| DaemonError::Store(error.to_string()))?,
+        serde_json::to_string(&sessions).map_err(|error| DaemonError::Store(error.to_string()))?,
+    ))
 }
 
 fn extend_precomputed_root_matches(
@@ -4533,6 +4967,8 @@ fn parse_inventory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceWorktr
         ));
     }
     Ok(SourceWorktreeInventoryRow {
+        agent_scope_disposition: None,
+        agent_scope_detail: None,
         custody_id: uuid(row.get(0)?, 0)?.ok_or_else(|| {
             rusqlite::Error::InvalidColumnType(0, "custody_id".into(), rusqlite::types::Type::Null)
         })?,
@@ -4562,6 +4998,8 @@ fn parse_inventory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceWorktr
         scheduled_dependency_digest:
             rsi_common::cohort_settlement::SOURCE_WORKTREE_EMPTY_DEPENDENCY_DIGEST.to_string(),
         session_path_dependency_count: 0,
+        session_path_dependency_reason: None,
+        resume_hold: None,
         session_path_dependency_digest:
             rsi_common::cohort_settlement::SOURCE_WORKTREE_EMPTY_SESSION_PATH_DEPENDENCY_DIGEST
                 .to_string(),
@@ -4690,6 +5128,34 @@ fn load_item_fence(tx: &Transaction<'_>, run_id: Uuid, session_id: Uuid) -> Resu
         },
     )
     .map_err(Into::into)
+}
+
+fn load_attribution_on(
+    conn: &Connection,
+    run_id: Uuid,
+) -> Result<Option<SourceWorktreeSettlementAttributionV1>> {
+    let row = conn.query_row(
+        "SELECT CASE WHEN typeof(origin)='text' AND octet_length(origin)<=16 THEN origin END,
+                CASE WHEN agent_session_id IS NULL OR (typeof(agent_session_id)='text' AND octet_length(agent_session_id)=36) THEN agent_session_id END
+           FROM source_worktree_settlement_attribution WHERE run_id=?1",
+        [run_id.to_string()], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)),
+    ).optional()?;
+    row.map(|(origin, agent)| {
+        let attribution = SourceWorktreeSettlementAttributionV1 {
+            origin: match origin.as_str() {
+                "operator" => SourceWorktreeSettlementOriginV1::Operator,
+                "agent" => SourceWorktreeSettlementOriginV1::Agent,
+                "automatic" => SourceWorktreeSettlementOriginV1::Automatic,
+                _ => return Err(DaemonError::Store("invalid settlement origin".into())),
+            },
+            agent_session_id: agent
+                .map(|id| Uuid::parse_str(&id).map_err(|e| DaemonError::Store(e.to_string())))
+                .transpose()?,
+        };
+        attribution.validate().map_err(DaemonError::Store)?;
+        Ok(attribution)
+    })
+    .transpose()
 }
 
 fn load_run_on(
@@ -4893,7 +5359,50 @@ fn load_run_on(
             "settlement receipt exceeds {SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS} items"
         )));
     }
+    // Validate the original bounded journal before looking up the newer
+    // attempt. Historical migration fixtures deliberately exercise this reader
+    // against malformed pre-reproof rows and must keep their evidence errors.
+    let attempt = conn.query_row(
+        "SELECT CASE WHEN typeof(state)='text' AND octet_length(state)<=64 THEN state END,
+                settled_count,refused_count,recovery_required_count,unattempted_count,
+                CASE WHEN typeof(updated_at)='text' AND octet_length(updated_at)<=30 THEN updated_at END,
+                CASE WHEN finished_at IS NULL OR (typeof(finished_at)='text' AND octet_length(finished_at)<=30) THEN finished_at END
+         FROM source_worktree_settlement_current_runs WHERE run_id=?1 AND (
+            EXISTS (SELECT 1 FROM source_worktree_settlement_reproof_runs WHERE run_id=?1) OR
+            EXISTS (SELECT 1 FROM source_worktree_settlement_completion_retries WHERE run_id=?1))",
+        [run_id.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row_u32(row,1)?, row_u32(row,2)?,
+                  row_u32(row,3)?, row_u32(row,4)?, row.get::<_, String>(5)?,
+                  row.get::<_, Option<String>>(6)?)),
+    ).optional()?;
+    let (state, counts, updated_at, finished_at, terminal_error) = if let Some((
+        state,
+        settled,
+        refused,
+        recovery_required,
+        unattempted,
+        updated_at,
+        finished_at,
+    )) = attempt
+    {
+        (
+            parse_run_state(&state).map_err(DaemonError::Store)?,
+            SourceWorktreeSettlementCountsV1 {
+                settled,
+                refused,
+                recovery_required,
+                unattempted,
+                ..counts
+            },
+            updated_at,
+            finished_at,
+            None,
+        )
+    } else {
+        (state, counts, updated_at, finished_at, terminal_error)
+    };
     Ok(Some(SourceWorktreeSettlementRunV1 {
+        attribution: load_attribution_on(conn, run_id)?,
         schema_version,
         policy_version,
         run_id,
@@ -4906,6 +5415,7 @@ fn load_run_on(
         state,
         counts,
         items,
+        retained_roots: load_retained_roots_on(conn, run_id)?,
         created_at,
         updated_at,
         finished_at,
@@ -4914,6 +5424,11 @@ fn load_run_on(
 }
 
 fn refresh_run_on(conn: &rusqlite::Connection, run_id: Uuid, now: &str) -> Result<()> {
+    // Completion retries project current item state; prior attempt counters
+    // are frozen. The immutable retry ledger explains each superseded fence.
+    if conn.query_row("SELECT EXISTS(SELECT 1 FROM source_worktree_settlement_completion_retries WHERE run_id=?1)", [run_id.to_string()], |row| row.get::<_, bool>(0))? {
+        return Ok(());
+    }
     let (eligible, settled, refused, recovery, unattempted, intent): (
         i64,
         i64,
@@ -4968,11 +5483,22 @@ fn refresh_run_on(conn: &rusqlite::Connection, run_id: Uuid, now: &str) -> Resul
         unattempted,
         intent,
     );
-    conn.execute(
+    let superseded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_worktree_settlement_reproof_runs WHERE run_id=?1)",
+        [run_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let update = if superseded {
+        "UPDATE source_worktree_settlement_reproof_runs SET state=?1,settled_count=?2,
+                refused_count=?3,recovery_required_count=?4,unattempted_count=?5,
+                updated_at=?6,finished_at=CASE WHEN ?7 THEN ?6 ELSE NULL END WHERE run_id=?8"
+    } else {
         "UPDATE source_worktree_settlement_runs SET state=?1,settled_count=?2,
                 refused_count=?3,recovery_required_count=?4,unattempted_count=?5,
-                updated_at=?6,finished_at=CASE WHEN ?7 THEN ?6 ELSE NULL END
-         WHERE run_id=?8",
+                updated_at=?6,finished_at=CASE WHEN ?7 THEN ?6 ELSE NULL END WHERE run_id=?8"
+    };
+    conn.execute(
+        update,
         params![
             state,
             settled,
@@ -5021,6 +5547,75 @@ fn parse_phase(value: &str) -> std::result::Result<SourceWorktreeSettlementPhase
     value.parse()
 }
 
+fn disposition_as_str(value: &SourceWorktreeDispositionV1) -> Result<String> {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => Ok(text),
+        _ => Err(DaemonError::Store(
+            "settlement disposition has no string form".into(),
+        )),
+    }
+}
+
+fn parse_disposition(value: &str) -> std::result::Result<SourceWorktreeDispositionV1, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| format!("unknown settlement retained-root disposition {value}"))
+}
+
+/// The retained-root snapshot of a run (#2635), bounded and byte-checked like
+/// the item journal. A run recorded before V179 has none.
+fn load_retained_roots_on(
+    conn: &rusqlite::Connection,
+    run_id: Uuid,
+) -> Result<Vec<SourceWorktreeRetainedRootV1>> {
+    let mut statement = conn.prepare(
+        "SELECT sequence,session_id,custody_id,session_status,sandbox_root,source_ref,
+                disposition,diagnostic
+         FROM source_worktree_settlement_retained_roots WHERE run_id=?1 ORDER BY sequence
+         LIMIT ?2",
+    )?;
+    let corrupt = |index: usize, message: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(message)),
+        )
+    };
+    let roots = statement
+        .query_map(
+            params![
+                run_id.to_string(),
+                i64::try_from(SETTLEMENT_ITEM_LOAD_LIMIT).map_err(|_| {
+                    DaemonError::Store("settlement item load limit exceeds i64".into())
+                })?
+            ],
+            |row| {
+                let session_id: String = row.get(1)?;
+                let custody_id: String = row.get(2)?;
+                let disposition: String = row.get(6)?;
+                Ok(SourceWorktreeRetainedRootV1 {
+                    sequence: row_u32(row, 0)?,
+                    session_id: Uuid::parse_str(&session_id)
+                        .map_err(|error| corrupt(1, error.to_string()))?,
+                    custody_id: Uuid::parse_str(&custody_id)
+                        .map_err(|error| corrupt(2, error.to_string()))?,
+                    session_status: row.get(3)?,
+                    sandbox_root: row.get(4)?,
+                    source_ref: row.get(5)?,
+                    disposition: parse_disposition(&disposition)
+                        .map_err(|message| corrupt(6, message))?,
+                    diagnostic: row.get(7)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if roots.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS {
+        return Err(DaemonError::Store(format!(
+            "settlement receipt exceeds {SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS} retained roots"
+        )));
+    }
+    Ok(roots)
+}
+
 fn parse_run_state(value: &str) -> std::result::Result<SourceWorktreeSettlementRunStateV1, String> {
     value.parse()
 }
@@ -5063,7 +5658,8 @@ mod tests {
         let trigger_count: i64 = store
             .conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'source_worktree_settlement_%'",
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'source_worktree_settlement_%'
+                  AND tbl_name IN ('source_worktree_settlement_runs', 'source_worktree_settlement_items', 'source_worktree_settlement_latest_runs', 'source_worktree_settlement_run_order')",
                 [],
                 |row| row.get(0),
             )
@@ -5159,6 +5755,7 @@ mod tests {
                 request_fingerprint: format!("sha256:{}", "1".repeat(64)),
                 observed_count: 1,
                 retained_count: 0,
+                retained: Vec::new(),
                 items: vec![NewSettlementItem {
                     session_id,
                     original_status: "Completed".into(),
@@ -5218,6 +5815,7 @@ mod tests {
             request_fingerprint: format!("sha256:{}", "3".repeat(64)),
             observed_count: receipt.counts.observed,
             retained_count: receipt.counts.retained,
+            retained: Vec::new(),
             items: vec![NewSettlementItem {
                 session_id: item.session_id,
                 original_status: item.original_status,
@@ -5237,6 +5835,511 @@ mod tests {
                 active_effects: item.active_effects,
                 participant_count: item.participant_count,
             }],
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn untouched_intent_migration_replays_without_revival_and_retains_fence_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "untouched-intent-replay");
+        fixture.store.mark_source_worktree_settlement_recovery_required(
+            fixture.run_id, fixture.session_id, SourceWorktreeSettlementPhaseV1::IntentCommitted,
+            "recovery_proof_failed",
+            "retained intent followed an earlier terminal stop and cannot prove no prior effect",
+        ).unwrap();
+        let before = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        crate::store::tests::rewind_store_to_schema_version(&fixture.store.conn, 172);
+        let catalog = crate::store::catalog_sql_by_name(&fixture.store.conn);
+        assert!(
+            fixture
+                .store
+                .reopen_source_worktree_untouched_intent_fence(fixture.run_id, fixture.session_id)
+                .is_err()
+        );
+        fixture.store.init_schema_internal(false, false).unwrap();
+        crate::store::tests::assert_post_v77_chain_replayed(&fixture.store.conn);
+        crate::store::assert_catalog_preserved_across_replay(&catalog, &fixture.store.conn, 172);
+        assert_eq!(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_nonterminal_source_worktree_settlement_run_ids(None, 64)
+                .unwrap(),
+            vec![fixture.run_id]
+        );
+        assert!(fixture.store.conn.execute(
+            "UPDATE source_worktree_settlement_items SET phase='intent_committed',refusal_code=NULL", [],
+        ).is_err(), "revival requires its durable audit");
+        assert!(
+            fixture
+                .store
+                .reopen_source_worktree_untouched_intent_fence(fixture.run_id, fixture.session_id)
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .store
+                .reopen_source_worktree_untouched_intent_fence(fixture.run_id, fixture.session_id)
+                .unwrap()
+        );
+        let reopened = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.items[0].phase,
+            SourceWorktreeSettlementPhaseV1::IntentCommitted
+        );
+        assert_eq!(reopened.counts.recovery_required, 0);
+        let audit: (i64, String, String, String) = fixture
+            .store
+            .conn
+            .query_row(
+                "SELECT r.recovery_required_count,a.fenced_at,a.refusal_code,a.observation
+             FROM source_worktree_settlement_runs r
+             JOIN source_worktree_settlement_completion_retries a USING(run_id) WHERE r.run_id=?1",
+                [fixture.run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            audit,
+            (
+                1,
+                before.updated_at,
+                "recovery_proof_failed".into(),
+                before.items[0].after_observation.clone().unwrap()
+            )
+        );
+        for sql in [
+            "UPDATE source_worktree_settlement_completion_retries SET observation='changed'",
+            "DELETE FROM source_worktree_settlement_completion_retries",
+            "INSERT OR REPLACE INTO source_worktree_settlement_completion_retries SELECT * FROM source_worktree_settlement_completion_retries",
+        ] {
+            assert!(
+                fixture.store.conn.execute(sql, []).is_err(),
+                "audit must be immutable: {sql}"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn untouched_intent_reproof_rejects_recorded_effects_markers_and_other_fences() {
+        for case in [
+            "reserved",
+            "active",
+            "marker",
+            "other-observation",
+            "other-refusal",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut fixture = quarantine_fixture(directory.path(), &format!("untouched-{case}"));
+            if matches!(case, "reserved" | "active") {
+                let mut run = synthetic_run_template(&fixture);
+                run.items[0].reserved_effects = u64::from(case == "reserved");
+                run.items[0].active_effects = u64::from(case == "active");
+                fixture
+                    .store
+                    .mark_source_worktree_settlement_unattempted(
+                        fixture.run_id,
+                        fixture.session_id,
+                        "fixture replaced by a fresh recorded-effect intent",
+                    )
+                    .unwrap();
+                fixture
+                    .store
+                    .insert_source_worktree_settlement_run(&run)
+                    .unwrap();
+                fixture.run_id = run.run_id;
+            }
+            if case == "marker" {
+                fixture
+                    .store
+                    .advance_source_worktree_settlement_item(
+                        fixture.run_id,
+                        fixture.session_id,
+                        SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                        SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                        Some("prior effect marker"),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            fixture.store.mark_source_worktree_settlement_recovery_required(
+                fixture.run_id, fixture.session_id, SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                if case == "other-refusal" { "worktree_residue" } else { "recovery_proof_failed" },
+                if case == "other-observation" { "prior effect cannot be excluded" }
+                else { "retained intent followed an earlier terminal stop and cannot prove no prior effect" },
+            ).unwrap();
+            let before = fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !fixture
+                    .store
+                    .reopen_source_worktree_untouched_intent_fence(
+                        fixture.run_id,
+                        fixture.session_id
+                    )
+                    .unwrap(),
+                "{case}"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .get_source_worktree_settlement_run(fixture.run_id)
+                    .unwrap()
+                    .unwrap(),
+                before,
+                "{case}"
+            );
+            assert!(
+                fixture
+                    .store
+                    .conn
+                    .execute(
+                        "INSERT INTO source_worktree_settlement_completion_retries
+                 SELECT run_id,session_id,updated_at,updated_at,refusal_code,after_observation
+                 FROM source_worktree_settlement_items WHERE run_id=?1",
+                        [fixture.run_id.to_string()],
+                    )
+                    .is_err(),
+                "{case}: database gate rejects bypassing caller filtering"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn settlement_completion_retry_migration_preserves_history_and_audits_each_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "completion-retry-replay");
+        fixture
+            .store
+            .mark_source_worktree_settlement_recovery_required(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "recovery_proof_failed",
+                "quarantined worktree failed its removal-authority proof",
+            )
+            .unwrap();
+        fixture
+            .store
+            .reopen_source_worktree_quarantine_proof_fences(fixture.run_id)
+            .unwrap();
+        fixture
+            .store
+            .mark_source_worktree_settlement_recovery_required(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "recovery_proof_failed",
+                "quarantined worktree failed its removal-authority proof",
+            )
+            .unwrap();
+        let before = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        crate::store::tests::rewind_store_to_schema_version(&fixture.store.conn, 171);
+        let catalog = crate::store::catalog_sql_by_name(&fixture.store.conn);
+        fixture.store.init_schema_internal(false, false).unwrap();
+        crate::store::tests::assert_post_v77_chain_replayed(&fixture.store.conn);
+        crate::store::assert_catalog_preserved_across_replay(&catalog, &fixture.store.conn, 171);
+        assert_eq!(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        for attempt in 1..=2 {
+            assert_eq!(
+                fixture
+                    .store
+                    .list_nonterminal_source_worktree_settlement_run_ids(None, 64)
+                    .unwrap(),
+                vec![fixture.run_id]
+            );
+            assert!(
+                fixture
+                    .store
+                    .reopen_source_worktree_completion_fences(fixture.run_id)
+                    .unwrap()
+            );
+            assert!(
+                !fixture
+                    .store
+                    .reopen_source_worktree_completion_fences(fixture.run_id)
+                    .unwrap()
+            );
+            let reopened = fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .validate_wire()
+                .unwrap();
+            assert_eq!(
+                reopened.items[0].phase,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted
+            );
+            assert_eq!(reopened.counts.recovery_required, 0);
+            assert!(reopened.finished_at.is_none());
+            let frozen: (i64,i64,i64) = fixture.store.conn.query_row(
+                "SELECT r.recovery_required_count,a.recovery_required_count,(SELECT count(*) FROM source_worktree_settlement_completion_retries WHERE run_id=r.run_id)
+                 FROM source_worktree_settlement_runs r JOIN source_worktree_settlement_reproof_runs a USING(run_id) WHERE run_id=?1",
+                [fixture.run_id.to_string()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).unwrap();
+            assert_eq!(frozen, (1, 1, attempt));
+            fixture
+                .store
+                .mark_source_worktree_settlement_recovery_required(
+                    fixture.run_id,
+                    fixture.session_id,
+                    SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                    "recovery_proof_failed",
+                    "quarantined worktree failed its removal-authority proof",
+                )
+                .unwrap();
+        }
+        for sql in [
+            "DELETE FROM source_worktree_settlement_completion_retries",
+            "UPDATE source_worktree_settlement_completion_retries SET observation='changed'",
+            "UPDATE source_worktree_settlement_items SET phase='intent_committed',refusal_code=NULL",
+        ] {
+            assert!(
+                fixture.store.conn.execute(sql, []).is_err(),
+                "unlogged revival and audit mutation are refused"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn quarantine_reproof_migration_replays_with_frozen_original_counters() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "reproof-replay");
+        fixture
+            .store
+            .mark_source_worktree_settlement_recovery_required(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "recovery_proof_failed",
+                "quarantined worktree failed its removal-authority proof",
+            )
+            .unwrap();
+        let original = serde_json::to_value(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        crate::store::tests::rewind_store_to_schema_version(&fixture.store.conn, 170);
+        let catalog = crate::store::catalog_sql_by_name(&fixture.store.conn);
+        fixture.store.init_schema_internal(false, false).unwrap();
+        crate::store::tests::assert_post_v77_chain_replayed(&fixture.store.conn);
+        crate::store::assert_catalog_preserved_across_replay(&catalog, &fixture.store.conn, 170);
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .store
+                    .get_source_worktree_settlement_run(fixture.run_id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            original
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_nonterminal_source_worktree_settlement_run_ids(None, 64)
+                .unwrap(),
+            vec![fixture.run_id]
+        );
+        assert!(
+            fixture
+                .store
+                .reopen_source_worktree_quarantine_proof_fences(fixture.run_id)
+                .unwrap()
+        );
+        let reopened = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .validate_wire()
+            .unwrap();
+        assert_eq!(
+            reopened.items[0].phase,
+            SourceWorktreeSettlementPhaseV1::IntentCommitted
+        );
+        assert_eq!(reopened.counts.recovery_required, 0);
+        assert!(reopened.finished_at.is_none());
+        let frozen: (String, i64) = fixture.store.conn.query_row(
+            "SELECT state,recovery_required_count FROM source_worktree_settlement_runs WHERE run_id=?1",
+            [fixture.run_id.to_string()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(frozen, ("recovery_required".into(), 1));
+        // The bounded V171 attempt stays immutable; completion recovery can now discover its fence.
+        fixture
+            .store
+            .mark_source_worktree_settlement_recovery_required(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "recovery_proof_failed",
+                "quarantined worktree failed its removal-authority proof",
+            )
+            .unwrap();
+        assert!(
+            !fixture
+                .store
+                .reopen_source_worktree_quarantine_proof_fences(fixture.run_id)
+                .unwrap()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_nonterminal_source_worktree_settlement_run_ids(None, 64)
+                .unwrap(),
+            vec![fixture.run_id]
+        );
+        let counters: (i64, i64) = fixture.store.conn.query_row(
+            "SELECT r.recovery_required_count,a.recovery_required_count FROM source_worktree_settlement_runs r
+             JOIN source_worktree_settlement_reproof_runs a USING(run_id) WHERE run_id=?1",
+            [fixture.run_id.to_string()], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counters, (1, 1));
+        for sql in [
+            "UPDATE source_worktree_settlement_items SET phase='intent_committed'",
+            "UPDATE source_worktree_settlement_reproof_runs SET recovery_required_count=0",
+            "UPDATE source_worktree_settlement_reproof_items SET reason='changed'",
+            "DELETE FROM source_worktree_settlement_reproof_items",
+            "DELETE FROM source_worktree_settlement_reproof_runs",
+            "INSERT OR REPLACE INTO source_worktree_settlement_reproof_items SELECT * FROM source_worktree_settlement_reproof_items",
+            "INSERT OR REPLACE INTO source_worktree_settlement_reproof_runs SELECT * FROM source_worktree_settlement_reproof_runs",
+        ] {
+            assert!(fixture.store.conn.execute(sql, []).is_err(), "guard: {sql}");
+        }
+        fixture.store.init_schema_internal(false, false).unwrap();
+        fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .validate_wire()
+            .unwrap();
+        let violations: i64 = fixture
+            .store
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn quarantine_reproof_only_reopens_exact_unmarked_first_proof_fences() {
+        for (case, code, observation, marker) in [
+            (
+                "wrong-refusal",
+                "worktree_residue",
+                "quarantined worktree failed its removal-authority proof",
+                None,
+            ),
+            (
+                "missing-paths",
+                "recovery_proof_failed",
+                "both worktree paths are absent without canonical durable removal authority",
+                None,
+            ),
+            (
+                "final-proof",
+                "recovery_proof_failed",
+                "quarantine changed during its final post-marker proof",
+                None,
+            ),
+            (
+                "marked",
+                "recovery_proof_failed",
+                "quarantined worktree failed its removal-authority proof",
+                Some("retained removal marker"),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut fixture = quarantine_fixture(directory.path(), case);
+            if let Some(marker) = marker {
+                fixture
+                    .store
+                    .conn
+                    .execute(
+                        "UPDATE source_worktree_settlement_items SET before_observation=?1",
+                        [marker],
+                    )
+                    .unwrap();
+            }
+            fixture
+                .store
+                .mark_source_worktree_settlement_recovery_required(
+                    fixture.run_id,
+                    fixture.session_id,
+                    SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                    code,
+                    observation,
+                )
+                .unwrap();
+            let before = serde_json::to_value(
+                fixture
+                    .store
+                    .get_source_worktree_settlement_run(fixture.run_id)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !fixture
+                    .store
+                    .reopen_source_worktree_quarantine_proof_fences(fixture.run_id)
+                    .unwrap(),
+                "{case}"
+            );
+            assert!(fixture.store.conn.execute("UPDATE source_worktree_settlement_items SET phase='intent_committed',refusal_code=NULL", []).is_err());
+            assert_eq!(
+                serde_json::to_value(
+                    fixture
+                        .store
+                        .get_source_worktree_settlement_run(fixture.run_id)
+                        .unwrap()
+                )
+                .unwrap(),
+                before
+            );
         }
     }
 
@@ -5371,6 +6474,7 @@ mod tests {
             request_fingerprint: format!("sha256:{}", "3".repeat(64)),
             observed_count: first.counts.observed,
             retained_count: first.counts.retained,
+            retained: Vec::new(),
             items: vec![NewSettlementItem {
                 session_id: item.session_id,
                 original_status: item.original_status,
@@ -5494,6 +6598,380 @@ mod tests {
                     params![fixture.canonical_repo_dir, fixture.run_id.to_string()],
                 )
                 .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn run_record_keeps_retained_roots_with_class_and_rejects_a_mismatched_snapshot() {
+        // #2635: a run that settled one root and retained a dirty and a
+        // non-ancestor root reads all three back from the run record.
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "retained-roots");
+        fixture
+            .store
+            .mark_source_worktree_settlement_refused(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "custody_drift",
+                "close fixture run",
+            )
+            .unwrap();
+        let root =
+            |sequence: u32, disposition, diagnostic: Option<&str>| SourceWorktreeRetainedRootV1 {
+                sequence,
+                session_id: Uuid::new_v4(),
+                custody_id: Uuid::new_v4(),
+                session_status: "Completed".into(),
+                sandbox_root: format!("/sandboxes/retained-{sequence}"),
+                source_ref: format!("refs/heads/rsi/retained-{sequence}"),
+                disposition,
+                diagnostic: diagnostic.map(str::to_string),
+            };
+        let mut run = synthetic_run_template(&fixture);
+        run.run_id = Uuid::new_v4();
+        run.idempotency_key = "retained-snapshot".into();
+        run.observed_count = 3;
+        run.retained_count = 2;
+        run.retained = vec![
+            root(
+                0,
+                SourceWorktreeDispositionV1::DirtyWorktree,
+                Some("2 dirty paths"),
+            ),
+            root(1, SourceWorktreeDispositionV1::RetainedNonAncestor, None),
+        ];
+
+        let mut short = run.clone();
+        short.retained.pop();
+        let mut eligible = run.clone();
+        eligible.retained[1].disposition = SourceWorktreeDispositionV1::EligibleIntegratedAncestor;
+        let mut skipped = run.clone();
+        skipped.retained[1].sequence = 5;
+        for bad in [short, eligible, skipped] {
+            assert!(
+                fixture
+                    .store
+                    .insert_source_worktree_settlement_run(&bad)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .store
+                    .get_source_worktree_settlement_run(bad.run_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        fixture
+            .store
+            .insert_source_worktree_settlement_run(&run)
+            .unwrap();
+        let receipt = fixture
+            .store
+            .get_source_worktree_settlement_run(run.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.counts.retained, 2);
+        assert_eq!(receipt.retained_roots, run.retained);
+        receipt.clone().validate_wire().unwrap();
+        // The replay of the same request returns the stored snapshot.
+        match fixture
+            .store
+            .insert_source_worktree_settlement_run(&run)
+            .unwrap()
+        {
+            InsertSettlementRunOutcome::Replay(replayed) => {
+                assert_eq!(replayed.retained_roots, run.retained);
+            }
+            InsertSettlementRunOutcome::Inserted => panic!("expected a replay"),
+        }
+        // The snapshot is immutable and retained.
+        assert!(
+            fixture
+                .store
+                .conn
+                .execute(
+                    "UPDATE source_worktree_settlement_retained_roots SET disposition='no_action'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .conn
+                .execute("DELETE FROM source_worktree_settlement_retained_roots", [])
+                .is_err()
+        );
+        // `INSERT OR REPLACE` / `REPLACE` / UPSERT would delete the colliding row
+        // without firing the DELETE trigger (recursive_triggers is off): the
+        // BEFORE INSERT guard refuses them, and the snapshot is unchanged.
+        let before = fixture
+            .store
+            .get_source_worktree_settlement_run(run.run_id)
+            .unwrap()
+            .unwrap()
+            .retained_roots;
+        for verb in ["INSERT OR REPLACE", "REPLACE", "INSERT"] {
+            let result = fixture.store.conn.execute(
+                &format!(
+                    "{verb} INTO source_worktree_settlement_retained_roots
+                        (run_id, sequence, session_id, custody_id, session_status,
+                         sandbox_root, source_ref, disposition, diagnostic)
+                     SELECT run_id, sequence, session_id, custody_id, session_status,
+                            sandbox_root, source_ref, 'no_action', 'replaced'
+                       FROM source_worktree_settlement_retained_roots WHERE sequence=0"
+                ),
+                [],
+            );
+            assert!(result.is_err(), "{verb} must be refused");
+        }
+        assert!(
+            fixture
+                .store
+                .conn
+                .execute(
+                    "INSERT INTO source_worktree_settlement_retained_roots
+                        (run_id, sequence, session_id, custody_id, session_status,
+                         sandbox_root, source_ref, disposition, diagnostic)
+                     SELECT run_id, sequence, session_id, custody_id, session_status,
+                            sandbox_root, source_ref, 'no_action', 'replaced'
+                       FROM source_worktree_settlement_retained_roots WHERE sequence=0
+                     ON CONFLICT(run_id, sequence) DO UPDATE SET diagnostic=excluded.diagnostic",
+                    [],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(run.run_id)
+                .unwrap()
+                .unwrap()
+                .retained_roots,
+            before
+        );
+        // A run recorded without a snapshot (before V179) still reads back.
+        let earlier = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert!(earlier.retained_roots.is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn settlement_attribution_is_atomic_immutable_and_retained_on_receipt_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "attribution");
+        let operator = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            operator.attribution.as_ref().unwrap().origin,
+            SourceWorktreeSettlementOriginV1::Operator
+        );
+        let mut run = synthetic_run_template(&fixture);
+        run.run_id = Uuid::new_v4();
+        run.idempotency_key = "attributed-agent".into();
+        let invalid = SourceWorktreeSettlementAttributionV1 {
+            origin: SourceWorktreeSettlementOriginV1::Agent,
+            agent_session_id: None,
+        };
+        assert!(
+            fixture
+                .store
+                .insert_source_worktree_settlement_run_as(&run, &invalid)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(run.run_id)
+                .unwrap()
+                .is_none()
+        );
+        fixture
+            .store
+            .mark_source_worktree_settlement_refused(
+                fixture.run_id,
+                fixture.session_id,
+                SourceWorktreeSettlementPhaseV1::IntentCommitted,
+                "custody_drift",
+                "close fixture run",
+            )
+            .unwrap();
+        let attribution = SourceWorktreeSettlementAttributionV1 {
+            origin: SourceWorktreeSettlementOriginV1::Agent,
+            agent_session_id: Some(fixture.session_id),
+        };
+        fixture
+            .store
+            .insert_source_worktree_settlement_run_as(&run, &attribution)
+            .unwrap();
+        let receipt = fixture
+            .store
+            .get_source_worktree_settlement_run(run.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.attribution, Some(attribution));
+        let history = fixture
+            .store
+            .list_source_worktree_settlement_runs(20)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history
+                .iter()
+                .find(|v| v.run_id == run.run_id)
+                .unwrap()
+                .attribution,
+            receipt.attribution
+        );
+        assert!(
+            fixture
+                .store
+                .list_source_worktree_settlement_runs(0)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .list_source_worktree_settlement_runs(51)
+                .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .list_source_worktree_settlement_runs(1)
+                .unwrap()
+                .len(),
+            1
+        );
+        let automatic = SourceWorktreeSettlementAttributionV1 {
+            origin: SourceWorktreeSettlementOriginV1::Automatic,
+            agent_session_id: None,
+        };
+        let InsertSettlementRunOutcome::Replay(replay) = fixture
+            .store
+            .insert_source_worktree_settlement_run_as(&run, &automatic)
+            .unwrap()
+        else {
+            panic!("receipt replay");
+        };
+        assert_eq!(replay.attribution, receipt.attribution);
+        assert!(fixture.store.conn.execute("INSERT OR REPLACE INTO source_worktree_settlement_attribution (run_id,origin,agent_session_id) VALUES (?1,'automatic',NULL)", [run.run_id.to_string()]).is_err());
+        assert!(fixture.store.conn.execute("UPDATE source_worktree_settlement_attribution SET origin='automatic',agent_session_id=NULL WHERE run_id=?1", [run.run_id.to_string()]).is_err());
+        assert!(
+            fixture
+                .store
+                .conn
+                .execute(
+                    "DELETE FROM source_worktree_settlement_attribution WHERE run_id=?1",
+                    [run.run_id.to_string()]
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn deleted_owner_migration_preserves_receipts_guards_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = quarantine_fixture(directory.path(), "deleted-owner-migration");
+        let receipt = fixture
+            .store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        crate::store::tests::rewind_store_to_schema_version(
+            &fixture.store.conn,
+            SETTLEMENT_DELETED_OWNER_SCHEMA_VERSION - 1,
+        );
+        fixture.store.init_schema().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+        fixture
+            .store
+            .mark_source_worktree_settlement_unattempted(
+                fixture.run_id,
+                fixture.session_id,
+                "fixture retained without effects",
+            )
+            .unwrap();
+        let mut run = synthetic_run_template(&fixture);
+        run.run_id = Uuid::new_v4();
+        run.idempotency_key = "deleted-owner-migration:second".into();
+        run.request_fingerprint = format!("sha256:{}", "9".repeat(64));
+        run.items[0].original_status = "Deleted".into();
+        fixture
+            .store
+            .insert_source_worktree_settlement_run(&run)
+            .unwrap();
+        let journal = fixture
+            .store
+            .list_source_worktree_settlement_journal_items(run.run_id)
+            .unwrap();
+        assert_eq!(journal[0].original_status, "Deleted");
+        assert!(
+            fixture
+                .store
+                .conn
+                .execute(
+                    "DELETE FROM source_worktree_settlement_items WHERE run_id=?1",
+                    [run.run_id.to_string()]
+                )
+                .is_err()
+        );
+        assert!(fixture.store.conn.execute("UPDATE source_worktree_settlement_items SET original_status='Running' WHERE run_id=?1", [run.run_id.to_string()]).is_err());
+        fixture.store.init_schema().unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .list_source_worktree_settlement_journal_items(run.run_id)
+                .unwrap()[0]
+                .original_status,
+            "Deleted"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn attribution_migration_rewinds_and_replays_without_changing_historical_receipts() {
+        let store = Store::open_in_memory().unwrap();
+        crate::store::tests::rewind_store_to_schema_version(
+            &store.conn,
+            SETTLEMENT_ATTRIBUTION_SCHEMA_VERSION - 1,
+        );
+        store.init_schema().unwrap();
+        for (kind, name) in SETTLEMENT_ATTRIBUTION_CATALOG_OBJECTS {
+            let exists: bool = store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                    [kind, name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "replayed attribution object {name}");
+        }
+        assert!(
+            store
+                .list_source_worktree_settlement_runs(20)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -5743,11 +7221,15 @@ mod tests {
     fn v95_migration_rejects_authentic_v94_duplicate_custody_authority() {
         let directory = tempfile::tempdir().expect("V94 duplicate custody directory");
         let fixture = quarantine_fixture(directory.path(), "v94-duplicate-custody");
+        // Remove newer dependents before the test's isolated V95 -> V94 rebuild.
+        crate::store::tests::rewind_store_to_schema_version(&fixture.store.conn, 171);
         let tx = fixture
             .store
             .conn
             .unchecked_transaction()
             .expect("open V95-to-V94 fixture transaction");
+        rebuild_settlement_status_constraint(&tx, false)
+            .expect("restore original settlement terminal status constraint");
         restore_v94_hardening(&tx).expect("restore exact V94 settlement hardening");
         tx.execute("PRAGMA user_version=94", [])
             .expect("restore V94 user version");
@@ -6180,6 +7662,58 @@ mod tests {
         let mut zero_root = authority_marker;
         zero_root.root_device = 0;
         assert!(zero_root.to_canonical_json().is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn quarantine_identity_binds_every_stable_field_but_allows_fresh_observations() {
+        let directory = tempfile::tempdir().expect("identity directory");
+        let fixture = quarantine_fixture(directory.path(), "marker-identity");
+        let retained = marker(&fixture, 'b');
+        let original = serde_json::to_value(&retained).unwrap();
+        assert!(retained.matches_quarantine_identity(&retained));
+        for (field, value) in original.as_object().unwrap() {
+            let mut changed = original.clone();
+            changed[field] = match value {
+                serde_json::Value::Number(number) => {
+                    serde_json::json!(number.as_u64().unwrap() + 1)
+                }
+                serde_json::Value::String(text) if text.starts_with("sha256:") => {
+                    serde_json::json!(format!("sha256:{}", "f".repeat(64)))
+                }
+                serde_json::Value::String(text) if text.len() == 40 => {
+                    serde_json::json!("f".repeat(40))
+                }
+                serde_json::Value::String(text) if Uuid::parse_str(text).is_ok() => {
+                    serde_json::json!(Uuid::new_v4())
+                }
+                serde_json::Value::String(text) => serde_json::json!(format!("{text}-drift")),
+                _ => panic!("unexpected marker field {field}"),
+            };
+            let fresh: QuarantineRemoveAuthorityV1 = serde_json::from_value(changed).unwrap();
+            assert_ne!(
+                retained, fresh,
+                "full marker equality must still bind {field}"
+            );
+            let volatile = matches!(
+                field.as_str(),
+                "removal_target_oid"
+                    | "holder_evidence_digest"
+                    | "holder_fixed_point_passes"
+                    | "trusted_platform_exemption_count"
+                    | "trusted_platform_exemption_digest"
+            );
+            assert_eq!(
+                retained.matches_quarantine_identity(&fresh),
+                volatile,
+                "{field}"
+            );
+            assert_eq!(
+                fresh.matches_quarantine_identity(&retained),
+                volatile,
+                "{field}"
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

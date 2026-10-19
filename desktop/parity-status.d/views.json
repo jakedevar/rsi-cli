@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "rows": {
+    "overlay:model-dropdown-widget": {
+      "status": "done",
+      "location": "src/model-dropdown.ts, src/model-dropdown-model.ts, src/actions/nav-run.ts, src/prompts.ts, src/actions/hierarchy-run.ts",
+      "note": "one dialog serves Ctrl-M / :model (the launch default), the New session prompt's model (Ctrl-M, the settings side's Model row) and the create-entity form (m): rsid's DiscoverModels per provider; browsing is tentative (Esc / q leave everything as it was); / filters with the TUI rules (case-insensitive, every term in the name or id, punctuation ignored as a fallback so opus45 finds claude-opus-4-5, matches highlighted, catalog order, matches of total), every printable key types while filtering; j/k, g/G, Home/End, Tab / Shift-Tab cycle providers in the TUI order keeping the query, 1-9, Enter. The Settings model rows stay read-only (daemon_fields) and the manager launch catalog is the managers' surface"
+    },
+    "overlay-ref:model-picker": {
+      "status": "done",
+      "location": "src/model-dropdown.ts, src/model-dropdown-model.ts",
+      "note": "every key of the table: j/k Down/Up, g/G, /, Up/Down Ctrl-N/Ctrl-P while typing, Home/End, Backspace / Ctrl-W / Ctrl-U, Tab/Shift-Tab, 1-9, Enter, Esc (stops typing first), q"
+    },
+    "overlay-ref:parent-picker": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts, src/pickers.ts, src/overlay-keys.ts",
+      "note": "gp (or Choose…) in the create-entity form: the legal parents for the kind; typing filters, Up/Down move (j/k type into the filter, as in the TUI's typing state), Enter sets the parent, Esc closes; Space N / Space ; with an empty filter"
+    },
+    "module:ui/overlay/parent_picker.rs": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts, src/pickers.ts",
+      "note": "see overlay-ref:parent-picker"
+    },
+    "overlay-ref:create-entity-normal": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts",
+      "note": "focus outside a text box is the form's normal mode: Tab/Shift-Tab (native), n/b/k/T/t focus name/body/kind/tags/topology, i edits, h/l on the kind change it (legal kinds only), Ctrl-P / Ctrl-Shift-P provider, e/E effort, s sandbox, m model dropdown, gp parent picker, Enter creates, Esc keeps the draft and closes, Ctrl-Enter (Cmd-Enter) creates, Ctrl-D discards"
+    },
+    "overlay-ref:create-entity-insert": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts, src/hierarchy-model.ts",
+      "note": "typing and Backspace in the name and tags; Space and , separate tag chips as they are typed (normalize_tag), Tab moves on with them committed; Esc returns to normal mode; Ctrl-Enter creates; Ctrl-D discards"
+    },
+    "overlay-ref:create-entity-body": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts, src/vim-field.ts",
+      "note": "the body is a vim field (G1's editor): i/a/o insert, Esc normal mode, h j k l w b and the rest; Enter is a newline; Tab/Shift-Tab move fields; Esc in normal mode keeps the draft and closes; Ctrl-Enter creates; Ctrl-D discards"
+    },
+    "overlay-ref:create-entity-topology": {
+      "status": "substitute",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts",
+      "note": "j/k Down/Up and G move the topology, Space toggles its preview, Enter chooses and moves on, Esc clears it and focuses the kind, Ctrl-Enter creates, Ctrl-D discards. Substitute for the typed filter: the topology is a native select, whose type-ahead jumps to the matching name"
+    },
+    "module:ui/overlay/create_entity_form.rs": {
+      "status": "done",
+      "location": "src/actions/hierarchy-run.ts, src/entity-form-keys.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "the form (G2) with the TUI keys of its four tables (G4)"
+    },
+    "overlay-ref:text-area-background": {
+      "status": "done",
+      "location": "src/textbg.ts, src/overlay-keys.ts, src/settings.ts",
+      "note": "Settings › Appearance › Screen › Background color (or the palette): type #RRGGBB (uppercased; the seventh character applies it, as in the TUI), Backspace, Enter applies, Delete clears the override, Esc / q close, Space N / Space ;. A desktop preference (localStorage) painted behind every text field while the Text area background switch is on"
+    },
+    "module:ui/overlay/text_area_bg_editor.rs": {
+      "status": "done",
+      "location": "src/textbg.ts, src/overlay-keys.ts",
+      "note": "see overlay-ref:text-area-background"
+    },
+    "overlay-ref:new-session-prompt": {
+      "status": "substitute",
+      "location": "src/prompts.ts, src/prompt-model.ts, src/launch.ts, src-tauri/src/prompts.rs",
+      "note": "Ctrl-Enter launches; Ctrl-O or Tab (normal) flips to the settings side; Ctrl-M the model dropdown; Ctrl-E steps the effort along the model's ladder; Ctrl-B toggles the git-worktree sandbox (LaunchSession sandbox); ? (normal) help; Ctrl-Q closes keeping the draft; Ctrl-Y compiles and Ctrl-Shift-G corrects into a preview, a / d accept or discard; Ctrl-Alt-A AI command (Ctrl-A stays select-all) and Ctrl-Shift-A AI chat; Ctrl-V pastes (images become @path, G1); the vim keys are G1's editor; a header row shows dir, model, effort bars, sandbox and the planned manager. Substitute: the desktop has one New session dialog and no tabs or splits, so Ctrl-T / Ctrl-S launch into the list, and Ctrl-J / Ctrl-K and Space N say there are no stacked prompts (the draft stays)"
+    },
+    "overlay-ref:new-session-settings": {
+      "status": "substitute",
+      "location": "src/prompts.ts, src/prompt-model.ts, src/launch.ts, src-tauri/src/prompts.rs",
+      "note": "j/k, h/l, Space/Enter on Model, Effort, Sandbox, Manager (needs a project), Scope (whole project, then each live Group with its live Epics), Policy (Observe, Execute, Full project control); Ctrl-E / Ctrl-B / Ctrl-M / Ctrl-Enter / Ctrl-T / Ctrl-S / ? / Ctrl-Q; Ctrl-O / Tab / Esc flip back. The appointment runs after the launch is accepted through one ConfigureHarnessManagerWithPolicy (the preset applied by rsi_common's own preset code, fenced by GetHarnessManager / GetHarnessManagerPolicy); a refusal is a notice and the session stays launched. Substitute for the grant page: p (or Enter on Grant) opens the full manager policy editor (:manager policy) on the granted policy right after the appointment, instead of editing it inside the prompt"
+    },
+    "overlay-ref:input-modal": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/prompts.ts, src/assist.ts",
+      "note": "Ctrl-G's editor (G1): Enter (with Submit on Enter) or Ctrl-Enter sends, Ctrl-Q closes and returns the text to the input bar, Ctrl-Alt-A AI command (Ctrl-A stays select-all) and Ctrl-Shift-A AI chat, Ctrl-Y compile and Ctrl-Shift-G grammar into a preview (a / d), Ctrl-V paste, vim i/a/o, Esc, h j k l w b"
+    },
+    "module:ui/overlay/input_modal.rs": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/prompts.ts",
+      "note": "see overlay-ref:input-modal"
+    },
+    "module:ui/overlay/suggestion_dropdown.rs": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "G1's slash-command suggestions in the message box, the launch and continue prompts and the input modal: Tab accepts, Down / Ctrl-N and Up / Ctrl-P move, Esc dismisses"
+    },
+    "overlay-ref:budget-policy-form": {
+      "status": "done",
+      "location": "src/budgets.ts, src/budgets-model.ts, src-tauri/src/budgets.rs",
+      "note": "Settings › Safety & Spend › Budgets (Enter lists, a adds): Tab / Shift-Tab cycle the nine fields, Up / Down cycle the scope kind and model tier, typing (digits only in the limits, one . in the ratio), Backspace, Enter saves, Esc closes. The policy is built with the TUI's rules (scope id unless Global, serde purpose, ratio in (0, 1], at least one counted limit, hidden fields kept) and sent as one UpdateModelControlPolicy with replace_policies, the breaker mode unchanged and no interrupt; an edit or delete is refused when the row changed since it was read; d deletes without asking, as the TUI does (delete_model_budget_policy). This is the one Budgets implementation: G3 (#82) built a second list and form as a manager view (View menu: Budget policies…), and it was removed when G3 and G4 were merged"
+    },
+    "module:ui/overlay/budget_policy_form.rs": {
+      "status": "done",
+      "location": "src/budgets.ts, src/budgets-model.ts, src-tauri/src/budgets.rs",
+      "note": "see overlay-ref:budget-policy-form; the list: j/k, Enter/Space edit, a add, d delete, R refresh, Esc/q"
+    },
+    "overlay-ref:screens-without-an-overlay-catalog": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/overlay-help.generated.ts, scripts/overlay-help.mjs",
+      "note": "each screen's desktop counterpart documents its keys where the TUI does: the Normal-mode table in help (All Commands), the Scheduled Jobs and theme role editor tables in the overlay catalog, help's own footer, the ESP square legend, the manager, settlement, satellite, remote and legacy-scratch surfaces in their dialogs' hint lines and README sections, and the graph dashboard (the DAG browser)"
+    },
+    "overlay-ref:surfaces-documented-by-hand": {
+      "status": "done",
+      "location": "README.md, src/keyhelp.ts, src/keyhelp-model.ts, src/overlay-help.generated.ts, scripts/overlay-help.mjs",
+      "note": "the hand-documented surfaces have their desktop documentation: vim text editing and the input bar (G1, README and the vim editor), the launch / continue prompts (the help's New Session Prompt, Settings and Continue Prompt rows, README G4), and the file viewer (its rows in help, README 'Project files'); the Prompt Creator is hub #3040"
+    },
+    "module:ui/status.rs": {
+      "status": "substitute",
+      "location": "src/sessions.ts, src/actions/input.ts, src/dom.ts",
+      "note": "the TUI's status line is the desktop header's daemon indicator, the NORMAL / INSERT badge (G1), the pending-chord hint and the toasts"
+    },
+    "module:ui/glyphs.rs": {
+      "status": "substitute",
+      "location": "src/keyhelp-model.ts SYMBOLS",
+      "note": "the desktop draws its own glyph vocabulary in HTML (pin, testing, rotation, retry and depth markers, folds, git gutter, tool pairing, settings widgets) and explains each by location in help's Symbols view (s), as the TUI's legend does"
+    },
+    "module:ui/height.rs": {
+      "status": "substitute",
+      "location": "static/styles.css, src/conversation.ts",
+      "note": "per-event row heights for terminal word wrap are the browser layout (CSS wrapping and scrolling); the file viewer keeps its fixed line height for virtualization"
+    },
+    "module:ui/navigator_layout.rs": {
+      "status": "substitute",
+      "location": "src/sessions.ts, src/listmodel.ts, static/styles.css",
+      "note": "the one-line navigator layout is the HTML session row: identity-first title truncated with an ellipsis, markers and columns laid out by CSS"
+    },
+    "module:ui/rainbow_loaders.rs": {
+      "status": "substitute",
+      "location": "src/sessions.ts, static/styles.css",
+      "note": "the animated terminal loaders are the desktop's status dots and its Loading… / COMPILING… text; the TUI's animation-style choices are TUI preferences"
+    },
+    "module:ui/tool_projection.rs": {
+      "status": "substitute",
+      "location": "src/tool-projection.ts, src/conversation.ts",
+      "note": "the same pairing rules (strictly by tool_use_id, parallel calls batch, pending and orphan rows kept, content-less System rows transparent, pre-migration rows unpaired) annotate each call (⧗ running / ✓ answered, the batch size on its first call) and each result (↳ tool #N). Substitute for the collapse: the transcript keeps one row per event, because selection, folds and copy act on events"
+    },
+    "module:ui/overlay/daemon_text_editor.rs": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts",
+      "note": "the Daemon Text Setting editor (overlay-ref:daemon-text-setting): type, Enter saves, Delete clears to the default, Esc cancels"
+    },
+    "overlay-ref:skill-preview": {
+      "status": "done",
+      "location": "src/skills.ts, src/skills-model.ts, src/actions/promptcreator-run.ts, src-tauri/src/input.rs",
+      "note": "the Skill Preview reads SKILL.md through rsid (GetSkill user:true, hub #3062; the TUI calls the same rsi_common::input_assets::read_skill): j/k, Ctrl-D/U, g/G scroll, q/Esc close back to the skills list"
+    }
+  }
+}

@@ -129,7 +129,7 @@ Proceed immediately without waiting for confirmation.
 
 ## Step 3: Worker Dispatch
 
-Spawn all workers in a **single message** using the `Agent` tool with `run_in_background: true`.
+Dispatch all workers in one batch, following `.claude/commands/_shared/team_dispatch.md`: RSI controls (`rsi_control_spawn` / `AgentSpawnChild`) inside an RSI session, native background agents only outside RSI. With no spawn authority, do each domain's research and plan contribution yourself in this session and do not claim workers ran.
 
 Name each worker descriptively: `"planner-common"`, `"planner-daemon-rpc"`, `"planner-tui-actions"`, `"planner-thoughts"`, etc.
 
@@ -172,7 +172,7 @@ Nothing before it. Nothing after it. The master reads only your report.
 
 <forbidden_content>
 (Extends the shared preamble's forbidden list — role-specific additions only.)
-- Any field that exceeds its max_words / max_items cap — over-budget returns will be rejected and the worker re-dispatched.
+- Any field that exceeds its max_words / max_items cap — over-budget fields are trimmed by the master during synthesis; do not redispatch a completed worker for budget or formatting alone.
 </forbidden_content>
 
 **Rule:** Workers contribute only file:line refs and bullet summaries. The plan document (written by the master) still contains code; worker returns must not. The master composes code sections from the file:line refs workers provide.
@@ -192,7 +192,7 @@ Suggested phase: [early | middle | late]
 
 ## Step 4: Synthesis + Phase Ordering
 
-After all workers report via TaskOutput:
+After all workers report (final messages read per `_shared/team_dispatch.md`):
 
 1. Parse each `PLAN CONTRIBUTION`
 2. Collect the bullet proposed_changes and file_refs across domains (master will write any code using the file:line refs)

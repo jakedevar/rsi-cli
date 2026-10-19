@@ -24,17 +24,20 @@ done < <(compgen -e | grep '^RSI_' || true)
 
 usage() {
     cat >&2 <<'EOF'
-Usage: scripts/run-rsid-test-shards.sh fast|full|list|warmup [--jobs N] [--evidence-dir DIR] [--dry-run] [--keep-rsid-artifacts]
-       scripts/run-rsid-test-shards.sh shard SHARD [--jobs N] [--filterset EXPR] [--evidence-dir DIR] [--dry-run] [--keep-rsid-artifacts]
+Usage: scripts/run-rsid-test-shards.sh fast|full|list|warmup [--jobs N] [--evidence-dir DIR] [--dry-run] [--keep-rsid-artifacts] [--slow-tier]
+       scripts/run-rsid-test-shards.sh shard SHARD [--jobs N] [--filterset 'test(A) | test(B)'] [--evidence-dir DIR] [--dry-run] [--keep-rsid-artifacts] [--slow-tier]
        scripts/run-rsid-test-shards.sh list|warmup --profile rsid-fast|ci-full [--jobs N] [--evidence-dir DIR]
 
-fast: all rsid library shards, integration targets, binary targets, and doctests.
+fast: all rsid library shards, integration targets, binary targets, the rsid-remote-read leaf library (#2410), and doctests.
 full: fast coverage plus every other workspace package's tests and doctests.
 list: enumerate the 16 library shards (each across its packages) and check their runtime identity union.
 warmup: build shard, integration, binary, and selected workspace test artifacts without running tests.
 shard: list, check, and run one library shard for a bounded edit/verify loop.
 --dry-run checks the static inventory and prints commands without running Cargo.
 --keep-rsid-artifacts (or RSI_LANDER_KEEP_RSID_ARTIFACTS=1) retains each shard's rsid test build.
+--slow-tier (or RSI_LANDER_SLOW_TIER=full) also runs the slow tier (#2270): the released-migration tests
+.config/slow-tier.toml names, which the profile's default-filter leaves out. The full QA and a
+migration-touching gate pass it; `full` mode (profile ci-full) always runs them.
 Cleanup skips while another runner uses the same Cargo target directory.
 EOF
     exit 2
@@ -51,8 +54,16 @@ keep_rsid_artifacts=0
 # so cleaning there only throws away binaries its prebuild compiled.
 [[ "${RSI_LANDER_KEEP_RSID_ARTIFACTS:-}" == 1 ]] && keep_rsid_artifacts=1
 list_profile=""
+# #2270: the default tier leaves out the released-migration tests the profile's
+# default-filter names; the full QA and a migration-touching gate run them.
+slow_tier=0
+[[ "${RSI_LANDER_SLOW_TIER:-}" == full ]] && slow_tier=1
 while (( $# )); do
     case "$1" in
+        --slow-tier)
+            slow_tier=1
+            shift
+            ;;
         --jobs)
             (( $# >= 2 )) || usage
             jobs="$2"
@@ -86,10 +97,12 @@ while (( $# )); do
 done
 [[ -z "$filterset" || "$mode" == shard ]] || usage
 if [[ -n "$filterset" ]]; then
-    # One nextest atom: test(NAME), test(=NAME) or test(/REGEX/) (the shapes
-    # check-touched-shards emits, #1510). Control and non-ASCII bytes are
-    # refused; "$filterset" is always forwarded as one quoted argument.
-    filterset_pattern='^test\((=?[A-Za-z0-9_:.-]+|/.+/)\)$'
+    # One or more nextest atoms joined by `|` (#1605): test(NAME), test(=NAME)
+    # or test(/REGEX/) (the shapes check-touched-shards emits, #1510). Control
+    # and non-ASCII bytes are refused; "$filterset" is always forwarded as one
+    # quoted argument.
+    filterset_atom='test\((=?[A-Za-z0-9_:.-]+|/.+/)\)'
+    filterset_pattern="^${filterset_atom}( *\\| *${filterset_atom})*\$"
     [[ "$filterset" =~ $filterset_pattern ]] || usage
     [[ -z "$(printf '%s' "$filterset" | LC_ALL=C tr -d '\040-\176')" ]] || usage
 fi
@@ -102,22 +115,40 @@ else
     if [[ "$mode" == full ]]; then profile=ci-full; else profile=rsid-fast; fi
 fi
 
+# `list` always ignores the default-filter: the runtime identity check needs every
+# shard test listed as matching. A run ignores it only on the slow tier.
+list_tier_args=(--ignore-default-filter)
+run_tier_args=()
+if (( slow_tier )); then run_tier_args=(--ignore-default-filter); fi
+
 if (( dry_run )); then
     shard_output="$(python3 scripts/check-rsid-test-shards.py --list-shards)"
 else
     shard_output="$(python3 scripts/check-rsid-test-shards.py --require-gates --list-shards)"
 fi
-mapfile -t shards <<<"$shard_output"
+# Portable to bash 3.2 (macOS /bin/bash): no `mapfile`, no associative arrays.
+shards=()
+while IFS= read -r shard_name; do
+    shards+=("$shard_name")
+done <<<"$shard_output"
 (( ${#shards[@]} == 16 )) || { echo 'expected exactly 16 library shards' >&2; exit 1; }
 # shard -> "-p PACKAGE ..." flags: the packages whose tests the shard feature selects.
-declare -A shard_package_flags
+# One "shard<TAB>flags" line per shard in `shard_package_map`; `shard_flags` looks one up.
+shard_package_map=""
 while read -r shard_name shard_packages; do
     flags=""
     for package_name in $shard_packages; do flags+="-p $package_name "; done
-    shard_package_flags[$shard_name]="${flags% }"
+    shard_package_map+="${shard_name}"$'\t'"${flags% }"$'\n'
 done < <(python3 scripts/check-rsid-test-shards.py --list-shard-packages)
+shard_flags() {
+    local wanted="$1" name flags
+    while IFS=$'\t' read -r name flags; do
+        if [[ "$name" == "$wanted" ]]; then printf '%s' "$flags"; return 0; fi
+    done <<<"$shard_package_map"
+    return 0
+}
 for shard_name in "${shards[@]}"; do
-    [[ -n "${shard_package_flags[$shard_name]:-}" ]] || { echo "no package declares shard $shard_name" >&2; exit 1; }
+    [[ -n "$(shard_flags "$shard_name")" ]] || { echo "no package declares shard $shard_name" >&2; exit 1; }
 done
 if [[ "$mode" == shard ]]; then
     [[ " ${shards[*]} " == *" $requested_shard "* ]] || usage
@@ -139,8 +170,8 @@ print_command() {
 if (( dry_run )); then
     echo "static plan: mode=$mode profile=$profile jobs=$jobs; no Cargo command executed"
     for shard in "${shards[@]}"; do
-        read -r -a package_flags <<<"${shard_package_flags[$shard]}"
-        print_command cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" --message-format json
+        read -r -a package_flags <<<"$(shard_flags "$shard")"
+        print_command cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" "${list_tier_args[@]}" --message-format json
     done
     runtime_check=(python3 scripts/check-rsid-test-shards.py --require-gates --runtime-dir '<evidence>/lists')
     if [[ "$mode" == shard ]]; then runtime_check+=(--runtime-shard "$requested_shard"); fi
@@ -153,8 +184,8 @@ if (( dry_run )); then
         fi
     elif [[ "$mode" != list ]]; then
         for shard in "${shards[@]}"; do
-            read -r -a package_flags <<<"${shard_package_flags[$shard]}"
-            run_args=(cargo nextest run --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" --status-level all --final-status-level all -j "$jobs")
+            read -r -a package_flags <<<"$(shard_flags "$shard")"
+            run_args=(cargo nextest run --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" ${run_tier_args[@]+"${run_tier_args[@]}"} --status-level all --final-status-level all -j "$jobs")
             if [[ -n "$filterset" ]]; then run_args+=(--filterset "$filterset"); fi
             print_command "${run_args[@]}"
             if (( ! keep_rsid_artifacts )); then
@@ -165,6 +196,9 @@ if (( dry_run )); then
         if [[ "$mode" != shard ]]; then
             print_command cargo nextest run --profile "$profile" -p rsid "${integration_args[@]}" --status-level all --final-status-level all -j "$jobs"
             print_command cargo nextest run --profile "$profile" -p rsid --bins --status-level all --final-status-level all -j "$jobs"
+            if [[ "$mode" == fast ]]; then
+                print_command cargo nextest run --profile "$profile" -p rsid-remote-read --lib --status-level all --final-status-level all -j "$jobs"
+            fi
             if [[ "$mode" == full ]]; then
                 print_command cargo nextest run --profile ci-full --workspace --exclude rsid --exclude rsid-store --status-level all --final-status-level all -j "$jobs"
             fi
@@ -253,10 +287,10 @@ fi
 
 for shard in "${shards[@]}"; do
     label="list-$shard"
-    read -r -a package_flags <<<"${shard_package_flags[$shard]}"
-    record_command "$label" cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" --message-format json
+    read -r -a package_flags <<<"$(shard_flags "$shard")"
+    record_command "$label" cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" "${list_tier_args[@]}" --message-format json
     echo "listing $shard"
-    if cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" --message-format json >"$evidence_dir/lists/$shard.json" 2>"$evidence_dir/logs/$label.stderr"; then
+    if cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" "${list_tier_args[@]}" --message-format json >"$evidence_dir/lists/$shard.json" 2>"$evidence_dir/logs/$label.stderr"; then
         status=0
     else
         status=$?
@@ -279,8 +313,8 @@ if [[ "$mode" == warmup ]]; then
 fi
 
 for shard in "${shards[@]}"; do
-    read -r -a package_flags <<<"${shard_package_flags[$shard]}"
-    run_args=(cargo nextest run --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" --status-level all --final-status-level all -j "$jobs")
+    read -r -a package_flags <<<"$(shard_flags "$shard")"
+    run_args=(cargo nextest run --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" ${run_tier_args[@]+"${run_tier_args[@]}"} --status-level all --final-status-level all -j "$jobs")
     if [[ -n "$filterset" ]]; then run_args+=(--filterset "$filterset"); fi
     if run_logged "run-$shard" "${run_args[@]}"; then
         run_status=0
@@ -295,6 +329,11 @@ done
 if [[ "$mode" == shard ]]; then exit 0; fi
 run_logged rsid-integrations cargo nextest run --profile "$profile" -p rsid "${integration_args[@]}" --status-level all --final-status-level all -j "$jobs"
 run_logged rsid-bins cargo nextest run --profile "$profile" -p rsid --bins --status-level all --final-status-level all -j "$jobs"
+if [[ "$mode" == fast ]]; then
+    # #2410: the Remote read core is its own package with no shard features, so no
+    # shard lists it; `full` runs it with the rest of the workspace.
+    run_logged remote-read-leaf cargo nextest run --profile "$profile" -p rsid-remote-read --lib --status-level all --final-status-level all -j "$jobs"
+fi
 if [[ "$mode" == full ]]; then
     run_logged other-workspace cargo nextest run --profile ci-full --workspace --exclude rsid --exclude rsid-store --status-level all --final-status-level all -j "$jobs"
 fi

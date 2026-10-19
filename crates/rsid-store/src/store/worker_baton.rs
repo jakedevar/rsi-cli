@@ -20,6 +20,11 @@
 //! flips to `sent` only after both landed, so a daemon that restarts in
 //! between finishes the same effects once ([`Store::pending_worker_batons`]).
 //! Nothing here interrupts a turn: the worker ends its own turn.
+//!
+//! #2898: the provider's `PreCompact` lifecycle hook (operator setting
+//! `provider_lifecycle_hooks`) passes the same baton before the provider
+//! compacts ([`Store::record_worker_pre_compact_baton`]); the record carries
+//! its [`WorkerBatonTrigger`], and the mail and the notice say why.
 
 use super::Store;
 use super::harness_manager_v2::refused;
@@ -61,6 +66,29 @@ pub struct WorkerBatonLauncher {
     pub issue_display_number: Option<i64>,
 }
 
+/// What made the worker pass the baton.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBatonTrigger {
+    /// The measured live context crossed the worker cap (#1254). Records
+    /// written before #2898 carry no trigger and read as this.
+    #[default]
+    ContextCap,
+    /// The provider's `PreCompact` hook reported an imminent compaction (#2898).
+    PreCompact,
+}
+
+impl WorkerBatonTrigger {
+    /// The serde name, as the typed notice carries it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ContextCap => "context_cap",
+            Self::PreCompact => "pre_compact",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerBatonState {
@@ -84,6 +112,9 @@ pub struct WorkerBatonRecord {
     /// `manager_notice:<job>` or `mail:<message>`.
     #[serde(default)]
     pub launcher_notice: Option<String>,
+    /// #2898: what passed the baton.
+    #[serde(default)]
+    pub trigger: WorkerBatonTrigger,
 }
 
 /// What one crossing did.
@@ -185,6 +216,43 @@ impl Store {
         cap_tokens: u64,
         now: DateTime<Utc>,
     ) -> Result<WorkerBatonOutcome> {
+        self.record_worker_baton(
+            worker,
+            WorkerBatonTrigger::ContextCap,
+            measured_tokens,
+            cap_tokens,
+            now,
+        )
+    }
+
+    /// #2898: the provider is about to compact `worker`'s context (its
+    /// `PreCompact` hook). Passes the same one baton as a cap crossing: a
+    /// worker that already holds a baton record (from either trigger) gets
+    /// nothing new, so one compaction, or several, never sends a second baton.
+    pub fn record_worker_pre_compact_baton(
+        &self,
+        worker: Uuid,
+        measured_tokens: u64,
+        cap_tokens: u64,
+        now: DateTime<Utc>,
+    ) -> Result<WorkerBatonOutcome> {
+        self.record_worker_baton(
+            worker,
+            WorkerBatonTrigger::PreCompact,
+            measured_tokens,
+            cap_tokens,
+            now,
+        )
+    }
+
+    fn record_worker_baton(
+        &self,
+        worker: Uuid,
+        trigger: WorkerBatonTrigger,
+        measured_tokens: u64,
+        cap_tokens: u64,
+        now: DateTime<Utc>,
+    ) -> Result<WorkerBatonOutcome> {
         if let Some(record) = self.worker_baton(worker)? {
             if record.state == WorkerBatonState::Due {
                 self.deliver_worker_baton(worker)?;
@@ -204,6 +272,7 @@ impl Store {
                 crossed_at: now,
                 worker_mail_id: None,
                 launcher_notice: None,
+                trigger,
             },
         )?;
         self.deliver_worker_baton(worker)?;
@@ -354,6 +423,7 @@ impl Store {
 fn notice_state(worker: Uuid, record: &WorkerBatonRecord) -> serde_json::Value {
     json!({
         "record_kind": WORKER_CONTEXT_CAP_NOTICE,
+        "trigger": record.trigger.name(),
         "worker": worker,
         "issue": record.launcher.issue_id,
         "issue_display_number": record.launcher.issue_display_number,
@@ -364,21 +434,45 @@ fn notice_state(worker: Uuid, record: &WorkerBatonRecord) -> serde_json::Value {
 }
 
 fn baton_mail(record: &WorkerBatonRecord) -> String {
+    let reason = match record.trigger {
+        WorkerBatonTrigger::ContextCap => format!(
+            "[rsi daemon, #1254 baton] Your measured context is {} tokens, past your worker cap of {} tokens.",
+            record.measured_tokens, record.cap_tokens
+        ),
+        WorkerBatonTrigger::PreCompact => {
+            "[rsi daemon, #2898 baton] Your provider is compacting your context (PreCompact hook)."
+                .to_string()
+        }
+    };
+    format!(
+        "{reason} Pass the baton now and start no new work:\n{}",
+        baton_steps(record)
+    )
+}
+
+/// The numbered baton protocol (commit, handoff, final line), shared by the
+/// baton mail and the `PreCompact` hook's handoff instruction (#2898).
+#[must_use]
+pub fn baton_steps(record: &WorkerBatonRecord) -> String {
     let handoff = record.launcher.issue_display_number.map_or_else(
         || "Write the handoff (what is done, what is left, the commit SHA, test state, the next step) in your final message.".to_string(),
         |issue| format!(
-            "Append a handoff to Issue #{issue} with AgentUpdateIssue (read it with AgentGetIssue, then send only body: the current body unchanged followed by a section headed `## Baton handoff` with what is done, what is left, the commit SHA, test state, the next step and your `Friction:` line, and expected_row_version from that read)."
+            "Publish a handoff to Issue #{issue} with `AgentUpdateIssue {{display_number: {issue}, handoff: \"<complete handoff>\", expected_row_version: <any positive>, idempotency_key: \"<unique>\"}}` and no other field. The handoff holds what is done, what is left, the commit SHA, test state, the next step and your `Friction:` line. Do not read the Issue again and do not copy its body: the handoff is stored as its own record."
         ),
     );
     format!(
-        "[rsi daemon, #1254 baton] Your measured context is {} tokens, past your worker cap of {} tokens. Pass the baton now and start no new work:\n1. Commit your work on your sandbox branch (WIP is fine).\n2. {handoff}\n3. End your turn with a final message whose first line is `PIPELINE HANDOFF — BATON <sha>` and whose last line is `Friction: none | #N[, #M] | <one line, not filed because ...>` (the kaizen Issues you filed, or the problem you could not file).\nYour launcher was told and will continue from your commit with a fresh worker.",
-        record.measured_tokens, record.cap_tokens
+        "1. Commit your work on your sandbox branch (WIP is fine).\n2. {handoff}\n3. End your turn with a final message whose first line is `PIPELINE HANDOFF — BATON <sha>` and whose last line is `Friction: none | #N[, #M] | <one line, not filed because ...>` (the kaizen Issues you filed, or the problem you could not file).\nYour launcher was told and will continue from your commit with a fresh worker."
     )
 }
 
 fn launcher_mail(worker: Uuid, record: &WorkerBatonRecord) -> String {
     format!(
-        "[rsi daemon, #1254 worker_context_cap] {}\nWorker {worker} crossed its context cap and was told to commit, append a handoff and end its turn. When it has ended its turn, continue its Issue with a fresh worker (AgentManagerLaunchIssueWorker with continue_from: \"{worker}\", or a new child from its commit).",
-        notice_state(worker, record)
+        "[rsi daemon, #1254 worker_context_cap] {}\nWorker {worker} {} and was told to commit, append a handoff and end its turn. When it has ended its turn, continue its Issue with a fresh worker (AgentManagerLaunchIssueWorker with continue_from: \"{worker}\", or a new child from its commit).",
+        notice_state(worker, record),
+        match record.trigger {
+            WorkerBatonTrigger::ContextCap => "crossed its context cap",
+            WorkerBatonTrigger::PreCompact =>
+                "is being compacted by its provider (PreCompact hook)",
+        }
     )
 }

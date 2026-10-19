@@ -378,7 +378,7 @@ mod tests {
     fn open_test_store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Store::open(&db_path).unwrap();
+        let store = Store::open_test_fixture(&db_path).unwrap();
         (dir, Arc::new(Mutex::new(store)))
     }
 

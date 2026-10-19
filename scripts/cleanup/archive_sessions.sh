@@ -58,6 +58,7 @@ echo "---"
 echo "Archived: $ARCHIVED"
 if (( ${#FAILED[@]} > 0 )); then
   echo "${#FAILED[@]} failures:"
+  # bash32-safe: guarded by the length check above
   printf '  %s\n' "${FAILED[@]}"
   exit 2
 fi

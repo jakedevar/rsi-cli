@@ -2,8 +2,8 @@
 Description=RSI satellite dial-home tunnel (%i)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=10min
-StartLimitBurst=3
+# Retry forever: a peer that is offline or rebooting must never leave the tunnel failed.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -12,7 +12,12 @@ ExecStartPre=%h/.local/libexec/rsi-satellite/dial-home.sh --prepare %i
 ExecStart=%h/.local/libexec/rsi-satellite/dial-home.sh %i
 ExecStartPost=%h/.local/libexec/rsi-satellite/dial-home.sh --secure %i
 Restart=always
+# Backoff: 20s first, growing in 6 steps to 5min. RestartSteps and
+# RestartMaxDelaySec need systemd >= 254; older systemd logs an unknown-key
+# warning, ignores them and keeps the fixed RestartSec=20s retry (still forever).
 RestartSec=20s
+RestartSteps=6
+RestartMaxDelaySec=5min
 TimeoutStopSec=5s
 KillSignal=SIGTERM
 

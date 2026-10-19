@@ -373,7 +373,7 @@ impl RpcServer {
         // BEFORE launch. If the upsert fails (e.g. bridge rejects malformed
         // topology), the launch does NOT proceed — a topology that can't
         // surface in gv shouldn't run silently.
-        let _ = self
+        let bridged_workflow_id = self
             .session_manager
             .upsert_bridged_workflow(&topology, params.project_id)
             .await?;
@@ -420,7 +420,12 @@ impl RpcServer {
         )
         .await?;
 
-        Ok(serde_json::json!({ "execution_id": response.execution_id }))
+        // #1753: `workflow_id` is the topology's own bridged workflow (the one
+        // the graph view opens), never one found by title.
+        Ok(serde_json::json!({
+            "execution_id": response.execution_id,
+            "workflow_id": bridged_workflow_id,
+        }))
     }
 
     pub(super) async fn handle_start_chained_workflow(

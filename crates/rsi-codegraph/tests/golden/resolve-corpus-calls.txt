@@ -1,0 +1,136 @@
+# Hand-labelled Calls edges for tests/fixtures/resolve-corpus (#2244).
+#
+# Method: every Extracted edge the resolver emitted on the frozen corpus was
+# checked against the source line it points at (callee name, enclosing
+# function, and that no local binding or closure shadows the name). All 112
+# are correct: strict precision 112/112 = 1.00. The corpus holds fewer than
+# 200 Extracted edges, so every one is labelled instead of a sample. Each
+# Inferred edge is a method call on a receiver whose type the source does not
+# state; the call is correct in the real crate but only a guess here, which is
+# exactly why it is not Extracted.
+#
+# Format: path:line caller -> callee   (qualified names)
+
+[extracted]
+src/bin/rsi-test-impact.rs:143 src/bin/rsi-test-impact.rs::changed_paths -> src/bin/rsi-test-impact.rs::git
+src/bin/rsi-test-impact.rs:156 src/bin/rsi-test-impact.rs::reader_index -> src/bin/rsi-test-impact.rs::git
+src/bin/rsi-test-impact.rs:157 src/bin/rsi-test-impact.rs::reader_index -> src/bin/rsi-test-impact.rs::git
+src/bin/rsi-test-impact.rs:162 src/bin/rsi-test-impact.rs::reader_index -> src/bin/rsi-test-impact.rs::git_show
+src/bin/rsi-test-impact.rs:172 src/bin/rsi-test-impact.rs::reader_index -> src/impact.rs::ReaderIndex::new
+src/bin/rsi-test-impact.rs:27 src/bin/rsi-test-impact.rs::main -> src/bin/rsi-test-impact.rs::run
+src/bin/rsi-test-impact.rs:34 src/bin/rsi-test-impact.rs::run -> src/bin/rsi-test-impact.rs::parse_args
+src/bin/rsi-test-impact.rs:50 src/bin/rsi-test-impact.rs::run -> src/bin/rsi-test-impact.rs::head_content
+src/bin/rsi-test-impact.rs:60 src/bin/rsi-test-impact.rs::run -> src/bin/rsi-test-impact.rs::workspace_metadata
+src/bin/rsi-test-impact.rs:61 src/bin/rsi-test-impact.rs::run -> src/bin/rsi-test-impact.rs::reader_index
+src/bin/rsi-test-impact.rs:71 src/bin/rsi-test-impact.rs::run -> src/impact.rs::select_tests_with_readers
+src/bin/rsi-test-impact.rs:82 src/bin/rsi-test-impact.rs::run -> src/impact.rs::select_tests_with_readers
+src/impact.rs:1010 src/impact.rs::dedup_and_finalize -> src/impact.rs::smoke_selections
+src/impact.rs:1025 src/impact.rs::dedup_and_finalize -> src/impact.rs::kind_order
+src/impact.rs:1025 src/impact.rs::dedup_and_finalize -> src/impact.rs::kind_order
+src/impact.rs:1143 src/impact.rs::tests::leaf_module_selects_module_tests_smoke_and_dependents -> src/impact.rs::select_tests
+src/impact.rs:1144 src/impact.rs::tests::leaf_module_selects_module_tests_smoke_and_dependents -> src/impact.rs::ChangedFile::new
+src/impact.rs:1148 src/impact.rs::tests::leaf_module_selects_module_tests_smoke_and_dependents -> src/impact.rs::tests::metadata
+src/impact.rs:1185 src/impact.rs::tests::shared_helper_and_cargo_manifest_fall_back_to_full -> src/impact.rs::ChangedFile::new
+src/impact.rs:1185 src/impact.rs::tests::shared_helper_and_cargo_manifest_fall_back_to_full -> src/impact.rs::select_tests
+src/impact.rs:1185 src/impact.rs::tests::shared_helper_and_cargo_manifest_fall_back_to_full -> src/impact.rs::tests::metadata
+src/impact.rs:1206 src/impact.rs::tests::rsid_full_shards_render_as_lander_arguments -> src/impact.rs::select_tests
+src/impact.rs:1207 src/impact.rs::tests::rsid_full_shards_render_as_lander_arguments -> src/impact.rs::ChangedFile::new
+src/impact.rs:1211 src/impact.rs::tests::rsid_full_shards_render_as_lander_arguments -> src/impact.rs::tests::metadata
+src/impact.rs:1228 src/impact.rs::tests::unknown_path_falls_back_to_full_workspace -> src/impact.rs::select_tests
+src/impact.rs:1229 src/impact.rs::tests::unknown_path_falls_back_to_full_workspace -> src/impact.rs::ChangedFile::new
+src/impact.rs:1230 src/impact.rs::tests::unknown_path_falls_back_to_full_workspace -> src/impact.rs::tests::metadata
+src/impact.rs:1251 src/impact.rs::tests::index -> src/impact.rs::ReaderIndex::new
+src/impact.rs:1274 src/impact.rs::tests::select -> src/impact.rs::ChangedFile::new
+src/impact.rs:1276 src/impact.rs::tests::select -> src/impact.rs::select_tests_with_readers
+src/impact.rs:1276 src/impact.rs::tests::select -> src/impact.rs::tests::index
+src/impact.rs:1276 src/impact.rs::tests::select -> src/impact.rs::tests::metadata
+src/impact.rs:1289 src/impact.rs::tests::docs_under_thoughts_select_only_the_smoke_set -> src/impact.rs::tests::select
+src/impact.rs:1290 src/impact.rs::tests::docs_under_thoughts_select_only_the_smoke_set -> src/impact.rs::tests::non_smoke
+src/impact.rs:1301 src/impact.rs::tests::many_unread_docs_do_not_hit_the_changed_file_bound -> src/impact.rs::tests::select
+src/impact.rs:1302 src/impact.rs::tests::many_unread_docs_do_not_hit_the_changed_file_bound -> src/impact.rs::tests::non_smoke
+src/impact.rs:1308 src/impact.rs::tests::a_skill_file_selects_the_test_that_include_strs_it -> src/impact.rs::tests::select
+src/impact.rs:1309 src/impact.rs::tests::a_skill_file_selects_the_test_that_include_strs_it -> src/impact.rs::tests::non_smoke
+src/impact.rs:1325 src/impact.rs::tests::a_production_include_widens_to_dependents -> src/impact.rs::tests::select
+src/impact.rs:1342 src/impact.rs::tests::a_directory_literal_selects_the_corpus_test_binary -> src/impact.rs::tests::select
+src/impact.rs:1343 src/impact.rs::tests::a_directory_literal_selects_the_corpus_test_binary -> src/impact.rs::tests::non_smoke
+src/impact.rs:1356 src/impact.rs::tests::a_script_read_by_a_bin_test_selects_the_bin_tests -> src/impact.rs::tests::select
+src/impact.rs:1357 src/impact.rs::tests::a_script_read_by_a_bin_test_selects_the_bin_tests -> src/impact.rs::tests::non_smoke
+src/impact.rs:1382 src/impact.rs::tests::rsid_bin_source_selects_bin_tests_not_lib_shards -> src/impact.rs::select_tests
+src/impact.rs:1383 src/impact.rs::tests::rsid_bin_source_selects_bin_tests_not_lib_shards -> src/impact.rs::ChangedFile::new
+src/impact.rs:1384 src/impact.rs::tests::rsid_bin_source_selects_bin_tests_not_lib_shards -> src/impact.rs::tests::metadata
+src/impact.rs:1388 src/impact.rs::tests::rsid_bin_source_selects_bin_tests_not_lib_shards -> src/impact.rs::tests::non_smoke
+src/impact.rs:1412 src/impact.rs::tests::global_inputs_still_force_the_full_workspace -> src/impact.rs::tests::select
+src/impact.rs:1426 src/impact.rs::tests::a_crate_manifest_stays_that_crates_full_set -> src/impact.rs::tests::select
+src/impact.rs:1480 src/impact.rs::tests::rsid_shard_packages_match_cargo_features -> src/impact.rs::tests::shard_features
+src/impact.rs:1483 src/impact.rs::tests::rsid_shard_packages_match_cargo_features -> src/impact.rs::rsid_shard_packages
+src/impact.rs:1489 src/impact.rs::tests::rsid_shard_packages_match_cargo_features -> src/impact.rs::rsid_shard_packages
+src/impact.rs:1494 src/impact.rs::tests::rsid_store_edits_gate_the_shared_shards_not_an_unsharded_package_run -> src/impact.rs::tests::metadata
+src/impact.rs:1505 src/impact.rs::tests::rsid_store_edits_gate_the_shared_shards_not_an_unsharded_package_run -> src/impact.rs::select_tests
+src/impact.rs:1506 src/impact.rs::tests::rsid_store_edits_gate_the_shared_shards_not_an_unsharded_package_run -> src/impact.rs::ChangedFile::new
+src/impact.rs:317 src/impact.rs::select_tests -> src/impact.rs::select_tests_with_readers
+src/impact.rs:334 src/impact.rs::select_tests_with_readers -> src/impact.rs::smoke_selections
+src/impact.rs:338 src/impact.rs::select_tests_with_readers -> src/impact.rs::full_workspace
+src/impact.rs:348 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_global_build_path
+src/impact.rs:349 src/impact.rs::select_tests_with_readers -> src/impact.rs::full_workspace
+src/impact.rs:375 src/impact.rs::select_tests_with_readers -> src/impact.rs::full_workspace
+src/impact.rs:394 src/impact.rs::select_tests_with_readers -> src/impact.rs::package_for_path
+src/impact.rs:396 src/impact.rs::select_tests_with_readers -> src/impact.rs::apply_readers
+src/impact.rs:406 src/impact.rs::select_tests_with_readers -> src/impact.rs::full_workspace
+src/impact.rs:412 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_package_build_path
+src/impact.rs:417 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:422 src/impact.rs::select_tests_with_readers -> src/impact.rs::apply_readers
+src/impact.rs:432 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_inert_doc_path
+src/impact.rs:438 src/impact.rs::select_tests_with_readers -> src/impact.rs::rsid_bin_target
+src/impact.rs:452 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_shared_test_support
+src/impact.rs:454 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:459 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_rsids
+src/impact.rs:467 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:470 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_macro_source
+src/impact.rs:470 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_ordinary_rust_path
+src/impact.rs:472 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:475 src/impact.rs::select_tests_with_readers -> src/impact.rs::is_ordinary_rust_path
+src/impact.rs:477 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:480 src/impact.rs::select_tests_with_readers -> src/impact.rs::rust_module_for_path
+src/impact.rs:482 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:501 src/impact.rs::select_tests_with_readers -> src/impact.rs::graph_modules
+src/impact.rs:509 src/impact.rs::select_tests_with_readers -> src/impact.rs::package_for_path
+src/impact.rs:515 src/impact.rs::select_tests_with_readers -> src/impact.rs::package_for_path
+src/impact.rs:537 src/impact.rs::select_tests_with_readers -> src/impact.rs::full_workspace
+src/impact.rs:545 src/impact.rs::select_tests_with_readers -> src/impact.rs::reverse_workspace_dependents
+src/impact.rs:552 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_package
+src/impact.rs:572 src/impact.rs::select_tests_with_readers -> src/impact.rs::add_full_rsids
+src/impact.rs:574 src/impact.rs::select_tests_with_readers -> src/impact.rs::dedup_and_finalize
+src/impact.rs:596 src/impact.rs::apply_readers -> src/impact.rs::package_for_path
+src/impact.rs:600 src/impact.rs::apply_readers -> src/impact.rs::reader_target
+src/impact.rs:608 src/impact.rs::apply_readers -> src/impact.rs::add_full_package
+src/impact.rs:635 src/impact.rs::reader_target -> src/impact.rs::rsid_bin_target
+src/impact.rs:647 src/impact.rs::reader_target -> src/impact.rs::rust_module_for_path
+src/impact.rs:726 src/impact.rs::ReaderIndex::new -> src/impact.rs::resolve_relative
+src/impact.rs:771 src/impact.rs::ReaderIndex::readers_of -> src/impact.rs::ReaderIndex::occurrences
+src/impact.rs:778 src/impact.rs::ReaderIndex::readers_of -> src/impact.rs::ReaderIndex::occurrences
+src/impact.rs:792 src/impact.rs::ReaderIndex::readers_of -> src/impact.rs::ReaderIndex::occurrences
+src/impact.rs:801 src/impact.rs::ReaderIndex::readers_of -> src/impact.rs::is_test_file_path
+src/impact.rs:844 src/impact.rs::graph_modules -> src/impact.rs::is_ordinary_rust_path
+src/impact.rs:863 src/impact.rs::graph_modules -> src/impact.rs::is_ordinary_rust_path
+src/impact.rs:899 src/impact.rs::graph_modules -> src/impact.rs::rust_module_for_path
+src/impact.rs:928 src/impact.rs::add_full_package -> src/impact.rs::is_rsid_shard_package
+src/impact.rs:929 src/impact.rs::add_full_package -> src/impact.rs::add_full_rsids
+src/impact.rs:961 src/impact.rs::full_workspace -> src/impact.rs::workspace_packages
+src/impact.rs:962 src/impact.rs::full_workspace -> src/impact.rs::is_rsid_shard_package
+src/impact.rs:963 src/impact.rs::full_workspace -> src/impact.rs::add_full_rsids
+src/impact.rs:965 src/impact.rs::full_workspace -> src/impact.rs::add_full_package
+src/impact.rs:973 src/impact.rs::full_workspace -> src/impact.rs::dedup_and_finalize
+src/resolve.rs:23 src/resolve.rs::resolve_unique -> src/resolve.rs::rust_semantic_path
+src/resolve.rs:60 src/resolve.rs::resolve_unique -> src/resolve.rs::unique
+src/resolve.rs:63 src/resolve.rs::resolve_unique -> src/resolve.rs::unique
+src/resolve.rs:69 src/resolve.rs::resolve_unique -> src/resolve.rs::resolved_relation
+
+[inferred]
+src/bin/rsi-test-impact.rs:86 src/bin/rsi-test-impact.rs::run -> src/impact.rs::ImpactSelection::lander_arguments
+src/bin/rsi-test-impact.rs:89 src/bin/rsi-test-impact.rs::run -> src/impact.rs::ImpactSelection::lander_arguments
+src/bin/rsi-test-impact.rs:97 src/bin/rsi-test-impact.rs::run -> src/impact.rs::ImpactSelection::cargo_test_commands
+src/impact.rs:1216 src/impact.rs::tests::rsid_full_shards_render_as_lander_arguments -> src/impact.rs::ImpactSelection::lander_arguments
+src/impact.rs:1346 src/impact.rs::tests::a_directory_literal_selects_the_corpus_test_binary -> src/impact.rs::ImpactSelection::cargo_test_commands
+src/impact.rs:1362 src/impact.rs::tests::a_script_read_by_a_bin_test_selects_the_bin_tests -> src/impact.rs::ImpactSelection::lander_arguments
+src/impact.rs:1396 src/impact.rs::tests::rsid_bin_source_selects_bin_tests_not_lib_shards -> src/impact.rs::ImpactSelection::cargo_test_commands
+src/impact.rs:362 src/impact.rs::select_tests_with_readers -> src/impact.rs::ReaderIndex::readers_of

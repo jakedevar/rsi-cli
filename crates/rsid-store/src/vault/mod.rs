@@ -33,6 +33,7 @@ pub use store::VaultStoreError;
 
 use chrono::{DateTime, Utc};
 use rsi_common::mcp::{McpCredentialMetadata, McpCredentialState};
+use rsi_common::operator_config::{CustomProviderKeyMetadata, CustomProviderKeyState};
 use rsi_common::provider_credentials::{
     CliExposureConsumer, CliExposureReason, CredentialCheckClass, CredentialCheckMetadata,
     CredentialState, DEFAULT_CHECK_TTL_SECS, ImportProviderCredentialsResult, ImportSkipReason,
@@ -43,7 +44,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use store::{StoredEntry, Tombstone, VaultFile};
+use store::{CustomProviderKeyFile, StoredEntry, Tombstone, VaultFile};
 
 /// Maximum accepted secret length (bytes).
 pub const MAX_SECRET_BYTES: usize = 4096;
@@ -202,6 +203,8 @@ impl CredentialRefusal {
 struct Inner {
     dir: Option<PathBuf>,
     file: parking_lot::Mutex<VaultFile>,
+    /// Custom-provider keys (hub #3039), persisted in their own file.
+    custom_provider_keys: parking_lot::Mutex<CustomProviderKeyFile>,
     settings: Arc<VaultSettings>,
     env: EnvReader,
     dynamic: Arc<dyn DynamicSource>,
@@ -286,14 +289,15 @@ impl VaultHandleBuilder {
     ///
     /// Returns a typed [`VaultStoreError`] naming the path for a looser mode, a symlink, malformed contents or I/O failure.
     pub fn open(self) -> Result<VaultHandle, VaultStoreError> {
-        let file = match &self.dir {
-            Some(dir) => store::load(dir)?,
-            None => VaultFile::default(),
+        let (file, custom_provider_keys) = match &self.dir {
+            Some(dir) => (store::load(dir)?, store::load_custom_provider_keys(dir)?),
+            None => (VaultFile::default(), CustomProviderKeyFile::default()),
         };
         Ok(VaultHandle {
             inner: Arc::new(Inner {
                 dir: self.dir,
                 file: parking_lot::Mutex::new(file),
+                custom_provider_keys: parking_lot::Mutex::new(custom_provider_keys),
                 settings: self.settings,
                 env: self.env,
                 dynamic: self.dynamic,
@@ -366,6 +370,21 @@ fn validate_secret(secret: &str) -> Result<String, VaultError> {
     Ok(trimmed.to_string())
 }
 
+/// Check a secret against the vault's input rules (non-empty, at most
+/// [`MAX_SECRET_BYTES`], no whitespace or control characters) without storing
+/// it. The error names the rule, never the value.
+///
+/// # Errors
+///
+/// Returns [`VaultError::InvalidSecret`].
+pub fn validate_secret_input(secret: &str) -> Result<(), VaultError> {
+    validate_secret(secret).map(drop)
+}
+
+fn custom_provider_key_id(id: uuid::Uuid) -> String {
+    id.as_hyphenated().to_string()
+}
+
 /// Slots with a defined validity/credit check endpoint.
 #[must_use]
 pub const fn has_check_endpoint(slot: Slot) -> bool {
@@ -398,6 +417,14 @@ impl VaultHandle {
             secrets.extend(file.entries.values().map(|entry| entry.secret.clone()));
             secrets.extend(file.mcp_entries.values().map(|entry| entry.secret.clone()));
         }
+        secrets.extend(
+            self.inner
+                .custom_provider_keys
+                .lock()
+                .entries
+                .values()
+                .map(|entry| entry.secret.clone()),
+        );
         for name in
             slots::scrubbed_env_var_names().chain(slots::AWS_SECRET_ENV_VARS.iter().copied())
         {
@@ -767,6 +794,106 @@ impl VaultHandle {
     pub fn mcp_secret(&self, id: &str) -> Option<secret::SecretString> {
         let file = self.inner.file.lock();
         file.mcp_entries.get(id).map(|entry| entry.secret.clone())
+    }
+
+    /// Store (or replace) the API key of one custom provider (hub #3039).
+    /// No environment or generator fallback applies to this namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError`] for an invalid secret or a persistence failure.
+    pub fn set_custom_provider_key(
+        &self,
+        id: uuid::Uuid,
+        secret: &str,
+    ) -> Result<CustomProviderKeyMetadata, VaultError> {
+        let value = validate_secret(secret)?;
+        let now = self.now();
+        let key = custom_provider_key_id(id);
+        self.mutate_custom_provider_keys(|file| {
+            let secret = SecretString::new(value);
+            let fingerprint = secret.fingerprint();
+            let previous = file
+                .entries
+                .get(&key)
+                .map(|entry| entry.fingerprint.clone());
+            file.entries.insert(
+                key.clone(),
+                StoredEntry {
+                    secret,
+                    fingerprint,
+                    set_at: now,
+                    rotated_from_fingerprint: previous,
+                    source_env_var: None,
+                },
+            );
+        })?;
+        Ok(self.custom_provider_key_metadata(id))
+    }
+
+    /// Remove a custom provider's key. Removing an absent key is a no-op and
+    /// writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultError::Store`] when the removal cannot be persisted.
+    pub fn clear_custom_provider_key(&self, id: uuid::Uuid) -> Result<(), VaultError> {
+        let key = custom_provider_key_id(id);
+        if !self
+            .inner
+            .custom_provider_keys
+            .lock()
+            .entries
+            .contains_key(&key)
+        {
+            return Ok(());
+        }
+        self.mutate_custom_provider_keys(|file| {
+            file.entries.remove(&key);
+        })
+    }
+
+    /// Secret-free metadata for one custom provider's key.
+    #[must_use]
+    pub fn custom_provider_key_metadata(&self, id: uuid::Uuid) -> CustomProviderKeyMetadata {
+        let file = self.inner.custom_provider_keys.lock();
+        match file.entries.get(&custom_provider_key_id(id)) {
+            Some(entry) => CustomProviderKeyMetadata {
+                state: CustomProviderKeyState::Set,
+                fingerprint: Some(entry.fingerprint.clone()),
+                set_at: Some(entry.set_at),
+            },
+            None => CustomProviderKeyMetadata {
+                state: CustomProviderKeyState::Absent,
+                fingerprint: None,
+                set_at: None,
+            },
+        }
+    }
+
+    /// Clone a custom provider's key for the daemon's own request to that
+    /// provider. `SecretString` has no clear `Debug`, `Display` or serde form.
+    #[must_use]
+    pub fn custom_provider_key(&self, id: uuid::Uuid) -> Option<SecretString> {
+        let file = self.inner.custom_provider_keys.lock();
+        file.entries
+            .get(&custom_provider_key_id(id))
+            .map(|entry| entry.secret.clone())
+    }
+
+    fn mutate_custom_provider_keys(
+        &self,
+        apply: impl FnOnce(&mut CustomProviderKeyFile),
+    ) -> Result<(), VaultError> {
+        // Held across persist, as in `mutate`: memory never runs ahead of disk.
+        let mut guard = self.inner.custom_provider_keys.lock();
+        let mut next = guard.clone();
+        apply(&mut next);
+        if let Some(dir) = &self.inner.dir {
+            store::save_custom_provider_keys(dir, &mut next)?;
+        }
+        *guard = next;
+        Ok(())
     }
 
     /// `ImportProviderCredentialsFromEnv`: explicit copy of static env keys.

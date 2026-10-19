@@ -1,8 +1,21 @@
 /// Full commit SHA embedded as `RSI_BUILD_SHA` for `AgentGetDaemonInfo`
 /// (#1045). `RSI_BUILD_SHA` in the build environment wins (release builds from
-/// a source tarball); otherwise `git rev-parse HEAD`; otherwise `unknown`.
+/// a source tarball, merge-queue gate builds); otherwise `git rev-parse HEAD`;
+/// otherwise `unknown`.
+///
+/// A pinned id never consults git, so nothing in the repository can change it
+/// and the script must not rerun when `HEAD` moves (#2508): a warm lander slot
+/// re-clones the candidate at every gate, which rewrites `.git/HEAD`, and a
+/// rerun makes Cargo recompile this crate and everything above it.
 fn emit_build_sha() {
     println!("cargo:rerun-if-env-changed=RSI_BUILD_SHA");
+    if let Some(sha) = std::env::var("RSI_BUILD_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        println!("cargo:rustc-env=RSI_BUILD_SHA={sha}");
+        return;
+    }
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
@@ -17,11 +30,7 @@ fn emit_build_sha() {
             println!("cargo:rerun-if-changed={found}");
         }
     }
-    let sha = std::env::var("RSI_BUILD_SHA")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| git(&["rev-parse", "HEAD"]))
-        .unwrap_or_else(|| "unknown".to_string());
+    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=RSI_BUILD_SHA={sha}");
 }
 
@@ -65,8 +74,23 @@ fn refuse_test_seam_in_release() {
 }
 // SEAM-GUARD-END
 
+// E2E-SEED-GUARD-BEGIN
+/// `e2e-seed` compiles the `rsi-e2e-seed` fixture writer (local #122); it writes a database, so it must
+/// never be compiled into a release build and, unlike `test-seam`, has no release opt-in (hub #3244).
+fn refuse_e2e_seed_in_release() {
+    let seed = std::env::var_os("CARGO_FEATURE_E2E_SEED").is_some();
+    let release = std::env::var("PROFILE").is_ok_and(|profile| profile == "release");
+    assert!(
+        !(seed && release),
+        "the `e2e-seed` feature is enabled in a release build; it must never ship \
+         (build the seeder in the debug profile only; there is no release override)"
+    );
+}
+// E2E-SEED-GUARD-END
+
 fn main() {
     refuse_test_seam_in_release();
+    refuse_e2e_seed_in_release();
     emit_build_sha();
     emit_build_main_worktree();
     // Get the SQLite include directory from the bundled libsqlite3-sys crate.

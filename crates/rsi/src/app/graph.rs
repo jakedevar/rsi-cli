@@ -117,6 +117,7 @@ impl App {
                 current_nodes: Vec::new(),
                 on_call: None,
                 rulings: Vec::new(),
+                node_attempts: Vec::new(),
                 updates: Vec::new(),
             },
         );
@@ -162,6 +163,7 @@ impl App {
                 current_nodes: Vec::new(),
                 on_call: None,
                 rulings: Vec::new(),
+                node_attempts: Vec::new(),
                 updates: Vec::new(),
             });
 

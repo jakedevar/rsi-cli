@@ -142,6 +142,19 @@ pub fn hold_error(until: DateTime<Utc>) -> DaemonError {
     ))
 }
 
+/// Stable code of the manager-policy gate's refusal while a provider's plan
+/// window (five-hour, seven-day, ...) is exhausted and has not reset.
+pub const PROVIDER_USAGE_WINDOW_REFUSAL_CODE: &str = "manager_v2_provider_usage_limit";
+
+/// True when `error` is the plan-window exhaustion refusal. It describes the
+/// provider account, never the wake or its target (#3066): the same delivery
+/// succeeds unchanged once the window resets, so no retry budget is spent on it.
+pub fn is_usage_window_refusal(error: &DaemonError) -> bool {
+    error
+        .to_string()
+        .contains(PROVIDER_USAGE_WINDOW_REFUSAL_CODE)
+}
+
 /// The hold deadline carried by a [`hold_error`], if `error` is one.
 pub fn hold_error_until(error: &DaemonError) -> Option<DateTime<Utc>> {
     let text = error.to_string();

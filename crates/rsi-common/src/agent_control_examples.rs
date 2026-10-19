@@ -24,7 +24,13 @@ use crate::agent_deploy::{
 use crate::agent_jobs::{
     JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_INVALID_REQUEST, JOB_KEY_CONFLICT,
     JOB_KEY_INVALID, JOB_KIND_NOT_AUTHORIZED, JOB_KIND_UNSUPPORTED, JOB_LAUNCH_FAILED,
-    JOB_NAME_INVALID, JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED,
+    JOB_NAME_INVALID, JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED, JOB_TOOLCHAIN_MISMATCH,
+};
+use crate::agent_landing_candidate::{
+    CANDIDATE_ADMISSION_TIMEOUT, CANDIDATE_HEAD_MISMATCH, CANDIDATE_INVALID_REQUEST,
+    CANDIDATE_JOB_ID_AMBIGUOUS, CANDIDATE_JOB_NOT_GREEN, CANDIDATE_JOB_NOT_TERMINAL,
+    CANDIDATE_NEW_FAILURES, CANDIDATE_NO_VERIFICATION_JOB, CANDIDATE_NOT_AUTHORIZED,
+    CANDIDATE_NOT_FOUND, CANDIDATE_RECEIPT_MISSING,
 };
 use crate::agent_projects::{
     PROJECT_ADMIN_UNAVAILABLE, PROJECT_HARNESS_PROTECTED, PROJECT_HAS_LIVE_SESSIONS,
@@ -42,6 +48,11 @@ use crate::manager_tier_routing::{
     MANAGER_TARGET_NOT_DESCENDANT, MANAGER_TIER_IDEMPOTENCY_CONFLICT, MANAGER_TIER_MAILBOX_FULL,
     MANAGER_TIER_NOT_NODE_SEAT, MANAGER_TIER_TARGET_UNKNOWN, MANAGER_TIER_TARGET_VACANT,
 };
+use crate::operator_todos::{
+    OPERATOR_TODO_CLOSED, OPERATOR_TODO_EVIDENCE_REQUIRED, OPERATOR_TODO_IDEMPOTENCY_CONFLICT,
+    OPERATOR_TODO_INVALID_REQUEST, OPERATOR_TODO_LIMIT, OPERATOR_TODO_NOT_AUTHORIZED,
+    OPERATOR_TODO_NOT_FOUND, OPERATOR_TODO_NOT_IN_SCOPE,
+};
 use crate::portfolio_delegation::{
     MANAGER_CHILD_OPERATOR_GRANTED, MANAGER_DIRECT_REPORT_CAP, MANAGER_NODE_NOT_IN_SCOPE,
     MANAGER_SCOPE_NOT_NARROWED,
@@ -51,19 +62,28 @@ use crate::portfolio_nodes::{
     MANAGER_NODE_STALE, MANAGER_SCOPE_OVERLAP, PORTFOLIO_IDEMPOTENCY_CONFLICT,
 };
 use crate::rolling_queue::{
-    QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS,
-    QUEUE_GATE_TIMEOUT, QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_REGATE_EXHAUSTED,
-    QUEUE_SOURCE_INVALID,
+    QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_ENTRY_IN_FLIGHT, QUEUE_ENTRY_NOT_FOUND,
+    QUEUE_ENTRY_SETTLED, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_GATE_TIMEOUT,
+    QUEUE_INVALID_REQUEST, QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_PROBE_TIMEOUT,
+    QUEUE_REASON_INVALID, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
+    QUEUE_SOURCE_SESSION_OUT_OF_SCOPE, QUEUE_SUPERSEDES_NOT_DESCENDANT, QUEUE_TIP_READ_TIMEOUT,
 };
 use crate::rpc::AgentIssueErrorCodeV1;
 use crate::satellite_dispatch::{
+    SATELLITE_ISSUE_REF_INVALID, SATELLITE_ISSUE_REF_UNAVAILABLE, SATELLITE_ISSUE_REFS_TOO_LARGE,
     SATELLITE_MESSAGE_INVALID, SATELLITE_MESSAGE_KEY_CONFLICT, SATELLITE_MESSAGE_KEY_INVALID,
     SATELLITE_MESSAGE_QUEUE_FULL, SATELLITE_REPORT_INVALID, SATELLITE_REPORT_NOT_AUTHORIZED,
     SATELLITE_REPORT_QUEUE_FULL, SATELLITE_TARGET_NOT_AUTHORIZED,
 };
+use crate::standing_directives::{
+    STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT, STANDING_DIRECTIVE_INVALID_REQUEST,
+    STANDING_DIRECTIVE_LIMIT, STANDING_DIRECTIVE_NOT_AUTHORIZED, STANDING_DIRECTIVE_NOT_FOUND,
+};
 use crate::wake_predicate::{
-    WAKE_WHEN_CAP_REACHED, WAKE_WHEN_FIELD_MISPLACED, WAKE_WHEN_JOB_NOT_FOUND,
+    WAKE_WHEN_CAP_REACHED, WAKE_WHEN_EXECUTION_NOT_FOUND, WAKE_WHEN_FIELD_MISPLACED,
+    WAKE_WHEN_HEALTH_MANAGER_ONLY, WAKE_WHEN_ISSUE_NOT_FOUND, WAKE_WHEN_JOB_NOT_FOUND,
     WAKE_WHEN_PREDICATE_INVALID, WAKE_WHEN_TIMEOUT_INVALID, WAKE_WHEN_TIMING_UNSUPPORTED,
+    WAKE_WHEN_TODO_NOT_FOUND,
 };
 use serde_json::Value;
 
@@ -97,15 +117,15 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::GetProgress => serde_json::json!({"session_ids": []}),
             AgentControlVerbV1::SendMessage => serde_json::json!({
-                "target_session_id": issue, "message": "done", "idempotency_key": "mail-v1"
+                "session_id": issue, "message": "done", "idempotency_key": "mail-v1"
             }),
             AgentControlVerbV1::GetStatus | AgentControlVerbV1::Halt => serde_json::json!({}),
             AgentControlVerbV1::ContinueChild => serde_json::json!({
-                "target_session_id": issue, "query": "resume stage",
+                "session_id": issue, "query": "resume stage",
                 "expected_tip_session_id": issue, "expected_event_sequence": 7
             }),
             AgentControlVerbV1::ArchiveChild => serde_json::json!({
-                "target_session_id": issue,
+                "session_id": issue,
                 "expected_tip_session_id": issue, "expected_event_sequence": 7
             }),
             AgentControlVerbV1::ScheduleWake => serde_json::json!({
@@ -118,7 +138,7 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::CreateIssue => serde_json::json!({
                 "title": "Follow-up", "idempotency_key": "issue-v1"
             }),
-            AgentControlVerbV1::ListIssues => serde_json::json!({}),
+            AgentControlVerbV1::ListIssues => serde_json::json!({"title_contains":"kaizen"}),
             AgentControlVerbV1::GetIssue => serde_json::json!({"issue_id": issue}),
             AgentControlVerbV1::UpdateIssue => serde_json::json!({
                 "issue_id": issue, "expected_row_version": 1,
@@ -126,7 +146,8 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::UpdateIssueStatus => serde_json::json!({
                 "issue_id": issue, "status": "Closed", "expected_row_version": 1,
-                "idempotency_key": "status-v1"
+                "idempotency_key": "status-v1",
+                "note": "covered_by 0123456789abcdef"
             }),
             AgentControlVerbV1::ArchiveIssue => serde_json::json!({
                 "issue_id": issue, "expected_row_version": 1,
@@ -165,7 +186,7 @@ impl AgentControlVerbV1 {
                 "issue": 1100, "brief": "Build the Issue you are bound to; read it with AgentGetIssue.",
                 "launch": {"provider": "Claude", "model": "claude-sonnet-5-5", "effort": "high"},
                 "parent_epic_id": issue, "idempotency_key": "launch-issue-1100-worker-1",
-                "sandbox_source": {"rolling": {}}
+                "sandbox_source": {"rolling": {}}, "related": [1101]
             }),
             AgentControlVerbV1::ManagerProgress => serde_json::json!({}),
             AgentControlVerbV1::ManagerInbox => serde_json::json!({
@@ -222,6 +243,9 @@ impl AgentControlVerbV1 {
                 "scope": "epic", "epic_id": issue, "include_executions": true,
                 "cursor": null, "limit": 8
             }),
+            AgentControlVerbV1::TopologyGet => serde_json::json!({
+                "topology_id": null, "name": "review-loop"
+            }),
             AgentControlVerbV1::TopologyExecute => serde_json::json!({
                 "topology_id": issue, "expected_digest": format!("sha256:{}", "a".repeat(64)),
                 "epic_id": issue, "inputs": {}, "base_commit": null, "idempotency_key": "run-v1"
@@ -241,7 +265,17 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::CancelJob => serde_json::json!({"job_id": issue}),
             AgentControlVerbV1::EnqueueLandingSource => serde_json::json!({
                 "source_commit": "0123456789abcdef0123456789abcdef01234567",
-                "test_filters": ["rsid=rolling_queue"], "idempotency_key": "enqueue-v1"
+                "derive_filters": true, "idempotency_key": "enqueue-v1", "supersedes": issue
+            }),
+            AgentControlVerbV1::ListRollingQueue => serde_json::json!({
+                "state": "queued", "limit": 20
+            }),
+            AgentControlVerbV1::CancelRollingQueueEntry => serde_json::json!({
+                "entry_id": issue, "reason": "superseded by a newer commit"
+            }),
+            AgentControlVerbV1::CheckLandingCandidate => serde_json::json!({
+                "job_id": "a7f23944",
+                "source_commit": "0123456789abcdef0123456789abcdef01234567"
             }),
             AgentControlVerbV1::ReadSessionEvents => serde_json::json!({
                 "session_id": issue, "after_sequence": 0, "limit": 20,
@@ -260,6 +294,9 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::QueryFailureSignatures => serde_json::json!({
                 "test_id": "session::launch::tests::example_test"
             }),
+            AgentControlVerbV1::WorkerRoster => serde_json::json!({
+                "states": ["stranded", "parked_on_job"], "limit": 20
+            }),
             AgentControlVerbV1::GlobalOverview => serde_json::json!({}),
             AgentControlVerbV1::ManagerOverview => serde_json::json!({}),
             AgentControlVerbV1::CreateProject => serde_json::json!({
@@ -267,6 +304,32 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::UpdateProject => serde_json::json!({
                 "project_id": issue, "name": "Demo renamed"
+            }),
+            AgentControlVerbV1::ListSourceWorktreeCohorts => serde_json::json!({}),
+            AgentControlVerbV1::AuditSourceWorktreeCohort => {
+                serde_json::json!({"repository_identity": "repo:example", "fields": "summary"})
+            }
+            AgentControlVerbV1::ApplySourceWorktreeCohort => {
+                let digest = format!("sha256:{}", "a".repeat(64));
+                serde_json::json!({"repository_identity": "repo:example", "plan_digest": digest,
+                    "authorization": format!("APPLY repo:example {digest}"), "idempotency_key": "settlement:example"})
+            }
+            AgentControlVerbV1::OperatorTodoUpsert => serde_json::json!({
+                "todo_key": "codex-login", "title": "Log in to Codex on the laptop",
+                "how": "codex login", "link": "issue:#1747", "priority": 2,
+                "idempotency_key": "operator-todo-codex-login-1"
+            }),
+            AgentControlVerbV1::OperatorTodoClose => serde_json::json!({
+                "todo_key": "codex-login", "status": "done", "observed": true,
+                "evidence": "[observed] codex login status reports a signed-in account",
+                "idempotency_key": "operator-todo-codex-login-close-1"
+            }),
+            AgentControlVerbV1::StandingDirective => serde_json::json!({
+                "action": "set", "scope": format!("project:{issue}"),
+                "text": "Overnight: keep the hub and the laptop busy; escalate only real gates; send ONE morning summary.",
+                "provenance": "operator, 2026-10-15 07:35Z, relayed by the global manager",
+                "expires_in_secs": 28800,
+                "idempotency_key": "standing-directive-overnight-1"
             }),
             AgentControlVerbV1::GlobalSend => serde_json::json!({
                 "project_id": issue, "message": "Land #872 and report back.",
@@ -301,6 +364,17 @@ impl AgentControlVerbV1 {
                 "node_id": issue, "expected_grant_version": 7,
                 "idempotency_key": "node-revoke-child-1"
             }),
+            AgentControlVerbV1::PushSatelliteManagerPolicy => serde_json::json!({
+                "peer_id": issue, "remote_session_id": issue, "expected_scope_version": 1,
+                "expected_policy_version": 1, "idempotency_key": "sat-policy-1",
+                "policy": {"allowed_launches": [{"provider": "Claude", "model": "claude-sonnet-4-6"}],
+                    "max_created_sessions": 4, "max_active_sessions": 2, "provider_limits": []}
+            }),
+            AgentControlVerbV1::ReseatSatelliteManager => serde_json::json!({
+                "peer_id": issue, "remote_session_id": issue, "provider": "Claude",
+                "model": "claude-sonnet-5-5", "reason": "codex login expired (401)",
+                "provider_unavailable": false
+            }),
             AgentControlVerbV1::RequestDeploy => serde_json::json!({
                 "sha": "0123456789abcdef0123456789abcdef01234567",
                 "binaries_dir": "/tmp/bin", "idempotency_key": "deploy-v1"
@@ -333,7 +407,7 @@ macro_rules! issue_refusals {
         ),
         refusal(
             AgentIssueErrorCodeV1::AuthorityDenied.as_str(),
-            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue may only append to that Issue's body while its binding is live",
+            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue reads, with AgentGetIssue, that Issue, its review Issues and the same-project Issues its launch attached (`related`) or that `#N` selectors in its Issue or brief name (a missing number, such as a hub number, is refused the same way); to read another Issue, ask the manager to attach it with `related` on the launch (name it in your handoff) or find it with AgentListIssues title_contains; publish only a handoff or body append to your own Issue while its binding is live",
         ),
         refusal(
             AgentIssueErrorCodeV1::NotFoundInScope.as_str(),
@@ -353,7 +427,7 @@ macro_rules! issue_refusals {
         ),
         refusal(
             AgentIssueErrorCodeV1::InvalidTransition.as_str(),
-            "use a lifecycle transition allowed from the current Issue status",
+            "AgentUpdateIssue edits only Open or InProgress Issues (a live bound worker's own handoff excepted): for a Closed or Cancelled Issue file a follow-up with AgentCreateIssue, or reopen it with AgentUpdateIssueStatus Open only when the work really resumes; AgentUpdateIssueStatus moves Open or InProgress to any other status and Closed or Cancelled only back to Open",
         ),
         refusal(
             AgentIssueErrorCodeV1::Archived.as_str(),
@@ -374,7 +448,7 @@ macro_rules! issue_refusals {
 
 const ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!();
 
-/// `AgentUpdateIssue` also serves an Issue-bound worker's body append (#1284):
+/// `AgentUpdateIssue` also serves an Issue-bound worker's handoff (#1750) or body append (#1284):
 /// each way that arm can refuse is its own code (#1545).
 const UPDATE_ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!(
     refusal(
@@ -387,11 +461,11 @@ const UPDATE_ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!(
     ),
     refusal(
         AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed.as_str(),
-        "send only body, expected_row_version and idempotency_key; omit title, labels, priority and assignee",
+        "send only body (or handoff), expected_row_version and idempotency_key; omit title, labels, priority and assignee",
     ),
     refusal(
         AgentIssueErrorCodeV1::BoundIssueNotAppendOnly.as_str(),
-        "re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text",
+        "send {handoff} alone (no body copy) instead; to append to body, re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text (#1750)",
     ),
 );
 
@@ -550,7 +624,11 @@ const MANAGER_PAUSED: AgentControlRefusalV1 = refusal(
 );
 const MANAGER_HUMAN_OR_RECOVERY_OWNER: AgentControlRefusalV1 = refusal(
     "manager_v2_human_or_recovery_owner",
-    "a human, recovery owner or your own enabled resume wake holds this; retire the wake or wait",
+    "a human, recovery owner or your own enabled resume wake holds this; retire the wake or wait (succeed_manager cancels your own backstops itself and hands your durable obligations on, so only a human or daemon-owned owner holds it)",
+);
+const MANAGER_SUCCESSION_ROTATION_DISABLED: AgentControlRefusalV1 = refusal(
+    "manager_succession_rotation_disabled",
+    "the operator setting context_rotation_enabled is off, so succeed_manager refuses a new succession before any successor is queued or reserved and your seat, epoch and wakes stay as they are; an identical-key retry of a succession already queued still returns its stored receipt, and the Overview row keeps that unresolved_operation_id instead of the denial. Otherwise keep working and ask the operator to enable it; Overview shows the same denial (operator_enable_context_rotation); do not cancel wakes",
 );
 
 const SPAWN_REFUSALS: &[AgentControlRefusalV1] = &[
@@ -595,7 +673,7 @@ const SPAWN_REFUSALS: &[AgentControlRefusalV1] = &[
 const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
     refusal(
         crate::agent_jobs::JOB_SANDBOX_SESSION_LIVE,
-        "sandbox_session_id must name a terminal session; wait for it to finish",
+        "source_session_id must name a terminal session; wait for it to finish",
     ),
     refusal(
         JOB_INVALID_REQUEST,
@@ -603,7 +681,7 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
     ),
     refusal(
         JOB_INVALID_PARAMS,
-        "fix the kind-specific params; see the schema description for the kind",
+        "fix the kind-specific params; see the schema description for the kind; an over-size filter is named by field path (params.filters[i] or params.test_filters[i]), truncated text, byte length and limit",
     ),
     refusal(
         crate::agent_jobs::JOB_TIMEOUT_NOT_AUTHORIZED,
@@ -618,6 +696,22 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
         "pin qa_lane.sha to the owner sandbox submission-time HEAD and retry; probe failure also refuses; dirtiness is not checked",
     ),
     refusal(
+        crate::agent_jobs::JOB_SOURCE_SHA_MISMATCH,
+        "build params.sha is not the job worktree HEAD at submit; pass the commit the worktree is on (git rev-parse HEAD) or omit sha and retry",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_SCOPED_TEST_TOOL_HELPER_MISSING,
+        "the scoped-test or check-touched-shards copy that would run loads a scripts/ helper its tree lacks; the refusal names the file; commit it with the change that loads it and resubmit",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_SOURCE_RECORD_FAILED,
+        "the daemon could not write the build job source record beside the job log, so the build was refused rather than run unenforced; check the jobs directory is writable and has free space, then resubmit",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_SOURCE_MOVED,
+        "a build job compiles one commit: the worktree HEAD moved or a clean tree became dirty after submit; the refusal names both SHAs; leave the job worktree alone while a build runs, then resubmit",
+    ),
+    refusal(
         crate::agent_jobs::JOB_RECIPE_NOT_ALLOWED,
         "declare this recipe in the worktree .rsi/jobs.toml before submitting it",
     ),
@@ -625,12 +719,20 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
         crate::agent_jobs::JOB_RECIPE_INVALID,
         "fix .rsi/jobs.toml: version 1, at most 64 recipes, just/make targets, timeout and CPU caps; keep the manifest inside the worktree",
     ),
+    refusal(
+        crate::agent_jobs::JOB_RECIPE_USE_SCOPED_TEST,
+        "scoped-test and scoped-test-tmpfs recipes are retired; submit a test job with params.scoped_test.base set to origin/rolling instead, without recipe or filters; this selects the rolling-tip tool and records its copy in the receipt",
+    ),
     refusal(JOB_NAME_INVALID, "use a name of at most 80 bytes"),
     refusal(
         JOB_KEY_INVALID,
         "use an idempotency_key of at most 128 bytes without NUL",
     ),
     refusal(JOB_KIND_UNSUPPORTED, "use a kind the schema enumerates"),
+    refusal(
+        JOB_TOOLCHAIN_MISMATCH,
+        "the daemon PATH resolves a rustc other than the version rust-toolchain.toml pins; the operator restarts the daemon with ~/.cargo/bin on PATH (scripts/rsid-start-satellite does)",
+    ),
     refusal(
         JOB_PLATFORM_UNSUPPORTED,
         "macOS supports package test, build and recipe jobs; use Linux for shard, candidate-receipt, landing and cloud jobs; other operating systems have no durable backend",
@@ -696,11 +798,27 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         WAKE_WHEN_PREDICATE_INVALID,
-                        "set exactly one when predicate: jobs_terminal or sha_on_rolling",
+                        "set exactly one when predicate: jobs_terminal, sha_on_rolling, issue_closed, todo_closed, topology_execution_settled, settlement_run_settled or health_anomaly",
+                    ),
+                    refusal(
+                        WAKE_WHEN_HEALTH_MANAGER_ONLY,
+                        "only a project manager or portfolio seat arms health_anomaly; a worker reads its own job and leaves hub health to its manager",
+                    ),
+                    refusal(
+                        WAKE_WHEN_ISSUE_NOT_FOUND,
+                        "name an Issue display number that exists in your own project",
+                    ),
+                    refusal(
+                        WAKE_WHEN_TODO_NOT_FOUND,
+                        "name an operator to-do item id in your own manager scope (the id AgentOperatorTodoUpsert returned)",
+                    ),
+                    refusal(
+                        WAKE_WHEN_EXECUTION_NOT_FOUND,
+                        "name a topology execution id you requested or can read through its Epic (the id AgentTopologyExecute returned)",
                     ),
                     refusal(
                         WAKE_WHEN_JOB_NOT_FOUND,
-                        "name only job ids you own, submitted through AgentSubmitJob",
+                        "name only the job ids your own AgentSubmitJob calls returned (result.id); the newest file under the shared jobs log directory may be another session's job",
                     ),
                     refusal(
                         WAKE_WHEN_TIMEOUT_INVALID,
@@ -791,6 +909,7 @@ impl AgentControlVerbV1 {
                     MANAGER_CAPABILITY_DENIED,
                     MANAGER_PAUSED,
                     MANAGER_HUMAN_OR_RECOVERY_OWNER,
+                    MANAGER_SUCCESSION_ROTATION_DISABLED,
                     MANAGER_PROJECT_NOT_IN_SCOPE,
                     refusal(
                         crate::global_manager::MANAGER_TARGET_OWNED_BY_ANCESTOR,
@@ -798,11 +917,11 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         crate::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
-                        "the covering global grant's creation budget for this project is spent; ask the global manager",
+                        "read node_kind, node_id, cap_field, limit, current_count and window_start in the refusal; ask that node's grantor to raise that cap",
                     ),
                     refusal(
                         "manager_v2_daemon_setting_not_allowlisted",
-                        "ProposeDaemonSetting changes only the curated settings; spend and credentials are never adjustable",
+                        "ProposeDaemonSetting changes only the curated settings (its key is an enum in the schema: take it from there, never a guessed registry key); spend and credentials are never adjustable, so file an operator to-do for any other key",
                     ),
                     refusal(
                         "manager_v2_daemon_setting_not_adjustable",
@@ -811,6 +930,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         "manager_v2_daemon_setting_out_of_bounds",
                         "propose a value inside the operator's per-key min and max",
+                    ),
+                    refusal(
+                        "manager_v2_retention_recent_activity",
+                        "the session was active inside the 24 h retention window; the refusal names eligible_at (when it ends): skip the session until then, never retry it. ListSessions rows carry the same eligible_at, so a bulk archive pass lists first and skips rows that have one",
                     ),
                     refusal(
                         "manager_sandbox_source_invalid",
@@ -893,7 +1016,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         SATELLITE_TARGET_NOT_AUTHORIZED,
-                        "every authorization failure looks the same: check the operator enabled dispatch and declared this peer and session in your scope",
+                        "every authorization failure looks the same: check the operator enabled dispatch and declared this peer and the session, or the project named by scope_project_id, in your scope",
                     ),
                     refusal(
                         SATELLITE_MESSAGE_INVALID,
@@ -911,6 +1034,18 @@ impl AgentControlVerbV1 {
                         SATELLITE_MESSAGE_KEY_CONFLICT,
                         "retry with the original request or use a new idempotency_key",
                     ),
+                    refusal(
+                        SATELLITE_ISSUE_REF_INVALID,
+                        "issue_refs takes at most 8 distinct display numbers of 1 or more",
+                    ),
+                    refusal(
+                        SATELLITE_ISSUE_REF_UNAVAILABLE,
+                        "an issue_refs number is not an Issue your own AgentGetIssue can read (missing, another project or no Issue authority; one code for all three); nothing was queued, and it is raised only after the peer and target were authorized",
+                    ),
+                    refusal(
+                        SATELLITE_ISSUE_REFS_TOO_LARGE,
+                        "the message plus the expanded Issues exceed 16384 bytes and are never truncated: send fewer Issues per message",
+                    ),
                 ];
                 R
             }
@@ -918,15 +1053,23 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         QUEUE_DISABLED,
-                        "the operator has not enabled the rolling queue; land with rsi-rolling-land instead",
+                        "the rolling queue is disabled by an operator setting; keep the commit pushed and report queue_disabled with AgentReportUp, or send the result with AgentReportToHub on a satellite. The operator enables the queue or lands with rsi land or EnqueueRollingQueueSource; managers enqueue with AgentEnqueueLandingSource {derive_filters:true}. Agents never run the lander directly",
                     ),
                     refusal(
                         QUEUE_SOURCE_INVALID,
                         "enqueue a full 40-hex commit reachable from your sandbox",
                     ),
                     refusal(
+                        QUEUE_TIP_READ_TIMEOUT,
+                        "the rolling-tip read behind derive_filters did not finish within the call's wall bound and was killed (a slow or stalled git); no entry was recorded, so call again with the same idempotency_key. A derivation that is merely still running is not refused: the entry is recorded queued with filters_state deriving, so one call is enough",
+                    ),
+                    refusal(
+                        QUEUE_PROBE_TIMEOUT,
+                        "a git read of the source probe did not finish within the call's wall bound and was killed (a slow or stalled git); no entry was recorded, so call again with the same idempotency_key",
+                    ),
+                    refusal(
                         QUEUE_FILTER_INVALID,
-                        "use PACKAGE=FILTER test_filters within the schema bounds",
+                        "use PACKAGE=FILTER test_filters within the schema bounds (at most 32 filters of 256 bytes each, and not together with derive_filters); the refusal names the field path (test_filters[i]), the offending filter (truncated) with its byte length and the 256-byte limit; derive_filters:true has no such limits",
                     ),
                     refusal(
                         QUEUE_FILTER_MATCHES_NO_TESTS,
@@ -937,12 +1080,32 @@ impl AgentControlVerbV1 {
                         "use an idempotency_key of at most 128 bytes without NUL",
                     ),
                     refusal(
+                        QUEUE_ENTRY_NOT_FOUND,
+                        "supersedes must name an entry id from the same enqueuer and project; list your queued entries",
+                    ),
+                    refusal(
+                        QUEUE_ENTRY_IN_FLIGHT,
+                        "the supersedes entry is admitted or gating; enqueue normally without supersedes so the lander finishes it first",
+                    ),
+                    refusal(
+                        QUEUE_ENTRY_SETTLED,
+                        "the supersedes entry is terminal; enqueue normally without supersedes",
+                    ),
+                    refusal(
+                        QUEUE_SUPERSEDES_NOT_DESCENDANT,
+                        "the new source_commit must descend from the supersedes entry's commit in the source checkout; integrate its history or enqueue normally without supersedes",
+                    ),
+                    refusal(
                         QUEUE_DUPLICATE_SOURCE,
                         "this commit is already queued; wait for its outcome",
                     ),
                     refusal(
                         QUEUE_NOT_AUTHORIZED,
                         "only the appointed manager or an Epic lead may enqueue a landing source",
+                    ),
+                    refusal(
+                        QUEUE_SOURCE_SESSION_OUT_OF_SCOPE,
+                        "source_session_id is outside your manager or lead scope: omit source_session_id to land your own sandbox, or name a session in your scope (a global seat naming its own id is refused queue_not_authorized: name a session in a granted project)",
                     ),
                     refusal(
                         "queue_idempotency_conflict",
@@ -955,6 +1118,166 @@ impl AgentControlVerbV1 {
                     refusal(
                         QUEUE_GATE_TIMEOUT,
                         "the batch ran past the operator's gate wall-time budget (rolling_queue_gate_timeout_mins); nothing was published: enqueue again, with narrower test filters if you can",
+                    ),
+                ];
+                R
+            }
+            Self::ListRollingQueue => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        QUEUE_NOT_AUTHORIZED,
+                        "only the appointed manager, a portfolio seat or an Epic lead may read the queue; workers enqueue nothing and see nothing",
+                    ),
+                    refusal(
+                        QUEUE_INVALID_REQUEST,
+                        "send only state, project_id, limit (1..100) and before_sequence (at least 1)",
+                    ),
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                ];
+                R
+            }
+            Self::CancelRollingQueueEntry => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        QUEUE_NOT_AUTHORIZED,
+                        "only the appointed manager, a portfolio seat or an Epic lead may cancel a queue entry",
+                    ),
+                    refusal(
+                        QUEUE_ENTRY_NOT_FOUND,
+                        "the entry does not exist or is outside your scope (a project's current manager, a granted project, or an entry whose outcome wakes you): list yours with AgentListRollingQueue",
+                    ),
+                    refusal(
+                        QUEUE_ENTRY_IN_FLIGHT,
+                        "the entry is admitted or gating, so the lander owns it: wait for its outcome wake instead",
+                    ),
+                    refusal(
+                        QUEUE_ENTRY_SETTLED,
+                        "the entry already settled (published, refused, failed or superseded): nothing to cancel; re-enqueue the commit with a new idempotency_key if it is still wanted",
+                    ),
+                    refusal(
+                        QUEUE_REASON_INVALID,
+                        "send a non-empty reason of at most 256 bytes without control characters, or omit it",
+                    ),
+                    refusal(
+                        QUEUE_INVALID_REQUEST,
+                        "send only entry_id (a non-nil UUID) and an optional reason",
+                    ),
+                ];
+                R
+            }
+            Self::CheckLandingCandidate => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        CANDIDATE_NOT_AUTHORIZED,
+                        "only the worker's appointed manager, a portfolio seat or an Epic lead may check a candidate",
+                    ),
+                    refusal(
+                        CANDIDATE_NOT_FOUND,
+                        "the job or session does not exist or is outside your scope (the two look the same): name a worker you manage or lead",
+                    ),
+                    refusal(
+                        CANDIDATE_JOB_ID_AMBIGUOUS,
+                        "the job-id prefix matches more than one job in your scope: send more characters or the full id",
+                    ),
+                    refusal(
+                        CANDIDATE_INVALID_REQUEST,
+                        "send source_commit (40 lowercase hex) and job_id (a full id or at least 8 hex characters) and/or a non-nil source_session_id",
+                    ),
+                    refusal(
+                        CANDIDATE_NO_VERIFICATION_JOB,
+                        "verdict (ok:false): the session owns no scoped_test job; have the worker submit one before you enqueue",
+                    ),
+                    refusal(
+                        CANDIDATE_JOB_NOT_TERMINAL,
+                        "verdict (ok:false): the job is still queued or running; wait for its wake and check again",
+                    ),
+                    refusal(
+                        CANDIDATE_ADMISSION_TIMEOUT,
+                        "verdict (ok:false): the job never got a build slot or start (job_refusal names which), so it verified nothing; resubmit scoped_test",
+                    ),
+                    refusal(
+                        CANDIDATE_RECEIPT_MISSING,
+                        "verdict (ok:false): the job is not a scoped_test run or left no receipt; have the worker submit scoped_test",
+                    ),
+                    refusal(
+                        CANDIDATE_JOB_NOT_GREEN,
+                        "verdict (ok:false): the run failed before the baseline comparison classified its failures (new_failures is null); read the job log and rerun",
+                    ),
+                    refusal(
+                        CANDIDATE_NEW_FAILURES,
+                        "verdict (ok:false): new_failures lists tests that fail on the candidate and pass on the base; baseline_reds alone never block",
+                    ),
+                    refusal(
+                        CANDIDATE_HEAD_MISMATCH,
+                        "verdict (ok:false): the receipt head is not source_commit; docs_only_delta true means only documentation changed since, so enqueuing is your call, otherwise have the worker rerun scoped_test at source_commit",
+                    ),
+                ];
+                R
+            }
+            Self::PushSatelliteManagerPolicy => {
+                use crate::satellite_manager_policy::*;
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "target_not_authorized",
+                        "check Deploy authority, Execute mode, pairing, dispatch, declared scope and satellite inbound allowlist",
+                    ),
+                    refusal(
+                        POLICY_BOUNDS,
+                        "every launch triple and session/provider cap must fit the hub's effective project grant",
+                    ),
+                    refusal(
+                        POLICY_STALE,
+                        "read the satellite's current scope and policy versions before sending a new push",
+                    ),
+                    refusal(
+                        POLICY_KEY_CONFLICT,
+                        "retry the original payload or use a new idempotency_key",
+                    ),
+                    refusal(
+                        POLICY_INVALID,
+                        "use explicit nonempty launch choices and valid caps, versions and key",
+                    ),
+                    refusal(
+                        POLICY_UNREACHABLE,
+                        "restore the paired link and retry the identical request",
+                    ),
+                    refusal(
+                        POLICY_REFUSED,
+                        "the satellite returned an unrecognized refusal; inspect it locally",
+                    ),
+                ];
+                R
+            }
+            Self::ReseatSatelliteManager => {
+                use crate::manager_reseat::*;
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "target_not_authorized",
+                        "check Deploy authority, Execute mode, pairing, dispatch, declared scope and the satellite inbound allowlist",
+                    ),
+                    refusal(
+                        RESEAT_SEAT_LIVE,
+                        "the seat is running, or already replaced by a healthy successor; nothing to reseat",
+                    ),
+                    refusal(
+                        RESEAT_SEAT_NOT_FAILED,
+                        "the seat is stopped but not Failed; send provider_unavailable: true if its provider is down",
+                    ),
+                    refusal(
+                        SATELLITE_RESEAT_BOUNDS,
+                        "the provider, model and effort must be inside your project's effective launch grant; name one it allows",
+                    ),
+                    refusal(
+                        SATELLITE_RESEAT_INVALID,
+                        "name a provider and a non-empty reason of at most 512 bytes; model and effort must not be blank",
+                    ),
+                    refusal(
+                        SATELLITE_RESEAT_UNREACHABLE,
+                        "restore the paired link, read the satellite's scope status, then retry",
+                    ),
+                    refusal(
+                        SATELLITE_RESEAT_REFUSED,
+                        "the satellite refused with a code outside this list (no appointment, revoked scope or a non-root seat); inspect it locally",
                     ),
                 ];
                 R
@@ -1007,7 +1330,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         "deploy_restart_budget",
-                        "at most two deploy restarts per hour; wait before requesting another",
+                        "deploy restarts per hour are capped (operator setting deploy_restarts_per_hour, default 2); the refusal ends in retry_after=<RFC3339>, so arm one wake for that time",
                     ),
                     refusal(
                         "deploy_staged_copy_changed",
@@ -1067,10 +1390,20 @@ impl AgentControlVerbV1 {
                 R
             }
             Self::TopologyResolveAttempt => {
-                const R: &[AgentControlRefusalV1] = &[refusal(
-                    "discard_requires_manager",
-                    "a lead may inspect, accept or retry in its own Epic; discard needs the manager",
-                )];
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "discard_requires_manager",
+                        "a lead may inspect, accept or retry in its own Epic; discard needs the manager",
+                    ),
+                    refusal(
+                        "review_accept_requires_manager",
+                        "a lead may retry a blocked review; ruling on it (accept) needs the manager",
+                    ),
+                    refusal(
+                        "review_round_unavailable",
+                        "no further review round is available; accept the blocked review with a ruling or interrupt",
+                    ),
+                ];
                 R
             }
             Self::TopologyInterrupt => {
@@ -1080,7 +1413,7 @@ impl AgentControlVerbV1 {
                 )];
                 R
             }
-            Self::TopologyList | Self::TopologyGetExecution => &[],
+            Self::TopologyList | Self::TopologyGet | Self::TopologyGetExecution => &[],
             Self::CancelWake => {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
@@ -1090,6 +1423,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         "wake_protected",
                         "program guards and manager watches are daemon-owned and cannot be cancelled",
+                    ),
+                    refusal(
+                        "wake_already_disabled",
+                        "the matching wake is already disabled; list enabled wakes with AgentListWakes",
                     ),
                 ];
                 R
@@ -1108,6 +1445,24 @@ impl AgentControlVerbV1 {
                 )];
                 R
             }
+            Self::WorkerRoster => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        crate::agent_worker_roster::WORKER_ROSTER_INVALID_REQUEST,
+                        "send limit 1..=256, a non-nil project_id and each state at most once; omit project_id for your own scope",
+                    ),
+                    refusal(
+                        crate::agent_worker_roster::WORKER_ROSTER_NOT_AUTHORIZED,
+                        "project_id names a project you do not manage; omit it to list the workers you launched yourself",
+                    ),
+                    refusal(
+                        crate::agent_worker_roster::WORKER_ROSTER_CALLER_UNAVAILABLE,
+                        "only a live leaf session lists workers; refresh AgentGetAuthorityCatalog",
+                    ),
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                ];
+                R
+            }
             Self::ManagerLaunchIssueWorker => {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
@@ -1120,7 +1475,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         "manager_issue_worker_parent_required",
-                        "name parent_epic_id: your scope holds no single Epic to default to",
+                        "your scope holds no single live Epic to default to; set parent_epic_id to one of the Epics the message lists (up to 8, newest first, each with id, kind and title)",
                     ),
                     refusal(
                         "manager_issue_worker_authority_denied",
@@ -1128,7 +1483,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         crate::global_manager::MANAGER_ISSUE_WORKER_ALREADY_LIVE,
-                        "another manager's worker on this Issue is still live; watch it instead of launching a second",
+                        "a worker on this Issue is still live, running or parked on its own wake or job before its final handoff; the message names it: watch it instead of launching a second, or continue_from it to replace it",
                     ),
                     MANAGER_PROJECT_NOT_IN_SCOPE,
                     refusal(
@@ -1154,6 +1509,14 @@ impl AgentControlVerbV1 {
                     refusal(
                         crate::manager_issue_worker::MANAGER_ISSUE_WORKER_REVIEWED_UNAVAILABLE,
                         "review_of names no Issue of this project; pass the implementer Issue's display number, or omit review_of",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_RELATED_UNAVAILABLE,
+                        "related names no Issue of this project; pass same-project display numbers (not the bound Issue, at most 16, no duplicates), or omit related",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_REFERENCES_OVERFLOW,
+                        "the brief (with a predecessor's reads) holds more than 64 distinct #N or #A-#B selectors; name fewer in the brief and attach the rest with related",
                     ),
                     refusal(
                         crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_OUT_OF_SCOPE,
@@ -1228,6 +1591,112 @@ impl AgentControlVerbV1 {
                     refusal(
                         PROJECT_ADMIN_UNAVAILABLE,
                         "this session handle cannot refresh project caches; call again after a fresh turn or via rsi-rpc",
+                    ),
+                ];
+                R
+            }
+            Self::ListSourceWorktreeCohorts
+            | Self::AuditSourceWorktreeCohort
+            | Self::ApplySourceWorktreeCohort => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "storage_control_not_authorized",
+                        "refresh your authority catalog; only a current Execute-mode, unpaused PM or portfolio seat granted storage_control may settle",
+                    ),
+                    refusal(
+                        "storage_control_not_in_scope",
+                        "choose a repository associated with your covered projects; inspect per-root foreign or unknown ownership dispositions",
+                    ),
+                    refusal(
+                        "storage_control_invalid_request",
+                        "match the closed request schema; use the digest and authorization phrase returned by the audit",
+                    ),
+                    refusal(
+                        "storage_control_proof_refused",
+                        "inspect reason and audit dispositions; re-audit on drift; retain dirty, non-ancestor or dependent work",
+                    ),
+                    refusal(
+                        "source_settlement_busy",
+                        "AgentAuditSourceWorktreeCohort only: a settlement run holds the repository (data.holder_run_id); nothing was written and there is no plan; re-audit after data.retry_after_secs. This read has no idempotency_key: re-ask it as is",
+                    ),
+                ];
+                R
+            }
+            Self::OperatorTodoUpsert => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        OPERATOR_TODO_NOT_AUTHORIZED,
+                        "only a manager node seat (project PM, area or portfolio) may write the operator to-do list; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_INVALID_REQUEST,
+                        "send a non-blank todo_key, title and how within the size limits, a priority of 1 to 4, and an idempotency_key",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_CLOSED,
+                        "the item with this todo_key was already done or dismissed; use a new todo_key for a new item",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_LIMIT,
+                        "your scope already holds 64 open items; close the ones you observe done or no longer needed",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_IDEMPOTENCY_CONFLICT,
+                        "this idempotency_key already carries a different request; use a new key for a changed item",
+                    ),
+                ];
+                R
+            }
+            Self::StandingDirective => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        STANDING_DIRECTIVE_NOT_AUTHORIZED,
+                        "write only to a manager scope strictly below your own seat (a project PM writes to its areas, a portfolio seat to what it covers), and clear only a directive a manager relayed; the operator clears its own",
+                    ),
+                    refusal(
+                        STANDING_DIRECTIVE_INVALID_REQUEST,
+                        "set needs scope (project:<uuid>, area:<uuid> or portfolio:<uuid>), non-blank text and provenance within the size limits and an idempotency_key; clear needs only directive_id; expires_in_secs is 1 to 7776000",
+                    ),
+                    refusal(
+                        STANDING_DIRECTIVE_NOT_FOUND,
+                        "no directive with this id exists in a scope below yours; read the ids from AgentManagerOverview",
+                    ),
+                    refusal(
+                        STANDING_DIRECTIVE_LIMIT,
+                        "the scope already holds 8 active directives; clear one that no longer applies",
+                    ),
+                    refusal(
+                        STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT,
+                        "this idempotency_key already carries a different directive; use a new key",
+                    ),
+                ];
+                R
+            }
+            Self::OperatorTodoClose => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        OPERATOR_TODO_NOT_AUTHORIZED,
+                        "only a manager node seat (project PM, area or portfolio) may close operator to-do items; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_INVALID_REQUEST,
+                        "name exactly one of todo_id and todo_key, a status of done or dismissed, and an idempotency_key",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_EVIDENCE_REQUIRED,
+                        "record what you observed in evidence; for done also send observed:true, and never mark an item done on the operator's behalf",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_NOT_FOUND,
+                        "no item matches; check the todo_key in your own scope or the todo_id the upsert returned",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_NOT_IN_SCOPE,
+                        "a project or area seat closes only items of its own scope; ask the owning manager or a portfolio seat",
+                    ),
+                    refusal(
+                        OPERATOR_TODO_IDEMPOTENCY_CONFLICT,
+                        "this idempotency_key already carries a different request; use a new key",
                     ),
                 ];
                 R
@@ -1560,10 +2029,42 @@ mod tests {
                 "AgentManagerResolveEscalation",
                 "AgentReserveSuccessor",
                 "AgentSubmitReviewReceipt",
+                "AgentTopologyGet",
                 "AgentTopologyGetExecution",
                 "AgentTopologyList",
             ])
         );
+    }
+
+    #[test]
+    fn manager_control_advertises_the_disabled_rotation_refusal_without_destructive_advice() {
+        let refusal = AgentControlVerbV1::ManagerControl
+            .refusals()
+            .iter()
+            .find(|r| r.code == "manager_succession_rotation_disabled")
+            .expect("succeed_manager's early rotation-policy refusal is advertised");
+        assert!(refusal.next_action.contains("ask the operator"));
+        assert!(refusal.next_action.contains("do not cancel wakes"));
+    }
+
+    #[test]
+    fn queue_disabled_refusal_routes_to_the_operator_and_preserves_the_commit() {
+        let refusal = AgentControlVerbV1::EnqueueLandingSource
+            .refusals()
+            .iter()
+            .find(|r| r.code == crate::rolling_queue::QUEUE_DISABLED)
+            .expect("queue_disabled is advertised");
+        for guidance in [
+            "operator setting",
+            "keep the commit pushed",
+            "AgentReportUp",
+            "AgentReportToHub on a satellite",
+            "rsi land or EnqueueRollingQueueSource",
+            "AgentEnqueueLandingSource {derive_filters:true}",
+            "Agents never run the lander directly",
+        ] {
+            assert!(refusal.next_action.contains(guidance), "{guidance}");
+        }
     }
 
     #[test]

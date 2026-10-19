@@ -84,15 +84,23 @@ where
                 .unwrap_or_else(|| json!({}));
             let verb = tool.verb();
             if let Err(error) = verb.validate_params(&arguments) {
-                return Some(response(
-                    id,
-                    tool_error(error.class, json!({"field": error.field})),
-                ));
+                let mut detail = json!({"field": error.field});
+                error.enrich(&mut detail);
+                return Some(response(id, tool_error(error.class, detail)));
             }
             let normalized = match dispatch(verb.descriptor().method, arguments) {
                 Ok(rpc) if rpc.error.is_none() => json!({"code":"accepted", "result":rpc.result}),
                 Ok(rpc) => json!({"code":"rpc_error", "error":rpc.error}),
-                Err(_) => json!({"code":"rpc_error"}),
+                // A transport failure keeps `rpc_error` and now says why; a
+                // response timeout keeps its own typed code and hint (#2622).
+                Err(error) => {
+                    let timed_out =
+                        rsi_common::agent_rpc_client::response_timeout(&error).is_some();
+                    json!({
+                        "code": if timed_out { "rpc_response_timeout" } else { "rpc_error" },
+                        "message": error.to_string(),
+                    })
+                }
             };
             Some(response(
                 id,
@@ -164,6 +172,7 @@ mod tests {
             "rsi_control_manager_get_action",
             "rsi_control_topology_upsert",
             "rsi_control_topology_list",
+            "rsi_control_topology_get",
             "rsi_control_topology_execute",
             "rsi_control_topology_get_execution",
             "rsi_control_topology_interrupt",
@@ -181,12 +190,12 @@ mod tests {
         }), |_, _| { called.set(true); unreachable!() }).unwrap();
         assert!(!called.get());
         assert_eq!(reply["result"]["isError"], true);
-        assert!(
-            reply["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("invalid_input")
-        );
+        let error: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(error["code"], "invalid_input");
+        assert_eq!(error["detail"]["field"], "params");
+        assert_eq!(error["detail"]["path"], "params.query");
+        assert_eq!(error["detail"]["constraint"], "required \"query\"");
     }
 
     #[test]
@@ -251,5 +260,38 @@ mod tests {
         let normalized: Value = serde_json::from_str(text).unwrap();
         assert_eq!(normalized["code"], "invalid_input");
         assert_eq!(normalized["detail"]["field"], "params");
+    }
+    #[test]
+    fn audit_response_timeout_is_typed_and_does_not_advise_a_replay() {
+        let reply = handle_request(
+            json!({
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"rsi_control_audit_source_worktree_cohort",
+                    "arguments":{"repository_identity":"repo:example"}
+                }
+            }),
+            |method, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    rsi_common::agent_rpc_client::RpcResponseTimeout {
+                        method: method.to_string(),
+                        timeout: std::time::Duration::from_secs(30),
+                    },
+                ))
+            },
+        )
+        .unwrap();
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        let normalized: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(normalized["code"], "rpc_response_timeout");
+        let message = normalized["message"].as_str().unwrap();
+        assert!(
+            message.contains("AgentAuditSourceWorktreeCohort"),
+            "{message}"
+        );
+        assert!(!message.contains("Replay it"), "{message}");
+        assert_eq!(reply["result"]["isError"], true);
     }
 }

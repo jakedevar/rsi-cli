@@ -32,6 +32,9 @@ pub const HOOK_SUBCOMMAND: &str = "boundary-mail-hook";
 /// it: their tool-result shape differs from Claude's and they cannot take an
 /// `updatedToolOutput` replacement.
 pub const MAIL_ONLY_FLAG: &str = "--mail-only";
+/// The Claude tool whose `PreToolUse` call the hook answers with the typed
+/// undeliverable notice (hub #1161).
+pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 /// Daemon I/O bound for one claim.
 pub const DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
 /// #1183: the hook-only verb the hook calls AFTER writing its output, so the
@@ -138,6 +141,15 @@ pub fn claude_settings_json(command: &str) -> String {
                     "command": command,
                     "timeout": CLAUDE_HOOK_TIMEOUT_SECS,
                 }]
+            }, {
+                // Hub #1161: a headless session's AskUserQuestion gets the
+                // typed undeliverable notice as its tool result, in-turn.
+                "matcher": ASK_USER_QUESTION_TOOL,
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "timeout": CLAUDE_HOOK_TIMEOUT_SECS,
+                }]
             }],
             "PostToolUse": [{
                 "matcher": "*",
@@ -217,6 +229,26 @@ fn render_pre_tool_use(event: &Value, wrapper: &str) -> Option<String> {
     )
 }
 
+/// Hub #1161: deny an `AskUserQuestion` with the typed
+/// `[rsi:ask_user_question_undeliverable]` notice, which the CLI hands to the
+/// model as that call's tool result in the same turn. Every session this hook is
+/// installed for is an rsid-launched headless `-p` run with no human on the
+/// other end of the question, so the denial is unconditional; it needs no
+/// daemon call, so there is nothing to fail or delay.
+fn render_ask_user_question_denial(event: &Value) -> Option<String> {
+    if event.get("tool_name").and_then(Value::as_str) != Some(ASK_USER_QUESTION_TOOL) {
+        return None;
+    }
+    Some(
+        json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": crate::ask_user_question_notice::undeliverable_notice(),
+        }})
+        .to_string(),
+    )
+}
+
 /// Deny broad process signals (#1227) and unscoped library tests (#1339).
 fn render_shell_denial(event: &Value, full_suite: bool) -> Option<String> {
     if event.get("tool_name").and_then(Value::as_str) != Some("Bash") {
@@ -227,7 +259,12 @@ fn render_shell_denial(event: &Value, full_suite: bool) -> Option<String> {
         .and_then(|input| input.get("command"))
         .and_then(Value::as_str)?;
     let reason = crate::kill_guard::broad_kill_refusal(command)
-        .or_else(|| test_guard::refusal(command, full_suite))?;
+        .map(str::to_owned)
+        .or_else(|| test_guard::refusal(command, full_suite).map(str::to_owned))
+        .or_else(|| {
+            let cwd = event_cwd(event)?;
+            custody_refusal(command, &cwd, &sandbox_base())
+        })?;
     Some(
         json!({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -236,6 +273,103 @@ fn render_shell_denial(event: &Value, full_suite: bool) -> Option<String> {
         }})
         .to_string(),
     )
+}
+
+/// The working directory the provider reports for the tool call, else the
+/// hook's own (the provider launches the hook in the session's directory).
+fn event_cwd(event: &Value) -> Option<std::path::PathBuf> {
+    event
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// Where RSI sandboxes live: `RSI_SANDBOX_BASE`, else `~/.rsi/sandboxes`.
+pub fn sandbox_base() -> std::path::PathBuf {
+    std::env::var_os("RSI_SANDBOX_BASE")
+        .filter(|base| !base.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".rsi").join("sandboxes")))
+        .unwrap_or_default()
+}
+
+/// #2320: AGENTS.md hard rule 2 (never change the sandbox branch), rules 1, 8
+/// and 9 for a CLI provider shell (Claude `Bash`, Codex `Bash`), the same scan
+/// the Harness `shell` tool applies ([`crate::custody_scan`]). A command is
+/// checked when it starts inside an RSI sandbox or when it names a path inside
+/// the sandbox base (`git -C <sandbox>`, `cd <sandbox>`, `--git-dir=`,
+/// `--work-tree=`; #2540): the shell's starting directory says nothing about the
+/// repository a command targets. A command that never names a sandbox, run from
+/// a repository elsewhere, is not ours to guard. `Some(reason)` denies the call
+/// before it runs.
+fn custody_refusal(command: &str, cwd: &Path, base: &Path) -> Option<String> {
+    if base.as_os_str().is_empty() {
+        return None;
+    }
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    if !cwd.starts_with(&base) && !command_names_path_under(command, &cwd, &base) {
+        return None;
+    }
+    crate::custody_scan::check_command_sync_in(command, &cwd, &base)
+}
+
+/// Whether any word of `command` names a path under `base`, resolved the way
+/// the shell would from `cwd` (`~`, `$HOME`, `$RSI_SANDBOX_BASE`, relative
+/// words, `.`/`..`). Lexical and conservative: a word is a candidate wherever
+/// quoting or an operator puts it. A `cd` chain is not tracked, so a target
+/// assembled across several `cd` words is not recognised; the turn-end branch
+/// repair covers that residual.
+fn command_names_path_under(command: &str, cwd: &Path, base: &Path) -> bool {
+    let home = dirs::home_dir();
+    let base_text = base.to_string_lossy();
+    if command.contains(base_text.as_ref()) {
+        return true;
+    }
+    let words = command.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '&' | '|' | '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '='
+            )
+    });
+    words.filter(|word| !word.is_empty()).any(|word| {
+        let expanded = if let Some(rest) = ["$RSI_SANDBOX_BASE", "${RSI_SANDBOX_BASE}"]
+            .iter()
+            .find_map(|var| word.strip_prefix(var))
+        {
+            base.join(rest.trim_start_matches('/'))
+        } else if let Some(rest) = ["~", "$HOME", "${HOME}"]
+            .iter()
+            .find_map(|prefix| word.strip_prefix(prefix))
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        {
+            let Some(home) = home.as_ref() else {
+                return false;
+            };
+            home.join(rest.trim_start_matches('/'))
+        } else {
+            cwd.join(word)
+        };
+        lexically_normalized(&expanded).starts_with(base)
+    })
+}
+
+/// `path` with `.` and `..` folded away, without touching the filesystem.
+fn lexically_normalized(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Run the hook with no event input (mail only). Always returns exit code 0.
@@ -280,7 +414,8 @@ where
         .and_then(|exe| exe.to_str().map(str::to_string))
         .unwrap_or_else(|| "rsi-rpc".to_string());
     let cfg = spill_config_for_args(args, crate::spill::SpillConfig::from_env());
-    run_hook_with_input(&input, &cfg, &wrapper, stdout, dispatch)
+    let dialect = crate::provider_lifecycle_hooks::HookOutputDialect::from_hook_args(args);
+    run_hook_with_input_for(&input, &cfg, &wrapper, dialect, stdout, dispatch)
 }
 
 /// The spill configuration for one hook run: [`MAIL_ONLY_FLAG`] disables it.
@@ -303,6 +438,29 @@ pub fn run_hook_with_input<F>(
     cfg: &crate::spill::SpillConfig,
     wrapper: &str,
     stdout: &mut impl Write,
+    dispatch: F,
+) -> u8
+where
+    F: FnMut(&Path, &str, Value, Duration) -> std::io::Result<RpcResponse>,
+{
+    run_hook_with_input_for(
+        input,
+        cfg,
+        wrapper,
+        crate::provider_lifecycle_hooks::HookOutputDialect::Claude,
+        stdout,
+        dispatch,
+    )
+}
+
+/// [`run_hook_with_input`] for the provider whose hook output shape is
+/// `dialect` (#2898: only a `PreCompact` handoff instruction differs).
+pub fn run_hook_with_input_for<F>(
+    input: &str,
+    cfg: &crate::spill::SpillConfig,
+    wrapper: &str,
+    dialect: crate::provider_lifecycle_hooks::HookOutputDialect,
+    stdout: &mut impl Write,
     mut dispatch: F,
 ) -> u8
 where
@@ -314,7 +472,23 @@ where
         .and_then(|e| e.get("hook_event_name"))
         .and_then(Value::as_str)
         .unwrap_or("PostToolUse");
+    // #2766: a lifecycle event (`StopFailure`, `PreCompact`, `SessionStart`)
+    // is reported and never claims mail; only a `PreCompact` handoff
+    // instruction (#2898) and a `SessionStart` preamble (hub #2919) are
+    // printed.
+    if crate::provider_lifecycle_hooks::run_lifecycle_hook(
+        event.as_ref(),
+        dialect,
+        stdout,
+        &mut dispatch,
+    ) {
+        return 0;
+    }
     if event_name == "PreToolUse" {
+        if let Some(output) = event.as_ref().and_then(render_ask_user_question_denial) {
+            let _ = writeln!(stdout, "{output}");
+            return 0;
+        }
         // Guards apply regardless of the spill switches. Only the test guard
         // has a QA opt-out; it never bypasses the process signal guard.
         let full_suite = std::env::var("RSI_FULL_SUITE").as_deref() == Ok("1");
@@ -554,6 +728,68 @@ mod tests {
         );
     }
 
+    /// #2766: a lifecycle event reports itself once, claims no mail, prints
+    /// nothing and exits 0 even when the daemon call fails.
+    #[test]
+    fn a_lifecycle_event_is_reported_without_claiming_mail_and_never_fails() {
+        for name in ["StopFailure", "PreCompact"] {
+            let event = json!({"hook_event_name": name, "error": "rate_limit", "trigger": "auto"});
+            let mut out = Vec::new();
+            let tmp = tempfile::tempdir().unwrap();
+            let mut methods = Vec::new();
+            let code = run_hook_with_input(
+                &event.to_string(),
+                &spill_cfg(tmp.path()),
+                "/x/rsi-rpc",
+                &mut out,
+                |_, method, _, _| {
+                    methods.push(method.to_string());
+                    Err(std::io::Error::other("daemon unreachable"))
+                },
+            );
+            assert_eq!(code, 0, "{name}");
+            assert!(out.is_empty(), "{name} prints nothing");
+            assert_eq!(
+                methods,
+                [crate::provider_lifecycle_hooks::RECORD_METHOD],
+                "{name}"
+            );
+        }
+    }
+
+    /// #2898: a `PreCompact` whose daemon reply carries a handoff prints the
+    /// instruction in the provider's shape, claims no mail and exits 0.
+    #[test]
+    fn a_pre_compact_handoff_is_printed_per_provider_and_claims_no_mail() {
+        use crate::provider_lifecycle_hooks::HookOutputDialect;
+        let event = json!({"hook_event_name": "PreCompact", "trigger": "manual"});
+        for dialect in [HookOutputDialect::Claude, HookOutputDialect::Codex] {
+            let mut out = Vec::new();
+            let tmp = tempfile::tempdir().unwrap();
+            let mut methods = Vec::new();
+            let code = run_hook_with_input_for(
+                &event.to_string(),
+                &spill_cfg(tmp.path()),
+                "/x/rsi-rpc",
+                dialect,
+                &mut out,
+                |_, method, _, _| {
+                    methods.push(method.to_string());
+                    Ok(reply(json!({"outcome": "queued", "handoff": {
+                        "action": "worker_baton", "requested": true,
+                        "instruction": "Pass the baton: PIPELINE HANDOFF — BATON <sha>",
+                    }})))
+                },
+            );
+            assert_eq!(code, 0);
+            assert_eq!(methods, [crate::provider_lifecycle_hooks::RECORD_METHOD]);
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("PIPELINE HANDOFF — BATON <sha>"), "{out}");
+            let json = serde_json::from_str::<Value>(out.trim());
+            assert_eq!(json.is_ok(), dialect == HookOutputDialect::Codex, "{out}");
+        }
+    }
+
     #[test]
     fn settings_json_installs_a_bounded_post_tool_use_command_hook() {
         let value: Value =
@@ -562,6 +798,71 @@ mod tests {
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["command"], "rsi-rpc boundary-mail-hook");
         assert!(hook["timeout"].as_u64().unwrap() >= DAEMON_TIMEOUT.as_secs());
+    }
+
+    #[test]
+    fn settings_json_installs_the_ask_user_question_matcher() {
+        let value: Value = serde_json::from_str(&claude_settings_json("rsi-rpc x")).unwrap();
+        let groups = value["hooks"]["PreToolUse"].as_array().unwrap();
+        let ask = groups
+            .iter()
+            .find(|group| group["matcher"] == ASK_USER_QUESTION_TOOL)
+            .expect("AskUserQuestion matcher");
+        assert_eq!(ask["hooks"][0]["type"], "command");
+        assert_eq!(ask["hooks"][0]["command"], "rsi-rpc x");
+        assert_eq!(
+            ask["hooks"][0]["timeout"].as_u64(),
+            Some(CLAUDE_HOOK_TIMEOUT_SECS)
+        );
+        // The Bash guard group stays first and untouched.
+        assert_eq!(groups[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn pre_tool_use_answers_ask_user_question_with_the_typed_notice_without_the_daemon() {
+        let event = json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": []}});
+        let tmp = tempfile::tempdir().unwrap();
+        // Even with the spill switch off: this is a denial, not a rewrite.
+        let mut cfg = spill_cfg(tmp.path());
+        cfg.disabled = true;
+        let mut out = Vec::new();
+        let code = run_hook_with_input(
+            &event.to_string(),
+            &cfg,
+            "rsi-rpc",
+            &mut out,
+            |_, _, _, _| panic!("the AskUserQuestion denial must not call the daemon"),
+        );
+        assert_eq!(code, 0);
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        let specific = &value["hookSpecificOutput"];
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["permissionDecision"], "deny");
+        let reason = specific["permissionDecisionReason"].as_str().unwrap();
+        assert_eq!(
+            reason,
+            crate::ask_user_question_notice::undeliverable_notice()
+        );
+        assert!(reason.starts_with("[rsi:ask_user_question_undeliverable] "));
+        assert!(reason.contains("NOT declined by a human"));
+    }
+
+    #[test]
+    fn pre_tool_use_leaves_other_tools_alone_for_the_ask_user_question_hook() {
+        let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
+            "tool_input": {"file_path": "/x"}});
+        let tmp = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let code = run_hook_with_input(
+            &event.to_string(),
+            &spill_cfg(tmp.path()),
+            "rsi-rpc",
+            &mut out,
+            |_, _, _, _| panic!("PreToolUse must not call the daemon"),
+        );
+        assert_eq!(code, 0);
+        assert!(out.is_empty());
     }
 
     fn spill_cfg(root: &Path) -> crate::spill::SpillConfig {
@@ -632,6 +933,272 @@ mod tests {
             specific["permissionDecisionReason"],
             crate::kill_guard::BROAD_KILL_REFUSAL
         );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A repository under a fake sandbox base, with one committed file.
+    fn sandbox_repo() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sandboxes");
+        let repo = base.join("session");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "work"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        (tmp, base, repo)
+    }
+
+    /// #2320: a CLI shell may not change the sandbox branch. The incident was
+    /// a backticked example inside a double-quoted rsi-rpc argument that the
+    /// shell evaluated as `git checkout main`.
+    #[test]
+    fn custody_refuses_a_branch_change_in_a_sandbox() {
+        let (_tmp, base, repo) = sandbox_repo();
+        for command in [
+            "git checkout main",
+            "git switch main",
+            "git switch -c other",
+            "git checkout -b other",
+            "git reset --hard origin/rolling",
+            "git stash",
+            "git push --force origin work",
+            "cd /tmp && git checkout main",
+            "bash -c 'git checkout main'",
+            "rsi-rpc AgentSendMessage --params \"run `git checkout main` now\"",
+            "git -c alias.co=checkout co main",
+        ] {
+            let reason = custody_refusal(command, &repo, &base)
+                .unwrap_or_else(|| panic!("`{command}` must be refused"));
+            assert!(
+                reason.contains("rsi refused this command"),
+                "{command}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn custody_allows_ordinary_git_in_a_sandbox() {
+        let (_tmp, base, repo) = sandbox_repo();
+        for command in [
+            "git status",
+            "git log --oneline -3",
+            "git diff origin/rolling",
+            "git commit -m 'a checkout of main'",
+            "git add a.txt && git commit -m x",
+            "git fetch origin && git merge origin/rolling",
+            "git show main:a.txt",
+            "git branch --show-current",
+            "echo git checkout main",
+        ] {
+            assert_eq!(custody_refusal(command, &repo, &base), None, "{command}");
+        }
+    }
+
+    /// #2571: the CLI hook refuses the failed-`cd` chain that let fixture git
+    /// commit and reset in a worker's sandbox, before any command runs. The
+    /// scratch directory here does not exist, so an unguarded chain would have
+    /// run `git commit` in the sandbox.
+    #[test]
+    fn custody_refuses_a_scratch_cd_chain_before_git_can_touch_the_sandbox() {
+        let (tmp, base, repo) = sandbox_repo();
+        let missing = tmp.path().join("scratch-never-created");
+        let missing = missing.display();
+        let head_before = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
+        for command in [
+            format!("cd {missing}; git commit --allow-empty -m junk"),
+            format!("cd {missing} && git init -q && git commit --allow-empty -m junk"),
+            format!("mkdir -p {missing}; cd {missing}; git reset --mixed HEAD~1"),
+            "cd \"$(mktemp -d)\"; git commit --allow-empty -m junk".to_owned(),
+            "cd /tmp/fixture; git update-ref refs/heads/stray HEAD".to_owned(),
+            "cd /tmp/fixture; git branch stray HEAD".to_owned(),
+            "bash -c 'cd /tmp/fixture; git commit -m junk'".to_owned(),
+            // An empty or unknown pin is no pin: `git -C ""` acts on the cwd.
+            "d=; cd /tmp/missing; git -C \"$d\" commit -m junk".to_owned(),
+            "cd /tmp/missing; git -C \"$(mktemp -d)\" commit -m junk".to_owned(),
+            "cd /tmp/missing; GIT_DIR=\"$d\" GIT_WORK_TREE=\"$d\" git commit -m junk".to_owned(),
+            // A pin on an earlier line or command does not cover a later one.
+            "export GIT_DIR=/tmp/f/.git GIT_WORK_TREE=/tmp/f; cd /tmp/missing; git commit -m junk"
+                .to_owned(),
+            "cd /tmp/missing; cd /somewhere/else; git commit -m junk".to_owned(),
+        ] {
+            let reason = custody_refusal(&command, &repo, &base)
+                .unwrap_or_else(|| panic!("`{command}` must be refused"));
+            assert!(
+                reason.contains("scratch or temporary"),
+                "{command}: {reason}"
+            );
+            assert!(reason.contains("git -C <absolute scratch dir>"), "{reason}");
+        }
+        // Nothing ran: the refusal is a verdict on the text, so the assigned
+        // branch and the missing directory are exactly as they were.
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".git/HEAD")).unwrap(),
+            head_before
+        );
+        assert!(!std::path::Path::new(&missing.to_string()).exists());
+    }
+
+    /// #2571: the same words in a pinned or ordinary command are not refused,
+    /// and a scratch chain from outside any sandbox is not ours to guard.
+    #[test]
+    fn custody_allows_pinned_scratch_git_and_ordinary_sandbox_work() {
+        let (tmp, base, repo) = sandbox_repo();
+        let scratch = tmp.path().join("scratch-repo");
+        std::fs::create_dir(&scratch).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&scratch)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let scratch = scratch.display();
+        for command in [
+            format!("git -C {scratch} commit --allow-empty -m fixture"),
+            format!("git -C {scratch} reset --mixed HEAD~1"),
+            format!("cd {scratch} && git -C {scratch} commit -m fixture"),
+            format!("GIT_DIR={scratch}/.git GIT_WORK_TREE={scratch} git commit -m fixture"),
+            format!("cd {scratch} && git status"),
+            format!(
+                "cd {scratch} && env GIT_DIR={scratch}/.git GIT_WORK_TREE={scratch} git commit -m fixture"
+            ),
+            format!("cd {scratch} && git --git-dir {scratch}/.git --work-tree {scratch} add -A"),
+            "git -C \"$dir\" commit -m 'no scratch cd here'".to_owned(),
+            "git commit -m 'cd /tmp/scratch; git reset --mixed HEAD~2'".to_owned(),
+            "git add a.txt && git commit -m 'mktemp /tmp fixture'".to_owned(),
+            "git fetch origin && git merge origin/rolling && git push origin HEAD:rolling"
+                .to_owned(),
+            "git log --oneline -3 && git diff origin/rolling".to_owned(),
+        ] {
+            assert_eq!(custody_refusal(&command, &repo, &base), None, "{command}");
+        }
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            custody_refusal("cd /tmp/fixture; git commit -m x", &elsewhere, &base),
+            None
+        );
+    }
+
+    /// A repository outside every sandbox is not ours to guard.
+    #[test]
+    fn custody_ignores_a_directory_outside_the_sandbox_base() {
+        let (tmp, base, _repo) = sandbox_repo();
+        let elsewhere = tmp.path().join("scratch");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            custody_refusal("git checkout main", &elsewhere, &base),
+            None
+        );
+        assert_eq!(
+            custody_refusal("git checkout main", &elsewhere, Path::new("")),
+            None
+        );
+    }
+
+    /// #2540: the shell's starting directory is not the repository a command
+    /// targets. From outside the base, a literal `-C`/`cd`/`--git-dir`/
+    /// `--work-tree` target inside it is still refused; an unrelated repository
+    /// stays usable.
+    #[test]
+    fn custody_refuses_a_sandbox_target_from_a_directory_outside_the_base() {
+        let (tmp, base, repo) = sandbox_repo();
+        let elsewhere = tmp.path().join("scratch");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = tmp.path().join("other-repo");
+        let repo = repo.display();
+        for command in [
+            format!("git -C {repo} switch main"),
+            format!("git -C '{repo}' checkout main"),
+            format!("cd {repo} && git checkout main"),
+            format!("(cd \"{repo}\"; git switch -c other)"),
+            format!("pushd {repo} && git reset --hard origin/rolling"),
+            format!("git --git-dir={repo}/.git checkout main"),
+            format!("git --work-tree={repo} checkout main"),
+            format!(
+                "git -C {}/../sandboxes/session switch main",
+                elsewhere.display()
+            ),
+            format!("env -C {repo} git checkout main"),
+            format!("bash -c 'cd {repo} && git switch main'"),
+        ] {
+            let reason = custody_refusal(&command, &elsewhere, &base)
+                .unwrap_or_else(|| panic!("`{command}` must be refused"));
+            assert!(
+                reason.contains("rsi refused this command"),
+                "{command}: {reason}"
+            );
+        }
+        // A relative target resolved from a directory above the base.
+        assert!(
+            custody_refusal("git -C sandboxes/session switch main", tmp.path(), &base).is_some()
+        );
+        // Positive controls: an unrelated repository stays usable, including
+        // the same branch-changing commands, and sandbox reads stay allowed.
+        let other = other.display();
+        for command in [
+            "git checkout main".to_owned(),
+            format!("git -C {other} switch main"),
+            format!("cd {other} && git checkout -b topic"),
+            format!("git --git-dir={other}/.git checkout main"),
+            format!("git -C {repo} status"),
+            format!("cd {repo} && git log --oneline -3"),
+        ] {
+            assert_eq!(
+                custody_refusal(&command, &elsewhere, &base),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// A discard is allowed while nothing would be lost and refused when the
+    /// path has uncommitted changes (hard rules 8 and 9).
+    #[test]
+    fn custody_refuses_a_discard_only_when_it_would_lose_work() {
+        let (_tmp, base, repo) = sandbox_repo();
+        assert_eq!(
+            custody_refusal("git restore a.txt", &repo, &base),
+            None,
+            "clean path"
+        );
+        assert_eq!(
+            custody_refusal("git checkout -- a.txt", &repo, &base),
+            None,
+            "clean path"
+        );
+        std::fs::write(repo.join("a.txt"), "two").unwrap();
+        let reason = custody_refusal("git restore a.txt", &repo, &base).expect("dirty path");
+        assert!(reason.contains("a.txt"), "{reason}");
+        assert!(custody_refusal("git checkout -- a.txt", &repo, &base).is_some());
+        std::fs::write(repo.join("scratch.txt"), "x").unwrap();
+        assert!(custody_refusal("git clean -f", &repo, &base).is_some());
+    }
+
+    /// The PreToolUse answer for a denied custody command has the same shape as
+    /// the #1227 denial, and a non-Bash tool is never inspected.
+    #[test]
+    fn pre_tool_use_denial_covers_custody_and_leaves_other_tools_alone() {
+        let (_tmp, base, repo) = sandbox_repo();
+        // render_shell_denial reads RSI_SANDBOX_BASE / the home default, so
+        // the shape is checked through the same reason string it would carry.
+        let reason = custody_refusal("git switch main", &repo, &base).unwrap();
+        assert!(reason.contains("AGENTS.md hard rule 2"), "{reason}");
+        let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Read",
+            "tool_input": {"command": "git checkout main"}});
+        assert_eq!(render_shell_denial(&event, false), None);
     }
 
     #[test]

@@ -17,10 +17,11 @@ use crate::global_manager::{
 use crate::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
 
 /// The operator-only portfolio RPCs (never in an agent catalog).
-pub const OPERATOR_METHODS: [&str; 4] = [
+pub const OPERATOR_METHODS: [&str; 5] = [
     "ListPortfolioNodes",
     "GetPortfolioNode",
     "ConfigurePortfolioNode",
+    "ConfigurePortfolioNodeLaunches",
     "RevokePortfolioNode",
 ];
 
@@ -318,6 +319,186 @@ pub struct ConfigurePortfolioNodeRequestV1 {
     pub idempotency_key: String,
 }
 
+/// #2103: operator-only one-launch edit of a node's grant. Adds and removes
+/// launches (provider, model, effort) and rewrites nothing else: the daemon
+/// rebuilds the full configure request from the node's current grant, CAS-fenced
+/// on `expected_node_grant_version`, so the operator never re-types the grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurePortfolioNodeLaunchesRequestV1 {
+    pub node_id: Uuid,
+    #[serde(default)]
+    pub add: Vec<ManagerLaunchChoiceV2>,
+    #[serde(default)]
+    pub remove: Vec<ManagerLaunchChoiceV2>,
+    pub expected_node_grant_version: i64,
+    pub idempotency_key: String,
+}
+
+impl ConfigurePortfolioNodeLaunchesRequestV1 {
+    /// # Errors
+    /// A stable refusal code.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.node_id.is_nil()
+            || self.expected_node_grant_version <= 0
+            || !valid_key(&self.idempotency_key)
+            || (self.add.is_empty() && self.remove.is_empty())
+            || self.add.len() > GLOBAL_MANAGER_MAX_LAUNCHES
+            || self.remove.len() > GLOBAL_MANAGER_MAX_LAUNCHES
+            || self
+                .add
+                .iter()
+                .chain(&self.remove)
+                .any(|launch| launch.validate().is_err())
+            // A launch both added and removed is ambiguous.
+            || self.add.iter().any(|launch| self.remove.contains(launch))
+        {
+            return Err(PORTFOLIO_INVALID_REQUEST);
+        }
+        Ok(())
+    }
+
+    /// The full configure request that applies this edit to `node`: every
+    /// other field is the node's current value. `add` extends the grant's
+    /// `allowed_launches` (and the policy's list when it is non-empty, since a
+    /// non-empty policy list narrows the grant); `remove` drops the exact
+    /// entries from the grant, the policy and the child policy.
+    ///
+    /// # Errors
+    /// `portfolio_invalid_request` for a malformed edit or one that would leave
+    /// a launch list empty (an empty policy list means "any", which widens);
+    /// `manager_node_stale` when `expected_node_grant_version` is not the
+    /// node's current grant version.
+    pub fn apply_to(
+        &self,
+        node: &PortfolioNodeV1,
+    ) -> Result<ConfigurePortfolioNodeRequestV1, &'static str> {
+        self.validate()?;
+        if node.state != "active" || node.grant.grant_version != self.expected_node_grant_version {
+            return Err(MANAGER_NODE_STALE);
+        }
+        fn edit(
+            list: &[ManagerLaunchChoiceV2],
+            add: &[ManagerLaunchChoiceV2],
+            remove: &[ManagerLaunchChoiceV2],
+        ) -> Vec<ManagerLaunchChoiceV2> {
+            let mut out: Vec<ManagerLaunchChoiceV2> = list
+                .iter()
+                .filter(|launch| !remove.contains(launch))
+                .cloned()
+                .collect();
+            for launch in add {
+                if !out.contains(launch) {
+                    out.push(launch.clone());
+                }
+            }
+            out
+        }
+        let mut policy = node.grant.project_policy.clone();
+        if !policy.allowed_launches.is_empty() {
+            let edited = edit(&policy.allowed_launches, &self.add, &self.remove);
+            if edited.is_empty() {
+                return Err(PORTFOLIO_INVALID_REQUEST);
+            }
+            policy.allowed_launches = edited;
+        }
+        let mut child_policy = node.child_policy.clone();
+        if let Some(child) = child_policy.as_mut()
+            && !child.allowed_launches.is_empty()
+        {
+            let edited = edit(&child.allowed_launches, &[], &self.remove);
+            if edited.is_empty() {
+                return Err(PORTFOLIO_INVALID_REQUEST);
+            }
+            child.allowed_launches = edited;
+        }
+        let allowed_launches = edit(&node.grant.allowed_launches, &self.add, &self.remove);
+        if allowed_launches.is_empty() {
+            return Err(PORTFOLIO_INVALID_REQUEST);
+        }
+        Ok(ConfigurePortfolioNodeRequestV1 {
+            node_id: Some(node.node_id),
+            parent_node_id: node.parent_node_id,
+            adopt_node_ids: Vec::new(),
+            expected_parent_grant_version: None,
+            tier_label: node.tier_label.clone(),
+            seat_session_id: node.grant.seat_session_id,
+            project_ids: node.grant.project_ids.clone(),
+            allowed_launches,
+            policy,
+            child_policy,
+            max_direct_reports: node.max_direct_reports,
+            expected_node_grant_version: node.grant.grant_version,
+            expected_authority_epoch: node.authority_epoch,
+            idempotency_key: self.idempotency_key.clone(),
+        })
+    }
+}
+
+/// #1902: what a new root node's first grant starts from when the operator
+/// gives no policy: the most recent revoked root grant over the same
+/// coverage, so replacing a revoked seat does not silently drop its
+/// capabilities, caps and launches.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortfolioGrantPrefillV1 {
+    pub source_node_id: Uuid,
+    pub source_tier_label: String,
+    pub source_grant_version: i64,
+    /// The source covers exactly the new coverage; otherwise it overlaps it.
+    pub exact_coverage: bool,
+    pub allowed_launches: Vec<ManagerLaunchChoiceV2>,
+    pub policy: ManagerPolicyV2,
+    pub child_policy: Option<ManagerPolicyV2>,
+    pub max_direct_reports: u16,
+}
+
+/// The prefill for a new root covering `coverage`, from `nodes` (any mix of
+/// active and revoked): the most recently updated revoked root whose coverage
+/// equals `coverage`, else the most recent one that shares a project with it.
+/// `None` (use defaults) when no revoked root overlaps: a grant over other
+/// projects is not the operator's policy for these.
+#[must_use]
+pub fn prefill_from_revoked_root(
+    nodes: &[PortfolioNodeV1],
+    coverage: &[Uuid],
+) -> Option<PortfolioGrantPrefillV1> {
+    let same = |node: &PortfolioNodeV1| {
+        let ids = &node.grant.project_ids;
+        ids.len() == coverage.len() && coverage.iter().all(|id| ids.contains(id))
+    };
+    let overlaps = |node: &PortfolioNodeV1| {
+        node.grant
+            .project_ids
+            .iter()
+            .any(|id| coverage.contains(id))
+    };
+    let recency = |node: &&PortfolioNodeV1| (node.updated_at, node.grant.grant_version);
+    let revoked_roots = || {
+        nodes
+            .iter()
+            .filter(|node| node.state == "revoked" && node.parent_node_id.is_none())
+    };
+    let (source, exact_coverage) = match revoked_roots().filter(|n| same(n)).max_by_key(recency) {
+        Some(node) => (node, true),
+        None => (
+            revoked_roots()
+                .filter(|n| overlaps(n))
+                .max_by_key(recency)?,
+            false,
+        ),
+    };
+    Some(PortfolioGrantPrefillV1 {
+        source_node_id: source.node_id,
+        source_tier_label: source.tier_label.clone(),
+        source_grant_version: source.grant.grant_version,
+        exact_coverage,
+        allowed_launches: source.grant.allowed_launches.clone(),
+        policy: source.grant.project_policy.clone(),
+        child_policy: source.child_policy.clone(),
+        max_direct_reports: source.max_direct_reports,
+    })
+}
+
 impl ConfigurePortfolioNodeRequestV1 {
     /// # Errors
     /// A stable refusal code.
@@ -438,6 +619,204 @@ mod tests {
             expected_authority_epoch: 0,
             idempotency_key: "k".into(),
         }
+    }
+
+    fn node(
+        projects: &[Uuid],
+        state: &str,
+        parent: Option<Uuid>,
+        version: i64,
+        age_minutes: i64,
+        active_cap: u16,
+    ) -> PortfolioNodeV1 {
+        let at = chrono::DateTime::<Utc>::from_timestamp(1_800_000_000 + age_minutes * 60, 0)
+            .expect("timestamp");
+        let mut policy = ManagerPolicyV2::default();
+        policy.max_active_sessions = active_cap;
+        PortfolioNodeV1 {
+            node_id: Uuid::new_v4(),
+            tier_label: "global".into(),
+            state: state.into(),
+            authority_epoch: 1,
+            parent_node_id: parent,
+            grantor: "operator".into(),
+            seat_root_session_id: Uuid::new_v4(),
+            max_direct_reports: 9,
+            child_policy: None,
+            grant: GlobalManagerGrantV1 {
+                grant_id: Uuid::new_v4(),
+                grant_version: version,
+                seat_session_id: Uuid::new_v4(),
+                state: state.into(),
+                project_ids: projects.to_vec(),
+                allowed_launches: request().allowed_launches,
+                project_policy: policy,
+                operator_origin: "test".into(),
+                created_at: at,
+                updated_at: at,
+            },
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    fn fable() -> ManagerLaunchChoiceV2 {
+        ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Claude,
+            model: "claude-fable-5-1".into(),
+            effort: Some("max".into()),
+        }
+    }
+
+    fn launches_edit(
+        add: Vec<ManagerLaunchChoiceV2>,
+        remove: Vec<ManagerLaunchChoiceV2>,
+        version: i64,
+    ) -> ConfigurePortfolioNodeLaunchesRequestV1 {
+        ConfigurePortfolioNodeLaunchesRequestV1 {
+            node_id: Uuid::new_v4(),
+            add,
+            remove,
+            expected_node_grant_version: version,
+            idempotency_key: "edit".into(),
+        }
+    }
+
+    #[test]
+    fn launch_edit_adds_one_launch_and_keeps_every_other_field() {
+        let node = node(&[Uuid::new_v4()], "active", None, 13, 1, 7);
+        let full = launches_edit(vec![fable()], Vec::new(), 13)
+            .apply_to(&node)
+            .expect("applies");
+        let mut expected_launches = node.grant.allowed_launches.clone();
+        expected_launches.push(fable());
+        assert_eq!(full.allowed_launches, expected_launches);
+        assert_eq!(full.node_id, Some(node.node_id));
+        assert_eq!(full.seat_session_id, node.grant.seat_session_id);
+        assert_eq!(full.project_ids, node.grant.project_ids);
+        assert_eq!(full.policy, node.grant.project_policy);
+        assert_eq!(full.max_direct_reports, node.max_direct_reports);
+        assert_eq!(full.expected_node_grant_version, 13);
+        assert_eq!(full.expected_authority_epoch, node.authority_epoch);
+        assert_eq!(full.idempotency_key, "edit");
+        full.validate().expect("the derived request is valid");
+    }
+
+    #[test]
+    fn launch_edit_extends_a_restricting_policy_list_and_is_idempotent_on_repeat() {
+        let mut node = node(&[Uuid::new_v4()], "active", None, 2, 1, 7);
+        node.grant.project_policy.allowed_launches = node.grant.allowed_launches.clone();
+        let once = launches_edit(vec![fable()], Vec::new(), 2)
+            .apply_to(&node)
+            .expect("applies");
+        assert!(once.policy.allowed_launches.contains(&fable()));
+        node.grant.allowed_launches = once.allowed_launches.clone();
+        node.grant.project_policy = once.policy.clone();
+        node.grant.grant_version = 3;
+        let twice = launches_edit(vec![fable()], Vec::new(), 3)
+            .apply_to(&node)
+            .expect("applies");
+        assert_eq!(twice.allowed_launches, once.allowed_launches);
+        assert_eq!(twice.policy, once.policy);
+    }
+
+    #[test]
+    fn launch_edit_removes_from_grant_policy_and_child_policy() {
+        let mut node = node(&[Uuid::new_v4()], "active", None, 4, 1, 7);
+        node.grant.allowed_launches.push(fable());
+        node.grant.project_policy.allowed_launches = node.grant.allowed_launches.clone();
+        let mut child = ManagerPolicyV2::default();
+        child.allowed_launches = vec![fable(), node.grant.allowed_launches[0].clone()];
+        node.child_policy = Some(child);
+        let full = launches_edit(Vec::new(), vec![fable()], 4)
+            .apply_to(&node)
+            .expect("applies");
+        assert!(!full.allowed_launches.contains(&fable()));
+        assert!(!full.policy.allowed_launches.contains(&fable()));
+        let child = full.child_policy.expect("child policy kept");
+        assert_eq!(
+            child.allowed_launches,
+            vec![node.grant.allowed_launches[0].clone()]
+        );
+    }
+
+    #[test]
+    fn launch_edit_refuses_a_stale_version_an_empty_result_and_a_bad_edit() {
+        let node = node(&[Uuid::new_v4()], "active", None, 5, 1, 7);
+        assert_eq!(
+            launches_edit(vec![fable()], Vec::new(), 4).apply_to(&node),
+            Err(MANAGER_NODE_STALE)
+        );
+        let only = node.grant.allowed_launches.clone();
+        assert_eq!(
+            launches_edit(Vec::new(), only, 5).apply_to(&node),
+            Err(PORTFOLIO_INVALID_REQUEST)
+        );
+        assert_eq!(
+            launches_edit(Vec::new(), Vec::new(), 5).validate(),
+            Err(PORTFOLIO_INVALID_REQUEST)
+        );
+        assert_eq!(
+            launches_edit(vec![fable()], vec![fable()], 5).validate(),
+            Err(PORTFOLIO_INVALID_REQUEST)
+        );
+        let revoked = self::node(&[Uuid::new_v4()], "revoked", None, 5, 1, 7);
+        assert_eq!(
+            launches_edit(vec![fable()], Vec::new(), 5).apply_to(&revoked),
+            Err(MANAGER_NODE_STALE)
+        );
+    }
+
+    #[test]
+    fn prefill_takes_the_latest_revoked_root_over_the_same_coverage() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let nodes = [
+            node(&[a, b], "revoked", None, 7, 1, 11),
+            node(&[a, b], "revoked", None, 8, 5, 20),
+            node(&[a, b], "active", None, 1, 9, 3),
+            node(&[a, b], "revoked", Some(Uuid::new_v4()), 2, 9, 4),
+            node(&[c], "revoked", None, 3, 9, 5),
+        ];
+        let prefill = prefill_from_revoked_root(&nodes, &[b, a]).expect("prefill");
+        assert_eq!(prefill.source_grant_version, 8);
+        assert_eq!(prefill.policy.max_active_sessions, 20);
+        assert_eq!(prefill.max_direct_reports, 9);
+        assert!(prefill.exact_coverage);
+    }
+
+    #[test]
+    fn prefill_falls_back_to_overlap_and_then_to_defaults() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let nodes = [
+            node(&[a, b], "revoked", None, 8, 5, 20),
+            node(&[c], "revoked", None, 9, 9, 30),
+        ];
+        let overlap = prefill_from_revoked_root(&nodes, &[a]).expect("overlap");
+        assert_eq!(
+            (overlap.source_grant_version, overlap.exact_coverage),
+            (8, false)
+        );
+        assert_eq!(prefill_from_revoked_root(&nodes, &[Uuid::new_v4()]), None);
+        assert_eq!(prefill_from_revoked_root(&[], &[a]), None);
+    }
+
+    #[test]
+    fn portfolio_grant_accepts_64_launches_and_refuses_65() {
+        let mut request = request();
+        request.allowed_launches = (0..64)
+            .map(|i| ManagerLaunchChoiceV2 {
+                provider: SessionProvider::Claude,
+                model: format!("model-{i}"),
+                effort: None,
+            })
+            .collect();
+        assert_eq!(request.validate(), Ok(()));
+        request.allowed_launches.push(ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Claude,
+            model: "model-64".into(),
+            effort: None,
+        });
+        assert_eq!(request.validate(), Err(PORTFOLIO_INVALID_REQUEST));
     }
 
     #[test]

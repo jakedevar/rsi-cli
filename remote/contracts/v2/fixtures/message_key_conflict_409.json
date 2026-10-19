@@ -1,0 +1,24 @@
+{
+  "name": "message_key_conflict_409",
+  "request": {
+    "body": {
+      "idempotency_key": "550e8400-e29b-41d4-a716-446655440009",
+      "text": "please prioritize the migration, tell nobody secret-token-text"
+    },
+    "headers": {
+      "content-type": "application/json",
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>",
+      "x-rsi-csrf": "<csrf token>"
+    },
+    "method": "POST",
+    "path": "/api/v2/projects/550e8400-e29b-41d4-a716-446655440000/managers/550e8400-e29b-41d4-a716-446655440001/messages"
+  },
+  "response": {
+    "body": {
+      "error": "idempotency_conflict"
+    },
+    "retry_after": null,
+    "status": 409
+  }
+}

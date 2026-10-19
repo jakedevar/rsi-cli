@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Authorized fallback only: prefer AgentSubmitJob when it represents the lane.
+set -euo pipefail
+
+usage() {
+    echo 'usage: scripts/systemd-test-fallback UNIT LOG EXIT -- COMMAND [ARG ...]' >&2
+    exit 2
+}
+
+[[ $# -ge 5 ]] || usage
+execute=false
+if [[ $1 == --execute ]]; then
+    execute=true
+    shift
+else
+    unit=$1
+    shift
+    [[ $unit =~ ^rsi-test-fallback-[a-zA-Z0-9_-]+$ ]] || usage
+fi
+log_path=$1
+exit_path=$2
+shift 2
+[[ $1 == -- ]] || usage
+shift
+[[ $# -gt 0 && $log_path == /* && $exit_path == /* && $log_path != "$exit_path" ]] || usage
+
+if "$execute"; then
+    # This script runs inside the unit. Bash, rather than systemd's command-line
+    # expansion, owns PIPESTATUS and the numeric completion record (#1717).
+    set +e
+    "$@" 2>&1 | tee "$log_path"
+    statuses=("${PIPESTATUS[@]}")
+    result=${statuses[0]}
+    if ((result == 0 && statuses[1] != 0)); then
+        result=${statuses[1]}
+    fi
+    printf '%s\n' "$result" >"$exit_path.tmp"
+    mv -- "$exit_path.tmp" "$exit_path"
+    exit "$result"
+fi
+
+[[ $(uname -s) == Linux ]] || {
+    echo 'systemd test fallback requires Linux; use a supported daemon job on this platform' >&2
+    exit 2
+}
+command -v systemd-run >/dev/null || {
+    echo 'systemd-run is unavailable; use a supported daemon job' >&2
+    exit 2
+}
+mkdir -p -- "$(dirname -- "$log_path")" "$(dirname -- "$exit_path")"
+rm -f -- "$exit_path" "$exit_path.tmp"
+script_path=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
+
+# Forward build knobs only. Session authority and credentials stay outside the
+# systemd unit's environment, just as they do for scripts/scoped-test.
+environment=()
+for name in PATH CARGO_TARGET_DIR CARGO_BUILD_JOBS RUSTUP_TOOLCHAIN RUSTFLAGS \
+    CARGO_ENCODED_RUSTFLAGS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG RUSTC_WRAPPER \
+    RSI_BUILD_SLOTS RSI_BUILD_SLOT_ROOT RSI_BUILD_SCCACHE RUST_TEST_THREADS \
+    NEXTEST_TEST_THREADS TMPDIR TMP TEMP RUST_BACKTRACE; do
+    if [[ -v $name ]]; then
+        environment+=("--setenv=$name")
+    fi
+done
+
+# #2119: like every RSI cargo build and test unit, run in the hub's shared build
+# slice (RSI_BUILD_SLICE overrides the name; empty runs outside it).
+slice_args=()
+build_slice=${RSI_BUILD_SLICE-rsi-build.slice}
+if [[ -n $build_slice ]]; then
+    slice_args=("--slice=$build_slice")
+fi
+
+exec systemd-run --user --collect --expand-environment=no "${slice_args[@]}" \
+    "--unit=$unit" "--working-directory=$PWD" \
+    -p RuntimeMaxSec=1500 -p CPUQuota=200% -p TimeoutStopSec=2 \
+    -p KillMode=control-group "${environment[@]}" \
+    /bin/bash "$script_path" --execute "$log_path" "$exit_path" -- "$@"

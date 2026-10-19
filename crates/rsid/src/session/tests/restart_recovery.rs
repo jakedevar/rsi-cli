@@ -124,3 +124,147 @@ async fn restart_recovery_refusals_record_andon_and_owner_watch_reason_once() {
         }
     }
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn restart_recovery_queues_one_manager_resume_notice_unless_one_already_exists() {
+    let (manager, dir) = manager();
+    let project = Uuid::new_v4();
+    let manager_id = Uuid::new_v4();
+    let stamp = chrono::Utc::now();
+    manager
+        .store
+        .lock()
+        .await
+        .insert_project(&rsi_common::types::Project {
+            id: project,
+            name: "Restart recovery test".into(),
+            path: None,
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: stamp,
+            updated_at: stamp,
+        })
+        .unwrap();
+    let mut seat = bare_session(manager_id);
+    seat.project_id = Some(project);
+    seat.status = SessionStatus::Completed;
+    seat.working_dir = dir.path().to_path_buf();
+    insert_row(&manager, &seat).await;
+    {
+        let store = manager.store.lock().await;
+        store.conn.execute(
+            "INSERT INTO harness_manager_scopes
+             (project_id,manager_session_id,epic_ids_json,row_version,updated_at,scope_mode,group_ids_json)
+             VALUES(?1,?2,'[]',1,?3,'project','[]')",
+            rusqlite::params![
+                project.to_string(),
+                manager_id.to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        ).unwrap();
+    }
+
+    let mut worker = bare_session(Uuid::new_v4());
+    worker.project_id = Some(project);
+    worker.status = SessionStatus::Interrupted;
+    worker.issue_identifier = Some("RSI-1932".into());
+    insert_row(&manager, &worker).await;
+    // Existing terminal mail watches must not suppress the restart wake.
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&mk_watch_job_for(
+            worker.id,
+            manager_id,
+            "worker terminal mail",
+        ))
+        .unwrap();
+
+    manager
+        .queue_restart_recovery_manager_wakes(vec![worker.id])
+        .await
+        .unwrap();
+    manager
+        .queue_restart_recovery_manager_wakes(vec![worker.id])
+        .await
+        .unwrap();
+    {
+        let store = manager.store.lock().await;
+        let mut stmt = store.conn.prepare(
+            "SELECT message FROM scheduled_jobs WHERE wake_session_id=?1 AND wake_mode='resume' AND enabled=1",
+        ).unwrap();
+        let messages = stmt
+            .query_map([manager_id.to_string()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains(&worker.id.to_string()));
+        assert!(messages[0].contains("RSI-1932"));
+        assert!(messages[0].contains("Interrupted"));
+    }
+
+    let second_project = Uuid::new_v4();
+    let second_manager_id = Uuid::new_v4();
+    manager
+        .store
+        .lock()
+        .await
+        .insert_project(&rsi_common::types::Project {
+            id: second_project,
+            name: "Existing resume test".into(),
+            path: None,
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: stamp,
+            updated_at: stamp,
+        })
+        .unwrap();
+    let mut second_seat = bare_session(second_manager_id);
+    second_seat.project_id = Some(second_project);
+    second_seat.status = SessionStatus::Completed;
+    second_seat.working_dir = dir.path().to_path_buf();
+    insert_row(&manager, &second_seat).await;
+    manager.store.lock().await.conn.execute(
+        "INSERT INTO harness_manager_scopes
+         (project_id,manager_session_id,epic_ids_json,row_version,updated_at,scope_mode,group_ids_json)
+         VALUES(?1,?2,'[]',1,?3,'project','[]')",
+        rusqlite::params![
+            second_project.to_string(),
+            second_manager_id.to_string(),
+            chrono::Utc::now().to_rfc3339()
+        ],
+    ).unwrap();
+    let mut second_worker = worker.clone();
+    second_worker.id = Uuid::new_v4();
+    second_worker.project_id = Some(second_project);
+    insert_row(&manager, &second_worker).await;
+
+    let mut existing = mk_watch_job_for(second_worker.id, second_manager_id, "existing resume");
+    existing.wake_mode = rsi_common::types::WakeMode::Resume;
+    existing.wake_session_id = Some(second_manager_id);
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&existing)
+        .unwrap();
+    manager
+        .queue_restart_recovery_manager_wakes(vec![second_worker.id])
+        .await
+        .unwrap();
+    let store = manager.store.lock().await;
+    let count: i64 = store.conn.query_row(
+        "SELECT count(*) FROM scheduled_jobs WHERE wake_session_id=?1 AND wake_mode='resume' AND enabled=1",
+        [second_manager_id.to_string()],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        count, 1,
+        "the existing resume wake suppresses a recovery wake"
+    );
+}

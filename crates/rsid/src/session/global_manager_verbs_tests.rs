@@ -13,6 +13,10 @@ use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
 use rsi_common::harness_manager_v2::{
     ManagerCapabilityV2, ManagerLaunchChoiceV2, ManagerOperatingModeV2, ManagerPolicyV2,
 };
+use rsi_common::manager_budget::{
+    BudgetCapFieldV1, BudgetNodeKindV1, CreationCapRefusalV1, GlobalManagerBudgetV1,
+    raise_portfolio_request,
+};
 use rsi_common::types::{Project, SessionKind, SessionProvider, SessionStatus, WakeMode};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -368,7 +372,7 @@ async fn appoint_launches_appoints_and_saves_a_live_policy_and_replays() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn appointments_obey_the_grantors_resource_gates_before_any_launch() {
-    let (_control, store) = control_handle_with_store();
+    let (control, store) = control_handle_with_store();
     let p = portfolio(&store).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let regrant = |key: &str, edit: fn(&mut ManagerPolicyV2)| {
@@ -416,7 +420,7 @@ async fn appointments_obey_the_grantors_resource_gates_before_any_launch() {
     .unwrap_err();
     assert_eq!(code(error), "manager_v2_policy_paused");
     let child = AgentManagerAppointChildRequestV1::from(&appoint_request(p.b, "pm-b-paused"));
-    let error = appoint_child_with(&store, p.seat, &child, |session_id, project| {
+    let error = appoint_child_with(&store, p.seat, &child, |session_id, project, _| {
         launcher(&store, project, &calls)(session_id)
     })
     .await
@@ -444,13 +448,161 @@ async fn appointments_obey_the_grantors_resource_gates_before_any_launch() {
     )
     .await
     .unwrap_err();
-    assert_eq!(code(error), "manager_v2_creation_limit");
+    let message = code(error);
+    assert!(
+        message.starts_with("manager_v2_creation_limit: node_kind=portfolio"),
+        "{message}"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "the refusal launched nothing"
     );
     assert_eq!(appointments(&*store.lock().await), 1);
+
+    // #2502: the refusal names the GM node's created-sessions cap, the
+    // Budget panel shows that cap binding in project B, and one `+` step
+    // through the operator's ConfigurePortfolioNode edits the GM node grant
+    // (read back through AgentManagerOverview and the panel).
+    let detail = CreationCapRefusalV1::parse(&message).expect("typed refusal detail");
+    let node = store.lock().await.global_shim_node().unwrap().unwrap();
+    assert_eq!(detail.node_id, node);
+    assert_eq!((detail.used, detail.limit), (1, 1));
+    let created = |budget: &GlobalManagerBudgetV1| {
+        let project = budget
+            .projects
+            .iter()
+            .find(|project| project.project_id == p.b)
+            .unwrap();
+        let gm = &project.chain[0];
+        assert_eq!((gm.kind, gm.node_id), (BudgetNodeKindV1::Portfolio, node));
+        gm.cap(BudgetCapFieldV1::CreatedSessions).unwrap().clone()
+    };
+    let before = created(&store.lock().await.global_manager_budget(None).unwrap());
+    assert_eq!(
+        (before.used, before.limit, before.binding),
+        (1.0, Some(1.0), true)
+    );
+    {
+        let guard = store.lock().await;
+        let current = guard.get_portfolio_node(node).unwrap().unwrap();
+        let step = BudgetCapFieldV1::CreatedSessions.step();
+        let request = raise_portfolio_request(
+            &current,
+            BudgetCapFieldV1::CreatedSessions,
+            before.limit.unwrap() + step,
+            "budget-raise".into(),
+        );
+        guard
+            .configure_portfolio_node_confirmed(
+                &request,
+                crate::store::portfolio_nodes::PortfolioGrantor::Operator,
+                "operator:test",
+                true,
+            )
+            .unwrap();
+    }
+    let overview = control
+        .agent_manager_overview(p.seat, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        overview.grant.unwrap().project_policy.max_created_sessions,
+        33
+    );
+    // An operator edit opens a new grant epoch, so the node's count starts
+    // again from that grant (the panel says so).
+    let budget = store.lock().await.global_manager_budget(None).unwrap();
+    let after = created(&budget);
+    assert_eq!((after.used, after.limit), (0.0, Some(33.0)));
+    assert!(
+        budget.resets.contains("starts a new count"),
+        "{}",
+        budget.resets
+    );
+    global_appoint_manager_with(
+        &store,
+        p.seat,
+        &appoint_request(p.b, "gm-b-after-raise"),
+        launcher(&store, p.b, &calls),
+    )
+    .await
+    .unwrap();
+    // #2518: the new count restarts creations only. Spend already charged
+    // to work the node still covers (a worker below a covered Epic) is not
+    // reset by the edit, and the panel's statement says so.
+    let spend = |budget: &GlobalManagerBudgetV1| {
+        let gm = &budget
+            .projects
+            .iter()
+            .find(|project| project.project_id == p.b)
+            .unwrap()
+            .chain[0];
+        gm.cap(BudgetCapFieldV1::SpendUsd).unwrap().clone()
+    };
+    assert!(
+        budget.resets.contains("spend is NOT reset"),
+        "{}",
+        budget.resets
+    );
+    {
+        let guard = store.lock().await;
+        let group = Uuid::new_v4();
+        let epic = Uuid::new_v4();
+        let worker = Uuid::new_v4();
+        for (id, kind, parent) in [
+            (group, SessionKind::Group, None),
+            (epic, SessionKind::Epic, Some(group)),
+            (worker, SessionKind::Task, Some(epic)),
+        ] {
+            let mut row = test_session(id, PathBuf::from("/tmp/global-manager"));
+            row.project_id = Some(p.b);
+            row.session_kind = kind;
+            row.parent_id = parent;
+            row.status = SessionStatus::Running;
+            guard.insert_session(&row).unwrap();
+        }
+        let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        guard
+            .conn
+            .execute(
+                "INSERT INTO model_invocations(id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,dedup_key,policy_snapshot_json,usage_confidence,estimated_cost_usd,created_at,completed_at)
+                 VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable','admitted','completed','budget-spend-test',?2,?3,'{}','exact',20.0,?4,?4)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    worker.to_string(),
+                    format!("budget-spend:{worker}"),
+                    stamp,
+                ],
+            )
+            .unwrap();
+    }
+    let spend_before = spend(&store.lock().await.global_manager_budget(None).unwrap());
+    assert_eq!(spend_before.used, 20.0, "the worker's $20 is charged");
+    {
+        let guard = store.lock().await;
+        let current = guard.get_portfolio_node(node).unwrap().unwrap();
+        let request = raise_portfolio_request(
+            &current,
+            BudgetCapFieldV1::SpendUsd,
+            500.0,
+            "budget-spend-raise".into(),
+        );
+        guard
+            .configure_portfolio_node_confirmed(
+                &request,
+                crate::store::portfolio_nodes::PortfolioGrantor::Operator,
+                "operator:test",
+                true,
+            )
+            .unwrap();
+    }
+    let spend_after = spend(&store.lock().await.global_manager_budget(None).unwrap());
+    assert_eq!(spend_after.limit, Some(500.0));
+    assert_eq!(
+        spend_after.used, 20.0,
+        "an operator grant edit does not reset historical spend"
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -654,6 +806,109 @@ async fn portfolio_terminal_watch_arms_on_operator_pm_and_fires_on_terminal() {
         .await
         .update_session_status(p.pm_a, SessionStatus::Completed)
         .unwrap();
+    // #1755 / #1588 residual: this is only a turn end when the PM still
+    // holds child watches. Reproduce the five enabled watches in the Issue.
+    let mut child_watches = Vec::new();
+    {
+        let guard = store.lock().await;
+        for _ in 0..5 {
+            let child = add_session(&guard, Uuid::new_v4(), Some(p.a));
+            let mut watch = job.clone();
+            watch.id = Uuid::new_v4();
+            watch.name = format!("agent-child-{child}");
+            watch.wake_mode = WakeMode::OnTerminal(child);
+            watch.wake_session_id = Some(p.pm_a);
+            guard.insert_scheduled_job(&watch).unwrap();
+            child_watches.push(watch.id);
+        }
+    }
+    assert_eq!(
+        manager.plan_terminal_watch_fire(&job).await.unwrap(),
+        WatchFirePlan::NotReady,
+        "a PM turn end with live child watches leaves the portfolio watch armed"
+    );
+    // A sibling PM's actual completion cannot coalesce this interim PM.
+    let sibling = {
+        let guard = store.lock().await;
+        add_session(&guard, Uuid::new_v4(), Some(p.b))
+    };
+    {
+        let guard = store.lock().await;
+        appoint(&guard, p.b, sibling);
+        guard
+            .update_session_status(sibling, SessionStatus::Completed)
+            .unwrap();
+        let mut sibling_watch = job.clone();
+        sibling_watch.id = Uuid::new_v4();
+        sibling_watch.wake_mode = WakeMode::OnTerminal(sibling);
+        guard.insert_scheduled_job(&sibling_watch).unwrap();
+        child_watches.push(sibling_watch.id);
+    }
+    let sibling_watch = store
+        .lock()
+        .await
+        .get_scheduled_job(child_watches.last().unwrap())
+        .unwrap()
+        .unwrap();
+    let WatchFirePlan::Deliver { job_ids, .. } = manager
+        .plan_terminal_watch_fire(&sibling_watch)
+        .await
+        .unwrap()
+    else {
+        panic!("completed sibling PM should deliver");
+    };
+    assert_eq!(job_ids, vec![sibling_watch.id]);
+    for status in [SessionStatus::Failed, SessionStatus::Interrupted] {
+        store
+            .lock()
+            .await
+            .update_session_status(p.pm_a, status)
+            .unwrap();
+        assert!(
+            matches!(
+                manager.plan_terminal_watch_fire(&job).await.unwrap(),
+                WatchFirePlan::Deliver { .. }
+            ),
+            "a {status:?} PM must notify even with enabled child watches"
+        );
+    }
+    {
+        let guard = store.lock().await;
+        guard
+            .update_session_status(p.pm_a, SessionStatus::Completed)
+            .unwrap();
+        for watch in child_watches {
+            assert!(!guard.toggle_scheduled_job(&watch).unwrap());
+        }
+    }
+    // An enabled resume wake also makes a Completed PM turn interim.
+    let mut resume = job.clone();
+    resume.id = Uuid::new_v4();
+    resume.wake_mode = WakeMode::Resume;
+    resume.wake_session_id = Some(p.pm_a);
+    store.lock().await.insert_scheduled_job(&resume).unwrap();
+    assert_eq!(
+        manager.plan_terminal_watch_fire(&job).await.unwrap(),
+        WatchFirePlan::NotReady
+    );
+    assert!(!store.lock().await.toggle_scheduled_job(&resume.id).unwrap());
+    // Live direct children hold even without a watch; terminal children
+    // release the hold. Unrelated workers in the same project do not hold it.
+    let child = {
+        let guard = store.lock().await;
+        let child = add_session(&guard, Uuid::new_v4(), Some(p.a));
+        guard.update_session_parent(child, Some(p.pm_a)).unwrap();
+        child
+    };
+    assert_eq!(
+        manager.plan_terminal_watch_fire(&job).await.unwrap(),
+        WatchFirePlan::NotReady
+    );
+    store
+        .lock()
+        .await
+        .update_session_status(child, SessionStatus::Completed)
+        .unwrap();
     match manager.plan_terminal_watch_fire(&job).await.unwrap() {
         WatchFirePlan::Deliver {
             tip,
@@ -668,6 +923,140 @@ async fn portfolio_terminal_watch_arms_on_operator_pm_and_fires_on_terminal() {
         }
         other => panic!("terminal PM must deliver its watch: {other:?}"),
     }
+}
+
+/// #2560: a parent's watch is on the slot. Three routine PM handovers wake
+/// the parent zero times, the watch following the live seat; the PM then
+/// ending Interrupted with no successor wakes it exactly once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn three_pm_rotations_wake_the_portfolio_seat_zero_times_2560() {
+    use crate::session::harness::tools::HarnessTool;
+
+    let dir = crate::test_support::disk_backed_tempdir("portfolio-slot-watch-");
+    let manager = SessionManager::new(
+        Arc::new(crate::bus::EventBus::new(16)),
+        Store::open_in_memory().unwrap(),
+        false,
+        dir.path().join("daemon.sock"),
+        None,
+        Vec::new(),
+        crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env()),
+        dir.path().join("sandboxes"),
+    )
+    .unwrap();
+    let store = manager.store();
+    let p = portfolio(store).await;
+    let control = manager.agent_control();
+    let tool = portfolio_watch_tool(&control, p.seat);
+    let result = tool.execute(portfolio_watch_args(p.pm_a), dir.path()).await;
+    assert!(result.success, "{:?}", result.error_msg);
+    let watch_id = store
+        .lock()
+        .await
+        .list_scheduled_jobs()
+        .unwrap()
+        .remove(0)
+        .id;
+
+    let mut seat = p.pm_a;
+    let mut woken = 0;
+    for hop in 0..3 {
+        let job = store
+            .lock()
+            .await
+            .get_scheduled_job(&watch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.wake_mode, WakeMode::OnTerminal(seat));
+        // The seat ends its turn Completed, mid-handover: no wake.
+        {
+            let guard = store.lock().await;
+            guard
+                .update_session_status(seat, SessionStatus::Completed)
+                .unwrap();
+            guard
+                .insert_rotation_event(seat, &format!("r{hop}"), "writing_handoff", "entered", None)
+                .unwrap();
+        }
+        if !matches!(
+            manager.plan_terminal_watch_fire(&job).await.unwrap(),
+            WatchFirePlan::NotReady
+        ) {
+            woken += 1;
+        }
+        // The successor is published; the same watch now watches it.
+        let next = {
+            let guard = store.lock().await;
+            let next = add_session(&guard, Uuid::new_v4(), Some(p.a));
+            let depth = guard.get_session(seat).unwrap().unwrap().rotation_depth;
+            guard
+                .conn
+                .execute(
+                    "UPDATE sessions SET continued_from=?2, rotation_depth=?3 WHERE id=?1",
+                    rusqlite::params![next.to_string(), seat.to_string(), depth + 1],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE sessions SET status='Archived' WHERE id=?1",
+                    [seat.to_string()],
+                )
+                .unwrap();
+            assert!(guard.record_harness_manager_rotation(seat, next).unwrap());
+            guard
+                .insert_rotation_event(seat, &format!("r{hop}"), "completed", "completed", None)
+                .unwrap();
+            next
+        };
+        let job = store
+            .lock()
+            .await
+            .get_scheduled_job(&watch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.wake_mode, WakeMode::OnTerminal(next));
+        if !matches!(
+            manager.plan_terminal_watch_fire(&job).await.unwrap(),
+            WatchFirePlan::NotReady
+        ) {
+            woken += 1;
+        }
+        seat = next;
+    }
+    assert_eq!(woken, 0, "routine succession is silent");
+    assert_eq!(
+        store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .iter()
+            .filter(|job| job.enabled && matches!(job.wake_mode, WakeMode::OnTerminal(_)))
+            .count(),
+        1,
+        "one watch for the slot"
+    );
+    // The retired first seat stays readable by the portfolio seat.
+    assert!(control.agent_get_status(p.seat, p.pm_a).await.is_ok());
+
+    // The last seat ends Interrupted with no successor: exactly one wake.
+    store
+        .lock()
+        .await
+        .update_session_status(seat, SessionStatus::Interrupted)
+        .unwrap();
+    let job = store
+        .lock()
+        .await
+        .get_scheduled_job(&watch_id)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        manager.plan_terminal_watch_fire(&job).await.unwrap(),
+        WatchFirePlan::Deliver { .. }
+    ));
 }
 
 fn portfolio_watch_tool(
@@ -892,6 +1281,7 @@ fn child_request(projects: &[Uuid], level: u16, key: &str) -> AgentManagerAppoin
         query: "You manage your projects.".into(),
         idempotency_key: key.into(),
         sandbox: Some(false),
+        handoff: None,
     }
 }
 
@@ -900,10 +1290,16 @@ fn child_request(projects: &[Uuid], level: u16, key: &str) -> AgentManagerAppoin
 fn child_launcher(
     store: &SharedStore,
     calls: &Arc<AtomicUsize>,
-) -> impl FnOnce(Uuid, Uuid) -> std::pin::Pin<Box<dyn Future<Output = Result<Uuid>> + Send>> {
+) -> impl FnOnce(
+    Uuid,
+    Uuid,
+    ChildAppointment,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<Uuid>> + Send>> {
     let store = Arc::clone(store);
     let calls = Arc::clone(calls);
-    move |session_id, project| {
+    move |session_id, project, appointment| {
+        assert_eq!(appointment.session_id, session_id);
+        assert_eq!(appointment.launch_project_id, project);
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
             add_session(&*store.lock().await, session_id, Some(project));
@@ -922,9 +1318,20 @@ async fn appoint_child_launches_a_narrower_child_node_and_replays() {
     let (seat, [_a, b, c]) = delegating_global(&store).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let request = child_request(&[b, c], 1, "child-bc");
-    let first = appoint_child_with(&store, seat, &request, child_launcher(&store, &calls))
-        .await
-        .unwrap();
+    let first = appoint_child_with(
+        &store,
+        seat,
+        &request,
+        |session_id, project, appointment| {
+            assert!(
+                !appointment.replayed,
+                "launcher receives the original admission"
+            );
+            child_launcher(&store, &calls)(session_id, project, appointment)
+        },
+    )
+    .await
+    .unwrap();
     assert!(!first.deduplicated);
     let node_id = first.node_id.expect("a child node");
     assert_eq!(first.target_ref, format!("portfolio:{node_id}"));
@@ -1393,4 +1800,168 @@ async fn workspace_seat_lists_its_rotation_lineage_bounded() {
     );
     assert!(seat.predecessors_truncated);
     assert_eq!(seat.predecessors[0].status, SessionStatus::Completed);
+}
+
+/// A parent and a PM must observe the same measured Codex live tip after rotation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn rotated_codex_pm_budget_and_fill_match_parent_catalog_and_operator() {
+    use crate::config::{Config, RuntimeConfig};
+    use rsi_common::manager_node_workspace::AgentManagerOverviewRequestV1;
+    use rsi_common::{
+        CapabilityConfidence, CapabilityEvidence, CapabilitySource, ContextCapacity,
+        ResolvedContextBudget,
+    };
+    let (control, store) = control_handle_with_store();
+    let runtime = RuntimeConfig::from_config(&Config::default());
+    runtime
+        .update_field("context_rotation_enabled", &serde_json::json!(true))
+        .unwrap();
+    runtime
+        .update_field("coordinator_context_cap_tokens", &serde_json::json!(40))
+        .unwrap();
+    runtime
+        .update_field("context_rotation_global_pct", &serde_json::json!(53))
+        .unwrap();
+    let control = control.with_runtime_config(runtime.clone());
+    let p = portfolio(&store).await;
+    {
+        let guard = store.lock().await;
+        let mut predecessor = guard.get_session(p.pm_a).unwrap().unwrap();
+        predecessor.provider = SessionProvider::Claude;
+        predecessor.model = Some("claude-opus-5-5".into());
+        guard
+            .conn
+            .execute(
+                "UPDATE sessions SET provider='Claude' WHERE id=?1",
+                [p.pm_a.to_string()],
+            )
+            .unwrap();
+        predecessor.context_window = Some(1_000_000);
+        let mut evidence = CapabilityEvidence::legacy_unverified();
+        evidence.source = CapabilitySource::RuntimeTelemetry;
+        evidence.confidence = CapabilityConfidence::Authoritative;
+        predecessor.resolved_context_budget =
+            Some(ResolvedContextBudget::new(1_000_000, Default::default(), evidence).unwrap());
+        guard.update_session_metadata(&predecessor).unwrap();
+    }
+    let prior = control
+        .agent_manager_overview(p.pm_a, Default::default())
+        .await
+        .unwrap()
+        .seat
+        .unwrap()
+        .coordinator_budget
+        .unwrap();
+    assert_eq!(prior.provider, SessionProvider::Claude);
+    assert_eq!(prior.effective_tokens, Some(400_000));
+    let tip = Uuid::new_v4();
+    {
+        let guard = store.lock().await;
+        let mut row = test_session(tip, PathBuf::from("/tmp/codex-budget"));
+        row.status = SessionStatus::Running;
+        row.session_kind = SessionKind::Standard;
+        row.project_id = Some(p.a);
+        row.continued_from = Some(p.pm_a);
+        row.rotation_depth = guard.get_session(p.pm_a).unwrap().unwrap().rotation_depth + 1;
+        row.provider = SessionProvider::Codex;
+        row.model = Some("gpt-6.1-sol".into());
+        row.input_tokens = Some(100_000);
+        row.context_window = Some(258_400);
+        let mut evidence = CapabilityEvidence::legacy_unverified();
+        evidence.source = CapabilitySource::RuntimeTelemetry;
+        evidence.confidence = CapabilityConfidence::Authoritative;
+        row.resolved_context_budget = Some(
+            ResolvedContextBudget::new(258_400, ContextCapacity::default(), evidence).unwrap(),
+        );
+        guard.insert_session(&row).unwrap();
+        guard
+            .update_session_status(p.pm_a, SessionStatus::Archived)
+            .unwrap();
+        assert!(guard.record_harness_manager_rotation(p.pm_a, tip).unwrap());
+    }
+    let parent = control
+        .agent_manager_overview(p.seat, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let pm = parent
+        .projects
+        .iter()
+        .find(|v| v.overview.project_id == p.a)
+        .unwrap()
+        .overview
+        .manager
+        .as_ref()
+        .unwrap();
+    let own = control
+        .agent_manager_overview(tip, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap()
+        .seat
+        .unwrap();
+    assert_eq!(pm.session_id, tip);
+    assert_eq!(own.session_id, tip);
+    let expected_fill = 100_000.0 * 100.0 / 258_400.0;
+    assert_eq!(pm.context_fill_pct, Some(expected_fill));
+    assert_eq!(own.context_fill_pct, Some(expected_fill));
+    let budget = pm.coordinator_budget.clone().unwrap();
+    assert_eq!(budget.effective_tokens, Some(103_360));
+    assert_eq!(own.coordinator_budget.as_ref(), Some(&budget));
+    let catalog = control
+        .agent_get_authority_catalog(tip, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(catalog.coordinator_budget.as_ref(), Some(&budget));
+    assert!(catalog.guidance.contains(&budget.summary()));
+    let operator = control.coordinator_budgets().await.unwrap();
+    assert_eq!(
+        operator
+            .iter()
+            .find(|s| s.session_id == tip)
+            .unwrap()
+            .budget,
+        budget
+    );
+    // A window/model observation is visible on the next read, without changing policy.
+    {
+        let guard = store.lock().await;
+        let mut row = guard.get_session(tip).unwrap().unwrap();
+        row.model = Some("gpt-6-astra".into());
+        row.context_window = Some(1_000_000);
+        row.resolved_context_budget.as_mut().unwrap().active_tokens = 1_000_000;
+        guard.update_session_metadata(&row).unwrap();
+    }
+    let changed = control
+        .agent_manager_overview(tip, Default::default())
+        .await
+        .unwrap()
+        .seat
+        .unwrap();
+    let changed_budget = changed.coordinator_budget.unwrap();
+    assert_eq!(changed_budget.effective_tokens, Some(400_000));
+    assert_eq!(changed_budget.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(changed.context_fill_pct, Some(10.0));
+    assert_eq!(
+        control
+            .agent_get_authority_catalog(tip, Default::default())
+            .await
+            .unwrap()
+            .coordinator_budget,
+        Some(changed_budget)
+    );
+    {
+        let guard = store.lock().await;
+        let mut unknown = guard.get_session(tip).unwrap().unwrap();
+        unknown.input_tokens = None;
+        unknown.total_input_tokens = Some(2_000_000); // Billing totals cannot establish occupancy.
+        guard.update_session_metadata(&unknown).unwrap();
+    }
+    let unknown = control
+        .agent_manager_overview(tip, Default::default())
+        .await
+        .unwrap()
+        .seat
+        .unwrap();
+    assert_eq!(unknown.context_fill_pct, None);
+    assert_eq!(runtime.to_json()["coordinator_context_cap_tokens"], 40);
 }

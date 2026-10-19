@@ -163,6 +163,18 @@ impl FieldEdit {
         self.cursor += 1;
     }
 
+    /// Paste `pasted` at the cursor, replacing any selection, and leave the
+    /// cursor after the pasted text. Without this a paste (which changes the
+    /// text behind the cursor's back) would append at the end.
+    pub fn paste(&mut self, text: &mut String, pasted: &str) {
+        self.sync(text);
+        self.delete_selection(text);
+        let at = byte_at(text, self.cursor);
+        text.insert_str(at, pasted);
+        self.cursor += char_len(pasted);
+        self.seen.clone_from(text);
+    }
+
     fn move_to(&mut self, target: usize, extend: bool) {
         if extend {
             self.anchor.get_or_insert(self.cursor);

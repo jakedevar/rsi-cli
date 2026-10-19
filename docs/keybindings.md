@@ -209,6 +209,17 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>C` | Change session project | Moves the selected session to another project. |
 | `<Space>r` | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` | Cancel pending retry | Cancels the selected session's pending automatic retry. |
+| `<Space>dt` | Operator to-do panel | Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count. |
+| `<Space>dj` | To-do: next item | Moves the operator to-do cursor to the next item (opens the panel first when it is hidden). |
+| `<Space>dk` | To-do: previous item | Moves the operator to-do cursor to the previous item. |
+| `<Space>do` | To-do: open link | Opens the selected to-do item's linked Issue, session or URL. |
+| `<Space>dd` | To-do: mark done | Marks the selected operator to-do item done after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dx` | To-do: dismiss | Dismisses the selected operator to-do item without doing it after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dy` | To-do: copy command | Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open. |
+| `<Space>dc` | To-do: copy command | Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open. |
+| `<Space>dv` | To-do: open pop-up | Opens the selected operator to-do item in a pop-up with its full title, priority, link and the complete command text, and the yank, done, dismiss and open-link actions. |
+| `<Space>du` | To-do: undo close | Reopens the operator to-do item you just marked done or dismissed, within 60 seconds of the close. |
+| `<Space>da` | To-do: caught up | Clears the new and closed-since-last-visit highlights in the operator to-do panel. |
 | `<Space>x` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 | `<Space>T` | Open in new tab | Opens the selected session in a new tab. |
 | `<Space>gg` | Git panel (lazygit) | Suspends the TUI and runs lazygit in the session's working directory. |
@@ -231,6 +242,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>K` | Scheduled jobs | Opens the scheduled jobs browser. |
 | `<Space>gc` | ESP Square game | Opens the ESP Square guessing game. |
 | `gR` | Run Epic topology | Runs the focused Epic's bound workflow topology. |
+| `<Space>gl` | Land session branch | Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it. |
 | `<Space>G` | Create Group | Creates a top-level Group container. |
 | `<Space>E` | Create Epic | Creates an Epic container under the current Group. |
 | `<Space>gS` | Create Story | Creates a Story leaf under the current Epic. |
@@ -826,6 +838,12 @@ Registry keys of the Issues workspace; some apply only in the tab or mode the ac
 | `[` | Previous Issues tab | Switches to the previous Issues tab. |
 | `]` | Next Issues tab | Switches to the next Issues tab. |
 | `/` | Search local issues | Searches the locally loaded issues. |
+| `#` | Go to issue number | Prompts for an issue number and opens that issue, including closed and archived ones. |
+| `O` | Show only operator requests and decisions | Toggles a filter that keeps only Issues labelled operator-request or operator-decision; press again to show every Issue. |
+| `}` | Next detail item | Moves the inspector cursor to the next folding handoff or review section or related Issue. |
+| `{` | Previous detail item | Moves the inspector cursor to the previous folding section or related Issue. |
+| `o` | Open or fold detail item | Folds or unfolds the section under the inspector cursor, or opens the related Issue under it. |
+| `B` | Back to the previous Issue | Returns to the Issue you followed a related link from. |
 | `f` | Edit filters and saved views | Edits the issue filters and saved views. |
 | `s` | Cycle issue sort | Cycles the issue sort order. |
 | `g` | Start first-page command | First `g` of `gg`: starts the first-page jump. |
@@ -841,6 +859,21 @@ Esc, or the two-second timeout clears an armed `dd`. Esc precedence is dirty
 form warning/discard, confirmation, inspector, then pane restoration. The pane
 renders no static action-hint strip; its help and executor routes come from the
 shared action registry.
+
+**Reading the tracker (#2381):** the Local list keeps the number, state, priority,
+readiness, labels and age in aligned columns and drops the optional ones from the
+right as the terminal narrows (labels at 104 columns, readiness at 84, age at 60,
+priority at 44); a long title is cut with `…`. An Issue labelled `operator-request`
+carries a `◆` marker and one labelled `operator-decision` a `?`, both beside the
+colour, and `O` keeps only those two kinds (press it again to show every Issue).
+The inspector shows the state, priority, readiness, owner and labels first, the
+body as wrapped markdown, `## Handoff` and `## Review` sections folded under their
+own heading, the related Issues (blocked by, blocks and `#N` mentions) and the
+technical ids last. `}` and `{` move its cursor over the folded sections and the
+related Issues, `o` unfolds a section or opens the Issue under the cursor (the
+`#` jump), and `B` returns to the Issue you came from. Every state is a glyph
+and a word, and every colour is a theme role, so the high-contrast theme keeps
+its contrast.
 
 **Scheduled Jobs (`<Space>K`):** `j`/`k` moves, `n` creates, `Enter`/`e` edits, a single `Space` toggles enabled state, `t` triggers now, `r` refreshes, `dd` deletes, `?` opens contextual help, and `q`/`Esc` closes. Help preserves the selected row and an armed first `d`; closing it restores that exact pending state. Selected jobs retain the `> ` cursor and `[+]`/`[-]` enabled glyph. The overlay has no persistent action-hint row.
 
@@ -918,6 +951,7 @@ arguments open that editor on Enter.
 | `:refresh` |  | Refresh navigation | Re-fetches sessions, projects and labels from the daemon. |
 | `:theme [arg]` |  | Choose built-in theme | Opens the built-in theme picker; `:theme <name>` applies a theme directly. |
 | `:issues` |  | Open or focus Issues workspace | Opens the Issues workspace pane for the current project, or focuses it if already open. |
+| `:issue [arg]` |  | Open an issue by number | Opens the Issues workspace on the issue with the given number (`:issue 2377` or `:issue #2377`), including closed and archived issues; without a number it opens the go-to-number prompt. |
 | `:manager policy` |  | Edit manager policy | Opens the harness manager policy editor (operator-owned manager limits and choices). |
 | `:manager board` |  | Open manager board | Opens the harness manager work board. |
 | `:manager decisions` |  | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
@@ -931,6 +965,9 @@ arguments open that editor on Enter.
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `:rotate` | `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
 | `:rotation-abandon [arg]` |  | Abandon blocked rotation | Moves the selected session's blocked rotation to a fresh replacement session that takes the sandbox and the seat; `:rotation-abandon <provider>[/<model>]` picks its launch. Run twice to confirm. |
+| `:manager-reseat [arg]` |  | Reseat failed manager | Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm. |
+| `:cold-restore` |  | Restore from cold storage | Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way. |
+| `:cold-archive [arg]` |  | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
 | `:archives` |  | Open archives | Switches the session list to the Archive zone. |
 | `:model [arg]` | `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `:sessions` | `:ls` | List sessions | Lists sessions in the session list. |
@@ -966,7 +1003,7 @@ arguments open that editor on Enter.
 | `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
-| `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
+| `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `launch add\|remove <node> <Provider/model[/effort]>...` (adds or removes launches on the node's current grant), `configure <JSON>` and `revoke <node>` inspect or change one. |
 | `:manager escalations [arg]` |  | Manager escalations | Lists escalations that reached the top of their manager chain and top-of-chain reports; `:manager escalations rule <hop> <text>` rules one (the ruling returns down the chain to the source seat and never answers a human approval), `ack <notice>` marks a report read, `all` includes closed rows, failed or uncertain tier mail is listed with its reason and `undelivered [<cursor>]` pages it. |
 | `:manager friction [arg]` |  | Manager friction | Shows the friction rollup (the andon): refusals, deploy timeouts, superseded handoffs and lander refusals the daemon recorded, by signature, with the kaizen Issue filed for each repeating one; `:manager friction <hours>` widens the window (default 24, at most 720). The board's Inspect · Friction section shows one project's rows. |
 | `:manager tree` |  | Open manager tree | Opens the manager hierarchy tree: the global grant, project seats, area nodes and led Epics. |
@@ -981,6 +1018,8 @@ arguments open that editor on Enter.
 | `:tabclose` | `:tabc` | Close tab | Closes the current tab (handled by the pane's window commands). |
 | `:tabnext` | `:tabn` | Next tab | Switches to the next tab. |
 | `:tabprev` | `:tabp` `:tabprevious` | Previous tab | Switches to the previous tab. |
+| `:todo` |  | Operator to-do panel | Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count. |
+| `:land` |  | Land session branch | Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it. |
 <!-- rsi:generated:end -->
 
 Inside the unified manager surface, `1`–`5` select Board, Decisions, Inbox,
@@ -1159,8 +1198,9 @@ New-session prompts (blank) flip to a settings side where the launch is adjusted
 | Manager | `Space` / `Enter` / `h` / `l` | Blank prompts only: appoint the launched session as the current project's manager (needs a selected project) |
 | Scope | `h` / `l` (`Space` = forward) | Whole project, then each live Group followed by its live Epics |
 | Policy | `h` / `l` (`Space` = forward) | `Observe`, `Execute` (default) or `Full project control` |
+| Grant | `Space` / `Enter` / `p` | Opens the grant page, the second page of the settings side: preset, mode, every capability, the creation and concurrency allowances, the spend ceiling and the manager's allowed launches. `p` also toggles it from any row; `Esc` returns to the launch rows |
 
-The appointment runs after the daemon accepts the launch, through the same operator RPCs as `:manager appoint` and `:manager policy`: `ConfigureHarnessManager` with the chosen scope, then `ConfigureHarnessManagerPolicy` with the preset applied to a fresh policy (the editor's suggested allowances included). Appointing replaces the project's current manager. A refused step is reported in a notification; the session is launched either way and can be appointed later with `:manager appoint`.
+The appointment runs after the daemon accepts the launch, through one operator RPC, `ConfigureHarnessManagerWithPolicy` (#2237): the chosen scope and the policy are saved in one transaction, so a refused grant leaves no appointment behind. The policy is the preset applied to a fresh policy (the editor's suggested allowances included) unless the grant page was opened: then it is the grant as edited there. The grant page rows are the preset (`h` / `l` cycle Observe, Execute, Full project control and reset the rows below), the mode, one check box per capability, the `Containers`, `Sessions` and `Active` allowances (type digits or step with `h` / `l`), the `Spend` ceiling (`h` at the lowest value lifts it) and one check box per launch the manager may use for the sessions it creates. Every row is bounded the way the daemon bounds it, and a line under the rows says what the selected row does. Appointing replaces the project's current manager. A refused appointment is reported in a notification; the session is launched either way and can be appointed later with `:manager appoint`.
 
 #### Insert Mode (default when opened)
 
@@ -1604,6 +1644,9 @@ Keys of the settings pane (category rail and items).
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
 | `K` | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
 | `J` | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
+| `+` | Step setting up | Moves the selected setting to its next value (switches on): numeric rows stop at their maximum, choices wrap. The value is staged until you apply with w. |
+| `-` | Step setting down | Moves the selected setting to its previous value (switches off): numeric rows stop at their minimum, choices wrap. The value is staged until you apply with w. |
+| `w` | Apply pending settings | Applies every staged setting at once: ONE atomic daemon update carries every changed field with its final value (all of them take effect or none do), plus the local preferences. Esc or q discards them instead. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -1693,7 +1736,7 @@ Lists user-installed skills under `~/.claude/skills/`. Plugin-namespaced skills 
 |-----|--------|-------------|
 | `Enter` | Preview | Open read-only `SKILL.md` viewer |
 | `e` | Toggle | Rename `<name>/` ↔ `<name>.disabled/` |
-| `d` | Delete | Remove the skill directory (no confirm — matches API Models) |
+| `d` | Delete | Remove the skill directory permanently (press `d` twice on the same skill within 2 s; the first press shows a hint and deletes nothing) |
 
 **Skill Preview Overlay** (read-only `SKILL.md` viewer):
 
@@ -1736,17 +1779,17 @@ Views/adds/edits/deletes `rsi_common::model_control::ModelBudgetPolicy` rows via
 
 **Provider Keys category** (#694 K1b):
 
-Lists every key-vault credential slot (`rsi_common::provider_credentials::ProviderCredentialSlot` — a fixed 23-slot set, so this category's row count never changes) via the daemon's operator-only `ListProviderCredentials` RPC. Each row shows the slot's state (`vault`/`env_compat`/`generator`/`cleared`/`absent`), fingerprint, last validity/credit check class and age, remaining credit, route (`codex_cli`/`harness`), and CLI exposure (`always`/`on_fallback`/`none`). Rows show a `loading…` placeholder until the first response arrives. The `vault.env_compat` and `vault.check_ttl_secs` daemon settings are **not** in this category — they are two ordinary rows under **Daemon Features**, applied through the existing `UpdateDaemonConfig` path.
+Lists every key-vault credential slot (`rsi_common::provider_credentials::ProviderCredentialSlot` — a fixed slot set, so this category's row count never changes) via the daemon's operator-only `ListProviderCredentials` RPC. Each row shows the slot's state (`vault`/`env_compat`/`generator`/`cleared`/`absent`), fingerprint, last validity/credit check class and age, remaining credit, route (`codex_cli`/`harness`), and CLI exposure (`always`/`on_fallback`/`none`). The list ends with a `claude login` and a `codex login` row (#2753): the CLI's login state on the daemon host from the operator-only `GetProviderLoginState` RPC (`logged_in`/`logged_out`/`unknown`, the auth method, the age of the probe, the host-side fix such as `codex login` or `claude auth login` when logged out, and each satellite's own state). A logged-out CLI refuses launches with `provider_login_required`; `unknown` never does. It then ends with a `claude contract` and a `codex contract` row (#2755): the provider CLI contract canary from the operator-only `GetProviderContractState` RPC (`ok`/`degraded`/`unchecked`, the reason code such as `codex_hook_untrusted` or `claude_flag_unknown:--max-turns`, the CLI version, the age of the check, and for an untrusted Codex custody hook whether Codex launches are refused or run without custody). Only a definite untrusted Codex custody hook refuses launches (setting `codex_refuse_untrusted_custody_hook`); `unchecked` and every other degradation never do. Rows show a `loading…` placeholder until the first response arrives. The `vault.env_compat` and `vault.check_ttl_secs` daemon settings are **not** in this category — they are two ordinary rows under **Daemon Features**, applied through the existing `UpdateDaemonConfig` path.
 
 | Key | Action | Description |
 |-----|--------|-------------|
 | `Enter` / `Space` / `s` | Set | Open `ProviderCredentialForm` in Set mode for the selected slot |
 | `r` | Rotate | Open `ProviderCredentialForm` in Rotate mode for the selected slot |
-| `c` | Check | Run `CheckProviderCredential` immediately for the selected slot (no form) |
+| `c` | Check | Run `CheckProviderCredential` immediately for the selected slot (no form); on a login row, probe the CLI logins now (`RefreshProviderLoginState`); on a contract row, run the CLI contract canary now (`RefreshProviderContractState`) |
 | `d` | Clear (arm) | First press arms a "press `d` again" confirmation for the selected slot |
 | `d` (again, within 2s, same slot) | Clear (confirm) | Enqueues `ClearProviderCredential` for the selected slot |
 | `i` | Import | Enqueues `ImportProviderCredentialsFromEnv` (imports every importable slot at once; not row-scoped) |
-| `R` | Refresh | Re-fetch the credential list from the daemon |
+| `R` | Refresh | Re-fetch the credential list, probe the CLI logins and run the CLI contract canary now |
 
 **Provider Credential Form Overlay** (Set/Rotate — Provider Keys category):
 
@@ -1936,7 +1979,7 @@ The Recursive Graphs picker (`R`) renders a recursive task graph's **structure**
 | `k` / `Up` | Navigate Up | Move selection up in the prompt list |
 | `Enter` | Open Editor | Open the selected prompt in the file editor |
 | `Ctrl+n` | New Prompt | Create a new prompt file and open it in the editor |
-| `d` | Delete Prompt | Delete the selected prompt file |
+| `d` | Delete Prompt | Move the selected prompt to the daemon's recoverable trash (`~/.rsi/trash/prompts/`) |
 | `m` | Toggle Model | Toggle the model dropdown |
 | `q` | Close | Close the prompt creator (or close editor, return to list) |
 | `Ctrl+s` | Save | Save the current prompt (editor mode) |
@@ -1983,6 +2026,8 @@ Open **Settings → Integrations → Remote → Remote access**. The page edits 
 | `j` / `k` | Select a row |
 | `Space` / `Enter` | Allow or remove the selected device, or expose or hide the selected project (max 32 projects) |
 | `e` | Enable or disable Remote. Enable is all-or-nothing (a failure rolls back to disabled); disable takes effect on the gateway's next request |
+| `n` | Turn answering waiting decisions from the phone on or off (off by default; takes effect on the gateway's next request) |
+| `m` | Turn messaging manager seats from the phone on or off (off by default; API v2; takes effect on the gateway's next request) |
 | `a` | Apply: re-converge the gateway and `tailscale serve` route while enabled |
 | `r` | Refresh status |
 | `Esc` / `q` | Close |
@@ -2024,9 +2069,11 @@ The focused session is the one selected in the session list behind the tree; it 
 
 ### Global Manager Workspace (`gm`, `:global-manager`)
 
-`gm` (the `g` leader, then `m`) or `:global-manager` (also `:gm`, `:manager workspace`) opens the global manager workspace: one full-screen view above every project. It is not part of any project tab, so it shows the same content from every tab. It reads one bounded operator-only snapshot (`GetGlobalManagerWorkspace`): the active global grant (or the most recent revoked one), the global seat's session, and for each granted project its PM seat health plus portfolio signals (open / in-progress / operator-request Issues, running and waiting sessions, pending questions and approvals). Each seat shows `ACTIVE`, `IDLE`, `WAITING`, `PAUSED`, `STOPPED`, `MISSING` or `REVOKED`. The view is a console (#1231): the manager seats (the global seat, then each project's PM, indented by level) sit on the left, and the selected seat's live conversation sits on the right with its input bar. It uses the same renderer as the session detail pane and updates from the same event stream. `i` types to the selected seat in place (`t` selects the global seat first). `s` shows the selected seat session's status, `x` halts it softly and `X` halts it now (press twice), through the same path as the session list's `x` / `X`; `a` archives an earlier seat session (the current seat is refused: revoke or replace it first). Enter or Ctrl-Enter sends, and Esc leaves typing; drafts stay with each seat's session. `Tab` focuses the transcript for scrolling. Below 96 columns the list and the conversation take turns. `n` instantiates a manager in one flow. Pick the seat (global, or a project's PM), a provider/model/effort from the allowed launch catalog (the grant's launches plus the operator default) and, for the global seat, its projects (Scope, every project by default) and its Host project (the session's home: the tab's project when in scope, else the first project in scope; `h`/`l` on Host picks another project in scope). The global seat's header names its host project. It then launches a fresh session and appoints it through `ConfigureGlobalManager` or `ConfigureHarnessManager` plus the Execute policy. Validation and refusals show inline. When the launch succeeded but the appointment was refused, Enter retries only the appointment. With no grant the view says how to launch one (or appoint an existing session with `:manager global appoint [project names...]`). Missing, stopped and revoked seats say what to do. The view reloads every 15 seconds while open, after any `:manager global`, `:manager node` or `:manager restart` command, and on `r`; a failed reload keeps the last snapshot and says so. Enter opens the selected seat's session in a tab showing its project (opening one when needed). `?` lists the keys.
+`gm` (the `g` leader, then `m`) or `:global-manager` (also `:gm`, `:manager workspace`) opens the global manager workspace: one full-screen view above every project. It is not part of any project tab, so it shows the same content from every tab. It reads one bounded operator-only snapshot (`GetGlobalManagerWorkspace`): the active global grant (or the most recent revoked one), the global seat's session, and for each granted project its PM seat health plus portfolio signals (open / in-progress / operator-request Issues, running and waiting sessions, pending questions and approvals). Each seat shows `ACTIVE`, `IDLE`, `WAITING`, `PAUSED`, `STOPPED`, `MISSING` or `REVOKED`. The look follows the session list and its detail (#2237): a scope header (`Above all projects / Seats`, the seat count and the snapshot's age), a signal band on the selected-row band with the grant (a node console shows where the node sits, its grant, its fleet and its escalations), the list's column header, `★ GLOBAL` and `● PROJECT MANAGERS n` section rules, one status glyph per seat (`●` active, `✓` idle, `!` waiting, `⏸` paused, `×` stopped, `○` missing, `⊘` revoked), the accent rail and selected-row band, dim zero counts and warm waiting counts, and a key-hint row at the bottom. The view is a console (#1231): the manager seats (the global seat, then each project's PM, indented by level) sit on the left, and the selected seat's live conversation sits on the right with its input bar. It uses the same renderer as the session detail pane and updates from the same event stream. `i` types to the selected seat in place (`t` selects the global seat first). `s` shows the selected seat session's status, `x` halts it softly and `X` halts it now (press twice), through the same path as the session list's `x` / `X`; `a` archives an earlier seat session (the current seat is refused: revoke or replace it first). Enter or Ctrl-Enter sends, and Esc leaves typing; drafts stay with each seat's session. `Tab` focuses the transcript for scrolling. Below 96 columns the list and the conversation take turns. `n` instantiates a manager in one flow. Pick the seat (global, or a project's PM), a provider/model/effort from the allowed launch catalog (the grant's launches plus the operator default) and, for the global seat, its projects (Scope, every project by default) and its Host project (the session's home: the tab's project when in scope, else the first project in scope; `h`/`l` on Host picks another project in scope). The global seat's header names its host project. The Grant field (`Enter`, `l` or `Right` on it) opens the grant editor in place of the form: for the global seat the launches it may start project managers from and the policy body its project managers receive, for a PM that manager's own policy; the rows are the preset, the mode, one check box per capability, the creation and concurrency allowances, the spend ceiling and the launches (`j`/`k` rows, `h`/`l` change, `Space` toggles, digits type a number, `Esc` returns to the form). The editor starts from the grant the global seat holds (or the last revoked grant, or the defaults), is checked before anything launches, and goes out with the appointment. It then launches a fresh session and appoints it through `ConfigureGlobalManager` (the global seat, with the grant as edited) or `ConfigureHarnessManagerWithPolicy` (a PM, appointment and policy in one transaction). Validation and refusals show inline. When the launch succeeded but the appointment was refused, Enter retries only the appointment. With no grant the view says how to launch one (or appoint an existing session with `:manager global appoint [project names...]`). Missing, stopped and revoked seats say what to do. The view reloads every 15 seconds while open, after any `:manager global`, `:manager node` or `:manager restart` command, and on `r`; a failed reload keeps the last snapshot and says so. Enter opens the selected seat's session in a tab showing its project (opening one when needed). `?` lists the keys.
 
 The same console renders any manager node (#1240). Enter on a Portfolio, Project or Area row of the manager tree opens that node's console from the operator-only `GetManagerNodeWorkspace` snapshot. The header names the node it reports to, its grant, a fleet rollup of its coverage (active agents and 5-minute and 1-hour token and cost rates, 24-hour invocations) and the escalations waiting on it. The seats are the node's own seat, each child portfolio node (as a digest with its summed counts) with the projects it covers beneath it, then the projects the node manages directly and its child areas. Enter on a child row opens that child's console, and Backspace opens the parent's. In a node console, `n` launches project managers only; appoint portfolio and area seats from the manager tree. `gm` still opens the global through `GetGlobalManagerWorkspace`.
+
+**Budget panel (`b`, #2502).** `b` replaces the console with the one place to see and change a manager chain's budget, read from the operator-only `GetGlobalManagerBudget`. The header reads `Above all projects / Budget` and says plainly how counts run: there is no timed reset; a portfolio node counts created sessions and containers since its current grant began (any operator edit of that grant, a raise here included, starts a new count of creations), spend is not reset by an edit (it stays the spend of the work the node still covers, so a raise changes the limit only), a PM counts over its current scope, and active sessions are live. One section rule per covered project lists its chain from the top: each portfolio node (`★ PORTFOLIO`, "governs this node and everything under it") and then the project manager (`● PM`, "governs this PM's own launches"), each with its four caps (created sessions, active sessions, containers, spend in USD) as used / limit and the room left. The binding cap, the lowest room along the chain for that cap (ties go to the upper node, since raising a lower one admits nothing), is marked with `!` in the warning colour, or `×` in the error colour when it is spent. `+` stages a one-step raise of the selected cap (32 created sessions, 1 active session, 4 containers or $10) and never lowers an allowance, so on an unlimited spend it leaves the cap unchanged with a notice; digits type a new limit and Enter stages it (the review shows the value the daemon will store: counts are rounded, active sessions are at least 1, and a spend of 0 means no cap). A finite spend cap whose spend is unknown (an unknown observation, or no known total) shows `blocked`: admission refuses every launch with `manager_v2_spend_unknown` whatever the headroom, so raising the cap does not admit more. The review names the node, the cap, old and new values and the RPC it will call: `ConfigurePortfolioNode` (fenced on the grant version and authority epoch) for a portfolio node, `ConfigureHarnessManagerPolicy` (fenced on the policy and scope versions) for a PM. Enter or `y` saves, re-reads the panel and shows the value read back (a mismatch is reported as an error); `+` adds another step and Esc or `n` cancels. `r` reloads, `b`, `q` or Esc returns to the seats. A creation refusal (`manager_v2_creation_limit`, `manager_ancestor_allowance_exceeded`) names the node kind and id, the cap field, used and limit and this path (`raise_in="TUI: gm (global manager workspace) > b Budget > <kind> <id> > <cap> > + or type a number"`); a delegate (area or Epic lead) has no panel row, so its refusal names the manager tree instead (`TUI: :manager tree > the delegate row for manager session <id> (area or Epic) > e > <cap>`). In the manager tree, a parent's `binds first` marker compares remaining headroom (limit minus used, each node under its own counting window) when the Budget snapshot is available, and labels the parent's raw values as limits when it is not.
 
 | Key | Action |
 |-----|--------|
@@ -2035,6 +2082,7 @@ The same console renders any manager node (#1240). Enter on a Portfolio, Project
 | `Backspace` | Open the parent node's console |
 | `t` | Talk: select the console's own seat and type to it, from any row |
 | `p` | Open the selected project's tab |
+| `b` | Open the Budget panel: `j`/`k` move, `+` raise one step, digits type a limit, Enter review then save, `r` reload, `b`/Esc back |
 | `T` | Open the manager tree |
 | `:` | Open the command palette (`:manager global appoint ...`, `:manager global revoke`, ...) |
 | `r` | Refresh the snapshot |
@@ -2436,7 +2484,9 @@ Keys of the theme role editor.
 | `x` | Halt the selected seat session (soft stop) |
 | `X` | Halt the selected seat session now (press twice) |
 | `a` | Archive the selected earlier seat session |
-| `n` | Launch and appoint a manager (seat, launch, scope) |
+| `n` | Launch and appoint a manager (seat, launch, scope, grant) |
+| `b` | Budget panel: every cap of the global node and each PM as used / limit, binding cap marked |
+| `b: + / 0-9` | Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back |
 | `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
 | `Enter / l` | Open the seat's session in its project tab, or a child node's console |
 | `Backspace` | Open the parent node's console |
@@ -2772,6 +2822,17 @@ Keys of the theme role editor.
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
 
+### Daemon Text Setting
+
+<!-- rsi:generated:begin overlay-daemon-text-setting -->
+| Keys | Action |
+| --- | --- |
+| `Type, Backspace` | Edit text |
+| `Enter` | Save value |
+| `Delete` | Clear (use the default) |
+| `Esc` | Cancel |
+<!-- rsi:generated:end -->
+
 ### Prompt Preview
 
 <!-- rsi:generated:begin overlay-prompt-preview -->
@@ -2795,6 +2856,27 @@ Keys of the theme role editor.
 | `Ctrl-D / Ctrl-U` | Half page down / up |
 | `g / Home, G / End` | Jump to top / bottom |
 | `Esc / q` | Close |
+| `Space N` | Close and open a blank session prompt |
+| `Space ;` | Open the command palette |
+<!-- rsi:generated:end -->
+
+### To-do Pop-up
+
+<!-- rsi:generated:begin overlay-to-do-pop-up -->
+| Keys | Action |
+| --- | --- |
+| `y` | Yank the command (the item stays open) |
+| `d` | Mark done (asks y/n first) |
+| `x` | Dismiss (asks y/n first) |
+| `u` | Undo the last close (60 s) |
+| `o` | Open the item's link |
+| `n / p` | Show next / previous item |
+| `j / k, Down / Up` | Scroll |
+| `Ctrl-D / Ctrl-U` | Scroll ten rows down / up |
+| `g / Home` | Jump to top |
+| `y / Enter` | At the prompt: confirm the close |
+| `n / Esc` | At the prompt: cancel; otherwise close |
+| `q` | Close |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2981,6 +3063,8 @@ Sessions on providers that cannot switch in place get the reason as a toast.
 | `j / k, Down / Up` | Move between settings |
 | `h / l, Left / Right` | Change the selected setting |
 | `Space / Enter` | Toggle or open the selected setting |
+| `p, Enter on Grant` | Open the manager's grant page: preset, mode, capabilities, allowances, launches |
+| `Grant page: j / k, h / l, Space, digits` | Move between rows, step or toggle a row, type a number; Esc returns to the launch rows |
 | `Ctrl-E / Ctrl-B` | Cycle effort / toggle sandbox |
 | `Ctrl-M` | Open model picker |
 | `Ctrl-Enter` | Launch the session |

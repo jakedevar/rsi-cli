@@ -14,8 +14,9 @@ use rsi_common::issue_workspace::{
     IssueDependencyMutationRequestV1, IssueDependencyMutationResultV1, IssueDependencyPageV1,
     IssueDispatchRecordV1, IssueTrackerStatusV1, IssueTrackerTickResultV1, IssueWorkspaceErrorV1,
     IssueWorkspacePageV1, ListIssueDependenciesRequestV1, ListIssueEventsV2RequestV1,
-    ListIssueEventsV2ResultV1, ListIssuesPageRequestV1, OperatorIssueMutationResultV1,
-    RestoreIssueRequestV1, UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
+    ListIssueEventsV2ResultV1, ListIssueHandoffsRequestV1, ListIssueHandoffsResultV1,
+    ListIssuesPageRequestV1, OperatorIssueMutationResultV1, RestoreIssueRequestV1,
+    UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
 };
 use rsi_common::rpc::{
     CommitRecursiveLiveAttemptOutputParams, CommitRecursiveLiveAttemptOutputResponse,
@@ -66,7 +67,7 @@ use rsi_common::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -280,6 +281,24 @@ pub struct DaemonClient {
     next_id: AtomicI64,
     /// True when a fire-and-forget request was sent and the response hasn't been consumed yet.
     pending_response: bool,
+    /// #2067: the transport-only session authority token from
+    /// `$RSI_SESSION_TOKEN`, when this process runs inside an agent session.
+    /// Forwarded on every request exactly as `rsi-rpc` does, so the daemon
+    /// attributes the call to the session and refuses operator-only methods.
+    /// It never leaves this field except as the request's `session_token`.
+    session_token: Option<rsi_common::rpc::AgentTransportBearer>,
+    /// Bumped when an `UpdateDaemonConfig` write starts and again when it
+    /// ends, so a `GetDaemonConfig` read that overlapped a write is
+    /// recognisable as possibly stale (#2882). See [`Self::config_write_epoch`].
+    config_write_epoch: AtomicU64,
+}
+
+/// The session token the environment carries, if any (empty counts as none).
+fn session_token_from_env() -> Option<rsi_common::rpc::AgentTransportBearer> {
+    std::env::var(rsi_common::identity::ENV_SESSION_TOKEN)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -293,7 +312,7 @@ fn launch_session_with_opts_custom_provider_params(
     session_kind: Option<rsi_common::types::SessionKind>,
     project_id: Option<uuid::Uuid>,
     openai_base_url: &str,
-    openai_api_key: &str,
+    custom_provider_id: uuid::Uuid,
     max_retries: Option<u8>,
     effort: Option<&str>,
     parent_id: Option<uuid::Uuid>,
@@ -310,7 +329,7 @@ fn launch_session_with_opts_custom_provider_params(
         "session_kind": session_kind,
         "project_id": project_id,
         "openai_base_url": openai_base_url,
-        "openai_api_key": openai_api_key,
+        "custom_provider_id": custom_provider_id,
         "max_retries": max_retries,
         "effort": effort,
         "parent_id": parent_id,
@@ -336,8 +355,9 @@ fn launch_session_with_opts_params(
     tags: &[String],
     workflow_id: Option<uuid::Uuid>,
     workflow_id_override: Option<uuid::Uuid>,
+    cli_access: Option<rsi_common::harness_tool_policy::CliAccessMode>,
 ) -> Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "query": query,
         "title": title,
         "working_dir": working_dir,
@@ -353,7 +373,13 @@ fn launch_session_with_opts_params(
         "tags": tags,
         "workflow_id": workflow_id,
         "workflow_id_override": workflow_id_override,
-    })
+    });
+    // #2758: only a requested access mode adds the operator-only policy, so a
+    // plain launch keeps its exact wire form.
+    if let Some(mode) = cli_access {
+        params["tool_policy"] = serde_json::json!({ "cli_access": mode });
+    }
+    params
 }
 
 fn recursive_graph_id_params(graph_id: RecursiveTaskGraphId) -> Value {
@@ -616,6 +642,16 @@ impl DaemonClient {
         )?)
     }
 
+    /// Read this daemon's declared inbound scope with each entry resolved
+    /// against the live sessions (#1928).
+    pub async fn get_satellite_scope_status(
+        &mut self,
+    ) -> Result<rsi_common::satellite_dispatch::SatelliteScopeStatusV1> {
+        Ok(serde_json::from_value(
+            self.request("GetSatelliteScopeStatus", Value::Null).await?,
+        )?)
+    }
+
     /// Replace this daemon's satellite-side inbound delivery policy.
     pub async fn put_satellite_inbound_policy(
         &mut self,
@@ -669,7 +705,31 @@ impl DaemonClient {
             stream: None,
             next_id: AtomicI64::new(1),
             pending_response: false,
+            session_token: session_token_from_env(),
+            config_write_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// A counter that changes whenever this client starts or finishes an
+    /// `UpdateDaemonConfig` write. A config read whose epoch at request time
+    /// differs from the epoch at apply time may have raced a write and must
+    /// not overwrite the locally mirrored value (#2882).
+    pub fn config_write_epoch(&self) -> u64 {
+        self.config_write_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Replace the forwarded session token (tests; production reads the
+    /// environment in [`DaemonClient::new`]).
+    #[must_use]
+    pub fn with_session_token(mut self, token: Option<&str>) -> Self {
+        self.session_token = token.filter(|value| !value.is_empty()).map(Into::into);
+        self
+    }
+
+    /// True when requests carry a session token, i.e. this process is an agent
+    /// session and the daemon will treat its calls as attributed.
+    pub fn is_session_attributed(&self) -> bool {
+        self.session_token.is_some()
     }
 
     /// Default socket path: ~/.flywheel/daemon.sock
@@ -719,7 +779,7 @@ impl DaemonClient {
             id: Some(Value::Number(id.into())),
             method: method.to_string(),
             params,
-            session_token: None,
+            session_token: self.session_token.clone(),
         };
 
         let json = serde_json::to_string(&request)?;
@@ -763,7 +823,7 @@ impl DaemonClient {
             id: Some(Value::Number(id.into())),
             method: method.to_string(),
             params,
-            session_token: None,
+            session_token: self.session_token.clone(),
         };
 
         let json = serde_json::to_string(&request)?;
@@ -913,6 +973,19 @@ impl DaemonClient {
             .await?;
         Ok(serde_json::from_value(result)?)
     }
+    /// #2237: appoint a manager and save its policy in one atomic step.
+    pub async fn configure_harness_manager_with_policy(
+        &mut self,
+        request: rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyRequestV2,
+    ) -> Result<rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyResultV2> {
+        let result = self
+            .request(
+                "ConfigureHarnessManagerWithPolicy",
+                serde_json::to_value(request)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
     pub async fn get_harness_manager_state(
         &mut self,
         request: rsi_common::harness_manager_v2::GetHarnessManagerStateRequestV2,
@@ -968,6 +1041,50 @@ impl DaemonClient {
             .await?;
         Ok(serde_json::from_value(result)?)
     }
+    /// #2055: operator-only. Resolve (`dry_run`) or enqueue a session's branch
+    /// on the rolling merge queue.
+    pub async fn enqueue_rolling_queue_source(
+        &mut self,
+        params: &rsi_common::rolling_queue::EnqueueRollingQueueSourceParams,
+    ) -> Result<rsi_common::rolling_queue::EnqueueRollingQueueSourceResponse> {
+        let result = self
+            .request("EnqueueRollingQueueSource", serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #2055: operator-only read of the merge queue, newest first.
+    pub async fn get_rolling_queue(
+        &mut self,
+        limit: u32,
+    ) -> Result<rsi_common::rolling_queue::RollingQueueResponse> {
+        let result = self
+            .request("GetRollingQueue", serde_json::json!({ "limit": limit }))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #2068: operator-only read of exactly these queue entries by id, however
+    /// far back they sit.
+    pub async fn get_rolling_queue_entries(
+        &mut self,
+        entry_ids: &[uuid::Uuid],
+    ) -> Result<rsi_common::rolling_queue::RollingQueueResponse> {
+        let result = self
+            .request(
+                "GetRollingQueue",
+                serde_json::json!({ "entry_ids": entry_ids }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Operator-only daemon identity, including cached local release detection.
+    pub async fn get_daemon_info(&mut self) -> Result<rsi_common::agent_daemon_info::DaemonInfoV1> {
+        let result = self.request("GetDaemonInfo", serde_json::json!({})).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     /// #1122: operator-only quiet-point restart status, force and cancel.
     pub async fn get_operator_restart(
         &mut self,
@@ -1015,6 +1132,22 @@ impl DaemonClient {
     ) -> Result<rsi_common::global_manager::GlobalManagerWorkspaceV1> {
         let result = self
             .request("GetGlobalManagerWorkspace", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #2502: operator-only Budget panel of a portfolio node (the global
+    /// node when `node_id` is `None`).
+    pub async fn get_global_manager_budget(
+        &mut self,
+        node_id: Option<uuid::Uuid>,
+    ) -> Result<rsi_common::manager_budget::GlobalManagerBudgetV1> {
+        let result = self
+            .request(
+                rsi_common::manager_budget::GET_GLOBAL_MANAGER_BUDGET,
+                serde_json::to_value(
+                    rsi_common::manager_budget::GetGlobalManagerBudgetRequestV1 { node_id },
+                )?,
+            )
             .await?;
         Ok(serde_json::from_value(result)?)
     }
@@ -1111,6 +1244,23 @@ impl DaemonClient {
         let result = self
             .request(
                 "ConfigurePortfolioNode",
+                serde_json::to_value(rsi_common::portfolio_nodes::PortfolioCapConfirmation {
+                    request,
+                    confirm_cap_reductions,
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #2103: add or remove launches on one node, CAS on its grant version.
+    pub async fn configure_portfolio_node_launches(
+        &mut self,
+        request: rsi_common::portfolio_nodes::ConfigurePortfolioNodeLaunchesRequestV1,
+        confirm_cap_reductions: bool,
+    ) -> Result<rsi_common::portfolio_nodes::PortfolioNodeV1> {
+        let result = self
+            .request(
+                "ConfigurePortfolioNodeLaunches",
                 serde_json::to_value(rsi_common::portfolio_nodes::PortfolioCapConfirmation {
                     request,
                     confirm_cap_reductions,
@@ -1254,7 +1404,8 @@ impl DaemonClient {
         self.fire_and_forget("LaunchSession", params).await
     }
 
-    /// Launch a session with an inline OpenAI-compatible provider config (custom provider).
+    /// Launch a session against a custom provider. The daemon resolves its key
+    /// from the vault by `custom_provider_id` (hub #3039); the TUI never holds it.
     #[allow(clippy::too_many_arguments)]
     pub async fn launch_session_custom_provider(
         &mut self,
@@ -1266,7 +1417,7 @@ impl DaemonClient {
         system_prompt: Option<&str>,
         project_id: Option<uuid::Uuid>,
         openai_base_url: &str,
-        openai_api_key: &str,
+        custom_provider_id: uuid::Uuid,
         workflow_id: Option<uuid::Uuid>,
         effort: Option<&str>,
         tags: &[String],
@@ -1281,7 +1432,7 @@ impl DaemonClient {
             "system_prompt": system_prompt,
             "project_id": project_id,
             "openai_base_url": openai_base_url,
-            "openai_api_key": openai_api_key,
+            "custom_provider_id": custom_provider_id,
             "workflow_id": workflow_id,
             "effort": effort,
             "tags": tags,
@@ -1303,7 +1454,7 @@ impl DaemonClient {
         system_prompt: Option<&str>,
         project_id: Option<uuid::Uuid>,
         openai_base_url: &str,
-        openai_api_key: &str,
+        custom_provider_id: uuid::Uuid,
         workflow_id: Option<uuid::Uuid>,
         effort: Option<&str>,
         tags: &[String],
@@ -1318,7 +1469,7 @@ impl DaemonClient {
             "system_prompt": system_prompt,
             "project_id": project_id,
             "openai_base_url": openai_base_url,
-            "openai_api_key": openai_api_key,
+            "custom_provider_id": custom_provider_id,
             "workflow_id": workflow_id,
             "effort": effort,
             "tags": tags,
@@ -1340,7 +1491,7 @@ impl DaemonClient {
         session_kind: Option<rsi_common::types::SessionKind>,
         project_id: Option<uuid::Uuid>,
         openai_base_url: &str,
-        openai_api_key: &str,
+        custom_provider_id: uuid::Uuid,
         max_retries: Option<u8>,
         effort: Option<&str>,
         parent_id: Option<uuid::Uuid>,
@@ -1357,7 +1508,7 @@ impl DaemonClient {
             session_kind,
             project_id,
             openai_base_url,
-            openai_api_key,
+            custom_provider_id,
             max_retries,
             effort,
             parent_id,
@@ -1382,7 +1533,7 @@ impl DaemonClient {
         session_kind: Option<rsi_common::types::SessionKind>,
         project_id: Option<uuid::Uuid>,
         openai_base_url: &str,
-        openai_api_key: &str,
+        custom_provider_id: uuid::Uuid,
         max_retries: Option<u8>,
         effort: Option<&str>,
         parent_id: Option<uuid::Uuid>,
@@ -1399,7 +1550,7 @@ impl DaemonClient {
             session_kind,
             project_id,
             openai_base_url,
-            openai_api_key,
+            custom_provider_id,
             max_retries,
             effort,
             parent_id,
@@ -1451,6 +1602,7 @@ impl DaemonClient {
             tags,
             workflow_id,
             workflow_id_override,
+            None,
         );
         self.fire_and_forget("LaunchSession", params).await
     }
@@ -1476,6 +1628,49 @@ impl DaemonClient {
         workflow_id: Option<uuid::Uuid>,
         workflow_id_override: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid> {
+        self.launch_session_with_opts_access_response(
+            query,
+            title,
+            working_dir,
+            provider,
+            model,
+            system_prompt,
+            session_kind,
+            project_id,
+            max_retries,
+            effort,
+            parent_id,
+            sandbox,
+            tags,
+            workflow_id,
+            workflow_id_override,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::launch_session_with_opts_response`], plus the operator-only CLI
+    /// access mode (#2758).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn launch_session_with_opts_access_response(
+        &mut self,
+        query: &str,
+        title: Option<&str>,
+        working_dir: Option<&Path>,
+        provider: SessionProvider,
+        model: Option<&str>,
+        system_prompt: Option<&str>,
+        session_kind: Option<rsi_common::types::SessionKind>,
+        project_id: Option<uuid::Uuid>,
+        max_retries: Option<u8>,
+        effort: Option<&str>,
+        parent_id: Option<uuid::Uuid>,
+        sandbox: Option<rsi_common::types::SandboxSpec>,
+        tags: &[String],
+        workflow_id: Option<uuid::Uuid>,
+        workflow_id_override: Option<uuid::Uuid>,
+        cli_access: Option<rsi_common::harness_tool_policy::CliAccessMode>,
+    ) -> Result<uuid::Uuid> {
         let params = launch_session_with_opts_params(
             query,
             title,
@@ -1492,6 +1687,7 @@ impl DaemonClient {
             tags,
             workflow_id,
             workflow_id_override,
+            cli_access,
         );
         self.request_launch_session(params).await
     }
@@ -1789,6 +1985,18 @@ impl DaemonClient {
         )?)
     }
 
+    /// #2750 operator-only: replace a failed manager seat with a successor on
+    /// another provider.
+    pub async fn reseat_harness_manager(
+        &mut self,
+        params: rsi_common::manager_reseat::ReseatHarnessManagerParams,
+    ) -> Result<rsi_common::manager_reseat::ReseatHarnessManagerResult> {
+        Ok(serde_json::from_value(
+            self.request("ReseatHarnessManager", serde_json::to_value(params)?)
+                .await?,
+        )?)
+    }
+
     /// List archived sessions, optionally filtered by project.
     pub async fn list_archived_sessions(
         &mut self,
@@ -2003,6 +2211,58 @@ impl DaemonClient {
         Ok(segments)
     }
 
+    /// #2384: operator-only. Where a session's event rows live (`live`, `cold`
+    /// or `restored`), for the "cold storage" badge.
+    pub async fn get_cold_session_storage(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<rsi_common::cold_storage::ColdSessionStorageV1> {
+        let result = self
+            .request(
+                "GetColdSessionStorage",
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #2384: operator-only. Put a cold session's rows back into the live
+    /// database. `already_hot` is success.
+    pub async fn restore_cold_session(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<rsi_common::cold_storage::ColdRestoreReceiptV1> {
+        let result = self
+            .request(
+                "RestoreColdSession",
+                serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #2384: operator-only. The cold-storage archive's status for Settings.
+    pub async fn get_cold_archive_status(
+        &mut self,
+    ) -> Result<rsi_common::cold_storage::ColdArchiveStatusV1> {
+        let result = self
+            .request("GetColdArchiveStatus", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #2384: operator-only. Start an archive pass in the background (`stage`,
+    /// `verify`; `move` and `compact` are refused until they exist).
+    pub async fn run_cold_archive_now(
+        &mut self,
+        mode: &str,
+    ) -> Result<rsi_common::cold_storage::ColdRunStartedV1> {
+        let result = self
+            .request("RunColdArchiveNow", serde_json::json!({ "mode": mode }))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     /// Get the lifetime usage aggregate for the Settings -> Stats category,
     /// optionally scoped to a single project (tab-scoped filter, D1).
     ///
@@ -2124,6 +2384,141 @@ impl DaemonClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// `GetProviderLoginState` (operator-only, #2753): the cached CLI login
+    /// state of `claude` and `codex` on the daemon host (state, method, check
+    /// time and the host-side remedy).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn get_provider_login_state(
+        &mut self,
+    ) -> Result<rsi_common::provider_login::ProviderLoginStateResultV1> {
+        let result = self
+            .request(
+                rsi_common::provider_login::METHOD_GET,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `RefreshProviderLoginState` (operator-only, #2753): probe both CLIs now
+    /// and return the new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn refresh_provider_login_state(
+        &mut self,
+    ) -> Result<rsi_common::provider_login::ProviderLoginStateResultV1> {
+        let result = self
+            .request(
+                rsi_common::provider_login::METHOD_REFRESH,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `GetProviderContractState` (operator-only, #2755): the cached CLI
+    /// contract canary result of `claude` and `codex` on the daemon host
+    /// (state, reason code, CLI version, check time) and the two settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn get_provider_contract_state(
+        &mut self,
+    ) -> Result<rsi_common::provider_contract::ProviderContractStateResultV1> {
+        let result = self
+            .request(
+                rsi_common::provider_contract::METHOD_GET,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `RefreshProviderContractState` (operator-only, #2755): run the canary
+    /// for both CLIs now and return the new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn refresh_provider_contract_state(
+        &mut self,
+    ) -> Result<rsi_common::provider_contract::ProviderContractStateResultV1> {
+        let result = self
+            .request(
+                rsi_common::provider_contract::METHOD_REFRESH,
+                serde_json::Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `OperatorTodoList` (operator-only, #1747): every open to-do item plus
+    /// the items closed at or after `closed_since` (the catch-up view).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn list_operator_todos(
+        &mut self,
+        closed_since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<rsi_common::operator_todos::OperatorTodoListResultV1> {
+        let params = rsi_common::operator_todos::OperatorTodoListRequestV1 { closed_since };
+        let result = self
+            .request("OperatorTodoList", serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `OperatorTodoClose` (operator-only, #1747): mark one item done or
+    /// dismissed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn close_operator_todo(
+        &mut self,
+        todo_id: uuid::Uuid,
+        status: rsi_common::operator_todos::OperatorTodoStatusV1,
+    ) -> Result<rsi_common::operator_todos::OperatorTodoV1> {
+        let params = rsi_common::operator_todos::OperatorTodoCloseRequestV1 {
+            todo_id,
+            status,
+            note: None,
+        };
+        let result = self
+            .request("OperatorTodoClose", serde_json::to_value(params)?)
+            .await?;
+        let closed: rsi_common::operator_todos::OperatorTodoCloseResultV1 =
+            serde_json::from_value(result)?;
+        Ok(closed.todo)
+    }
+
+    /// `OperatorTodoReopen` (operator-only, #2950): undo the operator's own
+    /// close of `todo_id` inside the undo window. The reopened item is a new
+    /// open row; the result carries it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn reopen_operator_todo(
+        &mut self,
+        todo_id: uuid::Uuid,
+    ) -> Result<rsi_common::operator_todos::OperatorTodoV1> {
+        let params = rsi_common::operator_todos::OperatorTodoReopenRequestV1 { todo_id };
+        let result = self
+            .request("OperatorTodoReopen", serde_json::to_value(params)?)
+            .await?;
+        let reopened: rsi_common::operator_todos::OperatorTodoReopenResultV1 =
+            serde_json::from_value(result)?;
+        Ok(reopened.todo)
+    }
+
     /// `ListMcpServers` — metadata-only server definitions and credentials.
     ///
     /// # Errors
@@ -2221,6 +2616,182 @@ impl DaemonClient {
             .request(
                 rsi_common::mcp::METHOD_CLEAR_SECRET,
                 serde_json::to_value(rsi_common::mcp::McpServerIdParams { id })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ListCustomProviders` (hub #3039) — the daemon's custom providers,
+    /// key metadata only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn list_custom_providers(
+        &mut self,
+    ) -> Result<rsi_common::operator_config::ListCustomProvidersResult> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_LIST_CUSTOM_PROVIDERS,
+                Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `PutCustomProvider` — create or replace one provider. A key in
+    /// `params.api_key` goes to the daemon vault and is never returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn put_custom_provider(
+        &mut self,
+        params: rsi_common::operator_config::PutCustomProviderParams,
+    ) -> Result<rsi_common::operator_config::CustomProviderSummary> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_PUT_CUSTOM_PROVIDER,
+                serde_json::to_value(params)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `DeleteCustomProvider` — remove a provider and its vault key.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn delete_custom_provider(
+        &mut self,
+        id: uuid::Uuid,
+    ) -> Result<rsi_common::operator_config::DeleteCustomProviderResult> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_DELETE_CUSTOM_PROVIDER,
+                serde_json::to_value(rsi_common::operator_config::CustomProviderIdParams { id })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `SetCustomProviderRoute` — run a daemon model role against a custom
+    /// provider (`Some(id)`) or detach it (`None`). The daemon resolves the
+    /// key itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn set_custom_provider_route(
+        &mut self,
+        role: rsi_common::operator_config::CustomProviderRole,
+        id: Option<uuid::Uuid>,
+    ) -> Result<rsi_common::operator_config::CustomProviderRouteResult> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_SET_CUSTOM_PROVIDER_ROUTE,
+                serde_json::to_value(rsi_common::operator_config::SetCustomProviderRouteParams {
+                    role,
+                    id,
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `ListClaudeHooks` — the daemon host's `~/.claude/settings.json` hooks
+    /// and the file revision a put must name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn list_claude_hooks(
+        &mut self,
+    ) -> Result<rsi_common::operator_config::ClaudeHooksView> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_LIST_CLAUDE_HOOKS,
+                Value::Null,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `PutClaudeHooks` — replace the hooks block if the file is still at
+    /// `expected_revision`. A stale revision is `Ok(Err(current_revision))`
+    /// (the save-conflict prompt), every other failure is `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn put_claude_hooks(
+        &mut self,
+        expected_revision: String,
+        hooks: rsi_common::claude_hooks::ClaudeHooks,
+    ) -> Result<std::result::Result<rsi_common::operator_config::ClaudeHooksView, String>> {
+        let params = rsi_common::operator_config::PutClaudeHooksParams {
+            expected_revision,
+            hooks,
+        };
+        match self
+            .request(
+                rsi_common::operator_config::METHOD_PUT_CLAUDE_HOOKS,
+                serde_json::to_value(params)?,
+            )
+            .await
+        {
+            Ok(result) => Ok(Ok(serde_json::from_value(result)?)),
+            Err(ClientError::Rpc {
+                data: Some(data), ..
+            }) if data.get("code").and_then(Value::as_str)
+                == Some(rsi_common::operator_config::CLAUDE_HOOKS_CONFLICT) =>
+            {
+                Ok(Err(data
+                    .get("current_revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `GetMessageBridge` — one bridge config (`config: None` while absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn get_message_bridge(
+        &mut self,
+        kind: rsi_common::operator_config::MessageBridgeKindV1,
+    ) -> Result<rsi_common::operator_config::MessageBridgeView> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_GET_MESSAGE_BRIDGE,
+                serde_json::to_value(rsi_common::operator_config::GetMessageBridgeParams { kind })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `PutMessageBridge` — write one bridge config.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error.
+    pub async fn put_message_bridge(
+        &mut self,
+        kind: rsi_common::operator_config::MessageBridgeKindV1,
+        config: rsi_common::operator_config::MessageBridgeConfigV1,
+    ) -> Result<rsi_common::operator_config::MessageBridgeView> {
+        let result = self
+            .request(
+                rsi_common::operator_config::METHOD_PUT_MESSAGE_BRIDGE,
+                serde_json::to_value(rsi_common::operator_config::PutMessageBridgeParams {
+                    kind,
+                    config,
+                })?,
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -2537,6 +3108,21 @@ impl DaemonClient {
         inputs: serde_json::Value,
         parent_id: Option<uuid::Uuid>,
     ) -> Result<uuid::Uuid> {
+        Ok(self
+            .execute_topology_receipt(topology_id, project_id, inputs, parent_id)
+            .await?
+            .0)
+    }
+
+    /// `execute_topology` plus the topology's bridged workflow id from the
+    /// receipt (`None` from a daemon that predates #1753).
+    pub async fn execute_topology_receipt(
+        &mut self,
+        topology_id: uuid::Uuid,
+        project_id: Option<uuid::Uuid>,
+        inputs: serde_json::Value,
+        parent_id: Option<uuid::Uuid>,
+    ) -> Result<(uuid::Uuid, Option<uuid::Uuid>)> {
         let result = self
             .request(
                 "ExecuteTopology",
@@ -2549,7 +3135,9 @@ impl DaemonClient {
             )
             .await?;
         let execution_id: uuid::Uuid = serde_json::from_value(result["execution_id"].clone())?;
-        Ok(execution_id)
+        let workflow_id: Option<uuid::Uuid> =
+            serde_json::from_value(result["workflow_id"].clone()).unwrap_or(None);
+        Ok((execution_id, workflow_id))
     }
 
     /// Fetch the latest snapshot for a workflow execution.
@@ -3563,6 +4151,64 @@ impl DaemonClient {
         Ok(card)
     }
 
+    // --- Prompt files (hub #3040: operator-only, scoped to ~/.rsi/prompts) ---
+
+    /// List the prompt creator's `*.md` prompts, newest first.
+    pub async fn list_prompt_files(
+        &mut self,
+    ) -> Result<rsi_common::prompt_files::ListPromptFilesResponseV1> {
+        let result = self
+            .request(rsi_common::prompt_files::METHOD_LIST, serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Read one prompt by its flat `*.md` name.
+    pub async fn get_prompt_file(
+        &mut self,
+        name: &str,
+    ) -> Result<rsi_common::prompt_files::GetPromptFileResponseV1> {
+        let params = serde_json::to_value(rsi_common::prompt_files::GetPromptFileRequestV1 {
+            name: name.to_string(),
+        })?;
+        let result = self
+            .request(rsi_common::prompt_files::METHOD_GET, params)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Write one prompt atomically; `create_only` refuses an existing name.
+    pub async fn put_prompt_file(
+        &mut self,
+        name: &str,
+        content: &str,
+        create_only: bool,
+    ) -> Result<rsi_common::prompt_files::PutPromptFileResponseV1> {
+        let params = serde_json::to_value(rsi_common::prompt_files::PutPromptFileRequestV1 {
+            name: name.to_string(),
+            content: content.to_string(),
+            create_only,
+        })?;
+        let result = self
+            .request(rsi_common::prompt_files::METHOD_PUT, params)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// Move one prompt to the daemon's recoverable prompt trash.
+    pub async fn delete_prompt_file(
+        &mut self,
+        name: &str,
+    ) -> Result<rsi_common::prompt_files::DeletePromptFileResponseV1> {
+        let params = serde_json::to_value(rsi_common::prompt_files::DeletePromptFileRequestV1 {
+            name: name.to_string(),
+        })?;
+        let result = self
+            .request(rsi_common::prompt_files::METHOD_DELETE, params)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     // --- Issue workspace (operator-only generic RPCs) ---
 
     pub async fn create_issue_v2(
@@ -3655,6 +4301,17 @@ impl DaemonClient {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// `ListIssueHandoffs` (#2420): the stored handoff records of one Issue.
+    pub async fn list_issue_handoffs(
+        &mut self,
+        request: ListIssueHandoffsRequestV1,
+    ) -> Result<ListIssueHandoffsResultV1> {
+        let value = self
+            .request("ListIssueHandoffs", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub async fn archive_issue(
         &mut self,
         request: ArchiveIssueRequestV1,
@@ -3698,11 +4355,35 @@ impl DaemonClient {
 
     /// Update a single daemon config field by name.
     pub async fn update_daemon_config(&mut self, field: &str, value: Value) -> Result<()> {
-        self.request(
-            "UpdateDaemonConfig",
-            serde_json::json!({ "field": field, "value": value }),
-        )
-        .await?;
+        self.config_write_epoch.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .request(
+                "UpdateDaemonConfig",
+                serde_json::json!({ "field": field, "value": value }),
+            )
+            .await;
+        self.config_write_epoch.fetch_add(1, Ordering::SeqCst);
+        result?;
+        Ok(())
+    }
+
+    /// Update several daemon config fields in ONE request (#2236). The daemon
+    /// validates every value first and applies, persists and publishes the set
+    /// as one change: either every field takes effect or none does.
+    pub async fn update_daemon_config_batch(&mut self, updates: &[(String, Value)]) -> Result<()> {
+        let updates: Vec<Value> = updates
+            .iter()
+            .map(|(field, value)| serde_json::json!({ "field": field, "value": value }))
+            .collect();
+        self.config_write_epoch.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .request(
+                "UpdateDaemonConfig",
+                serde_json::json!({ "updates": updates }),
+            )
+            .await;
+        self.config_write_epoch.fetch_add(1, Ordering::SeqCst);
+        result?;
         Ok(())
     }
 
@@ -3718,6 +4399,17 @@ impl DaemonClient {
         decode_sandbox_storage_report(value)
     }
 
+    /// The warm target pools' newest good pool, its age in commits and disk
+    /// use (#1882). Operator/TUI-only.
+    pub async fn get_target_pool_status(
+        &mut self,
+    ) -> Result<rsi_common::target_pool::TargetPoolStatus> {
+        let value = self
+            .request("GetTargetPoolStatus", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// Run one bounded sandbox target-cache pass. `dry_run=true` traverses the
     /// same custody boundary without deleting cache data.
     pub async fn run_sandbox_build_cache_reclaim(
@@ -3731,6 +4423,18 @@ impl DaemonClient {
             )
             .await?;
         decode_sandbox_storage_report(value)
+    }
+
+    pub async fn list_source_worktree_settlement_runs(
+        &mut self,
+    ) -> Result<Vec<rsi_common::cohort_settlement::SourceWorktreeSettlementRunSummaryV1>> {
+        let value = self
+            .request(
+                "ListSourceWorktreeSettlementRuns",
+                serde_json::json!({"limit":20}),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
     }
 
     pub async fn list_source_worktree_cohorts(
@@ -3949,6 +4653,67 @@ mod tests {
     }
 
     use super::*;
+
+    /// #2067: the `rsi` client forwards the session token as the request's
+    /// transport-only `session_token` (never in params), so the daemon applies
+    /// its refusal of operator methods to tokened callers; without a token the
+    /// operator's calls are unchanged.
+    #[tokio::test]
+    async fn the_client_forwards_the_session_token_so_operator_methods_are_refused() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        let socket_path = crate::test_support::short_socket_path("token-forward");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        let server = tokio::spawn(async move {
+            // Mirrors the daemon's gate: a tokened caller may not call an
+            // operator-only method (crates/rsid/src/rpc.rs).
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                log.lock().unwrap().push(request.clone());
+                let response = if request.get("session_token").is_some() {
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"],
+                        "error": {"code": -32602, "message": "not available to session-attributed callers"}})
+                } else {
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"],
+                        "result": {"enabled": true, "batch_size": 1, "entries": []}})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let id = uuid::Uuid::new_v4();
+        let mut tokened =
+            DaemonClient::new(socket_path.clone()).with_session_token(Some("synthetic-token"));
+        assert!(tokened.is_session_attributed());
+        tokened.connect().await.unwrap();
+        let refused = tokened.get_rolling_queue_entries(&[id]).await.unwrap_err();
+        assert!(matches!(refused, ClientError::Rpc { code: -32602, .. }));
+        assert!(!format!("{refused:?}").contains("synthetic-token"));
+        let mut operator = DaemonClient::new(socket_path.clone()).with_session_token(None);
+        operator.connect().await.unwrap();
+        let answered = operator.get_rolling_queue_entries(&[id]).await.unwrap();
+        assert!(answered.entries.is_empty());
+        server.await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0]["session_token"], "synthetic-token");
+        assert!(
+            seen[0]["params"]
+                .to_string()
+                .find("synthetic-token")
+                .is_none()
+        );
+        assert!(seen[1].get("session_token").is_none());
+        // #2068: a watch names its entries instead of reading a newest page.
+        assert_eq!(seen[1]["params"]["entry_ids"], serde_json::json!([id]));
+    }
 
     #[tokio::test]
     async fn discover_models_capabilities_decode_live_metadata_and_legacy_daemons() {
@@ -4416,6 +5181,9 @@ mod tests {
             pass_contention: None,
             refusals: Vec::new(),
             shared_target: None,
+            stray_targets: None,
+            computed_at: None,
+            age_ms: None,
         };
         let decoded = decode_sandbox_storage_report(serde_json::to_value(v2).unwrap()).unwrap();
         assert!(matches!(decoded, SandboxBuildCacheReclaimReportWire::V2(_)));
@@ -4454,6 +5222,7 @@ mod tests {
             &["ci".to_string()],
             None,
             None,
+            None,
         );
 
         let decoded: rsi_common::rpc::LaunchSessionParams = serde_json::from_value(params).unwrap();
@@ -4480,6 +5249,7 @@ mod tests {
             None,
             None,
             &["ci".to_string()],
+            None,
             None,
             None,
         );
@@ -4512,6 +5282,7 @@ mod tests {
             &["ci".to_string()],
             Some(workflow_id),
             None,
+            None,
         );
 
         let decoded: rsi_common::rpc::LaunchSessionParams = serde_json::from_value(params).unwrap();
@@ -4519,9 +5290,45 @@ mod tests {
         assert_eq!(decoded.workflow_id_override, None);
     }
 
+    /// #2758: a requested CLI access mode rides as the operator-only
+    /// `tool_policy.cli_access`; a plain launch keeps its exact wire form.
+    #[test]
+    fn launch_session_with_opts_carries_cli_access_only_when_requested() {
+        let params = |cli_access| {
+            launch_session_with_opts_params(
+                "query",
+                None,
+                None,
+                SessionProvider::Claude,
+                None,
+                None,
+                Some(rsi_common::types::SessionKind::Standard),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["ci".to_string()],
+                None,
+                None,
+                cli_access,
+            )
+        };
+        assert!(params(None).get("tool_policy").is_none());
+        let decoded: rsi_common::rpc::LaunchSessionParams = serde_json::from_value(params(Some(
+            rsi_common::harness_tool_policy::CliAccessMode::ReadOnly,
+        )))
+        .unwrap();
+        assert_eq!(
+            decoded.tool_policy.and_then(|policy| policy.cli_access),
+            Some(rsi_common::harness_tool_policy::CliAccessMode::ReadOnly)
+        );
+    }
+
     #[test]
     fn custom_provider_launch_opts_serializes_parent_id() {
         let parent_id = uuid::Uuid::new_v4();
+        let provider_id = uuid::Uuid::new_v4();
         let params = launch_session_with_opts_custom_provider_params(
             "query",
             Some("explicit title"),
@@ -4532,7 +5339,7 @@ mod tests {
             Some(rsi_common::types::SessionKind::Bug),
             None,
             "http://localhost:11434/v1",
-            "test-key",
+            provider_id,
             None,
             None,
             Some(parent_id),
@@ -4551,6 +5358,9 @@ mod tests {
             decoded.openai_base_url.as_deref(),
             Some("http://localhost:11434/v1")
         );
+        // hub #3039: the key is named by provider id, never sent inline.
+        assert_eq!(decoded.custom_provider_id, Some(provider_id));
+        assert_eq!(decoded.openai_api_key, None);
     }
 
     #[test]

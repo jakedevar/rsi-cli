@@ -11,14 +11,25 @@
     <span class="brand">rsi</span>
     <span id="conn" class="conn conn-unknown" title="">connecting…</span>
     <span class="spacer"></span>
-    <button id="new-session" class="btn primary" type="button">New session</button>
+    <label class="check" title="Drive the app with the TUI's vim keys while focus is not in a text field"><input id="vim-keys" type="checkbox" checked> Vim keys</label>
+    <button id="open-issues" class="btn" type="button" data-action="issues-open">Issues</button>
+    <button id="open-palette" class="btn" type="button" data-action="palette">Actions…</button>
+    <button id="new-session" class="btn primary" type="button" data-action="launch">New session</button>
   </header>
+  <div id="boot-banner" class="boot-banner" role="alert" hidden></div>
   <div class="layout">
     <aside class="sidebar">
       <div class="view-toggle" role="group" aria-label="Session view">
-        <button id="view-active" class="seg active" type="button" aria-pressed="true">Active</button>
-        <button id="view-archived" class="seg" type="button" aria-pressed="false">Archived</button>
+        <button id="view-active" class="seg active" type="button" aria-pressed="true" data-action="view-active">Active</button>
+        <button id="view-archived" class="seg" type="button" aria-pressed="false" data-action="view-archived">Archived</button>
       </div>
+      <div class="list-tools">
+        <button class="btn" type="button" data-action="choose-project">Project…</button>
+        <button class="btn" type="button" data-action="choose-sort">Sort…</button>
+        <button class="btn" type="button" data-action="attention-list">Waiting</button>
+        <button class="btn" type="button" data-action="session-info">Info</button>
+      </div>
+      <div id="list-scope" class="list-scope" aria-live="polite"></div>
       <div class="filters">
         <select id="project-filter" aria-label="Project"><option value="">All projects</option></select>
         <input id="search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions">
@@ -27,7 +38,7 @@
       <ul id="session-list" class="session-list" aria-label="Sessions"></ul>
     </aside>
     <main class="detail">
-      <div id="empty" class="empty">Select a session.</div>
+      <div id="empty" class="empty" aria-live="polite">Select a session.</div>
       <section id="session-view" class="session-view" hidden>
         <div class="session-head">
           <div class="head-main">
@@ -35,12 +46,12 @@
             <div id="s-meta" class="meta"></div>
           </div>
           <div class="head-actions">
-            <button id="toggle-tools" class="btn" type="button">Hide tools</button>
+            <button id="toggle-tools" class="btn" type="button" data-action="toggle-tools">Hide tools</button>
             <span id="pause-state" class="pause-state" hidden></span>
-            <button id="clear-pause" class="btn" type="button" hidden>Clear pause</button>
-            <button id="interrupt" class="btn danger" type="button" title="Soft pause: interrupt the running turn">Interrupt</button>
-            <button id="hard-pause" class="btn danger" type="button" title="Hard pause: interrupt and hold until cleared">Hard pause</button>
-            <button id="archive" class="btn" type="button">Archive</button>
+            <button id="clear-pause" class="btn" type="button" hidden data-action="clear-pause">Clear pause</button>
+            <button id="interrupt" class="btn danger" type="button" data-action="soft-interrupt">Interrupt</button>
+            <button id="hard-pause" class="btn danger" type="button" data-action="hard-pause">Hard pause</button>
+            <button id="archive" class="btn" type="button" data-action="archive">Archive</button>
           </div>
         </div>
         <div id="approval-banner" class="approval-banner" hidden></div>
@@ -52,7 +63,43 @@
       </section>
     </main>
   </div>
+  <section id="issues-view" class="issues" aria-label="Issues" hidden>
+    <header class="issues-head">
+      <h1>Issues</h1>
+      <select id="issues-project" aria-label="Project"></select>
+      <span id="issues-chips" class="chips"></span>
+      <span class="spacer"></span>
+      <span id="issues-status" class="meta"></span>
+      <button id="issues-sort" class="btn" type="button" data-action="issues-sort">Sort</button>
+      <button class="btn" type="button" data-action="issues-filters">Filters…</button>
+      <button class="btn" type="button" data-action="issues-refresh">Refresh</button>
+      <button class="btn primary" type="button" data-action="issues-new">New Issue</button>
+      <button class="btn" type="button" data-action="issues-close">Close</button>
+    </header>
+    <button id="issues-retry" class="issues-retry" type="button" hidden></button>
+    <div class="issues-body">
+      <div class="issues-listpane">
+        <ul id="issues-list" class="issues-list" role="listbox" aria-label="Issues" tabindex="0"></ul>
+        <div class="issues-pager">
+          <button id="issues-page-prev" class="btn" type="button" data-action="issues-page-prev">← Previous page</button>
+          <button id="issues-page-next" class="btn" type="button" data-action="issues-page-next">Next page →</button>
+        </div>
+      </div>
+      <div id="issues-inspector" class="issues-inspector" tabindex="-1" aria-label="Issue details"></div>
+    </div>
+  </section>
   <div id="toast" class="toast" hidden></div>
+  <div id="keyhint" class="keyhint" hidden aria-live="polite"></div>
+  <div id="cmdline" class="cmdline" hidden aria-live="polite"></div>
+
+  <dialog id="palette" class="palette" aria-label="Command palette">
+    <input id="palette-input" type="text" placeholder="Search actions…" autocomplete="off" spellcheck="false" aria-label="Search actions" aria-controls="palette-list">
+    <ul id="palette-list" class="palette-list" role="listbox" aria-label="Actions"></ul>
+  </dialog>
+
+  <dialog id="issue-dialog" class="issue-dialog" aria-label="Issue form">
+    <form id="issue-form" method="dialog" class="launch-form"></form>
+  </dialog>
 
   <dialog id="launch-dialog">
     <form id="launch-form" method="dialog" class="launch-form">

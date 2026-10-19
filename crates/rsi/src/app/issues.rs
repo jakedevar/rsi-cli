@@ -4,13 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsi_common::issue_workspace::{
     ArchiveIssueRequestV1, CreateIssueV2RequestV1, GetIssueInProjectRequestV1,
-    ISSUE_WORKSPACE_DEFAULT_LIMIT, IssueContentPatchV2, IssueDependencyCursorV1,
-    IssueDependencyDirectionV1, IssueDependencyMutationRequestV1, IssueDependencyMutationResultV1,
-    IssueDependencyPageV1, IssueDispatchRecordV1, IssueTrackerStatusV1, IssueTrackerTickResultV1,
-    IssueWorkspaceCursorV1, IssueWorkspaceErrorV1, IssueWorkspacePageV1, IssueWorkspaceRowV1,
-    ListIssueDependenciesRequestV1, ListIssueEventsV2RequestV1, ListIssuesPageRequestV1,
-    NullablePatchV1, OperatorIssueMutationResultV1, PageDirectionV1, RestoreIssueRequestV1,
-    UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
+    ISSUE_HANDOFF_LIST_DEFAULT_LIMIT, ISSUE_WORKSPACE_DEFAULT_LIMIT, IssueContentPatchV2,
+    IssueDependencyCursorV1, IssueDependencyDirectionV1, IssueDependencyMutationRequestV1,
+    IssueDependencyMutationResultV1, IssueDependencyPageV1, IssueDispatchRecordV1,
+    IssueTrackerStatusV1, IssueTrackerTickResultV1, IssueWorkspaceCursorV1, IssueWorkspaceErrorV1,
+    IssueWorkspacePageV1, IssueWorkspaceRowV1, ListIssueDependenciesRequestV1,
+    ListIssueEventsV2RequestV1, ListIssueHandoffsRequestV1, ListIssueHandoffsResultV1,
+    ListIssuesPageRequestV1, NullablePatchV1, OperatorIssueMutationResultV1, PageDirectionV1,
+    RestoreIssueRequestV1, UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
 };
 use rsi_common::types::{Issue, IssueEventPageV1, IssueStatus, Session};
 use uuid::Uuid;
@@ -18,11 +19,11 @@ use uuid::Uuid;
 use super::{App, replace_node};
 use crate::types::{
     ISSUE_WORKSPACE_FOCUSED_REFRESH_MS, ISSUE_WORKSPACE_STALE_AFTER_MS, IssueCancelConfirmation,
-    IssueDependencyReconciliation, IssueEditorMode, IssueEditorState,
-    IssuePendingDependencyMutation, IssuePendingMutation, IssueWorkspaceDataKind,
+    IssueDependencyReconciliation, IssueEditorMode, IssueEditorState, IssueLocalFilters,
+    IssueNumberJump, IssuePendingDependencyMutation, IssuePendingMutation, IssueWorkspaceDataKind,
     IssueWorkspaceFocus, IssueWorkspaceLoadState, IssueWorkspaceLocalRequestIdentity,
     IssueWorkspacePageAnchor, IssueWorkspaceRequestIdentity, IssueWorkspaceSavedView,
-    IssueWorkspaceState, IssueWorkspaceTab, Pane, PaneId, SplitNode,
+    IssueWorkspaceState, IssueWorkspaceTab, Pane, PaneId, SplitNode, parse_issue_number,
 };
 
 #[derive(Debug)]
@@ -47,6 +48,10 @@ pub enum IssueWorkspaceAsyncPayload {
         requested_issue_id: Uuid,
         after_sequence: Option<i64>,
         page: IssueEventPageV1,
+    },
+    Handoffs {
+        requested_issue_id: Uuid,
+        page: ListIssueHandoffsResultV1,
     },
     DependencyCandidates {
         requested_issue_id: Uuid,
@@ -305,6 +310,190 @@ impl App {
         pane_id
     }
 
+    /// Open the Issues workspace on the Issue with this number (#2381): the
+    /// one entry point behind `:issue N`, the to-do `issue:#N` link, the `#`
+    /// key and a number typed into the search.
+    pub(crate) fn open_issue_number(&mut self, number: i64) {
+        let pane_id = self.open_or_focus_issues();
+        self.begin_issue_number_jump(pane_id, number);
+    }
+
+    /// `:issue [N]`: a number opens that Issue, blank opens the go-to prompt.
+    pub(crate) fn open_issue_command(&mut self, argument: &str) {
+        let argument = argument.trim();
+        let pane_id = self.open_or_focus_issues();
+        if argument.is_empty() {
+            self.open_issue_goto_editor(pane_id);
+            return;
+        }
+        match parse_issue_number(argument) {
+            Some(number) => self.begin_issue_number_jump(pane_id, number),
+            None => self.notify_error(format!("Not an Issue number: {argument} (use :issue 2377)")),
+        }
+    }
+
+    /// Select and open Issue `number`. Already on the visible page: select it.
+    /// Otherwise narrow Local to `#N` across every status and the archive; the
+    /// page that arrives selects the row, or says the number does not exist.
+    pub(crate) fn begin_issue_number_jump(&mut self, pane_id: PaneId, number: i64) {
+        let mut visible = None;
+        let mut blocked = false;
+        if let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) {
+            if state
+                .transient
+                .editor
+                .as_ref()
+                .is_some_and(|editor| !matches!(editor.mode, IssueEditorMode::Filter))
+            {
+                blocked = true;
+            } else {
+                state.active_tab = IssueWorkspaceTab::Local;
+                state.transient.editor = None;
+                state.transient.cancel_confirmation = None;
+                state.transient.archive_confirmation = None;
+                state.transient.pending_yank = false;
+                state.transient.pending_jump = false;
+                let position = state.transient.current_page.as_ref().and_then(|page| {
+                    page.rows
+                        .iter()
+                        .position(|row| row.issue.display_number == number)
+                });
+                if let Some(position) = position {
+                    let issue_id = state
+                        .transient
+                        .current_page
+                        .as_ref()
+                        .map(|page| page.rows[position].issue.id);
+                    state.transient.pending_number_jump = None;
+                    state.local.selected_issue_id = issue_id;
+                    state.local.selected_row = position;
+                    state.local.inspector_open = true;
+                    state.focus = IssueWorkspaceFocus::Inspector;
+                    visible = issue_id;
+                } else {
+                    let (restore_filters, restore_saved_view) = state
+                        .transient
+                        .pending_number_jump
+                        .take()
+                        .map(|jump| (jump.restore_filters, jump.restore_saved_view))
+                        .unwrap_or_else(|| (state.local.filters.clone(), state.local.saved_view));
+                    state.transient.pending_number_jump = Some(IssueNumberJump {
+                        number,
+                        restore_filters,
+                        restore_saved_view,
+                    });
+                    state.local.filters = IssueLocalFilters {
+                        query: Some(format!("#{number}")),
+                        archive: rsi_common::types::IssueArchiveFilterV1::All,
+                        ..IssueLocalFilters::default()
+                    };
+                    state.local.saved_view = None;
+                    reset_local_pagination(state);
+                    state.focus = IssueWorkspaceFocus::Table;
+                }
+            }
+        }
+        if blocked {
+            self.notify("Close the open Issue form first");
+            return;
+        }
+        if let Some(issue_id) = visible {
+            self.reconcile_associated_session_selection(pane_id, issue_id);
+            self.request_issue_inspector(pane_id, issue_id);
+        } else {
+            self.request_issue_workspace_active(pane_id, false);
+        }
+        self.mark_dirty();
+    }
+
+    /// `}` / `{`: move the inspector cursor over its folding sections and
+    /// related Issues, wrapping at the ends.
+    pub(crate) fn move_issue_detail_cursor(&mut self, pane_id: PaneId, delta: isize) {
+        if let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) {
+            let count = crate::ui::issue_detail::state_items(state).len();
+            if count == 0 {
+                return;
+            }
+            let current = state.transient.detail_cursor.min(count - 1) as isize;
+            state.transient.detail_cursor = (current + delta).rem_euclid(count as isize) as usize;
+            state.transient.detail_follow = true;
+        }
+        self.mark_dirty();
+    }
+
+    /// `o`: fold or unfold the section under the cursor, or open the related
+    /// Issue under it (remembering where we came from for `B`).
+    pub(crate) fn activate_issue_detail_item(&mut self, pane_id: PaneId) {
+        use crate::ui::issue_detail::{DetailItem, inspected_issue, state_items};
+        let mut follow = None;
+        if let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) {
+            let items = state_items(state);
+            let Some(item) = items
+                .get(
+                    state
+                        .transient
+                        .detail_cursor
+                        .min(items.len().saturating_sub(1)),
+                )
+                .copied()
+            else {
+                return;
+            };
+            match item {
+                DetailItem::Section(_) | DetailItem::Handoff(_) => {
+                    if let Some(issue_id) = state.local.selected_issue_id {
+                        let key = (issue_id, item.fold_key());
+                        if !state.transient.detail_expanded.remove(&key) {
+                            state.transient.detail_expanded.insert(key);
+                        }
+                        state.transient.detail_follow = true;
+                    }
+                }
+                DetailItem::Issue(number) => {
+                    let from = inspected_issue(state).map(|issue| issue.display_number);
+                    if let Some(from) = from {
+                        state.transient.detail_history.push(from);
+                        if state.transient.detail_history.len() > 32 {
+                            state.transient.detail_history.remove(0);
+                        }
+                    }
+                    follow = Some(number);
+                }
+            }
+        }
+        if let Some(number) = follow {
+            self.begin_issue_number_jump(pane_id, number);
+        }
+        self.mark_dirty();
+    }
+
+    /// `B`: return to the Issue a related link was followed from.
+    pub(crate) fn issue_detail_back(&mut self, pane_id: PaneId) {
+        let previous = match self.active_tab_mut().layout.find_pane_mut(pane_id) {
+            Some(Pane::Issues(state)) => state.transient.detail_history.pop(),
+            _ => None,
+        };
+        match previous {
+            Some(number) => self.begin_issue_number_jump(pane_id, number),
+            None => self.notify("No earlier Issue to go back to"),
+        }
+    }
+
+    /// The `#` key: the search prompt, primed for an Issue number.
+    fn open_issue_goto_editor(&mut self, pane_id: PaneId) {
+        self.open_issue_filter_editor(pane_id, 1);
+        if let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id)
+            && let Some(editor) = &mut state.transient.editor
+            && matches!(editor.mode, IssueEditorMode::Filter)
+        {
+            editor.dependency_text = "#".to_string();
+            if let Some(filters) = &mut editor.filter_draft {
+                filters.query = Some("#".to_string());
+            }
+            editor.error = Some("Go to Issue: type its number · Enter opens · Esc cancels".into());
+        }
+    }
+
     /// Restore the pane replaced by the currently focused Issues workspace.
     pub fn restore_pre_issues_pane(&mut self) -> bool {
         let pane_id = self.active_tab().focused_pane;
@@ -487,6 +676,7 @@ impl App {
                             assignee: local_identity.as_ref().unwrap().filters.assignee.clone(),
                             unassigned: local_identity.as_ref().unwrap().filters.unassigned,
                             labels_all: local_identity.as_ref().unwrap().filters.labels_all.clone(),
+                            labels_any: local_identity.as_ref().unwrap().filters.labels_any.clone(),
                             provenance: local_identity.as_ref().unwrap().filters.provenance.clone(),
                             query: local_identity.as_ref().unwrap().filters.query.clone(),
                             archive: local_identity.as_ref().unwrap().filters.archive,
@@ -559,6 +749,7 @@ impl App {
             None,
         );
         self.request_issue_event_page_in_tab(tab_index, pane_id, issue_id, None);
+        self.request_issue_handoffs_in_tab(tab_index, pane_id, issue_id);
     }
 
     fn request_issue_dependency_reconciliation_in_tab(
@@ -776,6 +967,55 @@ impl App {
         });
     }
 
+    /// #2420: load the stored handoff records of the inspected Issue beside the
+    /// other inspector data.
+    fn request_issue_handoffs_in_tab(&mut self, tab_index: usize, pane_id: PaneId, issue_id: Uuid) {
+        let data_kind = IssueWorkspaceDataKind::Handoffs;
+        let Some(tab) = self.tabs.get_mut(tab_index) else {
+            return;
+        };
+        let Some(Pane::Issues(state)) = tab.layout.find_pane_mut(pane_id) else {
+            return;
+        };
+        let Some(project_id) = state.project_id else {
+            return;
+        };
+        let request_identity = IssueWorkspaceRequestIdentity::Handoffs { issue_id };
+        let Some(generation) = state.begin_request(data_kind, request_identity.clone()) else {
+            return;
+        };
+        state.data_state_mut(data_kind).load_state = IssueWorkspaceLoadState::Loading;
+        let socket_path = self.client.socket_path().to_path_buf();
+        let tx = self.issues_tx.clone();
+        tokio::spawn(async move {
+            let mut client = crate::client::DaemonClient::new(socket_path);
+            let outcome = match client.connect().await {
+                Err(error) => Err(async_error(error)),
+                Ok(()) => client
+                    .list_issue_handoffs(ListIssueHandoffsRequestV1 {
+                        project_id,
+                        issue_id,
+                        after_sequence: None,
+                        limit: ISSUE_HANDOFF_LIST_DEFAULT_LIMIT,
+                    })
+                    .await
+                    .map(|page| IssueWorkspaceAsyncPayload::Handoffs {
+                        requested_issue_id: issue_id,
+                        page,
+                    })
+                    .map_err(async_error),
+            };
+            let _ = tx.send(IssueWorkspaceAsyncEvent {
+                pane_id,
+                project_id: Some(project_id),
+                data_kind,
+                generation,
+                request_identity,
+                outcome,
+            });
+        });
+    }
+
     fn request_issue_dependency_candidates(
         &mut self,
         pane_id: PaneId,
@@ -829,6 +1069,7 @@ impl App {
                         assignee: None,
                         unassigned: false,
                         labels_all: Vec::new(),
+                        labels_any: Vec::new(),
                         provenance: Vec::new(),
                         query: (!query.trim().is_empty()).then_some(query.clone()),
                         archive: rsi_common::types::IssueArchiveFilterV1::Active,
@@ -972,6 +1213,27 @@ impl App {
                                     direction,
                                     page,
                                 } => {
+                                    if let Some(jump) = state.transient.pending_number_jump.take() {
+                                        let found = page
+                                            .rows
+                                            .iter()
+                                            .find(|row| row.issue.display_number == jump.number);
+                                        if let Some(row) = found {
+                                            state.local.selected_issue_id = Some(row.issue.id);
+                                            state.local.inspector_open = true;
+                                            state.focus = IssueWorkspaceFocus::Inspector;
+                                        } else {
+                                            state.local.filters = jump.restore_filters;
+                                            state.local.saved_view = jump.restore_saved_view;
+                                            reset_local_pagination(state);
+                                            refresh_kinds.push(IssueWorkspaceDataKind::LocalPage);
+                                            notification = Some(format!(
+                                                "No Issue #{} in this project",
+                                                jump.number
+                                            ));
+                                            error_notification = true;
+                                        }
+                                    }
                                     let selected_position =
                                         state.local.selected_issue_id.and_then(|id| {
                                             page.rows.iter().position(|row| row.issue.id == id)
@@ -1058,6 +1320,9 @@ impl App {
                                         state.transient.events_target = None;
                                         state.transient.events_after_sequence = None;
                                         state.transient.events_next_after_sequence = None;
+                                        state.transient.handoffs.clear();
+                                        state.transient.handoffs_target = None;
+                                        state.transient.handoffs_total = 0;
                                         state.transient.blocked_by_cursor = None;
                                         state.transient.blocks_cursor = None;
                                         state.local.selected_associated_session_id = None;
@@ -1110,6 +1375,14 @@ impl App {
                                     state.transient.events_next_after_sequence =
                                         page.next_after_sequence;
                                     state.transient.events = page.events;
+                                }
+                                IssueWorkspaceAsyncPayload::Handoffs {
+                                    requested_issue_id,
+                                    page,
+                                } => {
+                                    state.transient.handoffs_target = Some(requested_issue_id);
+                                    state.transient.handoffs_total = page.total;
+                                    state.transient.handoffs = page.handoffs;
                                 }
                                 IssueWorkspaceAsyncPayload::DependencyCandidates {
                                     requested_issue_id,
@@ -1264,6 +1537,9 @@ impl App {
                             }
                         }
                         Err(error) => {
+                            if event.data_kind == IssueWorkspaceDataKind::LocalPage {
+                                state.transient.pending_number_jump = None;
+                            }
                             let definitive = error.workspace.is_some();
                             let uncertain_dependency = (!definitive
                                 && event.data_kind == IssueWorkspaceDataKind::Mutation)
@@ -1434,6 +1710,9 @@ impl App {
                 issue_id,
                 after_sequence,
             } => self.request_issue_event_page_in_tab(tab_index, pane_id, issue_id, after_sequence),
+            IssueWorkspaceRequestIdentity::Handoffs { issue_id } => {
+                self.request_issue_handoffs_in_tab(tab_index, pane_id, issue_id)
+            }
             IssueWorkspaceRequestIdentity::DependencyCandidates { issue_id, query } => {
                 self.request_issue_dependency_candidates_in_tab(tab_index, pane_id, issue_id, query)
             }
@@ -1547,6 +1826,11 @@ fn current_request_identity(
                 })
                 })
             }),
+        IssueWorkspaceDataKind::Handoffs => state
+            .local
+            .selected_issue_id
+            .filter(|issue_id| state.transient.missing_selected_issue_id != Some(*issue_id))
+            .map(|issue_id| IssueWorkspaceRequestIdentity::Handoffs { issue_id }),
         IssueWorkspaceDataKind::DependencyCandidates => {
             state
                 .transient
@@ -1671,6 +1955,12 @@ fn payload_matches_identity(
                 && requested_issue_id == issue_id
                 && after_sequence == expected_after_sequence
         }
+        (
+            IssueWorkspaceAsyncPayload::Handoffs {
+                requested_issue_id, ..
+            },
+            IssueWorkspaceRequestIdentity::Handoffs { issue_id },
+        ) => kind == IssueWorkspaceDataKind::Handoffs && requested_issue_id == issue_id,
         (
             IssueWorkspaceAsyncPayload::DependencyCandidates {
                 requested_issue_id,
@@ -1915,6 +2205,21 @@ impl App {
             ActionId::IssueCopyUuid => self.copy_selected_issue(pane_id, false),
             ActionId::IssueCopyNumber => self.copy_selected_issue(pane_id, true),
             ActionId::IssueSearch => self.open_issue_filter_editor(pane_id, 1),
+            ActionId::IssueGoToNumber => self.open_issue_goto_editor(pane_id),
+            ActionId::IssueOperatorFilter => {
+                if let Some(Pane::Issues(state)) =
+                    self.active_tab_mut().layout.find_pane_mut(pane_id)
+                {
+                    state.local.filters.toggle_operator_only();
+                    state.local.saved_view = None;
+                    reset_local_pagination(state);
+                }
+                self.request_issue_workspace_active(pane_id, false);
+            }
+            ActionId::IssueDetailNext => self.move_issue_detail_cursor(pane_id, 1),
+            ActionId::IssueDetailPrevious => self.move_issue_detail_cursor(pane_id, -1),
+            ActionId::IssueDetailActivate => self.activate_issue_detail_item(pane_id),
+            ActionId::IssueDetailBack => self.issue_detail_back(pane_id),
             ActionId::IssueFilter => self.open_issue_filter_editor(pane_id, 0),
             ActionId::IssueSort => {
                 if let Some(Pane::Issues(state)) =
@@ -2437,6 +2742,25 @@ impl App {
     }
 
     fn select_issue_editor_value(&mut self, pane_id: PaneId) {
+        // Enter in the search field applies it, so `/` then a number then Enter
+        // lands on the Issue (#2381).
+        let search_field = match self.active_tab_mut().layout.find_pane_mut(pane_id) {
+            Some(Pane::Issues(state)) => match &mut state.transient.editor {
+                Some(editor)
+                    if matches!(editor.mode, IssueEditorMode::Filter)
+                        && editor.active_field == 1 =>
+                {
+                    sync_editor_derived(editor);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if search_field {
+            self.submit_issue_editor(pane_id, false);
+            return;
+        }
         let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) else {
             return;
         };
@@ -3081,9 +3405,22 @@ impl App {
                 let Some(filters) = editor.filter_draft else {
                     return;
                 };
+                // A bare number (`2377`, `#2377`) in the search goes straight to
+                // that Issue instead of filtering (#2381).
+                if let Some(query) = filters.query.as_deref() {
+                    if let Some(number) = parse_issue_number(query) {
+                        self.begin_issue_number_jump(pane_id, number);
+                        return;
+                    }
+                    if query.trim() == "#" {
+                        self.set_issue_editor_error(pane_id, "Type an Issue number after #");
+                        return;
+                    }
+                }
                 if let Some(Pane::Issues(state)) =
                     self.active_tab_mut().layout.find_pane_mut(pane_id)
                 {
+                    state.transient.pending_number_jump = None;
                     state.local.filters = filters;
                     state.local.saved_view = editor.filter_saved_view;
                     state.local.mine_assignee = editor.filter_mine_assignee;
@@ -3734,6 +4071,257 @@ mod tests {
         data.last_good_ms = Some(now_ms());
     }
 
+    fn jump_app() -> (App, Uuid, PaneId) {
+        let mut app = with_session_list(0);
+        let project_id = Uuid::new_v4();
+        app.tabs[app.active_tab].project_id = Some(project_id);
+        let pane_id = app.open_or_focus_issues();
+        (app, project_id, pane_id)
+    }
+
+    fn issues_state(app: &App, pane_id: PaneId) -> &IssueWorkspaceState {
+        match app.active_tab().layout.find_pane(pane_id) {
+            Some(Pane::Issues(state)) => state,
+            _ => panic!("Issues pane"),
+        }
+    }
+
+    /// The Local page the daemon would answer to the request now in flight.
+    fn local_page_event(
+        app: &App,
+        pane_id: PaneId,
+        project_id: Uuid,
+        issues: Vec<Issue>,
+    ) -> IssueWorkspaceAsyncEvent {
+        let state = issues_state(app, pane_id);
+        IssueWorkspaceAsyncEvent {
+            pane_id,
+            project_id: Some(project_id),
+            data_kind: IssueWorkspaceDataKind::LocalPage,
+            generation: state.generation(IssueWorkspaceDataKind::LocalPage),
+            request_identity: state
+                .request_identity(IssueWorkspaceDataKind::LocalPage)
+                .cloned()
+                .expect("a Local request is in flight"),
+            outcome: Ok(IssueWorkspaceAsyncPayload::LocalPage {
+                cursor: None,
+                direction: PageDirectionV1::Forward,
+                page: IssueWorkspacePageV1 {
+                    rows: issues.into_iter().map(fixture_row).collect(),
+                    previous_cursor: None,
+                    next_cursor: None,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn issue_numbers_parse_from_every_form_the_operator_types() {
+        for (input, expected) in [
+            ("2377", Some(2377)),
+            ("#2377", Some(2377)),
+            (" #2377 ", Some(2377)),
+            ("issue:#2377", Some(2377)),
+            ("issue:2377", Some(2377)),
+            ("0", None),
+            ("#", None),
+            ("", None),
+            ("23x", None),
+            ("-5", None),
+            ("scheduler", None),
+            ("99999999999999999999", None),
+        ] {
+            assert_eq!(parse_issue_number(input), expected, "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn jumping_to_a_hidden_number_narrows_local_to_that_number_across_the_archive() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        let previous = IssueLocalFilters {
+            labels_all: vec!["kept".to_string()],
+            ..IssueLocalFilters::default()
+        };
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id) {
+            state.local.filters = previous.clone();
+        }
+        app.open_issue_number(2377);
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.local.filters.query.as_deref(), Some("#2377"));
+        assert_eq!(
+            state.local.filters.archive,
+            rsi_common::types::IssueArchiveFilterV1::All
+        );
+        assert!(state.local.filters.statuses.is_empty());
+        assert!(state.local.filters.labels_all.is_empty());
+        let jump = state
+            .transient
+            .pending_number_jump
+            .as_ref()
+            .expect("a go-to-number request");
+        assert_eq!(jump.number, 2377);
+        assert_eq!(jump.restore_filters, previous);
+    }
+
+    #[tokio::test]
+    async fn the_page_for_a_number_selects_that_row_and_opens_it() {
+        let (mut app, project_id, pane_id) = jump_app();
+        let other = fixture_issue(project_id, Uuid::new_v4(), 12, "Other");
+        let target = fixture_issue(project_id, Uuid::new_v4(), 2377, "Archived target");
+        app.begin_issue_number_jump(pane_id, 2377);
+        let event = local_page_event(&app, pane_id, project_id, vec![other, target.clone()]);
+        app.apply_issue_workspace_event(event);
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.local.selected_issue_id, Some(target.id));
+        assert_eq!(state.local.selected_row, 1);
+        assert!(state.local.inspector_open);
+        assert_eq!(state.focus, IssueWorkspaceFocus::Inspector);
+        assert!(state.transient.pending_number_jump.is_none());
+        assert_eq!(state.local.filters.query.as_deref(), Some("#2377"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_number_says_so_and_restores_the_previous_filters() {
+        let (mut app, project_id, pane_id) = jump_app();
+        let previous = IssueLocalFilters {
+            labels_all: vec!["kept".to_string()],
+            ..IssueLocalFilters::default()
+        };
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id) {
+            state.local.filters = previous.clone();
+        }
+        app.begin_issue_number_jump(pane_id, 999_999);
+        let event = local_page_event(&app, pane_id, project_id, Vec::new());
+        app.apply_issue_workspace_event(event);
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.local.filters, previous);
+        assert!(state.transient.pending_number_jump.is_none());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("No Issue #999999"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_already_on_the_page_is_selected_without_a_new_filter() {
+        let (mut app, project_id, pane_id) = jump_app();
+        let first = fixture_issue(project_id, Uuid::new_v4(), 10, "First");
+        let second = fixture_issue(project_id, Uuid::new_v4(), 11, "Second");
+        install_issue_page(&mut app, pane_id, first);
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id)
+            && let Some(page) = &mut state.transient.current_page
+        {
+            page.rows.push(fixture_row(second.clone()));
+        }
+        app.begin_issue_number_jump(pane_id, 11);
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.local.selected_issue_id, Some(second.id));
+        assert!(state.local.inspector_open);
+        assert!(state.transient.pending_number_jump.is_none());
+        assert_eq!(state.local.filters.query, None);
+    }
+
+    #[tokio::test]
+    async fn the_issue_command_takes_numbers_and_rejects_anything_else() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        app.open_issue_command("#41");
+        assert_eq!(
+            issues_state(&app, pane_id)
+                .transient
+                .pending_number_jump
+                .as_ref()
+                .map(|jump| jump.number),
+            Some(41)
+        );
+        app.open_issue_command("scheduler");
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("Not an Issue number: scheduler"))
+        );
+        app.open_issue_command("");
+        let editor = issues_state(&app, pane_id)
+            .transient
+            .editor
+            .as_ref()
+            .expect("a bare :issue opens the go-to prompt");
+        assert_eq!(editor.dependency_text, "#");
+    }
+
+    #[tokio::test]
+    async fn the_hash_key_prompts_and_enter_goes_to_the_typed_number() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        assert!(
+            app.handle_issue_workspace_action(crate::action_registry::ActionId::IssueGoToNumber)
+                .await
+        );
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id)
+            && let Some(editor) = &mut state.transient.editor
+        {
+            assert_eq!(editor.dependency_text, "#");
+            editor.dependency_text.push_str("2377");
+        }
+        app.select_issue_editor_value(pane_id);
+        let state = issues_state(&app, pane_id);
+        assert!(state.transient.editor.is_none());
+        assert_eq!(
+            state
+                .transient
+                .pending_number_jump
+                .as_ref()
+                .map(|jump| jump.number),
+            Some(2377)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_hash_asks_for_the_number_instead_of_searching() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        app.open_issue_goto_editor(pane_id);
+        app.select_issue_editor_value(pane_id);
+        let state = issues_state(&app, pane_id);
+        assert!(state.transient.pending_number_jump.is_none());
+        let editor = state.transient.editor.as_ref().expect("editor stays open");
+        assert!(
+            editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Type an Issue number"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_number_in_the_search_goes_to_the_issue_and_text_still_searches() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        app.open_issue_filter_editor(pane_id, 1);
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id)
+            && let Some(editor) = &mut state.transient.editor
+        {
+            editor.dependency_text = "2377".to_string();
+        }
+        app.select_issue_editor_value(pane_id);
+        assert_eq!(
+            issues_state(&app, pane_id)
+                .transient
+                .pending_number_jump
+                .as_ref()
+                .map(|jump| jump.number),
+            Some(2377)
+        );
+
+        app.open_issue_filter_editor(pane_id, 1);
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id)
+            && let Some(editor) = &mut state.transient.editor
+        {
+            editor.dependency_text = "scheduler".to_string();
+        }
+        app.select_issue_editor_value(pane_id);
+        let state = issues_state(&app, pane_id);
+        assert!(state.transient.pending_number_jump.is_none());
+        assert_eq!(state.local.filters.query.as_deref(), Some("scheduler"));
+    }
+
     #[test]
     fn issue_workspace_fake_clock_enforces_cadence_stale_and_one_in_flight() {
         assert_eq!(
@@ -4141,6 +4729,7 @@ mod tests {
                     issue_id: issue.id,
                     expected_row_version: issue.row_version.saturating_sub(1),
                     status: issue.status,
+                    note: None,
                 },
             ),
             issue: issue.clone(),
@@ -7522,6 +8111,185 @@ mod tests {
             notification
                 .message
                 .contains("selected row version advanced")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_key_toggles_the_one_key_operator_filter() {
+        use crate::action_registry::ActionId;
+        let (mut app, _project_id, pane_id) = jump_app();
+        assert!(
+            app.handle_issue_workspace_action(ActionId::IssueOperatorFilter)
+                .await
+        );
+        let filters = &issues_state(&app, pane_id).local.filters;
+        assert!(filters.operator_only());
+        assert_eq!(
+            filters.labels_any,
+            vec![
+                "operator-request".to_string(),
+                "operator-decision".to_string()
+            ]
+        );
+        assert!(
+            app.handle_issue_workspace_action(ActionId::IssueOperatorFilter)
+                .await
+        );
+        let filters = &issues_state(&app, pane_id).local.filters;
+        assert!(!filters.operator_only());
+        assert!(filters.labels_any.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detail_keys_fold_sections_follow_related_issues_and_go_back() {
+        use crate::action_registry::ActionId;
+        let (mut app, project_id, pane_id) = jump_app();
+        let mut issue = fixture_issue(project_id, Uuid::new_v4(), 7, "Parent");
+        issue.body = "Intro mentions #9.\n\n## Handoff\nRESULT abc\n".to_string();
+        install_issue_page(&mut app, pane_id, issue.clone());
+
+        // The section opens, then the cursor moves on to the mentioned Issue.
+        app.handle_issue_workspace_action(ActionId::IssueDetailActivate)
+            .await;
+        assert!(
+            issues_state(&app, pane_id)
+                .transient
+                .detail_expanded
+                .contains(&(issue.id, 1))
+        );
+        app.handle_issue_workspace_action(ActionId::IssueDetailNext)
+            .await;
+        assert_eq!(issues_state(&app, pane_id).transient.detail_cursor, 1);
+        app.handle_issue_workspace_action(ActionId::IssueDetailNext)
+            .await;
+        assert_eq!(
+            issues_state(&app, pane_id).transient.detail_cursor,
+            0,
+            "the cursor wraps"
+        );
+        app.handle_issue_workspace_action(ActionId::IssueDetailPrevious)
+            .await;
+        assert_eq!(issues_state(&app, pane_id).transient.detail_cursor, 1);
+
+        // Following the link is the slice A jump, and remembers where we were.
+        app.handle_issue_workspace_action(ActionId::IssueDetailActivate)
+            .await;
+        let state = issues_state(&app, pane_id);
+        assert_eq!(
+            state
+                .transient
+                .pending_number_jump
+                .as_ref()
+                .map(|jump| jump.number),
+            Some(9)
+        );
+        assert_eq!(state.transient.detail_history, vec![7]);
+
+        app.handle_issue_workspace_action(ActionId::IssueDetailBack)
+            .await;
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.local.selected_issue_id, Some(issue.id));
+        assert!(state.transient.detail_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stored_handoff_loads_collapsed_and_o_unfolds_it() {
+        use crate::action_registry::ActionId;
+        use crate::ui::issue_detail::{DetailItem, state_items};
+        let (mut app, project_id, pane_id) = jump_app();
+        let issue = fixture_issue(project_id, Uuid::new_v4(), 12, "Has a stored handoff");
+        install_issue_page(&mut app, pane_id, issue.clone());
+        let handoff = rsi_common::types::IssueHandoffV1 {
+            sequence: 1,
+            author_session_id: Uuid::new_v4(),
+            body: "RESULT abc123 slice done\nTests green".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let identity = IssueWorkspaceRequestIdentity::Handoffs { issue_id: issue.id };
+        let generation = match app.active_tab_mut().layout.find_pane_mut(pane_id) {
+            Some(Pane::Issues(state)) => state
+                .begin_request(IssueWorkspaceDataKind::Handoffs, identity.clone())
+                .expect("no handoff read in flight"),
+            _ => panic!("Issues pane"),
+        };
+        // A page read for another Issue is not applied to this inspector.
+        app.apply_issue_workspace_event(IssueWorkspaceAsyncEvent {
+            pane_id,
+            project_id: Some(project_id),
+            data_kind: IssueWorkspaceDataKind::Handoffs,
+            generation,
+            request_identity: identity.clone(),
+            outcome: Ok(IssueWorkspaceAsyncPayload::Handoffs {
+                requested_issue_id: Uuid::new_v4(),
+                page: ListIssueHandoffsResultV1 {
+                    handoffs: vec![handoff.clone()],
+                    next_after_sequence: None,
+                    total: 1,
+                },
+            }),
+        });
+        assert!(issues_state(&app, pane_id).transient.handoffs.is_empty());
+
+        // The mismatch restarts the read; answer the restarted one.
+        let generation = issues_state(&app, pane_id).generation(IssueWorkspaceDataKind::Handoffs);
+        app.apply_issue_workspace_event(IssueWorkspaceAsyncEvent {
+            pane_id,
+            project_id: Some(project_id),
+            data_kind: IssueWorkspaceDataKind::Handoffs,
+            generation,
+            request_identity: identity,
+            outcome: Ok(IssueWorkspaceAsyncPayload::Handoffs {
+                requested_issue_id: issue.id,
+                page: ListIssueHandoffsResultV1 {
+                    handoffs: vec![handoff.clone()],
+                    next_after_sequence: None,
+                    total: 1,
+                },
+            }),
+        });
+        let state = issues_state(&app, pane_id);
+        assert_eq!(state.transient.handoffs, vec![handoff]);
+        assert_eq!(state.transient.handoffs_target, Some(issue.id));
+        assert_eq!(state_items(state), vec![DetailItem::Handoff(1)]);
+        assert!(
+            state.transient.detail_expanded.is_empty(),
+            "a stored handoff starts collapsed"
+        );
+
+        let key = (issue.id, DetailItem::Handoff(1).fold_key());
+        app.handle_issue_workspace_action(ActionId::IssueDetailActivate)
+            .await;
+        assert!(
+            issues_state(&app, pane_id)
+                .transient
+                .detail_expanded
+                .contains(&key)
+        );
+        app.handle_issue_workspace_action(ActionId::IssueDetailActivate)
+            .await;
+        assert!(
+            !issues_state(&app, pane_id)
+                .transient
+                .detail_expanded
+                .contains(&key)
+        );
+    }
+
+    #[tokio::test]
+    async fn going_back_with_no_history_says_so() {
+        let (mut app, _project_id, pane_id) = jump_app();
+        app.handle_issue_workspace_action(crate::action_registry::ActionId::IssueDetailBack)
+            .await;
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|notice| notice.message.contains("No earlier Issue"))
+        );
+        assert!(
+            issues_state(&app, pane_id)
+                .transient
+                .detail_history
+                .is_empty()
         );
     }
 }

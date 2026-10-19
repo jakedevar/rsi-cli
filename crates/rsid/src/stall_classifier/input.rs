@@ -458,7 +458,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_happy_path() {
-        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let store = Store::open_in_memory().unwrap();
         let parent_id = Uuid::new_v4();
         let parent = seeded_session(parent_id, SessionKind::Standard, None);
         store.insert_session(&parent).unwrap();
@@ -502,7 +502,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_with_children() {
-        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let store = Store::open_in_memory().unwrap();
         let parent_id = Uuid::new_v4();
         let parent = seeded_session(parent_id, SessionKind::Standard, None);
         store.insert_session(&parent).unwrap();
@@ -529,9 +529,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_missing_session_errors() {
-        let store = Arc::new(Mutex::new(
-            Store::open(std::path::Path::new(":memory:")).unwrap(),
-        ));
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let r = build_classification_input(Uuid::new_v4(), &active, &store, 10, 200).await;

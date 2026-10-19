@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod inherited_listener;
-pub use inherited_listener::inherited_daemon_listener;
+pub use inherited_listener::{InheritedListener, inherited_daemon_listener};
 
 const INCUMBENT_METADATA_MAX_BYTES: u64 = 4 * 1024;
 const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);

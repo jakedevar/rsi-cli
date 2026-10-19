@@ -101,6 +101,31 @@ kitty keyboard protocol; others send it as Backspace.
   and you seat its manager with the first list above. Agents cannot delete or
   archive a project.
 
+**Run a topology on an Issue**
+
+The seeded `issue-implement-review-land` topology implements one Issue in a
+sandbox, has a DB-native reviewer check the commit (with a bounded fix loop),
+and lands the accepted commit through the rolling merge queue. Operator start
+needs a live Epic for the Issue's project and that project's appointed manager
+in Execute mode (the manager owns the review and land nodes, see
+[docs/topology-on-epic/README.md](docs/topology-on-epic/README.md)).
+
+1. `<Space>i` opens the Issues workspace; select the Issue.
+2. Press `T`, or run `:topology run issue-implement-review-land [<epic>]`. The
+   Epic defaults to the Epic enclosing your focused session, else the project's
+   only live Epic; name one (title or id prefix) if there are several. The run
+   view opens on the started execution. If the project has no live manager the
+   start is refused with the reason.
+
+Or paste this to the project manager:
+
+- > Run the issue-implement-review-land topology on #N under Epic E; you are on
+  > call for its questions.
+
+Questions from the run reach that manager first; only gate-class questions
+(production, deletion, spend, credentials, human approval) wait in `<Space>gd`
+for you.
+
 Inspect progress with `<Space>i` (Issues workspace), `<Space>gd` (manager
 decisions awaiting you) and `<Space>n` / `:alerts` (attention history).
 

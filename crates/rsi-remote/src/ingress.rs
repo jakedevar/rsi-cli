@@ -7,12 +7,13 @@ pub enum Method {
     Post,
 }
 
-/// The one optional query string a V1 GET may carry. Rejected shapes never
+/// The optional query fields a V1 GET may carry. Rejected shapes never
 /// produce this struct; see [`parse_request`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Query {
     pub cursor: Option<String>,
     pub before: Option<(i32, i64)>,
+    pub pending_after: Option<String>,
 }
 
 /// A fully validated gateway request. Every field was checked by
@@ -64,7 +65,7 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
     let (path, query) = match target.split_once('?') {
         None => (target, Query::default()),
         Some((path, raw)) => {
-            if !path.starts_with("/api/v1/") {
+            if !path.starts_with("/api/v1/") && !path.starts_with("/api/v2/") {
                 return Err("invalid request line");
             }
             (path, parse_query(raw)?)
@@ -74,17 +75,24 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
         return Err("invalid request line");
     }
     let answer = answer_route(path);
+    let message = message_route(path);
     let method = match (parts[0], path) {
-        ("GET", path) if allowed_get(path) && answer.is_none() => Method::Get,
+        ("GET", path) if allowed_get(path) && answer.is_none() && message.is_none() => Method::Get,
         ("POST", "/auth/session" | "/auth/logout") => Method::Post,
-        ("POST", _) if answer.is_some() => Method::Post,
+        ("POST", _) if answer.is_some() || message.is_some() => Method::Post,
         _ => return Err("invalid request line"),
     };
-    // The answer POST and the decision-targets GET carry no query: a query on
-    // either is refused before any header or body check.
-    if query != Query::default()
-        && (matches!(method, Method::Post)
-            || read_method(path) == Some("RemoteGetDecisionTargetsV1"))
+    // Only the decision-targets GET accepts the producer inventory cursor.
+    let decision_targets = read_method(path) == Some("RemoteGetDecisionTargetsV1");
+    // The v2 routes take no V1 cursors; only the conversation route takes
+    // `before`.
+    let v2 = path.starts_with("/api/v2/");
+    let conversation = v2_read_method(path) == Some("RemoteGetManagerConversationV2");
+    if (matches!(method, Method::Post) && query != Query::default())
+        || (decision_targets && (query.cursor.is_some() || query.before.is_some()))
+        || (!decision_targets && query.pending_after.is_some())
+        || (v2 && query.cursor.is_some())
+        || (v2 && !conversation && query.before.is_some())
     {
         return Err("invalid request line");
     }
@@ -100,11 +108,20 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
         return Err("untrusted forwarding");
     }
     let content_length = content_length(&headers)?;
-    if matches!(method, Method::Post) && (path == "/auth/session" || answer.is_some()) {
+    if matches!(method, Method::Post)
+        && (path == "/auth/session" || answer.is_some() || message.is_some())
+    {
         if headers.get("content-type") != Some(&"application/json") {
             return Err("invalid content type");
         }
-        if !(1..=4096).contains(&content_length) {
+        // A message body carries up to 4096 text bytes, which JSON may escape
+        // to several times that; the typed parser bounds the decoded text.
+        let max_body = if message.is_some() {
+            MAX_MESSAGE_BODY
+        } else {
+            4096
+        };
+        if !(1..=max_body).contains(&content_length) {
             return Err("invalid content-length");
         }
     } else if content_length != 0 {
@@ -140,7 +157,7 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
 }
 
 /// The V1 query grammar: `key=value` pairs joined by `&`, keys `cursor` and
-/// `before` each at most once and never empty. Anything else (extra keys,
+/// `before` and `pending_after` each at most once and never empty. Anything else (extra keys,
 /// `%`/`+`/`;`, a repeated `?`, a duplicate key) is an invalid request line.
 fn parse_query(raw: &str) -> Result<Query, &'static str> {
     if raw.is_empty() {
@@ -162,10 +179,21 @@ fn parse_query(raw: &str) -> Result<Query, &'static str> {
                 }
                 query.before = Some(parse_before(value)?);
             }
+            "pending_after" => {
+                if query.pending_after.is_some() || !pending_after_token(value) {
+                    return Err("invalid request line");
+                }
+                query.pending_after = Some(value.to_string());
+            }
             _ => return Err("invalid request line"),
         }
     }
     Ok(query)
+}
+
+/// Producer decision ids are canonical UUIDs with one of two closed prefixes.
+pub(crate) fn pending_after_token(value: &str) -> bool {
+    matches!(value.split_once(':'), Some(("pending-question" | "pending-approval", id)) if uuid(id))
 }
 
 fn cursor_token(value: &str) -> bool {
@@ -219,11 +247,15 @@ fn parse_headers<'a>(
     Ok(headers)
 }
 
+/// Largest message request body, in bytes (the text is bounded separately).
+pub const MAX_MESSAGE_BODY: usize = 32 * 1024;
+
 fn allowed_get(path: &str) -> bool {
     matches!(
         path,
         "/" | "/app.js" | "/api.js" | "/state.js" | "/styles.css" | "/auth/bootstrap"
     ) || path.starts_with("/api/v1/")
+        || v2_read_method(path).is_some()
 }
 
 fn content_length(headers: &HashMap<String, &str>) -> Result<usize, &'static str> {
@@ -285,6 +317,46 @@ pub fn read_method(path: &str) -> Option<&'static str> {
             session,
             "decision-targets",
         ] if uuid(project) && uuid(session) => Some("RemoteGetDecisionTargetsV1"),
+        _ => None,
+    }
+}
+
+/// The closed v2 GET route table (#2962): the exposed projects' manager seats
+/// and one seat's conversation. No request-supplied method name is forwarded.
+#[must_use]
+pub fn v2_read_method(path: &str) -> Option<&'static str> {
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        ["", "api", "v2", "projects"] => Some("RemoteListManagerSeatsV2"),
+        [
+            "",
+            "api",
+            "v2",
+            "projects",
+            project,
+            "managers",
+            seat,
+            "conversation",
+        ] if uuid(project) && uuid(seat) => Some("RemoteGetManagerConversationV2"),
+        _ => None,
+    }
+}
+
+/// The exact message-POST shape: `(project, seat session)`.
+#[must_use]
+pub fn message_route(path: &str) -> Option<(String, String)> {
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        [
+            "",
+            "api",
+            "v2",
+            "projects",
+            project,
+            "managers",
+            seat,
+            "messages",
+        ] if uuid(project) && uuid(seat) => Some(((*project).to_string(), (*seat).to_string())),
         _ => None,
     }
 }
@@ -614,6 +686,53 @@ mod tests {
     }
 
     #[test]
+    fn pending_after_is_validated_and_scoped_to_decision_targets() {
+        let path = "/api/v1/projects/550e8400-e29b-41d4-a716-446655440000/sessions/550e8400-e29b-41d4-a716-446655440001/decision-targets";
+        let id = "550e8400-e29b-41d4-a716-446655440002";
+        for kind in ["pending-question", "pending-approval"] {
+            let cursor = format!("{kind}:{id}");
+            let parsed =
+                parse_request(&get(&format!("{path}?pending_after={cursor}")), HOST).unwrap();
+            assert_eq!(parsed.path, path);
+            assert_eq!(parsed.query.pending_after.as_deref(), Some(cursor.as_str()));
+        }
+        for query in [
+            "pending_after=".to_string(),
+            "pending_after=unknown:value".to_string(),
+            "pending_after=pending-approval:invalid".to_string(),
+            format!("pending_after=pending-approval:{}", id.to_uppercase()),
+            format!("pending_after=pending-approval:{id}%20"),
+            format!("pending_after=pending-approval:{id}+"),
+            format!("pending_after=pending-approval:{id}&pending_after=pending-approval:{id}"),
+            format!("pending_after=pending-approval:{id}&cursor=x"),
+            format!("pending_after=pending-approval:{id}&before=1:2"),
+        ] {
+            assert!(
+                parse_request(&get(&format!("{path}?{query}")), HOST).is_err(),
+                "{query}"
+            );
+        }
+        assert!(
+            parse_request(
+                &get(&format!("/api/v1/info?pending_after=pending-approval:{id}")),
+                HOST
+            )
+            .is_err()
+        );
+        let answer = path.replace("decision-targets", "decisions/answer");
+        assert!(
+            parse_request(
+                &request(
+                    &format!("POST {answer}?pending_after=pending-approval:{id} HTTP/1.1"),
+                    "content-type: application/json\r\ncontent-length: 2\r\n"
+                ),
+                HOST
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn decision_targets_and_answer_routes_parse_exactly() {
         const PROJECT: &str = "550e8400-e29b-41d4-a716-446655440000";
         const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
@@ -685,5 +804,91 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    const P: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const SEAT: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn post(path: &str, content_length: usize) -> Vec<u8> {
+        request(
+            &format!("POST {path} HTTP/1.1"),
+            &format!("content-type: application/json\r\ncontent-length: {content_length}\r\n"),
+        )
+    }
+
+    #[test]
+    fn v2_routes_are_a_closed_table() {
+        let list = parse_request(&get("/api/v2/projects"), HOST).unwrap();
+        assert_eq!(v2_read_method(&list.path), Some("RemoteListManagerSeatsV2"));
+        let conversation = format!("/api/v2/projects/{P}/managers/{SEAT}/conversation");
+        assert_eq!(
+            v2_read_method(&conversation),
+            Some("RemoteGetManagerConversationV2")
+        );
+        let message = format!("/api/v2/projects/{P}/managers/{SEAT}/messages");
+        assert_eq!(
+            message_route(&message),
+            Some((P.to_string(), SEAT.to_string()))
+        );
+        assert_eq!(v2_read_method(&message), None, "a write is not a read");
+        for path in [
+            "/api/v2/projects/nope/managers/x/conversation".to_string(),
+            format!("/api/v2/projects/{P}/managers/{SEAT}"),
+            format!("/api/v2/projects/{P}/managers/{SEAT}/conversation/x"),
+            format!("/api/v2/projects/{P}/sessions/{SEAT}/messages"),
+            format!(
+                "/api/v2/projects/{}/managers/{SEAT}/messages",
+                P.to_uppercase()
+            ),
+            "/api/v2/info".to_string(),
+        ] {
+            assert_eq!(v2_read_method(&path), None, "{path}");
+            assert_eq!(message_route(&path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn v2_query_grammar_allows_only_before_on_the_conversation() {
+        let conversation = format!("/api/v2/projects/{P}/managers/{SEAT}/conversation");
+        let older = parse_request(&get(&format!("{conversation}?before=3:903")), HOST).unwrap();
+        assert_eq!(older.query.before, Some((3, 903)));
+        assert_eq!(older.path, conversation);
+        for target in [
+            format!("{conversation}?cursor=abc"),
+            format!("{conversation}?pending_after=pending-question:{P}"),
+            "/api/v2/projects?before=3:903".to_string(),
+            format!("{conversation}?before=3:0"),
+            format!("{conversation}?before=3:903&before=2:1"),
+        ] {
+            assert!(parse_request(&get(&target), HOST).is_err(), "{target}");
+        }
+    }
+
+    #[test]
+    fn v2_message_post_has_its_own_body_bounds_and_no_other_post_exists() {
+        let message = format!("/api/v2/projects/{P}/managers/{SEAT}/messages");
+        let parsed = parse_request(&post(&message, 5000), HOST).unwrap();
+        assert_eq!(parsed.method, Method::Post);
+        assert_eq!(parsed.content_length, 5000);
+        assert!(parse_request(&post(&message, MAX_MESSAGE_BODY), HOST).is_ok());
+        for bad in [0, MAX_MESSAGE_BODY + 1] {
+            assert!(parse_request(&post(&message, bad), HOST).is_err(), "{bad}");
+        }
+        // The answer routes keep their 4096-byte bound.
+        let answer = format!("/api/v1/projects/{P}/sessions/{SEAT}/decisions/answer");
+        assert!(parse_request(&post(&answer, 4096), HOST).is_ok());
+        assert!(parse_request(&post(&answer, 4097), HOST).is_err());
+        // Content type must be JSON; a query on a POST is refused; GET of the
+        // write route and POST of the read routes are not routes.
+        let wrong_type = request(
+            &format!("POST {message} HTTP/1.1"),
+            "content-type: text/plain\r\ncontent-length: 5\r\n",
+        );
+        assert!(parse_request(&wrong_type, HOST).is_err());
+        assert!(parse_request(&post(&format!("{message}?before=1:1"), 5), HOST).is_err());
+        assert!(parse_request(&get(&message), HOST).is_err());
+        let conversation = format!("/api/v2/projects/{P}/managers/{SEAT}/conversation");
+        assert!(parse_request(&post(&conversation, 5), HOST).is_err());
+        assert!(parse_request(&post("/api/v2/projects", 5), HOST).is_err());
     }
 }

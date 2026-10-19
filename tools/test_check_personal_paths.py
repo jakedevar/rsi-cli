@@ -57,7 +57,13 @@ class CheckPersonalPaths(unittest.TestCase):
         self.assertEqual(run("a.rs", f'let dns = "{OTHER_RESOLVER}";\n')[0], 1)
 
     def test_egress_fixture_files_may_name_public_ips_but_not_personal_paths(self):
-        rel = "crates/rsi-common/src/egress_policy.rs"
+        for rel in sorted(cpp.IP_FIXTURE_PATHS):
+            with self.subTest(path=rel):
+                self.check_ip_fixture_path(rel)
+        # The same line in any other file is still a finding.
+        self.assertEqual(run("egress_policy.rs", f'assert_public("{PUBLIC_IP}");\n')[0], 1)
+
+    def check_ip_fixture_path(self, rel):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / rel
             path.parent.mkdir(parents=True)
@@ -72,8 +78,6 @@ class CheckPersonalPaths(unittest.TestCase):
                     self.assertEqual(cpp.main(["check", rel]), 1)
             finally:
                 os.chdir(cwd)
-        # The same line in any other file is still a finding.
-        self.assertEqual(run("egress_policy.rs", f'assert_public("{PUBLIC_IP}");\n')[0], 1)
 
     def test_version_numbers_are_not_ip_literals(self):
         self.assertEqual(run("a.txt", "v1.94.1 and 1.2.3.4.5 and 12.3.4.5.6\n")[0], 0)

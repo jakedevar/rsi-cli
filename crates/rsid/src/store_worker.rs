@@ -26,6 +26,11 @@ pub enum StoreCommand {
     },
     InsertTurnMetric(TurnMetric),
     UpdateSessionMetadata(Session),
+    /// The stamp the Store writer returns is dropped here: this worker holds
+    /// no runtime `completed` map, so it must not serve a daemon with terminal
+    /// sessions unless it hands the stamp back for
+    /// `cohort_settlement::apply_store_write` (#258, #265). The daemon's
+    /// project attach goes through `SessionManager::update_session_project`.
     AttachProject {
         session_id: Uuid,
         project_id: Uuid,
@@ -315,7 +320,7 @@ mod tests {
     /// are orphaned in `/tmp` when it drops.
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("test.db")).unwrap();
         (dir, store)
     }
 

@@ -1,0 +1,553 @@
+//! Core types for the agent harness LLM conversation protocol.
+//!
+//! These map to the intersection of Anthropic's Messages API and OpenAI's
+//! Chat Completions API. Provider implementations translate to/from these.
+
+// Provider layer is built ahead of resolve_provider() wiring (Phase 6+).
+#![allow(dead_code)]
+
+use serde::{Deserialize, Serialize};
+
+const TOOL_BLOCKS_PREFIX: &str = "\u{001e}rsi-tool-blocks-v1:";
+
+/// Tool content independent of any provider's request format. Image data is
+/// base64 encoded; callers must apply their own size and media-type limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolContentBlock {
+    Text {
+        text: String,
+    },
+    ServerToolResult {
+        result: serde_json::Value,
+    },
+    Image {
+        media_type: String,
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+    },
+}
+
+fn encode_tool_blocks(blocks: &[ToolContentBlock]) -> String {
+    format!(
+        "{TOOL_BLOCKS_PREFIX}{}",
+        serde_json::to_string(blocks).expect("tool content blocks serialize")
+    )
+}
+
+fn decode_tool_blocks(content: &str) -> Option<Vec<ToolContentBlock>> {
+    content
+        .strip_prefix(TOOL_BLOCKS_PREFIX)
+        .and_then(|json| serde_json::from_str(json).ok())
+}
+
+fn visible_tool_text(blocks: &[ToolContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ToolContentBlock::Text { text } => text.clone(),
+            ToolContentBlock::ServerToolResult { result } => {
+                let name = result
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("server_tool_result");
+                format!("[hosted tool result: {name}]")
+            }
+            ToolContentBlock::Image {
+                media_type,
+                detail,
+                reference,
+                width,
+                height,
+                ..
+            } => {
+                let mut line = format!("[image: {media_type}");
+                if let Some(reference) = reference {
+                    line.push_str(&format!(", reference: {reference}"));
+                }
+                if let Some(detail) = detail {
+                    line.push_str(&format!(", detail: {detail}"));
+                }
+                if let (Some(width), Some(height)) = (width, height) {
+                    line.push_str(&format!(", size: {width}x{height}"));
+                }
+                line.push(']');
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn image_event_metadata(blocks: &[ToolContentBlock]) -> Option<serde_json::Value> {
+    let images: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolContentBlock::Image {
+                media_type,
+                data,
+                detail,
+                reference,
+                width,
+                height,
+            } => Some(serde_json::json!({
+                "media_type": media_type,
+                "detail": detail,
+                "reference": reference,
+                "width": width,
+                "height": height,
+                "base64_chars": data.len(),
+            })),
+            ToolContentBlock::Text { .. } => None,
+            ToolContentBlock::ServerToolResult { .. } => None,
+        })
+        .collect();
+    let server_tool_results: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolContentBlock::ServerToolResult { result } => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    if images.is_empty() && server_tool_results.is_empty() {
+        return None;
+    }
+    let mut metadata = serde_json::Map::new();
+    if !images.is_empty() {
+        metadata.insert("images".into(), serde_json::Value::Array(images));
+    }
+    if !server_tool_results.is_empty() {
+        metadata.insert(
+            "server_tool_results".into(),
+            serde_json::Value::Array(server_tool_results),
+        );
+    }
+    Some(serde_json::Value::Object(metadata))
+}
+
+/// Role in a conversation message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// A single message in the conversation history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: MessageRole,
+    pub content: String,
+    /// For tool result messages: the ID of the tool call this responds to.
+    pub tool_call_id: Option<String>,
+    /// Whether this tool result represents a failed execution.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+    /// Tool calls requested by the assistant (populated when role == Assistant).
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::System,
+            content: content.into(),
+            tool_call_id: None,
+            is_error: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            tool_call_id: None,
+            is_error: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            is_error: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            is_error: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn tool_error_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(call_id.into()),
+            is_error: true,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Preserve the persisted string history shape while carrying typed blocks.
+    /// Legacy tool messages remain ordinary strings and decode as one text block.
+    pub fn tool_result_blocks(
+        call_id: impl Into<String>,
+        blocks: Vec<ToolContentBlock>,
+        is_error: bool,
+    ) -> Self {
+        let mut message = Self::tool_result(call_id, encode_tool_blocks(&blocks));
+        message.is_error = is_error;
+        message
+    }
+
+    pub fn tool_blocks(&self) -> Vec<ToolContentBlock> {
+        decode_tool_blocks(&self.content).unwrap_or_else(|| {
+            vec![ToolContentBlock::Text {
+                text: self.content.clone(),
+            }]
+        })
+    }
+
+    pub fn has_typed_tool_blocks(&self) -> bool {
+        decode_tool_blocks(&self.content).is_some()
+    }
+
+    pub fn visible_tool_text(&self) -> String {
+        visible_tool_text(&self.tool_blocks())
+    }
+
+    pub fn event_metadata(&self) -> Option<serde_json::Value> {
+        image_event_metadata(&self.tool_blocks())
+    }
+
+    /// Approximate token count using the 4-chars-per-token heuristic.
+    pub fn estimated_tokens(&self) -> u64 {
+        self.content.len().div_ceil(4) as u64
+    }
+}
+
+/// A tool call from the assistant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON string of the arguments.
+    pub arguments: String,
+    /// True for provider-hosted tools; the agent loop never executes these.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hosted: bool,
+    /// Exact provider result payload for a hosted tool, keyed by the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_result: Option<serde_json::Value>,
+}
+
+/// Specification for a tool the LLM can call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema string for the tool's input parameters.
+    pub parameters_json: String,
+    /// Optional freeform representation for providers with custom tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeform: Option<HarnessFreeformToolFormat>,
+    /// Discriminates local function tools from provider-hosted wire tools.
+    #[serde(default = "default_tool_spec_kind")]
+    pub kind: HarnessToolSpecKind,
+}
+
+fn default_tool_spec_kind() -> HarnessToolSpecKind {
+    HarnessToolSpecKind::Function
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarnessToolSpecKind {
+    Function,
+    AnthropicWebSearch { wire_type: String },
+    AnthropicWebFetch { wire_type: String },
+    ResponsesWebSearch,
+}
+
+impl HarnessToolSpecKind {
+    pub fn is_hosted(&self) -> bool {
+        !matches!(self, Self::Function)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessFreeformToolFormat {
+    pub r#type: String,
+    pub syntax: String,
+    pub definition: String,
+}
+
+/// Request to send to an LLM provider.
+#[derive(Debug, Clone)]
+pub struct ChatRequest {
+    pub messages: Vec<ChatMessage>,
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub tools: Vec<HarnessToolSpec>,
+    pub stream: bool,
+    pub reasoning_effort: Option<String>,
+    /// The session allows server-side context editing (#1097). Only the
+    /// direct Anthropic transport acts on it; it never changes a message.
+    pub context_editing: bool,
+    /// Send `tool_choice: "none"` next to `tools` (#2253). The loop sets it on
+    /// the wrap-up and final-answer turns only for a route whose quirk allows
+    /// it; the request then keeps its `tools` so the history's `tool_calls`
+    /// stay valid. Other routes clear `tools` and never see it.
+    pub tool_choice_none: bool,
+}
+
+/// Response from an LLM provider (blocking path).
+#[derive(Debug, Clone)]
+pub struct ChatResponse {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+    pub reasoning_content: Option<String>,
+    pub stop_reason: Option<String>,
+}
+
+/// Token usage from a provider response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// Provider-reported USD cost of this response (OpenRouter `usage.cost`).
+    /// `None` when the provider reported none; never an estimate.
+    pub cost_usd: Option<f64>,
+}
+
+/// A single chunk from a streaming response.
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    pub delta_text: String,
+    pub tool_call_deltas: Vec<ToolCallDelta>,
+    pub is_final: bool,
+    pub usage: Option<TokenUsage>,
+    pub stop_reason: Option<String>,
+    /// A provider's top-level `warning` text (Inception reports a reset
+    /// parameter this way, #2253); the loop turns it into a `system` event.
+    pub warning: Option<String>,
+}
+
+/// Incremental tool call data from a streaming chunk.
+#[derive(Debug, Clone)]
+pub struct ToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_delta: String,
+}
+
+/// Result of executing a tool.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub success: bool,
+    pub output: String,
+    pub error_msg: Option<String>,
+}
+
+impl ToolResult {
+    /// Whether tool execution failed. `success` remains the source of truth for
+    /// existing tool implementations while exposing the protocol error flag.
+    pub fn is_error(&self) -> bool {
+        !self.success
+    }
+
+    /// Produce a block result without changing existing text-tool constructors.
+    ///
+    /// A failing result always carries `error_msg` (the visible block text), so
+    /// callers never see `success == false` with no message.
+    pub fn from_blocks(blocks: Vec<ToolContentBlock>, is_error: bool) -> Self {
+        let error_msg = is_error.then(|| {
+            let text = visible_tool_text(&blocks);
+            if text.trim().is_empty() {
+                "tool failed without a message".to_string()
+            } else {
+                text
+            }
+        });
+        Self {
+            success: !is_error,
+            output: encode_tool_blocks(&blocks),
+            error_msg,
+        }
+    }
+
+    pub fn has_typed_blocks(&self) -> bool {
+        decode_tool_blocks(&self.output).is_some()
+    }
+
+    pub fn event_metadata(&self) -> Option<serde_json::Value> {
+        let blocks = decode_tool_blocks(&self.output)?;
+        image_event_metadata(&blocks)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failing_block_result_always_sets_error_msg() {
+        let failed = ToolResult::from_blocks(
+            vec![ToolContentBlock::Text {
+                text: "boom".into(),
+            }],
+            true,
+        );
+        assert!(!failed.success);
+        assert_eq!(failed.error_msg.as_deref(), Some("boom"));
+        let empty = ToolResult::from_blocks(Vec::new(), true);
+        assert!(empty.error_msg.as_deref().is_some_and(|m| !m.is_empty()));
+        let ok = ToolResult::from_blocks(Vec::new(), false);
+        assert!(ok.success && ok.error_msg.is_none());
+    }
+
+    #[test]
+    fn test_chat_message_constructors() {
+        let sys = ChatMessage::system("you are helpful");
+        assert_eq!(sys.role, MessageRole::System);
+        assert_eq!(sys.content, "you are helpful");
+        assert!(sys.tool_calls.is_empty());
+        assert!(sys.tool_call_id.is_none());
+
+        let user = ChatMessage::user("hello");
+        assert_eq!(user.role, MessageRole::User);
+
+        let asst = ChatMessage::assistant("hi there");
+        assert_eq!(asst.role, MessageRole::Assistant);
+
+        let tool = ChatMessage::tool_result("call-123", "result data");
+        assert_eq!(tool.role, MessageRole::Tool);
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call-123"));
+        assert_eq!(tool.content, "result data");
+        assert!(!tool.is_error);
+
+        let tool_error = ChatMessage::tool_error_result("call-error", "failed");
+        assert!(tool_error.is_error);
+    }
+
+    #[test]
+    fn test_estimated_tokens() {
+        let msg = ChatMessage::user("hello world"); // 11 chars -> (11+3)/4 = 3
+        assert_eq!(msg.estimated_tokens(), 3);
+
+        let empty = ChatMessage::user("");
+        assert_eq!(empty.estimated_tokens(), 0); // (0+3)/4 = 0 (integer division)
+    }
+
+    #[test]
+    fn test_message_role_serde() {
+        let json = serde_json::to_string(&MessageRole::System).unwrap();
+        assert_eq!(json, "\"system\"");
+
+        let parsed: MessageRole = serde_json::from_str("\"assistant\"").unwrap();
+        assert_eq!(parsed, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn test_tool_call_serde() {
+        let tc = ToolCall {
+            id: "tc-1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+            hosted: false,
+            hosted_result: None,
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        let parsed: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "tc-1");
+        assert_eq!(parsed.name, "read_file");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn tool_error_history_round_trips_and_success_flag_stays_omitted() {
+        let history = vec![
+            ChatMessage::tool_result("call-ok", "ok"),
+            ChatMessage::tool_error_result("call-error", "failed"),
+        ];
+        let json = serde_json::to_value(&history).unwrap();
+        assert_eq!(json[0].get("is_error"), None);
+        assert_eq!(json[1]["is_error"], true);
+
+        let parsed: Vec<ChatMessage> = serde_json::from_value(json).unwrap();
+        assert!(!parsed[0].is_error);
+        assert!(parsed[1].is_error);
+        assert_eq!(parsed[1].tool_call_id.as_deref(), Some("call-error"));
+    }
+
+    #[test]
+    fn typed_tool_blocks_round_trip_in_string_history() {
+        let blocks = vec![
+            ToolContentBlock::Text {
+                text: "preview".into(),
+            },
+            ToolContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+                detail: None,
+                reference: None,
+                width: None,
+                height: None,
+            },
+        ];
+        let result = ToolResult::from_blocks(blocks.clone(), true);
+        assert!(result.is_error());
+        assert!(result.has_typed_blocks());
+        let message = ChatMessage::tool_result_blocks("call-image", blocks.clone(), true);
+        let stored = serde_json::to_value(&message).unwrap();
+        assert!(stored["content"].is_string());
+        let restored: ChatMessage = serde_json::from_value(stored).unwrap();
+        assert!(restored.is_error);
+        assert_eq!(restored.tool_blocks(), blocks);
+        assert_eq!(restored.visible_tool_text(), "preview\n[image: image/png]");
+
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "content": "plain text",
+            "tool_call_id": "old",
+            "tool_calls": []
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.tool_blocks(),
+            vec![ToolContentBlock::Text {
+                text: "plain text".into()
+            }]
+        );
+    }
+}

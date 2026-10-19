@@ -216,7 +216,7 @@ pub(in crate::store) fn apply_v129_migration(store: &Store) -> Result<()> {
 // RSI-RELEASED-MIGRATION-END: v129-topology-executor-migration
 
 /// Test teardown: rewind a head database to the exact V128 catalog.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn rewind_v129_fixture_to_v128(connection: &Connection) {
     let version: i32 = connection

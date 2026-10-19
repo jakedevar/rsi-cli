@@ -162,6 +162,53 @@ Hard rules:
 5. Enum strings must match serde variants exactly.
 6. Sandbox tombstone updates must flip cleanup state and null sandbox path/branch atomically.
 
+### `model_invocations.estimated_cost_usd` is session-cumulative on launch/resume rows (#2593)
+
+A `session.launch.fresh` / `session.continue.resume` row is settled from the session's
+running totals, so its `estimated_cost_usd` (and its token and `wall_time_ms` columns) is the
+session's CUMULATIVE figure at that moment: the rows of one session rise monotonically and the
+last equals `sessions.cost_usd`. A plain `SUM(estimated_cost_usd)` over them overstates spend
+many times over. Every other purpose settles its own cost. The stored meaning is unchanged
+(released rows are not rewritten). Anything that adds invocation costs up (budgets, alerts,
+usage views, ad-hoc SQL) reads the per-invocation increment: join
+`model_control::cost::cost_increment_sql!()` (`cost_increment_usd` per `invocation_id`; the
+difference to the session's previous priced launch/resume row, a drop restarts from the row's
+own value). `usage_stats`, `efficiency_metrics`, the manager spend ledger and
+`session_model_invocation_cost_total` already do; a test in `model_control/cost.rs` pins it.
+Ad-hoc SQL: `scripts/export-issue-pipeline-evidence.py` (`session_invocations`) has the same
+`lag()` difference.
+
+### Copying the live database, and throwaway daemons (#2530)
+
+Do not run `sqlite3 ~/.rsi/rsi.db "VACUUM INTO ..."` or `.backup`: the schema's CHECK
+constraints call SQL functions only the daemon registers (`rsi_uuid_is_canonical`,
+`rsi_rfc3339_nanos_is_canonical`, `rsi_jsonrpc_id_is_canonical`, ...), so the CLI fails with
+`no such function`, and its `.backup` restarts on every write by a live daemon and may never
+finish on a busy WAL database. Use the supported tool; it opens the source read-only, registers
+the functions, copies in one read transaction and writes nothing next to the source:
+
+    rsi-db-snapshot --out /scratch/copy.db                 # consistent page copy (seconds for GBs)
+    rsi-db-snapshot --out /scratch/copy.db --vacuum        # VACUUM INTO copy
+    rsi-db-snapshot --out /scratch/copy.db --control       # copy + timed VACUUM INTO control (#2384 protocol)
+    rsi-db-snapshot --out /scratch/copy.db --source PATH   # a database other than the live one
+
+It prints one JSON line (method, page and free-page counts, bytes, `elapsed_ms`) and refuses to
+overwrite `--out`. The default source is `rsi.db` next to the daemon socket
+(`$RSI_DAEMON_SOCKET_PATH`, else `~/.rsi/daemon.sock`). The code is
+`rsid-store` `migration_backup::snapshot_database`, the same copier the pre-migration backup uses.
+
+**A daemon keeps its database next to its socket.** A throwaway daemon started with
+`RSI_DAEMON_SOCKET_PATH=/tmp/x/daemon.sock` uses `/tmp/x/rsi.db`, not `$HOME/.rsi/rsi.db`.
+Pointing the socket elsewhere without copying the database there silently creates a fresh empty
+one, and RPCs then answer `Session not found`. Put the snapshot at `<socket dir>/rsi.db` to
+run a daemon on a copy of production state.
+
+When the copy holds production state, run the throwaway daemon in an isolation wrapper so it
+cannot reach the real world: `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net
+--unshare-pid --tmpfs ~/.rsi --tmpfs /run/user/$UID --bind <scratch> <scratch>` with the
+socket and copied `rsi.db` under `<scratch>`. A fresh-state recipe such as
+`thoughts/shared/notes/2237-gm-ui/capture.py` needs no wrapper; add one before pointing it at a copy.
+
 ## Keybinding Changes
 
 Keybinding sources and the end-to-end recipe for adding an action live in
@@ -433,6 +480,34 @@ names the standard; the mechanics live there.
 
 If the active harness supports context rotation and reports that rotation or auto-compaction is required, run the repo’s context-rotation flow immediately. Preserve structured handoff state before continuing.
 
+**One source of truth (#2558).** The rotation point is an operator setting, never a
+number in a playbook or prompt. The guard
+`no_guidance_file_hard_codes_a_context_rotation_percentage_2558` (`rsid`,
+`session/authority_catalog_verb.rs`) fails when a guidance file, a manager
+playbook or the worker preamble states one. The settings, all in the TUI under
+Settings > Context Rotation (live apply):
+
+- `coordinator_context_cap_tokens`: the hard cap for a coordinating seat (project
+  manager, area manager, Epic lead, portfolio manager). `0` is off, `1..=100` is a
+  percentage of the session's context window, larger values are absolute tokens;
+  `:context-cap <Provider[/model]> [pct|tokens|default]` sets a provider or model
+  override.
+- `context_rotation_global_pct`, `context_rotation_claude_pct`,
+  `context_rotation_codex_pct`: the succession point (the global value wins when
+  set; a provider with no setting uses the built-in 65%).
+- `worker_context_cap_tokens`: the point at which a worker is told to pass the
+  baton (same value forms as the coordinator cap).
+
+`AgentGetAuthorityCatalog` states the caller's effective threshold (the lower of
+the caller's cap and succession point, with the deciding setting), and
+`AgentManagerOverview` shows it as `rotation_threshold_pct` next to
+`context_fill_pct`. Both are a percentage of the same denominator: the session's
+active context window (`resolved_context_budget.active_tokens`); `context_fill_pct`
+is the measured prompt tokens over that window, and a percentage cap is the same
+window times the percentage. A manager that quotes another figure (for example a
+self-estimate over a different window) is not comparing like with like: read the
+two fields.
+
 ## Reference Docs
 
 Plans: `thoughts/shared/plans/`
@@ -466,6 +541,42 @@ reused and once grew `debug/incremental` to 63 GB, which tripped cargo-slot's
   build holds that lock, so a held lock skips the prune. It is logged as
   "Shared target incremental prune pass completed". The target is
   `RSI_SHARED_TARGET_DIR`, else `CARGO_TARGET_DIR`, else `~/.cargo/shared-target`.
+
+### Stray sandbox targets and the disk andon (#2682)
+
+The terminal-sandbox sweep only visits finished sessions that hold a live,
+verified custody root. Three gaps let a hub reach 98% disk with the caches
+unconsidered; each is now covered:
+
+- **Re-grown targets.** The pressure pass's recent lane
+  (`SELECT_RECENT_PRESENT_KEYS_SQL`, `store/target_reclaim_sweep.rs`) no longer
+  excludes a custody generation that already has a reclaim event: a worker that
+  was reclaimed, resumed and rebuilt `target/` has a new directory inode, which
+  is a new intent identity. Only a `target/` on disk is a candidate, so a
+  reclaimed row whose directory is gone costs one stat. Archived and idle
+  Completed sessions with live custody were already in the candidate set.
+- **Stray directories.** `crates/rsid/src/stray_target_reclaim.rs` lists the
+  UUID-named sandbox directories that hold a `target/` and asks
+  `Store::stray_target_owner` who owns each (a directory is *claimed* by any
+  unfinished session, any live custody root or any `Live` session row, matched by
+  stored path or by directory name). An **orphan** (no row names it) or
+  **detached** directory (only finished sessions without live custody name it) has
+  its `target/` and nothing else removed under pressure, with the shared
+  `debug/` rules: 30 minute idle floor, no held cargo lock, no process using the
+  directory, rename to a `target.rsi-reclaim-*` stage then budgeted removal. They
+  are reported as `stray_targets` on `GetSandboxStorageStatus` and
+  `RunSandboxBuildCacheReclaim`.
+- **Runaway disk.** Every `RUNAWAY_DISK_INTERVAL` (10 minutes) the reclaim job
+  measures the `target/` of each sandbox an unfinished session owns; past
+  `RUNAWAY_DISK_THRESHOLD_BYTES` (40 GiB, a constant, not an operator setting)
+  it records one `runaway_disk` notice per whole multiple of the threshold to the
+  owning manager (inbox notice, else the Epic lead's mail), like `runaway_process`
+  (#1337). It never stops the worker. The size judged leaves out
+  `target/scoped-baselines` (the transient baseline build of the worker's own
+  `scoped_test`, reported apart as `scoped_baseline_gib`), and while the owner has
+  a queued or running `scoped_test` job the record suggests no halt (#2782). The
+  `cargo clean` between shards advice appears only when `target/debug/deps` holds
+  `rsid-<hash>` binaries of more than one feature set.
 
 ## Launch-model allowlist (#692)
 
@@ -504,3 +615,66 @@ while #1197 alone took 3 min, because one combined gate carried the union of
 every source's filters. Gate speed work is #1244. The merged filters spanned
 most rsid shards and rsid-store modules, so the gate cost scaled with the batch
 instead of with any one change.
+
+## Harness: the native direct-API agent (#2234)
+
+The in-process Harness (`crates/rsid/src/session/harness/`) runs its own agent
+loop against a model API: `Harness` sessions, and the Harness routes of
+OpenRouter and Bedrock. Operator request #2234 made it a complete coding
+agent on a plain Chat Completions route, with Inception's Mercury 2
+(`mercury-2`, compatible-table entry `mercury`) as the reference model. The
+wire profile (effort mapping, output cap, `tool_choice`) is in
+`docs/provider-capabilities.md`, rendered from the table entry.
+
+**Tool set.** One registry assembly (`HarnessToolRegistry::default_tools`)
+serves a fresh launch and a rotation; pin a roster change in
+`tools/mod.rs`'s `rotation_and_fresh_share_identical_tool_set`.
+
+| Area | Tools | Notes |
+| --- | --- | --- |
+| Web | `web_fetch`, `web_search` | The native pair is for routes with no hosted one; the loop drops a native spec when the route advertises its own. `web_fetch` is guarded by `harness_egress_mode` (`deny_private` refuses loopback, link-local, metadata and private ranges after DNS and every redirect; `offline` refuses all) and wraps pages as untrusted. `web_search` is registered only when `harness_web_search_backend` (`auto` tries Serper, then Exa, then the keyless SearXNG; or `serper`, `exa`, `searxng`, `disabled`) names a configured backend: a Provider Keys slot that resolves, or for SearXNG the `harness_searxng_url` setting (`scripts/searxng-local.sh up` serves a loopback-only instance, #2315). The `web_access` policy and the search, fetch and web-cost caps apply to native and hosted calls alike, by tool name. |
+| Navigate | `grep`, `glob`, `list_files`, `read_file` (ranged) | Ignore-aware (`.gitignore`), no external binary. |
+| Edit | `file_edit` (multi-edit, `replace_all`), `apply_patch`, `write_file` | `file_edit` applies every edit or none and returns a diff excerpt. |
+| Run | `shell`, `exec_command`/`write_stdin`, `git` | Scrubbed environment (no credentials). The git custody guard refuses commands that break AGENTS.md hard rules 1, 2, 8 and 9 before anything runs, with `error_code: custody_git_refused`. |
+| Coordinate | `update_plan`, `schedule_wake`, `rsi_control_*` | Caller identity is bound at registration, never an argument. |
+| External | MCP stdio tools (`mcp__<server>__<tool>`) | Names are capped at 64 characters; above the MCP deferred tool threshold setting only `tool_search` is advertised. |
+
+**Recovery (S7).** A call that fails schema validation is answered with the
+field and type to fix and is not run; an unknown tool name gets a "did you
+mean"; the third identical failure in a row gets one `[harness]` nudge and a
+`repeat_failure` stream event; an empty tool-call id or name is synthesized or
+refused, never dropped.
+
+**Base instructions (S8).** Every Harness-loop prompt starts with the static
+text in `crates/rsid/assets/harness/base_instructions.md`
+(`base_prompt.rs`; it is static so the prefix caches). Editing it means
+bumping `BASE_PROMPT_VERSION` and the two digests pinned in the `base_prompt`
+tests together; every tool name the text mentions must be registered or listed
+in the tests' conditional table.
+
+**Keys.** The model key is a vault slot read on every request (a rotation
+reaches a live session); the search key is the backend's slot. Neither goes
+into a tool output, stream event, persisted event or the shell environment.
+
+**Acceptance test.** `harness/e2e_tests.rs` is the one launcher: a
+`wiremock` server plays the model and streams Mercury-shaped SSE (tool-call
+arguments split across deltas, a final `include_usage` chunk with no
+`choices`, nested token details). `run_turn_with` / `ScenarioOptions` drive the
+real provider, loop and registry against it, with pages from a loopback server
+behind the egress seam and search from a mock Serper. Scenarios live in
+`e2e_tests/` (`navigation`, `recovery`, `acceptance`).
+`acceptance::mercury_session_runs_the_whole_native_tool_set_end_to_end` is the
+umbrella check: search, fetch, glob, grep, a recovered malformed call, a
+multi-edit, `apply_patch`, `exec_command`, `update_plan`,
+`rsi_control_status` and an MCP tool, then the answer; it asserts every call is
+paired, the worktree diff, and that the fake model key appears only in the
+model server's `Authorization` header and the fake search key only in the
+vendor's `X-API-KEY`. Extend that scenario for a new tool rather than adding a
+launcher. No test uses the network or a real key. An operator-run live probe
+that records a sanitized real Mercury stream (a few cents) is optional and not
+in CI.
+
+**Deferred** (outside #2234): MCP streamable HTTP and OAuth, a filesystem
+sandbox for `shell` (Linux-only; custody rests on the worktree, the scope and
+the custody guard), PDF in `web_fetch`, Anthropic prompt caching (#694 P1),
+the prompt ledger slices of #795, and a code-mode REPL (#789 stays a no-go).

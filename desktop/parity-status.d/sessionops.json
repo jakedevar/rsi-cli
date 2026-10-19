@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "rows": {
+    "key:P": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "TogglePin on the open session, else the list cursor's; the toast is the TUI's and the row shows ◆ (pinned rows sort first, listmodel.ts)"
+    },
+    "key:<Space>t": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "ToggleTestingNeeded on a leaf session (a Group or Epic is refused with a reason); the row shows ☐ while marked"
+    },
+    "key:<Space>r": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "ToggleRotationDisabled; the row shows ⊘ while auto-rotation is off"
+    },
+    "key:<Space>k": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "CancelRetry; trusts the daemon's cancelled bool (\"Retry cancelled\" / \"No pending retry to cancel\"); the row shows the ↻N/M retry badge"
+    },
+    "key:R": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "RotateSession on the open session when the transcript has the keys, else the list cursor's; only Running, Completed, Interrupted or Failed leaves, as rotate_focused_session; also :rotate"
+    },
+    "key:<Space>x": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "Continues the open session with /ci_commit (ContinueSession); refused while the session is Starting, as the TUI"
+    },
+    "key:<Space>gl": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "EnqueueRollingQueueSource dry run shows the commit and where it stands; the same key (or :land) on the same session within 30 s queues exactly that commit under an operator-land-<uuid> key; queued entries are watched through GetRollingQueue {entry_ids} every 5 s and announced when they settle (land.rs)"
+    },
+    "cmd:rotate": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "same action as R (named here because it is the same feature as the Normal-mode row)"
+    },
+    "cmd:land": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "same action as <Space>gl"
+    },
+    "section:session-lifecycle": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/approvals.ts, src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
+      "note": "DD (trash), <Space>a (archive) and U (unarchive) in slice 6; P, R, <Space>t, <Space>r and <Space>k in the session-ops slice (G2) with their row markers"
+    },
+    "section:session-actions-detail-view": {
+      "status": "done",
+      "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs, src/actions/emergency-spec.ts",
+      "note": "<Space>x commit and push (session ops) and <Space>X emergency stop (emergency slice)"
+    }
+  }
+}

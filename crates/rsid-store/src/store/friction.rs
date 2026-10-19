@@ -71,6 +71,8 @@ DROP TABLE friction_events;";
 
 /// UUIDv5 namespace of andon Issue ids (`<project>\0<signature>`).
 const ANDON_ISSUE_NAMESPACE: Uuid = Uuid::from_u128(0x6a1d_0e5c_8f3b_4c7e_9a51_1333_0a4d_0f11);
+/// Typed refusal code of an andon filing with no evidence sample (#2307).
+pub const ANDON_EVIDENCE_MISSING: &str = "andon_evidence_missing";
 /// Newest distinct evidence references shown per signature.
 const EVIDENCE_PER_ROW: i64 = 5;
 
@@ -607,8 +609,19 @@ impl Store {
                 None,
             )?;
             let sessions = self.andon_sessions(&candidate, &since)?;
-            if let Some(filing) = self.file_andon_issue(&candidate, &evidence, &sessions, now)? {
-                out.push(filing);
+            match self.file_andon_issue(&candidate, &evidence, &sessions, now) {
+                Ok(Some(filing)) => out.push(filing),
+                Ok(None) => {}
+                // One candidate with nothing to cite must not stall the others.
+                Err(DaemonError::InvalidParam(code)) if code == ANDON_EVIDENCE_MISSING => {
+                    tracing::warn!(
+                        signature = %candidate.signature,
+                        project_id = %candidate.project_id,
+                        code = ANDON_EVIDENCE_MISSING,
+                        "andon refused to file an Issue without an evidence sample"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(out)
@@ -621,6 +634,7 @@ impl Store {
         sessions: &[String],
         now: DateTime<Utc>,
     ) -> Result<Option<AndonFilingV1>> {
+        let evidence = andon_evidence(evidence, sessions)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let already: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM andon_filings WHERE project_id=?1 AND signature=?2)",
@@ -640,7 +654,7 @@ impl Store {
                 "andon: {} repeated {}× across {} sessions",
                 candidate.signature, candidate.occurrences, candidate.sessions
             ),
-            body: andon_issue_body(candidate, evidence, sessions),
+            body: andon_issue_body(candidate, &evidence, sessions),
             priority: None,
             labels: ANDON_ISSUE_LABELS.iter().map(ToString::to_string).collect(),
             created_by_session_id: None,
@@ -680,6 +694,26 @@ impl Store {
             sessions: candidate.sessions,
         }))
     }
+}
+
+/// The evidence an andon Issue must carry (#2307): the recorded clean
+/// references, else the triggering sessions as `session:<id>` references.
+/// Refuses with `andon_evidence_missing` when neither exists, so an Issue never
+/// reads `evidence: none recorded`.
+fn andon_evidence(evidence: &[String], sessions: &[String]) -> Result<Vec<String>> {
+    let refs: Vec<String> = if evidence.is_empty() {
+        sessions
+            .iter()
+            .map(|session| format!("session:{session}"))
+            .filter(|reference| is_friction_evidence(reference))
+            .collect()
+    } else {
+        evidence.to_vec()
+    };
+    if refs.is_empty() {
+        return Err(DaemonError::InvalidParam(ANDON_EVIDENCE_MISSING.into()));
+    }
+    Ok(refs)
 }
 
 fn andon_issue_body(candidate: &Candidate, evidence: &[String], sessions: &[String]) -> String {

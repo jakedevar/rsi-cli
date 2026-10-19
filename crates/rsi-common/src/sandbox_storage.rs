@@ -25,6 +25,12 @@ pub const SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON: usize = 4;
 /// check carries; longer names are cut, never rejected.
 pub const SANDBOX_RECLAIM_CHECK_SUBJECT_MAX: usize = 40;
 const SANDBOX_RECLAIM_CHECK_TOKEN_MAX: usize = 96;
+/// Top-level `target/` directory the TUI e2e harness preserves its run
+/// artifacts in. The harness writes it and build-cache reclaim recognises it
+/// from this one name (#1838), so a worker that ran the e2e suite stays
+/// reclaimable. Add any further harness-owned `target/` directory here, not as
+/// a second literal in the reclaim allowlist.
+pub const E2E_ARTIFACTS_DIR_NAME: &str = "e2e-artifacts";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -381,7 +387,7 @@ pub struct SandboxTargetReclaimIntentSweepV2 {
     pub wrapped: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxTargetReclaimIntentCountsV2 {
     pub prepared: u32,
@@ -389,6 +395,24 @@ pub struct SandboxTargetReclaimIntentCountsV2 {
     pub deleting: u32,
     pub completed: u32,
     pub abandoned: u32,
+    /// Active intents that have not changed state for longer than the stuck
+    /// bound (#2731). Absent when none is stuck and on older payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck: Option<SandboxTargetReclaimIntentStuckV1>,
+}
+
+/// Residual (`Prepared`/`Staged`/`Deleting`) reclaim intents older than
+/// `older_than_secs` since their last state change, with the reason they are
+/// reported rather than silently retained (#2731).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxTargetReclaimIntentStuckV1 {
+    pub prepared: u32,
+    pub staged: u32,
+    pub deleting: u32,
+    pub older_than_secs: u64,
+    pub oldest_age_secs: u64,
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -416,6 +440,22 @@ pub struct SandboxBuildCacheReclaimReportV2 {
     /// Payloads from before #1607 decode it as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_target: Option<SandboxSharedTargetReclaimV1>,
+    /// Sandbox directories no live session owns whose `target/` build output
+    /// is on disk (#2682): orphans with no session row and the leftovers of
+    /// sessions that ended without a live custody root. Only the `target/`
+    /// is ever reclaimed, never the source worktree. Payloads from before
+    /// #2682 decode it as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stray_targets: Option<SandboxStrayTargetsV1>,
+    /// RFC3339 time (nanoseconds) the daemon computed this report. Set on a
+    /// status read served from the daemon's preview cache (#2604); absent on
+    /// older payloads and on a pass report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed_at: Option<String>,
+    /// Milliseconds between `computed_at` and the moment the daemon served
+    /// this report (#2604); 0 for a report computed for this very call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
 }
 
 /// What one pass decided about the shared cargo `debug/` directory.
@@ -470,6 +510,77 @@ pub struct SandboxSharedTargetReclaimV1 {
     pub staged_pending: bool,
 }
 
+/// Most stray entries one report carries; the totals still count the rest.
+pub const SANDBOX_STRAY_TARGETS_SAMPLES_MAX: usize = 64;
+
+/// Why a sandbox directory's `target/` has no live owner (#2682).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxStrayTargetKind {
+    /// No session row and no custody root names the directory.
+    Orphan,
+    /// Only finished sessions without a live custody root name it (a failed
+    /// or quarantined cleanup, or a purged row whose directory survived).
+    Detached,
+}
+
+/// One stray sandbox `target/` directory and what the pass decided about it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxStrayTargetV1 {
+    /// The sandbox directory's name under the sandbox base (never a path).
+    pub name: String,
+    pub kind: SandboxStrayTargetKind,
+    /// The finished session that last named the directory, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub outcome: SandboxSharedTargetReclaimOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    pub measured_bytes: u64,
+    pub measured_truncated: bool,
+    pub reclaimed_bytes: u64,
+    pub staged_pending: bool,
+}
+
+/// All stray targets one pass saw. Pressure alone makes them reclaimable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxStrayTargetsV1 {
+    /// Strays found, including those past the sample bound.
+    pub total_count: u32,
+    /// Allocated bytes seen across the sampled entries (a lower bound).
+    pub total_measured_bytes: u64,
+    /// Bytes freed this pass.
+    pub reclaimed_bytes: u64,
+    /// Largest first, at most [`SANDBOX_STRAY_TARGETS_SAMPLES_MAX`].
+    pub entries: Vec<SandboxStrayTargetV1>,
+}
+
+impl SandboxStrayTargetsV1 {
+    pub fn validate_wire(&self) -> Result<(), &'static str> {
+        if self.entries.len() > SANDBOX_STRAY_TARGETS_SAMPLES_MAX {
+            return Err("stray-target sample is unbounded");
+        }
+        for entry in &self.entries {
+            if entry.name.is_empty() || entry.name.len() > 255 || entry.name.contains('/') {
+                return Err("stray-target name is not a directory name");
+            }
+            if let Some(check) = &entry.check {
+                if check.is_empty()
+                    || check.len() > SANDBOX_RECLAIM_CHECK_TOKEN_MAX
+                    || !check.bytes().all(|byte| byte.is_ascii_graphic())
+                {
+                    return Err("stray-target check is not a bounded token");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SandboxSharedTargetReclaimV1 {
     pub fn validate_wire(&self) -> Result<(), &'static str> {
         if let Some(check) = &self.check {
@@ -495,6 +606,9 @@ impl SandboxBuildCacheReclaimReportV2 {
         validate_refusals(&self.refusals)?;
         if let Some(shared) = &self.shared_target {
             shared.validate_wire()?;
+        }
+        if let Some(strays) = &self.stray_targets {
+            strays.validate_wire()?;
         }
         Ok(self)
     }
@@ -920,11 +1034,15 @@ mod tests {
                     deleting: 1,
                     completed: 9,
                     abandoned: 3,
+                    stuck: None,
                 }),
             },
             pass_contention: None,
             refusals: Vec::new(),
             shared_target: None,
+            stray_targets: None,
+            computed_at: None,
+            age_ms: None,
         }
     }
 

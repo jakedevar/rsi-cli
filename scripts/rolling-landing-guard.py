@@ -143,7 +143,7 @@ def lost_hunks(repo, base, source, candidate, proof=None):
     patch = git(repo, "diff", "--no-ext-diff", "--no-renames", "--binary",
                 "--unified=0", base, source).stdout
     if not patch:
-        raise GuardError("accepted source has no changes from its base")
+        return []
     errors = []
     renames = renamed_paths(repo, source, candidate)
     proved_sites = {}
@@ -320,7 +320,10 @@ def main():
         missing = lost_hunks(repo, args.base, args.source, args.candidate, proof)
         packages = affected_crates(repo, args.target, args.candidate)
         commands = test_commands(packages, args.test_filter)
-        report = {"accepted_source": args.source, "candidate": args.candidate,
+        unchanged = (git(repo, "rev-parse", f"{args.target}^{{tree}}").stdout
+                     == git(repo, "rev-parse", f"{args.candidate}^{{tree}}").stdout)
+        report = {"outcome": "already_on_rolling" if unchanged and not missing else "candidate",
+                  "accepted_source": args.source, "candidate": args.candidate,
                   "lost_hunks": missing, "affected_crates": packages,
                   "test_commands": [" ".join(command) for command in commands],
                   "tests_executed": False}

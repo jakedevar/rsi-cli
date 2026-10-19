@@ -142,23 +142,6 @@ impl Store {
         Ok(count as u64)
     }
 
-    /// Most recent persisted foreground session activity timestamp.
-    pub fn latest_session_activity_at(&self) -> Result<Option<chrono::DateTime<Utc>>> {
-        let raw: Option<String> =
-            self.conn
-                .query_row("SELECT MAX(updated_at) FROM sessions", [], |row| row.get(0))?;
-        raw.map(|value| {
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|e| {
-                    crate::error::DaemonError::Store(format!(
-                        "invalid session updated_at timestamp '{value}': {e}"
-                    ))
-                })
-        })
-        .transpose()
-    }
-
     /// List completed/archived sessions that have no explicit observations yet.
     pub fn sessions_needing_extraction(&self, limit: usize) -> Result<Vec<Uuid>> {
         let mut stmt = self.conn.prepare(
@@ -313,7 +296,7 @@ mod tests {
     /// are orphaned in `/tmp` when it drops.
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("test.db")).unwrap();
         (dir, store)
     }
 

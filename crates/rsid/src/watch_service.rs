@@ -55,6 +55,7 @@ pub fn spawn_terminal_watch_service(
                 match rx.recv().await {
                     Ok(event) => handle_event(&event, &store, &scheduler).await,
                     Err(RecvError::Lagged(missed)) => {
+                        bus.record_lagged(missed);
                         // The receiver fast-forwarded past `missed` events.
                         // The due-tick covers whatever was lost; accelerate
                         // it once rather than reasoning about the gap.

@@ -21,6 +21,9 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-md.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+rsi-common = { path = "../rsi-common" }
+
 [[bin]]
 name = "rsi-test-impact"
 path = "src/bin/rsi-test-impact.rs"

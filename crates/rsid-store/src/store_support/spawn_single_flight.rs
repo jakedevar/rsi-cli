@@ -36,6 +36,25 @@ static SPAWN_SINGLE_FLIGHT: Mutex<Option<HashMap<Uuid, Arc<tokio::sync::Mutex<()
 /// publication. Source-worktree settlement takes the exclusive guard across
 /// its final runtime-alias recheck and Git effects. This deliberately favors a
 /// small, auditable safety boundary over per-path lock-map complexity.
+///
+/// # Lock order (#2081)
+///
+/// The cwd admission lock is the OUTERMOST of the daemon's blocking locks:
+///
+/// `provider-cwd admission -> Store -> custody root lock -> repository mutex`
+///
+/// (the last three as ordered in `store::custody_lock_order`; a thread that
+/// already holds a root lock or the repository mutex reaches the Store only
+/// through its bounded `try_lock`). Provider launch (read) and archive cleanup
+/// (write) already hold this lock while they wait for the repository mutex
+/// (worktree allocation, cleanup Git effects). Therefore NO thread may wait
+/// for this lock while holding the Store, a custody root lock or the
+/// repository mutex. Cohort settlement follows it: each root takes the
+/// exclusion first and then enters the repository mutex for that root alone
+/// (`cohort_settlement::settle_root_exclusion_first`), releasing both between
+/// roots so a launch or cleanup that queued behind it is admitted. The
+/// remaining in-mutex acquisition (startup recovery, before any launch can
+/// exist) is bounded to one second and surrenders as `runtime_state_contended`.
 static PROVIDER_CWD_ADMISSION: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 pub type ProviderCwdAdmissionGuard = tokio::sync::RwLockReadGuard<'static, ()>;

@@ -48,6 +48,11 @@ pub(crate) fn status_lines(status: &RemoteStatusV1) -> Vec<String> {
         } else {
             "Tailscale: unreachable".to_string()
         },
+        format!(
+            "Phone writes: answers {} (n)   messages to managers {} (m)",
+            yes_no(status.allow_answers, "ON", "off"),
+            yes_no(status.allow_messages, "ON", "off")
+        ),
         match &status.url {
             Some(url) => format!("Open on phone: {}", safe(url, 120)),
             None => "Open on phone: (host unknown until Tailscale is reachable)".to_string(),
@@ -97,7 +102,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &RemoteOverlayState) 
     frame.render_widget(Clear, popup);
     let block = theme::overlay_block()
         .title(Line::from(Span::styled(
-            " Remote · read-only phone view ",
+            " Remote · phone view ",
             Style::default()
                 .fg(theme::overlay_title())
                 .add_modifier(Modifier::BOLD),
@@ -164,7 +169,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &RemoteOverlayState) 
     }
     lines.push(Line::default());
     lines.push(Line::from(
-        "Tab list · j/k move · Space toggle · e enable/disable · a apply · r refresh · Esc close",
+        "Tab list · j/k move · Space toggle · e enable/disable · n answers · m messages · a apply · r refresh · Esc close",
     ));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
@@ -196,8 +201,20 @@ mod tests {
         assert!(text.contains("Remote: ENABLED"));
         assert!(text.contains("Gateway: running   Serve route: missing   Funnel: off"));
         assert!(text.contains("Open on phone: https://box.ts.net/"));
+        assert!(text.contains("Phone writes: answers off (n)   messages to managers off (m)"));
         assert!(text.contains("sudo tailscale set --operator=$USER"));
         assert!(text.contains("1.102.4 Running"));
+    }
+
+    #[test]
+    fn write_switches_show_their_state() {
+        let status = RemoteStatusV1 {
+            allow_answers: false,
+            allow_messages: true,
+            ..Default::default()
+        };
+        let text = status_lines(&status).join("\n");
+        assert!(text.contains("Phone writes: answers off (n)   messages to managers ON (m)"));
     }
 
     #[test]

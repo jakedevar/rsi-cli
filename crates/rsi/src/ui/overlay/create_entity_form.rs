@@ -192,17 +192,23 @@ pub(super) fn render_create_entity_form(
         y += 2;
     }
     if visibility_list.contains(&CreateEntityField::Effort) {
-        let ladder = crate::overlay::create_entity_form::effort_ladder_for_selection(
+        let ladder = crate::overlay::create_entity_form::live_effort_ladder_for_selection(
+            app,
             provider,
             model.as_deref(),
-            app.selected_provider,
-            app.selected_model.as_deref(),
         );
-        render_effort_row(frame, inner, y, effort.as_deref(), ladder, focused_field);
+        render_effort_row(frame, inner, y, effort.as_deref(), &ladder, focused_field);
         y += 2;
     }
     if visibility_list.contains(&CreateEntityField::Sandbox) {
-        render_sandbox_row(frame, inner, y, sandbox, focused_field);
+        render_sandbox_row(
+            frame,
+            inner,
+            y,
+            sandbox,
+            app.launch_read_only,
+            focused_field,
+        );
         y += 2;
     }
 
@@ -797,7 +803,7 @@ fn render_effort_row(
     inner: Rect,
     y: u16,
     effort: Option<&str>,
-    ladder: &[&'static str],
+    ladder: &[String],
     focused_field: CreateEntityField,
 ) {
     let label_style = Style::default()
@@ -808,7 +814,7 @@ fn render_effort_row(
     let cells = std::iter::once(("none", None)).chain(
         ladder
             .iter()
-            .map(|level| (effort_cell_label(level), Some(*level))),
+            .map(|level| (effort_cell_label(level), Some(level.as_str()))),
     );
     for (label, value) in cells {
         let selected = effort == value;
@@ -839,6 +845,7 @@ fn render_sandbox_row(
     inner: Rect,
     y: u16,
     sandbox: bool,
+    read_only: bool,
     focused_field: CreateEntityField,
 ) {
     let label_style = Style::default()
@@ -854,11 +861,17 @@ fn render_sandbox_row(
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled("  Sandbox: ", label_style),
         Span::styled(toggle_label.to_string(), Style::default().fg(toggle_color)),
+        // #2758: the operator-only read-only launch mode (Claude/Codex).
+        Span::styled("  Read-only: ", label_style),
+        Span::styled(
+            if read_only { "[on]" } else { "[off]" }.to_string(),
+            Style::default().fg(toggle_color),
+        ),
     ];
     if focused {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            "(s: toggle)",
+            "(s: sandbox, R: read-only)",
             Style::default().fg(theme::overlay_hint()),
         ));
     }

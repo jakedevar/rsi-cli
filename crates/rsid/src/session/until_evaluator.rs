@@ -8,7 +8,7 @@
 //!
 //! # Variants
 //!
-//! - `MaxIterations(n)`: halt after `n` iterations (sync check).
+//! - `MaxIterations(n)`: halt after `n` iterations.
 //! - `LeadHalt`: subscribe to `EventBus` for `DaemonEvent::HaltDirective { directive: "/halt" }`;
 //!   set `halt_flag` atomically when detected (async subscriber task).
 //! - `Predicate(String)`: V1 stub — only `"index_exhausted"` is evaluated
@@ -36,7 +36,7 @@ use rsi_common::rpc::GetIndexStatusParams;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
-/// Signal returned by `UntilEvaluator::check` / `check_async` after each
+/// Signal returned by `UntilEvaluator::check_async` after each
 /// iteration to tell the loop driver whether to continue or halt.
 #[derive(Debug)]
 pub(crate) enum UntilSignal {
@@ -139,6 +139,7 @@ impl UntilEvaluator {
                             return;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            eb.record_lagged(n);
                             tracing::warn!(
                                 lagged = n,
                                 "UntilEvaluator LeadHalt subscriber lagged — re-checking active \
@@ -181,49 +182,9 @@ impl UntilEvaluator {
         }
     }
 
-    /// Synchronous check. Increments the iteration counter and evaluates all
-    /// non-async halt sources. Returns `Continue` or `Halt(reason)`.
-    ///
-    /// For `Predicate` conditions, use `check_async` which can perform I/O.
-    pub(crate) fn check(&mut self) -> UntilSignal {
-        self.iteration += 1;
-
-        let mut fired: Vec<HaltReason> = Vec::new();
-
-        // LeadHalt check (highest priority, always checked regardless of condition variant).
-        if self.halt_flag.load(Ordering::Relaxed) {
-            let source = self
-                .halt_source
-                .lock()
-                .ok()
-                .and_then(|g| *g)
-                .unwrap_or(Uuid::nil());
-            fired.push(HaltReason::LeadHalt {
-                source_session: source,
-            });
-        }
-
-        match &self.condition {
-            UntilCondition::MaxIterations(n) => {
-                if self.iteration >= *n {
-                    fired.push(HaltReason::MaxIterationsReached(*n));
-                }
-            }
-            UntilCondition::LeadHalt => {
-                // Handled above via halt_flag; no additional action needed.
-            }
-            UntilCondition::Predicate(_) => {
-                // Predicate check requires async I/O — caller must use check_async().
-                // If check() is called for a Predicate condition, treat as NoUntilGuard.
-                fired.push(HaltReason::NoUntilGuard);
-            }
-        }
-
-        resolve_signal(fired, self.iteration)
-    }
-
-    /// Async check. Equivalent to `check()` but also evaluates `Predicate` conditions
-    /// that require I/O (filesystem INDEX.status.json reads).
+    /// Evaluate every halt source after one iteration, including `Predicate`
+    /// conditions that require I/O (filesystem INDEX.status.json reads).
+    /// Increments the iteration counter. Returns `Continue` or `Halt(reason)`.
     pub(crate) async fn check_async(
         &mut self,
         session_manager: &Arc<SessionManager>,
@@ -309,6 +270,25 @@ fn resolve_signal(fired: Vec<HaltReason>, iteration: u32) -> UntilSignal {
         .into_iter()
         .min_by_key(halt_reason_priority)
         .expect("fired is non-empty");
+
+    match &best {
+        HaltReason::LeadHalt { source_session } => tracing::info!(
+            iteration,
+            source_session = %source_session,
+            "UntilEvaluator: halting on a lead /halt directive"
+        ),
+        HaltReason::MaxIterationsReached(max) => tracing::info!(
+            iteration,
+            max_iterations = *max,
+            "UntilEvaluator: halting at the iteration limit"
+        ),
+        HaltReason::PredicateMet(predicate) => tracing::info!(
+            iteration,
+            predicate = %predicate,
+            "UntilEvaluator: halting because the predicate is met"
+        ),
+        HaltReason::NoUntilGuard => {}
+    }
 
     UntilSignal::Halt(best)
 }
@@ -426,7 +406,7 @@ mod tests {
     fn manager() -> (SessionManager, TempDir) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("rsi.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         let config = Config::from_env();
         let runtime_config = RuntimeConfig::from_config(&config);
         let manager = SessionManager::new(

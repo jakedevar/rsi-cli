@@ -15,6 +15,7 @@ mod cards;
 pub mod chain_iterations;
 pub mod closure_kernel;
 pub mod cohort_settlement;
+pub mod cold_archive; // #2384 cold-storage archive of old session data.
 mod compiled_prompts;
 // The file stays at its released path: tools/released-migrations.json pins the
 // v128 sections of `daemon_restart_persistence.rs` by path.
@@ -33,9 +34,11 @@ pub mod manager_coordinator;
 mod manager_decision_history;
 mod manager_decision_rulings;
 pub mod manager_decisions;
+mod manager_obligations; // #2471: durable result/predicate carry across seat changes
 pub mod pending_approvals;
 pub mod session_retention;
 pub mod source_worktree_v120;
+pub(crate) mod terminal_custody_shape;
 pub use ideas::IdeaControllerReconciliationCursor;
 #[cfg(any(test, feature = "test-seam"))]
 pub use ideas::{IdeaControllerWriteFault, inject_d03_idea_controller_write_fault};
@@ -43,25 +46,37 @@ pub mod agent_deploys;
 pub mod agent_deploys_operator;
 pub mod agent_jobs;
 pub mod agent_projects;
+mod agent_worker_roster; // #2311: AgentWorkerRoster derived worker states
 mod catalog_convergence;
 pub mod child_autonomy;
+pub mod codegraph_failure_notice; // #2454 first-failure notice to the workspace owner.
+pub mod codegraph_health;
 pub mod custody_lock_order;
 pub mod daemon_info;
 mod failure_signatures;
 mod fleet;
 pub mod friction;
+pub mod gone_wake_escalation;
+pub mod issue_result_landed; // hub #2911: landed-RESULT notice to the manager.
+pub mod operator_todos;
+pub mod settlement_notice;
+pub mod standing_directives;
+pub mod unsettled_model_invocations; // #2528 bounded-shutdown record.
 pub use fleet::FleetScope;
 pub mod global_manager;
 mod issues;
 mod labels;
 mod lineage_convergence;
+mod manager_action_failure_escalation; // #2455 failure notice survives a manager scope change.
 pub mod manager_actions;
+pub mod manager_budget;
 pub mod manager_intent;
 pub mod manager_ledger;
 pub mod manager_node_workspace;
 pub mod manager_nodes;
 mod manager_notices;
 mod manager_prepared_actions;
+pub mod manager_reseat;
 pub mod manager_resources;
 pub mod manager_review_v121;
 pub mod manager_reviews;
@@ -88,25 +103,31 @@ pub mod provider_turn_custody;
 pub mod queue;
 mod rate_limits;
 pub mod recursive_dag;
+pub mod remote_manager;
 pub mod restart_intents;
 pub mod rolling_queue;
 pub mod rotation_abandon;
 mod rotation_events;
+mod session_activity;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod stripe_liveness_support;
 pub use rotation_events::{BlockedRotation, COMPLETED_TRIGGER_PHASE, RotationRequestSuccessor};
+pub mod manager_question_stall;
 pub mod portable_bundle; // #1406 clean export/import of durable state.
 pub mod row_mappers;
 pub mod runaway_process; // #1337 CPU-time andon notice to the owning manager.
 pub mod sandbox_custody;
 #[allow(clippy::redundant_pub_crate)]
 pub mod sandbox_reclaim;
+pub mod sandbox_stray; // #2682 stray sandbox target owner and runaway-disk notice.
 pub mod satellite_dispatch;
 #[allow(clippy::redundant_pub_crate)]
 pub mod satellite_identity;
 pub mod satellite_inbound_attempts;
 pub mod satellite_registry;
+pub mod satellite_report_outbox;
 pub mod satellite_reports;
+pub mod satellite_scope; // #1928 the one scope resolver.
 pub mod scheduled_jobs;
 #[cfg(test)]
 mod scheduled_jobs_list_tests; // #954 B paging tests
@@ -115,6 +136,7 @@ mod session_diagnostics;
 mod session_model_updates;
 pub mod session_tool_policy;
 pub mod session_transient_heal;
+mod session_write_order;
 mod sessions;
 pub mod successor_reservations;
 mod summaries;
@@ -139,6 +161,14 @@ pub use model_control::{
     StoreCompletionOutcome,
 };
 pub use row_mappers::parse_timestamp;
+#[cfg(any(test, feature = "test-seam"))]
+pub use session_write_order::script_session_write_clock_for_test;
+pub use session_write_order::{
+    SessionWriteField, SessionWrites, last_session_write, last_session_write_seq, session_writes,
+};
+pub use sessions::SessionWriteStamp;
+#[cfg(any(test, feature = "test-seam"))]
+pub use sessions::codegraph_registry_digest_count;
 
 use crate::error::DaemonError;
 use crate::error::Result;
@@ -157,6 +187,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 include!("migrations/support.rs");
+include!("migrations/altered_objects.rs");
 include!(concat!(env!("OUT_DIR"), "/store_migrations.rs"));
 
 /// Stable project seeded only into isolated in-memory test stores. Production
@@ -310,10 +341,15 @@ pub struct Store {
     /// `session::issue21_phase2_tests::the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity`.
     delivery_boot_id: Cell<Uuid>,
     /// #1103: process-local queue of reports the satellite's appointed manager
-    /// wrote for the hub. Deliberately not durable (informational, at most
-    /// once): the hub pulls and acknowledges them, a restart loses unsent ones.
-    pub(crate) hub_reports:
-        RefCell<std::collections::VecDeque<rsi_common::satellite_dispatch::SatelliteReportV1>>,
+    /// wrote for the hub, with the delivery state the seat can read (#2242).
+    /// Deliberately not durable (informational, at most once): the hub pulls
+    /// and acknowledges them, a restart loses unsent ones.
+    pub(crate) hub_reports: RefCell<satellite_report_outbox::HubReportOutbox>,
+    /// Bounded, process-local memo of write-free manager intent observations.
+    manager_intent_idle: RefCell<manager_intent::idle::IdleIntentCache>,
+    /// Exact activity maximum plus pending session rowids, installed on first
+    /// Dream control read. Only timestamps/rowids are retained, never payloads.
+    session_activity: RefCell<Option<session_activity::SessionActivityCache>>,
 }
 
 #[cfg(any(test, feature = "test-seam"))]
@@ -474,6 +510,7 @@ pub(crate) enum CurrentSchemaTemplateBackupObservation {
     Done(i32),
     Busy,
     Locked,
+    #[cfg(test)]
     Error,
     Unknown,
 }
@@ -552,6 +589,7 @@ impl CurrentSchemaTemplateBackupBudget {
                 Err(CurrentSchemaTemplateErrorCode::BackupUnknownResult
                     .error(format_args!("done_remaining={remaining}")))
             }
+            #[cfg(test)]
             CurrentSchemaTemplateBackupObservation::Error => {
                 Err(CurrentSchemaTemplateErrorCode::BackupStep.error("injected step error"))
             }
@@ -712,7 +750,9 @@ fn raw_in_memory_store_for_test() -> Result<Store> {
         controller_grant_incarnations: RefCell::new(HashMap::new()),
         program_run_boot_id: Cell::new(current_schema_template_runtime_identity()?),
         delivery_boot_id: Cell::new(current_schema_template_runtime_identity()?),
-        hub_reports: RefCell::new(std::collections::VecDeque::new()),
+        hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+        manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+        session_activity: RefCell::new(None),
     })
 }
 
@@ -928,7 +968,9 @@ fn raw_file_store_for_test(path: &Path) -> Result<Store> {
         controller_grant_incarnations: RefCell::new(HashMap::new()),
         program_run_boot_id: Cell::new(current_schema_template_runtime_identity()?),
         delivery_boot_id: Cell::new(current_schema_template_runtime_identity()?),
-        hub_reports: RefCell::new(std::collections::VecDeque::new()),
+        hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+        manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+        session_activity: RefCell::new(None),
     })
 }
 
@@ -1208,6 +1250,54 @@ fn backup_current_schema_template(
 }
 
 #[cfg(any(test, feature = "test-seam"))]
+fn refresh_file_fixture_bootstrap(conn: &mut Connection) -> Result<()> {
+    use rand::{RngCore, rngs::OsRng};
+
+    let tx = conn.transaction()?;
+    // The copy is a newly reserved fixture, never an existing database. Its
+    // immutable/forward-only bootstrap rows must get per-fixture values before
+    // use. Restore the exact source guards in this same transaction.
+    let mut guards = Vec::new();
+    for name in [
+        "sandbox_reclaim_sweeps_v119_forward_update",
+        "sandbox_target_reclaim_intent_sweeps_v119_forward_update",
+        "source_worktree_batch_cursor_keys_v120_no_update",
+    ] {
+        let sql: String = tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        tx.execute_batch(&format!("DROP TRIGGER \"{name}\";"))?;
+        guards.push(sql);
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    for table in [
+        "daemon_settings",
+        "sandbox_reclaim_sweeps",
+        "sandbox_target_reclaim_intent_sweeps",
+        "satellite_registry",
+    ] {
+        tx.execute(&format!("UPDATE {table} SET updated_at=?1"), [&now])?;
+    }
+    let mut key = [0_u8; 32];
+    OsRng.fill_bytes(&mut key);
+    tx.execute(
+        "UPDATE source_worktree_batch_cursor_keys SET cursor_key=?1,created_at=?2 WHERE key_id=1",
+        rusqlite::params![key.as_slice(), now],
+    )?;
+    tx.execute(
+        "UPDATE satellite_installation_identity SET installation_id=?1 WHERE singleton=1",
+        [Uuid::new_v4().to_string()],
+    )?;
+    for sql in guards {
+        tx.execute_batch(&sql)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-seam"))]
 fn open_in_memory_from_current_schema_template_with_timestamp(
     timestamp: impl FnOnce() -> String,
 ) -> Result<Store> {
@@ -1215,6 +1305,8 @@ fn open_in_memory_from_current_schema_template_with_timestamp(
     let mut store = raw_in_memory_store_for_test()
         .map_err(|error| CurrentSchemaTemplateErrorCode::DestinationInvariant.error(error))?;
     let (catalog, _) = backup_current_schema_template(source, &mut store.conn)?;
+    refresh_file_fixture_bootstrap(&mut store.conn)
+        .map_err(|error| CurrentSchemaTemplateErrorCode::DestinationInvariant.error(error))?;
     verify_current_schema_connection(
         &store.conn,
         Some(&catalog),
@@ -1225,7 +1317,7 @@ fn open_in_memory_from_current_schema_template_with_timestamp(
     Ok(store)
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_source_proof_for_test() -> Result<(i64, i64)> {
     let source = current_schema_template()?;
     match source {
@@ -1246,7 +1338,7 @@ pub(crate) fn current_schema_template_source_proof_for_test() -> Result<(i64, i6
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_is_unlocked_and_zero_seed_for_test() -> bool {
     let Ok(source) = current_schema_template() else {
         return false;
@@ -1268,7 +1360,7 @@ pub(crate) fn current_schema_template_is_unlocked_and_zero_seed_for_test() -> bo
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_disk_cache_for_test(
     directory: &Path,
 ) -> Result<(PathBuf, i64)> {
@@ -1276,12 +1368,12 @@ pub(crate) fn current_schema_template_disk_cache_for_test(
     Ok((source.path, source.page_count))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_cache_key_for_test() -> String {
     current_schema_template_cache_key()
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_cached_failure_replay_for_test() -> (usize, String, String) {
     let cache: OnceLock<std::result::Result<(), CachedCurrentSchemaTemplateError>> =
         OnceLock::new();
@@ -1302,7 +1394,7 @@ pub(crate) fn current_schema_template_cached_failure_replay_for_test() -> (usize
     (attempts.get(), errors.remove(0), errors.remove(0))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_init_failure_for_test(join: bool) -> String {
     let mode = if join {
         CurrentSchemaTemplateInitMode::InjectJoinPanic
@@ -1315,7 +1407,7 @@ pub(crate) fn current_schema_template_init_failure_for_test(join: bool) -> Strin
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_poison_failure_for_test() -> String {
     let mutex = std::sync::Arc::new(Mutex::new(()));
     let poisoner = std::sync::Arc::clone(&mutex);
@@ -1333,7 +1425,7 @@ pub(crate) fn current_schema_template_poison_failure_for_test() -> String {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_backup_bounds_for_test()
 -> (i32, i64, usize, usize, usize, Duration) {
     (
@@ -1346,7 +1438,7 @@ pub(crate) fn current_schema_template_backup_bounds_for_test()
     )
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn current_schema_template_backup_seam_for_test(
     mutex: &Mutex<()>,
     page_count: i64,
@@ -1372,7 +1464,7 @@ pub(crate) fn current_schema_template_backup_seam_for_test(
     Err(CurrentSchemaTemplateErrorCode::BackupStepBudget.error("incomplete injected backup"))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn cached_current_schema_early_failure_for_test() -> Result<Store> {
     current_schema_template()?;
     Err(CurrentSchemaTemplateErrorCode::DestinationInvariant.error("injected early clone failure"))
@@ -1472,6 +1564,16 @@ impl Store {
             source_worktree_v120::session_dependency_relevance_sql,
         )?;
         // RSI-RELEASED-MIGRATION-END: v120-source-worktree-session-relevance-function
+
+        // V175 (#2050): the dependency-health relevance classifier is versioned,
+        // not edited. The V120 function above stays registered for the released
+        // V120 catalog; the evidence view now calls this one.
+        conn.create_scalar_function(
+            "rsi_swc_v175_session_dependency_relevance",
+            31,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            source_worktree_v120::health_v175::session_dependency_relevance_sql,
+        )?;
 
         conn.create_scalar_function(
             "rsi_jsonrpc_id_is_canonical",
@@ -1713,6 +1815,29 @@ impl Store {
         Ok(())
     }
 
+    /// #2939: a second, read-only connection to the daemon's database for
+    /// observations computed without the shared Store lock. It runs no schema
+    /// initialisation (the daemon's own Store did) and refuses every write.
+    pub fn open_read_only_observer(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Self::refuse_newer_schema(&conn)?;
+        Self::register_sql_functions(&conn)?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=10000;")?;
+        Ok(Self {
+            conn,
+            controller_grants: RefCell::new(HashMap::new()),
+            controller_grant_incarnations: RefCell::new(HashMap::new()),
+            program_run_boot_id: Cell::new(Uuid::new_v4()),
+            delivery_boot_id: Cell::new(Uuid::new_v4()),
+            hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+            manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+            session_activity: RefCell::new(None),
+        })
+    }
+
     /// Filesystem database path; in-memory fixtures have no recovery target.
     pub fn database_path(&self) -> Option<&str> {
         self.conn.path().filter(|path| !path.is_empty())
@@ -1727,11 +1852,32 @@ impl Store {
     /// Open or create database at the given path.
     /// Runs schema initialization on open.
     pub fn open(path: &Path) -> Result<Self> {
+        // Owner-only (#1844): create a new database 0600 and tighten an old one
+        // before SQLite opens it, because `-wal`/`-shm` inherit the main file's
+        // mode. A creation failure is left to `Connection::open` to report.
+        // SQLite's `:memory:` (and an empty path) name no file: hardening it
+        // would create a stray 0600 `:memory:` file in the working directory,
+        // which dirties a sandbox and blocks its settlement.
+        let on_disk = !path.as_os_str().is_empty() && path != Path::new(":memory:");
+        let mut tightened = Vec::new();
+        if on_disk {
+            let _ = rsid_core::private_state::create_private_file(path);
+            tightened = rsid_core::private_state::tighten_database_files(path);
+        }
         let conn = Connection::open(path)?;
         // Refuse a newer schema before the first PRAGMA write (journal_mode
         // can rewrite the file header) or any DDL/DML.
         Self::refuse_newer_schema(&conn)?;
         Self::register_sql_functions(&conn)?;
+        // #2384: a new database starts in incremental auto-vacuum mode, so pages a
+        // cold-archive move frees return to the file system in small steps. The
+        // mode can only be chosen before the first table exists; an existing file
+        // changes mode only through the one-time compaction (plan §5).
+        let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        if page_count == 0 {
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+        }
+
         migration_backup::before_migration(&conn, path)?;
 
         // Enable WAL mode for better concurrent read performance
@@ -1753,10 +1899,68 @@ impl Store {
             controller_grant_incarnations: RefCell::new(HashMap::new()),
             program_run_boot_id: Cell::new(Uuid::new_v4()),
             delivery_boot_id: Cell::new(Uuid::new_v4()),
-            hub_reports: RefCell::new(std::collections::VecDeque::new()),
+            hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+            manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+            session_activity: RefCell::new(None),
         };
         store.init_schema()?;
+        // The WAL sidecars now exist, and a migration may have written backups.
+        if on_disk {
+            tightened.extend(rsid_core::private_state::tighten_database_files(path));
+            if let Some(parent) = path.parent() {
+                tightened.extend(rsid_core::private_state::tighten_tree(
+                    &parent.join("backups"),
+                ));
+            }
+        }
+        if !tightened.is_empty() {
+            tracing::info!(
+                count = tightened.len(),
+                db = %path.display(),
+                "tightened database file modes to owner-only"
+            );
+        }
         Ok(store)
+    }
+
+    /// Create a private, current-schema file fixture from the migration-built
+    /// template. Existing files still take the ordinary migration/reopen path.
+    /// Tests asserting migration execution use `open` directly; fixture setup
+    /// can avoid replaying every released migration just to build a database.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn open_test_fixture(path: &Path) -> Result<Self> {
+        if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+            return Self::open(path);
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Self::open(path);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let source = current_schema_template()?;
+        let mut conn = Connection::open(path)?;
+        Self::register_sql_functions(&conn)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let (catalog, _) = backup_current_schema_template(source, &mut conn)?;
+        refresh_file_fixture_bootstrap(&mut conn)?;
+        verify_current_schema_connection(
+            &conn,
+            Some(&catalog),
+            CurrentSchemaTemplateErrorCode::DestinationInvariant,
+        )?;
+        drop(conn);
+        // Keep the normal WAL, busy timeout, file hardening and runtime identity
+        // setup. At the current schema head this performs no migration replay.
+        Self::open(path)
     }
 
     /// Open an in-memory SQLite database for testing.
@@ -1769,7 +1973,7 @@ impl Store {
     }
 
     /// Build a current-schema in-memory fixture by replaying every migration.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn open_in_memory_via_migrations_for_test() -> Result<Self> {
         let store = raw_in_memory_store_for_test()?;
         store.init_schema()?;
@@ -1783,14 +1987,14 @@ impl Store {
         Ok(store)
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn open_in_memory_with_timestamp_for_test(
         timestamp: impl FnOnce() -> String,
     ) -> Result<Self> {
         open_in_memory_from_current_schema_template_with_timestamp(timestamp)
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn open_in_memory_v92_for_test() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::register_sql_functions(&conn)?;
@@ -1801,7 +2005,9 @@ impl Store {
             controller_grant_incarnations: RefCell::new(HashMap::new()),
             program_run_boot_id: Cell::new(Uuid::new_v4()),
             delivery_boot_id: Cell::new(Uuid::new_v4()),
-            hub_reports: RefCell::new(std::collections::VecDeque::new()),
+            hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+            manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+            session_activity: RefCell::new(None),
         };
         store.init_schema_internal(false, true)?;
         Ok(store)
@@ -1810,7 +2016,7 @@ impl Store {
     /// Build an authenticated predecessor shell without executing V85-V88.
     /// V88 migration tests use this to construct deployed V87 inputs solely
     /// from the sealed predecessor literals instead of rewinding V88.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn open_test_predecessor_v84(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::register_sql_functions(&conn)?;
@@ -1823,7 +2029,9 @@ impl Store {
             controller_grant_incarnations: RefCell::new(HashMap::new()),
             program_run_boot_id: Cell::new(Uuid::new_v4()),
             delivery_boot_id: Cell::new(Uuid::new_v4()),
-            hub_reports: RefCell::new(std::collections::VecDeque::new()),
+            hub_reports: RefCell::new(satellite_report_outbox::HubReportOutbox::default()),
+            manager_intent_idle: RefCell::new(manager_intent::idle::IdleIntentCache::default()),
+            session_activity: RefCell::new(None),
         };
         store.init_schema_internal(true, false)?;
         Ok(store)
@@ -1884,8 +2092,10 @@ impl Store {
         }
 
         // V120 definitions and the internal cursor key are authenticated on
-        // every reopen, before any projection reconciliation can write.
-        source_worktree_v120::validate_v120_catalog(&self.conn)?;
+        // every reopen, before any projection reconciliation can write. V175
+        // replaced the evidence view, so a V175+ store is checked against the
+        // V175 successor catalog (#2050).
+        source_worktree_v120::health_v175::validate_current_catalog(&self.conn)?;
         let live_version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;

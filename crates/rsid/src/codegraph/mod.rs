@@ -2,6 +2,7 @@
 //! connected only after the shared integration and schema seams are allocated.
 
 mod discovery;
+mod health;
 mod manager;
 mod native;
 mod retention;
@@ -11,12 +12,13 @@ mod status;
 mod watcher;
 mod worker;
 
+pub use health::{file_notices, notify_failure_episodes, run_codegraph_health_loop};
 pub use manager::{IndexHandle, IndexManager, IndexRequestError, IndexWorkspaceBinding};
 pub use native::{NativeCodegraphBinding, NativeCodegraphToolKind, execute_native_read};
 pub use retention::{DetailedGeneration, RetentionPlan, RetentionPolicy, plan_retention};
 pub use runtime::IndexRuntime;
 pub use service::{BoundCodegraphScope, CodegraphReadService, CodegraphServiceError};
-pub use status::{IndexPhase, IndexStatus};
+pub use status::{FailureEpisode, IndexPhase, IndexStatus};
 pub use watcher::IndexWatcher;
 
 use std::path::{Path, PathBuf};

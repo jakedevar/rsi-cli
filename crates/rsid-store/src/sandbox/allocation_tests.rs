@@ -1,4 +1,4 @@
-use super::AllocationPermit;
+use super::{AllocationPermit, effective_min_free_bytes};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -65,4 +65,21 @@ async fn allocation_permit_serializes_capacity_observation_across_allocators() {
         .unwrap()
         .unwrap();
     assert_eq!(permit.measure().unwrap().source_roots, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+#[test]
+fn launch_floor_is_capped_at_a_quarter_of_a_small_disk() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // A 60 GiB floor on a 192 GiB disk is 48 GiB; a 775 GiB hub keeps all 60.
+    assert_eq!(effective_min_free_bytes(60, 192 * GIB), 48 * GIB);
+    assert_eq!(effective_min_free_bytes(60, 775 * GIB), 60 * GIB);
+    assert_eq!(effective_min_free_bytes(30, 192 * GIB), 30 * GIB);
+    assert_eq!(effective_min_free_bytes(0, 192 * GIB), 0);
+    assert_eq!(
+        effective_min_free_bytes(60, 0),
+        60 * GIB,
+        "unknown size: no cap"
+    );
+    assert_eq!(effective_min_free_bytes(u64::MAX, u64::MAX), u64::MAX / 4);
 }

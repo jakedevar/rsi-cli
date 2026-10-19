@@ -2,17 +2,19 @@
 
 pub(crate) mod delivery;
 pub(crate) mod deploy_link;
+pub(crate) mod diagnostics;
 pub(crate) mod dispatch;
 pub(crate) mod hub;
 pub(crate) mod link;
 pub(crate) mod poll;
+pub(crate) mod qa_link;
 pub(crate) mod registry;
 pub(crate) mod reports;
 
 use crate::error::{DaemonError, Result};
 #[allow(unused_imports)]
 pub(crate) use crate::store_support::satellite::{
-    ReportedHealth, record_reported_health, reported_health,
+    ReportedHealth, record_reported_health, reported_health, reported_platform,
 };
 use chrono::{DateTime, Utc};
 use rsi_common::Session;
@@ -86,6 +88,12 @@ pub(crate) fn identity(installation_id: Uuid, incarnation_id: Uuid) -> Satellite
         capabilities: SatelliteCapabilitiesV1 {
             session_read: true,
             limits: SatelliteReadLimitsV1::default(),
+            // #2120: this build serves `RequestHubQaRun`.
+            qa_run: true,
+            // This build accepts the hub's report outcomes.
+            report_outcomes: true,
+            // #2587: this build accepts `interrupt_workers` on a hub deploy.
+            deploy_interrupt: true,
         },
         health: None,
     }
@@ -133,24 +141,59 @@ fn binary_digest() -> Option<String> {
 }
 
 fn load_avg_1m_milli() -> Option<u32> {
-    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
-    let load: f64 = text.split_whitespace().next()?.parse().ok()?;
+    let load = crate::daemon_info::load_average()?.one;
     if !load.is_finite() || load < 0.0 {
         return None;
     }
     Some((load * 1000.0).min(f64::from(u32::MAX)) as u32)
 }
 
-fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
     let stats = nix::sys::statvfs::statvfs(path).ok()?;
     Some(u64::from(stats.blocks_available()).saturating_mul(u64::from(stats.fragment_size())))
 }
 
 /// Bounded, non-secret health report carried on the satellite identity.
+/// The newest deploy; while it is `staged`, what holds its quiet point and
+/// since when (#2056), read live so the hub sees why it waits.
+pub(crate) fn last_deploy_status(
+    store: &crate::store::Store,
+) -> Result<Option<rsi_common::satellite::SatelliteDeployStatusV1>> {
+    let Some(row) = store.latest_agent_deploy()? else {
+        return Ok(None);
+    };
+    let (mut blockers, mut waiting_since) = (Vec::new(), None);
+    if row.state == rsi_common::agent_deploy::DeployState::Staged
+        && let Some(owner) = row.owner_session_id
+    {
+        blockers = store.deploy_quiet_blocker_details_with(owner, true)?;
+        blockers.truncate(rsi_common::satellite::SATELLITE_MAX_DEPLOY_BLOCKERS);
+        waiting_since = store
+            .agent_deploy_created_at(row.id)?
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+    }
+    Ok(Some(rsi_common::satellite::SatelliteDeployStatusV1 {
+        deploy_id: SatelliteUuidV1(row.id),
+        state: row.state,
+        sha: row.sha,
+        blockers,
+        waiting_since,
+        finished_at: store
+            .agent_deploy_settled_at(row.id)?
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+    }))
+}
+
 pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
+    let probe_started = Instant::now();
     let (sessions_running, sessions_waiting_approval, schema_version) =
         store.satellite_health_counts()?;
     Ok(SatelliteHealthV1 {
+        store_probe_elapsed_ms: Some(crate::satellite::diagnostics::elapsed_ms(probe_started)),
+        platform: Some(rsi_common::satellite::SatellitePlatformV1 {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+        }),
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         binary_sha256: binary_digest(),
         uptime_seconds: PROCESS_START.elapsed().as_secs(),
@@ -163,13 +206,20 @@ pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
         started_at: Some(crate::daemon_info::DaemonInfoService::global().started_at_rfc3339()),
         supervisor_mode: crate::daemon_info::supervisor_mode(),
         missing_provider_clis: crate::provider_cli::missing_provider_clis(),
-        last_deploy: store.latest_agent_deploy()?.map(|row| {
-            rsi_common::satellite::SatelliteDeployStatusV1 {
-                deploy_id: SatelliteUuidV1(row.id),
-                state: row.state,
-                sha: row.sha,
-            }
-        }),
+        manager_launches: store.satellite_manager_launches().unwrap_or_default(),
+        last_deploy: last_deploy_status(store)?,
+        latest_watchdog_trip: store
+            .latest_daemon_restart_record()?
+            .map(rsi_common::satellite::SatelliteWatchdogTripV1::try_from)
+            .transpose()
+            .map_err(|error| DaemonError::Store(error.to_string()))?,
+        // #2120: the RPC identity handler fills this from the live governor.
+        qa_admission: None,
+        // #2753: this host's own CLI login probes (cached; never probes here).
+        provider_logins: crate::provider_login::ProviderLoginService::global().health_reports(),
+        // #2747: the hub's `when.health_anomaly` reads these.
+        provider_faults: crate::health_anomaly::health_provider_faults(store, chrono::Utc::now())
+            .unwrap_or_default(),
     })
 }
 
@@ -278,5 +328,61 @@ impl SatelliteSessionSnapshots {
             ));
         }
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn imported_watchdog_trip_survives_reopen_and_enters_satellite_health() {
+        use crate::store::Store;
+        use crate::watchdog::{
+            RestartRecord, import_pending_restart_records, sidecar_path, write_restart_record,
+        };
+        use rsi_common::satellite::{SatelliteIdentityV1, SatelliteWatchdogProbeV1};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("fixture.sqlite");
+        let record = RestartRecord {
+            version: 1,
+            id: uuid::Uuid::new_v4(),
+            observed_at: chrono::Utc::now(),
+            last_healthy_at: chrono::Utc::now() - chrono::Duration::seconds(120),
+            failed_probes: vec!["rpc_timeout".into(), "store_probe_timeout".into()],
+        };
+        {
+            let store = Store::open_test_fixture(&database).unwrap();
+            assert!(
+                super::health(&store)
+                    .unwrap()
+                    .latest_watchdog_trip
+                    .is_none()
+            );
+            write_restart_record(&sidecar_path(directory.path(), record.id), &record).unwrap();
+            import_pending_restart_records(directory.path(), |record| {
+                store
+                    .persist_daemon_restart_record(record)
+                    .map_err(std::io::Error::other)
+            })
+            .unwrap();
+        }
+        let store = Store::open_test_fixture(&database).unwrap();
+        let mut identity = super::identity(uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        identity.health = Some(super::health(&store).unwrap());
+        // The hub's poller validates and caches this exact wire type.
+        let wire = serde_json::to_vec(&identity).unwrap();
+        let received: SatelliteIdentityV1 = serde_json::from_slice(&wire).unwrap();
+        received.validate().unwrap();
+        let trip = received.health.unwrap().latest_watchdog_trip.unwrap();
+        assert_eq!(trip.restart_id.0, record.id);
+        assert_eq!(trip.observed_at, record.observed_at);
+        assert_eq!(trip.last_healthy_at, record.last_healthy_at);
+        assert_eq!(
+            trip.failed_probes,
+            [
+                SatelliteWatchdogProbeV1::RpcTimeout,
+                SatelliteWatchdogProbeV1::StoreProbeTimeout
+            ]
+        );
     }
 }

@@ -199,7 +199,7 @@ async fn overview_from_a_global_lists_its_project_managers_and_projects() {
     let (control, store) = control_handle_with_store();
     let t = tree(&store).await;
     let overview = control
-        .agent_manager_overview(t.global1_seat, AgentManagerOverviewRequestV1 {})
+        .agent_manager_overview(t.global1_seat, AgentManagerOverviewRequestV1::default())
         .await
         .unwrap();
     assert_eq!(
@@ -246,6 +246,71 @@ async fn overview_from_a_global_lists_its_project_managers_and_projects() {
     let _ = (t.worker, t.global2_seat);
 }
 
+/// #2052: the default overview carries a compact one-row-per-model fleet,
+/// `full` is exactly the serialized workspace (the old shape) and `none`
+/// drops the rollup.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn overview_fleet_detail_defaults_to_a_compact_summary() {
+    use rsi_common::manager_node_workspace::ManagerOverviewFleetV1;
+    let (control, store) = control_handle_with_store();
+    let t = tree(&store).await;
+    let call = |fleet| {
+        control
+            .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1 { fleet })
+    };
+    let default = control
+        .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let summary = call(ManagerOverviewFleetV1::Summary).await.unwrap();
+    let full = call(ManagerOverviewFleetV1::Full).await.unwrap();
+    let none = call(ManagerOverviewFleetV1::None).await.unwrap();
+    // `as_of` is the wall clock of each call.
+    let norm = |mut value: serde_json::Value| {
+        if let Some(fleet) = value["fleet"].as_object_mut() {
+            fleet.insert("as_of".to_string(), serde_json::Value::Null);
+        }
+        value
+    };
+    assert_eq!(norm(default), norm(summary.clone()));
+    // `full` is today's shape: the typed workspace, serialized unchanged.
+    let typed = control
+        .agent_manager_overview(t.global1_seat, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        norm(full.clone()),
+        norm(serde_json::to_value(&typed).unwrap())
+    );
+    assert!(full["fleet"]["groups"].is_array());
+    assert_eq!(full["fleet"]["totals"].as_array().map(Vec::len), Some(3));
+    // The summary keeps the rollup's headline and drops the groups.
+    assert_eq!(summary["fleet"]["view"], "summary");
+    assert_eq!(summary["fleet"]["active"], 2);
+    assert!(summary["fleet"]["models"].is_array());
+    assert!(summary["fleet"].get("groups").is_none());
+    assert!(summary["fleet"]["totals"]["24h"]["invocations"].is_u64());
+    assert!(none["fleet"].is_null());
+    // Everything but `fleet` is identical in every mode.
+    for value in [&summary, &full, &none] {
+        let mut rest = value.clone();
+        rest["fleet"] = serde_json::Value::Null;
+        let mut base = serde_json::to_value(&typed).unwrap();
+        base["fleet"] = serde_json::Value::Null;
+        assert_eq!(rest, base);
+    }
+    // Size bound for the fleet part of the default payload: one row per model.
+    let fleet_bytes = serde_json::to_vec(&summary["fleet"]).unwrap().len();
+    assert!(fleet_bytes < 1024, "summary fleet is {fleet_bytes} bytes");
+    let summary_bytes = serde_json::to_vec(&summary).unwrap().len();
+    let full_bytes = serde_json::to_vec(&full).unwrap().len();
+    assert!(
+        summary_bytes < full_bytes,
+        "{summary_bytes} vs {full_bytes}"
+    );
+}
+
 /// Acceptance: from a pinnacle, the overview lists its globals' digests, not
 /// their projects: only the project the pinnacle manages directly has a row.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -254,7 +319,7 @@ async fn overview_from_a_pinnacle_lists_global_digests_not_their_projects() {
     let (control, store) = control_handle_with_store();
     let t = tree(&store).await;
     let overview = control
-        .agent_manager_overview(t.pinnacle_seat, AgentManagerOverviewRequestV1 {})
+        .agent_manager_overview(t.pinnacle_seat, AgentManagerOverviewRequestV1::default())
         .await
         .unwrap();
     assert_eq!(overview.label, "pinnacle");
@@ -323,12 +388,12 @@ async fn overview_is_refused_for_a_non_manager_and_served_to_every_seat() {
     let (control, store) = control_handle_with_store();
     let t = tree(&store).await;
     let refused = control
-        .agent_manager_overview(t.worker, AgentManagerOverviewRequestV1 {})
+        .agent_manager_overview(t.worker, AgentManagerOverviewRequestV1::default())
         .await
         .unwrap_err();
     assert_eq!(code(refused), MANAGER_TIER_NOT_NODE_SEAT);
     let pm = control
-        .agent_manager_overview(t.pm_a, AgentManagerOverviewRequestV1 {})
+        .agent_manager_overview(t.pm_a, AgentManagerOverviewRequestV1::default())
         .await
         .unwrap();
     assert_eq!(pm.node, ManagerNodeRefV1::Project { project_id: t.a });
@@ -344,6 +409,52 @@ async fn overview_is_refused_for_a_non_manager_and_served_to_every_seat() {
     }
     let worker = guard.agent_authority_projection(t.worker).unwrap();
     assert!(!worker.verbs.contains(&Verb::ManagerOverview));
+}
+
+/// #2743: the project manager's overview shows whether rolling is red: its
+/// open `qa` Issues and the green SHA state, per project. A project with no
+/// open `qa` Issue shows none, and a closed one drops out.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn overview_shows_the_open_qa_issues_of_each_project_2743() {
+    let (control, store) = control_handle_with_store();
+    let t = tree(&store).await;
+    let red = store
+        .lock()
+        .await
+        .create_issue(&rsi_common::types::NewIssue {
+            project_id: t.a,
+            title: "Full library QA test red after landing a0a9a7e6c".into(),
+            body: String::new(),
+            priority: Some(1),
+            labels: vec!["qa".into(), "bug".into()],
+            created_by_session_id: None,
+            assignee: None,
+            idea_id: None,
+            source_event_id: None,
+            source_finding_ref: None,
+        })
+        .unwrap();
+    let overview = control
+        .agent_manager_overview_value(t.pm_a, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let health = &overview["projects"][0]["overview"]["rolling_health"];
+    assert_eq!(health["open_qa_issues_total"], 1, "{overview}");
+    assert_eq!(health["open_qa_issues"][0]["number"], red.display_number);
+    assert!(health["qa_green"].is_null(), "no green run recorded yet");
+
+    store
+        .lock()
+        .await
+        .update_issue_status(red.id, rsi_common::types::IssueStatus::Closed)
+        .unwrap();
+    let overview = control
+        .agent_manager_overview_value(t.pm_a, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let health = &overview["projects"][0]["overview"]["rolling_health"];
+    assert_eq!(health["open_qa_issues_total"], 0, "{overview}");
 }
 
 /// Acceptance: for a single global, `GetGlobalManagerWorkspace` and
@@ -409,7 +520,7 @@ async fn global_shims_return_the_v0_data_of_the_single_global() {
         .await
         .unwrap();
     let overview = control
-        .agent_manager_overview(seat, AgentManagerOverviewRequestV1 {})
+        .agent_manager_overview(seat, AgentManagerOverviewRequestV1::default())
         .await
         .unwrap();
     assert_eq!(v0.grant_version, grant.grant_version);

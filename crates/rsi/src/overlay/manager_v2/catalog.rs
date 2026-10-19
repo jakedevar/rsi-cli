@@ -30,18 +30,13 @@ impl ManagerEffortChoices {
     }
     pub fn description(&self) -> String {
         match self {
-            Self::Known { default_hint, .. } => format!(
-                "Default = no explicit effort{}; never an effort wildcard",
-                default_hint
-                    .map(|s| format!(" (currently {s})"))
-                    .unwrap_or_default()
-            ),
+            Self::Known { .. } => "Any effort permits every effort on this model".into(),
             Self::DefaultOnly {
                 capability_unknown: true,
-            } => "Exact effort capability unknown; choose Default (no explicit effort)".into(),
+            } => "Exact effort capability unknown; choose any effort".into(),
             Self::DefaultOnly {
                 capability_unknown: false,
-            } => "No explicit effort choices advertised; Default means no explicit effort".into(),
+            } => "No explicit effort choices advertised; any effort permits all efforts".into(),
         }
     }
 }

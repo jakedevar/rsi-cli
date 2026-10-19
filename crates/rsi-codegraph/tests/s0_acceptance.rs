@@ -399,14 +399,22 @@ fn one_hop_projections_reject_overflow_instead_of_truncating() {
             |row| row.get(0),
         )
         .expect("helper endpoint");
+    // The relation lives in a shared resolution block; the adversarial rows
+    // join it, so the generation's manifest exposes them.
+    let block: i64 = connection
+        .query_row(
+            "SELECT block_id FROM cg_block_relations WHERE relation_key='test-calls-helper'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("relation block");
     for ordinal in 0..=ONE_HOP_LIMIT {
         connection
             .execute(
-                "INSERT INTO cg_relations(workspace_id,generation,relation_id,relation_key,kind,source_id,target_id,provenance)
-                 VALUES (?1,?2,?3,?4,'Calls',?5,?6,'Extracted')",
+                "INSERT INTO cg_block_relations(block_id,relation_id,relation_key,kind,source_id,target_id,provenance)
+                 VALUES (?1,?2,?3,'Calls',?4,?5,'Extracted')",
                 params![
-                    corpus.ready.workspace_id.to_string(),
-                    corpus.ready.generation,
+                    block,
                     Uuid::new_v4().to_string(),
                     format!("overflow-{ordinal}"),
                     corpus.test_id.to_string(),

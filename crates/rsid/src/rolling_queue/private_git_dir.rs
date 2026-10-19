@@ -1,17 +1,17 @@
 //! A fresh, private git directory for one queue reset (#1160).
 //!
-//! The queue worktree's real registration (`<common>/worktrees/<name>`) holds
-//! files git appends to in place (reflogs) and reads configuration and hooks
-//! from the operator's repository. Both are unsafe to hand to a destructive
-//! command: a hard link planted under the registration aliases an operator
-//! file, and the operator's config can name hooks and filters. So each reset
-//! runs git against a directory created fresh by the daemon: its own `HEAD`,
-//! empty `refs`, a minimal `config`, and a copy of the registration's index.
-//! Git reads the shared objects through `GIT_OBJECT_DIRECTORY`.
+//! The queue clone's own git directory (`<slot>/.git`) holds files a git run
+//! could append to in place (reflogs) and its config could name hooks and
+//! filters. Neither is handed to a destructive command: a hard link planted
+//! under the git directory aliases another file. So each reset runs git against
+//! a directory created fresh by the daemon beneath it: its own `HEAD`, empty
+//! `refs`, a minimal `config`, and a copy of the clone's index. Git reads the
+//! clone's objects (and, through its alternate, the source's) through
+//! `GIT_OBJECT_DIRECTORY`.
 //!
 //! `logs` is a regular file (git can create no reflog under it) and no ref is
 //! ever updated, so nothing is appended in place. A split index in the
-//! registration is not seeded (its shared half is not copied); the published
+//! git directory is not seeded (its shared half is not copied); the published
 //! index is always a full one.
 //!
 //! Every operation here is relative to an open directory handle and never
@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-/// Prefix of the scratch directories created inside a registration.
+/// Prefix of the scratch directories created inside a clone's git directory.
 pub(super) const SCRATCH_PREFIX: &str = "rsi-queue-scratch-";
 
 fn cname(name: &str) -> Result<CString, String> {
@@ -196,7 +196,7 @@ pub(super) fn open_dir_at(parent: &File, name: &str) -> Result<File, String> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn make_dir_at(parent: &File, name: &str) -> Result<(), String> {
+pub(super) fn make_dir_at(parent: &File, name: &str) -> Result<(), String> {
     let cname = cname(name)?;
     // SAFETY: as in `create_file_at`.
     match unsafe { nix::libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o700) } {
@@ -205,7 +205,7 @@ fn make_dir_at(parent: &File, name: &str) -> Result<(), String> {
     }
 }
 
-/// A private git directory: created fresh under `parent` (the registration),
+/// A private git directory: created fresh under `parent` (the clone's git directory),
 /// removed by [`PrivateGitDir::remove`].
 pub(super) struct PrivateGitDir {
     pub(super) dir: File,
@@ -214,7 +214,7 @@ pub(super) struct PrivateGitDir {
 
 impl PrivateGitDir {
     /// Create the directory, populate it and seed `index` from the
-    /// registration's (when it has one). A symlinked registration `index` is an
+    /// clone's (when it has one). A symlinked `index` is an
     /// error, not followed.
     pub(super) fn create(parent: &File) -> Result<Self, String> {
         let name = format!("{SCRATCH_PREFIX}{}", uuid::Uuid::new_v4());
@@ -249,7 +249,7 @@ impl PrivateGitDir {
         // function creates exclusively. As a file it can only be replaced, not
         // added to (#1170).
         create_file_at(&self.dir, "info", b"", 0o600)?;
-        // Only something shaped like an index is seeded: a registration entry
+        // Only something shaped like an index is seeded: a git directory entry
         // replaced by another file (a hard link to a config, say) must not
         // wedge every later reset. Git then starts from no index, and `clean`
         // removes what the old one would have. A split index (a
@@ -281,7 +281,7 @@ impl PrivateGitDir {
     }
 }
 
-/// Whether the registration holds a split index's shared half.
+/// Whether the git directory holds a split index's shared half.
 fn has_shared_index(parent: &File) -> bool {
     let listing = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
     let Ok(entries) = std::fs::read_dir(&listing) else {

@@ -1441,7 +1441,7 @@ mod tests {
     fn shard_features(package: &str) -> Vec<String> {
         let manifest = std::fs::read_to_string(format!(
             "{}/../{package}/Cargo.toml",
-            env!("CARGO_MANIFEST_DIR")
+            rsi_common::manifest_dir!()
         ))
         .expect("package manifest");
         manifest
@@ -1530,8 +1530,7 @@ mod tests {
 
     #[test]
     fn the_lander_imports_the_shared_shard_list() {
-        let lander = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
+        let lander = std::fs::read_to_string(rsi_common::manifest_dir!(
             "/../rsid/src/bin/rsi-rolling-land.rs"
         ))
         .expect("lander source");

@@ -1,5 +1,5 @@
 ---
-version: 9
+version: 10
 kind: bug
 inherits: worker_preamble.md
 ---
@@ -7,6 +7,8 @@ inherits: worker_preamble.md
 # Worker preamble — Bug
 
 Reproduce the reported failure, localize the smallest cause, fix it, and verify neighboring behavior. Kind-specific detail: `docs/agents/worker-kinds.md`.
+
+If the report cites `[observed]` database rows, replay the new predicate against them read-only (count before and after) and put it in the handoff; fixture rows you shaped yourself do not prove the fix (`docs/agents/worker-contract.md`, "Replay against cited rows").
 
 ## Stage contract
 

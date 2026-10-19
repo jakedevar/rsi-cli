@@ -258,8 +258,21 @@ impl ManagerResourceLaunchOrigin {
 
 /// Preserve provider-default None. Known model ladders and each provider's
 /// supported effort vocabulary are checked without rewriting the requested tuple.
+/// A Claude effort is judged by the CLI's live ladder the daemon installed
+/// (#289), exactly as a launch judges it (#2768).
 pub(super) fn validate_root_choice(
     choice: &rsi_common::harness_manager_v2::ManagerLaunchChoiceV2,
+) -> Result<()> {
+    validate_root_choice_with(
+        choice,
+        crate::store_support::provider_defaults::live_claude_effort_ladder,
+    )
+}
+
+/// [`validate_root_choice`] with the live Claude ladder lookup passed in.
+pub(super) fn validate_root_choice_with(
+    choice: &rsi_common::harness_manager_v2::ManagerLaunchChoiceV2,
+    claude_ladder: impl Fn(&str) -> Option<Vec<String>>,
 ) -> Result<()> {
     choice.validate().map_err(refused)?;
     if choice.model.chars().any(char::is_whitespace) || choice.model.starts_with('-') {
@@ -278,7 +291,10 @@ pub(super) fn validate_root_choice(
                         .is_none_or(|ladder| ladder.contains(&effort))
             }
             SessionProvider::Claude => {
-                crate::store_support::provider_defaults::claude_effort_level(Some(effort)).is_some()
+                crate::store_support::provider_defaults::claude_effort_valid(
+                    effort,
+                    claude_ladder(&choice.model).as_deref(),
+                )
             }
             // These engines do not send LaunchConfig.effort to their backend.
             // Refuse an explicit value instead of recording a silently ignored choice.

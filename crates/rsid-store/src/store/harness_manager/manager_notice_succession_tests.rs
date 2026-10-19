@@ -161,6 +161,168 @@ fn page_all(store: &Store, caller: Uuid) -> Vec<AgentManagerInboxResultV1> {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
+fn routine_inbox_reads_only_incoming_mail_across_manager_succession_3140() {
+    use rsi_common::harness_manager::AgentManagerInboxFieldsV1;
+
+    let f = fixture();
+    let epic = f.config.epic_ids[0];
+    let lead = f.store.manager_lead(f.config.project_id, epic).unwrap().id;
+    let send = |informational, key: &str| {
+        f.store
+            .manager_send(
+                f.anchor,
+                &AgentManagerSendRequestV1 {
+                    epic_id: epic,
+                    message: format!("outbound {key}"),
+                    idempotency_key: key.into(),
+                    informational,
+                },
+            )
+            .unwrap()
+    };
+    let info = send(true, "info");
+    let request = send(false, "request");
+    // Repeated routine reads must never echo either outbound send.
+    for _ in 0..2 {
+        assert!(inbox(&f.store, f.anchor, 0).messages.is_empty());
+    }
+    // Both sends still arrive through the lead's real inbox.
+    let incoming = inbox(&f.store, lead, 0);
+    assert_eq!(incoming.messages.len(), 2);
+    assert_eq!(incoming.messages[0].message_id, info.message_id);
+    assert_eq!(incoming.messages[1].message_id, request.message_id);
+
+    let tip = rotate(&f.store, f.anchor);
+    assert!(inbox(&f.store, tip, 0).messages.is_empty());
+    let reply = f
+        .store
+        .manager_reply(
+            lead,
+            &AgentManagerReplyRequestV1 {
+                request_id: request.message_id,
+                message: "completed".into(),
+                idempotency_key: "reply".into(),
+                still_running: false,
+            },
+        )
+        .unwrap();
+    let notice = f
+        .store
+        .manager_lead_notice(lead, "status", "lead-status")
+        .unwrap();
+    for _ in 0..2 {
+        let page = inbox(&f.store, tip, 0);
+        let ids: Vec<_> = page.messages.iter().map(|m| m.message_id).collect();
+        assert_eq!(ids, vec![reply.message_id, notice.message_id]);
+    }
+    // Audit forms retain the exchange, including the predecessor's sends.
+    let full = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                fields: AgentManagerInboxFieldsV1::Full,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<_> = full.messages.iter().map(|m| m.message_id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            info.message_id,
+            request.message_id,
+            reply.message_id,
+            notice.message_id
+        ]
+    );
+    assert!(full.messages[1].replied);
+    let audit = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                include_sent: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        audit
+            .messages
+            .iter()
+            .map(|m| m.message_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    let summary = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                fields: AgentManagerInboxFieldsV1::Summary,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        summary
+            .messages
+            .iter()
+            .map(|m| m.message_id)
+            .collect::<Vec<_>>(),
+        vec![reply.message_id, notice.message_id]
+    );
+    let exchange = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                request_id: Some(request.message_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<_> = exchange.messages.iter().map(|m| m.message_id).collect();
+    assert_eq!(ids, vec![request.message_id, reply.message_id]);
+    for kind in [
+        "session_state",
+        "action_result",
+        "operator_answer",
+        "ledger_change",
+    ] {
+        let filtered = f
+            .store
+            .manager_inbox(
+                tip,
+                &AgentManagerInboxRequestV1 {
+                    notice_kind: Some(kind.into()),
+                    include_sent: true,
+                    fields: AgentManagerInboxFieldsV1::Full,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(filtered.messages.is_empty(), "notice_kind={kind}");
+    }
+    let messages = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                notice_kind: Some("message".into()),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(messages.messages.len(), 1);
+    assert_eq!(messages.messages[0].message_id, reply.message_id);
+    assert_eq!(messages.next_after_sequence, Some(reply.sequence));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
 fn successor_settles_notices_addressed_to_every_predecessor_seat() {
     let f = fixture();
     for index in 0..3 {
@@ -463,6 +625,16 @@ fn seed_inbox_notice_for_recipient(
     satellite: bool,
     recipient: Uuid,
 ) -> (Uuid, i64) {
+    seed_inbox_notice_with_state(f, index, satellite, recipient, "{}")
+}
+
+fn seed_inbox_notice_with_state(
+    f: &Fixture,
+    index: usize,
+    satellite: bool,
+    recipient: Uuid,
+    state_json: &str,
+) -> (Uuid, i64) {
     let (job, _, _) = f.store.manager_action_watch_identity(&f.config);
     f.store
         .ensure_manager_action_watch(&f.config, &format!("{index}"))
@@ -486,7 +658,7 @@ fn seed_inbox_notice_for_recipient(
          (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
           source_session_id,recipient_session_id,kind,subject_id,subject_version,
           state_json,recorded_at,queued_at)
-         VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?6,?7,?8,?9,'{}',?10,?10)",
+         VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?6,?7,?8,?9,?11,?10,?10)",
             params![
                 id.to_string(),
                 job.to_string(),
@@ -497,7 +669,8 @@ fn seed_inbox_notice_for_recipient(
                 kind,
                 subject,
                 Uuid::new_v4().to_string(),
-                recorded
+                recorded,
+                state_json
             ],
         )
         .unwrap();
@@ -530,8 +703,32 @@ fn inbox_notice_cursor_reaches_later_satellite_report_and_settles_returned_pages
         Some(0),
         "legacy message cursor unchanged"
     );
+    assert!(
+        first
+            .notices
+            .iter()
+            .any(|notice| notice.notice_id == report),
+        "actionable satellite reports lead the page through a routine backlog"
+    );
+    assert_eq!(
+        first
+            .notices
+            .iter()
+            .filter(|notice| notice.notice_id != report)
+            .count(),
+        31
+    );
     let after = first.next_after_notice_sequence.unwrap();
-    assert_eq!(after, first.notices.last().unwrap().sequence);
+    assert_eq!(
+        after,
+        first
+            .notices
+            .iter()
+            .filter(|notice| notice.notice_id != report)
+            .map(|notice| notice.sequence)
+            .max()
+            .unwrap()
+    );
     let second = f
         .store
         .manager_inbox(
@@ -543,7 +740,12 @@ fn inbox_notice_cursor_reaches_later_satellite_report_and_settles_returned_pages
         )
         .unwrap();
     assert_eq!(second.notices.len(), 9);
-    assert_eq!(second.notices.last().unwrap().notice_id, report);
+    assert!(
+        !second
+            .notices
+            .iter()
+            .any(|notice| notice.notice_id == report)
+    );
     assert_eq!(second.next_after_notice_sequence, None);
     assert!(!second.more_notices);
     assert_eq!(unsettled(&f.store), 0);
@@ -662,4 +864,270 @@ fn inbox_explicit_settlement_refuses_foreign_or_unknown_ids_atomically() {
             .unwrap();
         assert_eq!(retrieved, 0);
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn settled_summary_drained_report_is_retrievable_in_full_by_notice_id_3068() {
+    use rsi_common::harness_manager::AgentManagerInboxFieldsV1;
+    let f = fixture();
+    let (routine, _) = seed_inbox_notice(&f, 0, false);
+    let long = "receipt and branch detail ".repeat(200);
+    let payload = serde_json::json!({
+        "record_kind": "satellite_report",
+        "untrusted_text": long,
+    });
+    let (report, sequence) =
+        seed_inbox_notice_with_state(&f, 1, true, f.anchor, &payload.to_string());
+    let drained = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                fields: AgentManagerInboxFieldsV1::Summary,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(drained.notices.len(), 2);
+    assert!(drained.notices.iter().all(|notice| notice.state.is_null()));
+    assert_eq!(unsettled(&f.store), 0);
+    // The cursor read finds nothing: the original payload is not lost, only settled.
+    let page = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                after_notice_sequence: sequence - 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(page.notices.is_empty());
+    let stored = |id: Uuid| -> (String, String) {
+        f.store
+            .conn
+            .query_row(
+                "SELECT retrieved_at,settled_at FROM harness_manager_notices WHERE id=?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let before = (stored(report), stored(routine));
+    // Read by id, newest first as asked, in full, after the settle.
+    let full = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                read_notice_ids: vec![report, routine],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let ids: Vec<_> = full.notices.iter().map(|notice| notice.notice_id).collect();
+    assert_eq!(ids, vec![report, routine]);
+    assert_eq!(full.notices[0].state, payload);
+    assert!(full.notices[0].state_summary.is_none());
+    assert!(!full.more_notices);
+    assert_eq!(full.next_after_notice_sequence, None);
+    assert!(full.settled_notice_ids.is_empty());
+    // The same read in summary form still trims, and repeats cleanly.
+    let again = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                read_notice_ids: vec![report],
+                fields: AgentManagerInboxFieldsV1::Summary,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(again.notices.len(), 1);
+    assert!(again.notices[0].state.is_null());
+    assert!(again.notices[0].state_summary.is_some());
+    assert_eq!((stored(report), stored(routine)), before);
+    assert_eq!(unsettled(&f.store), 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn read_by_notice_id_settles_and_drains_nothing_else_and_refuses_foreign_ids_3068() {
+    let f = fixture();
+    let (owned, _) = seed_inbox_notice(&f, 0, false);
+    let (pending, _) = seed_inbox_notice(&f, 1, false);
+    let mut other = f.store.get_session(f.anchor).unwrap().unwrap();
+    other.id = Uuid::new_v4();
+    f.store.insert_session(&other).unwrap();
+    let (foreign, _) = seed_inbox_notice_for_recipient(&f, 2, false, other.id);
+    // Reading a pending notice by id returns it but leaves every row pending.
+    let read = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                read_notice_ids: vec![owned],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(read.notices.len(), 1);
+    assert_eq!(read.notices[0].notice_id, owned);
+    assert_eq!(unsettled(&f.store), 3, "a read-by-id settles nothing");
+    for invalid in [foreign, Uuid::new_v4()] {
+        let error = f
+            .store
+            .manager_inbox(
+                f.anchor,
+                &AgentManagerInboxRequestV1 {
+                    read_notice_ids: vec![pending, invalid],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manager_notice_not_authorized"));
+    }
+    assert_eq!(unsettled(&f.store), 3);
+    // Survives seat succession.
+    let tip = rotate(&f.store, f.anchor);
+    let after = f
+        .store
+        .manager_inbox(
+            tip,
+            &AgentManagerInboxRequestV1 {
+                read_notice_ids: vec![owned],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(after.notices[0].recipient_session_id, tip);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn read_by_notice_id_consumes_no_messages_and_moves_no_message_cursor_3107() {
+    use rsi_common::harness_manager::AgentManagerInboxFieldsV1;
+    use rsi_common::harness_manager_v2::{ConfigureHarnessManagerPolicyRequestV2, ManagerPolicyV2};
+    let f = fixture();
+    // Retention is on, so a returned message would leave a retrieval receipt.
+    f.store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: f.config.project_id,
+            expected_scope_version: f.config.row_version,
+            expected_policy_version: 0,
+            idempotency_key: "grant".into(),
+            policy: ManagerPolicyV2::default(),
+        })
+        .unwrap();
+    // One settled, retained notice (summary-drained), then more unread mail
+    // than one page holds.
+    let payload =
+        serde_json::json!({"record_kind": "satellite_report", "untrusted_text": "full detail"});
+    let (report, _) = seed_inbox_notice_with_state(&f, 0, true, f.anchor, &payload.to_string());
+    let drained = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                fields: AgentManagerInboxFieldsV1::Summary,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(drained.notices.len(), 1);
+    let epic = f.config.epic_ids[0];
+    let lead = f.store.manager_lead(f.config.project_id, epic).unwrap().id;
+    for index in 0..3 {
+        f.store
+            .manager_lead_notice(lead, &format!("mail {index}"), &format!("k{index}"))
+            .unwrap();
+    }
+    let page_limit = 2;
+    let state = |store: &Store| -> (i64, i64, i64, i64, i64, i64) {
+        let count = |sql: &str| -> i64 { store.conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        (
+            count("SELECT count(*) FROM harness_manager_v2_records WHERE kind='retrieval'"),
+            count("SELECT count(*) FROM harness_manager_v2_events WHERE kind='retrieval'"),
+            count("SELECT count(*) FROM harness_manager_notices WHERE settled_at IS NULL"),
+            count("SELECT count(*) FROM harness_manager_notices WHERE retrieved_at IS NULL"),
+            // Per-message read markers: no message is marked read.
+            count("SELECT count(*) FROM harness_manager_v2_events WHERE kind='node_mail_read'"),
+            // The watches that wait on the mail stay enabled (unsettled).
+            count(
+                "SELECT count(*) FROM harness_manager_watches w
+                 JOIN scheduled_jobs j ON j.id=w.job_id WHERE j.enabled=1",
+            ),
+        )
+    };
+    let before = state(&f.store);
+    assert!(before.5 > 0, "an unsettled mail watch is armed to observe");
+    assert_eq!(before.4, 0);
+
+    let read = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                limit: page_limit,
+                read_notice_ids: vec![report],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(read.notices.len(), 1);
+    assert_eq!(read.notices[0].notice_id, report);
+    assert_eq!(read.notices[0].state, payload);
+    assert!(read.messages.is_empty());
+    assert_eq!(read.next_after_sequence, None);
+    assert!(!read.more_notices);
+    assert_eq!(read.next_after_notice_sequence, None);
+    // No retrieval receipt, no notice settled or retrieved by the exact read.
+    assert_eq!(state(&f.store), before);
+    assert_eq!(before.0, 0);
+    // A page that would hold every message must not mark any of it read or
+    // settle the mail watch either (a wrongful mark-read would settle it here).
+    let all_mail = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                limit: 10,
+                read_notice_ids: vec![report],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(all_mail.messages.is_empty());
+    assert_eq!(state(&f.store), before);
+
+    // The mail is untouched: an ordinary read still pages all of it.
+    let first = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                limit: page_limit,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(first.messages.len(), usize::from(page_limit));
+    let cursor = first.next_after_sequence.expect("a second page remains");
+    let second = f
+        .store
+        .manager_inbox(
+            f.anchor,
+            &AgentManagerInboxRequestV1 {
+                limit: page_limit,
+                after_sequence: cursor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(second.messages.len(), 1);
+    assert_eq!(second.next_after_sequence, None);
+    assert_eq!(state(&f.store).0, 3, "ordinary reads track retrieval");
 }

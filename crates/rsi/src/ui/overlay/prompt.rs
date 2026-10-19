@@ -8,6 +8,7 @@
 
 use crate::app::App;
 use crate::input_surface::InputSurface;
+use crate::overlay::grant_editor::GrantEditor;
 use crate::overlay::launch_settings::{self, LaunchSettingRow};
 use crate::suggestions::CommandSuggestion;
 use crate::types::{
@@ -51,6 +52,8 @@ pub(crate) struct SettingsSide {
     pub rows: Vec<SettingsRowView>,
     pub selected: usize,
     pub description: &'static str,
+    /// #2237: the grant page, when it replaces the launch rows.
+    pub grant: Option<GrantEditor>,
 }
 
 #[derive(Debug)]
@@ -102,7 +105,11 @@ pub(super) fn launch_view(
     let sandbox_supported = app.poll.sandbox_supported;
     let effort = effort_label(app, model_override, provider_override);
     let manager = launch.manager.map(|plan| ManagerChip {
-        preset: plan.preset.label(),
+        // An edited grant is named by what it now matches (or Custom).
+        preset: launch
+            .grant
+            .as_ref()
+            .map_or_else(|| plan.preset.label(), |editor| editor.preset().label()),
         replaces: launch_settings::replaced_manager_name(app, plan.project_id).is_some(),
     });
     let settings = launch.open.then(|| {
@@ -130,6 +137,7 @@ pub(super) fn launch_view(
                 .collect(),
             selected,
             description,
+            grant: launch.grant_open.then(|| launch.grant.clone()).flatten(),
         }
     });
     PromptLaunchView {
@@ -266,17 +274,40 @@ fn setting_value(
         }),
         LaunchSettingRow::ManagerPolicy => launch.manager.map_or_else(Vec::new, |plan| {
             vec![Span::styled(
-                plan.preset.label().to_string(),
+                launch
+                    .grant
+                    .as_ref()
+                    .map_or_else(|| plan.preset.label(), |editor| editor.preset().label())
+                    .to_string(),
                 Style::default().fg(theme::text()),
             )]
         }),
+        LaunchSettingRow::ManagerGrant => {
+            launch
+                .manager
+                .map_or_else(Vec::new, |_| match &launch.grant {
+                    Some(editor) => vec![
+                        Span::styled(editor.summary(), Style::default().fg(theme::text())),
+                        dim("  p / Enter edits"),
+                    ],
+                    None => vec![dim(
+                        "preset as is  ·  p / Enter edits capabilities, caps, launches",
+                    )],
+                })
+        }
     }
 }
+
+/// Rows the grant page asks for; the popup's height cap bounds it and the
+/// editor scrolls inside whatever it gets.
+const GRANT_PAGE_ROWS: u16 = 26;
 
 /// Body rows the prompt needs: its minimum textarea height on the front, or
 /// every settings row plus the description on the settings side.
 pub(super) fn body_min_rows(purpose: &PromptPurpose, launch: &PromptLaunchSettings) -> u16 {
-    if launch.open && launch_settings::has_settings_side(purpose) {
+    if launch.open && launch.grant_open && launch_settings::has_settings_side(purpose) {
+        GRANT_PAGE_ROWS
+    } else if launch.open && launch_settings::has_settings_side(purpose) {
         let rows = launch_settings::setting_rows(purpose, launch).len();
         u16::try_from(rows + 2).unwrap_or(u16::MAX)
     } else {
@@ -378,10 +409,13 @@ pub(super) fn render_prompt_popup(
         // half the viewport. compute_dynamic_popup_rect's MODAL_BOTTOM_MARGIN
         // additionally guarantees the popup never reaches the absolute screen bottom.
         let max_h = (area.height * 50 / 100).max(9);
-        let min_rows = view
-            .settings
-            .as_ref()
-            .map_or(3, |side| u16::try_from(side.rows.len() + 2).unwrap_or(3));
+        let min_rows = view.settings.as_ref().map_or(3, |side| {
+            if side.grant.is_some() {
+                GRANT_PAGE_ROWS
+            } else {
+                u16::try_from(side.rows.len() + 2).unwrap_or(3)
+            }
+        });
         super::compute_dynamic_popup_rect_with_manual_height(
             area,
             &surface.textarea,
@@ -520,7 +554,11 @@ pub(super) fn render_prompt_popup(
         render_mode_row(
             frame,
             hint_area,
-            " SETTINGS ",
+            if side.grant.is_some() {
+                " GRANT "
+            } else {
+                " SETTINGS "
+            },
             theme::overlay_mode_normal_fg(),
             theme::accent(),
             true,
@@ -804,6 +842,10 @@ fn render_mode_row(
 /// The settings side: one row per setting (selected row marked, cycling
 /// values framed by `‹ ›`), then the selected row's description, wrapped.
 fn render_settings_side(frame: &mut Frame, area: Rect, side: &SettingsSide) {
+    if let Some(editor) = &side.grant {
+        super::grant_editor::render_grant(frame, area, editor, theme::overlay_bg());
+        return;
+    }
     const LABEL_WIDTH: usize = 9;
     let lines: Vec<Line<'static>> = side
         .rows

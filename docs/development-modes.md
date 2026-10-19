@@ -26,12 +26,15 @@ marker, same file). The hook is a guard rail, not a security boundary.
    then run `./tools/install-hooks.sh` once (it sets `core.hooksPath` for every
    worktree). The shipped `pre-push` also runs RSI-repo-specific checks
    (test-shard inventory, operator-identifier scan); trim those for a foreign repo.
-3. **Lander.** `make release-install` installs `rsi-rolling-land` next to `rsid`.
-   Publish with `rsi-rolling-land --repo <sandbox> --remote origin --accepted <SHA>`
-   (add `--test-filter PACKAGE=FILTER` to scope the gate). Managers can instead
-   use the daemon merge queue (`AgentEnqueueLandingSource`,
-   [agent-control.md](agent-control.md)); the operator switches it on and off
-   with the **Rolling merge queue** setting (`<Space>,`).
+3. **Merge queue.** `make release-install` installs the queue's lander next to
+   `rsid`. Managers enqueue accepted SHAs with
+   `AgentEnqueueLandingSource {derive_filters:true}`
+   ([agent-control.md](agent-control.md)); agents never run the lander directly.
+   The operator switches the queue on and off with the **Rolling merge queue**
+   setting (`<Space>,`). For `queue_disabled`, keep the commit pushed and report
+   with `AgentReportUp`, or send the result with `AgentReportToHub` on a satellite.
+   The operator enables the queue or lands with `rsi land` or
+   `EnqueueRollingQueueSource`.
 4. **Manager policy preset.** Seat a manager with `:manager appoint`, then
    `:manager policy`, choose **Execute**, press `s`
    ([harness-manager.md](harness-manager.md)). For several repos use

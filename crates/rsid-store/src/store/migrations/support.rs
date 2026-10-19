@@ -262,21 +262,9 @@ pub(crate) enum LineageDetachmentV114MigrationFault {
     AfterRows,
 }
 
-impl LineageDetachmentV114MigrationFault {
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::AfterPreflight, Self::AfterCatalog, Self::AfterRows];
-}
-
 #[cfg(test)]
 thread_local! {
     static LINEAGE_DETACHMENT_V114_MIGRATION_FAULT: RefCell<Option<LineageDetachmentV114MigrationFault>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn lineage_detachment_v114_test_fail_next_migration(
-    fault: LineageDetachmentV114MigrationFault,
-) {
-    LINEAGE_DETACHMENT_V114_MIGRATION_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
 
 #[cfg(test)]
@@ -390,6 +378,7 @@ pub(crate) enum H1V92MigrationFault {
 }
 
 impl H1V92MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 6] = [
         Self::AfterPreflight,
         Self::AfterSchema,
@@ -443,6 +432,7 @@ pub(crate) enum H1V91MigrationFault {
 }
 
 impl H1V91MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 4] = [
         Self::AfterPreflight,
         Self::AfterChecks,
@@ -588,6 +578,7 @@ pub(crate) enum V90MigrationFault {
 }
 
 impl V90MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 10] = [
         Self::AfterPreflight,
         Self::AfterRename,
@@ -694,6 +685,7 @@ pub(crate) enum V89MigrationFault {
 }
 
 impl V89MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 7] = [
         Self::AfterPreflight,
         Self::AfterTables,
@@ -753,6 +745,7 @@ pub(crate) enum H1V85MigrationFault {
 }
 
 impl H1V85MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 8] = [
         Self::AfterPreflight,
         Self::AfterTables,
@@ -812,6 +805,7 @@ pub(crate) enum H1V86MigrationFault {
 }
 
 impl H1V86MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 8] = [
         Self::AfterPreflight,
         Self::AfterRename,
@@ -869,6 +863,7 @@ pub(crate) enum H1V87MigrationFault {
 }
 
 impl H1V87MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 6] = [
         Self::AfterPreflight,
         Self::AfterDrop,
@@ -926,6 +921,7 @@ pub(crate) enum H1V88MigrationFault {
 }
 
 impl H1V88MigrationFault {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 8] = [
         Self::AfterPreflight,
         Self::AfterRename,
@@ -2101,20 +2097,6 @@ pub(crate) enum AgentMessageV81MigrationFault {
 }
 
 #[cfg(test)]
-impl AgentMessageV81MigrationFault {
-    pub(crate) const ALL: [Self; 8] = [
-        Self::AfterExactSource,
-        Self::AfterV80Fingerprint,
-        Self::AfterSchema,
-        Self::AfterCopy,
-        Self::AfterFingerprint,
-        Self::AfterForeignKeyCheck,
-        Self::AfterUserVersion,
-        Self::BeforeCommit,
-    ];
-}
-
-#[cfg(test)]
 thread_local! {
     static AGENT_MESSAGE_V81_MIGRATION_FAULT: RefCell<Option<AgentMessageV81MigrationFault>> = const { RefCell::new(None) };
 }
@@ -2161,20 +2143,6 @@ pub(crate) enum AgentMessageV82MigrationFault {
     AfterUserVersion,
     AfterFingerprint,
     BeforeCommit,
-}
-
-#[cfg(test)]
-impl AgentMessageV82MigrationFault {
-    pub(crate) const ALL: [Self; 8] = [
-        Self::AfterExactSource,
-        Self::AfterV81Fingerprint,
-        Self::AfterSchema,
-        Self::AfterCopy,
-        Self::AfterForeignKeyCheck,
-        Self::AfterUserVersion,
-        Self::AfterFingerprint,
-        Self::BeforeCommit,
-    ];
 }
 
 #[cfg(test)]

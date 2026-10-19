@@ -283,7 +283,7 @@ impl Store {
 }
 // RSI-RELEASED-MIGRATION-END: v116-prepared-actions-caller-driver
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(super) fn rewind_prepared_actions_fixture_to_v115(connection: &rusqlite::Connection) {
     let rows: i64 = connection
         .query_row("SELECT count(*) FROM manager_prepared_actions", [], |row| {
@@ -813,9 +813,11 @@ impl Store {
         let materialized = materialize_prepared_action(&request.operation, resolved.lead.clone())?;
         let full_request = AgentManagerControlRequestV2 {
             project_id: target_project,
-            fence: resolved.manager.clone(),
-            idempotency_key: "prepared-snapshot".into(),
-            operation: materialized,
+            ..AgentManagerControlRequestV2::new(
+                resolved.manager.clone(),
+                "prepared-snapshot".into(),
+                materialized,
+            )
         };
         let origin = ManagerActionOriginV2::Agent { caller };
         let admission =
@@ -1639,17 +1641,18 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 AgentManagerControlRequestV2 {
-                    project_id: None,
-                    fence: ManagerFenceV2 {
-                        scope_version: config.row_version,
-                        policy_version,
-                    },
-                    idempotency_key: "left-pending".into(),
-                    operation: ManagerActionV2::PauseLead {
-                        epic_id: epic,
-                        expected: store.manager_action_lead_fence(epic).unwrap(),
-                        reason: "pending when the seat changes hands".into(),
-                    },
+                    ..AgentManagerControlRequestV2::new(
+                        ManagerFenceV2 {
+                            scope_version: config.row_version,
+                            policy_version,
+                        },
+                        "left-pending".into(),
+                        ManagerActionV2::PauseLead {
+                            epic_id: epic,
+                            expected: store.manager_action_lead_fence(epic).unwrap(),
+                            reason: "pending when the seat changes hands".into(),
+                        },
+                    )
                 },
             )
             .unwrap();
@@ -1745,16 +1748,18 @@ mod tests {
                 ManagerActionOriginV2::Agent { caller: global.id },
                 AgentManagerControlRequestV2 {
                     project_id: Some(config.project_id),
-                    fence: ManagerFenceV2 {
-                        scope_version: global_authority.config.row_version,
-                        policy_version: global_authority.grant.row_version,
-                    },
-                    idempotency_key: "foreign-principal-action".into(),
-                    operation: ManagerActionV2::PauseLead {
-                        epic_id: epic,
-                        expected: store.manager_action_lead_fence(epic).unwrap(),
-                        reason: "belongs to the portfolio seat".into(),
-                    },
+                    ..AgentManagerControlRequestV2::new(
+                        ManagerFenceV2 {
+                            scope_version: global_authority.config.row_version,
+                            policy_version: global_authority.grant.row_version,
+                        },
+                        "foreign-principal-action".into(),
+                        ManagerActionV2::PauseLead {
+                            epic_id: epic,
+                            expected: store.manager_action_lead_fence(epic).unwrap(),
+                            reason: "belongs to the portfolio seat".into(),
+                        },
+                    )
                 },
             )
             .unwrap();

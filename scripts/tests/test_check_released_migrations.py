@@ -2,15 +2,18 @@
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
+
 SPEC = importlib.util.spec_from_file_location(
     "check_released_migrations", ROOT / "tools/check-released-migrations.py"
 )
@@ -20,7 +23,7 @@ SPEC.loader.exec_module(GUARD)
 
 class ReleasedMigrationRefreshTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-released-migration-test-")
+        self.temp = scratch_tempdir("rsi-released-migration-test-")
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name) / "repo"
         self.repo.mkdir()
@@ -40,6 +43,7 @@ class ReleasedMigrationRefreshTest(unittest.TestCase):
         self.write(GUARD.MANIFEST_PATH, json.dumps(manifest, indent=2) + "\n")
         self.git("add", ".")
         self.git("commit", "-q", "-m", "base V1")
+        self.git("update-ref", "refs/remotes/origin/rolling", "HEAD")
         self.manifest = manifest
 
     @staticmethod
@@ -61,9 +65,7 @@ class ReleasedMigrationRefreshTest(unittest.TestCase):
         )
 
     def git(self, *args):
-        result = subprocess.run(
-            ["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=False
-        )
+        result = scratch_git(self.repo, *args, check=False)
         if result.returncode:
             raise AssertionError(f"git {' '.join(args)}: {result.stderr}")
         return result.stdout.strip()
@@ -124,6 +126,198 @@ class ReleasedMigrationRefreshTest(unittest.TestCase):
             updated["protected_sections"]["delta-catalog"]["path"],
             "crates/rsid/src/store/delta.rs",
         )
+
+    def append_unreleased(self):
+        helper = f"{GUARD.MIGRATION_DIR}/v002.rs"
+        self.write(
+            helper, "if version < 2 {\n    migrate_v2();\n}\n" + self.section("v002-catalog")
+        )
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 0, invocation.stderr)
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "unreleased V2")
+        return helper
+
+    def test_default_refresh_repins_edited_unreleased_block_and_section(self):
+        helper = self.append_unreleased()
+        before = json.loads(self.read_manifest())
+        edited = (self.repo / helper).read_text().replace("migrate_v2", "changed_v2")
+        self.write(helper, edited.replace("apply_v002", "changed_v002"))
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 0, invocation.stderr)
+        after = json.loads(self.read_manifest())
+        self.assertNotEqual(after["blocks"]["2"], before["blocks"]["2"])
+        self.assertNotEqual(
+            after["protected_sections"]["v002-catalog"],
+            before["protected_sections"]["v002-catalog"],
+        )
+        for version, pin in self.manifest["blocks"].items():
+            self.assertEqual(after["blocks"][version], pin)
+        for name, section in self.manifest["protected_sections"].items():
+            self.assertEqual(after["protected_sections"][name], section)
+
+    def test_explicit_base_can_repin_an_unreleased_version(self):
+        helper = self.append_unreleased()
+        before = json.loads(self.read_manifest())
+        self.write(helper, (self.repo / helper).read_text().replace("migrate_v2", "changed_v2"))
+        invocation = self.refresh("HEAD^")
+        self.assertEqual(invocation.returncode, 0, invocation.stderr)
+        self.assertNotEqual(json.loads(self.read_manifest())["blocks"]["2"], before["blocks"]["2"])
+
+    def test_explicit_base_keeps_a_published_version_immutable(self):
+        helper = self.append_unreleased()
+        self.git("update-ref", "refs/heads/published", "HEAD")
+        before = self.read_manifest()
+        self.write(helper, (self.repo / helper).read_text().replace("migrate_v2", "changed_v2"))
+        invocation = self.refresh("published")
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("changed migration blocks V2", invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_refresh_refuses_changed_released_ddl_even_after_branch_pin_refresh(self):
+        before = self.read_manifest()
+        changed = self.store().replace("migrate_v1", "changed_v1")
+        self.write(GUARD.MIGRATION_PATH, changed)
+        # A branch's edited pin must not redefine what the base released.
+        manifest = json.loads(before)
+        manifest["blocks"]["1"] = GUARD.inventory({GUARD.MIGRATION_PATH: changed})["blocks"]["1"]
+        self.write(GUARD.MANIFEST_PATH, json.dumps(manifest, indent=2) + "\n")
+        edited = self.read_manifest()
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("changed migration blocks V1", invocation.stderr)
+        self.assertEqual(self.read_manifest(), edited)
+
+    def test_refresh_refuses_changed_released_helper(self):
+        before = self.read_manifest()
+        self.write(
+            "crates/rsid/src/store/alpha.rs",
+            self.section("alpha-catalog").replace("apply_alpha", "changed_alpha"),
+        )
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("changed protected sections alpha-catalog", invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_missing_base_refuses_before_writing(self):
+        before = self.read_manifest()
+        invocation = self.refresh("missing-base")
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("cannot be resolved", invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_deleted_worktree_manifest_does_not_allow_released_ddl_changes(self):
+        (self.repo / GUARD.MANIFEST_PATH).unlink()
+        self.write(GUARD.MIGRATION_PATH, self.store().replace("migrate_v1", "changed_v1"))
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("changed migration blocks V1", invocation.stderr)
+        self.assertFalse((self.repo / GUARD.MANIFEST_PATH).exists())
+
+    def test_deleted_manifest_is_rebuilt_against_the_released_base(self):
+        before = self.read_manifest()
+        (self.repo / GUARD.MANIFEST_PATH).unlink()
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 0, invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_invalid_base_pins_refuse_before_writing(self):
+        before = self.read_manifest()
+        self.write(GUARD.MIGRATION_PATH, self.store().replace("migrate_v1", "changed_v1"))
+        self.git("add", GUARD.MIGRATION_PATH)
+        self.git("commit", "-q", "-m", "base source without corresponding pins")
+        invocation = self.refresh("HEAD")
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("refresh base migration manifest does not match its source", invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_refresh_refuses_noncontiguous_unreleased_versions(self):
+        before = self.read_manifest()
+        self.write(f"{GUARD.MIGRATION_DIR}/v003.rs", "if version < 3 {\n    migrate_v3();\n}\n")
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 1)
+        self.assertIn("every new version", invocation.stderr)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_refresh_resolves_a_conflicted_manifest_from_both_sides(self):
+        # Two landings that each append a pin at the same spot conflict on the
+        # derived manifest; refresh keeps every pin of both sides, no hand edit.
+        self.git("checkout", "-q", "-b", "side-gamma")
+        for name in ("gamma", "delta"):
+            if name == "delta":
+                self.git("checkout", "-q", "rolling")
+                self.git("checkout", "-q", "-b", "side-delta")
+            path = f"crates/rsid/src/store/{name}.rs"
+            self.write(path, self.section(f"{name}-catalog"))
+            self.assertEqual(self.refresh("--include-path", path).returncode, 0)
+            self.git("add", ".")
+            self.git("commit", "-q", "-m", f"add {name}")
+        merge = scratch_git(self.repo, "merge", "side-gamma", check=False)
+        self.assertNotEqual(merge.returncode, 0, "the fixture must conflict on the manifest")
+        self.assertIn("<<<<<<<", self.read_manifest())
+        invocation = self.refresh()
+        self.assertEqual(invocation.returncode, 0, invocation.stderr + invocation.stdout)
+        sections = json.loads(self.read_manifest())["protected_sections"]
+        self.assertEqual(
+            sorted(sections), ["alpha-catalog", "beta-catalog", "delta-catalog", "gamma-catalog"]
+        )
+
+    def check(self, base="origin/rolling", head="HEAD"):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"), base, head],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+
+    def commit_v2_without_a_pin(self):
+        store = self.store().replace("LATEST_SCHEMA_VERSION: i32 = 1", "LATEST_SCHEMA_VERSION: i32 = 2")
+        self.write(GUARD.MIGRATION_PATH, store + "if version < 2 {\n    migrate_v2();\n}\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "migration 2, no pin edit")
+
+    def test_the_guard_defers_the_pin_of_a_source_that_left_the_pin_file_alone(self):
+        # #1949: the lander derives the pin at publication, so a worker's
+        # source carries the new migration and the base's pin file unchanged.
+        self.commit_v2_without_a_pin()
+        self.assertEqual(json.loads(self.read_manifest()), self.manifest)
+        checked = self.check()
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertIn("pin deferred to the lander", checked.stdout)
+
+    def test_the_derived_pin_passes_the_strict_guard(self):
+        # What the lander commits (`--refresh` against the tip) is exactly the
+        # pin the guard defers: the committed result validates without deferral.
+        self.commit_v2_without_a_pin()
+        self.assertEqual(self.refresh("origin/rolling").returncode, 0)
+        self.git("add", GUARD.MANIFEST_PATH)
+        self.git("commit", "-q", "-m", "derive pin")
+        checked = self.check()
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertNotIn("deferred", checked.stdout)
+        self.assertEqual(json.loads(self.read_manifest())["blocks"]["2"],
+                         GUARD.inventory({GUARD.MIGRATION_PATH: (self.repo / GUARD.MIGRATION_PATH).read_text(),
+                                          "crates/rsid/src/store/cohort_settlement.rs": "",
+                                          "crates/rsid/src/store/alpha.rs": self.section("alpha-catalog"),
+                                          "crates/rsid/src/store/beta.rs": self.section("beta-catalog")})["blocks"]["2"])
+
+    def test_a_deferred_pin_cannot_cover_a_changed_released_block(self):
+        self.write(GUARD.MIGRATION_PATH, self.store().replace("migrate_v1", "migrate_v1_edited"))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "edit a released block")
+        refused = self.check()
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("does not match its source", refused.stderr)
+
+    def test_a_hand_edited_partial_pin_is_still_judged_strictly(self):
+        # Only a pin file left exactly at the base's content is deferred.
+        self.commit_v2_without_a_pin()
+        manifest = json.loads(self.read_manifest())
+        manifest["latest_schema_version"] = 2
+        self.write(GUARD.MANIFEST_PATH, json.dumps(manifest, indent=2) + "\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "half a pin")
+        refused = self.check()
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("does not match its source", refused.stderr)
 
     def test_a_store_moved_to_the_new_layout_still_validates_against_the_old_base(self):
         # #1021 S4: the store moved from crates/rsid to crates/rsid-store. The
@@ -226,6 +420,20 @@ class SplitLayoutTest(unittest.TestCase):
             for version in range(latest + 1)
         }
 
+    def test_the_rewind_constant_must_equal_the_schema_head(self):
+        """#2018: a new migration without the rewind fixture bump is refused."""
+        tests = "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = {};\n"
+        GUARD.validate_rewind_teardown_matches_schema(self.files(2), tests.format(2))
+        GUARD.validate_rewind_teardown_matches_schema(self.files(2), None)
+        with self.assertRaisesRegex(GUARD.GuardError, r"\(1\) does not match the schema head \(V2\)"):
+            GUARD.validate_rewind_teardown_matches_schema(self.files(2), tests.format(1))
+        GUARD.validate_rewind_teardown_matches_schema(self.files(2), "fn unrelated() {}\n")
+
+    def test_the_rewind_constant_is_found_in_this_checkout(self):
+        """#2018: a rename of the constant must not switch the guard off silently."""
+        text = (ROOT / GUARD.REWIND_TESTS_PATH).read_text()
+        self.assertRegex(text, GUARD.REWIND_TEARDOWN_RE)
+
     def test_head_is_the_highest_migration_file_and_blocks_are_per_file(self):
         actual = GUARD.inventory(self.files(2))
         self.assertEqual(actual["latest_schema_version"], 2)
@@ -269,6 +477,38 @@ class SplitLayoutTest(unittest.TestCase):
         with self.assertRaises(GUARD.GuardError):
             GUARD.validate_append_only(base, GUARD.inventory(skipped))
 
+    def test_a_declared_pending_sibling_may_be_skipped_but_nothing_else(self):
+        """#1285: v3 over base v1 passes only with v2 declared as a pending predecessor."""
+        base = GUARD.inventory(self.files(1))
+        gapped = self.files(3)
+        del gapped[f"{GUARD.MIGRATION_DIR}/v002.rs"]
+        head = GUARD.inventory(gapped)
+        with self.assertRaises(GUARD.GuardError):
+            GUARD.validate_append_only(base, head)
+        GUARD.validate_append_only(base, head, [2])
+        with self.assertRaises(GUARD.GuardError):
+            GUARD.validate_append_only(base, GUARD.inventory(self.files(3)), [2])
+        with self.assertRaises(GUARD.GuardError):
+            GUARD.validate_append_only(base, head, [3])
+
+    def test_pending_predecessors_parse_only_above_the_base_head(self):
+        declaration = json.dumps({"schema_version": 1, "version": 5, "files": [],
+                                  "pending_predecessors": [3, 4]})
+        self.assertEqual(GUARD.parse_pending_predecessors([declaration], 2), [3, 4])
+        self.assertEqual(GUARD.parse_pending_predecessors([declaration], 3), [4])
+        self.assertEqual(GUARD.parse_pending_predecessors([declaration], 4), [])
+        plain = json.dumps({"schema_version": 1, "version": 5, "files": []})
+        self.assertEqual(GUARD.parse_pending_predecessors([plain], 2), [])
+
+    def test_malformed_pending_predecessors_are_refused(self):
+        for bad in ([], [5], [6], ["4"], [True], [4, 4], list(range(1, 20))):
+            declaration = json.dumps({"schema_version": 1, "version": 5, "files": [],
+                                      "pending_predecessors": bad})
+            with self.assertRaises(GUARD.GuardError, msg=repr(bad)):
+                GUARD.parse_pending_predecessors([declaration], 0)
+        with self.assertRaises(GUARD.GuardError):
+            GUARD.parse_pending_predecessors(["not json"], 0)
+
     def test_inline_and_split_layouts_share_block_digests(self):
         inline = "// V0: Original schema\n        create_table();\n\n// V1: Session metadata columns\n" + (
             "        if version < 1 {\n            migrate();\n        }\n"
@@ -277,6 +517,98 @@ class SplitLayoutTest(unittest.TestCase):
         split = GUARD.inventory(self.files(1))
         self.assertEqual(legacy["blocks"]["1"], split["blocks"]["1"])
         GUARD.validate_append_only(legacy, split)
+
+
+class AlteredObjectsTest(unittest.TestCase):
+    """#2064: a new migration that alters an existing object needs one table entry."""
+
+    TABLE = (
+        "pub(crate) const MIGRATION_ALTERED_OBJECTS: &[(i32, &[&str])] = &[\n"
+        "    // #1: why\n"
+        "{entries}"
+        "];\n"
+    )
+
+    def table(self, *entries):
+        return self.TABLE.format(entries="".join(f"    {entry}\n" for entry in entries))
+
+    def migration(self, version, sql):
+        return {f"{GUARD.MIGRATION_DIR}/v{version:03d}.rs": f'execute_batch("{sql}");\n'}
+
+    def check(self, version, sql, *entries):
+        GUARD.validate_altered_objects(self.migration(version, sql), version - 1, self.table(*entries))
+
+    def test_an_alter_without_an_entry_is_refused_and_names_the_entry(self):
+        with self.assertRaises(GUARD.GuardError) as caught:
+            self.check(7, "ALTER TABLE things ADD COLUMN extra TEXT;")
+        message = str(caught.exception)
+        self.assertIn('(7, &["things"]),', message)
+        self.assertIn("false refusal", message)
+        self.assertIn(GUARD.ALTERED_OBJECTS_PATH, message)
+
+    def test_rustfmt_multiline_and_trailing_comma_entries_are_parsed(self):
+        sql = "ALTER TABLE things ADD COLUMN extra TEXT; DROP TRIGGER IF EXISTS guard_a;"
+        multiline = '(\n        7,\n        &[\n            "things",\n            "guard_a",\n        ],\n    ),'
+        self.check(7, sql, multiline)
+        self.check(7, sql, '(7, &["things", "guard_a",],),')
+        self.check(7, sql, '(7, &["things"],),\n    (7, &["guard_a"]),')
+
+    def test_an_unparseable_entry_is_a_hard_error_naming_the_line(self):
+        with self.assertRaises(GUARD.GuardError) as caught:
+            self.check(7, "ALTER TABLE things ADD COLUMN extra TEXT;", '(7, ["things"]),')
+        self.assertIn("unparseable", str(caught.exception))
+        self.assertIn("line 2", str(caught.exception))
+
+    def test_the_listed_object_passes_and_a_partial_entry_names_the_union(self):
+        self.check(7, "ALTER TABLE things ADD COLUMN extra TEXT;", '(7, &["things"]),')
+        with self.assertRaises(GUARD.GuardError) as caught:
+            self.check(
+                7,
+                "ALTER TABLE things ADD COLUMN extra TEXT; DROP TRIGGER IF EXISTS guard_a;",
+                '(7, &["things"]),',
+            )
+        self.assertIn('(7, &["guard_a", "things"]),', str(caught.exception))
+
+    def test_a_rebuild_is_seen_as_drop_and_rename_and_scratch_is_not_required(self):
+        rebuild = (
+            "CREATE TABLE things_new (id TEXT); INSERT INTO things_new SELECT id FROM things; "
+            "DROP TABLE things; ALTER TABLE things_new RENAME TO things;"
+        )
+        with self.assertRaises(GUARD.GuardError) as caught:
+            self.check(7, rebuild)
+        self.assertIn('(7, &["things"]),', str(caught.exception))
+        self.check(7, rebuild, '(7, &["things"]),')
+
+    def test_new_objects_comments_and_other_versions_do_not_need_entries(self):
+        self.check(7, "CREATE TABLE brand_new (id TEXT); CREATE TRIGGER t_a BEFORE UPDATE ON brand_new BEGIN SELECT 1; END;")
+        files = {f"{GUARD.MIGRATION_DIR}/v007.rs": "// ALTER TABLE old ADD COLUMN x TEXT\n/// DROP TABLE old\n"}
+        GUARD.validate_altered_objects(files, 6, self.table())
+        # Released versions are immutable and not rescanned.
+        GUARD.validate_altered_objects(self.migration(7, "ALTER TABLE things ADD COLUMN x;"), 7, self.table())
+        # A tree without the table or a base skips the check.
+        GUARD.validate_altered_objects(self.migration(7, "ALTER TABLE things ADD COLUMN x;"), 6, None)
+        GUARD.validate_altered_objects(self.migration(7, "ALTER TABLE things ADD COLUMN x;"), None, self.table())
+
+    def test_a_rebuild_helper_call_needs_some_entry(self):
+        files = {f"{GUARD.MIGRATION_DIR}/v008.rs": "cohort::rebuild_status_constraint(&tx)?;\n"}
+        with self.assertRaisesRegex(GUARD.GuardError, r"rebuild_\* helper.*\(8, &\[\"<object"):
+            GUARD.validate_altered_objects(files, 7, self.table())
+        GUARD.validate_altered_objects(files, 7, self.table('(8, &["status_items"]),'))
+
+    def test_the_altered_objects_table_is_found_in_this_checkout(self):
+        """A rename of the table must not switch the guard off silently."""
+        text = (ROOT / GUARD.ALTERED_OBJECTS_PATH).read_text()
+        table = GUARD.altered_objects_table(text)
+        self.assertEqual(table[170], {"manager_portfolio_appointments"})
+
+    def test_the_backfilled_table_covers_every_checked_in_migration_above_its_floor(self):
+        """The recorded versions are what the guard would demand of those migrations today."""
+        text = (ROOT / GUARD.ALTERED_OBJECTS_PATH).read_text()
+        floor = int(re.search(r"COMPLETE_ABOVE: i32 = (\d+);", text).group(1))
+        files = {}
+        for path in sorted((ROOT / GUARD.MIGRATION_DIR).glob("v*.rs")):
+            files[f"{GUARD.MIGRATION_DIR}/{path.name}"] = path.read_text()
+        GUARD.validate_altered_objects(files, floor, text)
 
 
 if __name__ == "__main__":

@@ -677,7 +677,7 @@ mod tests {
         path: &std::path::Path,
         boundary: CrashBoundary,
     ) -> (Session, Project, Idea, Uuid, Uuid) {
-        let store = Store::open(path).expect("open outbox seed store");
+        let store = Store::open_test_fixture(path).expect("open outbox seed store");
         let now = timestamp();
         let project = Project {
             id: Uuid::new_v4(),
@@ -926,7 +926,7 @@ mod tests {
         path: &std::path::Path,
         count: usize,
     ) -> (Vec<(Session, Project, Idea)>, Vec<Uuid>, Uuid) {
-        let store = Store::open(path).expect("open bounded publication seed store");
+        let store = Store::open_test_fixture(path).expect("open bounded publication seed store");
         let now = timestamp();
         let digest = Sha256Digest::parse(format!("sha256:{}", "c".repeat(64))).unwrap();
         let mut controllers = Vec::with_capacity(count);
@@ -1060,7 +1060,7 @@ mod tests {
         count: usize,
     ) -> DispatchFixture {
         let (controllers, run_ids, _) = seed_ready_work_runs(path, count);
-        let store = Store::open(path).unwrap();
+        let store = Store::open_test_fixture(path).unwrap();
         let now = timestamp();
         store
             .conn
@@ -1134,7 +1134,7 @@ mod tests {
         for index in 0..count {
             let (session, project, idea, run_id, _) =
                 seed_retry_pending_wake(path, CrashBoundary::Acknowledged);
-            let store = Store::open(path).unwrap();
+            let store = Store::open_test_fixture(path).unwrap();
             let wake_id: String = store
                 .conn
                 .query_row(
@@ -1209,7 +1209,7 @@ mod tests {
         Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(db_path).unwrap(),
+                Store::open_test_fixture(db_path).unwrap(),
                 false,
                 root.join("daemon.sock"),
                 None,
@@ -1234,7 +1234,10 @@ mod tests {
                 .insert(session.id, TrackedSession::new_for_test(session.clone()));
             manager
                 .register_agent_token(
-                    format!("d05-v6-{token_generation}-token:{}", session.id),
+                    crate::test_support::agent_token(&format!(
+                        "d05-v6-{token_generation}-token:{}",
+                        session.id
+                    )),
                     session.id,
                 )
                 .await;
@@ -1281,6 +1284,13 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn d05_v5_due_claim_sql_scope_precedes_limit_and_preserves_foreign_facts() {
+        // Seed the 65 ready runs once; every scenario mutates its own byte copy of
+        // that closed (checkpointed) database, so each still starts from a fresh,
+        // identical fixture without repeating ~600 seeding transactions.
+        let seed_dir = tempfile::tempdir().unwrap();
+        let seed_path = seed_dir.path().join("rsi.db");
+        let (seed_controllers, seed_run_ids, seed_eligible_action_id) =
+            seed_ready_work_runs(&seed_path, 65);
         for scenario in [
             "stale_controller",
             "foreign_project_idea",
@@ -1289,10 +1299,13 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("rsi.db");
-            let (mut controllers, run_ids, eligible_action_id) = seed_ready_work_runs(&db_path, 65);
+            std::fs::copy(&seed_path, &db_path).unwrap();
+            let mut controllers = seed_controllers.clone();
+            let run_ids = seed_run_ids.clone();
+            let eligible_action_id = seed_eligible_action_id;
             let (session, project, idea) = controllers.pop().unwrap();
             let eligible_run_id = *run_ids.last().unwrap();
-            let store = Store::open(&db_path).unwrap();
+            let store = Store::open_test_fixture(&db_path).unwrap();
             let now = timestamp();
             let earlier =
                 (now - chrono::Duration::minutes(2)).to_rfc3339_opts(SecondsFormat::Nanos, true);
@@ -1397,7 +1410,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("rsi.db");
         let (controllers, _run_ids, deferred_action_id) = seed_ready_work_runs(&db_path, 65);
-        Store::open(&db_path)
+        Store::open_test_fixture(&db_path)
             .unwrap()
             .conn
             .execute(
@@ -1487,7 +1500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("rsi.db");
         let (controllers, _run_ids, deferred_action_id) = seed_ready_work_runs(&db_path, 65);
-        Store::open(&db_path)
+        Store::open_test_fixture(&db_path)
             .unwrap()
             .conn
             .execute(
@@ -1636,7 +1649,10 @@ mod tests {
         manager.revoke_agent_token_for_session(session.id).await;
         manager
             .register_agent_token(
-                format!("d05-v6-replacement-provider-token:{}", session.id),
+                crate::test_support::agent_token(&format!(
+                    "d05-v6-replacement-provider-token:{}",
+                    session.id
+                )),
                 session.id,
             )
             .await;
@@ -1921,7 +1937,10 @@ mod tests {
                 sparse.project_id = Some(project.id);
                 sparse.status = SessionStatus::Running;
                 active.insert(sparse.id, TrackedSession::new_for_test(sparse.clone()));
-                tokens.insert(format!("d05-v7-sparse-token-{index}"), sparse.id);
+                tokens.insert(
+                    crate::test_support::agent_token(&format!("d05-v7-sparse-token-{index}")),
+                    sparse.id,
+                );
                 store.install_controller_grant_v1(
                     BoundControllerWriteAuthority::new(project.id, idea.id, sparse.id, 1).unwrap(),
                 );
@@ -1966,7 +1985,7 @@ mod tests {
             let (session, project, idea, run_id, job_id) =
                 seed_retry_pending_wake(&db_path, boundary);
 
-            let store = Store::open(&db_path).expect("reopen after crash boundary");
+            let store = Store::open_test_fixture(&db_path).expect("reopen after crash boundary");
             let manager = Arc::new(
                 SessionManager::new(
                     Arc::new(EventBus::new(16)),
@@ -1985,11 +2004,10 @@ mod tests {
                 .write()
                 .await
                 .insert(session.id, TrackedSession::new_for_test(session.clone()));
-            manager
-                .agent_tokens
-                .write()
-                .await
-                .insert(format!("d05-restart-token:{}", session.id), session.id);
+            manager.agent_tokens.write().await.insert(
+                crate::test_support::agent_token(&format!("d05-restart-token:{}", session.id)),
+                session.id,
+            );
             manager.store.lock().await.install_controller_grant_v1(
                 BoundControllerWriteAuthority::new(project.id, idea.id, session.id, 1)
                     .expect("restart grant"),
@@ -2055,7 +2073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("rsi.db");
         let (controllers, run_ids, deferred_action_id) = seed_ready_work_runs(&db_path, 33);
-        let store = Store::open(&db_path).unwrap();
+        let store = Store::open_test_fixture(&db_path).unwrap();
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
@@ -2075,11 +2093,10 @@ mod tests {
                 .write()
                 .await
                 .insert(session.id, TrackedSession::new_for_test(session.clone()));
-            manager
-                .agent_tokens
-                .write()
-                .await
-                .insert(format!("d05-v4-token:{}", session.id), session.id);
+            manager.agent_tokens.write().await.insert(
+                crate::test_support::agent_token(&format!("d05-v4-token:{}", session.id)),
+                session.id,
+            );
             manager.store.lock().await.install_controller_grant_v1(
                 BoundControllerWriteAuthority::new(project.id, idea.id, session.id, 1).unwrap(),
             );
@@ -2232,7 +2249,7 @@ mod tests {
         let db_path = dir.path().join("rsi.db");
         let (mut controllers, run_ids, action_id) = seed_ready_work_runs(&db_path, 1);
         let (session, project, idea) = controllers.pop().unwrap();
-        let store = Store::open(&db_path).unwrap();
+        let store = Store::open_test_fixture(&db_path).unwrap();
         let now = timestamp();
         store
             .conn
@@ -2300,11 +2317,10 @@ mod tests {
             .write()
             .await
             .insert(session.id, TrackedSession::new_for_test(session.clone()));
-        manager
-            .agent_tokens
-            .write()
-            .await
-            .insert(format!("d05-v4-reference-token:{}", session.id), session.id);
+        manager.agent_tokens.write().await.insert(
+            crate::test_support::agent_token(&format!("d05-v4-reference-token:{}", session.id)),
+            session.id,
+        );
         manager.store.lock().await.install_controller_grant_v1(
             BoundControllerWriteAuthority::new(project.id, idea.id, session.id, 1).unwrap(),
         );
@@ -2345,7 +2361,7 @@ mod tests {
         let db_path = dir.path().join("rsi.db");
         let (session, project, idea, run_id, _) =
             seed_retry_pending_wake(&db_path, CrashBoundary::Acknowledged);
-        let store = Store::open(&db_path).expect("reopen consumed wake fixture");
+        let store = Store::open_test_fixture(&db_path).expect("reopen consumed wake fixture");
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
@@ -2364,11 +2380,10 @@ mod tests {
             .write()
             .await
             .insert(session.id, TrackedSession::new_for_test(session.clone()));
-        manager
-            .agent_tokens
-            .write()
-            .await
-            .insert(format!("d05-rr2-token:{}", session.id), session.id);
+        manager.agent_tokens.write().await.insert(
+            crate::test_support::agent_token(&format!("d05-rr2-token:{}", session.id)),
+            session.id,
+        );
         manager.store.lock().await.install_controller_grant_v1(
             BoundControllerWriteAuthority::new(project.id, idea.id, session.id, 1).unwrap(),
         );

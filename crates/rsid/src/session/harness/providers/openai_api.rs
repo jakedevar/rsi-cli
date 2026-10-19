@@ -9,11 +9,12 @@
 use crate::error::DaemonError;
 use crate::model_control::ModelExecutionCapability;
 use crate::session::harness::api_key::ApiCredential;
-use crate::session::harness::errors::{self, ProviderError, ProviderErrorClass};
+use crate::session::harness::errors::{self, ProviderError, ProviderErrorClass, ProviderErrorExt};
 use crate::session::harness::provider::{ApiProvider, Result};
 use crate::session::harness::sse::read_openai_sse_stream;
 use crate::session::harness::types::*;
-use serde_json::{Value, json};
+use rsid_harness::providers::openai_api as openai_wire;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub struct OpenAiApiProvider {
@@ -36,7 +37,8 @@ impl OpenAiApiProvider {
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .json(&body);
+            .json(&body)
+            .timeout(crate::session::harness::net::total_timeout(request.stream));
         let key = self.credential.current();
         let fingerprint = key.as_ref().map(crate::vault::SecretString::fingerprint);
         if let Some(key) = key {
@@ -64,7 +66,8 @@ impl OpenAiApiProvider {
             .http
             .post(&url)
             .header("content-type", "application/json")
-            .json(&body);
+            .json(&body)
+            .timeout(crate::session::harness::net::total_timeout(request.stream));
         let key = self.credential.current().ok_or_else(|| {
             DaemonError::OpenAiApiError("OpenRouter credential unavailable".to_string())
         })?;
@@ -85,10 +88,7 @@ impl OpenAiApiProvider {
         let base_url = std::env::var("OPENAI_API_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".into());
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| DaemonError::Process(format!("HTTP client build error: {e}")))?;
+        let http = crate::session::harness::net::client()?;
 
         Ok(Self {
             http,
@@ -110,10 +110,7 @@ impl OpenAiApiProvider {
         credential: ApiCredential,
         quirks: ProviderQuirks,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| DaemonError::Process(format!("HTTP client build error: {e}")))?;
+        let http = crate::session::harness::net::client()?;
 
         Ok(Self {
             http,
@@ -139,205 +136,22 @@ impl OpenAiApiProvider {
         Ok(provider)
     }
 
+    /// The wire shape lives in `rsid-harness`; the route and quirks are resolved here.
     fn build_request_body(&self, request: &ChatRequest) -> Value {
-        let mut messages: Vec<Value> = Vec::new();
-        let mut pending_image_messages: Vec<Value> = Vec::new();
-
-        for msg in &request.messages {
-            // Chat Completions requires every tool reply for one assistant turn
-            // before the next user message. Defer image parts until the batch ends.
-            if msg.role != MessageRole::Tool {
-                messages.append(&mut pending_image_messages);
-            }
-            match msg.role {
-                MessageRole::System => {
-                    if !self.quirks.merge_system_into_user {
-                        messages.push(json!({
-                            "role": "system",
-                            "content": msg.content,
-                        }));
-                    }
-                }
-                MessageRole::User => {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": msg.content,
-                    }));
-                }
-                MessageRole::Assistant => {
-                    let mut m = json!({ "role": "assistant" });
-                    if !msg.content.is_empty() {
-                        m["content"] = json!(msg.content);
-                    }
-                    if !msg.tool_calls.is_empty() {
-                        m["tool_calls"] = json!(
-                            msg.tool_calls
-                                .iter()
-                                .map(|tc| {
-                                    json!({
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.name,
-                                            "arguments": tc.arguments,
-                                        },
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        );
-                    }
-                    messages.push(m);
-                }
-                MessageRole::Tool => {
-                    let blocks = msg.tool_blocks();
-                    let mut text = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ToolContentBlock::Text { text } => Some(text.as_str()),
-                            ToolContentBlock::ServerToolResult { .. } => None,
-                            ToolContentBlock::Image { .. } => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let image_parts = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ToolContentBlock::Image {
-                                media_type,
-                                data,
-                                detail,
-                                ..
-                            } => {
-                                let mut image_url = json!({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:{media_type};base64,{data}"),
-                                },
-                                });
-                                if let Some(detail) = detail {
-                                    image_url["image_url"]["detail"] = json!(detail);
-                                }
-                                Some(image_url)
-                            }
-                            ToolContentBlock::Text { .. } => None,
-                            ToolContentBlock::ServerToolResult { .. } => None,
-                        })
-                        .collect::<Vec<_>>();
-                    if !image_parts.is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str("[Image attached in the following user message]");
-                    }
-                    let content = if msg.is_error {
-                        json!({
-                            "error": {
-                                "type": "tool_execution",
-                                "message": text,
-                            }
-                        })
-                        .to_string()
-                    } else {
-                        text
-                    };
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                        "content": content,
-                    }));
-                    if !image_parts.is_empty() {
-                        let mut user_parts = vec![json!({
-                            "type": "text",
-                            "text": format!(
-                                "Image returned by tool call {}:",
-                                msg.tool_call_id.as_deref().unwrap_or("")
-                            ),
-                        })];
-                        user_parts.extend(image_parts);
-                        pending_image_messages.push(json!({
-                            "role": "user",
-                            "content": user_parts,
-                        }));
-                    }
-                }
-            }
-        }
-        messages.append(&mut pending_image_messages);
-
-        // Handle merge_system_into_user quirk
-        if self.quirks.merge_system_into_user {
-            let mut system_text = String::new();
-            messages.retain(|m| {
-                if m.get("role").and_then(|r| r.as_str()) == Some("system") {
-                    if let Some(content) = m.get("content").and_then(|c| c.as_str()) {
-                        system_text = format!("[System: {}]\n\n", content);
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            if !system_text.is_empty()
-                && let Some(first_user) = messages
-                    .iter_mut()
-                    .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            {
-                let existing = first_user
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                first_user["content"] = json!(format!("{system_text}{existing}"));
-            }
-        }
-
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .filter(|t| matches!(t.kind, HarnessToolSpecKind::Function))
-            .map(|t| {
-                let schema: Value =
-                    serde_json::from_str(&t.parameters_json).unwrap_or(json!({"type": "object"}));
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": schema,
-                    },
-                })
-            })
-            .collect();
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-        });
-
-        if !tools.is_empty() && self.quirks.native_tools {
-            body["tools"] = json!(tools);
-        }
-        if let Some(temp) = request.temperature {
-            body["temperature"] = json!(temp);
-        }
-        if let Some(max) = request.max_tokens {
-            body["max_tokens"] = json!(max);
-        }
-        // OpenRouter normalises reasoning control under `reasoning.effort`.
-        if self.execution_route
-            == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp
-            && let Some(effort) = request
-                .reasoning_effort
-                .as_deref()
-                .filter(|effort| matches!(*effort, "low" | "medium" | "high"))
-        {
-            body["reasoning"] = json!({ "effort": effort });
-        }
-        if request.stream && !self.quirks.disable_streaming {
-            body["stream"] = json!(true);
-            body["stream_options"] = json!({"include_usage": true});
-        }
-
-        body
+        let reasoning_effort = self.quirks.reasoning_effort;
+        openai_wire::build_request_body(
+            request,
+            &openai_wire::ChatCompletionsWire {
+                merge_system_into_user: self.quirks.merge_system_into_user,
+                native_tools: self.quirks.native_tools,
+                max_tokens_field: self.quirks.max_tokens_field.field_name(),
+                tool_choice_none: self.quirks.tool_choice_none,
+                disable_streaming: self.quirks.disable_streaming,
+                openrouter_reasoning: self.execution_route
+                    == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp,
+                reasoning_effort_wire: &|effort| reasoning_effort.wire_value(effort),
+            },
+        )
     }
 }
 
@@ -374,66 +188,8 @@ impl ApiProvider for OpenAiApiProvider {
             .await
             .map_err(|e| DaemonError::Process(format!("OpenAI parse error: {e}")))?;
 
-        let choice = json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first())
-            .ok_or_else(|| DaemonError::Process("No choices in OpenAI response".into()))?;
-
-        let message = choice
-            .get("message")
-            .ok_or_else(|| DaemonError::Process("No message in choice".into()))?;
-
-        let content = message
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let tool_calls: Vec<ToolCall> = message
-            .get("tool_calls")
-            .and_then(|tcs| tcs.as_array())
-            .map(|tcs| {
-                tcs.iter()
-                    .filter_map(|tc| {
-                        Some(ToolCall {
-                            id: tc.get("id")?.as_str()?.to_string(),
-                            name: tc.get("function")?.get("name")?.as_str()?.to_string(),
-                            arguments: tc.get("function")?.get("arguments")?.as_str()?.to_string(),
-                            hosted: false,
-                            hosted_result: None,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let usage = json
-            .get("usage")
-            .map(|u| TokenUsage {
-                prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                completion_tokens: u
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cost_usd: crate::session::harness::sse::reported_cost_usd(u),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-
-        let stop_reason = choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        Ok(ChatResponse {
-            content,
-            tool_calls,
-            usage,
-            reasoning_content: None,
-            stop_reason,
-        })
+        openai_wire::parse_chat_response(&json)
+            .map_err(|message| DaemonError::Process(message.into()))
     }
 
     async fn stream_chat(
@@ -452,6 +208,7 @@ impl ApiProvider for OpenAiApiProvider {
                     is_final: true,
                     usage: Some(response.usage.clone()),
                     stop_reason: response.stop_reason.clone(),
+                    warning: None,
                 })
                 .await;
             return Ok(response);
@@ -481,16 +238,7 @@ impl ApiProvider for OpenAiApiProvider {
         let (content, acc_tool_calls, usage, stop_reason) =
             read_openai_sse_stream(resp, &chunk_tx, cancel).await?;
 
-        let tool_calls: Vec<ToolCall> = acc_tool_calls
-            .into_iter()
-            .map(|tc| ToolCall {
-                id: tc.id,
-                name: tc.name,
-                arguments: tc.arguments,
-                hosted: false,
-                hosted_result: None,
-            })
-            .collect();
+        let tool_calls = openai_wire::convert_tool_calls(acc_tool_calls);
 
         Ok(ChatResponse {
             content,
@@ -503,6 +251,14 @@ impl ApiProvider for OpenAiApiProvider {
 
     fn supports_native_tools(&self) -> bool {
         self.quirks.native_tools
+    }
+
+    fn default_max_output_tokens(&self) -> Option<u32> {
+        self.quirks.default_max_output_tokens
+    }
+
+    fn accepts_tool_choice_none(&self) -> bool {
+        self.quirks.native_tools && self.quirks.tool_choice_none
     }
 
     fn supports_image_input(&self, model: &str) -> bool {
@@ -521,6 +277,7 @@ impl ApiProvider for OpenAiApiProvider {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+    use serde_json::json;
 
     fn request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
@@ -532,104 +289,8 @@ mod route_tests {
             stream: false,
             reasoning_effort: None,
             context_editing: false,
+            tool_choice_none: false,
         }
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-    #[test]
-    fn context_editing_never_reaches_an_openai_style_body() {
-        let provider = OpenAiApiProvider::with_config(
-            "http://localhost".into(),
-            ApiCredential::None,
-            ProviderQuirks::default(),
-        )
-        .unwrap();
-        let mut request = request(vec![ChatMessage::user("hi")]);
-        request.context_editing = true;
-        let body = provider.build_request_body(&request);
-        assert!(body.get("context_management").is_none());
-        assert!(!body.to_string().contains("clear_tool_uses"));
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-    #[test]
-    fn tool_results_use_text_tool_messages_and_user_image_parts() {
-        let provider = OpenAiApiProvider::with_config(
-            "http://localhost".into(),
-            ApiCredential::None,
-            ProviderQuirks::default(),
-        )
-        .unwrap();
-        let image = crate::session::harness::tools::view_image::test_png_image_block(Some("low"));
-        let ToolContentBlock::Image {
-            media_type, data, ..
-        } = &image
-        else {
-            panic!("test image block");
-        };
-        let body = provider.build_request_body(&request(vec![
-            ChatMessage::tool_result("legacy", "plain text"),
-            ChatMessage::tool_result_blocks(
-                "text",
-                vec![ToolContentBlock::Text {
-                    text: "typed text".into(),
-                }],
-                false,
-            ),
-            ChatMessage::tool_result_blocks(
-                "image",
-                vec![
-                    ToolContentBlock::Text {
-                        text: "preview".into(),
-                    },
-                    image.clone(),
-                ],
-                false,
-            ),
-            ChatMessage::tool_result_blocks(
-                "error",
-                vec![ToolContentBlock::Text {
-                    text: "failed".into(),
-                }],
-                true,
-            ),
-        ]));
-        assert_eq!(
-            body["messages"][0],
-            json!({
-                "role": "tool", "tool_call_id": "legacy", "content": "plain text"
-            })
-        );
-        assert_eq!(
-            body["messages"][1],
-            json!({
-                "role": "tool", "tool_call_id": "text", "content": "typed text"
-            })
-        );
-        assert_eq!(
-            body["messages"][2],
-            json!({
-                "role": "tool", "tool_call_id": "image",
-                "content": "preview\n[Image attached in the following user message]"
-            })
-        );
-        assert_eq!(body["messages"][3]["role"], "tool");
-        let error: Value =
-            serde_json::from_str(body["messages"][3]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            error,
-            json!({"error": {"type": "tool_execution", "message": "failed"}})
-        );
-        assert_eq!(
-            body["messages"][4],
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Image returned by tool call image:"},
-                    {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}"), "detail": "low"}}
-                ]
-            })
-        );
     }
 
     /// #1061: OpenRouter requests carry the reasoning effort as
@@ -647,6 +308,213 @@ mod route_tests {
             .unwrap()
             .build_request_body(&req);
         assert!(body.get("reasoning").is_none());
+    }
+
+    fn mercury_provider() -> OpenAiApiProvider {
+        let entry = crate::session::harness::compatible_table::lookup("mercury-2")
+            .expect("the mercury table entry");
+        OpenAiApiProvider::with_config(
+            entry.base_url.to_string(),
+            ApiCredential::None,
+            entry.quirks.clone(),
+        )
+        .unwrap()
+    }
+
+    fn probe_spec() -> HarnessToolSpec {
+        HarnessToolSpec {
+            name: "probe_tool".into(),
+            description: "Probe.".into(),
+            parameters_json: r#"{"type":"object"}"#.into(),
+            freeform: None,
+            kind: HarnessToolSpecKind::Function,
+        }
+    }
+
+    /// #2253: the Mercury route sends `reasoning_effort` and
+    /// `max_completion_tokens`, and never `max_tokens`, `diffusing`,
+    /// `parallel_tool_calls` or a `developer` role.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn mercury_body_carries_effort_and_completion_cap_and_nothing_it_must_not_get() {
+        let mut req = request(vec![
+            ChatMessage::system("You are an agent."),
+            ChatMessage::user("hi"),
+        ]);
+        req.model = "mercury-2".into();
+        req.max_tokens = Some(16_384);
+        req.reasoning_effort = Some("low".into());
+        req.tools = vec![probe_spec()];
+        req.stream = true;
+        let body = mercury_provider().build_request_body(&req);
+
+        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["max_completion_tokens"], 16_384);
+        for absent in [
+            "max_tokens",
+            "diffusing",
+            "parallel_tool_calls",
+            "reasoning",
+            "tool_choice",
+            "temperature",
+        ] {
+            assert!(body.get(absent).is_none(), "{absent} in {body}");
+        }
+        assert_eq!(body["tools"][0]["function"]["name"], "probe_tool");
+        assert!(body["tools"][0]["function"].get("strict").is_none());
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["role"] != "developer")
+        );
+        // Another route keeps today's body: `max_tokens`, no effort.
+        let plain = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks {
+                native_tools: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .build_request_body(&req);
+        assert_eq!(plain["max_tokens"], 16_384);
+        assert!(plain.get("max_completion_tokens").is_none());
+        assert!(plain.get("reasoning_effort").is_none());
+    }
+
+    /// #2253: RSI efforts map onto Mercury's `instant|low|medium|high`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn mercury_effort_mapping_table() {
+        let provider = mercury_provider();
+        for (rsi_effort, wire) in [
+            ("minimal", Some("instant")),
+            ("none", Some("instant")),
+            ("low", Some("low")),
+            ("medium", Some("medium")),
+            ("high", Some("high")),
+            ("xhigh", Some("high")),
+            ("max", Some("high")),
+            ("MAX", Some("high")),
+            ("ultra", None),
+            ("diffusing", None),
+        ] {
+            let mut req = request(vec![ChatMessage::user("hi")]);
+            req.reasoning_effort = Some(rsi_effort.into());
+            let body = provider.build_request_body(&req);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                wire,
+                "RSI effort {rsi_effort}"
+            );
+        }
+        // No session effort, no parameter: Mercury's own default applies.
+        let body = provider.build_request_body(&request(vec![ChatMessage::user("hi")]));
+        assert!(body.get("reasoning_effort").is_none());
+
+        // The plain OpenAI-style wire has no `instant`.
+        let mut req = request(vec![ChatMessage::user("hi")]);
+        req.reasoning_effort = Some("minimal".into());
+        let openai_style = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks {
+                native_tools: true,
+                reasoning_effort: ReasoningEffortWire::OpenAi,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            openai_style.build_request_body(&req)["reasoning_effort"],
+            "low"
+        );
+    }
+
+    /// #2603: the Local/custom helper route asks a reasoning model for no
+    /// reasoning with a top-level `reasoning_effort: "none"`; a route without
+    /// the quirk sends nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn local_helper_wire_carries_reasoning_effort_none() {
+        let mut req = request(vec![ChatMessage::user("title this")]);
+        req.model = "gemma4:e4b".into();
+        req.max_tokens = Some(200);
+        req.reasoning_effort = Some("none".into());
+        let local = OpenAiApiProvider::with_config(
+            "http://localhost:11434/v1".into(),
+            ApiCredential::None,
+            ProviderQuirks {
+                reasoning_effort: ReasoningEffortWire::OpenAiWithNone,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let body = local.build_request_body(&req);
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["max_tokens"], 200);
+
+        let plain = OpenAiApiProvider::with_config(
+            "http://localhost:11434/v1".into(),
+            ApiCredential::None,
+            ProviderQuirks::default(),
+        )
+        .unwrap();
+        assert!(
+            plain
+                .build_request_body(&req)
+                .get("reasoning_effort")
+                .is_none()
+        );
+    }
+
+    /// #2253: `tool_choice: "none"` goes out only with tools, only when the
+    /// loop asks, and only on a route whose quirk allows it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn tool_choice_none_is_gated_by_the_route_quirk_and_needs_tools() {
+        let mut req = request(vec![ChatMessage::user("hi")]);
+        req.tools = vec![probe_spec()];
+        req.tool_choice_none = true;
+        let mercury = mercury_provider();
+        assert!(mercury.accepts_tool_choice_none());
+        assert_eq!(mercury.build_request_body(&req)["tool_choice"], "none");
+
+        // Without the loop asking, or without tools, nothing is sent.
+        req.tool_choice_none = false;
+        assert!(
+            mercury
+                .build_request_body(&req)
+                .get("tool_choice")
+                .is_none()
+        );
+        req.tool_choice_none = true;
+        req.tools.clear();
+        assert!(
+            mercury
+                .build_request_body(&req)
+                .get("tool_choice")
+                .is_none()
+        );
+
+        // A route without the quirk never sends it, and tells the loop so.
+        req.tools = vec![probe_spec()];
+        let plain = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks {
+                native_tools: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!plain.accepts_tool_choice_none());
+        assert!(plain.build_request_body(&req).get("tool_choice").is_none());
+        assert_eq!(mercury.default_max_output_tokens(), Some(16_384));
+        assert_eq!(plain.default_max_output_tokens(), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

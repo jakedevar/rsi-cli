@@ -51,7 +51,7 @@
         "healthy"
       ],
       "params": {
-        "instructions": "The rolling baseline failed. The upstream context holds the typed report for every crate. For each failing check that is new (search AgentListIssues with title_contains for the check and crate first), file exactly one Issue with AgentCreateIssue: kind bug, label qa, a title naming the crate and failing check, and a body with the failing command, the first error lines from the report and the rolling commit. Do not edit files, do not commit, and do not write qa-green.sha. Finish with a PIPELINE HANDOFF — TRIAGE: block with doc_path: inline, status: complete and the Issue numbers you filed (or 'none new').",
+        "instructions": "The rolling baseline failed. The upstream context holds the typed report for every crate. For each failing check that is new (search AgentListIssues with title_contains for the check and crate first), file exactly one Issue with AgentCreateIssue: kind bug, label qa, a title naming the crate and failing check, and a body with the failing command, the first error lines from the report and the rolling commit. Do not edit files, do not commit, and do not write qa-green.sha. Finish with a PIPELINE HANDOFF — VERIFY: block with doc_path: inline, status: complete and the Issue numbers you filed (or 'none new').",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "medium",

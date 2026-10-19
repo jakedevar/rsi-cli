@@ -64,15 +64,16 @@ pub(crate) fn available_shim(
     }
 }
 
-pub(crate) fn launch(
+/// Prepare the detached transport without consuming execution authority.
+/// Each provider binds and spawns this command at its registered boundary.
+pub(crate) fn prepare_command(
     command: &Command,
     config: &LaunchConfig,
-    execution: CliExecutionCapability,
-    route: RuntimeExecutionRoute,
+    invocation: Uuid,
     shim: &Path,
     output: TurnOutput,
     stdin: Option<&[u8]>,
-) -> Result<(CliTurnProcess, mpsc::Receiver<StreamEvent>)> {
+) -> Result<(Command, DetachedTurn)> {
     #[cfg(not(unix))]
     return Err(DaemonError::Process(
         "detached CLI turns are unsupported on this platform".into(),
@@ -81,7 +82,6 @@ pub(crate) fn launch(
     {
         use std::io::Write;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        let invocation = execution.invocation_id();
         let state = config
             .rsi_socket
             .as_ref()
@@ -132,23 +132,35 @@ pub(crate) fn launch(
         }
         let mut wrapped =
             crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&wrapped, invocation)?;
+        let scope = crate::process_scope::command_scope(&wrapped);
         wrapped
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_tokio_process_group(&mut wrapped, ProcessContainment::Group)?;
-        let child = execution.bind_command(route, wrapped).spawn()?;
         let mut turn = DetachedTurn::new(invocation, spool);
         turn.output = output;
-        let (tx, rx) = mpsc::channel(100);
-        turn.spawn_reader(tx);
-        Ok((CliTurnProcess::detached_child(child, turn), rx))
+        turn.scope = scope;
+        Ok((wrapped, turn))
     }
+}
+
+/// Test-only handle on the shim-identity wait of [`DetachedTurn::custody`]
+/// (#2285): a test waits for the wait to park, then expires its 10 s deadline
+/// explicitly instead of sleeping through it. The production deadline branch
+/// (the typed `turn shim did not publish its identity` error) is the one taken.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct IdentityDeadlineTrigger {
+    expired: Arc<std::sync::atomic::AtomicBool>,
+    parked: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
 pub(crate) struct DetachedTurn {
     output: TurnOutput,
+    // Launch authority is daemon-owned; spool contents never select a kill target.
+    scope: Option<String>,
     auxiliary: Arc<Mutex<VecDeque<Vec<StreamEvent>>>>,
     pub invocation_id: Uuid,
     pub spool_dir: PathBuf,
@@ -157,15 +169,30 @@ pub(crate) struct DetachedTurn {
     ready: Arc<tokio::sync::Notify>,
     identity: Arc<Mutex<Option<(u32, Option<u64>)>>>,
     pub complete: Arc<std::sync::atomic::AtomicBool>,
+    // Terminal finalization can reread status after Finished removes the spool.
+    exit: Arc<Mutex<Option<std::process::ExitStatus>>>,
     handed_off: Arc<std::sync::atomic::AtomicBool>,
     handoff: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    identity_deadline: IdentityDeadlineTrigger,
     pub(crate) adopted: Option<crate::store::provider_turn_custody::ProviderTurnCustody>,
 }
 
 impl DetachedTurn {
+    /// Attach the reader only after the provider's admitted spawn succeeds.
+    pub(crate) fn into_process(
+        self,
+        child: tokio::process::Child,
+    ) -> (CliTurnProcess, mpsc::Receiver<StreamEvent>) {
+        let (tx, rx) = mpsc::channel(100);
+        self.spawn_reader(tx);
+        (CliTurnProcess::detached_child(child, self), rx)
+    }
+
     pub fn new(invocation_id: Uuid, spool_dir: PathBuf) -> Self {
         Self {
             output: TurnOutput::Claude,
+            scope: None,
             auxiliary: Arc::default(),
             invocation_id,
             spool_dir,
@@ -174,8 +201,11 @@ impl DetachedTurn {
             ready: Arc::default(),
             identity: Arc::default(),
             complete: Arc::default(),
+            exit: Arc::default(),
             handed_off: Arc::default(),
             handoff: Arc::default(),
+            #[cfg(test)]
+            identity_deadline: IdentityDeadlineTrigger::default(),
             adopted: None,
         }
     }
@@ -183,6 +213,7 @@ impl DetachedTurn {
     pub(crate) fn adopt(row: crate::store::provider_turn_custody::ProviderTurnCustody) -> Self {
         let mut turn = Self::new(row.invocation_id, row.spool_dir.clone());
         *turn.identity.lock().unwrap() = Some((row.pid, row.start_time));
+        turn.scope = row.worker_scope.clone();
         turn.adopted = Some(row);
         turn
     }
@@ -226,6 +257,14 @@ impl DetachedTurn {
             .unwrap_or_default()
     }
 
+    /// Kill every process left in the turn's recorded scope, including
+    /// descendants that escaped the shim's process group (#2007).
+    pub(crate) fn kill_recorded_scope(&self) {
+        if let Some(unit) = &self.scope {
+            rsid_core::process_control::kill_worker_scope(unit, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+
     pub(crate) fn pid(&self) -> Option<u32> {
         self.identity.lock().unwrap().map(|(pid, _)| pid)
     }
@@ -240,6 +279,9 @@ impl DetachedTurn {
     #[cfg(unix)]
     pub(crate) fn exit_status(&self) -> Result<Option<std::process::ExitStatus>> {
         use std::os::unix::process::ExitStatusExt;
+        if let Some(status) = *self.exit.lock().unwrap() {
+            return Ok(Some(status));
+        }
         if lock_held(&self.spool_dir)? {
             return Ok(None);
         }
@@ -270,7 +312,9 @@ impl DetachedTurn {
         } else {
             1 << 8
         };
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+        let status = std::process::ExitStatus::from_raw(raw);
+        *self.exit.lock().unwrap() = Some(status);
+        Ok(Some(status))
     }
 
     /// Read terminal evidence already committed before the handoff. Do not
@@ -315,6 +359,32 @@ impl DetachedTurn {
             ));
         }
         Ok(last)
+    }
+
+    /// Resolves once an identity wait has polled and found no shim identity.
+    #[cfg(test)]
+    pub(crate) async fn identity_wait_parked_for_test(&self) {
+        self.identity_deadline.parked.notified().await;
+    }
+
+    /// Expire the identity wait's deadline now (the test-only trigger).
+    #[cfg(test)]
+    pub(crate) fn expire_identity_deadline_for_test(&self) {
+        self.identity_deadline
+            .expired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn identity_deadline_expired(&self, deadline: tokio::time::Instant) -> bool {
+        #[cfg(test)]
+        if self
+            .identity_deadline
+            .expired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        tokio::time::Instant::now() >= deadline
     }
 
     pub fn leave_running(&self) {
@@ -366,6 +436,7 @@ impl DetachedTurn {
                     }
                 };
                 return Ok(NewProviderTurnCustody {
+                    worker_scope: self.scope.clone(),
                     invocation_id: self.invocation_id,
                     session_id,
                     spool_dir: self.spool_dir.clone(),
@@ -374,11 +445,13 @@ impl DetachedTurn {
                     boot_id,
                 });
             }
-            if tokio::time::Instant::now() >= deadline {
+            if self.identity_deadline_expired(deadline) {
                 return Err(DaemonError::Process(
                     "turn shim did not publish its identity".into(),
                 ));
             }
+            #[cfg(test)]
+            self.identity_deadline.parked.notify_one();
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -511,7 +584,7 @@ impl DetachedTurn {
         } else {
             None
         };
-        // Rebuild only decoding state (thread id), without sending consumed stdout.
+        // Rebuild decoding and correlation state without sending consumed stdout.
         if offset > 0
             && let Some(decoder) = &mut codex
         {
@@ -526,7 +599,7 @@ impl DetachedTurn {
                     break;
                 }
                 for frame in replay.push(&bytes[..count]) {
-                    decoder.rehydrate(&frame.event);
+                    decoder.rehydrate(frame.event).await;
                 }
             }
             if replay.offset != offset || replay.has_partial() {
@@ -541,8 +614,25 @@ impl DetachedTurn {
             ..LineTail::default()
         };
         let mut position = offset;
+        let mut stderr_tail = StderrTail::default();
+        if codex.is_some() && self.adopted.is_some() {
+            // Skip stderr lines a previous daemon already delivered.
+            stderr_tail.position = self.load_stderr_cursor();
+            stderr_tail.stored = stderr_tail.position;
+        }
         loop {
-            let done = self.spool_dir.join("exit.json").exists();
+            let done = self.spool_dir.join("exit.json").exists() && !lock_held(&self.spool_dir)?;
+            if done {
+                self.remove_stdin()?;
+            }
+            if let Some(decoder) = &mut codex {
+                if !self
+                    .read_codex_stderr(tx, decoder, &mut stderr_tail, done)
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
             match tokio::fs::File::open(self.spool_dir.join("stdout")).await {
                 Ok(mut file) => {
                     if file.metadata().await?.len() < position {
@@ -583,7 +673,7 @@ impl DetachedTurn {
                                 return Ok(());
                             }
                             if terminal {
-                                let _ = self.signal(nix::sys::signal::Signal::SIGTERM);
+                                self.terminate_shim().await?;
                                 return Ok(());
                             }
                         }
@@ -614,7 +704,12 @@ impl DetachedTurn {
                         "turn shim exit record has no outcome".into(),
                     ));
                 }
-                if let Ok(file) = tokio::fs::File::open(self.spool_dir.join("stderr")).await {
+                if let Some(decoder) = &mut codex {
+                    for event in decoder.finish_stderr() {
+                        self.send(tx, event, None).await;
+                    }
+                } else if let Ok(file) = tokio::fs::File::open(self.spool_dir.join("stderr")).await
+                {
                     let mut bytes = Vec::new();
                     file.take(PROVIDER_MAX_STDERR_BYTES as u64 + 1)
                         .read_to_end(&mut bytes)
@@ -631,11 +726,7 @@ impl DetachedTurn {
                         .filter(|s| !s.trim().is_empty())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if let Some(decoder) = &mut codex {
-                        for event in decoder.stderr(&text) {
-                            self.send(tx, event, None).await;
-                        }
-                    } else if !text.is_empty() {
+                    if !text.is_empty() {
                         self.send(
                             tx,
                             StreamEvent {
@@ -652,6 +743,9 @@ impl DetachedTurn {
                         return Ok(());
                     }
                 }
+                // Keep terminal evidence in the shared handle before custody
+                // settlement removes the files used by adopted-process waits.
+                let _ = self.exit_status()?;
                 self.complete
                     .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(());
@@ -677,6 +771,139 @@ impl DetachedTurn {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
+    /// SIGTERM the shim for a terminal diagnostic. The shim identity may not be
+    /// published or provable yet, so retry briefly; a shim that still cannot
+    /// be signalled fails the turn rather than leaving the provider running
+    /// unmonitored.
+    async fn terminate_shim(&self) -> Result<()> {
+        let mut attempts = 0;
+        loop {
+            match self.signal(nix::sys::signal::Signal::SIGTERM) {
+                Ok(()) => return Ok(()),
+                Err(error) if attempts >= SHIM_SIGNAL_RETRIES => {
+                    return Err(DaemonError::Process(format!(
+                        "provider shim could not be terminated after a terminal diagnostic: {error}"
+                    )));
+                }
+                Err(_) => {
+                    attempts += 1;
+                    tokio::time::sleep(SHIM_SIGNAL_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
+    fn stderr_cursor_path(&self) -> PathBuf {
+        self.spool_dir.join("stderr.cursor")
+    }
+
+    /// Daemon-private byte offset of the first undelivered stderr line. A
+    /// missing or malformed cursor means nothing was delivered.
+    fn load_stderr_cursor(&self) -> u64 {
+        let Ok(file) = std::fs::File::open(self.stderr_cursor_path()) else {
+            return 0;
+        };
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut std::io::Read::take(file, 32), &mut bytes).is_err() {
+            return 0;
+        }
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn store_stderr_cursor(&self, tail: &mut StderrTail) {
+        let offset = tail.position - tail.pending.len() as u64;
+        if offset == tail.stored {
+            return;
+        }
+        tail.stored = offset;
+        let path = self.stderr_cursor_path();
+        let temp = self.spool_dir.join("stderr.cursor.tmp");
+        let result =
+            std::fs::write(&temp, offset.to_string()).and_then(|()| std::fs::rename(&temp, &path));
+        if let Err(error) = result {
+            tracing::warn!(invocation_id = %self.invocation_id, %error, "turn stderr cursor write failed");
+        }
+    }
+
+    fn remove_stdin(&self) -> Result<()> {
+        match std::fs::remove_file(self.spool_dir.join("stdin")) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn read_codex_stderr(
+        &self,
+        tx: &mpsc::Sender<StreamEvent>,
+        decoder: &mut crate::codex::DetachedCodexDecoder,
+        tail: &mut StderrTail,
+        done: bool,
+    ) -> Result<bool> {
+        let mut file = match tokio::fs::File::open(self.spool_dir.join("stderr")).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !done => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        if file.metadata().await?.len() < tail.position {
+            return Err(DaemonError::Process("turn stderr spool shrank".into()));
+        }
+        file.seek(std::io::SeekFrom::Start(tail.position)).await?;
+        let mut bytes = [0u8; 65536];
+        loop {
+            let count = file.read(&mut bytes).await?;
+            if count == 0 {
+                break;
+            }
+            tail.position += count as u64;
+            for byte in &bytes[..count] {
+                let event = if *byte == b'\n' {
+                    tail.line(decoder)
+                } else if tail.pending.len() >= PROVIDER_MAX_LINE_BYTES {
+                    Some(crate::codex::detached_stderr_error(
+                        format!(
+                            "provider stderr line exceeded {}-byte bound",
+                            PROVIDER_MAX_LINE_BYTES
+                        ),
+                        "provider_output_overflow",
+                    ))
+                } else {
+                    tail.pending.push(*byte);
+                    None
+                };
+                if let Some(event) = event {
+                    let overflow = event.data["error_class"] == "provider_output_overflow"
+                        || event.data["error_class"] == "provider_output_read_error";
+                    if overflow {
+                        // The dead line is consumed; an adopter must not replay it.
+                        tail.pending.clear();
+                        self.store_stderr_cursor(tail);
+                    }
+                    let sent = self.send(tx, event, None).await;
+                    if overflow {
+                        // Report first, then stop the provider; a shim that cannot
+                        // be signalled fails the turn instead of running unmonitored.
+                        self.terminate_shim().await?;
+                        return Ok(false);
+                    }
+                    if !sent {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        if done && !tail.pending.is_empty() {
+            if let Some(event) = tail.line(decoder) {
+                self.send(tx, event, None).await;
+            }
+        }
+        self.store_stderr_cursor(tail);
+        Ok(true)
+    }
+
     async fn read_agy(&self, tx: &mpsc::Sender<StreamEvent>, boot: Uuid) -> Result<()> {
         use crate::process_control::AGY_MAX_TURN_BYTES;
         loop {
@@ -704,10 +931,28 @@ impl DetachedTurn {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        self.remove_stdin()?;
         // Validate durable completion before publishing provider output.
-        let status = self
+        let _status = self
             .exit_status()?
             .ok_or_else(|| DaemonError::Process("turn completion is still live".into()))?;
+        let file = tokio::fs::File::open(self.spool_dir.join("exit.json")).await?;
+        let mut record = Vec::new();
+        file.take(4097).read_to_end(&mut record).await?;
+        if record.len() > 4096 {
+            return Err(DaemonError::Process("turn exit record is oversized".into()));
+        }
+        let record: Value = serde_json::from_slice(&record)?;
+        if let Some(error) = record.get("error").and_then(Value::as_str) {
+            return Err(DaemonError::Process(error.into()));
+        }
+        if record.get("exit_code").and_then(Value::as_i64).is_none()
+            && record.get("signal").and_then(Value::as_i64).is_none()
+        {
+            return Err(DaemonError::Process(
+                "turn shim exit record has no outcome".into(),
+            ));
+        }
         let offset = self.adopted.as_ref().map_or(0, |r| r.stdout_offset);
         let mut file = tokio::fs::File::open(self.spool_dir.join("stdout")).await?;
         let mut bytes = Vec::new();
@@ -782,16 +1027,9 @@ impl DetachedTurn {
                 return Ok(());
             }
         }
-        if !status.success() {
-            self.send(
-                tx,
-                terminal_error(format!("Antigravity exited with {status}")),
-                None,
-            )
-            .await;
-        } else {
-            self.send(tx, result, None).await;
-        }
+        // Like direct agy stdout, a completed provider stream emits a result
+        // regardless of exit code. Process settlement still observes that code.
+        self.send(tx, result, None).await;
         self.complete
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -863,6 +1101,29 @@ fn pid_start_time(pid: u32) -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn pid_start_time(_pid: u32) -> Option<u64> {
     None
+}
+
+const SHIM_SIGNAL_RETRIES: u32 = if cfg!(test) { 25 } else { 250 };
+const SHIM_SIGNAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[derive(Default)]
+struct StderrTail {
+    position: u64,
+    pending: Vec<u8>,
+    /// Last cursor written to the spool; avoids rewriting it on every poll.
+    stored: u64,
+}
+
+impl StderrTail {
+    fn line(&mut self, decoder: &mut crate::codex::DetachedCodexDecoder) -> Option<StreamEvent> {
+        match String::from_utf8(std::mem::take(&mut self.pending)) {
+            Ok(line) => decoder.stderr_line(line.trim_end_matches('\r').to_string()),
+            Err(error) => Some(crate::codex::detached_stderr_error(
+                error.to_string(),
+                "provider_output_read_error",
+            )),
+        }
+    }
 }
 
 struct Frame {

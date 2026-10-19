@@ -36,7 +36,7 @@ async fn stale_rotation_deadline_settles_custody_without_finalizing_new_generati
     let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
     let manager = SessionManager::new(
         Arc::new(crate::bus::EventBus::new(16)),
-        Store::open(&dir.path().join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&dir.path().join("rsi.db")).unwrap(),
         false,
         dir.path().join("daemon.sock"),
         None,
@@ -180,6 +180,7 @@ async fn spool_content_blocks_persist_once_with_exact_question_and_newline_curso
         ).unwrap();
         guard
             .insert_provider_turn_custody(&NewProviderTurnCustody {
+                worker_scope: None,
                 invocation_id: invocation,
                 session_id: session,
                 spool_dir: std::env::temp_dir().join(invocation.to_string()),

@@ -138,6 +138,41 @@ where
     false
 }
 
+/// How often the satellite re-homes failure notices a re-appointment retired.
+const FAILURE_ADOPTION_EVERY: Duration = Duration::from_secs(15);
+
+/// #2453: record the satellite's due report failures as durable notices for
+/// its manager, and (paced) re-home the ones a re-appointment retired
+/// unretrieved. A failure leaves the notice due, so the next tick retries.
+async fn sweep_report_failures(store: &Arc<Mutex<Store>>, next_adoption: &mut Instant) {
+    let guard = store.lock().await;
+    match guard.sweep_hub_report_failures() {
+        Ok(0) => {}
+        Ok(recorded) => {
+            tracing::info!(
+                recorded,
+                "satellite report failures recorded for the manager"
+            );
+        }
+        Err(error) => tracing::warn!("satellite report failure notice not recorded: {error}"),
+    }
+    let now = Instant::now();
+    if *next_adoption > now {
+        return;
+    }
+    *next_adoption = now + FAILURE_ADOPTION_EVERY;
+    match guard.adopt_orphaned_report_failures() {
+        Ok(0) => {}
+        Ok(adopted) => {
+            tracing::info!(
+                adopted,
+                "satellite report failures re-homed onto the current manager"
+            );
+        }
+        Err(error) => tracing::warn!("satellite report failure re-homing failed: {error}"),
+    }
+}
+
 /// Run once for the hub daemon. Registry revision fences prevent an in-flight
 /// read from publishing after an operator edits policy or disables a peer.
 pub(crate) async fn run_hub_poller(
@@ -169,9 +204,14 @@ pub(crate) async fn run_hub_poller(
     let (done_tx, mut done_rx) = mpsc::channel::<(Uuid, u64, PollOutcome)>(MAX_IN_FLIGHT * 2);
     let mut ticker = tokio::time::interval(REGISTRY_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_adoption = Instant::now();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // #2453: a satellite's failed reports reach its manager on
+                // this tick whether or not the hub polls it or this daemon
+                // polls peers.
+                sweep_report_failures(&store, &mut next_adoption).await;
                 if !runtime_config.satellite_polling_enabled.load(Ordering::Relaxed) {
                     continue;
                 }
@@ -294,10 +334,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     fn socket_root() -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-hub-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-hub-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -464,10 +501,7 @@ mod tests {
     }
 
     async fn registered_peer() -> RegisteredPeer {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-hub-poll-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-hub-poll-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

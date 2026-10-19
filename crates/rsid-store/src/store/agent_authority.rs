@@ -15,7 +15,7 @@ use rsi_common::manager_operator_delegation::{
     DAEMON_SETTINGS_OPERATOR_METHODS, OPERATOR_DELEGATION_METHODS, STORAGE_CONTROL_OPERATOR_METHODS,
 };
 use rsi_common::types::{SessionKind, SessionStatus};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -189,8 +189,15 @@ pub struct VerbRights {
     pub portfolio_lander: bool,
     /// A worker bound to one Issue by `AgentManagerLaunchIssueWorker`.
     pub issue_bound: bool,
-    /// #1284: that binding is live, so the worker may append to its Issue.
+    /// #1284/#1878: live binding permits body appends and project summary searches.
     pub issue_bound_writer: bool,
+    /// #2448: a session node of a live topology execution attempt may run
+    /// the project summary dedupe search of `AgentListIssues`, nothing more.
+    pub topology_node: bool,
+    /// #2982: the caller is the active reviewer of a topology review
+    /// assignment, so it may read that assignment's execution (and nothing
+    /// else of the topology family).
+    pub topology_reviewer: bool,
     pub session_create: bool,
     pub work_writer: bool,
     pub control: bool,
@@ -201,6 +208,7 @@ pub struct VerbRights {
     /// #1626: an Execute-mode, unpaused project manager or portfolio seat may
     /// register and edit projects inside its coverage.
     pub project_admin: bool,
+    pub storage_control: bool,
     pub global_reporter: bool,
     /// #1238: the caller holds a manager node seat (area, project or
     /// portfolio), so it may report up and send down.
@@ -234,12 +242,28 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         | Verb::GetJob
         | Verb::ListJobs
         | Verb::CancelJob
+        // #2311: every live leaf lists the workers it launched; a project's
+        // manager or portfolio seat lists the project. The daemon checks the scope.
+        | Verb::WorkerRoster
+        // #2267: every live leaf may run `validate_only` to check a definition it
+        // designs; the daemon refuses every write to a caller without a manager
+        // or Epic-lead topology scope, so this grants no write.
+        | Verb::TopologyUpsert
         | Verb::QueryFailureSignatures => true,
         Verb::GetIssue => {
             rights.issue_lead || rights.issue_manager || rights.issue_reader || rights.issue_bound
         }
         Verb::ManagerLaunchIssueWorker => rights.session_create && rights.issue_manager,
-        Verb::ListIssues | Verb::ListIssueEvents => {
+        Verb::ListIssues => {
+            rights.issue_lead
+                || rights.issue_manager
+                || rights.issue_reader
+                || rights.issue_bound_writer
+                || rights.topology_node
+                // #2677: a bound reviewer dedupes before it files a process Issue.
+                || rights.reviewer
+        }
+        Verb::ListIssueEvents => {
             rights.issue_lead || rights.issue_manager || rights.issue_reader
         }
         Verb::UpdateIssue => rights.issue_lead || rights.issue_manager || rights.issue_bound_writer,
@@ -250,9 +274,20 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         Verb::ManagerReply => rights.managed_lead,
         Verb::ManagerNotify => rights.managed_lead || rights.portfolio_lead,
         Verb::EnqueueLandingSource => rights.lead || rights.manager || rights.portfolio_lander,
+        // #1964: the enqueue rule, plus a Status-mode portfolio seat for the
+        // read. The daemon narrows each call to the caller's own entries.
+        Verb::ListRollingQueue => rights.lead || rights.manager || rights.portfolio_reader,
+        Verb::CancelRollingQueueEntry => {
+            rights.lead || rights.manager || rights.portfolio_lander
+        }
+        // #2310: a read of a worker's job receipt before enqueue; the daemon narrows
+        // each call to the caller's own scope.
+        Verb::CheckLandingCandidate => rights.lead || rights.manager || rights.portfolio_reader,
         Verb::GetProviderStatus | Verb::GetDaemonInfo => rights.lead || rights.manager,
         Verb::SendSatelliteMessage | Verb::ReportToHub => rights.manager,
-        Verb::RequestDeploy => rights.deploy,
+        Verb::RequestDeploy | Verb::PushSatelliteManagerPolicy | Verb::ReseatSatelliteManager => {
+            rights.deploy
+        }
         Verb::ManagerWorkView => rights.managed_worker,
         Verb::ManagerProgress | Verb::ManagerInspect | Verb::ManagerGetAction
             if rights.portfolio_reader =>
@@ -283,18 +318,103 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         | Verb::ManagerAppointChild
         | Verb::ManagerRevokeChild => rights.global_manager,
         Verb::CreateProject | Verb::UpdateProject => rights.project_admin,
+        Verb::ListSourceWorktreeCohorts | Verb::AuditSourceWorktreeCohort | Verb::ApplySourceWorktreeCohort => rights.storage_control,
         Verb::ReportToGlobal => rights.global_reporter,
-        Verb::ReportUp | Verb::SendDown | Verb::ManagerOverview => rights.tier_seat,
-        Verb::TopologyUpsert
-        | Verb::TopologyList
+        // #1747: any manager node seat writes the operator to-do list; the
+        // daemon derives the item's scope from the seat, never from the request.
+        Verb::ReportUp
+        | Verb::SendDown
+        | Verb::ManagerOverview
+        | Verb::OperatorTodoUpsert
+        | Verb::OperatorTodoClose
+        // #2649: a manager seat relays standing directives below its own scope;
+        // the store re-derives the covered scope from the seat on every write.
+        | Verb::StandingDirective => rights.tier_seat,
+        Verb::TopologyList
+        | Verb::TopologyGet
         | Verb::TopologyExecute
-        | Verb::TopologyGetExecution
         | Verb::TopologyInterrupt
         | Verb::TopologyResolveAttempt => rights.lead || rights.topology_manager,
+        // #2982: an assigned topology reviewer reads its own execution's
+        // evidence; the daemon checks the execution on every call.
+        Verb::TopologyGetExecution => {
+            rights.lead || rights.topology_manager || rights.topology_reviewer
+        }
     }
 }
 
 impl Store {
+    /// #2448: the project of the live topology execution that `session` is a
+    /// session node of: its attempt is reserved, launching, running or
+    /// waiting and the execution is accepted, running or blocked. The
+    /// execution's own project wins, else the node session's. Read from rows
+    /// each time; `None` for any other session.
+    pub(crate) fn live_topology_node_project_on(
+        conn: &Connection,
+        session: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let project: Option<Option<String>> = conn
+            .query_row(
+                "SELECT COALESCE(e.project_id, s.project_id)
+             FROM topology_node_attempts a
+             JOIN topology_executions e ON e.id=a.execution_id
+             JOIN sessions s ON s.id=a.session_id
+             WHERE a.session_id=?1 AND a.node_kind='session'
+               AND a.status IN ('reserved','launching','running','waiting')
+               AND e.status IN ('accepted','running','blocked')
+             LIMIT 1",
+                [session.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(project.flatten().and_then(|raw| Uuid::parse_str(&raw).ok()))
+    }
+
+    /// #2982: whether `session` is the active reviewer of a review assignment
+    /// that serves a topology attempt (of `execution` when named, else of any
+    /// execution). Read from rows each time: the assignment must be `active`
+    /// and carry the `topology_attempt_id` the executor recorded, and that
+    /// attempt must belong to the execution.
+    pub fn topology_review_assignment_on(
+        conn: &Connection,
+        session: Uuid,
+        execution: Option<Uuid>,
+    ) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM manager_review_assignments a
+                   JOIN topology_node_attempts t
+                     ON t.id=json_extract(a.request_json,'$.topology_attempt_id')
+                  WHERE a.reviewer_session_id=?1 AND a.state='active'
+                    AND (?2 IS NULL OR t.execution_id=?2)
+                  LIMIT 1",
+                params![session.to_string(), execution.map(|id| id.to_string())],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// #2677: the project of the live review assignment `session` is the
+    /// active reviewer of (the assignment row's own project). Read from rows
+    /// each time; `None` for any other session. It scopes the title-search
+    /// dedupe read a reviewer holds before it files a process Issue.
+    pub(crate) fn live_review_assignment_project_on(
+        conn: &Connection,
+        session: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let project: Option<String> = conn
+            .query_row(
+                "SELECT project_id FROM manager_review_assignments \
+                 WHERE reviewer_session_id=?1 AND state='active' \
+                 ORDER BY updated_at DESC,assignment_id DESC LIMIT 1",
+                [session.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(project.and_then(|raw| Uuid::parse_str(&raw).ok()))
+    }
+
     /// #1277-#1279: the stable authority fence of `caller` (and, for a verb
     /// that acts on another session's sandbox, its `target`). It names the
     /// grant epoch and version, never a volatile field such as a timestamp,
@@ -688,6 +808,9 @@ impl Store {
             issue_bound: Self::bound_issue_for_worker_on(&self.conn, caller)?.is_some(),
             issue_bound_writer: Self::live_issue_binding_for_worker_on(&self.conn, caller)?
                 .is_some(),
+            topology_node: Self::live_topology_node_project_on(&self.conn, caller)?.is_some(),
+            topology_reviewer: is_reviewer
+                && Self::topology_review_assignment_on(&self.conn, caller, None)?,
             session_create: has(Capability::SessionCreate) || global_has(Capability::SessionCreate),
             work_writer: !update_variants.is_empty(),
             control: !control_actions.is_empty(),
@@ -698,6 +821,18 @@ impl Store {
                 || global_has(Capability::Automation),
             global_manager: is_global_manager,
             project_admin: self.agent_project_admin(caller)?,
+            storage_control: match self.agent_source_worktree_projects(caller) {
+                Ok(_) => true,
+                Err(DaemonError::StructuredRpc { data, .. })
+                    if data["code"] == "storage_control_not_authorized" =>
+                {
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%caller, %error, "Settlement authority unavailable; omitting storage controls from the catalog");
+                    false
+                }
+            },
             global_reporter: is_manager && self.global_reporter(caller)?,
             tier_seat: self.tier_caller_node(caller)?.is_some(),
             portfolio_lead: is_lead

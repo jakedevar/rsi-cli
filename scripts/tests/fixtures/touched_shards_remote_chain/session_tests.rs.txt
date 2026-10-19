@@ -1,0 +1,177 @@
+use super::*;
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_runtime_candidate_snapshot_is_scalar_and_nonblocking() {
+    let (manager, _dir) = manager();
+    let project = Uuid::new_v4();
+    let active_id = Uuid::new_v4();
+    let completed_id = Uuid::new_v4();
+    let mut active = bare_session(active_id);
+    active.status = SessionStatus::Running;
+    active.project_id = Some(project);
+    active.title = Some("large title".repeat(100_000));
+    manager
+        .active
+        .write()
+        .await
+        .insert(active_id, TrackedSession::new_for_test(active));
+    let mut completed = bare_session(completed_id);
+    completed.project_id = Some(project);
+    manager.completed.write().await.insert(
+        completed_id,
+        CompletedSession {
+            session: completed,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    let snapshot = manager.remote_runtime_session_candidates().unwrap();
+    let mut page_choices = vec![
+        crate::remote_read::SessionCandidateSelection {
+            id: active_id,
+            origin: crate::remote_read::SessionCandidateOrigin::Active,
+        },
+        crate::remote_read::SessionCandidateSelection {
+            id: completed_id,
+            origin: crate::remote_read::SessionCandidateOrigin::Completed,
+        },
+    ];
+    page_choices.sort_unstable_by_key(|row| row.id);
+    let page_rows = manager
+        .remote_runtime_session_page_rows(project, &page_choices, &snapshot)
+        .unwrap();
+    assert_eq!(page_rows.len(), 2);
+    assert!(page_rows.iter().all(Option::is_some));
+    let active_row = page_rows[page_choices
+        .iter()
+        .position(|row| row.id == active_id)
+        .unwrap()]
+    .as_ref()
+    .unwrap();
+    assert!(active_row.own_title.text.len() <= 512);
+    assert!(active_row.own_title.observed_bytes > 512);
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(Uuid::new_v4(), &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    let selected_runtime = manager
+        .remote_selected_runtime_session(project, active_id)
+        .unwrap()
+        .unwrap();
+    let pending_capture = manager
+        .remote_runtime_only_pending_capture(project, active_id)
+        .unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sessions(id TEXT PRIMARY KEY,project_id TEXT);
+         CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,sequence INTEGER);",
+    )
+    .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    let selected =
+        crate::remote_read::selected_runtime_store_miss(&tx, project, active_id, selected_runtime)
+            .unwrap();
+    tx.rollback().unwrap();
+    let pending = manager
+        .remote_runtime_only_pending_finish(&selected, pending_capture)
+        .unwrap();
+    assert_eq!(pending.coverage.len(), 8);
+    assert_eq!(
+        pending.coverage[0].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+    assert_eq!(
+        pending.coverage[1].state,
+        rsi_common::remote_read::CoverageStateV1::Complete
+    );
+    assert_eq!(
+        pending.coverage[4].state,
+        rsi_common::remote_read::CoverageStateV1::Unavailable
+    );
+    assert_eq!(snapshot.active.len(), 1);
+    assert_eq!(snapshot.active[0].id, active_id);
+    assert_eq!(snapshot.active[0].project_id, Some(project));
+    assert_eq!(snapshot.completed.len(), 1);
+    assert_eq!(snapshot.completed[0].id, completed_id);
+    assert!(snapshot.completed_observed_at >= snapshot.active_observed_at);
+    assert_eq!(snapshot.active[0].spawn_generation, Some(0));
+    assert_eq!(snapshot.completed[0].spawn_generation, None);
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, active_id),
+        Ok(Some(_))
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, completed_id),
+        Ok(Some(_))
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(Uuid::new_v4(), active_id),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&snapshot)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::NoObservedChange
+    );
+    let held = manager.active.write().await;
+    assert!(matches!(
+        manager.remote_runtime_session_candidates(),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_selected_runtime_session(project, active_id),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    drop(held);
+    let held = manager.completed.write().await;
+    assert!(matches!(
+        manager.remote_runtime_session_candidates(),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::Busy)
+    ));
+    drop(held);
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&active_id)
+        .unwrap()
+        .spawn_generation += 1;
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&snapshot)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::Changed
+    );
+    assert!(matches!(
+        manager.remote_runtime_session_page_rows(project, &page_choices, &snapshot),
+        Err(crate::remote_read::ReadError::SourceUnavailable)
+    ));
+    let refreshed = manager.remote_runtime_session_candidates().unwrap();
+    let mut completed = manager.completed.write().await;
+    let entry = completed.get_mut(&completed_id).unwrap();
+    entry.session.updated_at = entry.session.updated_at.clone() + chrono::Duration::nanoseconds(1);
+    drop(completed);
+    assert_eq!(
+        manager
+            .remote_runtime_session_recheck(&refreshed)
+            .unwrap()
+            .state,
+        crate::remote_read::RuntimeSessionRecheck::Changed
+    );
+}

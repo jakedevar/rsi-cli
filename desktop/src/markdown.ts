@@ -3,6 +3,7 @@
 // derived text in this app that is ever assigned to innerHTML. Everything else
 // uses textContent.
 import { api } from './api.js';
+import { highlightCodeBlocks } from './codeblocks.js';
 import { $, el, toast } from './dom.js';
 import { BATCH_TEXTS, MarkdownCache, cacheKey, takeBatch } from './mdmodel.js';
 
@@ -22,6 +23,7 @@ function setSanitizedHtml(target: HTMLElement, html: string): void {
 }
 
 function decorateCode(root: HTMLElement): void {
+  highlightCodeBlocks(root);
   for (const pre of root.querySelectorAll('pre')) {
     const btn = el('button', 'copy-code', 'Copy');
     btn.type = 'button';

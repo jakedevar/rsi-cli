@@ -1,297 +1,27 @@
-//! Generalized agent conversation loop.
-//!
-//! Handles prompt assembly, streaming API calls, tool dispatch, and context compaction.
+//! The harness turn loop facade (#2648): the algorithm lives in `rsid-harness`; this module
+//! binds it to the daemon's provider, model-call control, tool registry and agent mail.
 
 use crate::claude::StreamEvent;
 use crate::error::DaemonError;
-use crate::model_control::call_control::{ModelCallControl, ModelCallKind, ModelCallUsage};
-use crate::sandbox::{WorktreeDigest, worktree_content_digest};
-use crate::session::harness::agent_mail::{HarnessMailBoundary, HarnessMailDelivery};
-use crate::session::harness::compaction::{auto_compact, hard_trim};
-use crate::session::harness::errors::ProviderError;
-use crate::session::harness::normalize::normalize_history;
+use crate::model_control::call_control::ModelCallControl;
+use crate::session::harness::agent_mail::HarnessMailBoundary;
+use crate::session::harness::loop_ports::{DaemonMail, DaemonModelPort, DaemonTools, fault_into};
 use crate::session::harness::provider::ApiProvider;
-use crate::session::harness::retry;
-use crate::session::harness::tools::{HarnessToolRegistry, ToolExecutionMode, arguments};
+use crate::session::harness::tools::HarnessToolRegistry;
 use crate::session::harness::types::*;
-use rsi_common::completion_gates::{COMPLETION_GATES_GATE_TURN_BUDGET, CompletionGates};
-use serde_json::json;
-use std::collections::HashMap;
+use rsi_common::completion_gates::CompletionGates;
+use rsid_harness::agent_loop::{LoopParams, run_loop};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-/// Stream event carrying one auto-compaction record (#796); persisted as a
-/// `Compressed` conversation event.
-pub const COMPACTION_STREAM_EVENT: &str = "compaction";
-
-pub const COMPLETION_GATE_STREAM_EVENT: &str = "completion_gate";
-
-const MAX_PARALLEL_TOOL_CALLS: usize = 8;
-
-struct CompletionGateFailure {
-    gate_index: usize,
-    before_digest: WorktreeDigest,
-    after_digest: WorktreeDigest,
-    output: String,
-    exit_code: Option<i32>,
-    timed_out: bool,
-}
-
-enum PreparedToolCall {
-    Executable {
-        fingerprint: u64,
-        args: serde_json::Value,
-        repaired: bool,
-    },
-    Immediate {
-        fingerprint: u64,
-        message: ChatMessage,
-        is_error: bool,
-        emit_use: bool,
-        emit_result: bool,
-        use_input: serde_json::Value,
-    },
-    Duplicate {
-        fingerprint: u64,
-        source: usize,
-        repaired: bool,
-    },
-}
-
-/// Prompt for the tool-less final iteration (#1039).
-const ITERATION_LIMIT_WRAP_UP_PROMPT: &str = "[harness] This is your last permitted step and \
-tools are no longer available. Reply now with your final answer, or with a summary of what is \
-done and what remains, in the format your task requires.";
-
-/// Stream event recording the automatic final-answer retry (#1061).
-pub(crate) const FINAL_ANSWER_RETRY_STREAM_EVENT: &str = "final_answer_retry";
-
-/// Nudge appended for the one automatic retry of an empty, output-limited
-/// final response (#1061).
-const FINAL_ANSWER_RETRY_PROMPT: &str = "Your last response was empty because it hit the output \
-limit. Make no tool calls; write your final answer now, concisely.";
-
-/// Output-token ceiling for the final-answer retry call (#1061); the normal
-/// per-call ceiling is 8192.
-const FINAL_ANSWER_RETRY_MAX_TOKENS: u64 = 32_768;
-
-/// Reasoning effort for the final-answer retry call (#1061).
-const FINAL_ANSWER_RETRY_EFFORT: &str = "low";
-
-/// Whether a provider stop reason means the output budget ran out (#1061):
-/// `length` (OpenAI-compatible, OpenRouter), `max_tokens` (Anthropic),
-/// `max_output_tokens` / `incomplete` (Responses API).
-fn is_output_limit_stop(reason: Option<&str>) -> bool {
-    reason.is_some_and(|reason| {
-        matches!(
-            reason.trim().to_ascii_lowercase().as_str(),
-            "length" | "max_tokens" | "max_output_tokens" | "incomplete"
-        )
-    })
-}
-
-/// Why a harness turn ended without a normal final reply (#1039).
-#[derive(Debug, Clone)]
-enum HarnessLimitStop {
-    /// The iteration budget ran out while the model was still calling tools.
-    IterationLimit { max_iterations: u32 },
-    /// The model answered with no tool calls and no text.
-    EmptyResponse {
-        provider_stop_reason: Option<String>,
-        reasoning: Option<String>,
-    },
-}
-
-impl HarnessLimitStop {
-    fn code(&self) -> &'static str {
-        match self {
-            Self::IterationLimit { .. } => "iteration_limit",
-            Self::EmptyResponse { .. } => "empty_response",
-        }
-    }
-
-    fn message(&self) -> String {
-        match self {
-            Self::IterationLimit { max_iterations } => format!(
-                "[harness] Stopped: the turn used its {max_iterations}-step budget without a \
-                 final reply. Continue the session to resume from the last tool result."
-            ),
-            Self::EmptyResponse {
-                provider_stop_reason,
-                reasoning,
-            } => {
-                let mut text = format!(
-                    "[harness] Stopped: the model returned an empty final response \
-                     (provider stop reason: {}). Continue the session to retry.",
-                    provider_stop_reason.as_deref().unwrap_or("none")
-                );
-                if let Some(reasoning) = reasoning.as_deref().map(str::trim)
-                    && !reasoning.is_empty()
-                {
-                    let tail: String = reasoning.chars().take(8000).collect();
-                    text.push_str("\n\nLast reasoning from the model:\n");
-                    text.push_str(&tail);
-                }
-                text
-            }
-        }
-    }
-}
-
-fn aborted_tool_result() -> ToolResult {
-    ToolResult {
-        success: false,
-        output: String::new(),
-        error_msg: Some("Tool execution aborted".to_string()),
-    }
-}
-
-/// Estimate tokens remaining in the context window.
-fn estimate_remaining_tokens(history: &[ChatMessage], token_limit: u64) -> u64 {
-    let used: u64 = history.iter().map(|m| m.estimated_tokens()).sum();
-    token_limit.saturating_sub(used)
-}
-
-/// Hash a tool call for dedup.
-fn hash_tool_call(name: &str, arguments: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    arguments.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn tool_result_message(call_id: &str, result: ToolResult) -> ChatMessage {
-    let is_error = result.is_error();
-    let has_typed_blocks = result.has_typed_blocks();
-    let content = if is_error {
-        if has_typed_blocks {
-            // Typed blocks keep their structure; `error_msg` is set for
-            // callers that only read the message.
-            result.output
-        } else {
-            match result.error_msg {
-                Some(error) => format!("Error: {error}"),
-                None => format!("Error: {}", result.output),
-            }
-        }
-    } else {
-        result.output
-    };
-    if is_error {
-        ChatMessage::tool_error_result(call_id, content)
-    } else {
-        ChatMessage::tool_result(call_id, content)
-    }
-}
-
-fn hosted_tool_result_message(call: &ToolCall) -> ChatMessage {
-    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-        .unwrap_or(serde_json::Value::Null);
-    match &call.hosted_result {
-        Some(result) => ChatMessage::tool_result_blocks(
-            &call.id,
-            vec![ToolContentBlock::ServerToolResult {
-                result: result.clone(),
-            }],
-            false,
-        ),
-        None => ChatMessage::tool_error_result(
-            &call.id,
-            format!(
-                "Error: hosted tool {} returned no result (input: {arguments})",
-                call.name
-            ),
-        ),
-    }
-}
-
-async fn append_process_notices(
-    event_tx: &mpsc::Sender<StreamEvent>,
-    history: &mut Vec<ChatMessage>,
-    session_tag: &str,
-    process_notices: Vec<String>,
-) -> Result<(), DaemonError> {
-    if process_notices.is_empty() {
-        return Ok(());
-    }
-    let content = process_notices.join("\n");
-    event_tx
-        .send(StreamEvent {
-            event_type: "background_process_notice".into(),
-            data: json!({
-                "session_id": session_tag,
-                "message": content,
-            }),
-        })
-        .await
-        .map_err(|_| DaemonError::ChannelClosed)?;
-    history.push(ChatMessage::user(content));
-    Ok(())
-}
+pub use rsid_harness::agent_loop::{
+    COMPACTION_STREAM_EVENT, COMPLETION_GATE_STREAM_EVENT, FINAL_ANSWER_RETRY_STREAM_EVENT,
+    REPEAT_FAILURE_STREAM_EVENT, STREAM_SUPERSEDED_STREAM_EVENT,
+};
 
 #[cfg(test)]
-mod tool_content_tests {
-    use super::*;
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
-    #[test]
-    fn block_result_survives_loop_handoff_without_exposing_image_in_event_text() {
-        let message = tool_result_message(
-            "image",
-            ToolResult::from_blocks(
-                vec![
-                    ToolContentBlock::Text {
-                        text: "preview".into(),
-                    },
-                    ToolContentBlock::Image {
-                        media_type: "image/png".into(),
-                        data: "aGVsbG8=".into(),
-                        detail: None,
-                        reference: None,
-                        width: None,
-                        height: None,
-                    },
-                ],
-                true,
-            ),
-        );
-        assert!(message.is_error);
-        assert_eq!(message.tool_blocks().len(), 2);
-        assert_eq!(message.visible_tool_text(), "preview\n[image: image/png]");
-        assert!(!message.visible_tool_text().contains("aGVsbG8="));
-
-        let legacy = tool_result_message(
-            "failure",
-            ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some("failed".into()),
-            },
-        );
-        assert_eq!(legacy.content, "Error: failed");
-    }
-}
-
-/// #1000: one call's full prompt. Anthropic reports `input_tokens` without
-/// cache reads/writes; the OpenAI-compatible providers (chat completions,
-/// Responses) report a `prompt_tokens`/`input_tokens` that already includes
-/// cached tokens, with `cache_read_tokens` as a subset of it.
-fn full_prompt_tokens(provider_name: &str, usage: &TokenUsage) -> u64 {
-    if provider_name == "anthropic" {
-        usage
-            .prompt_tokens
-            .saturating_add(usage.cache_creation_tokens)
-            .saturating_add(usage.cache_read_tokens)
-    } else {
-        usage.prompt_tokens
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_harness_loop(
     provider: Box<dyn ApiProvider>,
@@ -352,1157 +82,50 @@ pub async fn run_harness_loop_with_compact_budget(
     completion_gates: Option<CompletionGates>,
     completion_gates_enabled: bool,
 ) -> Result<(), DaemonError> {
-    let session_tag = uuid::Uuid::new_v4().to_string();
-    let _process_turn = tools.process_turn_guard().await;
-
-    // Phase A: Initialize conversation history
-    let mut history: Vec<ChatMessage> = Vec::new();
-    if let Some(prior) = conversation_history {
-        history.extend(prior);
-        // Ensure user message is appended if we're not just rotating with an empty query.
-        if !user_query.trim().is_empty() {
-            history.push(ChatMessage::user(&user_query));
-        }
-    } else {
-        if !system_prompt.is_empty() {
-            history.push(ChatMessage::system(&system_prompt));
-        }
-        history.push(ChatMessage::user(&user_query));
-    }
-
-    // Emit init event
-    event_tx
-        .send(StreamEvent {
-            event_type: "system".into(),
-            data: json!({
-                "subtype": "init",
-                "session_id": session_tag,
-                "model": model,
-            }),
-        })
-        .await
-        .map_err(|_| DaemonError::ChannelClosed)?;
-
-    let process_notices = tools.take_process_notices().await;
-    append_process_notices(&event_tx, &mut history, &session_tag, process_notices).await?;
-
-    let mut total_usage = TokenUsage::default();
-    let mut hosted_tools_enabled = !provider.web_capabilities(&model).tools.is_empty();
-    // Cumulative full-prompt tokens across all model calls in this run.
-    // Anthropic: prompt_tokens (uncached) + cache_creation + cache_read.
-    // OpenAI-compatible: prompt_tokens (already includes cached).
-    // Emitted as "prompt_tokens_total" for the monitor.
-    let mut cumulative_prompt_tokens: u64 = 0;
-    tools.set_context_usage(0, token_limit);
-
-    // #1039: why the turn ended without a normal final reply, so the stream
-    // never shows a bare `Completed` with no assistant output.
-    let mut limit_stop: Option<HarnessLimitStop> = None;
-    let mut replied = false;
-    // #1061: an empty final response cut off by the output limit gets one
-    // automatic retry inside the same turn. The retry re-runs the current
-    // iteration, so it is granted one extra loop step.
-    let mut final_answer_retry_spent = false;
-    let mut final_answer_retry_pending = false;
-    let mut gate_retry_pending = false;
-    let mut completion_gate_attempts = 0_u32;
-    let mut last_completion_gate_failure: Option<CompletionGateFailure> = None;
-    let completion_gates = completion_gates.filter(|gates| !gates.is_empty());
-    let gate_iteration_budget = completion_gates.as_ref().map_or(0, |gates| {
-        gates
-            .max_attempts
-            .saturating_mul(COMPLETION_GATES_GATE_TURN_BUDGET)
-    });
-    let mut ordinary_iterations = 0_u32;
-
-    // Phase B: Enter tool-call loop
-    'turns: for _ in 0..max_iterations
-        .saturating_add(2)
-        .saturating_add(gate_iteration_budget)
-    {
-        let iteration = ordinary_iterations;
-        let final_answer_retry_turn = std::mem::take(&mut final_answer_retry_pending);
-        let gate_retry_turn = std::mem::take(&mut gate_retry_pending);
-        if iteration >= max_iterations && !gate_retry_turn && !final_answer_retry_turn {
-            break;
-        }
-        if !final_answer_retry_turn && !gate_retry_turn {
-            ordinary_iterations = ordinary_iterations.saturating_add(1);
-        }
-        // 1. Check cancellation (synchronous poll)
-        if cancel.is_cancelled() {
-            tracing::info!("Agent loop cancelled at iteration {iteration}");
-            model_call_control.fail_pending("interrupted").await?;
-            break;
-        }
-
-        // Fresh cache for each turn (dedup cache)
-        let mut seen_tool_calls: HashMap<u64, (String, bool)> = HashMap::new();
-        let compaction_focus = tools.take_compaction_focus().await;
-
-        // 2. Auto-compaction check
-        let compacted = auto_compact(
-            &mut history,
-            &*provider,
-            &model,
+    let port = DaemonModelPort::new(provider, model_call_control);
+    run_loop(
+        &port,
+        Arc::new(DaemonTools(tools)),
+        LoopParams {
+            system_prompt,
+            user_query,
+            working_dir,
+            model,
+            reasoning_effort,
+            max_iterations,
             token_limit,
+            conversation_history,
             compact_budget,
-            compaction_focus.as_deref(),
-            &cancel,
-            Arc::clone(&model_call_control),
-        )
-        .await
-        .map_err(|error| {
-            DaemonError::Process(format!("Harness auto-compaction failed: {error}"))
-        })?;
-        // #796: persist the compaction boundary so a continued session
-        // rebuilds summary plus kept tail, not the full raw transcript.
-        if let Some(record) = compacted {
-            // #974: a local-truncation fallback stays visible to the operator
-            // instead of silently failing the turn.
-            if let Some(fallback) = record.fallback.as_deref() {
-                tracing::warn!(
-                    fallback,
-                    messages_before = record.messages_before,
-                    "Harness auto-compaction used local truncation"
-                );
-            }
-            event_tx
-                .send(StreamEvent {
-                    event_type: COMPACTION_STREAM_EVENT.into(),
-                    data: json!({
-                        "summary": record.summary,
-                        "kept_messages": record.kept_messages,
-                        "messages_before": record.messages_before,
-                        "tokens_before": record.tokens_before,
-                        "fallback": record.fallback,
-                    }),
-                })
-                .await
-                .map_err(|_| DaemonError::ChannelClosed)?;
-        }
-        if cancel.is_cancelled() {
-            tracing::info!("Agent loop cancelled after compaction at iteration {iteration}");
-            model_call_control.fail_pending("interrupted").await?;
-            break;
-        }
-
-        // #1039: the last permitted iteration is a tool-less wrap-up so a
-        // turn that used its whole budget still ends with a final message.
-        let wrap_up_turn =
-            max_iterations > 1 && iteration + 1 == max_iterations && !final_answer_retry_turn;
-        if wrap_up_turn {
-            history.push(ChatMessage::user(ITERATION_LIMIT_WRAP_UP_PROMPT));
-        }
-
-        // 3. Build ChatRequest
-        let repair = normalize_history(&mut history);
-        if repair.synthesized != 0 || repair.dropped != 0 {
-            event_tx
-                .send(StreamEvent {
-                    event_type: "history_repaired".into(),
-                    data: json!({
-                        "synthesized": repair.synthesized,
-                        "dropped": repair.dropped,
-                    }),
-                })
-                .await
-                .map_err(|_| DaemonError::ChannelClosed)?;
-        }
-        let effective_max_tokens = estimate_remaining_tokens(&history, token_limit);
-        let request_max_tokens = if final_answer_retry_turn {
-            effective_max_tokens.min(FINAL_ANSWER_RETRY_MAX_TOKENS)
-        } else {
-            effective_max_tokens.min(8192)
-        };
-        let mut tool_specs = if provider.supports_native_tools() {
-            tools.specs()
-        } else {
-            Vec::new()
-        };
-        if hosted_tools_enabled {
-            tool_specs.extend(tools.filter_hosted_specs(provider.web_capabilities(&model).specs()));
-        }
-        if wrap_up_turn || final_answer_retry_turn {
-            tool_specs.clear();
-        }
-        let mut request = ChatRequest {
-            messages: history.clone(),
-            model: model.clone(),
-            temperature: None,
-            max_tokens: Some(request_max_tokens as u32),
-            tools: tool_specs,
-            stream: provider.supports_streaming(),
-            reasoning_effort: if final_answer_retry_turn {
-                Some(FINAL_ANSWER_RETRY_EFFORT.to_string())
-            } else {
-                reasoning_effort.clone()
-            },
-            context_editing: tools.context_editing_enabled(),
-        };
-
-        // 4. Call provider (streaming or blocking)
-        let fingerprint_hint = format!(
-            "{}:{}:{}:{}",
-            request.model,
-            request.messages.len(),
-            request.max_tokens.unwrap_or_default(),
-            request
-                .messages
-                .last()
-                .map(|message| message.content.as_str())
-                .unwrap_or_default()
-        );
-        let mut retries_done = 0;
-        let mut prior_invocation_id = None;
-        let mut last_retry_error: Option<ProviderError> = None;
-        let mut claimed_mail: Option<Box<dyn HarnessMailDelivery>> = None;
-        let (response, settlement) = loop {
-            let admission = model_call_control
-                .admit(
-                    ModelCallKind::Primary,
-                    &format!("turn:{iteration}:attempt:{retries_done}"),
-                    &format!("{fingerprint_hint}:attempt:{retries_done}"),
-                    prior_invocation_id,
-                )
-                .await;
-            let admitted_call = match admission {
-                Ok(call) => call,
-                Err(DaemonError::PolicyDenied(reason)) if retries_done > 0 => {
-                    let Some(error) = last_retry_error else {
-                        return Err(DaemonError::PolicyDenied(reason));
-                    };
-                    tracing::info!(%reason, "model retry policy refused another Harness attempt");
-                    event_tx
-                        .send(StreamEvent {
-                            event_type: "provider_error".into(),
-                            data: json!({
-                                "class": error.class, "http_status": error.http_status,
-                                "retry_after_ms": error.retry_after_ms,
-                                "detail_code": error.detail_code, "session_id": session_tag,
-                            }),
-                        })
-                        .await
-                        .map_err(|_| DaemonError::ChannelClosed)?;
-                    return Err(error.into_daemon_error());
-                }
-                Err(error) => return Err(error),
-            };
-            let (mut settlement, execution) = admitted_call.into_parts();
-            let model_invocation_id = settlement.invocation_id();
-            if iteration > 0 && claimed_mail.is_none() {
-                if let (Some(boundary), Some(model_invocation_id)) =
-                    (&agent_mail_boundary, model_invocation_id)
-                {
-                    match boundary.claim(model_invocation_id).await {
-                        Ok(Some(mut mail)) => {
-                            mail.append(&mut history, &mut request);
-                            claimed_mail = Some(mail);
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            target: "agent_coordination",
-                            session_id = %session_tag,
-                            error = %error,
-                            "Harness mid-turn mail claim failed; the message stays queued"
-                        ),
-                    }
-                }
-            }
-            if cancel.is_cancelled() {
-                if let Some(mut mail) = claimed_mail.take() {
-                    mail.undo_append(&mut history, &mut request);
-                    mail.record_rejected("agent_message_cancelled_before_dispatch")
-                        .await;
-                }
-                model_call_control.fail_pending("interrupted").await?;
-                break 'turns;
-            }
-            let emitted_chunk = Arc::new(AtomicBool::new(false));
-
-            let response = if provider.supports_streaming() {
-                let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(64);
-                let event_tx_clone = event_tx.clone();
-                let tag = session_tag.clone();
-                let emitted = Arc::clone(&emitted_chunk);
-
-                let forward_task = tokio::spawn(async move {
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        emitted.store(true, Ordering::Release);
-                        if !chunk.delta_text.is_empty() {
-                            let _ = event_tx_clone
-                                .send(StreamEvent {
-                                    event_type: "content_block_delta".into(),
-                                    data: json!({
-                                        "session_id": tag,
-                                        "delta": { "type": "text_delta", "text": chunk.delta_text },
-                                    }),
-                                })
-                                .await;
-                        }
-                    }
-                });
-
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        forward_task.abort();
-                        let _ = forward_task.await;
-                        if let Some(mut mail) = claimed_mail.take() {
-                            mail.record_effect_possible().await;
-                        }
-                        model_call_control.fail(settlement, "interrupted").await?;
-                        break 'turns;
-                    }
-                    result = provider.stream_chat(&request, chunk_tx, &cancel, execution) => {
-                        forward_task.abort();
-                        let _ = forward_task.await;
-                        result
-                    }
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        if let Some(mut mail) = claimed_mail.take() {
-                            mail.record_effect_possible().await;
-                        }
-                        model_call_control.fail(settlement, "interrupted").await?;
-                        break 'turns;
-                    }
-                    result = provider.chat(&request, execution) => result,
-                }
-            };
-            if let Some(mut mail) = claimed_mail.take() {
-                mail.record_effect_possible().await;
-            }
-
-            let response = match response {
-                Err(DaemonError::StreamFallbackRequired(reason)) => {
-                    let failed_stream_invocation_id = settlement.invocation_id();
-                    model_call_control
-                        .fail(settlement, "stream_fallback_required")
-                        .await?;
-                    tracing::warn!(
-                        %reason,
-                        iteration,
-                        "streaming attempt failed; requesting separately admitted blocking fallback"
-                    );
-                    if cancel.is_cancelled() {
-                        break 'turns;
-                    }
-
-                    let fallback_call = model_call_control
-                        .admit(
-                            ModelCallKind::Primary,
-                            &format!("turn:{iteration}:blocking_fallback"),
-                            &format!("{fingerprint_hint}:blocking_fallback"),
-                            failed_stream_invocation_id,
-                        )
-                        .await?;
-                    let (fallback_settlement, fallback_execution) = fallback_call.into_parts();
-                    settlement = fallback_settlement;
-
-                    let mut fallback_request = request.clone();
-                    fallback_request.stream = false;
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => {
-                            model_call_control.fail(settlement, "interrupted").await?;
-                            break 'turns;
-                        }
-                        result = provider.chat(&fallback_request, fallback_execution) => result,
-                    }
-                }
-                other => other,
-            };
-
-            // 5. On provider error: retry logic
-            match response {
-                Ok(r) => break (r, settlement),
-                Err(e) => {
-                    let failed_invocation_id = settlement.invocation_id();
-                    let provider_error = ProviderError::from_daemon_error(&e);
-                    model_call_control
-                        .fail(
-                            settlement,
-                            provider_error
-                                .as_ref()
-                                .map_or("provider_call_failed", |error| error.detail_code.as_str()),
-                        )
-                        .await?;
-                    if provider_error
-                        .as_ref()
-                        .is_some_and(|error| error.http_status == Some(400))
-                        && request.tools.iter().any(|tool| tool.kind.is_hosted())
-                    {
-                        let spec = request
-                            .tools
-                            .iter()
-                            .find(|tool| tool.kind.is_hosted())
-                            .expect("hosted tool checked above");
-                        let failed_call = ToolCall {
-                            id: format!("hosted-{}-failed", spec.name),
-                            name: spec.name.clone(),
-                            arguments: "{}".to_string(),
-                            hosted: true,
-                            hosted_result: None,
-                        };
-                        let mut assistant = ChatMessage::assistant("");
-                        assistant.tool_calls.push(failed_call.clone());
-                        history.push(assistant);
-                        history.push(ChatMessage::tool_error_result(
-                            &failed_call.id,
-                            format!(
-                                "Error: hosted tool {} was rejected by the provider",
-                                spec.name
-                            ),
-                        ));
-                        event_tx
-                            .send(StreamEvent {
-                                event_type: "tool_use".into(),
-                                data: json!({
-                                    "session_id": session_tag,
-                                    "name": failed_call.name,
-                                    "input": {},
-                                    "id": failed_call.id,
-                                }),
-                            })
-                            .await
-                            .map_err(|_| DaemonError::ChannelClosed)?;
-                        event_tx
-                            .send(StreamEvent {
-                                event_type: "tool_result".into(),
-                                data: json!({
-                                    "session_id": session_tag,
-                                    "content": format!("Error: hosted tool {} was rejected by the provider", spec.name),
-                                    "name": failed_call.name,
-                                    "tool_use_id": failed_call.id,
-                                    "is_error": true,
-                                    "metadata": serde_json::Value::Null,
-                                }),
-                            })
-                            .await
-                            .map_err(|_| DaemonError::ChannelClosed)?;
-                        hosted_tools_enabled = false;
-                        continue 'turns;
-                    }
-                    if let Some(error) = provider_error.as_ref()
-                        && !emitted_chunk.load(Ordering::Acquire)
-                        && retry::delay(error, retries_done).is_some()
-                    {
-                        if retry::wait(error, retries_done, &cancel).await {
-                            retries_done += 1;
-                            prior_invocation_id = failed_invocation_id;
-                            last_retry_error = Some(error.clone());
-                            continue;
-                        }
-                        break 'turns;
-                    }
-                    tracing::error!(error = %e, iteration, "LLM call failed");
-
-                    event_tx
-                        .send(StreamEvent {
-                            event_type: if provider_error.is_some() {
-                                "provider_error"
-                            } else {
-                                "system"
-                            }
-                            .into(),
-                            data: provider_error.map_or_else(
-                                || {
-                                    json!({
-                                        "subtype": "error",
-                                        "error": e.to_string(),
-                                        "session_id": session_tag,
-                                    })
-                                },
-                                |error| {
-                                    json!({
-                                        "class": error.class,
-                                        "http_status": error.http_status,
-                                        "retry_after_ms": error.retry_after_ms,
-                                        "detail_code": error.detail_code,
-                                        "session_id": session_tag,
-                                    })
-                                },
-                            ),
-                        })
-                        .await
-                        .map_err(|_| DaemonError::ChannelClosed)?;
-
-                    return Err(e);
-                }
-            }
-        };
-
-        model_call_control
-            .complete(
-                settlement,
-                ModelCallUsage {
-                    input_tokens: Some(response.usage.prompt_tokens),
-                    output_tokens: Some(response.usage.completion_tokens),
-                    cache_creation_tokens: Some(response.usage.cache_creation_tokens),
-                    cache_read_tokens: Some(response.usage.cache_read_tokens),
-                    reasoning_tokens: Some(response.usage.reasoning_tokens),
-                    estimated_cost_usd: response.usage.cost_usd,
-                    ..ModelCallUsage::default()
-                },
-            )
-            .await?;
-
-        // Track tokens
-        total_usage.prompt_tokens = response.usage.prompt_tokens;
-        total_usage.completion_tokens += response.usage.completion_tokens;
-        total_usage.cache_creation_tokens = response.usage.cache_creation_tokens;
-        total_usage.cache_read_tokens = response.usage.cache_read_tokens;
-        total_usage.reasoning_tokens += response.usage.reasoning_tokens;
-        total_usage.total_tokens = total_usage.prompt_tokens + total_usage.completion_tokens;
-        cumulative_prompt_tokens = cumulative_prompt_tokens
-            .saturating_add(full_prompt_tokens(provider.name(), &response.usage));
-        tools.set_context_usage(
-            full_prompt_tokens(provider.name(), &response.usage),
-            token_limit,
-        );
-
-        // 6. Parse tool calls
-        if response.tool_calls.is_empty() {
-            // Compose final reply
-            if response.content.trim().is_empty()
-                && !final_answer_retry_spent
-                && is_output_limit_stop(response.stop_reason.as_deref())
-            {
-                // #1061: the last call spent its whole output budget on
-                // reasoning. Retry once inside this turn, while the tool
-                // results are still in context, with a final-answer nudge.
-                final_answer_retry_spent = true;
-                final_answer_retry_pending = true;
-                history.push(ChatMessage::user(FINAL_ANSWER_RETRY_PROMPT));
-                event_tx
-                    .send(StreamEvent {
-                        event_type: FINAL_ANSWER_RETRY_STREAM_EVENT.into(),
-                        data: json!({
-                            "session_id": session_tag,
-                            "provider_stop_reason": response.stop_reason,
-                        }),
-                    })
-                    .await
-                    .map_err(|_| DaemonError::ChannelClosed)?;
-                continue 'turns;
-            }
-            if response.content.trim().is_empty() {
-                // #1039: an empty final response is not a completion. Surface
-                // what the model did return (its reasoning) so the operator and
-                // the parent see a clear terminal reason.
-                limit_stop = Some(HarnessLimitStop::EmptyResponse {
-                    provider_stop_reason: response.stop_reason.clone(),
-                    reasoning: response.reasoning_content.clone(),
-                });
-            } else {
-                if let Some(gates) = completion_gates.as_ref() {
-                    if !completion_gates_enabled {
-                        event_tx
-                            .send(StreamEvent {
-                                event_type: COMPLETION_GATE_STREAM_EVENT.into(),
-                                data: json!({
-                                    "session_id": session_tag,
-                                    "gate": null,
-                                    "status": "disabled",
-                                    "attempt": 0,
-                                    "exit": null,
-                                    "tree_digest": null,
-                                    "tree_digest_after": null,
-                                    "skipped": false,
-                                    "output": "",
-                                    "timed_out": false,
-                                }),
-                            })
-                            .await
-                            .map_err(|_| DaemonError::ChannelClosed)?;
-                    } else if completion_gate_attempts >= gates.max_attempts {
-                        let failure = last_completion_gate_failure.as_ref();
-                        event_tx
-                            .send(StreamEvent {
-                                event_type: COMPLETION_GATE_STREAM_EVENT.into(),
-                                data: json!({
-                                    "session_id": session_tag,
-                                    "gate": failure.map(|failure| gates.gates[failure.gate_index].name.as_str()),
-                                    "status": "exhausted",
-                                    "attempt": gates.max_attempts,
-                                    "exit": failure.and_then(|failure| failure.exit_code),
-                                    "tree_digest": failure.and_then(|failure| failure.before_digest.event_value()),
-                                    "tree_digest_after": failure.and_then(|failure| failure.after_digest.event_value()),
-                                    "skipped": false,
-                                    "output": failure.map_or("", |failure| failure.output.as_str()),
-                                    "timed_out": failure.is_some_and(|failure| failure.timed_out),
-                                }),
-                            })
-                            .await
-                            .map_err(|_| DaemonError::ChannelClosed)?;
-                        replied = true;
-                        break;
-                    } else {
-                        let before_digest =
-                            worktree_content_digest(&working_dir).map_err(|error| {
-                                DaemonError::Process(format!(
-                                    "Harness completion gate digest failed: {error}"
-                                ))
-                            })?;
-                        if let Some(failure) = last_completion_gate_failure.as_ref()
-                            && (before_digest == failure.before_digest
-                                || before_digest == failure.after_digest)
-                        {
-                            completion_gate_attempts += 1;
-                            event_tx
-                                .send(StreamEvent {
-                                    event_type: COMPLETION_GATE_STREAM_EVENT.into(),
-                                    data: json!({
-                                        "session_id": session_tag,
-                                        "gate": gates.gates[failure.gate_index].name,
-                                        "status": "skipped",
-                                        "attempt": completion_gate_attempts,
-                                        "exit": failure.exit_code,
-                                        "tree_digest": before_digest.event_value(),
-                                        "tree_digest_after": failure.after_digest.event_value(),
-                                        "skipped": true,
-                                        "output": failure.output,
-                                        "timed_out": failure.timed_out,
-                                    }),
-                                })
-                                .await
-                                .map_err(|_| DaemonError::ChannelClosed)?;
-                            let reason = if failure.timed_out {
-                                "timed out".to_string()
-                            } else {
-                                format!(
-                                    "exit {}",
-                                    failure
-                                        .exit_code
-                                        .map_or("unknown".to_string(), |code| code.to_string())
-                                )
-                            };
-                            let feedback = format!(
-                                "completion gate `{}` did not run again because the worktree was \
-                                 unchanged after the previous failure ({reason}).\n\n{}",
-                                gates.gates[failure.gate_index].name, failure.output,
-                            );
-                            history.push(ChatMessage::user(rsi_common::daemon_message::wrap(
-                                "completion-gate",
-                                &feedback,
-                            )));
-                            gate_retry_pending = true;
-                            continue 'turns;
-                        }
-
-                        let mut failed = None;
-                        for (gate_index, gate) in gates.gates.iter().enumerate() {
-                            let outcome = tools
-                                .execute_completion_gate(gate, &working_dir, &cancel)
-                                .await;
-                            if outcome.cancelled {
-                                break 'turns;
-                            }
-                            if !outcome.success {
-                                failed = Some((gate_index, outcome));
-                                break;
-                            }
-                        }
-
-                        if let Some((gate_index, outcome)) = failed {
-                            let after_digest =
-                                worktree_content_digest(&working_dir).map_err(|error| {
-                                    DaemonError::Process(format!(
-                                        "Harness completion gate digest failed: {error}"
-                                    ))
-                                })?;
-                            completion_gate_attempts += 1;
-                            let failure = CompletionGateFailure {
-                                gate_index,
-                                before_digest,
-                                after_digest,
-                                output: outcome.output.clone(),
-                                exit_code: outcome.exit_code,
-                                timed_out: outcome.timed_out,
-                            };
-                            let reason = if outcome.timed_out {
-                                "timed out".to_string()
-                            } else {
-                                format!(
-                                    "exit {}",
-                                    outcome
-                                        .exit_code
-                                        .map_or("unknown".to_string(), |code| code.to_string())
-                                )
-                            };
-                            let feedback = format!(
-                                "completion gate `{}` failed ({reason}). Fix the failure and try \
-                                 to finish again; this gate will be rechecked at the next final reply.\n\n{}",
-                                gates.gates[gate_index].name, outcome.output,
-                            );
-                            event_tx
-                                .send(StreamEvent {
-                                    event_type: COMPLETION_GATE_STREAM_EVENT.into(),
-                                    data: json!({
-                                        "session_id": session_tag,
-                                        "gate": gates.gates[gate_index].name,
-                                        "status": "failed",
-                                        "attempt": completion_gate_attempts,
-                                        "exit": outcome.exit_code,
-                                        "tree_digest": before_digest.event_value(),
-                                        "tree_digest_after": after_digest.event_value(),
-                                        "skipped": false,
-                                        "output": outcome.output,
-                                        "timed_out": outcome.timed_out,
-                                    }),
-                                })
-                                .await
-                                .map_err(|_| DaemonError::ChannelClosed)?;
-                            history.push(ChatMessage::user(rsi_common::daemon_message::wrap(
-                                "completion-gate",
-                                &feedback,
-                            )));
-                            last_completion_gate_failure = Some(failure);
-                            gate_retry_pending = true;
-                            continue 'turns;
-                        }
-
-                        event_tx
-                            .send(StreamEvent {
-                                event_type: COMPLETION_GATE_STREAM_EVENT.into(),
-                                data: json!({
-                                    "session_id": session_tag,
-                                    "gate": null,
-                                    "status": "passed",
-                                    "attempt": completion_gate_attempts,
-                                    "exit": 0,
-                                    "tree_digest": before_digest.event_value(),
-                                    "tree_digest_after": null,
-                                    "skipped": false,
-                                    "output": "",
-                                    "timed_out": false,
-                                }),
-                            })
-                            .await
-                            .map_err(|_| DaemonError::ChannelClosed)?;
-                    }
-                }
-                event_tx
-                    .send(StreamEvent {
-                        event_type: "assistant".into(),
-                        data: json!({
-                            "session_id": session_tag,
-                            "message": {
-                                "role": "assistant",
-                                "content": [{"type": "text", "text": response.content}],
-                                "usage": {
-                                    "prompt_tokens_total": cumulative_prompt_tokens,
-                                    "input_tokens": total_usage.prompt_tokens,
-                                    "cache_creation_input_tokens": total_usage.cache_creation_tokens,
-                                    "cache_read_input_tokens": total_usage.cache_read_tokens,
-                                    "output_tokens": total_usage.completion_tokens,
-                                    "reasoning_output_tokens": total_usage.reasoning_tokens,
-                                },
-                            },
-                        }),
-                    })
-                    .await
-                    .map_err(|_| DaemonError::ChannelClosed)?;
-            }
-            replied = limit_stop.is_none();
-            break; // Complete
-        }
-
-        // 7. Execute tool calls
-        let assistant_msg = ChatMessage {
-            role: MessageRole::Assistant,
-            content: response.content.clone(),
-            tool_call_id: None,
-            is_error: false,
-            tool_calls: response.tool_calls.clone(),
-        };
-        history.push(assistant_msg);
-
-        let mut call_index = 0;
-        while call_index < response.tool_calls.len() {
-            let first_call = &response.tool_calls[call_index];
-            let sequential = tools
-                .execution_mode(&first_call.name)
-                .is_none_or(|mode| mode == ToolExecutionMode::Sequential);
-            let batch_limit = if sequential {
-                1
-            } else {
-                MAX_PARALLEL_TOOL_CALLS
-            };
-            let batch_start = call_index;
-            call_index += 1;
-            while call_index < response.tool_calls.len() && call_index - batch_start < batch_limit {
-                let next_call = &response.tool_calls[call_index];
-                let next_sequential = tools
-                    .execution_mode(&next_call.name)
-                    .is_none_or(|mode| mode == ToolExecutionMode::Sequential);
-                if next_sequential != sequential {
-                    break;
-                }
-                call_index += 1;
-            }
-
-            let batch = &response.tool_calls[batch_start..call_index];
-            if sequential {
-                seen_tool_calls.clear();
-            }
-            let mut prepared: Vec<PreparedToolCall> = Vec::with_capacity(batch.len());
-            let mut batch_sources: HashMap<u64, usize> = HashMap::new();
-            for tc in batch {
-                let fingerprint = hash_tool_call(&tc.name, &tc.arguments);
-                let cacheable = !tc.hosted
-                    && tools
-                        .execution_mode(&tc.name)
-                        .is_some_and(|mode| mode == ToolExecutionMode::ParallelSafe);
-                if cacheable && let Some(source) = batch_sources.get(&fingerprint) {
-                    if let PreparedToolCall::Immediate {
-                        message, is_error, ..
-                    } = &prepared[*source]
-                    {
-                        prepared.push(PreparedToolCall::Immediate {
-                            fingerprint,
-                            message: message.clone(),
-                            is_error: *is_error,
-                            emit_use: false,
-                            emit_result: false,
-                            use_input: serde_json::Value::Null,
-                        });
-                    } else {
-                        prepared.push(PreparedToolCall::Duplicate {
-                            fingerprint,
-                            source: *source,
-                            repaired: matches!(
-                                prepared[*source],
-                                PreparedToolCall::Executable { repaired: true, .. }
-                            ),
-                        });
-                    }
-                    continue;
-                }
-
-                if tc.hosted {
-                    // #792: the provider ran a hosted call; the session policy
-                    // still decides whether its result is admitted. A denied or
-                    // over-budget call settles as a visible tool-error row.
-                    let denial = tools
-                        .policy()
-                        .and_then(|policy| policy.admit_call(&tc.name, true).err());
-                    let message = if let Some(error) = denial {
-                        ChatMessage::tool_error_result(&tc.id, format!("Error: {}", error.text()))
-                    } else {
-                        if let (Some(policy), Some(result)) = (tools.policy(), &tc.hosted_result) {
-                            policy.record_result_bytes(result.to_string().len());
-                        }
-                        hosted_tool_result_message(tc)
-                    };
-                    let is_error = message.is_error;
-                    let use_input = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                        .unwrap_or(serde_json::Value::Null);
-                    prepared.push(PreparedToolCall::Immediate {
-                        fingerprint,
-                        message,
-                        is_error,
-                        emit_use: true,
-                        emit_result: true,
-                        use_input,
-                    });
-                    batch_sources.insert(fingerprint, prepared.len() - 1);
-                    continue;
-                }
-
-                if cacheable
-                    && let Some((cached_result, is_error)) = seen_tool_calls.get(&fingerprint)
-                {
-                    let message = if *is_error {
-                        ChatMessage::tool_error_result(&tc.id, cached_result)
-                    } else {
-                        ChatMessage::tool_result(&tc.id, cached_result)
-                    };
-                    prepared.push(PreparedToolCall::Immediate {
-                        fingerprint,
-                        message,
-                        is_error: *is_error,
-                        emit_use: false,
-                        emit_result: false,
-                        use_input: serde_json::Value::Null,
-                    });
-                    if cacheable {
-                        batch_sources.insert(fingerprint, prepared.len() - 1);
-                    }
-                    continue;
-                }
-
-                let parsed = match arguments::parse_tool_arguments(&tc.arguments) {
-                    Ok(parsed) => parsed,
-                    Err(message) => {
-                        // Surface a parse error the model can act on instead of
-                        // letting an empty object fail a schema "missing field".
-                        let result_message =
-                            ChatMessage::tool_error_result(&tc.id, format!("Error: {message}"));
-                        prepared.push(PreparedToolCall::Immediate {
-                            fingerprint,
-                            message: result_message,
-                            is_error: true,
-                            emit_use: true,
-                            emit_result: true,
-                            use_input: serde_json::Value::Null,
-                        });
-                        if cacheable {
-                            batch_sources.insert(fingerprint, prepared.len() - 1);
-                        }
-                        continue;
-                    }
-                };
-                let repaired = parsed.repaired;
-                let mut args = parsed.value;
-                if let Some(schema) = tools.parameters_json(&tc.name)
-                    && let Ok(schema) = serde_json::from_str::<serde_json::Value>(schema)
-                {
-                    arguments::coerce_with_schema(&mut args, &schema);
-                }
-                if cacheable {
-                    batch_sources.insert(fingerprint, prepared.len());
-                }
-                prepared.push(PreparedToolCall::Executable {
-                    fingerprint,
-                    args,
-                    repaired,
-                });
-            }
-
-            let mut tasks = JoinSet::new();
-            let mut results: Vec<Option<ToolResult>> = vec![None; prepared.len()];
-            for (index, call) in prepared.iter().enumerate() {
-                let PreparedToolCall::Executable { args, .. } = call else {
-                    continue;
-                };
-                let tc = &batch[index];
-                event_tx
-                    .send(StreamEvent {
-                        event_type: "tool_use".into(),
-                        data: json!({
-                            "session_id": session_tag,
-                            "name": tc.name,
-                            "input": args.clone(),
-                            // Join key for pairing this call with its result.
-                            "id": tc.id,
-                        }),
-                    })
-                    .await
-                    .map_err(|_| DaemonError::ChannelClosed)?;
-
-                let tools = Arc::clone(&tools);
-                let name = tc.name.clone();
-                let args = args.clone();
-                let working_dir = working_dir.clone();
-                let cancel = cancel.clone();
-                let event_tx = event_tx.clone();
-                tasks.spawn(async move {
-                    let result = tools
-                        .execute_with_context(&name, args, &working_dir, &cancel, Some(event_tx))
-                        .await;
-                    (index, result)
-                });
-            }
-
-            while let Some(joined) = tasks.join_next().await {
-                if let Ok((index, result)) = joined {
-                    results[index] = Some(result);
-                }
-            }
-
-            let cancelled = cancel.is_cancelled();
-            for (index, call) in prepared.into_iter().enumerate() {
-                let tc = &batch[index];
-                let (result_message, is_error, emit_use, emit_result, use_input) = match call {
-                    PreparedToolCall::Executable {
-                        fingerprint: _,
-                        args,
-                        repaired,
-                    } => {
-                        let result = results[index].clone().unwrap_or_else(aborted_tool_result);
-                        let mut message = tool_result_message(&tc.id, result);
-                        if repaired && !message.has_typed_tool_blocks() {
-                            message.content.push('\n');
-                            message.content.push_str(arguments::REPAIR_NOTE);
-                        }
-                        let is_error = message.is_error;
-                        (message, is_error, true, true, args)
-                    }
-                    PreparedToolCall::Immediate {
-                        fingerprint: _,
-                        message,
-                        is_error,
-                        emit_use,
-                        emit_result,
-                        use_input,
-                    } => (message, is_error, emit_use, emit_result, use_input),
-                    PreparedToolCall::Duplicate {
-                        fingerprint: _,
-                        source,
-                        repaired,
-                    } => {
-                        let result = results[source].clone().unwrap_or_else(aborted_tool_result);
-                        let mut message = tool_result_message(&tc.id, result);
-                        if repaired && !message.has_typed_tool_blocks() {
-                            message.content.push('\n');
-                            message.content.push_str(arguments::REPAIR_NOTE);
-                        }
-                        let is_error = message.is_error;
-                        (message, is_error, false, true, serde_json::Value::Null)
-                    }
-                };
-
-                if emit_use
-                    && event_tx
-                        .send(StreamEvent {
-                            event_type: "tool_use".into(),
-                            data: json!({
-                                "session_id": session_tag,
-                                "name": tc.name,
-                                "input": use_input,
-                                // Join key for pairing this call with its result.
-                                "id": tc.id,
-                            }),
-                        })
-                        .await
-                        .is_err()
-                {
-                    return Err(DaemonError::ChannelClosed);
-                }
-                if emit_result {
-                    let result_metadata = result_message.event_metadata();
-                    let result_text = result_message.visible_tool_text();
-                    event_tx
-                        .send(StreamEvent {
-                            event_type: "tool_result".into(),
-                            data: json!({
-                                "session_id": session_tag,
-                                "content": result_text,
-                                "name": tc.name,
-                                "tool_use_id": tc.id,
-                                "is_error": is_error,
-                                "metadata": result_metadata,
-                            }),
-                        })
-                        .await
-                        .map_err(|_| DaemonError::ChannelClosed)?;
-                }
-                if tools
-                    .execution_mode(&tc.name)
-                    .is_some_and(|mode| mode == ToolExecutionMode::ParallelSafe)
-                {
-                    seen_tool_calls.insert(
-                        hash_tool_call(&tc.name, &tc.arguments),
-                        (result_message.content.clone(), is_error),
-                    );
-                }
-                history.push(result_message);
-            }
-
-            if cancelled {
-                model_call_control.fail_pending("interrupted").await?;
-                break 'turns;
-            }
-        }
-
-        let process_notices = tools.take_process_notices().await;
-        append_process_notices(&event_tx, &mut history, &session_tag, process_notices).await?;
-
-        hard_trim(&mut history, 200); // safety backstop
-    }
-
-    // Every non-error exit other than a reply or a cancellation is the
-    // iteration budget running out mid tool loop.
-    if limit_stop.is_none() && !replied && !cancel.is_cancelled() {
-        limit_stop = Some(HarnessLimitStop::IterationLimit { max_iterations });
-    }
-    if let Some(stop) = limit_stop.as_ref() {
-        tracing::warn!(
-            session_id = %session_tag,
-            stop_reason = stop.code(),
-            "Harness turn ended without a final reply"
-        );
-        event_tx
-            .send(StreamEvent {
-                event_type: "assistant".into(),
-                data: json!({
-                    "session_id": session_tag,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": stop.message()}],
-                        "usage": {
-                            "prompt_tokens_total": cumulative_prompt_tokens,
-                            "input_tokens": total_usage.prompt_tokens,
-                            "cache_creation_input_tokens": total_usage.cache_creation_tokens,
-                            "cache_read_input_tokens": total_usage.cache_read_tokens,
-                            "output_tokens": total_usage.completion_tokens,
-                            "reasoning_output_tokens": total_usage.reasoning_tokens,
-                        },
-                    },
-                }),
-            })
-            .await
-            .map_err(|_| DaemonError::ChannelClosed)?;
-    }
-
-    // Phase C & D: Emit final result
-    event_tx
-        .send(StreamEvent {
-            event_type: "result".into(),
-            data: json!({
-                "subtype": "turn_completed",
-                "stop_reason": limit_stop.as_ref().map_or("end_turn", HarnessLimitStop::code),
-                "session_id": session_tag,
-                "usage": {
-                    "prompt_tokens_total": cumulative_prompt_tokens,
-                    "input_tokens": total_usage.prompt_tokens,
-                    "cache_creation_input_tokens": total_usage.cache_creation_tokens,
-                    "cache_read_input_tokens": total_usage.cache_read_tokens,
-                    "output_tokens": total_usage.completion_tokens,
-                    "reasoning_output_tokens": total_usage.reasoning_tokens,
-                },
-            }),
-        })
-        .await
-        .map_err(|_| DaemonError::ChannelClosed)?;
-
-    Ok(())
+            completion_gates,
+            completion_gates_enabled,
+        },
+        event_tx,
+        cancel,
+        agent_mail_boundary.map(|boundary| {
+            Arc::new(DaemonMail(boundary)) as Arc<dyn rsid_harness::ports::MailBoundary>
+        }),
+    )
+    .await
+    .map_err(fault_into)
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::session::harness) mod tests {
     use super::*;
     use crate::model_control::call_control::StoreBackedModelCallControl;
     use crate::model_control::{AdmissionDecision, admit_invocation};
     use crate::session::harness::agent_mail::{TestHarnessMailBoundary, TestHarnessMailDelivery};
-    use crate::session::harness::api_key::ApiCredential;
-    use crate::session::harness::providers::openai_api::OpenAiApiProvider;
+    use crate::session::harness::errors::{ProviderError, ProviderErrorExt};
+    use crate::session::harness::tools::ToolExecutionMode;
     use crate::store::Store;
     use rsi_common::completion_gates::CompletionGate;
+    use rsid_harness::agent_loop::{FINAL_ANSWER_RETRY_EFFORT, FINAL_ANSWER_RETRY_PROMPT};
     use rusqlite::params;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Barrier, Mutex};
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
-    #[test]
-    fn test_estimate_remaining_tokens() {
-        let history = vec![
-            ChatMessage::system("sys prompt"),      // ~3 tokens
-            ChatMessage::user("hello world"),       // ~3 tokens
-            ChatMessage::assistant("hi there guy"), // ~3 tokens
-        ];
-        let remaining = estimate_remaining_tokens(&history, 100);
-        // Total estimated ~9 tokens, so remaining should be ~91
-        assert!(remaining > 80);
-        assert!(remaining < 100);
-    }
 
     struct FakeProvider {
         responses: Mutex<VecDeque<ChatResponse>>,
@@ -1996,14 +619,14 @@ mod tests {
         }
     }
 
-    async fn root_permit(
+    pub(in crate::session::harness) async fn root_permit(
         store: &Arc<Mutex<Store>>,
         session_id: uuid::Uuid,
     ) -> crate::model_control::AdmissionPermit {
         root_permit_keyed(store, session_id, "root").await
     }
 
-    async fn root_permit_keyed(
+    pub(in crate::session::harness) async fn root_permit_keyed(
         store: &Arc<Mutex<Store>>,
         session_id: uuid::Uuid,
         key_prefix: &str,
@@ -2047,7 +670,7 @@ mod tests {
         }
     }
 
-    fn controller(
+    pub(in crate::session::harness) fn controller(
         store: &Arc<Mutex<Store>>,
         session_id: uuid::Uuid,
         permit: crate::model_control::AdmissionPermit,
@@ -2473,6 +1096,92 @@ mod tests {
         let requests = requests.lock().await;
         assert_eq!(requests[0].tools.len(), 2);
         assert_eq!(requests[1].tools.len(), 0);
+    }
+
+    /// #2250: the route's hosted `web_fetch` and the native tool share a name;
+    /// the model sees one. When the provider rejects the hosted tools (400),
+    /// the next request carries the native function spec instead.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn hosted_web_fetch_wins_over_the_native_tool_until_the_provider_rejects_it() {
+        use crate::session::harness::tools::web_fetch::WebFetchTool;
+        use crate::session::harness::types::HarnessToolSpecKind;
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let permit = root_permit(&store, session_id).await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let rejected = ProviderError {
+            class: crate::session::harness::errors::ProviderErrorClass::BadRequest,
+            http_status: Some(400),
+            retry_after_ms: None,
+            detail_code: "request_rejected".into(),
+        }
+        .into_daemon_error();
+        let provider = HostedFallbackProvider {
+            requests: Arc::clone(&requests),
+            outcomes: Mutex::new(VecDeque::from([
+                Err(rejected),
+                Ok(ChatResponse {
+                    content: "recovered".into(),
+                    tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
+                    reasoning_content: None,
+                    stop_reason: Some("end_turn".into()),
+                }),
+            ])),
+        };
+        let mut registry = HarnessToolRegistry::new();
+        registry.register(Arc::new(WebFetchTool::new()));
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        run_harness_loop(
+            Box::new(provider),
+            Arc::new(registry),
+            String::new(),
+            "fetch".to_string(),
+            std::env::temp_dir(),
+            "claude-sonnet-5".to_string(),
+            None,
+            event_tx,
+            CancellationToken::new(),
+            controller(&store, session_id, permit),
+            3,
+            100_000,
+            None,
+        )
+        .await
+        .expect("hosted-tool rejection must not end the session");
+
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let fetch_specs = |request: &ChatRequest| -> Vec<bool> {
+            request
+                .tools
+                .iter()
+                .filter(|tool| tool.name == "web_fetch")
+                .map(|tool| tool.kind.is_hosted())
+                .collect()
+        };
+        // Exactly one `web_fetch`, and it is the provider-hosted one.
+        assert_eq!(fetch_specs(&requests[0]), [true]);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "web_search" && tool.kind.is_hosted())
+        );
+        // After the 400 the hosted tools are off and the native function
+        // spec is what the model now sees.
+        assert_eq!(fetch_specs(&requests[1]), [false]);
+        let native = requests[1]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "web_fetch")
+            .expect("native web_fetch spec");
+        assert!(matches!(native.kind, HarnessToolSpecKind::Function));
+        assert!(requests[1].tools.iter().all(|tool| !tool.kind.is_hosted()));
     }
 
     async fn captured_harness_request_effort(reasoning_effort: Option<String>) -> Option<String> {
@@ -2911,6 +1620,165 @@ mod tests {
         }
     }
 
+    /// Hub #748 strand 1: a direct Harness session's second physical turn
+    /// failed with `model invocation dedup conflict for key
+    /// session.harness.turn:<sid>:2:root:turn:1` because the child key was
+    /// rebuilt from the session id, an ordinal and an iteration hint that all
+    /// restart per turn. Two turns of one session, each under its own root
+    /// permit and with three model calls (two child admissions), must admit
+    /// with distinct child keys while the session stays the owner, and an
+    /// exact replay of one child key must still dedup instead of admitting a
+    /// second execution.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn second_harness_turn_admits_distinct_child_keys_and_a_replayed_key_dedups() {
+        use rsi_common::model_control::ModelInvocationPurpose;
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let mut roots = Vec::new();
+        for (turn, prefix) in ["turn-1", "turn-2"].into_iter().enumerate() {
+            let permit = root_permit_keyed(&store, session_id, prefix).await;
+            roots.push(permit.invocation_id());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                request_efforts: Arc::new(Mutex::new(Vec::new())),
+                request_messages: Arc::clone(&requests),
+                responses: Some(Arc::new(Mutex::new(VecDeque::from([
+                    tool_only_response(&format!("t{turn}-a")),
+                    tool_only_response(&format!("t{turn}-b")),
+                    ChatResponse {
+                        content: "done".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: TokenUsage::default(),
+                        reasoning_content: None,
+                        stop_reason: None,
+                    },
+                ])))),
+            };
+            let (event_tx, _event_rx) = mpsc::channel(64);
+            let history = (turn > 0).then(|| vec![ChatMessage::user("first turn")]);
+            run_harness_loop(
+                Box::new(provider),
+                Arc::new(HarnessToolRegistry::new()),
+                String::new(),
+                format!("turn {turn}"),
+                std::env::temp_dir(),
+                "claude-opus-5".to_string(),
+                None,
+                event_tx,
+                CancellationToken::new(),
+                controller(&store, session_id, permit),
+                8,
+                100_000,
+                history,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("turn {turn} must admit: {error}"));
+            assert_eq!(requests.lock().await.len(), 3, "turn {turn} made 3 calls");
+        }
+        assert_ne!(roots[0], roots[1], "each turn has its own root permit");
+
+        let children = store
+            .lock()
+            .await
+            .list_model_invocation_records(
+                100,
+                false,
+                Some(ModelInvocationPurpose::SessionHarnessTurn),
+                Some(session_id),
+            )
+            .expect("list child invocations");
+        assert_eq!(children.len(), 4, "two child admissions per turn");
+        for child in &children {
+            assert_eq!(
+                child.owner.session_id,
+                Some(session_id),
+                "the session stays the authorization owner"
+            );
+        }
+        let mut keys: Vec<String> = children
+            .iter()
+            .map(|child| child.dedup_key.clone().expect("child dedup key"))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            4,
+            "child keys are distinct across turns: {keys:?}"
+        );
+        for root in &roots {
+            let under_root = children
+                .iter()
+                .filter(|child| child.parent_invocation_id == Some(*root))
+                .count();
+            assert_eq!(under_root, 2, "two children under root {root}");
+        }
+
+        // An exact replay of a recorded child admission still dedups: the
+        // ledger returns the existing invocation and admits nothing new.
+        let replayed = children
+            .iter()
+            .find(|child| child.parent_invocation_id == Some(roots[1]))
+            .expect("a turn-2 child");
+        let request = crate::model_control::ModelAdmissionRequest {
+            purpose: ModelInvocationPurpose::SessionHarnessTurn,
+            provider: Some("Harness".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            backend: Some("Harness".to_string()),
+            effort: Some("high".to_string()),
+            trigger: "test_harness_loop".to_string(),
+            owner: rsi_common::model_control::InvocationOwner {
+                session_id: Some(session_id),
+                ..Default::default()
+            },
+            dedup_key: replayed.dedup_key.clone(),
+            request_fingerprint: replayed.request_fingerprint.clone(),
+            parent_invocation_id: Some(roots[1]),
+            retry_of_invocation_id: None,
+            expected_usage: Some(crate::model_control::explicit_expected_usage(
+                ModelInvocationPurpose::SessionHarnessTurn,
+                Some("Harness"),
+                Some("Harness"),
+                Some("gpt-5.4"),
+            )),
+            baseline_input_tokens: 0,
+            baseline_output_tokens: 0,
+            baseline_cache_creation_tokens: 0,
+            baseline_cache_read_tokens: 0,
+            baseline_reasoning_tokens: 0,
+            baseline_embedding_input_count: 0,
+            baseline_wall_time_ms: 0,
+        };
+        let bus = Arc::new(crate::bus::EventBus::new(8));
+        match admit_invocation(&store, request, &bus)
+            .await
+            .expect("replay admission")
+        {
+            AdmissionDecision::Duplicate { invocation_id } => {
+                assert_eq!(invocation_id, replayed.id, "the replay names the original");
+            }
+            AdmissionDecision::Admitted(permit) => panic!(
+                "an exact replay of {:?} admitted a new invocation {}",
+                replayed.dedup_key,
+                permit.invocation_id()
+            ),
+        }
+        let after = store
+            .lock()
+            .await
+            .list_model_invocation_records(
+                100,
+                false,
+                Some(ModelInvocationPurpose::SessionHarnessTurn),
+                Some(session_id),
+            )
+            .expect("list after replay");
+        assert_eq!(after.len(), 4, "the replay added no ledger row");
+    }
+
     fn tool_only_response(id: &str) -> ChatResponse {
         ChatResponse {
             content: String::new(),
@@ -3225,10 +2093,12 @@ mod tests {
             .filter(|event| event.event_type == "tool_use")
             .map(|event| event.data["id"].as_str().unwrap_or_default())
             .collect();
+        // #2279: one `tool_use` per executed call id, so two calls announce twice.
         let mut unique_tool_use_ids = tool_use_ids.clone();
         unique_tool_use_ids.sort_unstable();
         unique_tool_use_ids.dedup();
         assert_eq!(unique_tool_use_ids.len(), 2);
+        assert_eq!(tool_use_ids.len(), 2, "{tool_use_ids:?}");
         assert_eq!(
             events
                 .iter()
@@ -4177,25 +3047,6 @@ mod tests {
             )
             .expect("denied rows");
         assert_eq!(denied_rows, 1);
-    }
-
-    /// #1000: one call's full prompt. Anthropic reports input without cache;
-    /// OpenAI-compatible providers already include cached tokens.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
-    #[test]
-    fn full_prompt_tokens_counts_cached_tokens_once_per_provider_shape() {
-        let usage = TokenUsage {
-            prompt_tokens: 1_000,
-            completion_tokens: 50,
-            total_tokens: 1_050,
-            cache_creation_tokens: 200,
-            cache_read_tokens: 700,
-            reasoning_tokens: 0,
-            cost_usd: None,
-        };
-        assert_eq!(super::full_prompt_tokens("anthropic", &usage), 1_900);
-        assert_eq!(super::full_prompt_tokens("openai_responses", &usage), 1_000);
-        assert_eq!(super::full_prompt_tokens("openai", &usage), 1_000);
     }
 
     /// #783: a tool that records the arguments the loop dispatched to it.

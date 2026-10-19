@@ -7,6 +7,9 @@
 
 use crate::gate::GateDecision;
 use crate::metrics::BaselineSnapshot;
+use rsi_common::bench_record::{
+    BenchRunRecord, Comparison, Interval, IntervalMethod, Summary, Verdict,
+};
 use serde_json::{Value, json};
 use std::fmt::Write;
 
@@ -145,6 +148,259 @@ pub fn render_json(candidate: &BaselineSnapshot, gate: &GateDecision) -> Value {
         "candidate": candidate,
         "gate_decision": gate,
     })
+}
+
+fn pct(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| format!("{:.1}%", v * 100.0))
+}
+
+fn usd(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| format!("${v:.4}"))
+}
+
+fn interval_text(ci: Option<Interval>) -> String {
+    ci.map_or_else(
+        || "n/a".to_string(),
+        |i| format!("[{:.1}%, {:.1}%]", i.lo * 100.0, i.hi * 100.0),
+    )
+}
+
+/// Markdown report of one `BenchRunRecord` (`rsi-eval bench report`).
+#[must_use]
+pub fn render_bench_markdown(record: &BenchRunRecord, summary: &Summary) -> String {
+    let run = &record.run;
+    let mut out = String::new();
+    let _ = writeln!(out, "# rsi-eval bench report");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "- **Dataset**: `{}` @ `{}` (split `{}`, {} tasks, k={})",
+        run.dataset_repo,
+        run.dataset_commit,
+        run.split,
+        run.tasks.len(),
+        run.k
+    );
+    let _ = writeln!(
+        out,
+        "- **Model**: `{}` (effort `{}`, route `{}`)",
+        run.model, run.effort, run.route
+    );
+    let _ = writeln!(
+        out,
+        "- **Harbor**: `{}`; adapter tree `{}`; harness build `{}`",
+        run.harbor_version, run.adapter_tree_hash, run.harness_build_digest
+    );
+    let _ = writeln!(
+        out,
+        "- **Observation fingerprint**: `{}`",
+        run.observation_fingerprint
+    );
+    let _ = writeln!(
+        out,
+        "- **Host**: `{}` (concurrency {}), {} to {}",
+        run.host, run.concurrency, run.started_at, run.finished_at
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Results");
+    let _ = writeln!(out);
+    let method = match summary.ci_method {
+        Some(IntervalMethod::Wilson) => "95% Wilson",
+        Some(IntervalMethod::ClusteredBootstrap) => {
+            "95% task-clustered bootstrap, 10,000 resamples"
+        }
+        None => "none",
+    };
+    let _ = writeln!(out, "| metric | value |");
+    let _ = writeln!(out, "|---|---|");
+    let _ = writeln!(out, "| pass rate | {} |", pct(summary.pass_rate));
+    let _ = writeln!(
+        out,
+        "| pass rate CI ({method}) | {} |",
+        interval_text(summary.ci)
+    );
+    if summary.k > 1 {
+        let _ = writeln!(
+            out,
+            "| pass@{} | {} |",
+            summary.k,
+            summary.pass_at_k.map_or_else(
+                || summary
+                    .pass_at_k_refusal
+                    .clone()
+                    .unwrap_or_else(|| "n/a".to_string()),
+                |v| format!("{:.1}%", v * 100.0)
+            )
+        );
+    }
+    let _ = writeln!(
+        out,
+        "| tasks scored / unscored | {} / {} |",
+        summary.tasks_scored, summary.tasks_unscored
+    );
+    let _ = writeln!(
+        out,
+        "| valid trials (passed) | {} ({}) |",
+        summary.valid_trials, summary.passed_trials
+    );
+    let _ = writeln!(
+        out,
+        "| invalid trials (excluded) | {} |",
+        summary.invalid_trials
+    );
+    let _ = writeln!(
+        out,
+        "| - reward invalid / invalid route / infra interrupted | {} / {} / {} |",
+        summary.reward_invalid_trials,
+        summary.invalid_route_trials,
+        summary.infra_interrupted_trials
+    );
+    let _ = writeln!(
+        out,
+        "| suspected solution lookup | {} |",
+        summary.suspected_solution_lookup_trials
+    );
+    let _ = writeln!(
+        out,
+        "| cost per trial | {} |",
+        usd(summary.cost_per_trial_usd)
+    );
+    let _ = writeln!(
+        out,
+        "| cost per task | {} |",
+        usd(summary.cost_per_task_usd)
+    );
+    let _ = writeln!(
+        out,
+        "| USD per solved trial | {} |",
+        usd(summary.usd_per_solved_trial)
+    );
+    let _ = writeln!(
+        out,
+        "| cached tokens per output token | {} |",
+        summary
+            .cached_tokens_per_output_token
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}"))
+    );
+    let _ = writeln!(out);
+    if !summary.failure_causes.is_empty() {
+        let _ = writeln!(out, "## Failure causes");
+        let _ = writeln!(out);
+        for (cause, count) in &summary.failure_causes {
+            let _ = writeln!(out, "- `{cause}`: {count}");
+        }
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out, "## Trials");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "| task | attempt | result | cause | cost | turns | wall_ms | session |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|");
+    for t in &record.trials {
+        let result = if !t.is_valid() {
+            "INVALID"
+        } else if t.passed {
+            "pass"
+        } else {
+            "FAIL"
+        };
+        let mut cause = t
+            .failure_cause
+            .clone()
+            .or_else(|| t.exception_type.clone())
+            .unwrap_or_else(|| "-".to_string());
+        if t.suspected_solution_lookup {
+            cause.push_str(" (suspected lookup)");
+        }
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | ${:.4} | {} | {} | {} |",
+            t.task,
+            t.attempt,
+            result,
+            cause,
+            t.cost_usd,
+            t.turns,
+            t.wall_ms,
+            t.session_id.as_deref().unwrap_or("-")
+        );
+    }
+    out
+}
+
+/// Markdown report of a paired compare (`rsi-eval bench compare`).
+#[must_use]
+pub fn render_compare_markdown(
+    a: &BenchRunRecord,
+    b: &BenchRunRecord,
+    comparison: &Comparison,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# rsi-eval bench compare");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "- **A (baseline)**: `{}` model `{}`",
+        a.run.observation_fingerprint, a.run.model
+    );
+    let _ = writeln!(
+        out,
+        "- **B (candidate)**: `{}` model `{}`",
+        b.run.observation_fingerprint, b.run.model
+    );
+    let verdict = match comparison.verdict {
+        Verdict::Improvement => "IMPROVEMENT",
+        Verdict::Regression => "REGRESSION",
+        Verdict::Inconclusive => "inconclusive",
+    };
+    let _ = writeln!(out, "- **Verdict**: {verdict}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| metric | value |");
+    let _ = writeln!(out, "|---|---|");
+    let _ = writeln!(out, "| tasks compared | {} |", comparison.per_task.len());
+    let _ = writeln!(
+        out,
+        "| pass rate A / B | {} / {} |",
+        pct(Some(comparison.a_pass_rate)),
+        pct(Some(comparison.b_pass_rate))
+    );
+    let _ = writeln!(
+        out,
+        "| mean difference (B - A) | {:+.1} pp |",
+        comparison.mean_diff * 100.0
+    );
+    let ci = comparison.ci.map_or_else(
+        || "n/a".to_string(),
+        |i| format!("[{:+.1} pp, {:+.1} pp]", i.lo * 100.0, i.hi * 100.0),
+    );
+    let _ = writeln!(out, "| 95% bootstrap CI over tasks | {ci} |");
+    let _ = writeln!(
+        out,
+        "| improved / regressed / unchanged | {} / {} / {} |",
+        comparison.improved, comparison.regressed, comparison.unchanged
+    );
+    if !comparison.unscored_tasks.is_empty() {
+        let _ = writeln!(
+            out,
+            "| unscored (no valid trial on a side) | {} |",
+            comparison.unscored_tasks.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Per-task");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| task | A | B | diff |");
+    let _ = writeln!(out, "|---|---|---|---|");
+    for t in &comparison.per_task {
+        let _ = writeln!(
+            out,
+            "| {} | {:.2} | {:.2} | {:+.2} |",
+            t.task, t.a, t.b, t.diff
+        );
+    }
+    out
 }
 
 #[cfg(test)]

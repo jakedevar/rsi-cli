@@ -69,10 +69,16 @@ pub enum ProviderCredentialSlot {
     Cloudflare,
     Anyscale,
     Octoai,
+    /// Web-search vendor key for the Harness `web_search` tool (#2251). Not a
+    /// model provider: it is consumed only by the in-process search adapter.
+    Serper,
+    /// Web-search vendor key (Exa) for the Harness `web_search` tool (#2252).
+    /// Not a model provider: consumed only by the in-process search adapter.
+    Exa,
 }
 
 impl ProviderCredentialSlot {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Openrouter,
         Self::Anthropic,
         Self::Openai,
@@ -96,6 +102,8 @@ impl ProviderCredentialSlot {
         Self::Cloudflare,
         Self::Anyscale,
         Self::Octoai,
+        Self::Serper,
+        Self::Exa,
     ];
 
     #[must_use]
@@ -124,6 +132,8 @@ impl ProviderCredentialSlot {
             Self::Cloudflare => "cloudflare",
             Self::Anyscale => "anyscale",
             Self::Octoai => "octoai",
+            Self::Serper => "serper",
+            Self::Exa => "exa",
         }
     }
 

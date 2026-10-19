@@ -804,7 +804,8 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             name: "MyOllama".into(),
             base_url: "http://localhost:11434".into(),
-            api_key: String::new(),
+            api_key_set: true,
+            api_key_fingerprint: None,
             default_model: "llama3".into(),
         }];
 

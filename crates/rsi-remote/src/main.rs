@@ -6,7 +6,11 @@ use rsi_remote::{
     gate::{Gate, REFRESH_EVERY},
     ingress::{self, Method, Request},
     localapi_client::{DEFAULT_SOCKET, LocalApiClient},
-    reads::{self, DaemonReads, OperatorDispatch, ReadDispatch, ServeError, default_daemon_socket},
+    managers::{self, MessageRequest},
+    reads::{
+        self, DaemonReads, OperatorDispatch, ReadDispatch, ReadError, ServeError,
+        default_daemon_socket,
+    },
     session::{self, Sessions},
 };
 use std::{
@@ -52,13 +56,14 @@ async fn command() -> io::Result<()> {
         [group, action, file] if group == "config" && action == "show" => {
             let policy = config::read(Path::new(file))?;
             println!(
-                "enabled={} canonical_host={} owner_user_id={} node_count={} project_count={} allow_answers={}",
+                "enabled={} canonical_host={} owner_user_id={} node_count={} project_count={} allow_answers={} allow_messages={}",
                 policy.enabled,
                 policy.canonical_host,
                 policy.owner_user_id,
                 policy.allowed_node_ids.len(),
                 policy.project_ids.len(),
-                policy.allow_answers
+                policy.allow_answers,
+                policy.allow_messages
             );
         }
         [group, action, file] if group == "config" && action == "disable" => {
@@ -85,13 +90,31 @@ async fn command() -> io::Result<()> {
                 if policy.allow_answers { "on" } else { "off" }
             );
         }
+        [group, action, file, state] if group == "config" && action == "messages" => {
+            let mut policy = config::read(Path::new(file))?;
+            match state.as_str() {
+                "on" => policy.allow_messages = true,
+                "off" => policy.allow_messages = false,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "usage: rsi-remote config messages <policy.toml> on|off",
+                    ));
+                }
+            }
+            config::write(Path::new(file), &policy, false)?;
+            println!(
+                "messages {}",
+                if policy.allow_messages { "on" } else { "off" }
+            );
+        }
         [action, config_path, socket_path] if action == "run" => {
             run(Path::new(config_path), Path::new(socket_path)).await?
         }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: rsi-remote config init|check|show|disable <policy.toml> | config answers <policy.toml> on|off | run <policy.toml> <ingress.sock>",
+                "usage: rsi-remote config init|check|show|disable <policy.toml> | config answers <policy.toml> on|off | config messages <policy.toml> on|off | run <policy.toml> <ingress.sock>",
             ));
         }
     }
@@ -477,17 +500,44 @@ async fn route<D: ReadDispatch + OperatorDispatch>(
                 if !policy.allow_answers {
                     return Response::new(403, "Forbidden");
                 }
-                return match reads::serve_operator(&req.path, policy, reads).await {
+                let started = Instant::now();
+                return match reads::serve_operator(&req.path, &req.query, policy, reads).await {
                     Ok(bytes) => Response::json(200, "OK", bytes),
                     Err(ServeError::Denied(_)) => Response::new(403, "Forbidden"),
-                    Err(ServeError::Failed(_)) => Response::new(502, "Bad Gateway"),
+                    Err(ServeError::Failed(error)) => {
+                        failed_read(ingress::read_method(&req.path), error, started)
+                    }
                 };
             }
+            let started = Instant::now();
             match reads::serve_read(&req.path, &req.query, policy, reads).await {
                 Ok(bytes) => Response::json(200, "OK", bytes),
                 Err(ServeError::Denied(_)) => Response::new(403, "Forbidden"),
-                Err(ServeError::Failed(_)) => Response::new(502, "Bad Gateway"),
+                Err(ServeError::Failed(error)) => {
+                    failed_read(ingress::read_method(&req.path), error, started)
+                }
             }
+        }
+        (Method::Get, path) if path.starts_with("/api/v2/") => {
+            // API v2 reads: the exposed projects' manager seats and one
+            // seat's conversation (session, scope and one closed daemon read).
+            Response::from_answer(
+                managers::serve_read(req, origin_ok, binding, sessions, policy, reads, now).await,
+            )
+        }
+        (Method::Post, path) if ingress::message_route(path).is_some() => {
+            // The whole message pipeline (session, CSRF, Origin, switch, scope,
+            // rate, body, seat, audit, forward) lives in `managers`.
+            let input = MessageRequest {
+                req,
+                body,
+                origin_ok,
+                binding,
+                sessions,
+                policy,
+                now,
+            };
+            Response::from_answer(answers.messages().serve(&input, reads).await)
         }
         (Method::Post, path) if ingress::answer_route(path).is_some() => {
             // The whole answer pipeline (session, CSRF, Origin, switch, scope,
@@ -505,6 +555,32 @@ async fn route<D: ReadDispatch + OperatorDispatch>(
         }
         _ => Response::new(404, "Not Found"),
     }
+}
+
+/// Seconds a phone is asked to wait after a busy or timed-out read.
+const READ_RETRY_AFTER_SECS: u64 = 2;
+
+/// The response for a failed daemon read, with one journal line (method, code,
+/// status, duration; never content, ids or tokens). A busy or timed-out read
+/// is a 503 with `Retry-After`; only a real connect failure is a 502.
+fn failed_read(method: Option<&str>, error: ReadError, started: Instant) -> Response {
+    let status = error.http_status();
+    let code = error.code();
+    eprintln!(
+        "rsi-remote: read failed: method={} code={code} status={status} duration_ms={}",
+        method.unwrap_or("-"),
+        started.elapsed().as_millis()
+    );
+    let reason = match status {
+        503 => "Service Unavailable",
+        502 => "Bad Gateway",
+        _ => "Internal Server Error",
+    };
+    let mut response = Response::json(status, reason, json_string("error", code));
+    if status == 503 {
+        response.retry_after = Some(READ_RETRY_AFTER_SECS);
+    }
+    response
 }
 
 fn json_string(key: &str, value: &str) -> Vec<u8> {
@@ -676,6 +752,10 @@ async fn handle<D: ReadDispatch + OperatorDispatch>(
     stream.write_all(&response.serialize_for(head_only)).await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -1095,7 +1175,7 @@ mod tests {
 
     impl FakeLocalApi {
         fn start(ingress: &Path, client_node: &str) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::short_tempdir().unwrap();
             let socket = dir.path().join("sock");
             let listener = UnixListener::bind(&socket).unwrap();
             let ingress = ingress.to_path_buf();
@@ -1140,6 +1220,11 @@ mod tests {
         }
     }
 
+    const V2_SEAT: &str = "550e8400-e29b-41d4-a716-446655440001";
+    const V2_SEATS: &str = r#"{"projects":[{"project_id":"550e8400-e29b-41d4-a716-446655440000","name":"Alpha","project_manager":{"session_id":"550e8400-e29b-41d4-a716-446655440001","role":"project_manager","status":"Running","provider":"Claude","model":null,"last_activity_at":"2026-10-17T09:30:00.000000000Z","pending_decisions":0,"pending_decisions_truncated":false},"global_manager":null}]}"#;
+    const V2_CONVERSATION: &str = r#"{"seat":{"session_id":"550e8400-e29b-41d4-a716-446655440001","role":"project_manager","status":"Running","provider":"Claude","model":null,"last_activity_at":"2026-10-17T09:30:00.000000000Z","pending_decisions":0,"pending_decisions_truncated":false},"items":[],"next_before":null,"has_more":false,"operator_messages":[]}"#;
+    const V2_RECEIPT: &str = r#"{"message_id":"550e8400-e29b-41d4-a716-44665544000a","seat_session_id":"550e8400-e29b-41d4-a716-446655440001","state":"queued","created_at":"2026-10-17T09:31:00.000000000Z","deduplicated":false}"#;
+
     /// A counting read dispatcher that always returns the empty project list.
     struct ItemsDispatch {
         calls: AtomicUsize,
@@ -1147,10 +1232,15 @@ mod tests {
         last: std::sync::Mutex<Option<ReadRequestV1>>,
         /// Reply to a decision-targets call.
         targets: std::sync::Mutex<Vec<u8>>,
+        target_requests: std::sync::Mutex<Vec<serde_json::Value>>,
         /// Reply to an answer call.
         answer: std::sync::Mutex<Result<Vec<u8>, reads::OperatorError>>,
         /// Every answer request the daemon would have received, as wire JSON.
         answer_requests: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// API v2 replies, and every v2 call as `(method, params)`.
+        v2_seats: std::sync::Mutex<Result<Vec<u8>, reads::OperatorError>>,
+        v2_send: std::sync::Mutex<Result<Vec<u8>, reads::OperatorError>>,
+        v2_calls: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
     }
 
     impl ItemsDispatch {
@@ -1160,9 +1250,23 @@ mod tests {
                 operator_calls: AtomicUsize::new(0),
                 last: std::sync::Mutex::new(None),
                 targets: std::sync::Mutex::new(br#"{"items":[]}"#.to_vec()),
+                target_requests: std::sync::Mutex::new(Vec::new()),
                 answer: std::sync::Mutex::new(Ok(br#"{"items":[]}"#.to_vec())),
                 answer_requests: std::sync::Mutex::new(Vec::new()),
+                v2_seats: std::sync::Mutex::new(Ok(V2_SEATS.as_bytes().to_vec())),
+                v2_send: std::sync::Mutex::new(Ok(V2_RECEIPT.as_bytes().to_vec())),
+                v2_calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn v2_calls(&self, method: &str) -> Vec<serde_json::Value> {
+            self.v2_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == method)
+                .map(|(_, params)| params.clone())
+                .collect()
         }
 
         fn answer_requests(&self) -> Vec<serde_json::Value> {
@@ -1194,7 +1298,13 @@ mod tests {
         async fn call(&self, call: &reads::OperatorCall) -> Result<Vec<u8>, reads::OperatorError> {
             self.operator_calls.fetch_add(1, Ordering::SeqCst);
             match call {
-                reads::OperatorCall::DecisionTargets(_) => Ok(self.targets.lock().unwrap().clone()),
+                reads::OperatorCall::DecisionTargets(request) => {
+                    self.target_requests
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(request).unwrap());
+                    Ok(self.targets.lock().unwrap().clone())
+                }
                 reads::OperatorCall::AnswerPending(request) => {
                     self.answer_requests
                         .lock()
@@ -1208,6 +1318,27 @@ mod tests {
                         .unwrap()
                         .push(serde_json::to_value(request).unwrap());
                     self.answer.lock().unwrap().clone()
+                }
+                reads::OperatorCall::ManagerSeats(_) => {
+                    self.v2_calls
+                        .lock()
+                        .unwrap()
+                        .push((call.method().into(), call.wire().unwrap()["params"].clone()));
+                    self.v2_seats.lock().unwrap().clone()
+                }
+                reads::OperatorCall::ManagerConversation(_) => {
+                    self.v2_calls
+                        .lock()
+                        .unwrap()
+                        .push((call.method().into(), call.wire().unwrap()["params"].clone()));
+                    Ok(V2_CONVERSATION.as_bytes().to_vec())
+                }
+                reads::OperatorCall::SendManagerMessage(_) => {
+                    self.v2_calls
+                        .lock()
+                        .unwrap()
+                        .push((call.method().into(), call.wire().unwrap()["params"].clone()));
+                    self.v2_send.lock().unwrap().clone()
                 }
             }
         }
@@ -1227,7 +1358,7 @@ mod tests {
     }
 
     async fn harness(client_node: &str) -> Harness {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config_path = dir.path().join("policy.toml");
         let policy = remote_policy(true);
@@ -1580,7 +1711,7 @@ mod tests {
     /// the 503 text answer (tokio `try_write` here delivered nothing).
     #[tokio::test]
     async fn busy_gateway_answers_503_text_on_a_fresh_connection() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let socket = dir.path().join("ingress.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         for _ in 0..5 {
@@ -1602,6 +1733,27 @@ mod tests {
                 bytes.extend_from_slice(&chunk[..n]);
             }
             assert_text_answer(&bytes, 503, b"service unavailable\n");
+        }
+    }
+
+    #[test]
+    fn failed_reads_are_503_busy_502_unreachable_and_their_own_class() {
+        let started = Instant::now();
+        for (error, status, retry, code) in [
+            (ReadError::Busy, 503, Some("2"), "busy"),
+            (ReadError::Timeout, 503, Some("2"), "timeout"),
+            (ReadError::Connect, 502, None, "connect"),
+            (ReadError::PeerMismatch, 502, None, "peer_mismatch"),
+            (ReadError::Malformed, 500, None, "malformed"),
+            (ReadError::Oversize, 500, None, "oversize"),
+            (ReadError::Daemon(-32603), 500, None, "daemon_error"),
+        ] {
+            let response = failed_read(Some("RemoteGetInfoV1"), error, started);
+            let (got, headers, body) = parse_response(&response.serialize());
+            assert_eq!(got, status, "{code}");
+            assert_eq!(header(&headers, "retry-after"), retry, "{code}");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], code);
         }
     }
 
@@ -1832,6 +1984,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_targets_pending_cursor_round_trips_through_http() {
+        let harness = harness(ECLIENT_NODE).await;
+        let session_token = establish_session(&harness).await;
+        let cookie = format!("__Host-rsi_remote={session_token}");
+        let mut policy = remote_policy(true);
+        policy.allow_answers = true;
+        config::write(&harness.config_path, &policy, false).unwrap();
+        let path = format!(
+            "/api/v1/projects/{PROJECT}/sessions/550e8400-e29b-41d4-a716-446655440001/decision-targets"
+        );
+        let cursor = "pending-approval:550e8400-e29b-41d4-a716-446655440002";
+        *harness.dispatch.targets.lock().unwrap() =
+            serde_json::to_vec(&serde_json::json!({"pending_next":cursor,"truncated":true}))
+                .unwrap();
+        let request = |target: &str| {
+            raw(
+                "GET",
+                target,
+                ECLIENT_IP,
+                &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+                b"",
+            )
+        };
+        let (status, _, body) = exchange(&harness, request(&path)).await;
+        assert_eq!(status, 200);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let next = response["pending_next"].as_str().unwrap();
+        *harness.dispatch.targets.lock().unwrap() =
+            br#"{"pending_items":[],"truncated":false}"#.to_vec();
+        let (status, _, body) =
+            exchange(&harness, request(&format!("{path}?pending_after={next}"))).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["truncated"],
+            false
+        );
+        let calls = harness.dispatch.target_requests.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["pending_after"], cursor);
+        let (status, _, _) =
+            exchange(&harness, request(&format!("{path}?pending_after=invalid"))).await;
+        assert_eq!(status, 403);
+        assert_eq!(harness.dispatch.operator_calls(), 2);
+    }
+
+    #[tokio::test]
     async fn answer_post_end_to_end_through_the_real_handler() {
         answer_post_handler_case(false).await;
     }
@@ -1957,7 +2155,8 @@ mod tests {
         assert_eq!(harness.dispatch.operator_calls(), 0);
         assert!(harness.audit.lines().is_empty());
 
-        // The real answer: one target read, one answer, two audit lines.
+        // Pending answers reach the daemon receipt fence directly; ordinary
+        // answers first read their current target. Both forward one answer.
         let (status, headers, reply) = exchange(&harness, post(&good, &path, &body)).await;
         assert_eq!(status, 200);
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
@@ -1966,7 +2165,10 @@ mod tests {
                 [if pending { "receipt_key" } else { "key" }],
             if pending { IDEM } else { "receipt-key" }
         );
-        assert_eq!(harness.dispatch.operator_calls(), 2);
+        assert_eq!(
+            harness.dispatch.operator_calls(),
+            if pending { 1 } else { 2 }
+        );
         let sent = harness.dispatch.answer_requests();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["project_id"], PROJECT);
@@ -2016,5 +2218,333 @@ mod tests {
             assert_eq!(status, 403, "{path}");
         }
         assert_eq!(harness.dispatch.calls(), 0);
+    }
+
+    fn write_policy(harness: &Harness, allow_messages: bool) {
+        let policy = Config {
+            allow_messages,
+            ..remote_policy(true)
+        };
+        config::write(&harness.config_path, &policy, false).unwrap();
+    }
+
+    fn message_request(
+        session_token: &str,
+        csrf: Option<&str>,
+        origin: Option<&str>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let path = format!("/api/v2/projects/{PROJECT}/managers/{V2_SEAT}/messages");
+        let length = body.len().to_string();
+        let cookie = format!("__Host-rsi_remote={session_token}");
+        let mut headers = vec![
+            ("Content-Type", "application/json"),
+            ("Content-Length", length.as_str()),
+            ("Cookie", cookie.as_str()),
+        ];
+        if let Some(csrf) = csrf {
+            headers.push(("x-rsi-csrf", csrf));
+        }
+        if let Some(origin) = origin {
+            headers.push(("Origin", origin));
+        }
+        raw("POST", &path, ECLIENT_IP, &headers, body)
+    }
+
+    const MESSAGE_BODY: &[u8] =
+        br#"{"text":"focus on the gate","idempotency_key":"550e8400-e29b-41d4-a716-446655440009"}"#;
+
+    /// The native client binding (contracts-v2): a non-browser client keeps the
+    /// CSRF and Origin protections by sending `Origin: https://<canonical_host>`
+    /// itself, taking the CSRF token from the `/auth/session` body and sending
+    /// the cookies back verbatim. It never sends Fetch Metadata headers.
+    #[tokio::test]
+    async fn native_client_binds_with_origin_and_csrf_and_reaches_every_v2_route() {
+        let harness = harness(ECLIENT_NODE).await;
+        write_policy(&harness, true);
+        let origin = format!("https://{EHOST}");
+
+        // Bootstrap: no cookie, no Origin required; the nonce is the body.
+        let (status, headers, body) = exchange(
+            &harness,
+            raw("GET", "/auth/bootstrap", ECLIENT_IP, &[], b""),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let nonce = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let boot = cookie_value(headers_all(&headers, "set-cookie")[0], session::BOOT_COOKIE);
+
+        // Session: the Origin header is mandatory (no Fetch Metadata from a
+        // native client), the boot cookie is replayed, the CSRF token is in
+        // the JSON body.
+        let body = format!("{{\"nonce\":\"{nonce}\"}}").into_bytes();
+        let session_request = |origin: Option<&str>| {
+            let length = body.len().to_string();
+            let cookie = format!("__Host-rsi_boot={boot}");
+            let mut headers = vec![
+                ("Content-Type", "application/json"),
+                ("Content-Length", length.as_str()),
+                ("Cookie", cookie.as_str()),
+            ];
+            if let Some(origin) = origin {
+                headers.push(("Origin", origin));
+            }
+            raw("POST", "/auth/session", ECLIENT_IP, &headers, &body)
+        };
+        let (status, _, _) = exchange(&harness, session_request(None)).await;
+        assert_eq!(
+            status, 403,
+            "a session without the Origin header is refused"
+        );
+        // The boot cookie is single use: bootstrap again.
+        let (_, headers, body2) = exchange(
+            &harness,
+            raw("GET", "/auth/bootstrap", ECLIENT_IP, &[], b""),
+        )
+        .await;
+        let nonce = serde_json::from_slice::<serde_json::Value>(&body2).unwrap()["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let boot = cookie_value(headers_all(&headers, "set-cookie")[0], session::BOOT_COOKIE);
+        let body = format!("{{\"nonce\":\"{nonce}\"}}").into_bytes();
+        let length = body.len().to_string();
+        let (status, headers, session_body) = exchange(
+            &harness,
+            raw(
+                "POST",
+                "/auth/session",
+                ECLIENT_IP,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Content-Length", &length),
+                    ("Cookie", &format!("__Host-rsi_boot={boot}")),
+                    ("Origin", &origin),
+                ],
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let csrf = serde_json::from_slice::<serde_json::Value>(&session_body).unwrap()["csrf"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let token = cookie_value(
+            headers_all(&headers, "set-cookie")
+                .into_iter()
+                .find(|cookie| cookie.starts_with("__Host-rsi_remote="))
+                .unwrap(),
+            session::SESSION_COOKIE,
+        );
+        let cookie = format!("__Host-rsi_remote={token}");
+
+        // v2 reads with the Origin header (and no Fetch Metadata).
+        let get = |path: &str, origin: Option<&str>| {
+            let mut headers = vec![("Cookie", cookie.as_str())];
+            if let Some(origin) = origin {
+                headers.push(("Origin", origin));
+            }
+            raw("GET", path, ECLIENT_IP, &headers, b"")
+        };
+        let (status, headers, body) =
+            exchange(&harness, get("/api/v2/projects", Some(&origin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "content-type"), Some("application/json"));
+        // The daemon's seat list plus the policy's switch (hub #2988).
+        let served = format!(
+            "{},\"messages_enabled\":true}}",
+            V2_SEATS.strip_suffix('}').unwrap()
+        );
+        assert_eq!(body, served.as_bytes());
+        let conversation = format!("/api/v2/projects/{PROJECT}/managers/{V2_SEAT}/conversation");
+        let (status, _, body) = exchange(&harness, get(&conversation, Some(&origin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, V2_CONVERSATION.as_bytes());
+        let older = format!("{conversation}?before=3:903");
+        let (status, _, _) = exchange(&harness, get(&older, Some(&origin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            harness.dispatch.v2_calls("RemoteGetManagerConversationV2")[1]["before"],
+            serde_json::json!({"sequence": 3, "id": 903})
+        );
+        // Neither an Origin nor Fetch Metadata: a read is refused.
+        let before = harness.dispatch.operator_calls();
+        let (status, _, _) = exchange(&harness, get("/api/v2/projects", None)).await;
+        assert_eq!(status, 401);
+        let (status, _, _) = exchange(
+            &harness,
+            get("/api/v2/projects", Some("https://evil.example")),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(harness.dispatch.operator_calls(), before);
+        // The browser path is unchanged: Fetch Metadata still satisfies a read.
+        let browser = raw(
+            "GET",
+            "/api/v2/projects",
+            ECLIENT_IP,
+            &[("Cookie", &cookie), ("Sec-Fetch-Site", "same-origin")],
+            b"",
+        );
+        assert_eq!(exchange(&harness, browser).await.0, 200);
+
+        // The message write: Origin, session cookie and CSRF all required.
+        let (status, _, _) = exchange(
+            &harness,
+            message_request(&token, None, Some(&origin), MESSAGE_BODY),
+        )
+        .await;
+        assert_eq!(status, 403, "no CSRF token");
+        let (status, _, _) = exchange(
+            &harness,
+            message_request(&token, Some(&csrf), None, MESSAGE_BODY),
+        )
+        .await;
+        assert_eq!(status, 403, "no Origin header");
+        let (status, _, _) = exchange(
+            &harness,
+            message_request(
+                &token,
+                Some(&csrf),
+                Some("https://evil.example"),
+                MESSAGE_BODY,
+            ),
+        )
+        .await;
+        assert_eq!(status, 403, "foreign Origin");
+        assert!(
+            harness
+                .dispatch
+                .v2_calls("RemoteSendManagerMessageV2")
+                .is_empty()
+        );
+
+        let (status, headers, body) = exchange(
+            &harness,
+            message_request(&token, Some(&csrf), Some(&origin), MESSAGE_BODY),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "content-type"), Some("application/json"));
+        assert_eq!(body, V2_RECEIPT.as_bytes());
+        assert_eq!(
+            harness.dispatch.v2_calls("RemoteSendManagerMessageV2"),
+            vec![serde_json::json!({
+                "project_id": PROJECT, "seat_session_id": V2_SEAT,
+                "text": "focus on the gate", "idempotency_key": "550e8400-e29b-41d4-a716-446655440009",
+            })]
+        );
+        let lines = harness.audit.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["result"], "receipt");
+        assert!(
+            !serde_json::to_string(&lines)
+                .unwrap()
+                .contains("focus on the gate")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_message_needs_the_switch_and_an_allowed_device_like_every_other_route() {
+        // A device outside allowed_node_ids gets the same fixed 403 as ever,
+        // before any session exists or any daemon call is made.
+        let harness_other = harness("nOTHER").await;
+        let (status, _, body) = exchange(
+            &harness_other,
+            message_request(
+                &"a".repeat(64),
+                Some(&"b".repeat(64)),
+                Some(&format!("https://{EHOST}")),
+                MESSAGE_BODY,
+            ),
+        )
+        .await;
+        assert_eq!((status, body.as_slice()), (403, FORBIDDEN_BODY));
+        let (status, _, body) = exchange(
+            &harness_other,
+            raw("GET", "/api/v2/projects", ECLIENT_IP, &[], b""),
+        )
+        .await;
+        assert_eq!((status, body.as_slice()), (403, FORBIDDEN_BODY));
+        assert_eq!(harness_other.dispatch.operator_calls(), 0);
+
+        // An allowed device with the switch off: bare 403, nothing dispatched;
+        // the switch is read per request, so flipping the file turns it on.
+        let harness = harness(ECLIENT_NODE).await;
+        let (token, csrf) = establish_session_with_csrf(&harness).await;
+        let origin = format!("https://{EHOST}");
+        let send = || message_request(&token, Some(&csrf), Some(&origin), MESSAGE_BODY);
+        let (status, _, body) = exchange(&harness, send()).await;
+        assert_eq!((status, body.as_slice()), (403, FORBIDDEN_BODY));
+        assert_eq!(harness.dispatch.operator_calls(), 0);
+        // The project list reports the same switch the send obeys (hub #2988).
+        let session_cookie = format!("__Host-rsi_remote={token}");
+        let list = || {
+            raw(
+                "GET",
+                "/api/v2/projects",
+                ECLIENT_IP,
+                &[
+                    ("Cookie", session_cookie.as_str()),
+                    ("Origin", origin.as_str()),
+                ],
+                b"",
+            )
+        };
+        let messages_enabled = |body: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()["messages_enabled"].clone()
+        };
+        let (status, _, body) = exchange(&harness, list()).await;
+        assert_eq!(status, 200);
+        assert_eq!(messages_enabled(&body), serde_json::json!(false));
+        write_policy(&harness, true);
+        let (status, _, body) = exchange(&harness, list()).await;
+        assert_eq!(status, 200);
+        assert_eq!(messages_enabled(&body), serde_json::json!(true));
+        let (status, _, _) = exchange(&harness, send()).await;
+        assert_eq!(status, 200);
+        write_policy(&harness, false);
+        let (status, _, body) = exchange(&harness, send()).await;
+        assert_eq!((status, body.as_slice()), (403, FORBIDDEN_BODY));
+        assert_eq!(
+            harness
+                .dispatch
+                .v2_calls("RemoteSendManagerMessageV2")
+                .len(),
+            1
+        );
+
+        // Framing: a wrong content type never routes (body bounds: ingress tests).
+        write_policy(&harness, true);
+        let length = MESSAGE_BODY.len().to_string();
+        let cookie = format!("__Host-rsi_remote={token}");
+        let path = format!("/api/v2/projects/{PROJECT}/managers/{V2_SEAT}/messages");
+        let (status, _, _) = exchange(
+            &harness,
+            raw(
+                "POST",
+                &path,
+                ECLIENT_IP,
+                &[
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", &length),
+                    ("Cookie", &cookie),
+                ],
+                MESSAGE_BODY,
+            ),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(
+            harness
+                .dispatch
+                .v2_calls("RemoteSendManagerMessageV2")
+                .len(),
+            1
+        );
     }
 }

@@ -9,6 +9,13 @@
 //!    per repository identity, so two roots of one repository share it).
 //!
 //! The blocking order is `Store -> custody root lock -> repository mutex`.
+//! The daemon-wide provider-cwd admission lock
+//! (`spawn_single_flight::acquire_provider_cwd_admission` / `..settlement_cwd_exclusion`)
+//! sits outside all three: `provider-cwd admission -> Store -> custody root
+//! lock -> repository mutex`. Provider launch and archive cleanup hold it while
+//! they wait for the repository mutex, so nothing may wait for it while holding
+//! any of the three (cohort settlement takes it per root, before the mutex;
+//! Issue #2081).
 //! Effect admission, retry and rotation binds, `Store` methods that take a
 //! root lock internally and adoption all acquire in that order.
 //!
@@ -137,7 +144,7 @@ pub fn set_bounded_wait_for_test(wait: Option<Duration>) {
 
 /// The typed, retryable refusal a bounded acquisition surrenders with. The
 /// caller's durable state is unchanged, so the pass is safe to retry.
-pub(crate) fn lock_order_busy_error() -> DaemonError {
+pub fn lock_order_busy_error() -> DaemonError {
     sandbox_custody_error(SandboxCustodyErrorV1 {
         version: 1,
         code: SandboxCustodyErrorCodeV1::RootBusy,
@@ -376,6 +383,35 @@ pub async fn lock_store_then_session_root(
     .await
 }
 
+/// [`lock_store_then_session_root`] with a finite `budget` (the same budget
+/// as [`lock_store_then_root_within`]). `None` means the budget expired with
+/// the stripe (or the Store) busy; nothing is held. The resume preauthentication
+/// uses this so a stripe that stays held cannot pin the Store ahead of the
+/// bounded effect admission (#1162).
+pub async fn lock_store_then_session_root_within(
+    store: &StoreMutex<Store>,
+    session_id: Uuid,
+    budget: Duration,
+) -> Option<(StoreGuard<'_, Store>, Option<CustodyRootGuard>)> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let guard = tokio::time::timeout_at(deadline, store.lock()).await.ok()?;
+        let custody_id = match guard.live_custody_for_session(session_id) {
+            Ok(custody) => custody.custody_id,
+            Err(_) => return Some((guard, None)),
+        };
+        match try_lock_custody_root(custody_id) {
+            Some(root) => return Some((guard, Some(root))),
+            None => drop(guard),
+        }
+        #[cfg(any(test, feature = "test-seam"))]
+        signal_admission_contention(custody_id);
+        if !wait_root_quiescent_until(custody_id, deadline).await {
+            return None;
+        }
+    }
+}
+
 /// [`lock_store_then_root`] for callers that learn the custody id from the
 /// Store through `resolve`, which runs under the Store guard on every attempt
 /// (a busy root lock drops the Store, so the answer is re-read). `None` returns the
@@ -427,7 +463,7 @@ mod tests {
             .status()
             .expect("git init");
         assert!(status.success());
-        let store = Store::open(&dir.path().join("lock-order.db")).expect("store");
+        let store = Store::open_test_fixture(&dir.path().join("lock-order.db")).expect("store");
         Fixture {
             _dir: dir,
             store: Arc::new(StoreMutex::new(store)),
@@ -598,7 +634,7 @@ mod tests {
             // proves it reached the busy root lock (and let go of the Store).
             let contended = admission_contention_signal(admission_custody);
             let store = Arc::clone(&f.store);
-            let mut admission = runtime.spawn(async move {
+            let admission = runtime.spawn(async move {
                 let (_store, _root) = lock_store_then_root(&store, admission_custody).await;
             });
             contended

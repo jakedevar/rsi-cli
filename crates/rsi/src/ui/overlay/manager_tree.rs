@@ -3,18 +3,19 @@
 //! a detail pane for the selected node with its action availability, and the
 //! in-tree preview, editor and confirm modals.
 
-use crate::overlay::global_manager_command::CapField;
+use crate::overlay::global_manager_command::{CapField, GrantCaps};
 use crate::overlay::manager_tree::actions::{NODE_FIELDS, availability};
 use crate::overlay::manager_tree::{
     GlobalEditor, HINTS, ManagerTreeState, NodeEditor, PendingAction, Tone, TreeModal, grant_text,
-    kind_tag, launches_text, seat_text,
+    handoff_text, kind_tag, launches_text, seat_text,
 };
-use crate::ui::theme;
+use crate::ui::{glyphs, theme};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Padding, Paragraph};
+use rsi_common::manager_budget::{BudgetCapFieldV1, BudgetNodeKindV1};
 use rsi_common::manager_tree::{ManagerTreeKindV1, ManagerTreeRowV1};
 use rsi_common::types::SessionStatus;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -375,11 +376,19 @@ fn detail_lines(state: &ManagerTreeState, width: usize) -> Vec<Line<'static>> {
         seat.push_str(&format!(" · granted by {grantor}"));
     }
     let mut scope = row.scope.clone().unwrap_or_else(|| "none".into());
+    // #2502: lead with what this node's caps govern, and for a PM the
+    // portfolio caps above it, so the two editors are never confused.
+    if let Some(budget) = budget_text(state, row) {
+        scope = format!("{budget} · {scope}");
+    }
     if let Some(grant) = grant_text(row) {
         scope.push_str(&format!(" · grant {grant}"));
     }
     if let Some(launches) = launches_text(row) {
         scope.push_str(&format!(" · {launches}"));
+    }
+    if let Some(handoff) = handoff_text(row) {
+        scope.push_str(&format!(" · {handoff}"));
     }
     let load = format!(
         "{} running · {} direct reports · {} pending escalations · {} pending decisions · {}",
@@ -435,6 +444,91 @@ fn detail_lines(state: &ManagerTreeState, width: usize) -> Vec<Line<'static>> {
             ),
         ]),
     ]
+}
+
+/// #2502: what a Portfolio or Project row's caps govern; for a project, the
+/// parent portfolio node's caps beside its own, marked when they bind first.
+fn budget_text(state: &ManagerTreeState, row: &ManagerTreeRowV1) -> Option<String> {
+    match row.kind {
+        ManagerTreeKindV1::Global | ManagerTreeKindV1::Portfolio => Some(format!(
+            "governs {} (raise: gm > b Budget)",
+            BudgetNodeKindV1::Portfolio.governs()
+        )),
+        ManagerTreeKindV1::Project => {
+            let mut text = format!("governs {}", BudgetNodeKindV1::Project.governs());
+            let parent = row
+                .parent_key
+                .as_ref()
+                .and_then(|key| state.rows.iter().find(|candidate| &candidate.key == key))
+                .and_then(|parent| parent.grant.as_ref().map(|grant| (parent, grant)));
+            if let Some((parent, caps)) = parent {
+                let own = row.grant.as_ref();
+                let project = row.project_id;
+                let fields = [
+                    (
+                        BudgetCapFieldV1::CreatedSessions,
+                        "created",
+                        f64::from(caps.max_created_sessions),
+                        own.map(|own| f64::from(own.max_created_sessions)),
+                    ),
+                    (
+                        BudgetCapFieldV1::ActiveSessions,
+                        "active",
+                        f64::from(caps.max_active_sessions),
+                        own.map(|own| f64::from(own.max_active_sessions)),
+                    ),
+                ];
+                // Remaining headroom (limit - used, each node under its own
+                // counting window) decides what binds; raw limits are the
+                // fallback when usage is unavailable and are labelled so.
+                let mut binds = false;
+                let mut usage = project.is_some() && own.is_some();
+                let mut parts = Vec::new();
+                for (field, label, parent_limit, own_limit) in fields {
+                    let by_room = state
+                        .budget
+                        .as_ref()
+                        .zip(project)
+                        .zip(parent.node_id)
+                        .zip(own_limit)
+                        .and_then(|(((budget, project), parent_id), own_limit)| {
+                            let binds = budget.parent_binds_first(
+                                (BudgetNodeKindV1::Project, project),
+                                parent_id,
+                                field,
+                                Some(own_limit),
+                            )?;
+                            let left = budget
+                                .cap_of(project, BudgetNodeKindV1::Portfolio, parent_id, field)?
+                                .headroom()?;
+                            Some((binds, left))
+                        });
+                    match by_room {
+                        Some((by_room, left)) => {
+                            binds |= by_room;
+                            parts.push(format!("{label} {parent_limit:.0} ({left:.0} left)"));
+                        }
+                        None => {
+                            usage = false;
+                            binds |= own_limit.is_some_and(|own| parent_limit < own);
+                            parts.push(format!("{label} {parent_limit:.0}"));
+                        }
+                    }
+                }
+                text.push_str(&format!(
+                    " · parent {} {}: {}",
+                    safe(&parent.label),
+                    if usage { "caps" } else { "limits" },
+                    parts.join(" · ")
+                ));
+                if binds {
+                    text.push_str(" (parent binds first; raise: gm > b Budget)");
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
 }
 
 fn count(value: Option<i64>) -> String {
@@ -740,12 +834,81 @@ fn confirm_lines(pending: &PendingAction) -> Vec<Row> {
     out
 }
 
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// #2521: whether the parent node has less room left than this node's edited
+/// cap would, by remaining headroom (`limit - used`, each node under its own
+/// counting window, ancestor-origin charges included). `None` when usage is
+/// unavailable, so the caller falls back to [`parent_binds`] on raw limits.
+fn parent_binds_by_room(editor: &GlobalEditor, field: CapField) -> Option<bool> {
+    let budget = editor.budget.as_ref()?;
+    let node = editor.node.as_ref()?;
+    let parent = node.parent_node_id?;
+    let (cap, limit) = match field {
+        CapField::Active => (
+            BudgetCapFieldV1::ActiveSessions,
+            Some(f64::from(editor.caps.max_active_sessions)),
+        ),
+        CapField::Sessions => (
+            BudgetCapFieldV1::CreatedSessions,
+            Some(f64::from(editor.caps.max_created_sessions)),
+        ),
+        CapField::Containers => (
+            BudgetCapFieldV1::CreatedContainers,
+            Some(f64::from(editor.caps.max_created_containers)),
+        ),
+        CapField::Spend => (BudgetCapFieldV1::SpendUsd, editor.caps.max_spend_usd),
+        CapField::Groups => return None,
+    };
+    budget.parent_binds_first(
+        (BudgetNodeKindV1::Portfolio, node.node_id),
+        parent,
+        cap,
+        limit,
+    )
+}
+
+/// #2502: whether the parent's `field` cap is tighter than this node's
+/// edited one (raw limits: the fallback when no usage is available).
+fn parent_binds(field: CapField, own: &GrantCaps, parent: &GrantCaps) -> bool {
+    match field {
+        CapField::Active => parent.max_active_sessions < own.max_active_sessions,
+        CapField::Sessions => parent.max_created_sessions < own.max_created_sessions,
+        CapField::Containers => parent.max_created_containers < own.max_created_containers,
+        CapField::Spend => parent
+            .max_spend_usd
+            .is_some_and(|cap| own.max_spend_usd.is_none_or(|own| cap < own)),
+        CapField::Groups => false,
+    }
+}
+
 fn global_editor_lines(editor: &GlobalEditor) -> Vec<Row> {
+    let tier = editor
+        .node
+        .as_ref()
+        .map_or("global", |node| node.tier_label.as_str());
     let mut out = vec![plain(&format!(
-        "Global grant v{} · seat {} · Space toggles a project; the caps below apply to every project manager it appoints",
+        "{} grant v{} · seat {} · Space toggles a project",
+        capitalize(tier),
         editor.grant.grant_version,
         &editor.grant.seat_session_id.to_string()[..8]
     ))];
+    // #2502: say what these caps govern, so the node editor is never
+    // mistaken for a project manager's own policy.
+    out.push((
+        format!(
+            "Governs {}: per covered project, every launch by this node, the managers under it and their workers, counted since this grant began. A PM's own policy (:manager policy) caps only that PM's launches.",
+            BudgetNodeKindV1::Portfolio.governs()
+        ),
+        Style::default()
+            .fg(theme::overlay_title())
+            .add_modifier(Modifier::BOLD),
+    ));
     let row_style = |position: usize| {
         if position == editor.cursor {
             Style::default()
@@ -761,19 +924,37 @@ fn global_editor_lines(editor: &GlobalEditor) -> Vec<Row> {
             row_style(position),
         ));
     }
-    out.push(plain(
-        "Per-project manager caps (h/l or -/+ adjust, H/L ±10)",
-    ));
+    for launch in &editor.grant.allowed_launches {
+        out.push(plain(&format!("Launch {}", launch.display())));
+    }
+    out.push(plain(&format!(
+        "Caps per covered project (h/l or -/+ adjust, H/L ±10) · {}",
+        editor.parent.as_ref().map_or_else(
+            || "no parent node: these are the top caps".to_string(),
+            |(label, _)| format!("parent {} caps beside each field", safe(label))
+        )
+    )));
     for (offset, field) in CapField::ALL.into_iter().enumerate() {
-        out.push((
-            format!(
-                "{:<24} ◂ {:>6} ▸   was {}",
-                field.label(),
-                editor.caps.describe(field),
-                editor.original_caps.describe(field)
-            ),
-            row_style(editor.projects.len() + offset),
-        ));
+        let mut text = format!(
+            "{:<24} ◂ {:>6} ▸   was {:<6}",
+            field.label(),
+            editor.caps.describe(field),
+            editor.original_caps.describe(field)
+        );
+        let mut style = row_style(editor.projects.len() + offset);
+        if let Some((_, parent)) = editor.parent.as_ref().filter(|_| field != CapField::Groups) {
+            let by_room = parent_binds_by_room(editor, field);
+            text.push_str(&format!(
+                " parent{} {}",
+                if by_room.is_some() { "" } else { " limit" },
+                parent.describe(field)
+            ));
+            if by_room.unwrap_or_else(|| parent_binds(field, &editor.caps, parent)) {
+                text.push_str(&format!(" {} parent binds first", glyphs::NEEDS_YOU));
+                style = style.fg(theme::warning_status());
+            }
+        }
+        out.push((text, style));
     }
     if let Some(error) = &editor.error {
         out.push((safe(error), Style::default().fg(theme::error_status())));

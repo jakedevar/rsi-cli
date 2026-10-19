@@ -407,3 +407,78 @@ fn test_dynamic_popup_tiny_terminal_degrades_gracefully() {
     // can't be honored.
     assert!(rect.y + rect.height <= area.y + area.height);
 }
+
+/// #2438: the text editor shows the title, the typed value and the
+/// daemon's refusal, with the keys it really answers to.
+#[test]
+fn daemon_text_editor_shows_the_path_the_reason_and_its_keys() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.overlay = crate::types::OverlayState::DaemonTextEditor {
+        field: "cold_archive_dir",
+        input: "/mnt/cold/rsi".to_string(),
+        error: Some("the archive directory resolves into the sandbox root /sbx".to_string()),
+    };
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..30)
+        .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let screen = rows.join("\n");
+    for expected in [
+        "Cold-storage directory",
+        "/mnt/cold/rsi",
+        "resolves into the sandbox root /sbx",
+        "Enter: save",
+        "Esc: cancel",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "{expected:?} is on screen:\n{screen}"
+        );
+    }
+}
+
+/// #2393: the same editor, opened on the SearXNG URL, is titled for that field
+/// and prompts for a URL.
+#[test]
+fn daemon_text_editor_is_titled_for_its_field() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.overlay = crate::types::OverlayState::DaemonTextEditor {
+        field: "harness_searxng_url",
+        input: "http://127.0.0.1:8888".to_string(),
+        error: None,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let screen: String = (0..30)
+        .map(|y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "Harness SearXNG URL",
+        "Base URL of the SearXNG instance",
+        "http://127.0.0.1:8888",
+        "type a URL",
+    ] {
+        assert!(
+            screen.contains(expected),
+            "{expected:?} is on screen:\n{screen}"
+        );
+    }
+}

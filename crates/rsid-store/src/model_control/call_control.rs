@@ -679,12 +679,12 @@ impl ModelCallSettlementWorker {
             })?
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn drain_blocking(&self) -> Result<()> {
         self.handle.drain_blocking()
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn shutdown_blocking(&self) -> Result<()> {
         self.shutdown_blocking_inner()
     }
@@ -1641,6 +1641,11 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unwritable_abandonment_releases_capacity_in_memory_and_settles_once_on_recovery() {
+        // #2172: each wait below is for an eventual state (the policy's own
+        // bound is 200 ms of retained age), so the cap only has to outlast a
+        // starved host: a full-library run on a CPU-capped laptop stalled
+        // this test past the old 5 s. A state that never arrives still fails.
+        const EVENTUALLY: Duration = Duration::from_secs(30);
         let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
         let (config, lead) = {
             let guard = store.lock().await;
@@ -1693,11 +1698,14 @@ mod tests {
         drop(settlement);
         drop(control);
 
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENTUALLY, async {
             loop {
                 let guard = store.lock().await;
                 let released = capacity_released_ids_json().contains(&invocation_id.to_string());
-                if released {
+                let retained = !lock_unpoisoned(&worker.handle.inner.state)
+                    .retained
+                    .is_empty();
+                if released && retained {
                     assert_eq!(
                         invocation_row(&guard, invocation_id).0,
                         "running",
@@ -1730,7 +1738,7 @@ mod tests {
                 .execute_batch("DROP TRIGGER fail_every_model_settlement")
                 .expect("database recovers");
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENTUALLY, async {
             loop {
                 let guard = store.lock().await;
                 let (status, error_class) = invocation_row(&guard, invocation_id);

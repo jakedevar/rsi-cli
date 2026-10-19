@@ -178,8 +178,14 @@ fn validate_markdown_table(
     match extract_table(document, marker) {
         Ok(actual) if normalize(&actual) == normalize(expected) => {}
         Ok(_) => violations.push(format!(
-            "{}: {label} Markdown drift",
-            relative(&input.repo_root, path)
+            "{}: {label} Markdown drift; regenerate the table with `rsi-model-control-validate {}` \
+             and paste it under the section marker",
+            relative(&input.repo_root, path),
+            if label == "exclusion" {
+                "--print-exclusions"
+            } else {
+                "--print"
+            }
         )),
         Err(error) => violations.push(format!("{}: {error}", relative(&input.repo_root, path))),
     }
@@ -1438,7 +1444,15 @@ fn source_file_is_test_module(path: &Path) -> bool {
         return false;
     };
     if stem != "tests" {
-        return false;
+        // Descendants inherit the declaring module's cfg(test), even when
+        // their own file contains unannotated helpers that launch processes.
+        // Prove the declaration; a directory named tests alone is not enough.
+        return path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .filter(|ancestor| ancestor.file_name().is_some_and(|name| name == "tests"))
+            .any(|ancestor| source_file_is_test_module(&ancestor.with_extension("rs")));
     }
     let Some(parent) = path.parent() else {
         return false;
@@ -1621,8 +1635,29 @@ fn validate_closed_join(
             && sink.typed_delegation
             && boundary_matches + exclusion_matches == 0;
         if boundary_matches + exclusion_matches != 1 && !compiler_closed_delegation {
+            let hint = match sink.kind {
+                PrimitiveKind::CliSpawn => {
+                    "a new utility CliSpawn needs a NON_INVOCATIONS row with \
+                    AllowedExclusionOperation::UtilityCliSpawn"
+                }
+                PrimitiveKind::HttpPost => {
+                    "a new non-model HttpPost needs a NON_INVOCATIONS row with \
+                    AllowedExclusionOperation::NonModelHttpPost"
+                }
+                _ => "register the appropriate model execution boundary",
+            };
+            let table_hint = match sink.kind {
+                PrimitiveKind::CliSpawn | PrimitiveKind::HttpPost => {
+                    "regenerate the exclusion table in thoughts/shared/reference/model-invocation-registry.md \
+                     with `cargo run -p rsid --bin rsi-model-control-validate -- --print-exclusions`; "
+                }
+                _ => "",
+            };
             violations.push(format!(
-                "{}:{}: {:?} sink joins {} contracts, expected exactly one",
+                "{}:{}: {:?} sink joins {} contracts, expected exactly one \
+                 ({hint} in crates/rsid-store/src/model_control/registry.rs; \
+                 {table_hint}see \"Model-control registry\" in \
+                 crates/rsid-store/AGENTS.md)",
                 sink.path,
                 sink.item,
                 sink.kind,
@@ -2540,8 +2575,12 @@ fn expression_constructs_process(expression: &Expr) -> bool {
         Expr::Call(call) => matches!(
             call.func.as_ref(),
             Expr::Path(path)
-                if path.path.segments.iter().any(|segment| segment.ident == "Command")
-                    && path.path.segments.last().is_some_and(|segment| segment.ident == "new")
+                if (path.path.segments.iter().any(|segment| segment.ident == "Command")
+                    && path.path.segments.last().is_some_and(|segment| segment.ident == "new"))
+                    // This factory returns an unspawned tokio Command. Track
+                    // its result through locals just like Command::new.
+                    || (path.path.segments.iter().any(|segment| segment.ident == "ScopedWorkerCommand")
+                        && path.path.segments.last().is_some_and(|segment| segment.ident == "wrap_unspawned"))
         ),
         Expr::MethodCall(call) => expression_constructs_process(&call.receiver),
         Expr::Await(awaited) => expression_constructs_process(&awaited.base),
@@ -2713,11 +2752,14 @@ fn receiver_looks_process(expression: &Expr, process_commands: &HashSet<String>)
             call.method == "bind_command"
                 || receiver_looks_process(&call.receiver, process_commands)
         }
-        Expr::Call(call) => matches!(
-            call.func.as_ref(),
-            Expr::Path(path)
-                if path.path.segments.iter().any(|segment| segment.ident == "Command")
-        ),
+        Expr::Call(call) => {
+            expression_constructs_process(expression)
+                || matches!(
+                    call.func.as_ref(),
+                    Expr::Path(path)
+                        if path.path.segments.iter().any(|segment| segment.ident == "Command")
+                )
+        }
         Expr::Try(tried) => receiver_looks_process(&tried.expr, process_commands),
         Expr::Paren(paren) => receiver_looks_process(&paren.expr, process_commands),
         _ => false,

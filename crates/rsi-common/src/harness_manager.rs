@@ -369,6 +369,9 @@ impl HarnessManagerConfigV1 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerProgressRequestV1 {
+    /// Compact text excerpts by default; full restores the detailed progress rows.
+    #[serde(default)]
+    pub fields: AgentManagerProgressFieldsV1,
     #[serde(default)]
     pub after_epic_id: Option<Uuid>,
     #[serde(default)]
@@ -378,6 +381,15 @@ pub struct AgentManagerProgressRequestV1 {
     /// daemon checks against the grant, never caller identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+}
+
+/// Text detail in a manager progress page. Paging and authority fences are unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentManagerProgressFieldsV1 {
+    #[default]
+    Compact,
+    Full,
 }
 
 impl AgentManagerProgressRequestV1 {
@@ -410,6 +422,13 @@ pub struct HarnessManagerEpicProgressV1 {
     pub lead_title: Option<String>,
     pub status: Option<SessionStatus>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// #9: when the current lead last started a real model turn (an admitted
+    /// non-helper invocation). Unlike `updated_at`, titles, ledger notices,
+    /// wake arming and metadata writes never move it; `None` means the lead
+    /// has no recorded model turn. Read it to tell a dormant lead from a busy
+    /// one without reading session events.
+    #[serde(default)]
+    pub last_model_turn_at: Option<DateTime<Utc>>,
     pub pending_question: Option<PendingQuestion>,
     pub pipeline_artifact: Option<String>,
     /// Bounded latest assistant text, not a verification or acceptance receipt.
@@ -481,6 +500,10 @@ pub struct AgentManagerInboxRequestV1 {
     pub limit: u16,
     #[serde(default)]
     pub request_id: Option<Uuid>,
+    /// Include the manager seat's outbound sends for audits. A request_id or
+    /// fields:"full" also includes them; routine reads return incoming mail.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_sent: bool,
     /// Independent cursor for notices; message paging remains unchanged.
     #[serde(default)]
     pub after_notice_sequence: i64,
@@ -489,6 +512,35 @@ pub struct AgentManagerInboxRequestV1 {
     /// Settle exact notices belonging to this seat, independently of paging.
     #[serde(default)]
     pub settle_notice_ids: Vec<Uuid>,
+    /// #3068: re-read exact retained notices of this seat, settled or not.
+    /// This read settles nothing and advances no cursor; fields chooses detail.
+    /// Unknown, retired or foreign IDs refuse the whole call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_notice_ids: Vec<Uuid>,
+    /// How much of each returned notice to carry. `compact` (default)
+    /// omits historical work_versions; `full` restores them. `summary` drops
+    /// the `state` payload for a short
+    /// `state_summary` string. Full also includes outbound manager sends.
+    /// Settlement does not depend on it.
+    #[serde(default, skip_serializing_if = "AgentManagerInboxFieldsV1::is_compact")]
+    pub fields: AgentManagerInboxFieldsV1,
+}
+
+/// The `fields` choice of an `AgentManagerInbox` read (#285).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentManagerInboxFieldsV1 {
+    #[default]
+    Compact,
+    Full,
+    Summary,
+}
+
+impl AgentManagerInboxFieldsV1 {
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if passes a reference
+    const fn is_compact(&self) -> bool {
+        matches!(self, Self::Compact)
+    }
 }
 
 impl Default for AgentManagerInboxRequestV1 {
@@ -497,9 +549,12 @@ impl Default for AgentManagerInboxRequestV1 {
             after_sequence: 0,
             limit: default_inbox_limit(),
             request_id: None,
+            include_sent: false,
             after_notice_sequence: 0,
             notice_kind: None,
             settle_notice_ids: Vec::new(),
+            read_notice_ids: Vec::new(),
+            fields: AgentManagerInboxFieldsV1::Compact,
         }
     }
 }
@@ -520,6 +575,8 @@ impl AgentManagerInboxRequestV1 {
             })
             || self.settle_notice_ids.len() > usize::from(HARNESS_MANAGER_MAX_INBOX_PAGE)
             || self.settle_notice_ids.iter().any(|id| id.is_nil())
+            || self.read_notice_ids.len() > usize::from(HARNESS_MANAGER_MAX_INBOX_PAGE)
+            || self.read_notice_ids.iter().any(|id| id.is_nil())
             || self.limit == 0
             || self.limit > HARNESS_MANAGER_MAX_INBOX_PAGE
             || self.request_id.is_some_and(|id| id.is_nil())
@@ -718,12 +775,130 @@ pub struct HarnessManagerNoticeV1 {
     pub subject_version: String,
     pub source_session_id: Option<Uuid>,
     pub recipient_session_id: Uuid,
+    /// The full payload; absent (null) on a `fields:"summary"` read (#285).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub state: serde_json::Value,
+    /// #285: set only on a `fields:"summary"` read, in place of `state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_summary: Option<String>,
     pub recorded_at: DateTime<Utc>,
     pub queued_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub retrieved_at: DateTime<Utc>,
     pub settled_at: DateTime<Utc>,
+}
+
+/// Longest `reason` text a `state_summary` carries.
+const NOTICE_SUMMARY_REASON_CHARS: usize = 120;
+/// Longest `untrusted_text` excerpt a satellite-report `state_summary` carries (#326).
+const NOTICE_SUMMARY_UNTRUSTED_CHARS: usize = 240;
+
+impl HarnessManagerNoticeV1 {
+    /// Omit the repeated historical work-version list, retaining the notice's
+    /// identity, live state and row version. Full retrieval remains available.
+    #[must_use]
+    pub fn into_compact(mut self) -> Self {
+        fn omit_versions(state: &mut serde_json::Value) {
+            if let Some(object) = state.as_object_mut() {
+                if let Some(versions) = object.remove("work_versions") {
+                    object.insert(
+                        "work_versions_count".into(),
+                        serde_json::json!(versions.as_array().map_or(0, Vec::len)),
+                    );
+                }
+            }
+        }
+        omit_versions(&mut self.state);
+        if let Some(payload) = self.state.get_mut("payload") {
+            omit_versions(payload);
+        }
+        self
+    }
+
+    /// #285: the summary form of this notice: `state` dropped, a short
+    /// `state_summary` in its place. Pure projection; settlement is unchanged.
+    #[must_use]
+    pub fn into_summary(mut self) -> Self {
+        let summary = self.summary_text();
+        self.state = serde_json::Value::Null;
+        self.state_summary = Some(summary);
+        self
+    }
+
+    fn summary_text(&self) -> String {
+        let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+        let record_kind = text(&self.state["record_kind"]).unwrap_or_else(|| self.kind.clone());
+        let parts: Vec<String> = match self.kind.as_str() {
+            "ledger_change" if record_kind == "satellite_report" => self.satellite_report_parts(),
+            "ledger_change" if record_kind == "qa_issue" => {
+                self.scalar_parts(&["issue_number", "outcome", "rolling_sha"])
+            }
+            "ledger_change" if record_kind == "worker_context_cap" => {
+                self.scalar_parts(&["trigger", "issue_display_number", "measured_tokens", "cap"])
+            }
+            "ledger_change" => {
+                let payload = &self.state["payload"];
+                [
+                    text(&payload["state"]).map(|value| format!("state={value}")),
+                    text(&payload["reason"]).map(|value| {
+                        let reason: String =
+                            value.chars().take(NOTICE_SUMMARY_REASON_CHARS).collect();
+                        format!("reason={reason}")
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            }
+            "action_result" => [
+                ("action_kind", &self.state["action_kind"]),
+                ("state", &self.state["state"]),
+                ("outcome", &self.state["outcome"]),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| text(value).map(|value| format!("{name}={value}")))
+            .collect(),
+            _ => Vec::new(),
+        };
+        if parts.is_empty() {
+            return record_kind;
+        }
+        parts.join(" ")
+    }
+
+    /// #326: `name=value` for each listed top-level scalar the payload carries,
+    /// so an actionable notice's key facts survive a summary drain.
+    fn scalar_parts(&self, names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .filter_map(|name| {
+                let value = match &self.state[*name] {
+                    serde_json::Value::String(text) => text.clone(),
+                    serde_json::Value::Number(number) => number.to_string(),
+                    _ => return None,
+                };
+                Some(format!("{name}={value}"))
+            })
+            .collect()
+    }
+
+    /// #326: a satellite report's kind, peer and a bounded, clearly untrusted
+    /// excerpt of its text, so a summary drain never needs SQL.
+    fn satellite_report_parts(&self) -> Vec<String> {
+        let mut parts = self.scalar_parts(&["report_kind", "peer_label"]);
+        let Some(text) = self.state["untrusted_text"].as_str() else {
+            return parts;
+        };
+        let excerpt: String = text.chars().take(NOTICE_SUMMARY_UNTRUSTED_CHARS).collect();
+        let ellipsis = if excerpt.len() < text.len() {
+            "..."
+        } else {
+            ""
+        };
+        parts.push("untrusted=true informational_only=true".to_owned());
+        parts.push(format!("untrusted_excerpt={excerpt:?}{ellipsis}"));
+        parts
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,6 +1098,161 @@ mod tests {
     }
     use serde_json::json;
 
+    fn notice_with(kind: &str, state: serde_json::Value) -> HarnessManagerNoticeV1 {
+        let now = Utc::now();
+        HarnessManagerNoticeV1 {
+            notice_id: Uuid::new_v4(),
+            sequence: 9,
+            epic_id: Some(Uuid::new_v4()),
+            direction: "to_manager".into(),
+            kind: kind.into(),
+            subject_id: "intent:abc".into(),
+            subject_version: "4".into(),
+            source_session_id: Some(Uuid::new_v4()),
+            recipient_session_id: Uuid::new_v4(),
+            state,
+            state_summary: None,
+            recorded_at: now,
+            queued_at: now,
+            delivered_at: None,
+            retrieved_at: now,
+            settled_at: now,
+        }
+    }
+
+    #[test]
+    fn inbox_defaults_to_compact_and_summary_notices_carry_a_short_state_summary_285() {
+        let request: AgentManagerInboxRequestV1 = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(request.fields, AgentManagerInboxFieldsV1::Compact);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("fields")
+                .is_none()
+        );
+        let summary: AgentManagerInboxRequestV1 =
+            serde_json::from_value(json!({"fields": "summary"})).unwrap();
+        assert_eq!(summary.fields, AgentManagerInboxFieldsV1::Summary);
+        assert!(
+            serde_json::from_value::<AgentManagerInboxRequestV1>(json!({"fields": "tiny"}))
+                .is_err()
+        );
+
+        let state =
+            json!({"record_kind":"intent","payload":{"state":"stale_lead","reason":"r","x":[1]}});
+        let full = notice_with("ledger_change", state.clone());
+        assert_eq!(serde_json::to_value(&full).unwrap()["state"], state);
+        let ledger = full.into_summary();
+        assert_eq!(
+            ledger.state_summary.as_deref(),
+            Some("state=stale_lead reason=r")
+        );
+        let wire = serde_json::to_value(&ledger).unwrap();
+        assert!(wire.get("state").is_none());
+        assert_eq!(wire["state_summary"], "state=stale_lead reason=r");
+        assert_eq!(wire["subject_id"], "intent:abc");
+        assert_eq!(wire["subject_version"], "4");
+
+        let action = notice_with(
+            "action_result",
+            json!({"action_kind":"pause_lead","state":"succeeded","outcome":"lead_committed"}),
+        )
+        .into_summary();
+        assert_eq!(
+            action.state_summary.as_deref(),
+            Some("action_kind=pause_lead state=succeeded outcome=lead_committed")
+        );
+        let other =
+            notice_with("message", json!({"record_kind":"message","body":"b"})).into_summary();
+        assert_eq!(other.state_summary.as_deref(), Some("message"));
+        let bare = notice_with("session_state", json!({"x":1})).into_summary();
+        assert_eq!(bare.state_summary.as_deref(), Some("session_state"));
+        let bare_ledger =
+            notice_with("ledger_change", json!({"record_kind":"work","payload":{}})).into_summary();
+        assert_eq!(bare_ledger.state_summary.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn compact_notice_bounds_historical_work_versions_and_preserves_live_state() {
+        let versions: Vec<_> = (0..4096)
+            .map(|n| json!({"key":format!("work-{n}"),"version":n,"integrated":true}))
+            .collect();
+        let notice = notice_with(
+            "ledger_change",
+            json!({"record_kind":"intent","payload":{"state":"ready","active":["worker"],"work_versions":versions}}),
+        );
+        let full = serde_json::to_vec(&notice).unwrap().len();
+        let compact = notice.clone().into_compact();
+        assert_eq!(compact.notice_id, notice.notice_id);
+        assert_eq!(compact.subject_version, notice.subject_version);
+        assert_eq!(compact.state["payload"]["state"], "ready");
+        assert_eq!(compact.state["payload"]["active"], json!(["worker"]));
+        assert_eq!(compact.state["payload"]["work_versions_count"], 4096);
+        assert_eq!(
+            notice.state["payload"]["work_versions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4096
+        );
+        let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+        assert!(compact_bytes < 2048);
+        assert!(full > compact_bytes * 100);
+        eprintln!(
+            "bootstrap inbox notice: before={full} after={compact_bytes} bytes (tokens~=bytes/4)"
+        );
+        let request: AgentManagerProgressRequestV1 = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(request.fields, AgentManagerProgressFieldsV1::Compact);
+        assert!(
+            serde_json::from_value::<AgentManagerProgressRequestV1>(json!({"fields":"full"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn summary_keeps_actionable_notice_payloads_326() {
+        let report = |text: String| {
+            notice_with(
+                "ledger_change",
+                json!({"record_kind":"satellite_report","report_kind":"RESULT",
+                    "peer_label":"mac-mini","untrusted":true,"untrusted_text":text}),
+            )
+            .into_summary()
+            .state_summary
+            .expect("summary")
+        };
+        let long = report("x".repeat(300));
+        assert!(long.starts_with("report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_excerpt=\""));
+        assert!(long.ends_with("\"..."));
+        assert!(long.contains(&"x".repeat(240)));
+        assert!(!long.contains(&"x".repeat(241)));
+        // Truncation is on a char boundary, not a byte offset.
+        assert!(report("é".repeat(300)).contains(&"é".repeat(240)));
+        assert_eq!(
+            report("ok".into()),
+            "report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_excerpt=\"ok\""
+        );
+        let qa = notice_with(
+            "ledger_change",
+            json!({"record_kind":"qa_issue","issue_number":7,"outcome":"red","rolling_sha":"abc"}),
+        )
+        .into_summary();
+        assert_eq!(
+            qa.state_summary.as_deref(),
+            Some("issue_number=7 outcome=red rolling_sha=abc")
+        );
+        let cap = notice_with(
+            "ledger_change",
+            json!({"record_kind":"worker_context_cap","trigger":"soft",
+                "issue_display_number":9,"measured_tokens":5,"cap":4}),
+        )
+        .into_summary();
+        assert_eq!(
+            cap.state_summary.as_deref(),
+            Some("trigger=soft issue_display_number=9 measured_tokens=5 cap=4")
+        );
+    }
+
     #[test]
     fn legacy_inbox_result_decodes_without_notice_fields() {
         let result: AgentManagerInboxResultV1 = serde_json::from_value(json!({
@@ -953,6 +1283,8 @@ mod tests {
             json!({"notice_kind": "unknown"}),
             json!({"settle_notice_ids": [Uuid::nil()]}),
             json!({"settle_notice_ids": vec![Uuid::new_v4(); 33]}),
+            json!({"read_notice_ids": [Uuid::nil()]}),
+            json!({"read_notice_ids": vec![Uuid::new_v4(); 33]}),
         ] {
             let invalid: AgentManagerInboxRequestV1 = serde_json::from_value(value).unwrap();
             assert_eq!(invalid.validate(), Err("manager_invalid_inbox_page"));

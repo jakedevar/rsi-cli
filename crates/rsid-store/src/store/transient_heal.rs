@@ -21,16 +21,23 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::Store;
+use super::capacity_recovery::BACKOFF_SECONDS;
 use super::manager_actions::RecoveryOwnerMode;
 use super::scheduled_jobs::continuation_backoff_seconds;
 use crate::error::Result;
 use crate::model_control::transient_heal::{
-    HealIneligible, TransientHealObservation, TransientVerdict,
+    HealIneligible, PROVIDER_CAPACITY_HEAL_REASON, TransientHealObservation, TransientVerdict,
     classify_transient_failure_with_stop, heal_eligibility,
 };
 
 /// The Issue #1015 budget includes both provider failures and refused heals.
 pub const TRANSIENT_HEAL_MAX_ATTEMPTS: u32 = 8;
+/// Same-session resumes of a provider-capacity failure before the daemon gives
+/// up on the model (#2109). Their backoff is #123's table (60 s, 120 s, 240 s):
+/// capacity is the provider's, so waiting long on one model costs more than
+/// switching. Past this bound an Issue-bound worker is relaunched on the next
+/// allowed launch (`issue_worker_capacity`).
+pub const CAPACITY_RESUME_MAX_ATTEMPTS: u32 = 3;
 const TRANSIENT_HEAL_WINDOW_MINUTES: i64 = 60;
 const RECENT_ERROR_TEXT_EVENTS: i64 = 3;
 const RECENT_ERROR_TEXT_CHARS: usize = 512;
@@ -77,6 +84,20 @@ impl TransientHealV1 {
     }
 }
 
+/// The state of a session's provider-capacity heal (#2109), read off its
+/// Resume job. Only meaningful while the session's current failure is a
+/// capacity failure; the caller checks the stop reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityResumeState {
+    /// Same-session resumes armed so far (the bound is `max_attempts`).
+    pub attempts: u32,
+    pub max_attempts: u32,
+    /// The bound is spent: the daemon will not resume this session again.
+    pub exhausted: bool,
+    /// When the armed resume fires; `None` when no resume is armed.
+    pub pending_until: Option<DateTime<Utc>>,
+}
+
 /// One scheduled (or exhausted) heal, for the owner notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealSchedule {
@@ -101,6 +122,45 @@ pub enum TransientHealOutcome {
     /// A pause or capacity refusal re-armed the wake without spending budget.
     Deferred(HealSchedule),
     Exhausted(HealSchedule),
+}
+
+/// The attempt bound and backoff of one heal `reason`.
+fn heal_budget(reason: &str) -> (u32, impl Fn(u32) -> i64) {
+    let capacity = reason == PROVIDER_CAPACITY_HEAL_REASON;
+    let max = if capacity {
+        CAPACITY_RESUME_MAX_ATTEMPTS
+    } else {
+        TRANSIENT_HEAL_MAX_ATTEMPTS
+    };
+    (max, move |attempt: u32| {
+        if capacity {
+            let step = usize::try_from(attempt.saturating_sub(1)).unwrap_or(usize::MAX);
+            BACKOFF_SECONDS[step.min(BACKOFF_SECONDS.len() - 1)]
+        } else {
+            continuation_backoff_seconds(attempt)
+        }
+    })
+}
+
+/// The resume prompt the daemon sends a healed session.
+fn heal_message(reason: &str, attempt: u32, max: u32) -> String {
+    if reason == PROVIDER_CAPACITY_HEAL_REASON {
+        format!(
+            "capacity: resumed. The provider reported the selected model at capacity (resume {attempt}/{max}); the daemon resumes this session on the same model. Continue your work where you left off."
+        )
+    } else {
+        format!("Resuming after a transient failure (attempt {attempt}/{max}): {reason}.")
+    }
+}
+
+/// The one-line manager-notice summary of a heal (#2109 names capacity).
+fn heal_notice_note(reason: &str, scheduled: bool) -> &'static str {
+    match (reason == PROVIDER_CAPACITY_HEAL_REASON, scheduled) {
+        (true, true) => "capacity: resumed",
+        (true, false) => "capacity: resume bound spent",
+        (false, true) => "transient failure: resumed",
+        (false, false) => "transient failure: heal budget spent",
+    }
 }
 
 /// Deterministic per-session heal job id.
@@ -134,6 +194,38 @@ impl Store {
                     .map_err(|error| crate::error::DaemonError::Store(error.to_string()))
             })
             .transpose()
+    }
+
+    /// The provider-capacity heal of `session_id` (#2109): its attempts, whether
+    /// its bound is spent and, while a resume is armed, when it fires. `None`
+    /// when the session never had a capacity heal.
+    pub fn capacity_resume_state(&self, session_id: Uuid) -> Result<Option<CapacityResumeState>> {
+        let row: Option<(bool, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT enabled, next_fire_at, json_extract(schedule_json,'$.transient_heal')
+                 FROM scheduled_jobs
+                 WHERE wake_session_id=?1 AND wake_mode='resume' AND json_valid(schedule_json)
+                   AND json_type(schedule_json,'$.transient_heal')='object'
+                   AND json_extract(schedule_json,'$.transient_heal.last_reason')=?2
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![session_id.to_string(), PROVIDER_CAPACITY_HEAL_REASON],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((enabled, next_fire_at, state)) = row else {
+            return Ok(None);
+        };
+        let state: TransientHealV1 = serde_json::from_str(&state)
+            .map_err(|error| crate::error::DaemonError::Store(error.to_string()))?;
+        Ok(Some(CapacityResumeState {
+            attempts: state.attempts,
+            max_attempts: CAPACITY_RESUME_MAX_ATTEMPTS,
+            exhausted: state.exhausted,
+            pending_until: (enabled && !state.exhausted)
+                .then(|| parse_rfc3339(&next_fire_at))
+                .flatten(),
+        }))
     }
 
     fn transient_heal_observation(&self, session: &Session) -> Result<TransientHealObservation> {
@@ -361,7 +453,7 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<TransientHealOutcome> {
         let attempt = previous.attempts.max(1);
-        let not_before = now + chrono::Duration::seconds(continuation_backoff_seconds(attempt));
+        let not_before = now + chrono::Duration::seconds(heal_budget(reason).1(attempt));
         let mut state = previous.clone();
         state.paused_at.get_or_insert_with(|| rfc3339(now));
         let state_json = serde_json::to_string(&state)
@@ -384,7 +476,7 @@ impl Store {
             session_id,
             job_id,
             attempt,
-            max_attempts: TRANSIENT_HEAL_MAX_ATTEMPTS,
+            max_attempts: heal_budget(reason).0,
             not_before: Some(not_before),
             reason: reason.to_string(),
             owner_session_id: previous.owner_session_id,
@@ -432,11 +524,12 @@ impl Store {
         }
         let attempt = previous.as_ref().map_or(0, |state| state.attempts) + 1;
         let owner = session.parent_id;
+        let (max_attempts, backoff_seconds) = heal_budget(reason);
         let mut schedule = HealSchedule {
             session_id,
             job_id,
             attempt,
-            max_attempts: TRANSIENT_HEAL_MAX_ATTEMPTS,
+            max_attempts,
             not_before: None,
             reason: reason.to_string(),
             owner_session_id: owner,
@@ -447,7 +540,7 @@ impl Store {
             &self.conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        if attempt > TRANSIENT_HEAL_MAX_ATTEMPTS
+        if attempt > max_attempts
             || now - first_failed_at >= chrono::Duration::minutes(TRANSIENT_HEAL_WINDOW_MINUTES)
         {
             tx.execute(
@@ -461,16 +554,17 @@ impl Store {
                 "transient_heal_exhausted",
                 &json!({
                     "attempt": attempt,
-                    "max_attempts": TRANSIENT_HEAL_MAX_ATTEMPTS,
+                    "max_attempts": max_attempts,
                     "reason": reason,
                     "next_action": "retry_lead",
+                    "note": heal_notice_note(reason, false),
                 }),
             )?;
             tx.commit()?;
             return Ok(TransientHealOutcome::Exhausted(schedule));
         }
 
-        let not_before = now + chrono::Duration::seconds(continuation_backoff_seconds(attempt));
+        let not_before = now + chrono::Duration::seconds(backoff_seconds(attempt));
         let state = TransientHealV1 {
             attempts: attempt,
             first_failed_at: rfc3339(first_failed_at),
@@ -482,9 +576,7 @@ impl Store {
         };
         let state_json = serde_json::to_string(&state)
             .map_err(|error| crate::error::DaemonError::Store(error.to_string()))?;
-        let message = format!(
-            "Resuming after a transient failure (attempt {attempt}/{TRANSIENT_HEAL_MAX_ATTEMPTS}): {reason}."
-        );
+        let message = heal_message(reason, attempt, max_attempts);
         let updated = tx.execute(
             "UPDATE scheduled_jobs
              SET enabled=1, next_fire_at=?2, updated_at=?3, message=?4, wake_session_id=?6,
@@ -536,9 +628,10 @@ impl Store {
             &format!("transient_heal_scheduled:{attempt}"),
             &json!({
                 "attempt": attempt,
-                "max_attempts": TRANSIENT_HEAL_MAX_ATTEMPTS,
+                "max_attempts": max_attempts,
                 "not_before": rfc3339(not_before),
                 "reason": reason,
+                "note": heal_notice_note(reason, true),
             }),
         )?;
         tx.commit()?;

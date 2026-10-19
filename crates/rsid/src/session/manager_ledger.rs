@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use uuid::Uuid;
 pub(crate) mod git;
+mod job_evidence;
 
 /// Accepted-content refusals observed while integrating work. Recording one
 /// stops the persisted Execute intent from treating the work as ready.
@@ -83,6 +84,7 @@ impl AgentControlHandle {
         let store = self.store.lock().await;
         let mut result = store.manager_v2_inspect(caller, &request)?;
         if result.section != ManagerInspectSectionV2::Work {
+            self.overlay_live_rotation_readiness(&mut result);
             // These pages perform no filesystem work. Keep authorization,
             // observation and answer retrieval in one Store-lock interval;
             // a queued update belongs to the next snapshot, not a failed read.
@@ -108,6 +110,7 @@ impl AgentControlHandle {
         let store = self.store.lock().await;
         let mut result = store.manager_v2_inspect_operator(request.project_id, &request.query)?;
         if result.section != ManagerInspectSectionV2::Work {
+            self.overlay_live_rotation_readiness(&mut result);
             return Ok(result);
         }
         drop(store);
@@ -120,6 +123,20 @@ impl AgentControlHandle {
         }
         check_witnesses(&store, &result, &witnesses)?;
         Ok(result)
+    }
+    /// Overview readiness must agree with admission, which also honours the
+    /// live RuntimeConfig value (UpdateDaemonConfig publishes it before it
+    /// persists). The Store cannot see that value, so a persisted-absent
+    /// setting with rotation off reads `eligible` there; deny it here with the
+    /// same typed readiness the Store gives a persisted-off setting.
+    fn overlay_live_rotation_readiness(&self, result: &mut ManagerInspectionV2) {
+        let Some(config) = self.runtime_config.as_ref() else {
+            return;
+        };
+        let live_enabled = config
+            .context_rotation_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        overlay_live_rotation_rows(&mut result.rows, live_enabled);
     }
     async fn manager_inspection_freshness(
         &self,
@@ -478,6 +495,21 @@ impl AgentControlHandle {
         context: &LedgerObservationContext,
         request: &AgentManagerUpdateRequestV2,
     ) -> Result<LedgerObservation> {
+        // A caller-owned job reference names no session: it never reaches the
+        // source-session observation below.
+        if let ManagerUpdateV2::Stage {
+            job_evidence: Some(job),
+            ..
+        } = &request.change
+        {
+            return self
+                .observe_job_evidence(
+                    context.authority.caller,
+                    context.authority.config.project_id,
+                    job,
+                )
+                .await;
+        }
         let (evidence, integration) = match &request.change {
             ManagerUpdateV2::Stage {
                 evidence: Some(e), ..
@@ -1090,6 +1122,9 @@ const fn requires_work_version_match(change: &ManagerUpdateV2) -> bool {
         ManagerUpdateV2::Stage {
             evidence: Some(_),
             ..
+        } | ManagerUpdateV2::Stage {
+            job_evidence: Some(_),
+            ..
         } | ManagerUpdateV2::Integration { .. }
             | ManagerUpdateV2::Migration { .. }
             | ManagerUpdateV2::MigrationSeal { .. }
@@ -1154,6 +1189,44 @@ fn validate_work_bundle(
 mod remote_tests;
 #[cfg(test)]
 mod tests;
+
+/// Rewrites an `eligible` `manager_control` row to the shared typed
+/// `context_rotation_disabled` denial when the live rotation choice is off.
+/// Other rows, `ineligible` rows, a row with an `unresolved_operation_id` and an
+/// enabled live choice are untouched.
+fn overlay_live_rotation_rows(rows: &mut [Value], live_enabled: bool) {
+    if live_enabled {
+        return;
+    }
+    for row in rows.iter_mut() {
+        if row["type"] != "manager_control" || row["eligibility"] != "eligible" {
+            continue;
+        }
+        // An in-flight succession keeps its pointer: a denial carries none.
+        if !row["unresolved_operation_id"].is_null() {
+            continue;
+        }
+        let ids = (
+            serde_json::from_value::<Uuid>(row["logical_manager_session_id"].clone()),
+            serde_json::from_value::<Uuid>(row["current_session_id"].clone()),
+        );
+        let (Ok(logical), Ok(current)) = ids else {
+            continue;
+        };
+        let Ok(Value::Object(denied)) = serde_json::to_value(
+            ManagerSuccessionPreflightV2::rotation_disabled(logical, current),
+        ) else {
+            continue;
+        };
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        // No fence is published with a denial.
+        object.remove("expected");
+        object.remove("unresolved_operation_id");
+        object.extend(denied);
+    }
+}
 
 fn inspection_fence(result: &ManagerInspectionV2) -> Result<Value> {
     Ok(

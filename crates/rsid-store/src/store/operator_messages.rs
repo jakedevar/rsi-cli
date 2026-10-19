@@ -10,6 +10,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 // Provisional V<next> for #929. Seal after #888's V138 allocation.
+#[cfg(test)]
 pub(crate) const PROVISIONAL_VERSION: i32 = 142;
 
 pub(crate) fn apply_migration(store: &Store, version: i32) -> Result<()> {
@@ -168,6 +169,35 @@ impl Store {
         Ok(messages)
     }
 
+    /// The newest `limit` operator messages of a session with their delivery
+    /// state, newest first and without their text (#2962, the phone's
+    /// delivery view). Read only.
+    pub fn recent_operator_message_states(
+        &self,
+        session_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<rsi_common::remote_manager_v2::OperatorMessageStateV2>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{SELECT} WHERE session_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2"
+        ))?;
+        let messages = statement
+            .query_map(params![session_id.to_string(), i64::from(limit)], row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages
+            .into_iter()
+            .map(
+                |message| rsi_common::remote_manager_v2::OperatorMessageStateV2 {
+                    message_id: message.id,
+                    state: message.state,
+                    created_at: message.created_at,
+                    updated_at: message.updated_at,
+                    delivered_at: message.delivered_at,
+                    text_len: u32::try_from(message.original_content.len()).unwrap_or(u32::MAX),
+                },
+            )
+            .collect())
+    }
+
     pub fn edit_operator_message(&mut self, id: Uuid, content: &str) -> Result<OperatorMessage> {
         valid_content(content)?;
         let changed = self.conn.execute(
@@ -229,15 +259,6 @@ impl Store {
         };
         tx.commit()?;
         Ok(message)
-    }
-
-    pub(crate) fn has_queued_operator_message(&self, session_id: Uuid) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM operator_messages WHERE session_id=?1 AND state='queued'",
-            [session_id.to_string()],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
     }
 
     /// Persist the last recoverable boundary before invoking a provider. A
@@ -411,7 +432,7 @@ mod tests {
     fn operator_queue_edit_withdraw_and_restart_preserve_fifo() {
         let directory = tempfile::tempdir().expect("test directory");
         let path = directory.path().join("operator-messages.db");
-        let mut store = Store::open(&path).expect("open store");
+        let mut store = Store::open_test_fixture(&path).expect("open store");
         let mut session = make_test_session();
         session.status = SessionStatus::Running;
         store.insert_session(&session).expect("insert session");
@@ -499,7 +520,7 @@ mod tests {
     fn terminal_cli_pre_effect_claim_requeues_after_restart() {
         let directory = tempfile::tempdir().expect("test directory");
         let path = directory.path().join("terminal-operator-message.db");
-        let mut store = Store::open(&path).expect("open store");
+        let mut store = Store::open_test_fixture(&path).expect("open store");
         let mut session = make_test_session();
         session.status = SessionStatus::Running;
         store.insert_session(&session).expect("insert session");
@@ -600,7 +621,7 @@ mod tests {
     fn post_effect_crash_preserves_uncertainty_and_blocks_replay() {
         let directory = tempfile::tempdir().expect("test directory");
         let path = directory.path().join("operator-post-effect.db");
-        let mut store = Store::open(&path).expect("open store");
+        let mut store = Store::open_test_fixture(&path).expect("open store");
         let mut session = make_test_session();
         session.status = SessionStatus::Completed;
         store.insert_session(&session).expect("insert session");

@@ -1,7 +1,7 @@
 //! Bounded exact-byte discovery. Watch events are only hints; this scan is the
 //! authority for each complete staged inventory.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use rsi_codegraph::{
     SourceFile,
@@ -18,6 +18,21 @@ pub struct Discovery {
     pub files: Vec<SourceFile>,
     pub digest: String,
     pub bytes: usize,
+    /// Symlinked source paths left out of the inventory, sorted by path.
+    pub skipped_symlinks: Vec<SkippedSymlink>,
+}
+
+/// A symlinked path with an indexed extension. The link is never read or
+/// followed: only the link itself is inspected, so a skip can neither leak a
+/// target's bytes nor fail the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSymlink {
+    pub relative_path: String,
+    /// Whether the recorded target stays under the registered root, judged
+    /// lexically from the link text. An in-root alias such as
+    /// `CLAUDE.md -> AGENTS.md` is expected; an outside target is worth a
+    /// look. This classifies the skip and never authorizes a read.
+    pub target_within_root: bool,
 }
 
 fn include_file(path: &Path) -> bool {
@@ -41,12 +56,42 @@ fn skip_entry(entry: &walkdir::DirEntry) -> bool {
             .is_some_and(|name| IGNORED_DIRS.contains(&name))
 }
 
+/// Resolve the link text without touching what it names: read the link
+/// itself, join a relative target onto the link's directory and fold `.`/`..`
+/// lexically. A target that climbs above the filesystem root is outside.
+fn link_target_within_root(root: &Path, link: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        link.parent().unwrap_or(root).join(target)
+    };
+    let mut folded = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::ParentDir => {
+                if !folded.pop() {
+                    return false;
+                }
+            }
+            Component::CurDir => {}
+            other => folded.push(other.as_os_str()),
+        }
+    }
+    folded.starts_with(root)
+}
+
 /// Scan only regular source files inside the canonical registered root.
-/// Symlinked source paths fail closed, including links that point back inside.
+/// A symlinked source path is skipped and recorded, one path at a time, so a
+/// repository that tracks `CLAUDE.md -> AGENTS.md` still indexes. A root or
+/// directory swapped during the scan still fails closed.
 pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
     // A registered root can disappear or be replaced while the daemon runs.
     workspace.validate_current_root()?;
     let mut files = Vec::new();
+    let mut skipped_symlinks = Vec::new();
     let mut total_bytes = 0usize;
     let mut entry_count = 0usize;
     let walker = WalkDir::new(&workspace.root)
@@ -62,9 +107,16 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(IndexError::UnsafeWorkspace(
-                "source path is a symlink".into(),
-            ));
+            skipped_symlinks.push(SkippedSymlink {
+                relative_path: entry
+                    .path()
+                    .strip_prefix(&workspace.root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                target_within_root: link_target_within_root(&workspace.root, entry.path()),
+            });
+            continue;
         }
         if !entry.file_type().is_file() {
             continue;
@@ -125,6 +177,7 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
         });
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    skipped_symlinks.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     let bytes = files.iter().map(|file| file.bytes.len()).sum();
     if bytes > MAX_STAGED_SOURCE_BYTES {
         return Err(IndexError::DiscoveryLimit("source bytes"));
@@ -136,10 +189,19 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
         hasher.update(file.relative_path.as_bytes());
         hasher.update(blake3::hash(&file.bytes).as_bytes());
     }
+    // A tree with no links hashes exactly as before. Mixing the skips in
+    // otherwise lets a new link reach the publish fence and refresh the count.
+    for link in &skipped_symlinks {
+        hasher.update(b"skipped-symlink");
+        hasher.update(&(link.relative_path.len() as u64).to_le_bytes());
+        hasher.update(link.relative_path.as_bytes());
+        hasher.update(&[u8::from(link.target_within_root)]);
+    }
     Ok(Discovery {
         files,
         digest: hasher.finalize().to_hex().to_string(),
         bytes,
+        skipped_symlinks,
     })
 }
 
@@ -167,16 +229,97 @@ mod tests {
     #[cfg(unix)]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn symlinked_source_is_rejected() {
+    fn symlinked_sources_are_skipped_and_recorded_without_following() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.rs"), "secret").unwrap();
-        std::os::unix::fs::symlink(
-            outside.path().join("secret.rs"),
-            root.path().join("link.rs"),
-        )
-        .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "# agents\n").unwrap();
+        std::fs::create_dir_all(root.path().join("crates/rsid")).unwrap();
+        std::fs::write(root.path().join("crates/rsid/AGENTS.md"), "# rsid\n").unwrap();
+        std::fs::write(outside.path().join("secret.md"), "SECRET-OUTSIDE-BYTES").unwrap();
+        std::fs::create_dir(outside.path().join("docs")).unwrap();
+        std::fs::write(outside.path().join("docs/leak.md"), "LEAK").unwrap();
+        // In-root alias, nested in-root alias, out-of-root file, dangling link
+        // and a linked directory: none may be read, followed or descended.
+        std::os::unix::fs::symlink("AGENTS.md", root.path().join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.path().join("crates/rsid/CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), root.path().join("x.md"))
+            .unwrap();
+        std::os::unix::fs::symlink("missing-target.md", root.path().join("dangling.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("docs"), root.path().join("linked-docs"))
+            .unwrap();
+
         let workspace = RegisteredWorkspace::primary(Uuid::new_v4(), root.path()).unwrap();
+        let found = discover(&workspace).unwrap();
+
+        let paths = found
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["AGENTS.md", "crates/rsid/AGENTS.md"]);
+        assert!(
+            found
+                .files
+                .iter()
+                .all(|file| !file.bytes.windows(4).any(|w| w == b"LEAK" || w == b"SECR")),
+            "a skipped link's target bytes entered the inventory"
+        );
+        assert_eq!(
+            found.skipped_symlinks,
+            [
+                SkippedSymlink {
+                    relative_path: "CLAUDE.md".into(),
+                    target_within_root: true,
+                },
+                SkippedSymlink {
+                    relative_path: "crates/rsid/CLAUDE.md".into(),
+                    target_within_root: true,
+                },
+                SkippedSymlink {
+                    relative_path: "dangling.md".into(),
+                    target_within_root: true,
+                },
+                SkippedSymlink {
+                    relative_path: "x.md".into(),
+                    target_within_root: false,
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn skipped_symlinks_change_the_digest_only_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "# agents\n").unwrap();
+        let workspace = RegisteredWorkspace::primary(Uuid::new_v4(), root.path()).unwrap();
+        let plain = discover(&workspace).unwrap();
+        assert!(plain.skipped_symlinks.is_empty());
+        assert_eq!(plain.digest, discover(&workspace).unwrap().digest);
+
+        std::os::unix::fs::symlink("AGENTS.md", root.path().join("CLAUDE.md")).unwrap();
+        let linked = discover(&workspace).unwrap();
+        assert_eq!(linked.files.len(), plain.files.len());
+        assert_eq!(linked.skipped_symlinks.len(), 1);
+        assert_ne!(linked.digest, plain.digest);
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn registered_root_swapped_for_a_symlink_still_fails_closed() {
+        let base = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = base.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn one() {}\n").unwrap();
+        std::fs::write(other.path().join("lib.rs"), "pub fn two() {}\n").unwrap();
+        let workspace = RegisteredWorkspace::primary(Uuid::new_v4(), &root).unwrap();
+        discover(&workspace).unwrap();
+
+        std::fs::rename(&root, base.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(other.path(), &root).unwrap();
         assert!(matches!(
             discover(&workspace),
             Err(IndexError::UnsafeWorkspace(_))

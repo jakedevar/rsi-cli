@@ -111,16 +111,21 @@ impl SessionManager {
         session_id: Uuid,
         group_id: Option<Uuid>,
     ) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_label(session_id, group_id)
             .await?;
-        // Update in-memory state
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.group_id = group_id;
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.group_id = group_id;
-        }
+        // Update in-memory state wherever the session lives; a completed
+        // entry also mirrors the write's `updated_at` stamp (#257, #265).
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Label,
+            stamp,
+            |session| session.group_id = group_id,
+        )
+        .await;
         self.event_bus
             .publish(crate::bus::DaemonEvent::SessionMetadataChanged {
                 session_id,

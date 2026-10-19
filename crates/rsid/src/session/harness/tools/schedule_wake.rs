@@ -153,6 +153,21 @@ impl ScheduleWakeTool {
             },
             None => return fail("mode 'on_terminal' requires 'watch_session_id'"),
         };
+        // #2725: a queued launch of the caller's own Issue worker has no row
+        // yet; the launch arms this watch itself.
+        if control
+            .issue_worker_launch_watch_pending(origin, watched)
+            .await
+        {
+            return ToolResult {
+                success: true,
+                output: format!(
+                    "terminal watch on session {watched} deduplicated: {}",
+                    rsi_common::manager_issue_worker::ISSUE_WORKER_WATCH_PENDING_NOTE
+                ),
+                error_msg: None,
+            };
+        }
         // Watched-subject scope = AgentGetStatus/AgentHalt scope
         // (self / direct child / child-of-led-Epic), self-watch rejected.
         if let Err(e) = control.authorize_watch_target(origin, watched).await {
@@ -300,7 +315,7 @@ impl HarnessTool for ScheduleWakeTool {
              registers the deterministic master-orchestrate program sentinel. In 'when' \
              mode the daemon evaluates the 'when' predicate (jobs_terminal: every listed \
              AgentSubmitJob job you own is terminal; sha_on_rolling: that commit is on \
-             origin/rolling) and resumes this session ONCE when it is true, unsatisfiable \
+             origin/rolling; issue_closed: that Issue number in your project is Closed; todo_closed: that operator to-do id in your scope is done or dismissed; topology_execution_settled: that topology execution id is succeeded, failed, cancelled or blocked; settlement_run_settled: that source-worktree settlement run id (from AgentApplySourceWorktreeCohort) is finished; health_anomaly: manager seats only, the daemon checks its health conditions every minute with no model turn and wakes you only when one holds) and resumes this session ONCE when it is true, unsatisfiable \
              or past 'timeout_seconds' (timed_out true), carrying each job's id, name, \
              state, exit code and refusal; submit the batch with wake 'none' first. Jobs fire \
              within ~60 seconds of the requested time. One-shot or recurring."
@@ -987,6 +1002,11 @@ mod tests {
                 workspace: true,
                 all_targets: false,
                 release: false,
+                no_default_features: false,
+                features: Vec::new(),
+                shards: Vec::new(),
+                cpu_quota_percent: None,
+                sha: None,
             }),
             cwd: "/tmp".into(),
             unit_name: format!("rsi-job-{id}"),
@@ -1022,7 +1042,11 @@ mod tests {
         };
         let schema: serde_json::Value = serde_json::from_str(tool.parameters_json()).unwrap();
         assert!(schema["properties"]["when"].is_object());
+        assert!(
+            schema["properties"]["when"]["properties"]["topology_execution_settled"].is_object()
+        );
         assert!(tool.description().contains("'when'"));
+        assert!(tool.description().contains("topology_execution_settled"));
 
         let arm = |when: serde_json::Value, extra: serde_json::Value| {
             let mut args = serde_json::json!({

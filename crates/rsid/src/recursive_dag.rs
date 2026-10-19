@@ -805,7 +805,7 @@ mod tests {
         }
 
         fn open(&self) -> Store {
-            Store::open(&self.path).expect("open store")
+            Store::open_test_fixture(&self.path).expect("open store")
         }
     }
 
@@ -952,7 +952,8 @@ mod tests {
             assert_eq!(phase, RecursiveAttemptPhase::Execute);
             if !self.requested {
                 self.requested = true;
-                let store = Store::open(&self.db_path).expect("open store from fake executor");
+                let store =
+                    Store::open_test_fixture(&self.db_path).expect("open store from fake executor");
                 store
                     .request_recursive_graph_cancellation(
                         detail.graph.id,
@@ -984,7 +985,8 @@ mod tests {
             assert_eq!(phase, RecursiveAttemptPhase::Execute);
             if !self.requested {
                 self.requested = true;
-                let store = Store::open(&self.db_path).expect("open store from fake executor");
+                let store =
+                    Store::open_test_fixture(&self.db_path).expect("open store from fake executor");
                 let active_run = store
                     .list_recursive_scheduler_runs_for_graph(detail.graph.id)
                     .expect("list scheduler runs")

@@ -32,6 +32,7 @@ use rsi_common::global_manager::{
 };
 use rsi_common::harness_manager::{ConfigureHarnessManagerRequestV1, HarnessManagerScopeModeV1};
 use rsi_common::harness_manager_v2::ManagerPolicyV2;
+use rsi_common::manager_budget::GlobalManagerBudgetV1;
 use rsi_common::manager_nodes::{
     ConfigureManagerNodeRequestV1, GetManagerNodeRequestV1, ManagerNodeSelectorV1,
     ManagerNodeViewV1, RevokeManagerNodeRequestV1,
@@ -167,6 +168,13 @@ pub struct GlobalEditor {
     pub projects: Vec<(Uuid, String, bool)>,
     pub caps: GrantCaps,
     pub original_caps: GrantCaps,
+    /// #2502: the parent portfolio node's label and caps (`None`: a root).
+    /// A parent cap below this node's binds first, so the editor shows it
+    /// beside each field.
+    pub parent: Option<(String, GrantCaps)>,
+    /// #2521: the Budget snapshot the editor reads parent headroom from
+    /// (`None`: usage unavailable, so the parent caps show as raw limits).
+    pub budget: Option<GlobalManagerBudgetV1>,
     pub cursor: usize,
     pub error: Option<String>,
 }
@@ -185,6 +193,8 @@ impl GlobalEditor {
             projects,
             caps,
             original_caps: caps,
+            parent: None,
+            budget: None,
             cursor: 0,
             error: None,
         }
@@ -706,6 +716,25 @@ async fn global_action(
 
 /// Every known project with whether `grant` covers it, plus granted ids the
 /// TUI does not know, sorted by name.
+/// #2502: the parent portfolio node's label and caps, read from the loaded
+/// tree rows (`None` for a root or a parent the tree has not loaded).
+fn parent_caps(app: &mut App, parent: Option<Uuid>) -> Option<(String, GrantCaps)> {
+    let parent = parent?;
+    let tree = state(app)?;
+    let row = tree.rows.iter().find(|row| row.node_id == Some(parent))?;
+    let grant = row.grant.as_ref()?;
+    Some((
+        row.label.clone(),
+        GrantCaps {
+            max_active_sessions: grant.max_active_sessions,
+            max_created_sessions: grant.max_created_sessions,
+            max_created_containers: grant.max_created_containers,
+            max_spend_usd: grant.max_spend_usd,
+            allow_create_groups: true,
+        },
+    ))
+}
+
 fn editor_projects(app: &App, grant: &GlobalManagerGrantV1) -> Vec<(Uuid, String, bool)> {
     let mut projects: Vec<(Uuid, String, bool)> = app
         .projects
@@ -812,14 +841,12 @@ async fn portfolio_action(
         }
         TreeAction::Edit => {
             let projects = editor_projects(app, &node.grant);
-            set_modal(
-                app,
-                TreeModal::EditGlobal(Box::new(GlobalEditor::new(
-                    node.grant.clone(),
-                    Some(Box::new(node)),
-                    projects,
-                ))),
-            );
+            let parent = parent_caps(app, node.parent_node_id);
+            let budget = super::load_budget(app).await;
+            let mut editor = GlobalEditor::new(node.grant.clone(), Some(Box::new(node)), projects);
+            editor.parent = parent;
+            editor.budget = budget;
+            set_modal(app, TreeModal::EditGlobal(Box::new(editor)));
         }
         TreeAction::Revoke => {
             let mut lines = vec![format!(

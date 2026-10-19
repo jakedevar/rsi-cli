@@ -469,7 +469,7 @@ impl Store {
 }
 
 /// Catalog objects created by V122, for fixtures and presence checks.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) const V122_CATALOG_OBJECTS: [(&str, &str); 2] = [
     ("table", "harness_manager_v2_work_facts"),
     ("index", "harness_manager_v2_work_fact_identity"),

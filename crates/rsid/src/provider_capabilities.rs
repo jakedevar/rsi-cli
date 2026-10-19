@@ -32,9 +32,10 @@ pub(crate) const VALIDATED_CODEX_SEMANTIC_FIXTURE_DIGEST: &str =
     "sha256:a60498398ac4824e943151d11e2479b003eb971b4180fdcd862d49fcdc577321";
 /// Exact catalog contracts whose schema and semantics have passed offline
 /// review. The raw installed catalog and its bounded semantic fixture are two
-/// reviewed representations of the same 0.155.1 contract. A new CLI version
-/// or digest remains discovery-only until this allowlist is deliberately
-/// extended alongside provider-capability validation.
+/// reviewed representations of the same 0.155.1 contract. Since #2761 this list
+/// is evidence only: it never decides trust (structural validation against the
+/// `consumed!` field contracts does), it marks a snapshot as
+/// [`CodexCatalogSnapshot::reviewed_digest`].
 pub(crate) const VALIDATED_CODEX_CATALOG_CONTRACTS: &[(&str, &str)] = &[
     (
         VALIDATED_CODEX_CLI_VERSION,
@@ -343,6 +344,10 @@ pub(crate) const REPOSITORY_MODEL_FALLBACKS: &[(&str, u64)] = &[
     ("gemini-2.5", 1_048_576),
     ("gemini-3", 1_048_576),
     ("gemini-3.5", 1_048_576),
+    // Inception Mercury (#2253). `mercury-2.5` precedes `mercury-2`, which it
+    // contains.
+    ("mercury-2.5", 260_000),
+    ("mercury-2", 128_000),
 ];
 
 pub(crate) const CODEX_TRANSPORT_FALLBACKS: &[(&str, u64)] = &[
@@ -405,9 +410,11 @@ pub(crate) struct CodexCatalogCacheKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexCatalogTrust {
-    /// Exact version, schema, and semantic contract passed offline review.
-    Allowlisted,
-    /// Structurally parseable and usable for discovery, but not capacity.
+    /// Every consumed catalog field is present with its expected type (#2761);
+    /// unknown extra fields are recorded and tolerated.
+    Trusted,
+    /// Parseable and usable for discovery, but a consumed field is missing or
+    /// retyped (or the catalog carries no models), so it feeds no capacity.
     DiscoveryOnly,
 }
 
@@ -416,12 +423,46 @@ pub(crate) enum CodexCatalogTrust {
 pub(crate) struct CodexCatalogSnapshot {
     pub(crate) key: CodexCatalogCacheKey,
     pub(crate) trust: CodexCatalogTrust,
+    /// Why `trust` is what it is: [`TRUST_REASON_STRUCTURAL`], or
+    /// `catalog_field_missing:<key>`, `catalog_field_type:<key>`,
+    /// [`TRUST_REASON_NO_MODELS`] when `DiscoveryOnly`.
+    pub(crate) trust_reason: String,
+    /// The version and digest match a reviewed contract
+    /// ([`VALIDATED_CODEX_CATALOG_CONTRACTS`]); evidence, not authority.
+    pub(crate) reviewed_digest: bool,
+    /// Root or model keys no field contract names: recorded, tolerated.
+    pub(crate) unknown_fields: BTreeSet<String>,
     pub(crate) observed_at: DateTime<Utc>,
     pub(crate) models: Vec<CodexCatalogModel>,
     pub(crate) raw_keys: BTreeSet<String>,
 }
 
 impl CodexCatalogSnapshot {
+    /// The wire view of this snapshot's trust verdict and evidence.
+    pub(crate) fn trust_view(&self) -> rsi_common::provider_contract::ProviderCatalogTrustV1 {
+        use rsi_common::provider_contract::{ProviderCatalogTrust, ProviderCatalogTrustV1};
+        /// Bound on the unknown keys one status row carries.
+        const MAX_UNKNOWN_FIELDS: usize = 32;
+        ProviderCatalogTrustV1 {
+            trust: match self.trust {
+                CodexCatalogTrust::Trusted => ProviderCatalogTrust::Trusted,
+                CodexCatalogTrust::DiscoveryOnly => ProviderCatalogTrust::DiscoveryOnly,
+            },
+            reason: self.trust_reason.clone(),
+            cli_version: self.key.cli_version.clone(),
+            content_digest: self.key.content_digest.as_str().to_string(),
+            reviewed_digest: self.reviewed_digest,
+            model_count: u32::try_from(self.models.len()).unwrap_or(u32::MAX),
+            unknown_fields: self
+                .unknown_fields
+                .iter()
+                .take(MAX_UNKNOWN_FIELDS)
+                .cloned()
+                .collect(),
+            observed_at: self.observed_at,
+        }
+    }
+
     pub(crate) fn effort_capabilities(
         &self,
     ) -> Vec<rsi_common::model_utils::ModelEffortCapabilities> {
@@ -521,7 +562,7 @@ struct CodexCatalogCacheState {
 /// Process-local structurally parsed catalog cache.
 ///
 /// Every parseable snapshot remains available to model discovery. Only an
-/// exact allowlisted contract may supply resolved capacity. Failed probes
+/// structurally validated (trusted) catalog may supply resolved capacity. Failed probes
 /// update freshness state but never replace the last parsed snapshot, so model
 /// menus may reuse the last good projection while capacity resolution degrades.
 #[derive(Debug, Default)]
@@ -619,12 +660,12 @@ impl CodexCatalogCache {
         Some(Arc::clone(snapshot))
     }
 
-    fn current_allowlisted_snapshot_for_version(
+    fn current_trusted_snapshot_for_version(
         &self,
         expected_cli_version: Option<&str>,
     ) -> Option<Arc<CodexCatalogSnapshot>> {
         self.current_snapshot_for_version(expected_cli_version)
-            .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Allowlisted)
+            .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Trusted)
     }
 
     pub(crate) fn current_snapshot_for_exact_version(
@@ -634,11 +675,11 @@ impl CodexCatalogCache {
         self.current_snapshot_for_version(Some(cli_version))
     }
 
-    fn current_allowlisted_snapshot_for_exact_version(
+    fn current_trusted_snapshot_for_exact_version(
         &self,
         cli_version: &str,
     ) -> Option<Arc<CodexCatalogSnapshot>> {
-        self.current_allowlisted_snapshot_for_version(Some(cli_version))
+        self.current_trusted_snapshot_for_version(Some(cli_version))
     }
 
     fn has_unusable_capability_observation(
@@ -655,7 +696,7 @@ impl CodexCatalogCache {
                         .is_some_and(|version| version.trim() != snapshot.key.cli_version)
                     || expected_content_digest
                         .is_some_and(|digest| digest.trim() != snapshot.key.content_digest.as_str())
-                    || snapshot.trust != CodexCatalogTrust::Allowlisted
+                    || snapshot.trust != CodexCatalogTrust::Trusted
             }
             (Some(_), CatalogProbeState::Never) => true,
             (None, CatalogProbeState::Parsed(_)) => true,
@@ -716,6 +757,15 @@ impl ProviderCapabilityRegistry {
             .record_probe_failure(cli_version, raw.map(content_digest));
     }
 
+    /// The operator-facing trust verdict of the last parsed Codex catalog
+    /// (#2761); `None` before any catalog parsed.
+    pub(crate) fn codex_catalog_trust_view(
+        &self,
+    ) -> Option<rsi_common::provider_contract::ProviderCatalogTrustV1> {
+        self.cached_codex_catalog()
+            .map(|snapshot| snapshot.trust_view())
+    }
+
     pub(crate) fn cached_codex_catalog(&self) -> Option<Arc<CodexCatalogSnapshot>> {
         self.codex_catalog.cached_snapshot()
     }
@@ -743,7 +793,7 @@ impl ProviderCapabilityRegistry {
             .flatten();
         let catalog = catalog_observation
             .as_deref()
-            .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Allowlisted);
+            .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Trusted);
         let catalog_model = catalog.and_then(|snapshot| snapshot.model(request.model));
         let mut capacity = catalog_model
             .map(|model| model.capacity.clone())
@@ -785,7 +835,7 @@ impl ProviderCapabilityRegistry {
         }
 
         // A native Codex configured value is the provider's raw input, not
-        // necessarily its effective active window. Only an allowlisted
+        // necessarily its effective active window. Only a trusted
         // catalog may supply the percentage needed to promote that value to
         // Configured/Authoritative. Until then, retain the raw fact in
         // `capacity` and fall through to a degraded active-budget source.
@@ -876,6 +926,48 @@ impl ProviderCapabilityRegistry {
 
 static PROVIDER_CAPABILITIES: LazyLock<ProviderCapabilityRegistry> =
     LazyLock::new(ProviderCapabilityRegistry::default);
+
+/// A parseable catalog whose missing consumed field makes it discovery-only,
+/// independent of the installed CLI version or the reviewed-digest list.
+#[cfg(test)]
+#[cfg(any(
+    not(feature = "test-shard-mode"),
+    feature = "test-shard-session-01",
+    feature = "test-shard-store-04"
+))]
+pub(crate) fn discovery_only_codex_catalog_for_test() -> Vec<u8> {
+    let mut root: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../tests/fixtures/codex-models-0.155.1.json"
+    ))
+    .expect("catalog fixture JSON");
+    for model in root["models"].as_array_mut().expect("catalog models") {
+        model
+            .as_object_mut()
+            .expect("catalog model")
+            .remove("context_window");
+    }
+    serde_json::to_vec(&root).expect("discovery-only catalog JSON")
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static LAUNCH_CATALOG_FOR_TEST: ProviderCapabilityRegistry;
+}
+
+/// Scope launch catalog refresh and resolution to one future. No host CLI or
+/// process-global cache participates, including while the future is paused.
+#[cfg(test)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+pub(crate) async fn with_launch_catalog_for_test<F: std::future::Future>(
+    raw_catalog: &[u8],
+    future: F,
+) -> F::Output {
+    let registry = ProviderCapabilityRegistry::default();
+    registry
+        .refresh_codex_catalog("codex-cli 0.153.0", raw_catalog, Utc::now())
+        .expect("parse launch catalog fixture");
+    LAUNCH_CATALOG_FOR_TEST.scope(registry, future).await
+}
 
 pub(crate) fn provider_capabilities() -> &'static ProviderCapabilityRegistry {
     &PROVIDER_CAPABILITIES
@@ -973,6 +1065,12 @@ pub(crate) fn resolve_fresh_context_budget(
     model: &str,
     configured_tokens: Option<u64>,
 ) -> ResolvedContextBudget {
+    #[cfg(test)]
+    if let Ok(budget) = LAUNCH_CATALOG_FOR_TEST.try_with(|registry| {
+        resolve_fresh_context_budget_with_registry(registry, provider, model, configured_tokens)
+    }) {
+        return budget;
+    }
     resolve_fresh_context_budget_with_registry(
         provider_capabilities(),
         provider,
@@ -1020,6 +1118,14 @@ pub(crate) fn resolve_new_incarnation_context_budget_for(
     model: &str,
     existing: Option<&ResolvedContextBudget>,
 ) -> ResolvedContextBudget {
+    #[cfg(test)]
+    if let Ok(budget) = LAUNCH_CATALOG_FOR_TEST.try_with(|registry| {
+        resolve_new_incarnation_context_budget_for_with_registry(
+            registry, provider, model, existing,
+        )
+    }) {
+        return budget;
+    }
     resolve_new_incarnation_context_budget_for_with_registry(
         provider_capabilities(),
         provider,
@@ -1068,14 +1174,14 @@ pub(crate) fn resolved_context_budget_for_session(session: &Session) -> Resolved
 
 /// Resolve whether a Harness route's model advertises image input.
 ///
-/// An allowlisted installed Codex catalog is authoritative when its model is
+/// A trusted installed Codex catalog is authoritative when its model is
 /// present. Other routes use the small set of known vision-capable model
 /// families; unknown models are intentionally conservative.
 pub(crate) fn supports_image_input(model: &str) -> bool {
     if let Some(snapshot) = provider_capabilities()
         .codex_catalog
         .cached_snapshot()
-        .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Allowlisted)
+        .filter(|snapshot| snapshot.trust == CodexCatalogTrust::Trusted)
         && let Some(catalog_model) = snapshot.model(model)
     {
         return catalog_model
@@ -1119,7 +1225,7 @@ pub(crate) fn rehydrate_resolved_context_budget(
         )
         && let Some(snapshot) = provider_capabilities()
             .codex_catalog
-            .current_allowlisted_snapshot_for_exact_version(version)
+            .current_trusted_snapshot_for_exact_version(version)
         && snapshot.key.content_digest.as_str() == digest
         && let Some(catalog_model) = snapshot.model(model)
     {
@@ -1146,6 +1252,10 @@ pub(crate) async fn refresh_installed_catalog_for_provider(
     provider: SessionProvider,
     runtime_config: Arc<crate::config::RuntimeConfig>,
 ) -> Result<()> {
+    #[cfg(test)]
+    if LAUNCH_CATALOG_FOR_TEST.try_with(|_| ()).is_ok() {
+        return Ok(());
+    }
     #[cfg(test)]
     if pinned_codex_catalog_observation_for_runtime_config(&runtime_config).is_some() {
         // The pinned per-session registry was parsed and validated during
@@ -1275,16 +1385,138 @@ fn content_digest(raw: &[u8]) -> Sha256Digest {
         .expect("SHA-256 construction is canonical")
 }
 
-fn codex_catalog_trust(key: &CodexCatalogCacheKey) -> CodexCatalogTrust {
-    if VALIDATED_CODEX_CATALOG_CONTRACTS
+/// Trust reason of a catalog whose consumed fields all validated.
+pub(crate) const TRUST_REASON_STRUCTURAL: &str = "structural_validation";
+/// Trust reason of a catalog with no models: it carries no capacity evidence.
+pub(crate) const TRUST_REASON_NO_MODELS: &str = "catalog_models_empty";
+
+/// Whether a version and digest match a reviewed contract (evidence only).
+fn codex_catalog_reviewed_digest(key: &CodexCatalogCacheKey) -> bool {
+    VALIDATED_CODEX_CATALOG_CONTRACTS
         .iter()
         .any(|(version, digest)| {
             *version == key.cli_version.as_str() && *digest == key.content_digest.as_str()
         })
-    {
-        CodexCatalogTrust::Allowlisted
+}
+
+/// The JSON type a consumed model field must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogFieldType {
+    String,
+    Unsigned,
+    Integer,
+    Bool,
+    Array,
+    Object,
+}
+
+impl CatalogFieldType {
+    fn matches(self, value: &Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Unsigned => value.is_u64(),
+            Self::Integer => value.is_i64() || value.is_u64(),
+            Self::Bool => value.is_boolean(),
+            Self::Array => value.is_array(),
+            Self::Object => value.is_object(),
+        }
+    }
+}
+
+/// The expected type of a consumed model field and whether a model may omit
+/// it. Every `consumed!` key of [`CODEX_CATALOG_MODEL_FIELDS`] must be listed
+/// (a unit test pins it), so consuming a new field forces a type decision.
+/// `tool_mode` is the one optional field: the bundled 0.163.0 catalog omits it
+/// on `codex-auto-review` [observed].
+fn consumed_model_field_type(key: &str) -> Option<(CatalogFieldType, bool)> {
+    use CatalogFieldType::{Array, Bool, Integer, Object, String, Unsigned};
+    Some(match key {
+        "tool_mode" => (String, true),
+        "context_window" | "max_context_window" | "effective_context_window_percent" => {
+            (Unsigned, false)
+        }
+        "priority" => (Integer, false),
+        "supported_in_api" | "supports_image_detail_original" | "supports_search_tool" => {
+            (Bool, false)
+        }
+        "experimental_supported_tools" | "input_modalities" | "supported_reasoning_levels" => {
+            (Array, false)
+        }
+        "truncation_policy" => (Object, false),
+        "apply_patch_tool_type"
+        | "comp_hash"
+        | "default_reasoning_level"
+        | "description"
+        | "display_name"
+        | "shell_type"
+        | "slug"
+        | "visibility"
+        | "web_search_tool_type" => (String, false),
+        _ => return None,
+    })
+}
+
+/// The structural verdict of a parsed catalog root (#2761): trusted when
+/// `models` is a non-empty array and every model carries every consumed field
+/// with its expected type; otherwise discovery-only with the first violation
+/// as a reason code. Also returns the keys no field contract names.
+fn validate_codex_catalog_structure(root: &Value) -> (CodexCatalogTrust, String, BTreeSet<String>) {
+    let mut unknown = BTreeSet::new();
+    let root_object = root.as_object();
+    for key in root_object.into_iter().flat_map(|object| object.keys()) {
+        if !CODEX_CATALOG_ROOT_FIELDS.iter().any(|f| f.key == key) {
+            unknown.insert(key.clone());
+        }
+    }
+    let models: &[Value] = root
+        .get("models")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice);
+    let mut verdict: Option<String> = if models.is_empty() {
+        Some(TRUST_REASON_NO_MODELS.to_string())
     } else {
-        CodexCatalogTrust::DiscoveryOnly
+        None
+    };
+    for model in models {
+        let object = model.as_object();
+        for key in object.into_iter().flat_map(|object| object.keys()) {
+            if !CODEX_CATALOG_MODEL_FIELDS.iter().any(|f| f.key == key) {
+                unknown.insert(key.clone());
+            }
+        }
+        if verdict.is_some() {
+            continue;
+        }
+        for field in CODEX_CATALOG_MODEL_FIELDS {
+            if !matches!(field.handling, CatalogFieldHandling::Consumed(_)) {
+                continue;
+            }
+            let Some((expected, optional)) = consumed_model_field_type(field.key) else {
+                // A consumed field without a declared type cannot be proven.
+                verdict = Some(format!("catalog_field_type:{}", field.key));
+                break;
+            };
+            match object.and_then(|object| object.get(field.key)) {
+                None if optional => {}
+                None => {
+                    verdict = Some(format!("catalog_field_missing:{}", field.key));
+                    break;
+                }
+                Some(value) if !expected.matches(value) => {
+                    verdict = Some(format!("catalog_field_type:{}", field.key));
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    match verdict {
+        None => (
+            CodexCatalogTrust::Trusted,
+            TRUST_REASON_STRUCTURAL.to_string(),
+            unknown,
+        ),
+        Some(reason) => (CodexCatalogTrust::DiscoveryOnly, reason, unknown),
     }
 }
 
@@ -1339,6 +1571,7 @@ pub(crate) fn parse_codex_catalog_snapshot(
         ));
     }
     let root: Value = serde_json::from_slice(raw)?;
+    let (trust, trust_reason, unknown_fields) = validate_codex_catalog_structure(&root);
     let raw_keys = root
         .as_object()
         .ok_or_else(|| DaemonError::Process("Codex model catalog must be an object".to_string()))?
@@ -1366,11 +1599,14 @@ pub(crate) fn parse_codex_catalog_snapshot(
         cli_version: cli_version.to_string(),
         content_digest: content_digest(raw),
     };
-    let trust = codex_catalog_trust(&key);
+    let reviewed_digest = codex_catalog_reviewed_digest(&key);
 
     Ok(CodexCatalogSnapshot {
         key,
         trust,
+        trust_reason,
+        reviewed_digest,
+        unknown_fields,
         observed_at,
         models,
         raw_keys,
@@ -1514,6 +1750,20 @@ mod tests {
     const CODEX_0_155_1_VERSION: &str = "codex-cli 0.155.1";
     const CODEX_0_155_1_FIXTURE_DIGEST: &str = VALIDATED_CODEX_SEMANTIC_FIXTURE_DIGEST;
 
+    const CODEX_0_163_0_BUNDLED_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/codex-models-0.163.0-bundled.json");
+    const CODEX_0_163_0_VERSION: &str = "codex-cli 0.163.0";
+
+    /// The 0.155.1 fixture with `field` removed from every model: a catalog
+    /// that no longer carries a consumed field.
+    fn fixture_without_field(field: &str) -> Vec<u8> {
+        let mut root: Value = serde_json::from_slice(CODEX_0_155_1_FIXTURE).unwrap();
+        for model in root["models"].as_array_mut().unwrap() {
+            model.as_object_mut().unwrap().remove(field);
+        }
+        serde_json::to_vec(&root).unwrap()
+    }
+
     fn fixture_snapshot() -> CodexCatalogSnapshot {
         parse_codex_catalog_snapshot(
             CODEX_0_155_1_VERSION,
@@ -1560,6 +1810,7 @@ mod tests {
         let response = rsi_common::model_utils::DiscoveredModels {
             models: snapshot.legacy_model_tuples(),
             effort_capabilities: capabilities,
+            ..Default::default()
         };
         let decoded: rsi_common::model_utils::DiscoveredModels =
             serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
@@ -1575,7 +1826,7 @@ mod tests {
     fn real_codex_0_155_1_fixture_preserves_capacity_reasoning_and_projection() {
         let snapshot = fixture_snapshot();
         assert_eq!(snapshot.key.cli_version, CODEX_0_155_1_VERSION);
-        assert_eq!(snapshot.trust, CodexCatalogTrust::Allowlisted);
+        assert_eq!(snapshot.trust, CodexCatalogTrust::Trusted);
         assert_eq!(
             snapshot.key.content_digest.as_str(),
             CODEX_0_155_1_FIXTURE_DIGEST
@@ -1634,7 +1885,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn reviewed_raw_and_semantic_0_155_1_contracts_are_allowlisted_exactly() {
+    fn reviewed_raw_and_semantic_0_155_1_contracts_are_recorded_as_evidence_exactly() {
         for digest in [
             VALIDATED_CODEX_RAW_CATALOG_DIGEST,
             VALIDATED_CODEX_SEMANTIC_FIXTURE_DIGEST,
@@ -1643,16 +1894,13 @@ mod tests {
                 cli_version: VALIDATED_CODEX_CLI_VERSION.to_string(),
                 content_digest: Sha256Digest::parse(digest).unwrap(),
             };
-            assert_eq!(codex_catalog_trust(&key), CodexCatalogTrust::Allowlisted);
+            assert!(codex_catalog_reviewed_digest(&key));
 
             let future_key = CodexCatalogCacheKey {
                 cli_version: "codex-cli 0.153.0".to_string(),
                 content_digest: key.content_digest,
             };
-            assert_eq!(
-                codex_catalog_trust(&future_key),
-                CodexCatalogTrust::DiscoveryOnly
-            );
+            assert!(!codex_catalog_reviewed_digest(&future_key));
         }
     }
 
@@ -1713,10 +1961,10 @@ mod tests {
             changed_version.snapshot().key.cli_version,
             "codex-cli 0.153.0"
         );
-        assert_eq!(
-            changed_version.snapshot().trust,
-            CodexCatalogTrust::DiscoveryOnly
-        );
+        // A new version with the same structure is trusted (#2761) but is not
+        // a reviewed digest for that version.
+        assert_eq!(changed_version.snapshot().trust, CodexCatalogTrust::Trusted);
+        assert!(!changed_version.snapshot().reviewed_digest);
         assert!(
             cache
                 .current_snapshot_for_exact_version("codex-cli 0.153.0")
@@ -1724,8 +1972,8 @@ mod tests {
         );
         assert!(
             cache
-                .current_allowlisted_snapshot_for_exact_version("codex-cli 0.153.0")
-                .is_none()
+                .current_trusted_snapshot_for_exact_version("codex-cli 0.153.0")
+                .is_some()
         );
 
         let changed_raw = String::from_utf8(CODEX_0_155_1_FIXTURE.to_vec())
@@ -1746,11 +1994,15 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn unreviewed_version_or_digest_stays_discoverable_but_degrades_capacity() {
+    fn structurally_untrusted_catalog_stays_discoverable_but_degrades_capacity() {
         let registry = ProviderCapabilityRegistry::default();
         let future_version = "codex-cli 0.153.0";
         let future = registry
-            .refresh_codex_catalog(future_version, CODEX_0_155_1_FIXTURE, Utc::now())
+            .refresh_codex_catalog(
+                future_version,
+                &fixture_without_field("context_window"),
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(future.snapshot().trust, CodexCatalogTrust::DiscoveryOnly);
         assert_eq!(
@@ -1780,14 +2032,9 @@ mod tests {
             Some(future.snapshot().key.content_digest.as_str())
         );
 
-        let changed_raw = String::from_utf8(CODEX_0_155_1_FIXTURE.to_vec())
-            .unwrap()
-            .replace(
-                "Our most capable model for complex, demanding work.",
-                "Changed catalog description.",
-            );
+        let changed_raw = fixture_without_field("effective_context_window_percent");
         let changed_digest = registry
-            .refresh_codex_catalog(CODEX_0_155_1_VERSION, changed_raw.as_bytes(), Utc::now())
+            .refresh_codex_catalog(CODEX_0_155_1_VERSION, &changed_raw, Utc::now())
             .unwrap();
         assert_eq!(
             changed_digest.snapshot().trust,
@@ -1840,14 +2087,9 @@ mod tests {
     #[test]
     fn discovery_only_launch_pins_catalog_identity_across_intervening_refresh() {
         let registry = ProviderCapabilityRegistry::default();
-        let changed_raw = String::from_utf8(CODEX_0_155_1_FIXTURE.to_vec())
-            .unwrap()
-            .replace(
-                "Our most capable model for complex, demanding work.",
-                "Changed catalog description.",
-            );
+        let changed_raw = fixture_without_field("max_context_window");
         let launch_snapshot = registry
-            .refresh_codex_catalog(CODEX_0_155_1_VERSION, changed_raw.as_bytes(), Utc::now())
+            .refresh_codex_catalog(CODEX_0_155_1_VERSION, &changed_raw, Utc::now())
             .unwrap();
         assert_eq!(
             launch_snapshot.snapshot().trust,
@@ -1912,7 +2154,7 @@ mod tests {
         let replacement = registry
             .refresh_codex_catalog(CODEX_0_155_1_VERSION, CODEX_0_155_1_FIXTURE, Utc::now())
             .unwrap();
-        assert_eq!(replacement.snapshot().trust, CodexCatalogTrust::Allowlisted);
+        assert_eq!(replacement.snapshot().trust, CodexCatalogTrust::Trusted);
         assert_ne!(
             launch_snapshot.snapshot().key.content_digest,
             replacement.snapshot().key.content_digest
@@ -2002,6 +2244,24 @@ mod tests {
         ));
         assert_eq!(local.active_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
         assert_eq!(local.evidence.source, CapabilitySource::LegacyUnverified);
+    }
+
+    /// #2253: Inception's models page gives `mercury-2` a 128K window and
+    /// `mercury-2.5` a 260K one; the longer id must not fall into the shorter.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn mercury_models_resolve_their_documented_windows() {
+        let registry = ProviderCapabilityRegistry::default();
+        for (model, expected) in [("mercury-2", 128_000), ("mercury-2.5", 260_000)] {
+            let resolved = registry
+                .resolve_context_budget(ContextBudgetRequest::new(SessionProvider::Harness, model));
+            assert_eq!(resolved.active_tokens, expected, "model {model}");
+            assert_eq!(
+                resolved.evidence.source,
+                CapabilitySource::RepositoryFallback,
+                "model {model}"
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -2098,6 +2358,139 @@ mod tests {
         assert_eq!(harness.capacity.advertised_max_tokens, Some(1_050_000));
         assert_eq!(harness.capacity.max_output_tokens, Some(128_000));
         assert!(!harness.authorizes_threshold_rotation());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn every_consumed_model_field_declares_an_expected_type() {
+        let consumed = CODEX_CATALOG_MODEL_FIELDS
+            .iter()
+            .filter(|field| matches!(field.handling, CatalogFieldHandling::Consumed(_)))
+            .collect::<Vec<_>>();
+        assert!(!consumed.is_empty());
+        for field in consumed {
+            assert!(
+                consumed_model_field_type(field.key).is_some(),
+                "consumed field {} has no expected type",
+                field.key
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn bundled_0_163_0_catalog_is_trusted_and_resolves_non_degraded_capacity() {
+        let registry = ProviderCapabilityRegistry::default();
+        let refreshed = registry
+            .refresh_codex_catalog(
+                CODEX_0_163_0_VERSION,
+                CODEX_0_163_0_BUNDLED_FIXTURE,
+                Utc::now(),
+            )
+            .unwrap();
+        let snapshot = refreshed.snapshot();
+        assert_eq!(snapshot.trust, CodexCatalogTrust::Trusted);
+        assert_eq!(snapshot.trust_reason, TRUST_REASON_STRUCTURAL);
+        assert!(
+            !snapshot.reviewed_digest,
+            "0.163.0 was never digest-reviewed"
+        );
+        assert_eq!(snapshot.models.len(), 11);
+        assert!(
+            snapshot.unknown_fields.contains("model_specialty"),
+            "new fields are recorded: {:?}",
+            snapshot.unknown_fields
+        );
+        // The catalog is tolerated although `tool_mode` is absent on one model.
+        assert!(
+            snapshot
+                .models
+                .iter()
+                .any(|model| !model.raw_keys.contains("tool_mode"))
+        );
+
+        let mut request = ContextBudgetRequest::new(SessionProvider::Codex, "gpt-6-astra");
+        request.expected_codex_cli_version = Some(CODEX_0_163_0_VERSION);
+        let budget = registry.resolve_context_budget(request);
+        assert_eq!(budget.evidence.source, CapabilitySource::ProviderCatalog);
+        assert_eq!(budget.evidence.confidence, CapabilityConfidence::Verified);
+        assert_eq!(budget.capacity.provider_default_tokens, Some(272_000));
+        assert_eq!(budget.active_tokens, 258_400);
+
+        // The provider health row serves the verdict, its reason and evidence.
+        let view = registry.codex_catalog_trust_view().unwrap();
+        assert_eq!(
+            view.trust,
+            rsi_common::provider_contract::ProviderCatalogTrust::Trusted
+        );
+        assert_eq!(view.reason, TRUST_REASON_STRUCTURAL);
+        assert_eq!(view.cli_version, CODEX_0_163_0_VERSION);
+        assert_eq!(view.model_count, 11);
+        assert_eq!(view.content_digest, snapshot.key.content_digest.as_str());
+        assert!(view.unknown_fields.contains(&"model_specialty".to_string()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn removed_or_retyped_consumed_field_is_discovery_only_with_a_reason_code() {
+        let removed = parse_codex_catalog_snapshot(
+            CODEX_0_155_1_VERSION,
+            &fixture_without_field("context_window"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(removed.trust, CodexCatalogTrust::DiscoveryOnly);
+        assert_eq!(removed.trust_reason, "catalog_field_missing:context_window");
+
+        let mut root: Value = serde_json::from_slice(CODEX_0_155_1_FIXTURE).unwrap();
+        // A retype the wire struct would also accept (`Value`-typed), so only
+        // the structural check sees it; a retype serde refuses fails the parse.
+        root["models"][0]["truncation_policy"] = Value::from("tokens");
+        let retyped = parse_codex_catalog_snapshot(
+            CODEX_0_155_1_VERSION,
+            &serde_json::to_vec(&root).unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(retyped.trust, CodexCatalogTrust::DiscoveryOnly);
+        assert_eq!(retyped.trust_reason, "catalog_field_type:truncation_policy");
+
+        let mut root: Value = serde_json::from_slice(CODEX_0_155_1_FIXTURE).unwrap();
+        root["models"] = Value::Array(Vec::new());
+        let empty = parse_codex_catalog_snapshot(
+            CODEX_0_155_1_VERSION,
+            &serde_json::to_vec(&root).unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(empty.trust, CodexCatalogTrust::DiscoveryOnly);
+        assert_eq!(empty.trust_reason, TRUST_REASON_NO_MODELS);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn extra_unknown_fields_are_recorded_and_tolerated() {
+        let mut root: Value = serde_json::from_slice(CODEX_0_155_1_FIXTURE).unwrap();
+        root["models"][0]["brand_new_model_field"] = Value::from(true);
+        root["brand_new_root_field"] = Value::from(1);
+        let snapshot = parse_codex_catalog_snapshot(
+            CODEX_0_155_1_VERSION,
+            &serde_json::to_vec(&root).unwrap(),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.trust, CodexCatalogTrust::Trusted);
+        assert_eq!(snapshot.trust_reason, TRUST_REASON_STRUCTURAL);
+        assert!(
+            !snapshot.reviewed_digest,
+            "a changed digest is not reviewed"
+        );
+        assert_eq!(
+            snapshot.unknown_fields.iter().cloned().collect::<Vec<_>>(),
+            ["brand_new_model_field", "brand_new_root_field"]
+        );
+        assert!(fixture_snapshot().unknown_fields.is_empty());
+        assert!(fixture_snapshot().reviewed_digest);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -2232,7 +2625,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn legacy_consumers_have_no_provider_specific_mapping_or_stale_numeric_value() {
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::path::Path::new(rsi_common::manifest_dir!());
         let stale_spaced = ["372", "_000"].concat();
         let stale_plain = ["372", "000"].concat();
         let mut stale_hits = Vec::new();

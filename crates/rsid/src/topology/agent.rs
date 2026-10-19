@@ -30,10 +30,10 @@ use rsi_common::rpc::{
 use rsi_common::topology_agent::{
     AgentTopologyEventV1, AgentTopologyExecuteRequestV1, AgentTopologyExecuteResultV1,
     AgentTopologyExecutionSummaryV1, AgentTopologyGetExecutionRequestV1,
-    AgentTopologyGetExecutionResultV1, AgentTopologyInterruptRequestV1,
-    AgentTopologyInterruptResultV1, AgentTopologyListRequestV1, AgentTopologyListResultV1,
-    AgentTopologyScopeV1, AgentTopologySummaryV1, AgentTopologyUpsertRequestV1,
-    AgentTopologyUpsertResultV1,
+    AgentTopologyGetExecutionResultV1, AgentTopologyGetRequestV1, AgentTopologyGetResultV1,
+    AgentTopologyInterruptRequestV1, AgentTopologyInterruptResultV1, AgentTopologyListRequestV1,
+    AgentTopologyListResultV1, AgentTopologyScopeV1, AgentTopologySummaryV1,
+    AgentTopologyUpsertRequestV1, AgentTopologyUpsertResultV1,
 };
 use rsi_common::types::{
     GraphExecutionUpdate, SessionKind, SessionProvider, SessionStatus, Topology,
@@ -314,6 +314,20 @@ pub(crate) enum TopologyCaller {
     },
 }
 
+/// The live project-level grant policy a lead (or a validate-only worker,
+/// #2267) is checked against, `None` when the project holds no live grant.
+fn project_grant_policy(
+    store: &Store,
+    project_id: Option<Uuid>,
+) -> Result<Option<ManagerPolicyV2>> {
+    Ok(project_id
+        .map(|project| store.get_harness_manager_policy(project))
+        .transpose()?
+        .flatten()
+        .filter(|grant| !grant.revoked)
+        .map(|grant| grant.policy))
+}
+
 impl TopologyCaller {
     /// Resolve the caller from durable rows only; never from request fields.
     pub(crate) fn resolve(store: &Store, caller: Uuid) -> Result<Self> {
@@ -459,15 +473,7 @@ impl TopologyCaller {
                 Some(authority.grant.policy.clone()),
                 Some(authority.config.clone()),
             ),
-            Self::Lead { project_id, .. } => (
-                project_id
-                    .map(|project| store.get_harness_manager_policy(project))
-                    .transpose()?
-                    .flatten()
-                    .filter(|grant| !grant.revoked)
-                    .map(|grant| grant.policy),
-                None,
-            ),
+            Self::Lead { project_id, .. } => (project_grant_policy(store, *project_id)?, None),
         };
         let config = match config {
             Some(config) => Some(config),
@@ -677,10 +683,24 @@ impl TopologyRecord {
         .transpose()
     }
 
-    fn by_name(conn: &Connection, name: &str) -> Result<Option<Self>> {
+    fn by_name(
+        conn: &Connection,
+        name: &str,
+        owner_kind: &str,
+        project_id: Option<Uuid>,
+        epic_id: Option<Uuid>,
+    ) -> Result<Option<Self>> {
         conn.query_row(
-            &format!("SELECT {TOPOLOGY_COLUMNS} FROM topologies WHERE name=?1"),
-            [name],
+            &format!(
+                "SELECT {TOPOLOGY_COLUMNS} FROM topologies WHERE name=?1 \
+                AND owner_kind=?2 AND project_id IS ?3 AND epic_id IS ?4"
+            ),
+            params![
+                name,
+                owner_kind,
+                project_id.map(|id| id.to_string()),
+                epic_id.map(|id| id.to_string())
+            ],
             raw_topology,
         )
         .optional()?
@@ -688,10 +708,11 @@ impl TopologyRecord {
         .transpose()
     }
 
-    /// Digest of the exact stored definition text. Operator updates rewrite
-    /// the text without touching the V129 column, so it is never cached.
+    /// Canonical digest of the stored definition text (#2693). Operator
+    /// updates rewrite the text without touching the V129 column, so it is
+    /// never cached.
     pub(crate) fn digest(&self) -> String {
-        rows::digest(&self.definition_json)
+        rows::definition_digest(&self.definition_json)
     }
 
     fn summary(&self) -> AgentTopologySummaryV1 {
@@ -704,6 +725,7 @@ impl TopologyRecord {
             definition_digest: self.digest(),
             shared: self.shared,
             updated_at: self.updated_at.clone(),
+            starter_drift: super::starters::drift(&self.name, &self.definition_json),
         }
     }
 
@@ -768,17 +790,13 @@ fn attempt_launch(execution: &ExecutionRow, node: &NodeDef) -> Option<ManagerLau
     node_launch(node)
 }
 
-/// The equality rule of manager launches (`manager_action_resources`); an
+/// The allowlist rule of manager launches (`manager_action_resources`); an
 /// empty grant list fails closed for agents.
 pub(crate) fn launch_granted(
     allowed: &[ManagerLaunchChoiceV2],
     launch: &ManagerLaunchChoiceV2,
 ) -> bool {
-    allowed.iter().any(|choice| {
-        choice.provider == launch.provider
-            && choice.model == launch.model
-            && choice.effort == launch.effort
-    })
+    allowed.iter().any(|choice| choice.allows(launch))
 }
 
 /// Plan §5.3: a reviewer's vendor family must differ from the author's. An
@@ -1059,6 +1077,9 @@ fn global_launch_gate(
     requester: Uuid,
     launch: &ManagerLaunchChoiceV2,
 ) -> Result<Option<&'static str>> {
+    // #2472: `requester` is immutable provenance; the live owner is whoever
+    // holds that portfolio node's seat now, re-proved against its grant here.
+    let requester = live_owner(store, requester)?;
     let Ok(crate::store::harness_manager_v2::ManagerCallerV1::Global(authority)) =
         store.resolve_manager_caller(requester, Some(project))
     else {
@@ -1096,6 +1117,29 @@ fn global_launch_gate(
     ancestor_allowance(store, &authority.config, 1, own)
 }
 
+/// #2472/#2532: the session that acts for an execution's recorded requester now. A
+/// portfolio seat that rotated (a context-cap transfer or a replacement
+/// within the same authority epoch) is represented by its node's current
+/// seat, and a rotated project manager seat by the appointment's current
+/// seat, and a rotated Epic lead by the Epic's current lead (#3241); any
+/// other requester is itself. `requested_by_session_id` stays the
+/// immutable provenance, and callers re-prove the returned session's live
+/// authority (grant, scope version, project, mode), so a revoked, re-granted
+/// or narrowed node still refuses.
+pub(crate) fn live_owner(store: &Store, requester: Uuid) -> Result<Uuid> {
+    if let Some(seat) = store.portfolio_seat_now(requester)? {
+        return Ok(seat);
+    }
+    // #2532: a project manager seat that rotated (context cap, succession or
+    // re-appointment) is represented by the appointment's current seat.
+    if let Some(seat) = store.project_manager_seat_now(requester)? {
+        return Ok(seat);
+    }
+    // #3241: an Epic lead that rotated at the context cap is represented by the
+    // Epic's current lead, so the executions the predecessor started still land.
+    Ok(store.epic_lead_seat_now(requester)?.unwrap_or(requester))
+}
+
 /// #1275: a topology session launch is charged against every ancestor's
 /// allowance too, exactly as a lifecycle `create_session` is. `counted` is
 /// the launches already charged (a relaunch of this attempt).
@@ -1107,11 +1151,17 @@ fn ancestor_allowance(
 ) -> Result<Option<&'static str>> {
     match store.manager_ancestor_creation_allowance(config, false, needed, counted) {
         Ok(()) => Ok(None),
-        Err(DaemonError::InvalidParam(code)) if code == "manager_v2_creation_limit" => {
+        Err(DaemonError::InvalidParam(code))
+            if code.split(':').next()
+                == Some(rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT) =>
+        {
             Ok(Some("creation_limit"))
         }
         Err(DaemonError::InvalidParam(code))
-            if code == rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED =>
+            if code.starts_with(&format!(
+                "{}:",
+                rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
+            )) =>
         {
             Ok(Some(
                 rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
@@ -1140,6 +1190,7 @@ pub(crate) fn landing_gate(
     ) else {
         return Ok(Some("owner_required"));
     };
+    let requester = live_owner(store, requester)?;
     let Ok(caller) = TopologyCaller::resolve_in(store, requester, execution.project_id) else {
         return Ok(Some("requester_unauthorized"));
     };
@@ -1341,7 +1392,7 @@ pub(crate) fn upsert(
                 Ledger::Replay => (CallOutcome::Deduplicated(receipt), None),
                 Ledger::Unbound => (CallOutcome::Accepted(receipt), None),
             };
-            record_call(store, &audit, Some(done.kind), outcome, key)?;
+            record_call(store, &audit, done.kind, outcome, key)?;
             tx.commit()?;
             Ok((done.result, done.written))
         }
@@ -1373,7 +1424,96 @@ struct UpsertDone {
     written: Option<Topology>,
     ledger: Ledger,
     epic_id: Option<Uuid>,
-    kind: &'static str,
+    /// Ledger `caller_kind`; `None` for a validate-only worker (#2267).
+    kind: Option<&'static str>,
+}
+
+/// The launches the project's live grant allows, for a caller that holds no
+/// topology authority of its own (#2267). Empty when no live grant exists.
+fn project_allowed_launches(
+    store: &Store,
+    project_id: Option<Uuid>,
+) -> Result<Vec<ManagerLaunchChoiceV2>> {
+    let Some(mut policy) = project_grant_policy(store, project_id)? else {
+        return Ok(Vec::new());
+    };
+    if let Some(config) = project_id
+        .map(|project| store.get_harness_manager(project))
+        .transpose()?
+        .flatten()
+    {
+        policy.allowed_launches =
+            store.manager_effective_launches(&config, &policy.allowed_launches)?;
+    }
+    Ok(policy.allowed_launches)
+}
+
+/// The one policy line a validate-only worker sees (#2267): which launches the
+/// operator granted stays with the manager and the operator.
+pub(crate) const WORKER_POLICY_DIAGNOSTIC: &str = "launch not granted: the definition's session or review launches are not all covered by the operator's grant; ask the project manager for the allowed provider/model/effort triples";
+
+/// `validate_only` for any live leaf session that holds no topology authority
+/// (#2267), so a worker that designs a topology can run the daemon's own
+/// checks. The structural diagnostics are returned in full. The policy
+/// diagnostics collapse to [`WORKER_POLICY_DIAGNOSTIC`] without listing the
+/// grant. Nothing is written, the idempotency key stays unbound, and the
+/// result names no stored topology (no id, no revision). `None` when the
+/// request is not a worker validation, so the caller's refusal stands.
+fn validate_as_worker(
+    store: &Store,
+    knobs: AgentKnobs,
+    caller_id: Uuid,
+    request: &AgentTopologyUpsertRequestV1,
+) -> Result<Option<UpsertDone>> {
+    if !request.validate_only {
+        return Ok(None);
+    }
+    let Some(session) = store.get_session(caller_id)? else {
+        return Ok(None);
+    };
+    if !rsi_common::is_leaf_kind(session.session_kind)
+        || matches!(
+            session.status,
+            SessionStatus::Archived | SessionStatus::Deleted
+        )
+        || request
+            .project_id
+            .is_some_and(|project| session.project_id != Some(project))
+    {
+        return Ok(None);
+    }
+    let topology = Topology {
+        id: Uuid::new_v4(),
+        name: request.name.clone(),
+        definition: request.definition.clone(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let allowed = project_allowed_launches(store, session.project_id)?;
+    let checked = check_definition(&topology, &allowed, knobs.bulk_fanout_min_openrouter);
+    let mut diagnostics: Vec<String> = checked
+        .structural
+        .iter()
+        .take(DIAGNOSTICS_MAX - 1)
+        .cloned()
+        .collect();
+    if !checked.policy.is_empty() {
+        diagnostics.push(WORKER_POLICY_DIAGNOSTIC.to_owned());
+    }
+    let definition_json = rows::canonical_definition_text(&request.definition)?;
+    Ok(Some(UpsertDone {
+        result: AgentTopologyUpsertResultV1 {
+            topology_id: None,
+            revision: None,
+            definition_digest: rows::digest(&definition_json),
+            diagnostics,
+            deduplicated: false,
+        },
+        written: None,
+        ledger: Ledger::Unbound,
+        epic_id: None,
+        kind: None,
+    }))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1385,7 +1525,17 @@ fn upsert_in_tx(
     digest: &str,
 ) -> Result<UpsertDone> {
     request.validate().map_err(invalid)?;
-    let caller = TopologyCaller::resolve_in(store, caller_id, request.project_id)?;
+    let caller = match TopologyCaller::resolve_in(store, caller_id, request.project_id) {
+        Ok(caller) => caller,
+        Err(error) => {
+            // #2267: a caller with no topology authority may still check a
+            // definition. `validate_only` never writes and never binds its key.
+            return match validate_as_worker(store, knobs, caller_id, request)? {
+                Some(done) => Ok(done),
+                None => Err(error),
+            };
+        }
+    };
     let (epic_id, project_id) = match (request.scope, &caller) {
         (
             AgentTopologyScopeV1::Epic,
@@ -1455,11 +1605,12 @@ fn upsert_in_tx(
             written: None,
             ledger: Ledger::Replay,
             epic_id,
-            kind: caller.kind(),
+            kind: Some(caller.kind()),
         });
     }
     let owner_kind = request.scope.owner_kind();
-    let existing = TopologyRecord::by_name(&store.conn, &request.name)?;
+    let existing =
+        TopologyRecord::by_name(&store.conn, &request.name, owner_kind, project_id, epic_id)?;
     let owned = match existing {
         Some(record)
             if record.owner_kind == owner_kind
@@ -1472,7 +1623,7 @@ fn upsert_in_tx(
         Some(_) => {
             return Err(refusal(
                 "name_conflict",
-                "topology names are unique across the daemon; choose a different name",
+                "topology names are unique within their ownership scope; choose a different name",
             ));
         }
         None => None,
@@ -1490,7 +1641,7 @@ fn upsert_in_tx(
         .map(|policy| policy.allowed_launches)
         .unwrap_or_default();
     let checked = check_definition(&topology, &allowed, knobs.bulk_fanout_min_openrouter);
-    let definition_json = serde_json::to_string(&request.definition)?;
+    let definition_json = rows::canonical_definition_text(&request.definition)?;
     let definition_digest = rows::digest(&definition_json);
     if request.validate_only {
         return Ok(UpsertDone {
@@ -1504,7 +1655,7 @@ fn upsert_in_tx(
             written: None,
             ledger: Ledger::Unbound,
             epic_id,
-            kind: caller.kind(),
+            kind: Some(caller.kind()),
         });
     }
     if let Some(refused) = checked.refusal() {
@@ -1575,7 +1726,7 @@ fn upsert_in_tx(
                 {
                     return Err(refusal(
                         "name_conflict",
-                        "topology names are unique across the daemon; choose a different name",
+                        "topology names are unique within their ownership scope; choose a different name",
                     ));
                 }
                 Err(error) => return Err(error.into()),
@@ -1594,12 +1745,68 @@ fn upsert_in_tx(
         written: (!deduplicated).then_some(Topology { id, ..topology }),
         ledger: Ledger::Bind,
         epic_id,
-        kind: caller.kind(),
+        kind: Some(caller.kind()),
     })
 }
 
+/// One row per visible name, in the same order used by name lookup. Scope
+/// filters apply before ranking. Fixed-ID Get still reads a visible shared
+/// starter even when a private definition shadows its name.
+fn visible_page(
+    store: &Store,
+    caller: &TopologyCaller,
+    request: &AgentTopologyListRequestV1,
+    name: Option<&str>,
+    limit: u32,
+) -> Result<Vec<TopologyRecord>> {
+    let epics = serde_json::to_string(&caller.epics())?;
+    let project = caller.project_id().map(|id| id.to_string());
+    let preferred = if matches!(caller, TopologyCaller::Manager { .. }) {
+        "manager"
+    } else {
+        "epic"
+    };
+    let mut statement = store.conn.prepare(&format!(
+        "WITH visible AS (
+           SELECT {TOPOLOGY_COLUMNS}, ROW_NUMBER() OVER (
+             PARTITION BY name ORDER BY
+               CASE WHEN owner_kind=?9 THEN 0 WHEN owner_kind='operator' THEN 2 ELSE 1 END,
+               COALESCE(epic_id,''),id) AS name_rank
+           FROM topologies WHERE archived_at IS NULL AND name>?1
+           AND (?2 IS NULL OR owner_kind=?2) AND (?3 IS NULL OR epic_id=?3)
+           AND ((owner_kind='epic' AND epic_id IN (SELECT value FROM json_each(?4)) AND project_id IS ?5)
+             OR (owner_kind='manager' AND project_id IS ?5 AND (?6=1 OR (shared=1 AND project_id IS NOT NULL)))
+             OR (owner_kind='operator' AND shared=1))
+           AND (?8 IS NULL OR name=?8)
+         ) SELECT {TOPOLOGY_COLUMNS} FROM visible WHERE name_rank=1 ORDER BY name LIMIT ?7"
+    ))?;
+    let raw = statement
+        .query_map(
+            params![
+                request.cursor.clone().unwrap_or_default(),
+                request.scope.map(AgentTopologyScopeV1::owner_kind),
+                request.epic_id.map(|id| id.to_string()),
+                epics,
+                project,
+                i64::from(matches!(caller, TopologyCaller::Manager { .. })),
+                i64::from(limit),
+                name,
+                preferred
+            ],
+            raw_topology,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut records = raw
+        .into_iter()
+        .map(TopologyRecord::from_raw)
+        .collect::<Result<Vec<_>>>()?;
+    records.retain(|record| caller.sees(record));
+    Ok(records)
+}
+
 /// `AgentTopologyList` (plan §5.1): a name-ordered page of the topologies
-/// visible to the caller, optionally with its scope's live executions.
+/// visible to the caller, optionally with its scope's executions: live ones
+/// by default, plus the settled run history with `include_settled` (#2264).
 pub(crate) fn list(
     store: &Store,
     caller: Uuid,
@@ -1610,53 +1817,30 @@ pub(crate) fn list(
     if let Some(epic) = request.epic_id {
         caller.require_epic(store, epic, Reach::Read)?;
     }
-    let epics = serde_json::to_string(&caller.epics())?;
-    let project = caller.project_id().map(|id| id.to_string());
-    let mut statement = store.conn.prepare(&format!(
-        "SELECT {TOPOLOGY_COLUMNS} FROM topologies WHERE archived_at IS NULL AND name>?1 \
-           AND (?2 IS NULL OR owner_kind=?2) AND (?3 IS NULL OR epic_id=?3) \
-           AND ((owner_kind='epic' AND epic_id IN (SELECT value FROM json_each(?4)) AND project_id IS ?5) \
-             OR (owner_kind='manager' AND project_id IS ?5 AND (?6=1 OR shared=1)) \
-             OR (owner_kind='operator' AND shared=1)) \
-         ORDER BY name LIMIT ?7"
-    ))?;
-    let is_manager = i64::from(matches!(caller, TopologyCaller::Manager { .. }));
-    let raw = statement
-        .query_map(
-            params![
-                request.cursor.clone().unwrap_or_default(),
-                request.scope.map(AgentTopologyScopeV1::owner_kind),
-                request.epic_id.map(|id| id.to_string()),
-                epics,
-                project,
-                is_manager,
-                i64::from(limit) + 1,
-            ],
-            raw_topology,
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut records = raw
-        .into_iter()
-        .map(TopologyRecord::from_raw)
-        .collect::<Result<Vec<_>>>()?;
-    records.retain(|record| caller.sees(record));
+    let mut records = visible_page(store, &caller, request, None, limit + 1)?;
     let next_cursor = (records.len() > limit as usize).then(|| {
         records.truncate(limit as usize);
         records.last().map(|record| record.name.clone())
     });
-    let executions = if request.include_executions {
+    let executions = if request.include_executions || request.include_settled {
         let epics = request
             .epic_id
             .map_or_else(|| caller.epics(), |epic| vec![epic]);
         let mut statement = store.conn.prepare(
             "SELECT id FROM topology_executions \
-             WHERE status IN ('accepted','running','cancelling','blocked') \
+             WHERE (status IN ('accepted','running','cancelling','blocked') \
+                    OR (?3=1 AND status IN ('succeeded','failed','cancelled'))) \
                AND COALESCE(epic_id,parent_session_id) IN (SELECT value FROM json_each(?1)) \
-             ORDER BY created_at DESC LIMIT ?2",
+             ORDER BY status IN ('accepted','running','cancelling','blocked') DESC, \
+                      created_at DESC LIMIT ?2",
         )?;
         let ids = statement
             .query_map(
-                params![serde_json::to_string(&epics)?, EXECUTIONS_LIST_MAX],
+                params![
+                    serde_json::to_string(&epics)?,
+                    EXECUTIONS_LIST_MAX,
+                    i64::from(request.include_settled)
+                ],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1679,7 +1863,46 @@ pub(crate) fn list(
     })
 }
 
-fn execution_summary(
+/// `AgentTopologyGet` (#2414): one topology the caller can see, with its
+/// stored definition. Visibility is exactly the list's (`sees`); anything
+/// outside the caller's scope, archived or absent is `not_found_in_scope`, so
+/// a probe cannot tell a foreign topology from a missing one.
+pub(crate) fn get(
+    store: &Store,
+    caller: Uuid,
+    request: &AgentTopologyGetRequestV1,
+) -> Result<AgentTopologyGetResultV1> {
+    request.validate().map_err(invalid)?;
+    let caller = TopologyCaller::resolve_in(store, caller, request.project_id)?;
+    let record = match (request.topology_id, request.name.as_deref()) {
+        (Some(id), _) => TopologyRecord::load(&store.conn, id)?,
+        (None, Some(name)) => visible_page(
+            store,
+            &caller,
+            &AgentTopologyListRequestV1::default(),
+            Some(name),
+            1,
+        )?
+        .pop(),
+        (None, None) => None,
+    }
+    .filter(|record| !record.archived && caller.sees(record))
+    .ok_or_else(not_found)?;
+    let owner_session_id: Option<String> = store.conn.query_row(
+        "SELECT owner_session_id FROM topologies WHERE id=?1",
+        [record.id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(AgentTopologyGetResultV1 {
+        topology: record.summary(),
+        definition: serde_json::from_str(&record.definition_json)?,
+        owner_session_id: owner_session_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        project_id: record.project_id,
+        created_at: record.created_at.clone(),
+    })
+}
+
+pub(crate) fn execution_summary(
     conn: &Connection,
     execution_id: Uuid,
 ) -> Result<Option<AgentTopologyExecutionSummaryV1>> {
@@ -1758,6 +1981,7 @@ fn execution_summary(
         error: error.map(clip),
         created_at,
         finished_at,
+        outcome: None,
     }))
 }
 
@@ -1769,19 +1993,44 @@ pub(crate) fn get_execution(
 ) -> Result<AgentTopologyGetExecutionResultV1> {
     let limit = request.validated_limit().map_err(invalid)?;
     let project = execution_project(store, request.execution_id, request.project_id)?;
-    let caller = TopologyCaller::resolve_in(store, caller, project).map_err(|error| {
-        if request.project_id.is_none() {
-            derived_project_denial(error)
-        } else {
-            error
-        }
-    })?;
-    caller.require_execution(store, request.execution_id, Reach::Read)?;
-    let execution = execution_summary(&store.conn, request.execution_id)?.ok_or_else(not_found)?;
-    let nodes = rows::load_attempts(store, request.execution_id)?
+    // #2982: the active reviewer of a review assignment that serves this
+    // execution reads it (the author and merge-queue receipts its review
+    // contract names). Read-only: every other topology verb stays with a
+    // manager or the Epic lead, and a reviewer of another execution is
+    // refused like any other worker.
+    let assigned_reviewer =
+        Store::topology_review_assignment_on(&store.conn, caller, Some(request.execution_id))?;
+    if !assigned_reviewer {
+        let caller = TopologyCaller::resolve_in(store, caller, project).map_err(|error| {
+            if request.project_id.is_none() {
+                derived_project_denial(error)
+            } else {
+                error
+            }
+        })?;
+        caller.require_execution(store, request.execution_id, Reach::Read)?;
+    }
+    let mut execution =
+        execution_summary(&store.conn, request.execution_id)?.ok_or_else(not_found)?;
+    if crate::topology::outcome::is_settled(&execution.status) {
+        execution.outcome = crate::topology::outcome::settled_outcome(store, request.execution_id)?;
+    }
+    let attempts = rows::load_attempts(store, request.execution_id)?;
+    let nodes = attempts
         .iter()
         .map(crate::topology::resolve::summary)
         .collect();
+    // #3020: the assigned reviewer also reads the test evidence its review
+    // contract names (the author's verified `scoped_test` receipt and the
+    // merge-queue gate receipt). Nobody else gets receipt content here.
+    let receipts = if assigned_reviewer {
+        let row = rows::load_execution(store, request.execution_id)?.ok_or_else(not_found)?;
+        Some(crate::topology::review_receipts::project(
+            store, &row, &attempts,
+        )?)
+    } else {
+        None
+    };
     let after = request.after_sequence.unwrap_or(0);
     let mut statement = store.conn.prepare(
         "SELECT execution_seq,kind,node_id,attempt_id,actor_kind,actor_session_id,created_at \
@@ -1827,6 +2076,7 @@ pub(crate) fn get_execution(
     Ok(AgentTopologyGetExecutionResultV1 {
         execution,
         nodes,
+        receipts,
         events,
         next_sequence,
     })
@@ -1840,20 +2090,25 @@ pub(crate) struct Executed {
     pub(crate) accepted: Option<GraphExecutionUpdate>,
     pub(crate) topology: Option<Topology>,
     pub(crate) project_id: Option<Uuid>,
+    /// #2427: executions this one superseded, with their interrupt updates to
+    /// publish; the caller wakes each driver.
+    pub(crate) superseded: Vec<crate::topology::issue_hold::Superseded>,
 }
 
 fn execute_fingerprint(request: &AgentTopologyExecuteRequestV1) -> String {
-    rows::digest(
-        &json!({
-            "topology_id": request.topology_id,
-            "expected_digest": request.expected_digest,
-            "epic_id": request.epic_id,
-            "inputs": request.inputs,
-            "base_commit": request.base_commit,
-            "on_call": request.on_call,
-        })
-        .to_string(),
-    )
+    let mut fingerprint = json!({
+        "topology_id": request.topology_id,
+        "expected_digest": request.expected_digest,
+        "epic_id": request.epic_id,
+        "inputs": request.inputs,
+        "base_commit": request.base_commit,
+        "on_call": request.on_call,
+    });
+    // Added only when set so an earlier acceptance still replays (#2427).
+    if let Some(superseded) = request.supersedes_execution {
+        fingerprint["supersedes_execution"] = json!(superseded);
+    }
+    rows::digest(&fingerprint.to_string())
 }
 
 fn replayed(
@@ -1871,6 +2126,8 @@ fn replayed(
         accepted_at: prior.accepted_at,
         base_commit: prior.base_commit.clone(),
         deduplicated: true,
+        settle_wake_armed: false,
+        settle_wake_refusal: None,
     })
 }
 
@@ -1971,6 +2228,10 @@ fn admit(
     }
     let (checked, policy, scope_version) =
         admission_policy(store, knobs, caller, &record, request.epic_id)?;
+    // #2304 slice 3: a chosen review policy must be one the graph covers.
+    if let Some(workflow) = checked.workflow.as_ref() {
+        crate::topology::review_policy::resolve(Some(record.id), workflow, &request.inputs)?;
+    }
     let epic = store.get_session(request.epic_id)?.ok_or_else(not_found)?;
     let project_id = epic.project_id;
     let repo = project_id
@@ -2082,6 +2343,7 @@ pub(crate) async fn prepare_execute(
                 accepted: None,
                 topology: None,
                 project_id: None,
+                superseded: Vec::new(),
             })));
         }
         admit(&store, knobs, &caller, request)?
@@ -2180,8 +2442,35 @@ pub(crate) fn accept_prepared(
         other => other,
     })?
     .unwrap_or(serde_json::Value::Null);
+    // #2304 slice 3: record the resolved review policy with the input snapshot;
+    // enqueue re-derives and rechecks it against the stored graph.
+    let mut inputs = inputs;
+    if let Some(policy) = crate::topology::review_policy::resolve(
+        Some(admitted.record.id),
+        &admitted.workflow,
+        &inputs,
+    )? {
+        crate::topology::review_policy::record(&mut inputs, policy);
+    }
+    // #2260: a `close_issue` land needs the Issue it closes.
+    crate::topology::starters::require_issue_input(
+        &crate::topology::steps::WorkflowSteps::from_workflow(&admitted.workflow)
+            .map_err(DaemonError::InvalidParam)?,
+        Some(&inputs),
+    )?;
+    // #2427: one Issue, one live run. Refuses before any row; a named holder
+    // is interrupted here, under the accepting lock.
+    let id = Uuid::new_v4();
+    let superseded = crate::topology::issue_hold::guard(
+        store,
+        caller_id,
+        &caller,
+        id,
+        request.supersedes_execution,
+        &inputs,
+    )?;
     let new = NewExecution {
-        id: Uuid::new_v4(),
+        id,
         topology_id: Some(admitted.record.id),
         workflow_id: Uuid::new_v4(),
         definition: admitted.workflow,
@@ -2190,7 +2479,7 @@ pub(crate) fn accept_prepared(
         parent_session_id: Some(request.epic_id),
         repo_root,
         base_commit,
-        input: crate::topology::oncall::embed(inputs, request.on_call.as_ref())?,
+        input: crate::topology::oncall::embed(inputs.clone(), request.on_call.as_ref())?,
         requester: Some(ExecutionRequester {
             actor,
             epic_id: request.epic_id,
@@ -2208,19 +2497,24 @@ pub(crate) fn accept_prepared(
         owner: None,
     };
     let base_commit = new.base_commit.clone();
-    let id = new.id;
     match rows::accept_agent_execution(store, &new)? {
-        Acceptance::Fresh(update) => Ok(Executed {
-            result: AgentTopologyExecuteResultV1 {
-                execution_id: id,
-                accepted_at: update.updated_at,
-                base_commit,
-                deduplicated: false,
-            },
-            accepted: Some(update),
-            topology: Some(admitted.record.topology()),
-            project_id: admitted.project_id,
-        }),
+        Acceptance::Fresh(update) => {
+            crate::topology::issue_hold::mark_in_progress(store, caller_id, &inputs, id);
+            Ok(Executed {
+                result: AgentTopologyExecuteResultV1 {
+                    execution_id: id,
+                    accepted_at: update.updated_at,
+                    base_commit,
+                    deduplicated: false,
+                    settle_wake_armed: false,
+                    settle_wake_refusal: None,
+                },
+                accepted: Some(update),
+                topology: Some(admitted.record.topology()),
+                project_id: admitted.project_id,
+                superseded,
+            })
+        }
         Acceptance::Replay {
             execution_id,
             accepted_at,
@@ -2231,10 +2525,13 @@ pub(crate) fn accept_prepared(
                 accepted_at,
                 base_commit,
                 deduplicated: true,
+                settle_wake_armed: false,
+                settle_wake_refusal: None,
             },
             accepted: None,
             topology: None,
             project_id: None,
+            superseded: Vec::new(),
         }),
     }
 }
@@ -2332,7 +2629,8 @@ fn audit_refusal(
 
 /// `AgentTopologyResolveAttempt` (plan §3.4, §5.1): the operator resolution
 /// function, bound to the caller's scope. A lead cannot discard preserved
-/// bytes; the manager needs `Automation` (already required to resolve).
+/// bytes or rule on a blocked review (it may retry one); the manager needs
+/// `Automation` (already required to resolve).
 pub(crate) async fn resolve<E: NodeEffects>(
     executor: &Executor<E>,
     caller_id: Uuid,
@@ -2432,8 +2730,121 @@ pub(crate) fn authorize_execution(
     Ok((caller, execution))
 }
 
+/// Arm-time authorization of a `topology_execution_settled` wake (#2261): the
+/// execution's requester, or a manager or Epic lead that can read its Epic.
+/// An unknown or out-of-scope id is the one `wake_when_execution_not_found`.
+pub(crate) fn authorize_execution_wake(
+    store: &Store,
+    caller_id: Uuid,
+    execution_id: Uuid,
+) -> Result<()> {
+    let not_found = || {
+        DaemonError::InvalidParam(rsi_common::wake_predicate::WAKE_WHEN_EXECUTION_NOT_FOUND.into())
+    };
+    let execution = rows::load_execution(store, execution_id)
+        .ok()
+        .flatten()
+        .ok_or_else(not_found)?;
+    if execution.requested_by_session_id == Some(caller_id) {
+        return Ok(());
+    }
+    authorize_execution(store, caller_id, execution_id, Reach::Read)
+        .map(|_| ())
+        .map_err(|_| not_found())
+}
+
+/// The requester's identity for its settle wake: the launch facts of the
+/// session the wake resumes, read from its row.
+pub(crate) struct SettleWakeSeat {
+    pub(crate) caller: Uuid,
+    pub(crate) working_dir: std::path::PathBuf,
+    pub(crate) provider: Option<SessionProvider>,
+    pub(crate) model: Option<String>,
+    pub(crate) project_id: Option<Uuid>,
+}
+
+/// Hub #2967: arm the requester's one `topology_execution_settled` resume
+/// wake for an `AgentTopologyExecute`, the way `AgentEnqueueLandingSource`
+/// always wakes its enqueuer (#2405). Only a fresh acceptance arms it, and
+/// not under `wake:"none"`: the execution id is the key, and a replay
+/// (`executed.accepted` is `None`) reuses the first acceptance's wake, so an
+/// execution that settled in between never wakes its requester twice. The
+/// wake is named after the execution, so a retried arm replaces the row
+/// rather than adding one. Hub #2986: when the requester already owns an
+/// enabled settle wake for the execution (a manual one, whatever its name)
+/// nothing is armed and `false` is returned: the requester is already covered,
+/// and a later manual arm replaces the default the same way. A refusal is logged and read back as `false`; the
+/// execution is already durable and is not undone.
+pub(crate) fn arm_settle_wake(
+    store: &Store,
+    seat: SettleWakeSeat,
+    request: &AgentTopologyExecuteRequestV1,
+    executed: &Executed,
+) -> SettleWakeArm {
+    use crate::session::harness::tools::schedule_wake::{WakeWhenRequest, build_wake_when_job};
+    if executed.accepted.is_none() || request.wake == Some(rsi_common::agent_jobs::JobWake::None) {
+        return SettleWakeArm::default();
+    }
+    let execution_id = executed.result.execution_id;
+    let armed = build_wake_when_job(WakeWhenRequest {
+        message: format!(
+            "Topology execution {execution_id} settled. Read it with \
+             AgentTopologyGetExecution {{\"execution_id\":\"{execution_id}\"}} \
+             and act on its status."
+        ),
+        name: Some(format!("topology-settled-{execution_id}")),
+        predicate: rsi_common::wake_predicate::WakePredicate {
+            topology_execution_settled: Some(execution_id),
+            ..Default::default()
+        },
+        timeout_seconds: None,
+        working_dir: seat.working_dir,
+        provider: seat.provider,
+        model: seat.model,
+        project_id: seat.project_id,
+        origin_session_id: seat.caller,
+    })
+    .map_err(DaemonError::InvalidParam)
+    .and_then(|(job, state)| {
+        crate::scheduler::arm_authorized_deduped(
+            store,
+            &job,
+            &state,
+            true,
+            crate::store::scheduled_jobs::SettleWakeDedupe::SkipIfCovered,
+        )
+    });
+    match armed {
+        Ok(outcome) => SettleWakeArm {
+            armed: outcome.armed,
+            refusal: None,
+        },
+        Err(error) => {
+            tracing::warn!(%error, %execution_id, "topology settle wake not armed");
+            // #3019: the refusal reaches the requester in the receipt, not only
+            // the daemon log; the stable code is the whole `InvalidParam` text.
+            SettleWakeArm {
+                armed: false,
+                refusal: Some(match error {
+                    DaemonError::InvalidParam(code) => code,
+                    other => other.to_string(),
+                }),
+            }
+        }
+    }
+}
+
+/// What [`arm_settle_wake`] did: `armed`, or the reason a refused arm left the
+/// requester with no settle wake (`refusal` is `None` for a replay,
+/// `wake:"none"` or an already-covered execution).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SettleWakeArm {
+    pub(crate) armed: bool,
+    pub(crate) refusal: Option<String>,
+}
+
 /// [`authorize_execution`] for one resolution action; a lead never
-/// discards preserved bytes.
+/// discards preserved bytes or rules on a blocked review.
 fn authorize_resolution(
     store: &Store,
     caller_id: Uuid,
@@ -2453,5 +2864,55 @@ fn authorize_resolution(
             "ask the manager (Automation) or the operator to discard preserved work",
         ));
     }
+    // #2280: accepting a blocked review is the owning manager's ruling on an
+    // unfinished review, so an Epic lead may retry it but not rule on it.
+    if params.action == TopologyAttemptAction::Accept
+        && matches!(caller, TopologyCaller::Lead { .. })
+        && rows::load_attempt(store, params.attempt_id)?
+            .is_some_and(|(_, attempt)| attempt.node_kind == "review")
+    {
+        return Err(refusal(
+            "review_accept_requires_manager",
+            "ask the manager (Automation) or the operator to rule on a blocked review, or retry it",
+        ));
+    }
     Ok(caller)
+}
+
+#[cfg(test)]
+mod launch_allowlist_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn topology_allowlist_any_effort_preserves_exact_model_and_effort_restrictions() {
+        let any = ManagerLaunchChoiceV2 {
+            provider: rsi_common::SessionProvider::Codex,
+            model: "gpt-6-astra".into(),
+            effort: None,
+        };
+        for effort in rsi_common::model_utils::effort_ladder(&any.model) {
+            let exact = ManagerLaunchChoiceV2 {
+                effort: Some((*effort).into()),
+                ..any.clone()
+            };
+            assert!(launch_granted(&[any.clone()], &exact));
+        }
+        let high = ManagerLaunchChoiceV2 {
+            effort: Some("high".into()),
+            ..any.clone()
+        };
+        let low = ManagerLaunchChoiceV2 {
+            effort: Some("low".into()),
+            ..any.clone()
+        };
+        assert!(launch_granted(&[high.clone()], &high));
+        assert!(!launch_granted(&[high], &low));
+        let other = ManagerLaunchChoiceV2 {
+            model: "another-model".into(),
+            ..any.clone()
+        };
+        assert!(!launch_granted(&[any], &other));
+        assert!(!launch_granted(&[], &low));
+    }
 }

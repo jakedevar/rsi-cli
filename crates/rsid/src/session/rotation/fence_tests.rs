@@ -518,6 +518,29 @@ async fn exhausted_resume_retry_survives_crash_before_settlement_without_fresh_b
     Ok(())
 }
 
+/// #2487: a non-predicate wake keeps the settle-as-attempt behaviour when the
+/// retry bookkeeping write itself fails.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_retry_record_settles_a_non_predicate_wake_as_an_attempt() -> anyhow::Result<()> {
+    let (manager, dir) = rotation_manager();
+    let manager = Arc::new(manager);
+    let mut orphan = test_session(Uuid::new_v4(), SessionStatus::Starting);
+    orphan.working_dir = dir.path().to_path_buf();
+    manager.store.lock().await.insert_session(&orphan)?;
+    let job = resume_job(orphan.id, dir.path())?;
+    manager.store.lock().await.insert_scheduled_job(&job)?;
+    crate::scheduler::install_fault_for_test(job.id, "record_retry");
+    fire(&manager, &job).await;
+    let store = manager.store.lock().await;
+    let settled = store
+        .get_scheduled_job(&job.id)?
+        .ok_or_else(|| anyhow::anyhow!("wake row kept"))?;
+    assert!(!settled.enabled);
+    assert!(settled.last_fired_at.is_some());
+    Ok(())
+}
+
 /// Design test 15: an operator "trigger now" refused by the fence is typed
 /// and consumes nothing: the row stays enabled, unstamped, with no retry.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

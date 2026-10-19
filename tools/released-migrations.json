@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "latest_schema_version": 162,
+  "latest_schema_version": 182,
   "migration_dir": "crates/rsid-store/src/store/migrations",
   "blocks": {
     "0": "sha256:3e79edf6e3b6718c67bf3de92309ddd9cf97c1768cab75922a24d61405589ca5",
@@ -164,7 +164,27 @@
     "159": "sha256:5316c41780934868371cf06ae058f7d31dc1108dae410cd2161ab65b77b0dd24",
     "160": "sha256:04743daeea0e55fd52fdc4e4335f0c5a212546a4cb098e8c0698390ee922170c",
     "161": "sha256:5e93b3826995378ac5bbbfdf8dc6f7d6af2478999bf202f6b5e981dcaa43325f",
-    "162": "sha256:fa9a1fe6e78f7dc496bff3501de2e1118c1742027dc346a78c320f7c95ff6b00"
+    "162": "sha256:fa9a1fe6e78f7dc496bff3501de2e1118c1742027dc346a78c320f7c95ff6b00",
+    "163": "sha256:dff80090f0fa0a421b7a07eeb5319c6a4cd10b222a44963d4496b9c07accb93b",
+    "164": "sha256:d99dc88481a6491d203f7135fdcc35053effa790d51c4f176280a8fd768f8bcb",
+    "165": "sha256:971b56f0eac55e08870bbec35445b4a61e6b04428032b024b54d760a01132d9b",
+    "166": "sha256:2ae0446238a438b66db3e55a9c719ec1134ab3ba546195bc7d4289bfbebdb991",
+    "167": "sha256:f784ae5b83d9791ab13398a8fe9be747e114a0eba03681df97b0d3f08323dd52",
+    "168": "sha256:5b698803cf1436abe430e4412eb82a5878622dccb71a2c57b1c1452d0c6bd856",
+    "169": "sha256:b921fc28658d9db5044a55ad51f0162980274ae8e183990561ce725d03087090",
+    "170": "sha256:7a08c284b8c20acfcc4f5d375763214fe6a063ea8984ef4d30cd3264b9e5b15d",
+    "171": "sha256:cfe383b87c6316e5007f6fe055bf6de8e183ddaae73cceecdac50dc9537e8cb6",
+    "172": "sha256:b4913889c5d5c101d9de5d1bce61c4469215cc40f11f9447b307bcb6f2ab6215",
+    "173": "sha256:96f5525c36fc027505bf702c762457c578360c68e19befc5094b233143c1c7ee",
+    "174": "sha256:7089c174fc455f4d7edd0e57dfc682293a205e433f36eb07f6668daa80feca40",
+    "175": "sha256:16caa4c3461da3c1b0b2ee0531c224dfe976ff1528ba1ba0d4dc859c06952498",
+    "176": "sha256:26761cf07d5cae8fd0910150fac70c97d787f525dd4c37e90b770e78dc91155d",
+    "177": "sha256:52fe74acb96833a9d8023edfb049f2de08d25d61a85cf9f947d9e0609836c3d7",
+    "178": "sha256:9aff19d351a49b101d9923b68679785a1d611152d92779eccfc5520c5fd1520f",
+    "179": "sha256:0fc6630fceeacaacf9efd148e61936f6d558dacd8775c31813b5a7296fb69bf0",
+    "180": "sha256:768499f1a6248e2f5681376b2b9bc39a5e3014606b6d3069060660f43b4b122a",
+    "181": "sha256:0f1be96f90e03fcc220abe96b58c13c19bdd28057a940e72b0b06f4726bca2e7",
+    "182": "sha256:478edc1f58bf36815887e4813e21fd24aa5d092226060372d5947ce0d5c32e82"
   },
   "protected_sections": {
     "v112-operator-views-convergence-driver": {
@@ -522,6 +542,50 @@
     "satellite-registry-validator": {
       "path": "crates/rsid-store/src/store/satellite_registry.rs",
       "sha256": "sha256:b7bce47a6e61c001486bf1480e92cbe387b993b9869a6ba85abcc5aac6f98ea7"
+    },
+    "v171-settlement-reproof-schema": {
+      "path": "crates/rsid-store/src/store/cohort_settlement/reproof.rs",
+      "sha256": "sha256:e7fd54076f09e1b81d5165ee9665cb84bbaba212662c77671656c0badcbedbea"
+    },
+    "v171-settlement-altered-objects": {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "sha256": "sha256:7377edab38727c57bc764dca483ebef2a468e5a89d2312ae2299386d199e5c67"
+    },
+    "v172-settlement-completion-retry": {
+      "path": "crates/rsid-store/src/store/cohort_settlement/completion_retry.rs",
+      "sha256": "sha256:42f96034044b0897734d5c6dad00fc336ef9fd312a00767881b6077498d5b663"
+    },
+    "v172-settlement-completion-altered-objects": {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "sha256": "sha256:4fd875396b45793e30c8b311403960ad129bbb8bda86fe77dbfce8b9911c20e6"
+    },
+    "v173-settlement-untouched-intent": {
+      "path": "crates/rsid-store/src/store/cohort_settlement/untouched_intent.rs",
+      "sha256": "sha256:2fd46ce3f64969faba0c8ca4190fc0d24077b31152c63bceb3e07fe88182f1f4"
+    },
+    "v173-settlement-untouched-altered-objects": {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "sha256": "sha256:ebec884cb164cbabcdae5cbcae2421ad6966f91fe295449b8566c26591fda440"
+    },
+    "v175-session-health-altered-objects": {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "sha256": "sha256:025c17f348c69c2ccd3d1ef48f4ee13189885c3d300178e28cb208f74aadbeca"
+    },
+    "v175-session-dependency-health-catalog": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120/health_v175.rs",
+      "sha256": "sha256:5ec9e678f0ee8e3024e02bad62a35b7df66ea9cd94b1873387bb7d5060b3a033"
+    },
+    "v175-session-dependency-health-migration": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120/health_v175.rs",
+      "sha256": "sha256:9a5dabafa9b2621c8f8404484cd27fdda78ddc8188add01eb106043c2bde3d97"
+    },
+    "v175-session-dependency-health-validator": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120/health_v175.rs",
+      "sha256": "sha256:d6b5c5c420909b8f65bc9caa3e90ac503e7fcfbeb55a57068e210b552b25fed3"
+    },
+    "v180-deploy-request-identity-altered-objects": {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "sha256": "sha256:93298653361e3c80b056f03575a2b1ecd7c13a6e008fb396916bb2e81391007e"
     }
   }
 }

@@ -3,13 +3,15 @@
 import importlib.util
 import contextlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "rolling-landing-guard.py"
 sys.dont_write_bytecode = True
@@ -20,7 +22,7 @@ SPEC.loader.exec_module(GUARD)
 
 class LandingGuardTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-landing-guard-test-")
+        self.temp = scratch_tempdir(prefix="rsi-landing-guard-test-")
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name)
         self.git("init", "-q")
@@ -34,12 +36,24 @@ class LandingGuardTest(unittest.TestCase):
         self.base = self.commit("base")
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args], text=True).strip()
+        return scratch_git(self.repo, *args).stdout.strip()
 
     def commit(self, message):
         self.git("add", "crates/fixture")
         self.git("commit", "-q", "-m", message)
         return self.git("rev-parse", "HEAD")
+
+    def test_empty_accepted_delta_reports_already_on_rolling(self):
+        args = [str(SCRIPT), "--repo", str(self.repo), "--base", self.base,
+                "--source", self.base, "--target", self.base,
+                "--candidate", self.base, "--plan-only"]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(output):
+            self.assertEqual(GUARD.main(), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["outcome"], "already_on_rolling")
+        self.assertEqual(report["candidate"], self.base)
+        self.assertEqual(report["lost_hunks"], [])
 
     def test_reports_exact_accepted_line_reverted_by_later_resolution(self):
         self.file.write_text("new default\nobsolete line\nkeep\n")

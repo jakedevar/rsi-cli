@@ -790,7 +790,7 @@ mod tests {
 
         let main_db = dir.path().join("flywheel.db");
         // Create the main store so it exists on disk
-        let _main_store = Store::open(&main_db).unwrap();
+        let _main_store = Store::open_test_fixture(&main_db).unwrap();
 
         MemorySyncEngine::new(
             MemoryConfig {
@@ -826,7 +826,7 @@ mod tests {
         let good_db = dir.path().join("memory.sqlite");
         let store = MemoryStore::open(&good_db).unwrap();
         let main_db = dir.path().join("flywheel.db");
-        let _main_store = Store::open(&main_db).unwrap();
+        let _main_store = Store::open_test_fixture(&main_db).unwrap();
 
         // ...but hand the engine a `db_path` that cannot be opened as a
         // database. A directory is never a valid SQLite file, so the open

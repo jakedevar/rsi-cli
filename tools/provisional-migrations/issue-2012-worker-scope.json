@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "version": 169,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v169.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:4387173aa23733095f84f2973e63e4db3ce4799bd59e4502fff0971bf363da1e",
+      "sites": [
+        {
+          "anchor": "fn migrate_v169(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 169 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 169)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

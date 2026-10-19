@@ -1,22 +1,28 @@
 //! Signal/iMessage bridge connection form input handling.
+//!
+//! The configs are the daemon's (`GetMessageBridge` / `PutMessageBridge`,
+//! hub #3039): opening the form reads them through the daemon, saving writes
+//! them there.
 
 use crate::app::App;
-use crate::settings::{
-    MessageBridgeKind, MessageBridgeSettings, load_message_bridge_config,
-    write_message_bridge_config,
-};
+use crate::modalkit_types::LcAction;
+use crate::settings::{MessageBridgeKind, MessageBridgeSettings};
 use crate::types::OverlayState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Ask the daemon for the bridge config; the form opens when it answers.
 pub fn open_message_bridge_form(app: &mut App, bridge: MessageBridgeKind) {
-    let settings = match load_message_bridge_config(bridge) {
-        Ok(Some(settings)) => settings,
-        Ok(None) => app.settings.message_bridges.get(bridge).clone(),
-        Err(e) => {
-            app.notify(format!("Using saved settings; {}", e));
-            app.settings.message_bridges.get(bridge).clone()
-        }
-    };
+    app.pending_lc_actions
+        .push(LcAction::OpenMessageBridgeForm(bridge));
+}
+
+/// Open the form on `settings` (the daemon's config, or the TUI's saved
+/// copy while the file is absent).
+pub fn show_message_bridge_form(
+    app: &mut App,
+    bridge: MessageBridgeKind,
+    settings: MessageBridgeSettings,
+) {
     app.overlay = OverlayState::MessageBridgeForm {
         bridge,
         focused_field: 0,
@@ -25,6 +31,7 @@ pub fn open_message_bridge_form(app: &mut App, bridge: MessageBridgeKind) {
         allow_from: settings.allow_from,
         working_dir: settings.working_dir,
     };
+    app.mark_dirty();
 }
 
 pub(super) fn handle_message_bridge_form_key(app: &mut App, key: KeyEvent) {
@@ -164,15 +171,6 @@ fn submit_message_bridge_form(app: &mut App) {
     }
 
     *app.settings.message_bridges.get_mut(bridge) = settings.clone();
-    match write_message_bridge_config(bridge, &settings) {
-        Ok(path) => {
-            app.overlay = OverlayState::None;
-            app.notify_success(format!(
-                "Saved {} config: {} · bridge restart required",
-                bridge.label(),
-                path.display()
-            ));
-        }
-        Err(e) => app.notify(format!("Failed to save {} config: {}", bridge.label(), e)),
-    }
+    app.pending_lc_actions
+        .push(LcAction::PutMessageBridge { bridge, settings });
 }

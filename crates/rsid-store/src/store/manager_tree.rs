@@ -314,6 +314,7 @@ impl Store {
                     max_spend_usd: policy.max_spend_usd,
                     reserved: Vec::new(),
                 }),
+                last_seat_handoff: self.last_seat_handoff_of(node.node_id)?,
                 launches: portfolio_effective_launches(
                     &node.grant.allowed_launches,
                     &node.grant.project_policy,
@@ -413,6 +414,7 @@ impl Store {
             seat: seat_id.and_then(|id| self.tree_seat(id)),
             focus_session_id: seat_id,
             grant: None,
+            last_seat_handoff: None,
             launches: match live {
                 Some(config) => self.tree_pm_launches(config)?,
                 None => Vec::new(),
@@ -492,6 +494,7 @@ impl Store {
                 focus_session_id: epic.lead,
                 grant: None,
                 launches: Vec::new(),
+                last_seat_handoff: None,
                 load: ManagerTreeLoadV1 {
                     running_workers: Some(epic.running),
                     direct_reports: None,
@@ -549,6 +552,7 @@ impl Store {
                     max_spend_usd: g.allowance.max_spend_usd,
                     reserved: self.tree_reserved(node.id).unwrap_or_default(),
                 }),
+                last_seat_handoff: None,
                 launches: node
                     .grant
                     .as_ref()

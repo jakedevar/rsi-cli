@@ -136,6 +136,17 @@ fn setup() -> (tempfile::TempDir, CodegraphStore, Uuid) {
 fn id(store: &CodegraphStore, workspace: Uuid, name: &str) -> Uuid {
     store.search_name(workspace, name, 1).unwrap()[0].id
 }
+/// The stored block of the fixture file: `S` holds its nodes, `R` its relations.
+/// Fixtures that inject rows write into these block tables directly.
+fn block(conn: &rusqlite::Connection, kind: &str) -> i64 {
+    conn.query_row(
+        "SELECT b.block_id FROM cg_blocks b JOIN cg_manifest m ON m.block_id=b.block_id
+         WHERE b.kind=?1 AND b.path=?2 AND m.generation=1",
+        rusqlite::params![kind, PATH],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
 
 #[test]
 fn golden_architecture_and_impact_are_directed_and_evidenced() {
@@ -267,12 +278,12 @@ fn seed_modes_provenance_and_bounds_are_explicit() {
     // temporary database to exercise the reserved exploratory read contract.
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
     conn.execute(
-        "UPDATE cg_nodes SET provenance='Inferred' WHERE name='impact'",
+        "UPDATE cg_block_nodes SET provenance='Inferred' WHERE name='impact'",
         [],
     )
     .unwrap();
     conn.execute(
-        "UPDATE cg_relations SET provenance='Inferred' WHERE relation_key='impact-binding'",
+        "UPDATE cg_block_relations SET provenance='Inferred' WHERE relation_key='impact-binding'",
         [],
     )
     .unwrap();
@@ -460,15 +471,7 @@ fn live_baseline_and_current_sessions_survive_external_retention() {
     let conn = rusqlite::Connection::open(&database).unwrap();
     conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE")
         .unwrap();
-    for table in [
-        "cg_fts_nodes",
-        "cg_evidence",
-        "cg_relations",
-        "cg_nodes",
-        "cg_unresolved_references",
-        "cg_files",
-        "cg_snapshots",
-    ] {
+    for table in ["cg_manifest", "cg_snapshots"] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE workspace_id=?1 AND generation=?2"),
             rusqlite::params![workspace.to_string(), old_generation],
@@ -539,17 +542,19 @@ fn fts_sessions_keep_workspace_ownership() {
 fn broad_fts_statement_returns_typed_timeout() {
     let (dir, store, workspace) = setup();
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
+    let structure = block(&conn, "S");
     conn.execute(
         "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<30000)
-         INSERT INTO cg_nodes(workspace_id,generation,node_id,node_key,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance)
-         SELECT ?1,1,printf('10000000-0000-4000-8000-%012x',x),'bulk-'||x,'Function','bulk token',?2,0,1,1,1,1,2,'Extracted' FROM seq",
-        rusqlite::params![workspace.to_string(), PATH],
+         INSERT INTO cg_block_nodes(block_id,node_id,node_key,kind,name,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance)
+         SELECT ?1,printf('10000000-0000-4000-8000-%012x',x),'bulk-'||x,'Function','bulk token',0,1,1,1,1,2,'Extracted' FROM seq",
+        rusqlite::params![structure],
     ).unwrap();
     conn.execute(
-        "INSERT INTO cg_fts_nodes(name,path,workspace_id,generation,node_id,owner_path)
-         SELECT name,path,workspace_id,generation,node_id,path FROM cg_nodes WHERE workspace_id=?1 AND generation=1 AND name='bulk token'",
-        [workspace.to_string()],
-    ).unwrap();
+        "INSERT INTO cg_fts_blocks(rowid,name,path)
+         SELECT node_ix,name,?2 FROM cg_block_nodes WHERE block_id=?1 AND name='bulk token'",
+        rusqlite::params![structure, PATH],
+    )
+    .unwrap();
     let query = store
         .query(workspace, SnapshotSelector::CurrentReady)
         .unwrap();
@@ -574,11 +579,12 @@ fn evidence_fanout_over_hard_cap_reports_typed_counts() {
     let binding = id(&store, workspace, "binding");
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
     let source_digest = blake3::hash(SOURCE.as_bytes()).to_hex().to_string();
+    let structure = block(&conn, "S");
     for ordinal in 1..=70 {
         conn.execute(
-            "INSERT INTO cg_evidence(workspace_id,generation,fact_type,fact_id,ordinal,label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest)
-             VALUES (?1,1,'node',?2,?3,'extra',?4,0,1,1,1,1,2,?5,?6)",
-            rusqlite::params![workspace.to_string(), binding.to_string(), ordinal, PATH, source_digest, format!("{ordinal:064x}")],
+            "INSERT INTO cg_block_evidence(block_id,fact_type,fact_id,ordinal,label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest)
+             VALUES (?1,'node',?2,?3,'extra',?4,0,1,1,1,1,2,?5,?6)",
+            rusqlite::params![structure, binding.to_string(), ordinal, PATH, source_digest, format!("{ordinal:064x}")],
         ).unwrap();
     }
     let result = store
@@ -608,9 +614,9 @@ fn directed_cycle_has_finite_bounded_traversal() {
     let handler = id(&store, workspace, "handler");
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
     conn.execute(
-        "INSERT INTO cg_relations(workspace_id,generation,relation_id,relation_key,kind,source_id,target_id,provenance)
-         VALUES (?1,1,'20000000-0000-4000-8000-000000000001','cycle','Calls',?2,?3,'Extracted')",
-        rusqlite::params![workspace.to_string(), handler.to_string(), binding.to_string()],
+        "INSERT INTO cg_block_relations(block_id,relation_id,relation_key,kind,source_id,target_id,provenance)
+         VALUES (?1,'20000000-0000-4000-8000-000000000001','cycle','Calls',?2,?3,'Extracted')",
+        rusqlite::params![block(&conn, "R"), handler.to_string(), binding.to_string()],
     ).unwrap();
     let result = store
         .query(workspace, SnapshotSelector::CurrentReady)
@@ -786,9 +792,9 @@ fn very_wide_hub_respects_relation_and_time_limits() {
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
     conn.execute(
         "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<100001)
-         INSERT INTO cg_relations(workspace_id,generation,relation_id,relation_key,kind,source_id,target_id,provenance)
-         SELECT ?1,1,printf('00000000-0000-4000-8000-%012x',x),'stress-'||x,'Calls',?2,?3,'Extracted' FROM seq",
-        rusqlite::params![workspace.to_string(), source.to_string(), target.to_string()],
+         INSERT INTO cg_block_relations(block_id,relation_id,relation_key,kind,source_id,target_id,provenance)
+         SELECT ?1,printf('00000000-0000-4000-8000-%012x',x),'stress-'||x,'Calls',?2,?3,'Extracted' FROM seq",
+        rusqlite::params![block(&conn, "R"), source.to_string(), target.to_string()],
     ).unwrap();
     let query = store
         .query(workspace, SnapshotSelector::CurrentReady)
@@ -856,9 +862,9 @@ fn diff_id_scan_returns_typed_timeout_instead_of_sqlite_error() {
     let conn = rusqlite::Connection::open(dir.path().join("graph.sqlite")).unwrap();
     conn.execute(
         "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<30000)
-         INSERT INTO cg_nodes(workspace_id,generation,node_id,node_key,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance)
-         SELECT ?1,1,printf('30000000-0000-4000-8000-%012x',x),'diff-'||x,'Function','diff node',?2,0,1,1,1,1,2,'Extracted' FROM seq",
-        rusqlite::params![workspace.to_string(), PATH],
+         INSERT INTO cg_block_nodes(block_id,node_id,node_key,kind,name,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance)
+         SELECT ?1,printf('30000000-0000-4000-8000-%012x',x),'diff-'||x,'Function','diff node',0,1,1,1,1,2,'Extracted' FROM seq",
+        rusqlite::params![block(&conn, "S")],
     ).unwrap();
     let first = store
         .query(workspace, SnapshotSelector::CurrentReady)

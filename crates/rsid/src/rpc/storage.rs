@@ -25,7 +25,67 @@ pub struct RunArchivedSandboxPurgeParams {
     pub after: Option<crate::session::sandbox_purge::ArchivedSandboxPurgeCursor>,
 }
 
+fn decode_agent_settlement<T: serde::de::DeserializeOwned>(request: &RpcRequest) -> Result<T> {
+    let params = if request.params.is_null() {
+        serde_json::json!({})
+    } else {
+        request.params.clone()
+    };
+    serde_json::from_value(params).map_err(|_| {
+        crate::store::cohort_settlement::agent_settlement_refusal(
+            "storage_control_invalid_request",
+            "match the closed settlement request schema",
+        )
+    })
+}
+
 impl RpcServer {
+    pub(super) async fn handle_agent_list_source_worktree_cohorts(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let _: ListSourceWorktreeCohortsParams = decode_agent_settlement(request)?;
+        Ok(serde_json::to_value(
+            self.session_manager
+                .agent_control()
+                .agent_list_source_worktree_cohorts(caller)
+                .await?,
+        )?)
+    }
+
+    pub(super) async fn handle_agent_audit_source_worktree_cohort(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params = decode_agent_settlement(request)?;
+        self.session_manager
+            .agent_control()
+            .agent_audit_source_worktree_cohort_view(caller, params)
+            .await
+    }
+
+    pub(super) async fn handle_agent_apply_source_worktree_cohort(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: ApplySourceWorktreeCohortParams = decode_agent_settlement(request)?;
+        params.validate().map_err(|reason| {
+            crate::store::cohort_settlement::agent_settlement_refusal(
+                "storage_control_invalid_request",
+                &reason,
+            )
+        })?;
+        Ok(serde_json::to_value(
+            self.session_manager
+                .agent_control()
+                .agent_apply_source_worktree_cohort(caller, params)
+                .await?,
+        )?)
+    }
+
     pub(super) async fn handle_list_source_worktree_cohorts(
         &self,
         request: &RpcRequest,
@@ -78,6 +138,27 @@ impl RpcServer {
         .map_err(Into::into)
     }
 
+    pub(super) async fn handle_list_source_worktree_settlement_runs(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::cohort_settlement::ListSourceWorktreeSettlementRunsParams =
+            serde_json::from_value(if request.params.is_null() {
+                serde_json::json!({})
+            } else {
+                request.params.clone()
+            })
+            .map_err(|e| {
+                DaemonError::InvalidParam(format!("invalid settlement history request: {e}"))
+            })?;
+        serde_json::to_value(
+            self.session_manager
+                .list_source_worktree_settlement_runs(params.limit)
+                .await?,
+        )
+        .map_err(Into::into)
+    }
+
     pub(super) async fn handle_get_source_worktree_settlement_run(
         &self,
         request: &RpcRequest,
@@ -119,9 +200,20 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let report = self
             .session_manager
-            .run_sandbox_build_cache_reclaim_wire_for_trigger(true, "preview")
+            .cached_sandbox_storage_preview()
             .await?;
         Ok(serde_json::to_value(report)?)
+    }
+
+    /// Issue #1882: the warm target pools' newest good pool, its age in commits
+    /// and their disk use. Operator-only by default-deny. A host without the
+    /// installed `target-pool` script reports an empty status.
+    pub(super) async fn handle_get_target_pool_status(
+        &self,
+        _request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let status = crate::target_pool::status().await.unwrap_or_default();
+        Ok(serde_json::to_value(status)?)
     }
 
     pub(super) async fn handle_run_sandbox_build_cache_reclaim(

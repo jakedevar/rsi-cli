@@ -6,10 +6,10 @@
 //! verified non-sandbox row or a complete `Purged` tombstone needs no cleanup.
 
 use rsi_common::types::{SandboxCleanupState, SandboxKind, Session};
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 use std::process::Command;
 use uuid::Uuid;
 
@@ -134,7 +134,7 @@ pub enum OwnershipObservation {
     Unreadable,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IdentityObservation {
     canonical_root: PathBuf,
@@ -143,7 +143,7 @@ struct IdentityObservation {
     registered_branch: String,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 trait IdentityObserver {
     fn observe(
         &self,
@@ -154,7 +154,7 @@ trait IdentityObserver {
     fn between_observations(&self) {}
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct SystemIdentityObserver;
 
 #[cfg(test)]
@@ -167,7 +167,7 @@ impl IdentityObserver for SystemIdentityObserver {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum TargetDiagnostic {
@@ -177,7 +177,7 @@ enum TargetDiagnostic {
     SyntheticMatch,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl TargetDiagnostic {
     const ALL: [Self; 4] = [
         Self::Unknown,
@@ -191,7 +191,7 @@ impl TargetDiagnostic {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum ProofDiagnostic {
@@ -200,7 +200,7 @@ enum ProofDiagnostic {
     SyntheticMatch,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl ProofDiagnostic {
     const ALL: [Self; 3] = [Self::Missing, Self::Mismatched, Self::SyntheticMatch];
 
@@ -209,7 +209,7 @@ impl ProofDiagnostic {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum MappingDiagnostic {
@@ -217,7 +217,7 @@ enum MappingDiagnostic {
     SyntheticMatch,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl MappingDiagnostic {
     const ALL: [Self; 2] = [Self::Missing, Self::SyntheticMatch];
 
@@ -226,7 +226,7 @@ impl MappingDiagnostic {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum VerificationDiagnostic {
@@ -234,7 +234,7 @@ enum VerificationDiagnostic {
     SyntheticPass,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl VerificationDiagnostic {
     const ALL: [Self; 2] = [Self::Failed, Self::SyntheticPass];
 
@@ -245,7 +245,7 @@ impl VerificationDiagnostic {
 
 /// Diagnostic-only inputs. They can refine a blocked reason but can never
 /// construct cleanup authorization.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct D00Diagnostics {
     target: TargetDiagnostic,
@@ -254,7 +254,7 @@ struct D00Diagnostics {
     verification: VerificationDiagnostic,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl D00Diagnostics {
     const fn production() -> Self {
         Self {
@@ -482,12 +482,12 @@ fn observe_system_identity(
     })
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct GitOutput {
     stdout: Vec<u8>,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn git_output(
     directory: &Path,
     args: &[&str],
@@ -506,7 +506,7 @@ fn git_output(
     })
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn git_text(
     directory: &Path,
     args: &[&str],
@@ -526,13 +526,13 @@ fn git_text(
         .map_err(|_| failure)
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct WorktreeRegistration {
     head: String,
     branch: String,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn parse_worktree_registration(
     porcelain: &str,
     expected_root: &Path,
@@ -854,7 +854,7 @@ mod tests {
                 .expect("allocate sandbox");
             let branch = allocation.branch.clone().expect("sandbox branch");
             let db_path = db_dir.path().join("matrix.db");
-            let store = Store::open(&db_path).expect("open matrix store");
+            let store = Store::open_test_fixture(&db_path).expect("open matrix store");
             let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             store
                 .conn

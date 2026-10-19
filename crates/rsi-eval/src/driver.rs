@@ -97,6 +97,7 @@ async fn launch(socket: &Path, ticket: &CorpusTicket, working_dir: PathBuf) -> R
         parent_id: None,
         openai_base_url: None,
         openai_api_key: None,
+        custom_provider_id: None,
         workflow_id: None,
         max_retries: None,
         group_id: None,

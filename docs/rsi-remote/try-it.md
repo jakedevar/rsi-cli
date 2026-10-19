@@ -6,8 +6,10 @@ A read-only phone view of your RSI sessions: the session list (sessions that
 need you are badged and grouped first), one session's detail, its recent
 history, and the approvals or questions waiting on your RSI host. While the
 page is visible it refreshes itself (the list every 30 s, an open session every
-10 s, backing off after errors). There are no actions — no sending, approving,
-halting, or creating; answer waiting items on the RSI host. The page is served by `rsi-remote` on the same origin as
+10 s, backing off after errors). The page itself has no actions — no approving,
+halting, or creating. Two writes exist, both off until you turn them on (below):
+answering a waiting decision, and (API v2, for the native app) sending a message
+to a manager seat. The page is served by `rsi-remote` on the same origin as
 the API, so the browser holds the gateway session as an HttpOnly cookie.
 
 ## Requirements
@@ -73,6 +75,53 @@ the gateway reads; the settings page writes it. `rsi-remote config check|show`
 still work for inspection. Remote control is operator-only: agents have no
 RPC to change the device or project lists.
 
+## Messages to managers (API v2, opt-in)
+
+The native iOS app (#2961) talks to API v2 on the same URL: the exposed projects
+with their project-manager seat and the covering global manager seat, a seat's
+conversation, and a message to a seat. Reading needs only an exposed project.
+**Sending is off by default.** To enable it:
+
+1. Open **Settings → Integrations → Remote → Remote access** and press `m`
+   ("messages to managers" goes `ON`; `n` is the separate switch for answering
+   waiting decisions). It takes effect on the gateway's next request; no restart.
+   Without the TUI: `rsi-remote config messages ~/.config/rsi-remote/policy.toml on`
+   (and `off`). `rsi-remote config show <policy.toml>` prints `allow_messages`.
+2. A message is delivered exactly like one you type in the TUI
+   (`QueueOperatorMessage`): queued durably, handed to the manager at its next
+   tool boundary, at most once. The app shows its state (`queued`, `delivered`,
+   `uncertain`). Only the project's current manager seat and the global seat
+   covering an exposed project can be messaged; workers cannot.
+3. Every send is audited in `$XDG_STATE_HOME/rsi-remote/audit.jsonl` (default
+   `~/.local/state/rsi-remote/`): the device, project, seat, idempotency key and
+   the SHA-256 and length of the text — never the text. Limit: 1 message per
+   second and 32 per hour per session.
+
+### Native client binding
+
+A non-browser client keeps the CSRF and Origin protections by sending what a
+browser sends by itself. With `curl` (inside the tailnet, from an allowed device):
+
+```bash
+H=https://<canonical_host>
+curl -si -c jar $H/auth/bootstrap          # {"nonce":"…"} + boot cookie
+curl -s -b jar -c jar -H "Origin: $H" -H 'Content-Type: application/json' \
+     -d '{"nonce":"<nonce>"}' $H/auth/session   # {"csrf":"…"} + session cookie
+curl -s -b jar -H "Origin: $H" $H/api/v2/projects
+curl -s -b jar -H "Origin: $H" -H "x-rsi-csrf: <csrf>" \
+     -H 'Content-Type: application/json' \
+     -d '{"text":"status?","idempotency_key":"<fresh lowercase uuid>"}' \
+     $H/api/v2/projects/<project>/managers/<seat>/messages
+```
+
+`Origin: https://<canonical_host>` goes on every request, the CSRF token comes
+from the `/auth/session` body and goes on every write, and the cookies are the
+`__Host-` ones the gateway sets. Without a matching `Origin` a session is refused
+(`403`) and a read is `401`; without the CSRF token a write is `403`. The full
+contract, the error table and the retry rules are in
+[`contracts-v2.md`](contracts-v2.md); `remote/contracts/v2/fixtures` has the
+request/response pairs the app's decoding tests read.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -122,7 +171,8 @@ Walkthrough on the phone:
   history loads on demand with "Load older" (25 events at a time, up to 500
   kept on screen).
 - Updates are polled while the page is visible; there is no push stream.
-- No actions.
+- The page has no actions. Writes are the opt-in answers (`n`) and, for the
+  native app, messages to managers (`m`).
 - Tailscale 1.102.4 whois output is covered by a captured-fixture test (#1101),
   and 1.102.x patch 3+ is the qualified line; the gateway passed an independent
   network-exposure review. A full phone walkthrough is still worth reporting

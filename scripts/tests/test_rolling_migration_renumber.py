@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 SPEC = importlib.util.spec_from_file_location(
     "rolling_migration_renumber", ROOT / "tools/rolling-migration-renumber.py"
 )
@@ -24,7 +25,7 @@ GUARD_SPEC.loader.exec_module(LANDING_GUARD)
 
 class ProvisionalMigrationTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-renumber-test-")
+        self.temp = scratch_tempdir(prefix="rsi-renumber-test-")
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name) / "repo"
         self.repo.mkdir()
@@ -65,8 +66,7 @@ class ProvisionalMigrationTest(unittest.TestCase):
 
     @staticmethod
     def git(repo, *args):
-        result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
-                                text=True, check=False)
+        result = scratch_git(repo, *args, check=False)
         if result.returncode:
             raise AssertionError(f"git {' '.join(args)}: {result.stderr}")
         return result.stdout.strip()
@@ -77,25 +77,25 @@ class ProvisionalMigrationTest(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(value)
 
-    def source(self, label, extra="", released_edit=False):
+    def source(self, label, extra="", released_edit=False, version=130, pending=None):
         worktree = Path(self.temp.name) / f"source-{label}"
         self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.base)
-        helper = f"crates/rsid-store/src/store/{label}_v130.rs"
-        helper_text = (f"// RSI-RELEASED-MIGRATION-BEGIN: v130-{label}-migration\n"
-                       f"pub fn apply_v130() {{}}\n"
-                       f"// RSI-RELEASED-MIGRATION-END: v130-{label}-migration\n")
+        helper = f"crates/rsid-store/src/store/{label}_v{version}.rs"
+        helper_text = (f"// RSI-RELEASED-MIGRATION-BEGIN: v{version}-{label}-migration\n"
+                       f"pub fn apply_v{version}() {{}}\n"
+                       f"// RSI-RELEASED-MIGRATION-END: v{version}-{label}-migration\n")
         self.write(worktree, helper, helper_text)
         store = self.base_store().replace("LATEST_SCHEMA_VERSION: i32 = 129",
-                                          "LATEST_SCHEMA_VERSION: i32 = 130")
+                                          f"LATEST_SCHEMA_VERSION: i32 = {version}")
         store = store.replace("// V0: Original schema",
-                              f"mod {label}_v130;\n// V0: Original schema")
-        store += (f"// V130: {label} migration\n"
-                  f"if version < 130 {{\n    {label}_v130::apply_v130();\n}}\n")
+                              f"mod {label}_v{version};\n// V0: Original schema")
+        store += (f"// V{version}: {label} migration\n"
+                  f"if version < {version} {{\n    {label}_v{version}::apply_v{version}();\n}}\n")
         store += extra
         if released_edit:
             store = store.replace("migrate_v129();", "changed_v129();")
         self.write(worktree, RENUMBER.STORE, store)
-        tests = self.base_tests().replace("REWIND: i32 = 129", "REWIND: i32 = 130")
+        tests = self.base_tests().replace("REWIND: i32 = 129", f"REWIND: i32 = {version}")
         self.write(worktree, "crates/rsid-store/src/store/tests.rs", tests)
         base_manifest = RENUMBER.revision_inventory(self.repo, self.base)
         files = {name: (worktree / name).read_text()
@@ -107,37 +107,39 @@ class ProvisionalMigrationTest(unittest.TestCase):
         self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
         files = [
             (RENUMBER.STORE, store, RENUMBER.STORE, [
-                ("pub const LATEST_SCHEMA_VERSION: i32 = 130;",
+                (f"pub const LATEST_SCHEMA_VERSION: i32 = {version};",
                  "pub const LATEST_SCHEMA_VERSION: i32 = ${VERSION};", "head"),
-                (f"mod {label}_v130;", f"mod {label}_v${{VERSION}};", "unit"),
-                (f"// V130: {label} migration", f"// V${{VERSION}}: {label} migration", "unit"),
-                ("if version < 130 {", "if version < ${VERSION} {", "unit"),
-                (f"{label}_v130::apply_v130();",
+                (f"mod {label}_v{version};", f"mod {label}_v${{VERSION}};", "unit"),
+                (f"// V{version}: {label} migration", f"// V${{VERSION}}: {label} migration", "unit"),
+                (f"if version < {version} {{", "if version < ${VERSION} {", "unit"),
+                (f"{label}_v{version}::apply_v{version}();",
                  f"{label}_v${{VERSION}}::apply_v${{VERSION}}();", "unit"),
             ]),
             ("crates/rsid-store/src/store/tests.rs", tests,
              "crates/rsid-store/src/store/tests.rs", [
-                 ("const REWIND: i32 = 130;", "const REWIND: i32 = ${VERSION};", "head"),
+                 (f"const REWIND: i32 = {version};", "const REWIND: i32 = ${VERSION};", "head"),
              ]),
             (helper, helper_text, f"crates/rsid-store/src/store/{label}_v${{VERSION}}.rs", [
-                (f"// RSI-RELEASED-MIGRATION-BEGIN: v130-{label}-migration",
+                (f"// RSI-RELEASED-MIGRATION-BEGIN: v{version}-{label}-migration",
                  f"// RSI-RELEASED-MIGRATION-BEGIN: v${{VERSION}}-{label}-migration", "unit"),
-                ("pub fn apply_v130() {}", "pub fn apply_v${VERSION}() {}", "unit"),
-                (f"// RSI-RELEASED-MIGRATION-END: v130-{label}-migration",
+                (f"pub fn apply_v{version}() {{}}", "pub fn apply_v${VERSION}() {}", "unit"),
+                (f"// RSI-RELEASED-MIGRATION-END: v{version}-{label}-migration",
                  f"// RSI-RELEASED-MIGRATION-END: v${{VERSION}}-{label}-migration", "unit"),
             ]),
         ]
-        declaration = {"schema_version": 1, "version": 130, "files": [
+        declaration = {"schema_version": 1, "version": version, "files": [
             {"path": name, "path_template": template,
              "source_blob": RENUMBER.sha(content.encode()),
              "sites": [{"anchor": before, "replacement": after, "scope": scope}
                        for before, after, scope in sites]}
             for name, content, template, sites in files
         ]}
+        if pending:
+            declaration["pending_predecessors"] = pending
         self.write(worktree, f"tools/provisional-migrations/{label}.json",
                    json.dumps(declaration, indent=2) + "\n")
         self.git(worktree, "add", ".")
-        self.git(worktree, "commit", "-q", "-m", f"provisional V130 {label}")
+        self.git(worktree, "commit", "-q", "-m", f"provisional V{version} {label}")
         return self.git(worktree, "rev-parse", "HEAD")
 
     def candidate(self, source, target):
@@ -196,6 +198,41 @@ class ProvisionalMigrationTest(unittest.TestCase):
                     self.repo, self.base, unit["source"], final, proof_path)
         RENUMBER.guard.validate_append_only(RENUMBER.revision_inventory(self.repo, self.base),
                                             manifest)
+
+    def test_a_slice_numbered_after_a_declared_pending_sibling_lands_after_it(self):
+        """#1285: V131 over base V129 with V130 pending lands once the V130 sibling is on the target."""
+        sibling = self.source("alpha")
+        gapped = self.source("beta", version=131, pending=[130])
+        with self.assertRaisesRegex(RENUMBER.Refusal, "pending predecessor"):
+            RENUMBER.inspect(self.repo, self.base, gapped, self.base)
+        guard_cli = [sys.executable, str(ROOT / "tools/check-released-migrations.py")]
+        declared = subprocess.run([*guard_cli, self.base, gapped], cwd=self.repo,
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(declared.returncode, 0, declared.stderr + declared.stdout)
+        undeclared = self.source("gamma", version=131)
+        refused = subprocess.run([*guard_cli, self.base, undeclared], cwd=self.repo,
+                                 capture_output=True, text=True, check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("pending_predecessors", refused.stderr)
+        _, sibling_candidate = self.candidate(sibling, self.base)
+        unit, final = self.candidate(gapped, sibling_candidate)
+        self.assertEqual(unit["old_version"], 131)
+        self.assertEqual(unit["new_version"], 131)
+        manifest = RENUMBER.revision_inventory(self.repo, final)
+        self.assertEqual(manifest["latest_schema_version"], 131)
+        self.assertEqual(sorted(manifest["blocks"])[-2:], ["130", "131"])
+        proof = RENUMBER.prove(self.repo, unit, final, final)
+        self.assertEqual(LANDING_GUARD.lost_hunks(self.repo, self.base, gapped, final, proof), [])
+        released = subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"), sibling_candidate, final],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(released.returncode, 0, released.stderr + released.stdout)
+
+    def test_a_gap_without_a_declaration_is_still_more_than_one_migration(self):
+        undeclared = self.source("beta", version=131)
+        with self.assertRaises(RENUMBER.Refusal):
+            RENUMBER.inspect(self.repo, self.base, undeclared, self.base)
 
     def test_build_merge_uses_private_committer_identity(self):
         source = self.source("alpha")
@@ -333,7 +370,7 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
              "fn pagination() {\n    assert_eq!(second.events.len(), 130);\n}\n")
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-renumber-dir-test-")
+        self.temp = scratch_tempdir(prefix="rsi-renumber-dir-test-")
         self.addCleanup(self.temp.cleanup)
         self.repo = Path(self.temp.name) / "repo"
         self.repo.mkdir()
@@ -358,7 +395,7 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         self.base = self.git(self.repo, "rev-parse", "HEAD")
         self.completed = {}
 
-    def source(self, label):
+    def source(self, label, deferred_pin=False):
         worktree = Path(self.temp.name) / f"source-{label}"
         self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.base)
         unit = (f"impl Store {{\n    fn migrate_v130(&self, version: i32) -> Result<()> {{\n"
@@ -372,7 +409,8 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
             "crates/rsid-store/src/store/tests.rs", f"{MIGRATIONS}/v000.rs",
             f"{MIGRATIONS}/v129.rs", f"{MIGRATIONS}/v130.rs")}
         inventory = RENUMBER.guard.inventory(files)
-        self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
+        if not deferred_pin:
+            self.write(worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
         declared = [
             (f"{MIGRATIONS}/v130.rs", unit, f"{MIGRATIONS}/v${{VERSION}}.rs", [
                 ("fn migrate_v130(", "fn migrate_v${VERSION}(", "unit"),
@@ -393,6 +431,48 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         self.git(worktree, "add", ".")
         self.git(worktree, "commit", "-q", "-m", f"provisional V130 {label}")
         return self.git(worktree, "rev-parse", "HEAD")
+
+    def test_deferred_pin_passes_guard_and_inspects_next_number(self):
+        first_source = self.source("alpha")
+        _first, target = self.candidate(first_source, self.base)
+        source = self.source("beta", deferred_pin=True)
+        checked = subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"),
+             self.base, source], cwd=self.repo, capture_output=True, text=True, check=False)
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertIn("pin deferred to the lander", checked.stdout)
+        for rolling, expected in ((self.base, 130), (target, 131)):
+            with self.subTest(next_version=expected):
+                inspected = subprocess.run(
+                    [sys.executable, str(ROOT / "tools/rolling-migration-renumber.py"),
+                     "--repo", str(self.repo), "--base", self.base,
+                     "--source", source, "--target", rolling],
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(inspected.returncode, 0, inspected.stderr)
+                unit = json.loads(inspected.stdout)
+                self.assertEqual(unit["old_version"], 130)
+                self.assertEqual(unit["new_version"], expected)
+                self.assertIn("130", unit["source_manifest"]["blocks"])
+        _second, candidate = self.candidate(source, target)
+        self.assertEqual(RENUMBER.revision_inventory(self.repo, candidate)["latest_schema_version"], 131)
+        # Inspection and private candidate construction leave publication to the lander.
+        self.assertEqual(RENUMBER.show(self.repo, source, RENUMBER.MANIFEST),
+                         RENUMBER.show(self.repo, self.base, RENUMBER.MANIFEST))
+
+    def test_hand_edited_mismatched_pin_is_still_refused(self):
+        self.source("alpha", deferred_pin=True)
+        manifest = json.loads(RENUMBER.show(self.repo, self.base, RENUMBER.MANIFEST))
+        manifest["latest_schema_version"] = 130
+        source = self.commit_extra("alpha", RENUMBER.MANIFEST, json.dumps(manifest) + "\n")
+        with self.assertRaisesRegex(RENUMBER.Refusal, "provisional inventory does not match its source"):
+            RENUMBER.inspect(self.repo, self.base, source, self.base)
+
+    def test_deferred_pin_with_changed_released_migration_is_refused(self):
+        self.source("alpha", deferred_pin=True)
+        source = self.commit_extra("alpha", f"{MIGRATIONS}/v129.rs",
+                                   self.V129.replace("settled();", "changed();"))
+        with self.assertRaisesRegex(RENUMBER.Refusal, "provisional inventory does not match its source"):
+            RENUMBER.inspect(self.repo, self.base, source, self.base)
 
     def test_two_v130_files_land_as_v130_v131_without_touching_a_shared_file(self):
         first_source = self.source("alpha")
@@ -450,6 +530,22 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         self.assertIn("second.events.len(), 130)", tests)
         self.assertIn("const REWIND: i32 = 131;", tests)
 
+    def test_declared_site_on_unchanged_base_line_refuses(self):
+        source = self.source("alpha")
+        worktree = Path(self.temp.name) / "source-alpha"
+        decl = worktree / "tools/provisional-migrations/alpha.json"
+        data = json.loads(decl.read_text())
+        tests = next(f for f in data["files"] if f["path"].endswith("tests.rs"))
+        tests["sites"].append({"anchor": "second.events.len(), 130)",
+                               "replacement": "second.events.len(), ${VERSION})",
+                               "scope": "head"})
+        decl.write_text(json.dumps(data, indent=2) + "\n")
+        self.git(worktree, "add", ".")
+        self.git(worktree, "commit", "-q", "-m", "declare unchanged line")
+        source = self.git(worktree, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unchanged base line"):
+            RENUMBER.inspect(self.repo, self.base, source, self.base)
+
     def test_real_undeclared_schema_site_still_refuses(self):
         first_source = self.source("alpha")
         second_source = self.commit_extra(
@@ -472,6 +568,98 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
             capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["renumber_noop"])
+
+    def stacked_source_and_landed_target(self, differing_content=False, advance=False):
+        migration = self.source("alpha")
+        target_tree = self.git(self.repo, "rev-parse", f"{migration}^{{tree}}")
+        # The migration lands through another source, so the stacked source's
+        # merge-base with rolling still predates its declaration.
+        target = self.git(self.repo, "commit-tree", target_tree, "-p", self.base,
+                          "-m", "migration landed through another source")
+        target_worktree = Path(self.temp.name) / "target"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(target_worktree), target)
+        if differing_content:
+            filename = f"{MIGRATIONS}/v130.rs"
+            # Even a change outside the hashed migration gate must refuse.
+            self.write(target_worktree, filename,
+                       (target_worktree / filename).read_text() + "// landed fix\n")
+            declaration_path = "tools/provisional-migrations/alpha.json"
+            declaration = json.loads((target_worktree / declaration_path).read_text())
+            declaration["files"][0]["source_blob"] = RENUMBER.sha(
+                (target_worktree / filename).read_bytes())
+            self.write(target_worktree, declaration_path, json.dumps(declaration, indent=2) + "\n")
+            self.git(target_worktree, "add", filename, declaration_path)
+            self.git(target_worktree, "commit", "-q", "-m", "landed migration differs")
+        elif advance:
+            filename = f"{MIGRATIONS}/v131.rs"
+            self.write(target_worktree, filename, self.V129.replace("129", "131"))
+            inventory = RENUMBER.guard.inventory({
+                name: (target_worktree / name).read_text()
+                for name in RENUMBER.protected_paths_at(self.repo, target,
+                                                       RENUMBER.revision_inventory(self.repo, target))
+            } | {filename: (target_worktree / filename).read_text()})
+            self.write(target_worktree, RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + "\n")
+            self.git(target_worktree, "add", filename, RENUMBER.MANIFEST)
+            self.git(target_worktree, "commit", "-q", "-m", "later migration")
+        target = self.git(target_worktree, "rev-parse", "HEAD")
+        source = self.commit_extra("alpha", "docs/contract.md", "V130 contract for the next slice\n")
+        # Later slices may also edit a declared file beyond its original blob.
+        source = self.commit_extra(
+            "alpha", "crates/rsid-store/src/store/tests.rs", self.TESTS.replace(
+                "REWIND: i32 = 129", "REWIND: i32 = 130") + "// later slice\n")
+        self.assertEqual(self.git(self.repo, "merge-base", source, target), self.base)
+        return source, target, target_worktree
+
+    def transform_result(self, source, target):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "tools/rolling-migration-renumber.py"),
+             "--repo", str(self.repo), "--transform", "--base", self.base,
+             "--source", source, "--target", target],
+            capture_output=True, text=True, check=False)
+
+    def test_identical_already_landed_migration_merges_stacked_slice_as_is(self):
+        source, target, worktree = self.stacked_source_and_landed_target()
+        result = self.transform_result(source, target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = json.loads(result.stdout)
+        self.assertTrue(unit["renumber_noop"])
+        self.assertTrue(unit["migration_already_landed"])
+        self.git(worktree, "merge", "--no-ff", "-q", source, "-m", "plain stacked merge")
+        candidate = self.git(worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.repo, "show", "-s", "--format=%P", candidate),
+                         f"{target} {source}")
+        self.assertEqual(RENUMBER.revision_inventory(self.repo, candidate)["latest_schema_version"], 130)
+        self.assertEqual(RENUMBER.show(self.repo, candidate, f"{MIGRATIONS}/v130.rs"),
+                         RENUMBER.show(self.repo, target, f"{MIGRATIONS}/v130.rs"))
+        self.assertEqual(self.git(self.repo, "show", f"{candidate}:docs/contract.md"),
+                         "V130 contract for the next slice")
+        guard = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/rolling-landing-guard.py"),
+             "--repo", str(self.repo), "--base", self.base, "--source", source,
+             "--target", target, "--candidate", candidate, "--plan-only"],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(guard.returncode, 0, guard.stderr + guard.stdout)
+
+    def test_identical_already_landed_migration_is_noop_after_schema_head_advances(self):
+        source, target, _ = self.stacked_source_and_landed_target(advance=True)
+        result = self.transform_result(source, target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = json.loads(result.stdout)
+        self.assertTrue(unit["renumber_noop"])
+        self.assertTrue(unit["migration_already_landed"])
+        self.assertEqual(unit["old_version"], 130)
+        self.assertEqual(unit["new_version"], 130)
+        self.assertEqual(RENUMBER.revision_inventory(self.repo, target)["latest_schema_version"], 131)
+
+    def test_already_landed_migration_with_differing_content_names_remerge_remedy(self):
+        source, target, _ = self.stacked_source_and_landed_target(differing_content=True)
+        result = self.transform_result(source, target)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"declared migration {MIGRATIONS}/v130.rs", result.stderr)
+        self.assertIn("already on rolling with differing content", result.stderr)
+        self.assertIn("re-merge the source onto origin/rolling", result.stderr)
+        self.assertIn("retain rolling's released migration", result.stderr)
+        self.assertIn("re-submit the merged commit", result.stderr)
 
 
 if __name__ == "__main__":

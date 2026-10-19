@@ -4,6 +4,8 @@ members = [
     "crates/rsid",
     "crates/rsid-core",
     "crates/rsid-store",
+    "crates/rsid-remote-read",
+    "crates/rsid-harness",
     "crates/rsi",
     "crates/rsi-common",
     "crates/rsi-turn-shim",
@@ -149,3 +151,21 @@ large_enum_variant = "warn"
 mutable_key_type = "warn"
 await_holding_lock = "warn"
 missing_const_for_fn = "warn"
+
+# Test speed (#2285): the dev/test profile is opt-level 0, which also compiles the
+# bundled SQLite C library and the `syn` parser at -O0. Every store fixture insert
+# and every source-scanner test (they `syn::parse_file` whole crates) runs through
+# these, so optimising only these leaf dependencies makes the default test tier
+# several times faster for a one-time rebuild of the leaves. Our own crates keep
+# opt-level 0 and full debug assertions, and the release profile is untouched.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

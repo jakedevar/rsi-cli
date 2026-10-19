@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>v": {
+      "status": "done",
+      "location": "src/actions/graphs.ts, src/graphs.ts, src/graph-model.ts, src/graph-layout.ts",
+      "note": "Opens graph review: resumes the active draft, else the cursor session's effective topology (override, own, nearest ancestor), else a blank draft"
+    },
+    "cmd:graph": {
+      "status": "done",
+      "location": "src/actions/graphs.ts, src/graphs.ts",
+      "note": "Same action as <Space>v (toggles the pane)"
+    },
+    "key:<Space>gc": {
+      "status": "done",
+      "location": "src/actions/graphs.ts, src/esp.ts, src/esp-model.ts, src-tauri/src/graphs.rs",
+      "note": "ESP Square: 12 rounds, the TUI's colours, flashes, debounce, p-value and SaveEspGame on round 12"
+    },
+    "key:gR": {
+      "status": "done",
+      "location": "src/actions/graphs-run.ts, src/topology-preview.ts, src-tauri/src/graphs.rs",
+      "note": "ExecuteTopology on the cursor Epic's bound topology with parent_id = Epic and the TUI's three refusals. The key runs at once like the TUI; the Session menu, palette and right-click ask first and show the topology preview (GetTopology)"
+    },
+    "section:session-hierarchy-epic-topology-execution": {
+      "status": "done",
+      "location": "src/actions/graphs-run.ts, src/topology-preview.ts",
+      "note": "gR as above; spawned executors show under the Epic through the normal session polling"
+    },
+    "cmd:dag": {
+      "status": "done",
+      "location": "src/actions/graphs.ts, src/dag.ts",
+      "note": "Opens (toggles) the recursive DAG browser for the cursor session's project"
+    },
+    "cmd:topology": {
+      "status": "done",
+      "location": "src/actions/graphs-run.ts, src/topology-preview.ts, src/graphs.ts",
+      "note": ":topology run <name> [<epic>] on the Issues workspace's selected Issue: the TUI's Epic choice (named, cursor's own or enclosing Epic, only live Epic), ListTopologies exact name, ExecuteTopology {issue: N}, refusal hints, then the run view on the receipt's workflow"
+    },
+    "cmd:topology-resolve": {
+      "status": "done",
+      "location": "src/actions/graphs-run.ts, src/graph-model.ts, src-tauri/src/graphs.rs",
+      "note": "inspect|accept|retry|discard [<commit>] on a fresh snapshot's row version and blocked attempt; the TUI's idempotency key, so a repeat replays. Without an id it uses the one blocked execution this desktop run has seen"
+    },
+    "overlay:graph-review-overlay-space-v-or-graph": {
+      "status": "substitute",
+      "location": "src/graphs.ts, src/graph-model.ts, src/graph-layout.ts, src-tauri/src/graphs.rs",
+      "note": "SVG canvas from the ported layout; h/j/k/l, [ ], g/G, Enter detail, d/u/z, i/I/s/S edits (bridged recursive edits through EditRecursiveNode*), t/o/R pickers (starter templates and the run preflight from rsi_graph), r run (UpsertWorkflowDefinition + ExecuteWorkflow, polled GetWorkflowExecution, run view, then UpdateSessionWorkflow links the selected session to the workflow as the TUI does, #124), x interrupt, H/J/K/L pan, c follow. Substitute: the info dashboard (Tab, or l at the right edge) opens the recursive DAG browser on the graph instead of a split column; the TUI renders no graph in the session pane either, so none is substituted there (see parity-audit.json graph-review-dashboard)"
+    },
+    "overlay-ref:graph-review": {
+      "status": "done",
+      "location": "src/graph-model.ts graphKey, src/graphs.ts",
+      "note": "Every key of the table; Space N and Space ; reach the app keys. Tab opens the DAG browser on a bridged graph (see the overlay row)"
+    },
+    "overlay-ref:graph-review-empty": {
+      "status": "done",
+      "location": "src/graph-model.ts graphKey, src/graphs.ts"
+    },
+    "overlay-ref:graph-review-node-detail": {
+      "status": "done",
+      "location": "src/graph-model.ts graphKey, src/graphs.ts"
+    },
+    "overlay-ref:graph-review-edit-field": {
+      "status": "done",
+      "location": "src/graphs.ts editBox",
+      "note": "A text box: Enter commits (Shift-Enter adds a line to instructions), Esc cancels"
+    },
+    "overlay-ref:graph-review-picker": {
+      "status": "done",
+      "location": "src/graph-model.ts graphKey, src/graphs.ts drawPicker",
+      "note": "The starter picker also draws the selected template"
+    },
+    "overlay:recursive-dag-browser-overlay-dag": {
+      "status": "done",
+      "location": "src/dag.ts, src/dag-model.ts, src/dag-readbacks.ts, src-tauri/src/graphs.rs, src-tauri/src/dag_inspect.rs",
+      "note": "every panel from the TUI's readbacks (inventory, summary, task tree, runs and events, recovery, cancellations, heartbeats and leases, interrupts, live attempts, artifact summaries with load-more), capability gates, R/L with max_steps, C g / C r with a reason, c with a budget, ! gates; the inspector loads the artifact with its links (GetRecursiveExecutionArtifact), p the bounded preview (PreviewRecursiveExecutionArtifact, 16 KiB / 80 lines like the TUI), a validation's issues (ListRecursiveLiveValidationIssues), and Enter on a live attempt its artifact buckets (GetRecursiveLiveAttemptArtifacts); each is gated on its capability"
+    },
+    "overlay-ref:recursive-dag-browser": {
+      "status": "done",
+      "location": "src/dag-model.ts dagKey, src/dag.ts, src/dag-model.ts, src/dag-readbacks.ts, src-tauri/src/graphs.rs, src-tauri/src/dag_inspect.rs",
+      "note": "every key of the table; p previews through rsid, m / l show the looked-up artifact and links, and t / d show the TUI's own typed-detail-unavailable states (no daemon readback parses raw test or diff content)"
+    },
+    "overlay:esp-square-overlay-space-gc": {
+      "status": "done",
+      "location": "src/esp.ts, src/esp-model.ts"
+    },
+    "module:ui/overlay/esp_square.rs": {
+      "status": "done",
+      "location": "src/esp.ts, src/esp-model.ts"
+    },
+    "module:ui/overlay/graph.rs": {
+      "status": "substitute",
+      "location": "src/graphs.ts, src/graph-model.ts",
+      "note": "see overlay:graph-review-overlay-space-v-or-graph"
+    },
+    "module:ui/overlay/graph_layout.rs": {
+      "status": "done",
+      "location": "src/graph-layout.ts",
+      "note": "Line-for-line port: same components, layers, cycle breaking, edge routes, neighbour search and viewport clamp"
+    },
+    "module:ui/overlay/recursive_dag.rs": {
+      "status": "done",
+      "location": "src/dag.ts, src/dag-model.ts, src/dag-readbacks.ts, src-tauri/src/graphs.rs, src-tauri/src/dag_inspect.rs",
+      "note": "see overlay:recursive-dag-browser-overlay-dag"
+    },
+    "module:ui/overlay/topology_preview.rs": {
+      "status": "done",
+      "location": "src/topology-preview.ts, src/actions/graphs-run.ts",
+      "note": "render_dag_ascii's lines and placeholders; shown in the gR confirmation"
+    }
+  }
+}

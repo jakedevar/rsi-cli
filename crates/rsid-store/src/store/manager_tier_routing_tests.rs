@@ -961,7 +961,9 @@ fn revoking_or_replacing_a_node_retires_its_queued_mail_and_open_hops() {
     assert_eq!(again.hop, 2);
     assert_eq!(again.target_ref, format!("portfolio:{}", c.pinnacle));
 
-    // Replacing the pinnacle's seat retires mail and hops addressed to it.
+    // Reconfiguring the pinnacle (a new authority epoch) retires mail and
+    // hops addressed to it; only a seat transfer or replacement that keeps
+    // the epoch hands them on (#2468).
     let to_top = c
         .store
         .tier_report_up(c.pm, &report("for pinnacle now", "x-up-2"))
@@ -995,6 +997,274 @@ fn revoking_or_replacing_a_node_retires_its_queued_mail_and_open_hops() {
     assert_eq!(message_state(&c.store, to_top.message_id), "retired");
     assert!(!job_enabled(&c.store, to_top.message_id));
     assert_eq!(hop_events(&c.store, again.hop_id), ["opened", "retired"]);
+}
+
+/// The replacement mail created for the queued message `old` (#2468).
+fn rehomed(store: &Store, old: Uuid) -> Uuid {
+    let id: String = store
+        .conn
+        .query_row(
+            "SELECT id FROM manager_tier_messages WHERE idempotency_key=?1",
+            [format!("rehome:{old}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    Uuid::parse_str(&id).unwrap()
+}
+
+/// `(target session, author session)` of a tier message.
+fn message_target_and_author(store: &Store, id: Uuid) -> (Uuid, Option<Uuid>) {
+    let (target, author): (String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT target_session_id,source_session_id FROM manager_tier_messages WHERE id=?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (
+        Uuid::parse_str(&target).unwrap(),
+        author.map(|id| Uuid::parse_str(&id).unwrap()),
+    )
+}
+
+/// #2468: a context-cap seat transfer keeps the node, so its queued report,
+/// down-mail (either end) and open hop reach the successor once; a later
+/// revocation retires all of it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_seat_transfer_hands_queued_mail_and_the_open_hop_to_the_successor() {
+    let c = chain();
+    let up = c
+        .store
+        .tier_report_up(c.pm, &report("for global", "t-up"))
+        .unwrap();
+    let down = c
+        .store
+        .tier_send_down(
+            c.pinnacle_seat,
+            &send(ManagerNodeRefV1::Portfolio { node_id: c.global }, "t-down"),
+        )
+        .unwrap();
+    let from_global = c
+        .store
+        .tier_send_down(
+            c.global_seat,
+            &send(
+                ManagerNodeRefV1::Project {
+                    project_id: c.project,
+                },
+                "t-from",
+            ),
+        )
+        .unwrap();
+    let at_root = escalate_to_root(&c, "t");
+    let crossed = c
+        .store
+        .resolve_manager_node_escalation(c.pm, &root_forward(&c, &at_root, "t-root-forward"))
+        .unwrap();
+    let hop = crossed.above_project.unwrap();
+
+    let mut successor_row = test_session(Uuid::new_v4(), PathBuf::from("/tmp/tier-routing"));
+    successor_row.continued_from = Some(c.global_seat);
+    successor_row.status = SessionStatus::Completed;
+    c.store.insert_session(&successor_row).unwrap();
+    let successor = successor_row.id;
+    assert!(
+        c.store
+            .transfer_global_seat(c.global_seat, successor)
+            .unwrap()
+    );
+
+    let mut moved = Vec::new();
+    for old in [up.message_id, down.message_id, from_global.message_id] {
+        assert_eq!(message_state(&c.store, old), "retired");
+        assert!(!job_enabled(&c.store, old));
+        assert!(!c.store.global_message_deliverable(old).unwrap());
+        let new = rehomed(&c.store, old);
+        assert_eq!(message_state(&c.store, new), "queued");
+        assert!(job_enabled(&c.store, new));
+        assert!(c.store.global_message_deliverable(new).unwrap());
+        moved.push(new);
+    }
+    // Inbound mail goes to the successor; the original author is kept.
+    assert_eq!(
+        message_target_and_author(&c.store, moved[0]),
+        (successor, Some(c.pm))
+    );
+    assert_eq!(
+        message_target_and_author(&c.store, moved[1]),
+        (successor, Some(c.pinnacle_seat))
+    );
+    // Outbound mail still goes to its recipient, authored by the old seat.
+    assert_eq!(
+        message_target_and_author(&c.store, moved[2]),
+        (c.pm, Some(c.global_seat))
+    );
+    // Exactly one replacement per message.
+    assert_eq!(
+        count(
+            &c.store,
+            "SELECT count(*) FROM manager_tier_messages WHERE idempotency_key LIKE 'rehome:%'"
+        ),
+        3
+    );
+    // The hop was re-opened to the successor, which lists it.
+    assert_eq!(hop_events(&c.store, hop.hop_id), ["opened", "retired"]);
+    assert!(
+        c.store
+            .tier_escalations_for_seat(c.global_seat)
+            .unwrap()
+            .is_none()
+    );
+    let views = c
+        .store
+        .tier_escalations_for_seat(successor)
+        .unwrap()
+        .unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].target_session_id, successor);
+
+    // Revocation stays fenced: the successor's grant takes nothing further.
+    let (version, epoch) = grant_of(&c.store, c.global);
+    c.store
+        .revoke_portfolio_node(&RevokePortfolioNodeRequestV1 {
+            node_id: c.global,
+            expected_grant_version: version,
+            expected_authority_epoch: epoch,
+            idempotency_key: "t-revoke-global".into(),
+        })
+        .unwrap();
+    for new in moved {
+        assert_eq!(message_state(&c.store, new), "retired");
+        assert!(!c.store.global_message_deliverable(new).unwrap());
+    }
+    assert!(
+        c.store
+            .tier_escalations_for_seat(successor)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// #2468: a grantor replacing a node's seat keeps the node and epoch, so the
+/// new seat receives the queued report and the open hop and can rule it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_seat_replacement_hands_the_report_and_the_open_hop_to_the_new_seat() {
+    let c = chain();
+    let report_up = c
+        .store
+        .tier_report_up(c.pm, &report("for global", "r-up"))
+        .unwrap();
+    let at_root = escalate_to_root(&c, "r");
+    c.store
+        .resolve_manager_node_escalation(c.pm, &root_forward(&c, &at_root, "r-root-forward"))
+        .unwrap();
+    let new_seat = seat(&c.store, None);
+    let tx = Transaction::new_unchecked(&c.store.conn, TransactionBehavior::Immediate).unwrap();
+    c.store
+        .replace_portfolio_seat_in_tx(c.global, new_seat, "r-replace")
+        .unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(message_state(&c.store, report_up.message_id), "retired");
+    assert!(
+        !c.store
+            .global_message_deliverable(report_up.message_id)
+            .unwrap()
+    );
+    let moved = rehomed(&c.store, report_up.message_id);
+    assert!(c.store.global_message_deliverable(moved).unwrap());
+    assert_eq!(
+        message_target_and_author(&c.store, moved),
+        (new_seat, Some(c.pm))
+    );
+    let views = c
+        .store
+        .tier_escalations_for_seat(new_seat)
+        .unwrap()
+        .unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].target_session_id, new_seat);
+    let ruled = c
+        .store
+        .resolve_manager_node_escalation(
+            new_seat,
+            &seat_resolve(&views[0], Some("Proceed."), "r-new-rule"),
+        )
+        .unwrap();
+    assert_eq!(ruled.above_project.unwrap().state, "ruled");
+}
+
+/// #2468: a PM replaced by another session hands the project's queued
+/// down-mail and its own queued report to the new seat; a cleared seat gets
+/// nothing.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_replaced_pm_hands_queued_tier_mail_to_the_new_seat_and_a_cleared_pm_gets_none() {
+    use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+    let store = Store::open_in_memory().unwrap();
+    let p = project(&store, "P");
+    let appoint = |pm: Uuid, cleared: bool| {
+        let expected_row_version = store
+            .get_harness_manager(p)
+            .unwrap()
+            .map_or(0, |config| config.row_version);
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: p,
+                session_id: pm,
+                epic_ids: cleared.then(Vec::new),
+                group_ids: vec![],
+                expected_row_version,
+            })
+            .unwrap();
+    };
+    let old_pm = seat(&store, Some(p));
+    appoint(old_pm, false);
+    let top_seat = seat(&store, None);
+    let top = root_node(&store, "top", top_seat, &[p]);
+    let to_pm = store
+        .tier_send_down(
+            top_seat,
+            &send(ManagerNodeRefV1::Project { project_id: p }, "pm-down"),
+        )
+        .unwrap();
+    let pm_report = store
+        .tier_report_up(old_pm, &report("status", "pm-report"))
+        .unwrap();
+    assert_eq!(pm_report.target_ref, format!("portfolio:{top}"));
+
+    let new_pm = seat(&store, Some(p));
+    appoint(new_pm, false);
+    assert_eq!(store.global_live_manager(p).unwrap(), Some(new_pm));
+    let mut moved = Vec::new();
+    for old in [to_pm.message_id, pm_report.message_id] {
+        assert_eq!(message_state(&store, old), "retired");
+        assert!(!job_enabled(&store, old));
+        assert!(!store.global_message_deliverable(old).unwrap());
+        let new = rehomed(&store, old);
+        assert_eq!(message_state(&store, new), "queued");
+        assert!(job_enabled(&store, new));
+        assert!(store.global_message_deliverable(new).unwrap());
+        moved.push(new);
+    }
+    assert_eq!(
+        message_target_and_author(&store, moved[0]),
+        (new_pm, Some(top_seat))
+    );
+    // The report keeps its author and its recipient.
+    assert_eq!(
+        message_target_and_author(&store, moved[1]),
+        (top_seat, Some(old_pm))
+    );
+
+    appoint(new_pm, true);
+    for new in moved {
+        assert_eq!(message_state(&store, new), "retired");
+        assert!(!store.global_message_deliverable(new).unwrap());
+    }
 }
 
 /// PM displacement retires the queued down-mail to the seat and its own

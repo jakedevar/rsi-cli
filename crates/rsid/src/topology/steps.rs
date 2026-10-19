@@ -1,169 +1,17 @@
 //! Typed node steps and edge routing (#635, plan §3).
 //!
-//! A topology carries each node's [`TopologyStep`] in `params.step` and the
-//! routing of its incoming edges in `params.when`. The bridge copies both
-//! into the workflow snapshot's metadata (`topology_steps`, `edge_when`), and
-//! the executor decodes them strictly from there. The same static validation
-//! runs at upsert (over the topology) and at execute (over the snapshot), so
-//! an author cannot reach the executor with an unvalidated step.
+//! The pure decoding (`WorkflowSteps`, bridge metadata) lives in
+//! `rsi_graph::planning::steps` (#2415); this module keeps the daemon-owned
+//! execute-time validation, which still runs the store's `validate_graph`
+//! before any execution.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 
-use rsi_common::types::{
-    EdgeWhen, TOPOLOGY_STEP_PARAM, TOPOLOGY_WHEN_PARAM, TopologyDefinition, TopologyStep,
-};
-use rsi_graph::data::Value as GraphValue;
 use rsi_graph::format::WorkflowDefinition;
-use serde::{Deserialize, Serialize};
 
-/// Workflow metadata key: JSON `{node_id: TopologyStep}`.
-pub(crate) const STEPS_METADATA_KEY: &str = "topology_steps";
-/// Workflow metadata key: JSON `[{from, to, when}]` for non-`success` edges.
-pub(crate) const EDGE_WHEN_METADATA_KEY: &str = "edge_when";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EdgeWhenEntry {
-    pub(crate) from: String,
-    pub(crate) to: String,
-    pub(crate) when: EdgeWhen,
-}
-
-/// Decoded steps of one workflow snapshot.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct WorkflowSteps {
-    steps: HashMap<String, TopologyStep>,
-    when: HashMap<(String, String), EdgeWhen>,
-}
-
-impl WorkflowSteps {
-    /// Strictly decode the snapshot's step metadata. A workflow without it
-    /// is all legacy session nodes with `success` edges.
-    pub(crate) fn from_workflow(workflow: &WorkflowDefinition) -> Result<Self, String> {
-        let text = |key: &str| match workflow.metadata.get(key) {
-            None => Ok(None),
-            Some(GraphValue::String(text)) => Ok(Some(text.clone())),
-            Some(_) => Err(format!("workflow metadata {key} must be a JSON string")),
-        };
-        let steps: HashMap<String, TopologyStep> = match text(STEPS_METADATA_KEY)? {
-            None => HashMap::new(),
-            Some(text) => serde_json::from_str(&text)
-                .map_err(|error| format!("invalid topology step: {error}"))?,
-        };
-        let entries: Vec<EdgeWhenEntry> = match text(EDGE_WHEN_METADATA_KEY)? {
-            None => Vec::new(),
-            Some(text) => serde_json::from_str(&text)
-                .map_err(|error| format!("invalid edge routing: {error}"))?,
-        };
-        let mut when = HashMap::new();
-        for entry in entries {
-            if when
-                .insert((entry.from.clone(), entry.to.clone()), entry.when)
-                .is_some()
-            {
-                return Err(format!(
-                    "edge {} -> {} has more than one routing condition",
-                    entry.from, entry.to
-                ));
-            }
-        }
-        Ok(Self { steps, when })
-    }
-
-    /// A typed topology: at least one node carries `params.step`. Legacy
-    /// shapes (no step anywhere) keep every T2 legacy-parity rule.
-    pub(crate) fn is_typed(&self) -> bool {
-        !self.steps.is_empty()
-    }
-
-    pub(crate) fn step(&self, node: &str) -> Option<&TopologyStep> {
-        self.steps.get(node)
-    }
-
-    pub(crate) fn when(&self, from: &str, to: &str) -> EdgeWhen {
-        self.when
-            .get(&(from.to_owned(), to.to_owned()))
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Whether any outgoing edge routes a terminal failure of `node`.
-    pub(crate) fn routes_failure(&self, node: &str) -> bool {
-        self.when.iter().any(|((from, _), when)| {
-            from == node && matches!(when, EdgeWhen::Failure | EdgeWhen::Completed)
-        })
-    }
-
-    pub(crate) fn pass_content(&self, node: &str) -> bool {
-        matches!(
-            self.step(node),
-            Some(TopologyStep::Session {
-                pass_content: true,
-                ..
-            })
-        )
-    }
-
-    pub(crate) fn expects_commit(&self, node: &str) -> bool {
-        matches!(
-            self.step(node),
-            Some(TopologyStep::Session {
-                expects_commit: true,
-                ..
-            })
-        )
-    }
-
-    /// The node a review node reviews; `None` for any other node.
-    pub(crate) fn review_of(&self, node: &str) -> Option<&str> {
-        match self.step(node) {
-            Some(TopologyStep::Review { of, .. }) => Some(of.as_str()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn is_review(&self, node: &str) -> bool {
-        self.review_of(node).is_some()
-    }
-
-    /// Whether any node is not a session node (the legacy runner cannot run
-    /// command or gate nodes).
-    pub(crate) fn has_typed_effects(&self) -> bool {
-        self.steps
-            .values()
-            .any(|step| !matches!(step, TopologyStep::Session { .. }))
-    }
-
-    /// Whether any node is a review node (#1641 S1b): its Work lives on an
-    /// Epic's manager ledger, so the execution must have an Epic.
-    pub(crate) fn has_review_nodes(&self) -> bool {
-        self.steps
-            .values()
-            .any(|step| matches!(step, TopologyStep::Review { .. }))
-    }
-
-    /// Whether any node is a land node (#1641 S2): it enqueues on behalf of
-    /// the execution's owner: its manager or Epic lead, or for an operator
-    /// start the Epic's project manager (#1746).
-    pub(crate) fn has_land_nodes(&self) -> bool {
-        self.steps
-            .values()
-            .any(|step| matches!(step, TopologyStep::Land { .. }))
-    }
-
-    pub(crate) fn command_crates(&self) -> Vec<(&str, &str)> {
-        let mut crates = Vec::new();
-        for (node, step) in &self.steps {
-            if let TopologyStep::Command { op } = step {
-                for krate in op.crates() {
-                    crates.push((node.as_str(), krate));
-                }
-            }
-        }
-        crates.sort_unstable();
-        crates
-    }
-}
+#[cfg(test)]
+pub(crate) use rsi_graph::planning::steps::{EDGE_WHEN_METADATA_KEY, STEPS_METADATA_KEY};
+pub(crate) use rsi_graph::planning::steps::{WorkflowSteps, bridge_metadata, is_step_param};
 
 pub(crate) use crate::store_support::topology_validation::{
     StepEdge, StepNode, validate_graph, validate_topology,
@@ -174,20 +22,20 @@ pub(crate) use crate::store_support::topology_validation::{
 pub(crate) fn validate_workflow(workflow: &WorkflowDefinition) -> Result<WorkflowSteps, String> {
     let steps = WorkflowSteps::from_workflow(workflow)?;
     let known: HashSet<&str> = workflow.nodes.iter().map(|node| node.id.as_str()).collect();
-    if let Some(unknown) = steps.steps.keys().find(|id| !known.contains(id.as_str())) {
+    if let Some(unknown) = steps.step_node_ids().find(|id| !known.contains(id)) {
         return Err(format!("step names unknown node {unknown}"));
     }
-    for (from, to) in steps.when.keys() {
+    for (from, to) in steps.routed_edges() {
         if !workflow
             .edges
             .iter()
-            .any(|edge| &edge.source == from && &edge.target == to)
+            .any(|edge| edge.source == from && edge.target == to)
         {
             return Err(format!("edge routing names missing edge {from} -> {to}"));
         }
     }
     let loop_edges: HashSet<(String, String)> =
-        crate::session::graph_runner::parse_loop_edges_from_metadata(&workflow.metadata)
+        rsi_graph::planning::metadata::parse_loop_edges_from_metadata(&workflow.metadata)
             .into_iter()
             .collect();
     let nodes: Vec<StepNode<'_>> = workflow
@@ -216,45 +64,4 @@ pub(crate) fn validate_workflow(workflow: &WorkflowDefinition) -> Result<Workflo
         .collect();
     validate_graph(&nodes, &edges)?;
     Ok(steps)
-}
-
-/// Bridge helper: the metadata entries for a topology's steps and routing.
-pub(crate) fn bridge_metadata(
-    def: &TopologyDefinition,
-) -> Result<BTreeMap<String, GraphValue>, String> {
-    let mut steps = BTreeMap::new();
-    let mut routing = Vec::new();
-    for node in &def.nodes {
-        if let Some(step) = node.step()? {
-            steps.insert(node.id.clone(), step);
-        }
-        for (from, when) in node.incoming_when()? {
-            if when != EdgeWhen::Success {
-                routing.push(EdgeWhenEntry {
-                    from,
-                    to: node.id.clone(),
-                    when,
-                });
-            }
-        }
-    }
-    let mut metadata = BTreeMap::new();
-    if !steps.is_empty() {
-        metadata.insert(
-            STEPS_METADATA_KEY.to_owned(),
-            GraphValue::String(serde_json::to_string(&steps).map_err(|e| e.to_string())?),
-        );
-    }
-    if !routing.is_empty() {
-        metadata.insert(
-            EDGE_WHEN_METADATA_KEY.to_owned(),
-            GraphValue::String(serde_json::to_string(&routing).map_err(|e| e.to_string())?),
-        );
-    }
-    Ok(metadata)
-}
-
-/// The params keys the bridge consumes as typed step data (never tags).
-pub(crate) fn is_step_param(key: &str) -> bool {
-    key == TOPOLOGY_STEP_PARAM || key == TOPOLOGY_WHEN_PARAM
 }

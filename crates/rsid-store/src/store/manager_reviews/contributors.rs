@@ -629,6 +629,22 @@ mod tests {
         created: &str,
         stored: &[Uuid],
     ) -> Uuid {
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Claude,
+            model: "claude-sonnet-5".into(),
+            effort: None,
+        };
+        assignment_with_launch(f, reviewer, legacy, created, stored, launch)
+    }
+
+    fn assignment_with_launch(
+        f: &Fixture,
+        reviewer: Option<Uuid>,
+        legacy: bool,
+        created: &str,
+        stored: &[Uuid],
+        launch: ManagerLaunchChoiceV2,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let ordinal: i64 = f
             .store
@@ -646,11 +662,7 @@ mod tests {
                 policy_version: 1,
             },
             query: "review".into(),
-            launch: ManagerLaunchChoiceV2 {
-                provider: SessionProvider::Claude,
-                model: "claude-sonnet-5".into(),
-                effort: None,
-            },
+            launch,
             infra_retry_of: None,
             contributor_session_ids: stored.to_vec(),
             contributor_families: stored
@@ -662,6 +674,7 @@ mod tests {
             delta_of: None,
             finding_keys: vec![],
             topology_attempt_id: None,
+            model_substitution: None,
         };
         let mut value = serde_json::to_value(request).unwrap();
         if legacy {
@@ -1392,6 +1405,174 @@ mod tests {
             .request;
         assert!(request.contributor_session_ids.contains(&prior));
         assert!(request.contributor_families.contains(&"zai".to_string()));
+    }
+
+    fn launch(provider: SessionProvider, model: &str, effort: &str) -> ManagerLaunchChoiceV2 {
+        ManagerLaunchChoiceV2 {
+            provider,
+            model: model.into(),
+            effort: Some(effort.into()),
+        }
+    }
+
+    fn grant(f: &Fixture, allowed_launches: Vec<ManagerLaunchChoiceV2>) {
+        let version: i64 = f
+            .store
+            .get_harness_manager_policy(f.project)
+            .unwrap()
+            .unwrap()
+            .row_version;
+        f.store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: f.project,
+                expected_scope_version: 1,
+                expected_policy_version: version,
+                idempotency_key: format!("grant-{version}"),
+                policy: ManagerPolicyV2 {
+                    allowed_launches,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+
+    fn refuse_model(f: &Fixture, model: &str) {
+        refuse_model_on(f, "Codex", model);
+    }
+
+    fn refuse_model_on(f: &Fixture, provider: &str, model: &str) {
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, provider, model, query, working_dir, status,
+                                       created_at, updated_at, stop_reason, session_kind,
+                                       duration_ms)
+                 VALUES (?1,?5,?2,'q','/tmp','Failed',?3,?3,?4,'Task',2000)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    model,
+                    (Utc::now() - chrono::Duration::minutes(3)).to_rfc3339(),
+                    format!("provider_error:model_unavailable:{model}"),
+                    provider,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// #2735: a reviewer model the provider refused is replaced by an allowed
+    /// alternative of the same family first, then the next allowed family; the
+    /// effort follows the grant, and an available reviewer is left alone.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn unavailable_reviewer_falls_back_to_an_allowed_alternative() {
+        let f = fixture();
+        let codex = SessionProvider::Codex;
+        let sol = launch(codex, "gpt-6.1-sol", "high");
+        grant(
+            &f,
+            vec![
+                launch(SessionProvider::Claude, "claude-opus-5-5", "high"),
+                sol.clone(),
+                launch(codex, "gpt-6-astra", "high"),
+                launch(codex, "gpt-6-luna", "high"),
+            ],
+        );
+        // Nothing is refused yet: no substitution.
+        assert!(
+            f.store
+                .review_launch_substitute(f.project, &sol)
+                .unwrap()
+                .is_none()
+        );
+
+        refuse_model(&f, "gpt-6.1-sol");
+        refuse_model(&f, "gpt-6-astra");
+        let (choice, substitution) = f
+            .store
+            .review_launch_substitute(f.project, &sol)
+            .unwrap()
+            .expect("sol is refused");
+        assert_eq!(
+            (
+                choice.provider,
+                choice.model.as_str(),
+                choice.effort.as_deref()
+            ),
+            (codex, "gpt-6-luna", Some("high")),
+            "the same family wins over the Claude grant listed first, and skips the refused astra"
+        );
+        assert_eq!(substitution.from, sol);
+        assert_eq!(substitution.reason, "model_unavailable");
+        // A reviewer that still works is untouched.
+        let luna = launch(codex, "gpt-6-luna", "high");
+        assert!(
+            f.store
+                .review_launch_substitute(f.project, &luna)
+                .unwrap()
+                .is_none()
+        );
+
+        // The effort the grant does not admit becomes the grant's own.
+        let xhigh = launch(codex, "gpt-6.1-sol", "xhigh");
+        let (choice, _) = f
+            .store
+            .review_launch_substitute(f.project, &xhigh)
+            .unwrap()
+            .expect("sol is refused at any effort");
+        assert_eq!(choice.effort.as_deref(), Some("high"));
+
+        // With no usable same-family grant the next allowed family is chosen.
+        refuse_model(&f, "gpt-6-luna");
+        let (choice, _) = f
+            .store
+            .review_launch_substitute(f.project, &sol)
+            .unwrap()
+            .expect("another family is allowed");
+        assert_eq!(choice.model, "claude-opus-5-5");
+
+        // Nothing else is allowed: the original stays (and the launch is then
+        // refused up front with the typed code).
+        grant(&f, vec![sol.clone()]);
+        assert!(
+            f.store
+                .review_launch_substitute(f.project, &sol)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// #2735: the infra-retry successor of a review whose reviewer model has
+    /// since been refused is reserved on the fallback and records why.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn infra_retry_records_the_reviewer_substitution() {
+        let f = fixture();
+        // The fixture's author is OpenAI, so the reviewer family is Anthropic.
+        let claude = SessionProvider::Claude;
+        grant(
+            &f,
+            vec![
+                launch(claude, "claude-opus-5-5", "high"),
+                launch(claude, "claude-sonnet-5-5", "high"),
+            ],
+        );
+        let root = assignment_with_launch(
+            &f,
+            None,
+            true,
+            &now(),
+            &[],
+            launch(claude, "claude-opus-5-5", "high"),
+        );
+        refuse_model_on(&f, "Claude", "claude-opus-5-5");
+        let next = f.store.manager_review_infra_retry_for_test(root).unwrap();
+        let request = f.store.manager_review_assignment(next).unwrap().request;
+        assert_eq!(request.launch.model, "claude-sonnet-5-5");
+        let substitution = request
+            .model_substitution
+            .expect("the substitution is recorded");
+        assert_eq!(substitution.from.model, "claude-opus-5-5");
+        assert_eq!(substitution.reason, "model_unavailable");
     }
 }
 // #984: reviewers never contribute, so a reviewer row whose session is

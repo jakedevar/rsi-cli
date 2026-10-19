@@ -5,7 +5,7 @@ TEST_BENCHMARK_REPEAT ?= 3
 TEST_BENCHMARK_OUT ?= target/test-suite-benchmark/local-nextest-full.json
 
 .PHONY: help release release-install release-install-no-restart desktop desktop-install release-install-tui relink-release codex-prompts codex-prompts-check claude-commands claude-commands-check \
-	check-mirrors test-fast test-full test-serial test-benchmark scoped-test scoped-test-tmpfs check-touched-shards \
+	check-mirrors test-fast test-full test-serial test-slow-tier test-benchmark scoped-test scoped-test-tmpfs check-touched-shards \
 	recursive-dag-live-dogfood-setup recursive-dag-live-dogfood-env \
 	recursive-dag-live-dogfood-daemon recursive-dag-live-dogfood-gate \
 	recursive-dag-live-dogfood-tui recursive-dag-live-dogfood-claude-login \
@@ -19,15 +19,16 @@ help:
 		'make release          - build release rsi + rsid binaries' \
 		'make release-install  - build release binaries, refresh ~/.local/bin symlinks, and restart a running rsid at a quiet point (NOW=1 restarts immediately)' \
 		'make desktop          - build the desktop UI (frontend + release Tauri binary); fails if node/webkit2gtk are missing' \
-		'make desktop-install  - build the desktop UI and install rsi-desktop + app menu entry + icons' \
-		'make release-install-no-restart - same, but leave any running rsid alone' \
+		'make desktop-install  - build the desktop UI and install rsi-desktop + app menu entry + icons (macOS: ~/Applications/RSI Desktop.app)' \
+		'make release-install-no-restart - same, but do not restart rsid (still overwrites the live install; see install-release.sh --stage-dir)' \
 		'make release-install-tui - build + relink only the rsi TUI binary; rsid untouched, no restart' \
 		'make relink-release   - refresh ~/.local/bin symlinks (and restart rsid) without rebuilding' \
 		'make codex-prompts    - sync .codex/prompts into ~/.codex/prompts' \
 		'make codex-prompts-check - verify .codex/prompts matches ~/.codex/prompts' \
 		'make claude-commands  - sync Codex prompts into .claude/commands' \
 		'make claude-commands-check - verify Codex/Claude command parity' \
-		'make test-fast        - run every bounded rsid shard, integration/bin target, and doctest' \
+		'make test-fast        - run every bounded rsid shard, integration/bin target, and doctest (default tier: no slow-tier migration tests)' \
+		'make test-slow-tier   - run only the slow tier: the released-migration history tests' \
 		'make test-full        - run sharded rsid and the remaining workspace, doctests, and validators' \
 		'make test-serial      - run the rsid fast lane with one test worker' \
 		'make test-benchmark   - capture repeated full-lane timing evidence' \
@@ -124,6 +125,10 @@ claude-commands-check:
 
 # Operator manual (Epic M): regenerate the committed manual artifacts and the
 # generated regions of docs/keybindings.md from the registries, then re-check.
+.PHONY: watchdog-pressure
+watchdog-pressure:
+	python3 scripts/watchdog-compile-pressure.py
+
 manual:
 	RSI_BLESS_MANUAL=1 cargo test -p rsi --lib manual:: -- --quiet
 	cargo test -p rsi --lib manual:: -- --quiet
@@ -150,13 +155,34 @@ test-full: check-mirrors
 	cargo run -p rsid --bin rsi-provider-capability-validate --offline || status=$$?; \
 	exit $$status
 
-# Worker verification recipes declared in .rsi/jobs.toml (#1558, #1560). The job
+# Local verification targets and recipes declared in .rsi/jobs.toml (#1558, #1560).
+# Scoped verification jobs use params.scoped_test (#1954). The recipe job
 # runner already wraps `make` in cargo-slot, which marks its child with
 # RSI_CARGO_SLOT_HELD so these scripts do not take a second governor slot.
 # Budgets stay under the 20-minute recipe cap. Only BASE (a git rev) can be
 # overridden, and only a plain rev token is accepted.
 VERIFY_BASE ?= origin/rolling
 
+.PHONY: qa-resume-rsid
+qa-resume-rsid:
+	@test -z "$$RSI_SCOPED_TEST_FILTERS" || { echo 'qa-resume-rsid uses its local pinned plan, not filters' >&2; exit 2; }
+	python3 scripts/qa-resume
+
+.PHONY: rolling-library-qa
+# The merge queue's async full run after a bounded gate (#2092): every library
+# test, plus every bin and integration test target (#2094), since a bounded
+# gate also omits reached targets. Runs from the pinned rolling snapshot.
+rolling-library-qa:
+	@test -z "$$RSI_SCOPED_TEST_FILTERS" || { echo 'rolling-library-qa requires every library test' >&2; exit 2; }
+	@# Then every workspace package standalone (#2444): the gate checks the
+	@# selected packages as one merged invocation, which unifies features.
+	@# The tests run first so a standalone red never hides a test red.
+	@status=0; \
+	cargo nextest run --profile rsid-qa -p rsid -p rsid-store -p rsid-remote-read --lib --bins --tests --ignore-default-filter --no-fail-fast --status-level fail --final-status-level fail -j "$${RSI_LIBRARY_QA_TEST_THREADS:-2}" || status=$$?; \
+	scripts/check-standalone-packages.sh || status=$$?; \
+	exit $$status
+
+# One selected test pass, using lander tmpfs scratch when available (#1910).
 scoped-test:
 	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
 	./scripts/scoped-test --base '$(VERIFY_BASE)' --runtime-max-sec 1080 --total-max-sec 1140 --cpu-quota 200
@@ -170,17 +196,34 @@ test-deploy-migration-backup:
 		--filter 'rsid=shard:other-02:test(deploy)' \
 		--filter 'rsid=bin:rsid'
 
+# Compatibility for explicit parity-only callers; not a second default pass.
 scoped-test-tmpfs:
 	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
 	./scripts/scoped-test --tmpfs --base '$(VERIFY_BASE)' --runtime-max-sec 1080 --total-max-sec 1140 --cpu-quota 200
 
 check-touched-shards:
-	@test -z "$$RSI_SCOPED_TEST_FILTERS" || { echo 'check-touched-shards takes no focused filters (#1584); use the scoped-test recipe' >&2; exit 2; }
+	@test -z "$$RSI_SCOPED_TEST_FILTERS" || { echo 'check-touched-shards takes no focused filters (#1584); use the scoped_test job' >&2; exit 2; }
 	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
-	./scripts/check-touched-shards --base '$(VERIFY_BASE)'
+	./scripts/check-touched-shards --compile --base '$(VERIFY_BASE)'
+
+.PHONY: target-pool-build
+target-pool-build:
+	./scripts/target-pool build --repo .
 
 test-serial:
 	./scripts/run-rsid-test-shards.sh fast --jobs 1
+
+.PHONY: test-timings
+# The default tier (#2270): the slow tier is left out by the profile's default-filter.
+test-timings:
+	cargo nextest run --profile test-timings -p rsid -p rsid-store -p rsid-remote-read --lib
+
+.PHONY: test-slow-tier
+# Only the slow tier (#2270): the released-migration tests .config/slow-tier.toml names.
+# `not default()` is the complement of the profile's default-filter. Run it after a change
+# to a migration, the migration runner or a slow test; the full QA runs it on every sweep.
+test-slow-tier:
+	cargo nextest run --profile test-timings -p rsid-store --lib --ignore-default-filter -E 'not default()'
 
 test-benchmark:
 	./scripts/test-suite-benchmark.sh capture \
@@ -193,6 +236,11 @@ test-benchmark:
 .PHONY: e2e-tui
 e2e-tui:
 	./scripts/e2e.sh
+
+# #2421: the editing-mode live-switch test, 20 consecutive runs.
+.PHONY: e2e-editing-mode-live-switch-repeat
+e2e-editing-mode-live-switch-repeat:
+	E2E_REPEAT=20 E2E_FILTER=editing_mode::test_e2e_editing_mode_live_switch_without_restart ./scripts/e2e.sh
 
 dev-rsid-live-dogfood:
 	./scripts/recursive-dag-live-dogfood.sh daemon-fresh
@@ -237,3 +285,7 @@ recursive-dag-live-dogfood-commit:
 
 recursive-dag-live-dogfood-clean:
 	./scripts/recursive-dag-live-dogfood.sh clean
+
+.PHONY: check-socket-activation-macos
+check-socket-activation-macos:
+	./scripts/check-socket-activation-macos.sh

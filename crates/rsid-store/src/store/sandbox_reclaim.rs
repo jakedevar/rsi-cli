@@ -157,7 +157,7 @@ pub(crate) enum AdoptionOutcome {
     Retained(&'static str),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedSandboxPurgeCandidate {
     pub custody_id: Uuid,
     pub generation: u64,
@@ -436,22 +436,202 @@ impl Store {
     /// True when `session_id` still has a durable consumer that needs the
     /// session (or its custody) preserved: a successor reservation, an active
     /// review assignment, an open cleanup/settlement row, a manager scope, a
-    /// queued/running manager operation, or an unarchived manager work fact.
+    /// queued/running/uncertain manager operation, or an unarchived manager work fact.
+    /// A queued/uncertain manager operation whose durable target (read from its
+    /// `lifecycle_context` record) is a settled Archived/Deleted session and
+    /// whose kind cannot consume it is inert (#2171, #2219, #2220); see
+    /// `pending_manager_operation_is_inert_for`. Its operation and
+    /// receipt remain retained; every other operation keeps pinning.
     /// Fails closed on query error.
+    ///
+    /// This is the probe for a root that exists on disk. When the root is
+    /// already proven absent use
+    /// [`Self::session_has_pending_consumer_for_absent_root`].
     pub fn session_has_pending_consumer(&self, session_id: &str, custody_id: Uuid) -> Result<bool> {
+        self.session_pending_consumer(session_id, custody_id, false)
+    }
+
+    /// [`Self::session_has_pending_consumer`] for a root whose directory and
+    /// git registration are already proven absent (#1086). Absence means
+    /// `NotFound` on the exact path; a root that merely cannot be probed
+    /// (permission denied, I/O error) is not absent and keeps the full probe.
+    ///
+    /// Nothing is left on disk to preserve or to restore into, so two classes
+    /// of record that merely name a long-terminal session stop pinning its
+    /// custody forever:
+    /// - a `committed` successor reservation: the successor was established
+    ///   and the predecessor's lineage is settled (the archive path's live
+    ///   continuation probe already counts only `reserved`, `launching` and
+    ///   `uncertain`);
+    /// - an unarchived manager work fact: a ledger reference to the session,
+    ///   not a lease on its sandbox. The branch ref the adoption proof requires
+    ///   (or the purge's tip preservation) keeps the work itself, and the
+    ///   custody row keeps the root and branch identity.
+    ///
+    /// Everything that could still act on the session stays: an unsettled
+    /// successor reservation, a review assignment, an open cleanup or
+    /// settlement row, a manager scope and a queued, running or uncertain
+    /// manager operation, except the inert archived-target operations described above.
+    pub fn session_has_pending_consumer_for_absent_root(
+        &self,
+        session_id: &str,
+        custody_id: Uuid,
+    ) -> Result<bool> {
+        self.session_pending_consumer(session_id, custody_id, true)
+    }
+
+    fn session_pending_consumer(
+        &self,
+        session_id: &str,
+        custody_id: Uuid,
+        root_absent: bool,
+    ) -> Result<bool> {
         let dependent: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND state IN ('reserved','launching','committed','uncertain'))
+            "SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND (state IN ('reserved','launching','uncertain') OR (state='committed' AND ?3=0)))
               OR EXISTS(SELECT 1 FROM manager_review_assignments WHERE author_session_id=?1 AND state IN ('reserved','allocating','active'))
               OR EXISTS(SELECT 1 FROM archive_cleanup_runs WHERE custody_id=?2 AND phase NOT IN ('settled','refused'))
               OR EXISTS(SELECT 1 FROM source_worktree_settlement_items WHERE custody_id=?2 AND phase NOT IN ('refused','unattempted','settled'))
               OR EXISTS(SELECT 1 FROM harness_manager_scopes WHERE manager_session_id=?1)
-              OR EXISTS(SELECT 1 FROM harness_manager_v2_operations WHERE state IN ('queued','running','uncertain') AND (target_session_id=?1 OR instr(payload_json,?1)>0 OR instr(payload_json,?2)>0))
-              OR EXISTS(SELECT 1 FROM harness_manager_v2_work_facts WHERE archived=0 AND (instr(record_key,?1)>0 OR instr(work_key,?1)>0 OR instr(payload_json,?1)>0))",
-            params![session_id, custody_id.to_string()],
+              OR (?3=0 AND EXISTS(SELECT 1 FROM harness_manager_v2_work_facts WHERE archived=0 AND (instr(record_key,?1)>0 OR instr(work_key,?1)>0 OR instr(payload_json,?1)>0)))",
+            params![session_id, custody_id.to_string(), i64::from(root_absent)],
             |r| r.get(0),
         )
         .unwrap_or(true);
-        Ok(dependent)
+        Ok(dependent
+            || self
+                .session_has_pending_manager_operation(session_id, custody_id)
+                .unwrap_or(true))
+    }
+
+    fn session_has_pending_manager_operation(
+        &self,
+        session_id: &str,
+        custody_id: Uuid,
+    ) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,kind,state,target_session_id
+             FROM harness_manager_v2_operations
+             WHERE state IN ('queued','running','uncertain')
+               AND (target_session_id=?1 OR instr(payload_json,?1)>0 OR instr(payload_json,?2)>0)",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, custody_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (id, kind, state, target) in rows {
+            if !self.pending_manager_operation_is_inert_for(
+                session_id,
+                &id,
+                &kind,
+                &state,
+                target.as_deref(),
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when the pending operation `id` can no longer act on, or restore
+    /// into, the custody of `session_id` (#2171, #2219, #2220). Everything else
+    /// keeps pinning; any unreadable, missing or inconsistent evidence is
+    /// `false` (the caller also treats a query error as pinned).
+    ///
+    /// The durable target comes from the operation's `lifecycle_context`
+    /// record, the one the executor reads (`manager_action_operation`). The
+    /// operation row's own `payload_json` holds only `{origin, request}`, so
+    /// the target is never read from it.
+    ///
+    /// An operation is inert for `session_id` only when all of these hold:
+    /// - it is a `queued` or `uncertain` lifecycle action (never `running`);
+    /// - its context target, the row's `target_session_id` and its receipt
+    ///   target agree, and `session_id` is that target or the calling agent
+    ///   (attribution only; any other mention, such as a message, keeps pinning);
+    /// - its kind cannot consume an Archived/Deleted target: `resume_lead`,
+    ///   `pause_lead` and `retire_lead_continuations` against that exact lead
+    ///   (an Archived lead fails the target gate, a changed lead fails the
+    ///   fence), an `ArchiveSession` operator call for that exact session, or an
+    ///   `uncertain` `create_session` that owes no launch drain (uncertain
+    ///   actions are re-observed, never re-executed);
+    /// - the target is Archived/Deleted with no pending archive and no
+    ///   unsettled provider turn, so no provider custody is still open.
+    ///
+    /// A Completed/Failed/Interrupted target is resumable and keeps its root.
+    fn pending_manager_operation_is_inert_for(
+        &self,
+        session_id: &str,
+        id: &str,
+        kind: &str,
+        state: &str,
+        row_target: Option<&str>,
+    ) -> Result<bool> {
+        use super::manager_actions::{MANAGER_LAUNCH_DRAIN_PENDING, ManagerActionOriginV2};
+        use rsi_common::harness_manager_v2::ManagerActionV2;
+        use rsi_common::manager_operator_delegation::DelegatedOperatorCallV1;
+
+        if kind != "lifecycle_action" || !matches!(state, "queued" | "uncertain") {
+            return Ok(false);
+        }
+        let (Ok(operation_id), Some(Ok(target))) =
+            (Uuid::parse_str(id), row_target.map(Uuid::parse_str))
+        else {
+            return Ok(false);
+        };
+        // A missing lifecycle_context record leaves no durable target: pinned.
+        let Some(operation) = self.manager_action_operation(operation_id)? else {
+            return Ok(false);
+        };
+        let context = &operation.context;
+        if context.target_session_id != Some(target)
+            || operation.receipt.target_session_id != Some(target)
+            || context.request.validate().is_err()
+        {
+            return Ok(false);
+        }
+        let caller = match &context.origin {
+            ManagerActionOriginV2::Agent { caller } => Some(caller.to_string()),
+            ManagerActionOriginV2::OperatingIntent { .. } => None,
+        };
+        if session_id != target.to_string() && caller.as_deref() != Some(session_id) {
+            return Ok(false);
+        }
+        let cannot_consume_archived_target = match &context.request.operation {
+            ManagerActionV2::ResumeLead { expected, .. }
+            | ManagerActionV2::PauseLead { expected, .. }
+            | ManagerActionV2::RetireLeadContinuations { expected, .. } => {
+                expected.lead_session_id == Some(target)
+            }
+            ManagerActionV2::OperatorCall { call, .. } => matches!(
+                call.typed(),
+                Ok(DelegatedOperatorCallV1::ArchiveSession(params)) if params.session_id == target
+            ),
+            ManagerActionV2::CreateSession { .. } => {
+                state == "uncertain"
+                    && operation.receipt.outcome.as_deref() != Some(MANAGER_LAUNCH_DRAIN_PENDING)
+            }
+            _ => false,
+        };
+        if !cannot_consume_archived_target {
+            return Ok(false);
+        }
+        // Completed/Failed/Interrupted targets are resumable and still need
+        // their roots. An unsettled provider turn or archive still holds custody.
+        let settled: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions
+                WHERE id=?1 AND status IN ('Archived','Deleted') AND pending_archive=0)
+             AND NOT EXISTS(SELECT 1 FROM provider_turn_custody
+                WHERE session_id=?1 AND state NOT IN ('finished','abandoned'))",
+            [target.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(settled)
     }
 
     pub(crate) fn absent_root_gate(&self, c: &AbsentRootCandidate) -> Result<Option<&'static str>> {
@@ -500,26 +680,35 @@ impl Store {
         let participant_ids = participants
             .query_map([c.custody_id.to_string()], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let retry_eligible = self.startup_retry_eligible_sessions()?;
+        // Every participant id must parse before any verdict (a malformed id is
+        // a hard error, never a pass).
         for id in &participant_ids {
-            let participant = Uuid::parse_str(id).map_err(|error| {
+            Uuid::parse_str(id).map_err(|error| {
                 DaemonError::Store(format!("invalid participant UUID: {error}"))
             })?;
-            if retry_eligible.contains(&participant) {
-                return Ok(Some("retry_eligible"));
-            }
+        }
+        // One indexed probe for this custody's participants. The whole-corpus
+        // `startup_retry_eligible_sessions` scan used to run here once per
+        // candidate, 9 to 10 ms each: about 3 s of the startup restore with
+        // 300 candidates (#2354). The verdict is unchanged: a participant is
+        // retry eligible exactly when that scan would list it.
+        if self.custody_has_retry_eligible_participant(c.custody_id)? {
+            return Ok(Some("retry_eligible"));
         }
         for participant in &participant_ids {
             let lead: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE lead_session_id=?1 AND status NOT IN ('Archived','Deleted'))",[participant],|r|r.get(0))?;
             if lead {
                 return Ok(Some("live_lead"));
             }
-            if self.session_has_pending_consumer(participant, c.custody_id)? {
+            // The gate runs before the directory proof and again after it, and
+            // only a root proven absent can be adopted, so a root still on disk
+            // is retained by the proof either way (`directory_present`).
+            if self.session_has_pending_consumer_for_absent_root(participant, c.custody_id)? {
                 return Ok(Some("pending_consumer"));
             }
         }
         if let Some(owner_id) = owner {
-            let dependent: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND state IN ('reserved','launching','committed','uncertain'))",[owner_id.to_string()],|r|r.get(0)).unwrap_or(true);
+            let dependent: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_successor_reservations WHERE predecessor_session_id=?1 AND state IN ('reserved','launching','uncertain'))",[owner_id.to_string()],|r|r.get(0)).unwrap_or(true);
             if dependent {
                 return Ok(Some("successor_reserved"));
             }
@@ -527,25 +716,35 @@ impl Store {
         Ok(None)
     }
 
-    pub(crate) fn absent_root_dependency_gate(
+    /// The absent-root dependency gate and the work its proof did (hub #2940).
+    pub(crate) fn absent_root_dependency_gate_with_work(
         &self,
         c: &AbsentRootCandidate,
-    ) -> Result<Option<&'static str>> {
-        let dependencies =
-            self.source_worktree_targeted_dependencies_for_absent_root(c.custody_id, c.generation)?;
+    ) -> Result<(
+        Option<&'static str>,
+        super::source_worktree_v120::DependencyProofWork,
+    )> {
+        let (dependencies, work) = self
+            .source_worktree_targeted_dependencies_for_absent_root_with_work(
+                c.custody_id,
+                c.generation,
+            )?;
         if !dependencies.complete {
-            return Ok(Some(
-                dependencies
-                    .reason
-                    .unwrap_or("dependency_evidence_incomplete"),
+            return Ok((
+                Some(
+                    dependencies
+                        .reason
+                        .unwrap_or("dependency_evidence_incomplete"),
+                ),
+                work,
             ));
         }
         if dependencies.scheduled_dependency_count != 0
             || dependencies.session_path_dependency_count != 0
         {
-            return Ok(Some("dependency_present"));
+            return Ok((Some("dependency_present"), work));
         }
-        Ok(None)
+        Ok((None, work))
     }
 
     pub(crate) fn begin_absent_adoption_run(
@@ -632,7 +831,9 @@ impl Store {
             AdoptionOutcome::Retained(code) => ("retained", Some(code)),
         };
         let effectful = matches!(outcome, AdoptionOutcome::Adopted) && !dry_run;
-        tx.execute("INSERT INTO sandbox_reclaim_items(run_id,custody_id,generation,owner_session_id,owner_status,owner_updated_at,class,effectful,sandbox_root,sandbox_branch,branch_oid,phase,reason_code,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![run_id.to_string(),c.custody_id.to_string(),generation,c.owner_session_id.map(|v|v.to_string()),c.owner_status,c.owner_updated_at,class,i64::from(effectful),c.sandbox_root,c.sandbox_branch,branch_oid,phase,reason,now])?;
+        insert_absent_adoption_item_row(
+            &tx, run_id, c, branch_oid, generation, class, effectful, phase, reason, &now,
+        )?;
         if matches!(outcome, AdoptionOutcome::Adopted) && !dry_run {
             if c.state == "live" {
                 transition_terminal_root_tx(
@@ -653,14 +854,105 @@ impl Store {
         Ok(())
     }
 
+    /// Record the retained candidates of one run in a single transaction.
+    ///
+    /// A retained item has no custody effect: it only inserts its audit row, in
+    /// the shape `record_absent_adoption_item` writes for
+    /// `AdoptionOutcome::Retained`. Grouping those inserts changes how many
+    /// commits the run costs, not what is recorded; the restore used to commit
+    /// one per candidate, about 300 on the hub (#2354). Adopted outcomes keep
+    /// their own transaction because the custody transition commits with them.
+    ///
+    /// With `changed_only` (#2364) a candidate whose newest journalled row already
+    /// holds the same retained verdict (same generation, reason and branch tip) adds
+    /// no row: a restart over unchanged candidates would otherwise append ~300
+    /// identical rows. The newest row is read through
+    /// `sandbox_reclaim_items_custody`, one indexed probe per candidate. Callers
+    /// count the run from the decisions, not from the rows this writes.
+    pub(crate) fn record_absent_adoption_retained_batch(
+        &mut self,
+        run_id: Uuid,
+        items: &[(AbsentRootCandidate, Option<String>, &'static str)],
+        changed_only: bool,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = timestamp();
+        for (candidate, branch_oid, code) in items {
+            let generation = sql_generation(candidate.generation)?;
+            if changed_only {
+                let previous: Option<(i64, String, String, Option<String>, Option<String>)> = tx
+                    .prepare_cached(
+                        "SELECT generation,class,phase,reason_code,branch_oid
+                           FROM sandbox_reclaim_items WHERE custody_id=?1
+                          ORDER BY rowid DESC LIMIT 1",
+                    )?
+                    .query_row(params![candidate.custody_id.to_string()], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    })
+                    .optional()?;
+                if let Some((g, class, phase, reason, oid)) = previous
+                    && g == generation
+                    && class == "retained"
+                    && phase == "retained"
+                    && reason.as_deref() == Some(*code)
+                    && oid.as_deref() == branch_oid.as_deref()
+                {
+                    continue;
+                }
+            }
+            insert_absent_adoption_item_row(
+                &tx,
+                run_id,
+                candidate,
+                branch_oid.as_deref(),
+                generation,
+                "retained",
+                false,
+                "retained",
+                Some(*code),
+                &now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Close the run with the counts of its decisions. A retained candidate whose
+    /// verdict is unchanged writes no row (#2364), so the counts cannot be read
+    /// back from the journal.
     pub(crate) fn finish_absent_adoption_run(
         &self,
         run_id: Uuid,
         stop_reason: Option<&str>,
+        adopted_count: usize,
+        retained_count: usize,
     ) -> Result<()> {
-        self.conn.execute("UPDATE sandbox_reclaim_runs SET finished_at=?2,stop_reason=?3,adopted_count=(SELECT count(*) FROM sandbox_reclaim_items WHERE run_id=?1 AND reason_code='external_removal'),retained_count=(SELECT count(*) FROM sandbox_reclaim_items WHERE run_id=?1 AND phase='retained'),row_version=row_version+1 WHERE run_id=?1",params![run_id.to_string(),timestamp(),stop_reason])?;
+        self.conn.execute("UPDATE sandbox_reclaim_runs SET finished_at=?2,stop_reason=?3,adopted_count=?4,retained_count=?5,row_version=row_version+1 WHERE run_id=?1",params![run_id.to_string(),timestamp(),stop_reason,i64::try_from(adopted_count).unwrap_or(i64::MAX),i64::try_from(retained_count).unwrap_or(i64::MAX)])?;
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_absent_adoption_item_row(
+    tx: &Transaction<'_>,
+    run_id: Uuid,
+    c: &AbsentRootCandidate,
+    branch_oid: Option<&str>,
+    generation: i64,
+    class: &str,
+    effectful: bool,
+    phase: &str,
+    reason: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    tx.prepare_cached("INSERT INTO sandbox_reclaim_items(run_id,custody_id,generation,owner_session_id,owner_status,owner_updated_at,class,effectful,sandbox_root,sandbox_branch,branch_oid,phase,reason_code,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
+        .execute(params![run_id.to_string(),c.custody_id.to_string(),generation,c.owner_session_id.map(|v|v.to_string()),c.owner_status,c.owner_updated_at,class,i64::from(effectful),c.sandbox_root,c.sandbox_branch,branch_oid,phase,reason,now])?;
+    Ok(())
 }
 
 fn transition_quarantined_missing_root_tx(

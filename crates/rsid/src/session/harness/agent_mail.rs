@@ -424,6 +424,7 @@ mod tests {
             stream: true,
             reasoning_effort: None,
             context_editing: false,
+            tool_choice_none: false,
         }
     }
 

@@ -1,0 +1,17 @@
+/* Session lifecycle (slice 6): trash, notifications, recent completions, question modal. */
+dialog.detail-dialog { width: min(640px, 94vw); }
+.pick-header { padding: 6px 10px 2px; font-size: 11px; text-transform: uppercase; color: var(--subtext); cursor: default; }
+.trash-row, .notice, .recent { align-items: baseline; }
+.notice-msg { overflow-wrap: anywhere; }
+.notice-active .notice-msg { font-weight: 600; }
+.notice-error .notice-msg, .notice-failed .notice-msg { color: var(--red); }
+.notice-completed .notice-msg, .notice-success .notice-msg { color: var(--green); }
+.notice-attention .notice-msg { color: var(--yellow); }
+.recent-failed > span:first-child { color: var(--red); }
+.recent-completed > span:first-child { color: var(--green); }
+.question-opt { align-items: baseline; gap: 8px; justify-content: flex-start; flex-wrap: wrap; }
+.question-opt .pick-id { font-family: inherit; flex-basis: 100%; padding-left: 24px; }
+.opt-mark { width: 16px; text-align: center; }
+dialog#question-dialog textarea { width: 100%; resize: vertical; background: var(--surface0); border: 1px solid var(--surface1); border-radius: 6px; padding: 6px 8px; margin-top: 4px; }
+/* Emergency stop: the HARD marker on a session row it paused. */
+.pause-badge { grid-column: 1 / -1; font-size: 11px; font-weight: 600; color: var(--crust); background: var(--red); border-radius: 8px; padding: 0 8px; justify-self: start; }

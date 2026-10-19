@@ -238,21 +238,66 @@ impl Store {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // Bounded terminal selection and the existing decision projection share one transaction.
     pub fn manager_v2_refresh_approval_decisions(
         &self,
         config: &HarnessManagerConfigV1,
     ) -> Result<usize> {
         let cohort = self.manager_v2_cohort(config)?;
+        self.manager_v2_refresh_approval_decisions_in(config, &cohort)
+    }
+
+    /// The members of `ids` an approval refresh can change (#2494): those with
+    /// a publication, or with a legacy V106 `approval:<session>` decision.
+    fn manager_v2_approval_candidates(
+        &self,
+        config: &HarnessManagerConfigV1,
+        ids: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT s.value FROM json_each(?1) s
+             WHERE EXISTS(SELECT 1 FROM appserver_approval_publications p WHERE p.session_id=s.value)
+                OR EXISTS(SELECT 1 FROM harness_manager_v2_records r
+                    WHERE r.project_id=?2 AND r.manager_session_id=?3 AND r.scope_version=?4
+                      AND r.kind='decision' AND r.record_key='approval:'||s.value)",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    serde_json::to_string(ids)?,
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|id| {
+                Uuid::parse_str(id).map_err(|_| refused("manager_v2_invalid_stored_identity"))
+            })
+            .collect()
+    }
+
+    /// [`Self::manager_v2_refresh_approval_decisions`] over a cohort the caller
+    /// already read (#2494).
+    #[allow(clippy::too_many_lines)] // Bounded terminal selection and the existing decision projection share one transaction.
+    pub(crate) fn manager_v2_refresh_approval_decisions_in(
+        &self,
+        config: &HarnessManagerConfigV1,
+        cohort: &[super::manager_coordinator::ManagerCohortMemberV2],
+    ) -> Result<usize> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let mut changed = 0;
         let mut sessions = std::collections::BTreeSet::new();
-        sessions.extend(
-            cohort
-                .iter()
-                .filter(|m| m.epic_id.is_some())
-                .map(|m| m.session.id),
-        );
+        let member_ids: Vec<Uuid> = cohort
+            .iter()
+            .filter(|m| m.epic_id.is_some())
+            .map(|m| m.session.id)
+            .collect();
+        sessions.extend(self.manager_v2_approval_candidates(config, &member_ids)?);
         // A retired session may still own an unresolved publication. Select
         // only terminal sessions with a missing or stale decision projection;
         // stable blocked projections do not consume each refresh batch.
@@ -381,6 +426,15 @@ impl Store {
                 if let Some(old) = same {
                     payload["delivery"] = old.payload["delivery"].clone();
                     payload["answer"] = old.payload["answer"].clone();
+                    // #1704/#1749: the answer's audit identity is what tells an
+                    // operator delivery (exempt from topology binding) from an
+                    // unbound manager one. Projecting the occurrence again must
+                    // not erase it, or the queued answer is revoked.
+                    for field in ["answered_by", "history"] {
+                        if !old.payload[field].is_null() {
+                            payload[field] = old.payload[field].clone();
+                        }
+                    }
                 }
                 changed += usize::from(
                     self.manager_v2_record_changed(config, "decision", &key, epic, &payload)?,

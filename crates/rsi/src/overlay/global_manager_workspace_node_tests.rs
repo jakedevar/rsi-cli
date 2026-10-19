@@ -176,6 +176,8 @@ pub(crate) fn pinnacle_node(f: &Fixture) -> ManagerNodeWorkspaceV1 {
         }],
         escalations_truncated: false,
         fleet: fleet(20),
+        last_seat_handoff: None,
+        standing_directives: Vec::new(),
     }
 }
 
@@ -214,6 +216,8 @@ pub(crate) fn global_node(f: &Fixture) -> ManagerNodeWorkspaceV1 {
         escalations: vec![],
         escalations_truncated: false,
         fleet: fleet(10),
+        last_seat_handoff: None,
+        standing_directives: Vec::new(),
     }
 }
 
@@ -242,6 +246,8 @@ pub(crate) fn project_node(f: &Fixture) -> ManagerNodeWorkspaceV1 {
         escalations: vec![],
         escalations_truncated: false,
         fleet: fleet(5),
+        last_seat_handoff: None,
+        standing_directives: Vec::new(),
     }
 }
 
@@ -274,6 +280,8 @@ pub(crate) fn area_node(f: &Fixture) -> ManagerNodeWorkspaceV1 {
         escalations: vec![],
         escalations_truncated: false,
         fleet: fleet(1),
+        last_seat_handoff: None,
+        standing_directives: Vec::new(),
     }
 }
 
@@ -355,6 +363,65 @@ fn a_pinnacle_console_lists_child_nodes_with_their_projects_then_its_own() {
     assert_eq!(
         lines[3],
         "1 escalation waiting on this node: Two globals claim the release train"
+    );
+}
+
+#[test]
+fn a_node_console_shows_its_latest_seat_handoff() {
+    let f = super::tests::fixture();
+    let mut node = pinnacle_node(&f);
+    let (old_seat, new_seat) = (Uuid::new_v4(), Uuid::new_v4());
+    node.last_seat_handoff = Some(
+        rsi_common::manager_node_workspace::ManagerNodeSeatHandoffV1 {
+            appointment_id: Uuid::new_v4(),
+            old_seat,
+            new_seat,
+            handoff: Some("thoughts/shared/handoffs/general/h.md".into()),
+            handed_at: Utc::now(),
+            handoff_changed_after_appointment: false,
+            handoff_modified_at: None,
+        },
+    );
+    let state = node_state(node, Utc::now());
+    let lines = state.node_lines(&[f.a.clone(), f.b.clone()]);
+    let line = lines
+        .iter()
+        .find(|line| line.starts_with("Seat handed on"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(
+        line.contains(&old_seat.to_string()[..8]) && line.contains(&new_seat.to_string()[..8]),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("handoff thoughts/shared/handoffs/general/h.md"),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_node_console_flags_a_seat_handoff_edited_after_the_handover_2749() {
+    let f = super::tests::fixture();
+    let mut node = pinnacle_node(&f);
+    node.last_seat_handoff = Some(
+        rsi_common::manager_node_workspace::ManagerNodeSeatHandoffV1 {
+            appointment_id: Uuid::new_v4(),
+            old_seat: Uuid::new_v4(),
+            new_seat: Uuid::new_v4(),
+            handoff: Some("/home/op/.rsi/gm/handoff.md".into()),
+            handed_at: Utc::now(),
+            handoff_changed_after_appointment: true,
+            handoff_modified_at: Some(Utc::now()),
+        },
+    );
+    let state = node_state(node, Utc::now());
+    let lines = state.node_lines(&[f.a.clone(), f.b.clone()]);
+    let line = lines
+        .iter()
+        .find(|line| line.starts_with("Seat handed on"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(
+        line.ends_with("handoff /home/op/.rsi/gm/handoff.md · handoff edited after the handover"),
+        "{line}"
     );
 }
 
@@ -571,4 +638,18 @@ async fn launch_prompt_is_edited_in_place_in_standard_mode_only() {
         assert_eq!(form.prompt, expected, "{mode}");
         assert!(form.prompt_edited, "{mode}: typing marks the prompt edited");
     }
+}
+
+#[test]
+fn node_overview_serializes_any_effort_display_and_round_trips() {
+    let f = super::tests::fixture();
+    let mut workspace = global_node(&f);
+    workspace.grant.as_mut().unwrap().allowed_launches[0].effort = None;
+    let value = serde_json::to_value(&workspace).unwrap();
+    assert_eq!(
+        value["launches_display"][0],
+        "Claude/claude-opus-5-5/any effort"
+    );
+    let restored: ManagerNodeWorkspaceV1 = serde_json::from_value(value).unwrap();
+    assert_eq!(restored, workspace);
 }

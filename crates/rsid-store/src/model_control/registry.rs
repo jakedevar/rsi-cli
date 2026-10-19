@@ -284,7 +284,12 @@ pub const REGISTRY: [RegistryEntry; 28] = [
         "before each node LaunchConfig dispatch",
         "ledger row per node attempt",
         "deny-paid, pause-background, stop-all",
-        false,
+        // #1773: a topology or workflow execution is started explicitly by the
+        // operator or an appointed manager, and every session node names an
+        // operator-allowed provider/model/effort, so its paid node launches are
+        // admitted in Normal mode. DenyPaid, PauseBackground and StopAll still
+        // refuse them.
+        true,
     ),
     row(
         ModelInvocationPurpose::WorkflowChainIteration,
@@ -938,7 +943,7 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
     boundary(
         "claude_cli_launch",
         "crates/rsid/src/claude.rs",
-        "ClaudeClient::launch",
+        "ClaudeClient::launch_inner",
         "CliExecutionCapability",
         "execution",
         PrimitiveKind::CliSpawn,
@@ -948,7 +953,7 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
     boundary(
         "codex_cli_launch",
         "crates/rsid/src/codex.rs",
-        "CodexClient::launch",
+        "CodexClient::launch_inner",
         "CliExecutionCapability",
         "execution",
         PrimitiveKind::CliSpawn,
@@ -958,7 +963,7 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
     boundary(
         "antigravity_cli_launch",
         "crates/rsid/src/agy.rs",
-        "AgyClient::launch",
+        "AgyClient::launch_inner",
         "CliExecutionCapability",
         "execution",
         PrimitiveKind::CliSpawn,
@@ -1100,6 +1105,13 @@ pub const EXECUTION_BOUNDARIES: &[ExecutionBoundaryContract] = &[
 
 pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
     exclusion(
+        "satellite_tunnel_service_probe",
+        "crates/rsid/src/satellite/diagnostics.rs",
+        "tunnel_state",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "systemctl",
+    ),
+    exclusion(
         "appserver_transport_spawn",
         "crates/rsid/src/codex_app_server.rs",
         "CodexAppServerClient::launch_with_gate",
@@ -1123,7 +1135,7 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
     exclusion(
         "rolling_land_test_impact_tree",
         "crates/rsid/src/bin/rsi-rolling-land/test_impact.rs",
-        "load_tree",
+        "load_tree_of",
         AllowedExclusionOperation::UtilityCliSpawn,
         "git",
     ),
@@ -1142,6 +1154,20 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "--build-info",
     ),
     exclusion(
+        "local_binary_build_info",
+        "crates/rsid/src/local_build.rs",
+        "probe",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "--build-info",
+    ),
+    exclusion(
+        "job_toolchain_probe",
+        "crates/rsid/src/agent_jobs/toolchain.rs",
+        "probe",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "--version",
+    ),
+    exclusion(
         "rolling_queue_lander",
         "crates/rsid/src/rolling_queue.rs",
         "run_lander",
@@ -1149,9 +1175,30 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "--accepted",
     ),
     exclusion(
+        "rolling_queue_candidate_delta",
+        "crates/rsid/src/rolling_queue.rs",
+        "changed_paths",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git_command",
+    ),
+    exclusion(
+        "rolling_queue_merge_probe",
+        "crates/rsid/src/rolling_queue.rs",
+        "run_bounded",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "command",
+    ),
+    exclusion(
         "wake_when_rolling_fetch",
         "crates/rsid/src/scheduler/wake_when.rs",
         "fetch_origin_rolling",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git",
+    ),
+    exclusion(
+        "project_files_read_only_git",
+        "crates/rsid/src/project_files.rs",
+        "run_git",
         AllowedExclusionOperation::UtilityCliSpawn,
         "git",
     ),
@@ -1191,6 +1238,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "capture_bounded_with_spawn",
     ),
     exclusion(
+        "bounded_scope_command",
+        "crates/rsid-core/src/process_control.rs",
+        "run_bounded_scope_command",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "command",
+    ),
+    exclusion(
         "sandbox_git_bounded_process",
         "crates/rsid-store/src/sandbox/git_worktree.rs",
         "run_bounded_process",
@@ -1210,6 +1264,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "git_output",
         AllowedExclusionOperation::UtilityCliSpawn,
         "git",
+    ),
+    exclusion(
+        "provider_login_status_probe",
+        "crates/rsid/src/provider_login.rs",
+        "run_contained",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "status",
     ),
     exclusion(
         "topology_cargo_catalog",
@@ -1243,6 +1304,20 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "codex_config_read",
         "crates/rsid/src/codex.rs",
         "probe_codex_configured_context_window",
+        AllowedExclusionOperation::TransportSpawn,
+        "app-server",
+    ),
+    exclusion(
+        "codex_live_catalog",
+        "crates/rsid/src/codex_live_catalog.rs",
+        "probe_app_server",
+        AllowedExclusionOperation::TransportSpawn,
+        "app-server",
+    ),
+    exclusion(
+        "provider_contract_codex_hooks",
+        "crates/rsid/src/provider_contract.rs",
+        "CliContractRunner::codex_hooks",
         AllowedExclusionOperation::TransportSpawn,
         "app-server",
     ),
@@ -1301,6 +1376,20 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "LinearClient::graphql",
         AllowedExclusionOperation::NonModelHttpPost,
         "LINEAR_API_URL",
+    ),
+    exclusion(
+        "web_search_serper_post",
+        "crates/rsid/src/session/harness/tools/web_search/serper.rs",
+        "SerperBackend::post_search",
+        AllowedExclusionOperation::NonModelHttpPost,
+        "SERPER_SEARCH_URL",
+    ),
+    exclusion(
+        "web_search_exa_post",
+        "crates/rsid/src/session/harness/tools/web_search/exa.rs",
+        "ExaBackend::post_search",
+        AllowedExclusionOperation::NonModelHttpPost,
+        "EXA_SEARCH_URL",
     ),
     exclusion(
         "vault_credential_probe",
@@ -1535,7 +1624,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
-    fn agent_schedule_wake_fresh_is_the_only_default_enabled_paid_background_purpose() {
+    fn default_enabled_paid_background_purposes_are_fresh_wakes_and_graph_nodes() {
         let enabled: Vec<_> = REGISTRY
             .iter()
             .filter(|entry| {
@@ -1547,7 +1636,10 @@ mod tests {
             .collect();
         assert_eq!(
             enabled,
-            vec![ModelInvocationPurpose::AgentScheduleWakeFresh]
+            vec![
+                ModelInvocationPurpose::WorkflowGraphNode,
+                ModelInvocationPurpose::AgentScheduleWakeFresh,
+            ]
         );
     }
 }

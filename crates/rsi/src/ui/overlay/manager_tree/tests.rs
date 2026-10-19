@@ -59,6 +59,7 @@ fn node(
         focus_session_id: seat.map(|(id, ..)| uuid(id)),
         grant: None,
         launches: Vec::new(),
+        last_seat_handoff: None,
         load: ManagerTreeLoadV1 {
             running_workers: load[0],
             direct_reports: load[1],
@@ -525,7 +526,15 @@ fn editors() -> (NodeEditor, GlobalEditor) {
 
 #[test]
 fn editors_show_current_values_bounds_and_keys() {
-    let (node, global) = editors();
+    let (node, mut global) = editors();
+    global
+        .grant
+        .allowed_launches
+        .push(rsi_common::harness_manager_v2::ManagerLaunchChoiceV2 {
+            provider: rsi_common::SessionProvider::Claude,
+            model: "claude-opus-5-5".into(),
+            effort: None,
+        });
     let mut state = sample_state();
     state.modal = Some(TreeModal::EditNode(Box::new(node)));
     let screen = text(&draw(&state, 120, 40));
@@ -547,9 +556,68 @@ fn editors_show_current_values_bounds_and_keys() {
         "max active sessions",
         "◂     12 ▸   was 4",
         "h/l adjust a cap",
+        "any effort",
     ] {
         assert!(screen.contains(needle), "{needle} missing from\n{screen}");
     }
+}
+
+/// #2502: the portfolio grant editor says what it governs ("this node and
+/// everything under it", not a PM's own launches) and shows the parent
+/// node's cap beside each field, marking a parent cap that binds first.
+#[test]
+fn the_portfolio_editor_labels_what_it_governs_and_shows_the_parent_cap() {
+    let (_, mut global) = editors();
+    global.caps.max_created_sessions = 388;
+    let mut parent = global.caps;
+    parent.max_created_sessions = 100;
+    parent.max_active_sessions = 50;
+    global.parent = Some(("pinnacle manager".into(), parent));
+    let mut state = sample_state();
+    state.modal = Some(TreeModal::EditGlobal(Box::new(global)));
+    let screen = text(&draw(&state, 120, 40));
+    for needle in [
+        "Global grant v3",
+        "Governs this node and everything under it",
+        "parent pinnacle manager caps beside each field",
+        "◂    388 ▸",
+        "parent limit 100 ! parent binds first",
+        "parent limit 50",
+    ] {
+        assert!(screen.contains(needle), "{needle} missing from\n{screen}");
+    }
+    let (_, root) = editors();
+    state.modal = Some(TreeModal::EditGlobal(Box::new(root)));
+    let screen = text(&draw(&state, 120, 40));
+    assert!(
+        screen.contains("no parent node: these are the top caps"),
+        "{screen}"
+    );
+}
+
+/// #2502: a Project row's detail says it governs only the PM's own
+/// launches and shows the parent portfolio caps, marked when they bind.
+#[test]
+fn a_project_row_names_what_its_policy_governs_and_the_parent_cap() {
+    let mut state = sample_state();
+    state.rows[0].grant = Some(grant(3, 5));
+    let mut own = grant(1, 0);
+    own.max_created_sessions = 1024;
+    state.rows[1].grant = Some(own);
+    state.selected = 1;
+    let screen = text(&draw(&state, 200, 50));
+    assert!(
+        screen.contains(
+            "governs this PM's own launches · parent global manager limits: created 6 · active 3 (parent binds first"
+        ),
+        "{screen}"
+    );
+    state.selected = 0;
+    let screen = text(&draw(&state, 200, 50));
+    assert!(
+        screen.contains("governs this node and everything under it (raise: gm > b Budget)"),
+        "{screen}"
+    );
 }
 
 /// Text dumps of the main states for the Issue's visual check. Set
@@ -686,4 +754,162 @@ fn rows_show_who_granted_each_seat() {
     ] {
         assert!(screen.contains(&needle), "{needle} missing from\n{screen}");
     }
+}
+
+/// A budget snapshot of one project whose chain is the given portfolio
+/// nodes (top first) and optionally the PM, each cap given as
+/// (created used, created limit, active used, active limit).
+fn chain_budget(
+    project: Uuid,
+    nodes: &[(rsi_common::manager_budget::BudgetNodeKindV1, Uuid, [f64; 4])],
+) -> rsi_common::manager_budget::GlobalManagerBudgetV1 {
+    use rsi_common::manager_budget::{
+        BudgetCapFieldV1, BudgetCapV1, BudgetNodeV1, BudgetProjectV1, GlobalManagerBudgetV1,
+    };
+    let cap = |field, used, limit| BudgetCapV1 {
+        field,
+        used,
+        limit: Some(limit),
+        binding: false,
+        spend_unknown: false,
+    };
+    GlobalManagerBudgetV1 {
+        node_id: uuid(500),
+        node_label: "global".into(),
+        projects: vec![BudgetProjectV1 {
+            project_id: project,
+            project_name: "rsi".into(),
+            chain: nodes
+                .iter()
+                .map(|(kind, id, [cu, cl, au, al])| BudgetNodeV1 {
+                    kind: *kind,
+                    node_id: *id,
+                    label: "node".into(),
+                    version: 1,
+                    epoch: 1,
+                    counted_since: None,
+                    caps: vec![
+                        cap(BudgetCapFieldV1::CreatedSessions, *cu, *cl),
+                        cap(BudgetCapFieldV1::ActiveSessions, *au, *al),
+                    ],
+                })
+                .collect(),
+        }],
+        resets: String::new(),
+    }
+}
+
+/// #2521: a project row marks its parent as binding by remaining headroom,
+/// not by raw limits. A parent at 388 used of 388 binds a PM with a 256
+/// limit and nothing used; a parent with 100 left does not bind a PM whose
+/// 200 limit has only 1 left.
+#[test]
+fn a_project_row_marks_the_parent_that_binds_by_headroom_not_by_limit() {
+    use rsi_common::manager_budget::BudgetNodeKindV1::{Portfolio, Project};
+    let parent_id = uuid(500);
+    let run = |parent: (u16, f64), own: (u16, f64)| {
+        let mut state = sample_state();
+        state.rows[0].node_id = Some(parent_id);
+        let mut parent_grant = grant(3, 5);
+        parent_grant.max_created_sessions = parent.0;
+        state.rows[0].grant = Some(parent_grant);
+        let mut own_grant = grant(1, 0);
+        own_grant.max_created_sessions = own.0;
+        state.rows[1].grant = Some(own_grant);
+        state.budget = Some(chain_budget(
+            uuid(99),
+            &[
+                (
+                    Portfolio,
+                    parent_id,
+                    [parent.1, f64::from(parent.0), 0.0, 3.0],
+                ),
+                (Project, uuid(99), [own.1, f64::from(own.0), 0.0, 3.0]),
+            ],
+        ));
+        state.selected = 1;
+        text(&draw(&state, 220, 50))
+    };
+    let exhausted_parent = run((388, 388.0), (256, 0.0));
+    assert!(
+        exhausted_parent.contains("parent global manager caps: created 388 (0 left)"),
+        "{exhausted_parent}"
+    );
+    assert!(
+        exhausted_parent.contains("(parent binds first; raise: gm > b Budget)"),
+        "{exhausted_parent}"
+    );
+    let roomy_parent = run((100, 0.0), (200, 199.0));
+    assert!(
+        roomy_parent.contains("parent global manager caps: created 100 (100 left)"),
+        "{roomy_parent}"
+    );
+    assert!(
+        roomy_parent.contains("· active 3 (3 left)"),
+        "{roomy_parent}"
+    );
+}
+
+/// #2521: the portfolio editor compares the edited cap's headroom with the
+/// parent's, across different counting windows (each node's own `used`),
+/// and labels raw limits as limits when no usage is available.
+#[test]
+fn the_portfolio_editor_marks_the_parent_that_binds_by_headroom() {
+    use rsi_common::manager_budget::BudgetNodeKindV1::Portfolio;
+    let (parent_id, child_id, project) = (uuid(500), uuid(501), uuid(10));
+    let line_for = |parent: (u16, f64), own: (u16, f64)| {
+        let (_, mut global) = editors();
+        global.node = Some(Box::new(rsi_common::portfolio_nodes::PortfolioNodeV1 {
+            node_id: child_id,
+            tier_label: "swarm".into(),
+            state: "active".into(),
+            authority_epoch: 2,
+            parent_node_id: Some(parent_id),
+            grantor: "operator".into(),
+            seat_root_session_id: uuid(1),
+            max_direct_reports: 5,
+            child_policy: None,
+            grant: global.grant.clone(),
+            created_at: at(),
+            updated_at: at(),
+        }));
+        global.caps.max_created_sessions = own.0;
+        let mut parent_caps = global.caps;
+        parent_caps.max_created_sessions = parent.0;
+        global.parent = Some(("pinnacle manager".into(), parent_caps));
+        global.budget = Some(chain_budget(
+            project,
+            &[
+                (
+                    Portfolio,
+                    parent_id,
+                    [parent.1, f64::from(parent.0), 0.0, 50.0],
+                ),
+                (Portfolio, child_id, [own.1, f64::from(own.0), 0.0, 50.0]),
+            ],
+        ));
+        let mut state = sample_state();
+        state.modal = Some(TreeModal::EditGlobal(Box::new(global)));
+        text(&draw(&state, 140, 40))
+            .lines()
+            .find(|line| line.contains("max created sessions"))
+            .unwrap()
+            .to_string()
+    };
+    // Parent 388 limit fully used; the child's edited 256 has room: binds.
+    let exhausted = line_for((388, 388.0), (256, 0.0));
+    assert!(
+        exhausted.contains("parent 388 ! parent binds first"),
+        "{exhausted}"
+    );
+    // Parent limit 100 with nothing used; the child edited to 200 with 199
+    // used has 1 left: the parent's 100 left does not bind.
+    let roomy = line_for((100, 0.0), (200, 199.0));
+    let after_parent = roomy.split_once("parent 100").unwrap().1;
+    assert!(
+        after_parent
+            .trim_matches(|ch: char| ch == ' ' || ch == '│')
+            .is_empty(),
+        "{roomy}"
+    );
 }

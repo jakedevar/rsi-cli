@@ -18,7 +18,7 @@ use crate::types::{SessionProvider, SessionStatus};
 /// Most projects one grant may name.
 pub const GLOBAL_MANAGER_MAX_PROJECTS: usize = 64;
 /// Most launch choices one grant may allow.
-pub const GLOBAL_MANAGER_MAX_LAUNCHES: usize = 16;
+pub const GLOBAL_MANAGER_MAX_LAUNCHES: usize = 64;
 /// Largest message the global seat or a PM may send (bytes).
 pub const GLOBAL_MANAGER_MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// Largest appointment query (bytes).
@@ -173,11 +173,23 @@ pub struct GlobalPmSeatV1 {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub context_fill_pct: Option<f64>,
+    /// #2558: the percentage of the context window at which this seat is
+    /// rotated, in the same unit and over the same window as `context_fill_pct`
+    /// (live operator settings; `None` when no rotation applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_threshold_pct: Option<f64>,
+    /// Resolved policy for this exact live seat and window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_budget: Option<crate::coordinator_budget::CoordinatorBudgetV1>,
     pub cost_usd: Option<f64>,
     pub updated_at: DateTime<Utc>,
     /// The project's manager scope version (`HarnessManagerConfigV1.row_version`).
     pub scope_version: i64,
     pub pending_question: bool,
+    /// #2667: the typed code of this seat's finally refused `succeed_manager`
+    /// (the seat is still on this session and nothing is handing it over).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succession_refusal: Option<String>,
 }
 
 /// The PM's saved V2 policy.
@@ -217,6 +229,15 @@ pub struct GlobalProjectOverviewV1 {
     pub pending_questions: i64,
     /// Pending tool approvals.
     pub pending_approvals: i64,
+    /// #2649: the standing operator directives active on this project's
+    /// manager scope, verbatim with author, provenance and timestamps.
+    #[serde(default)]
+    pub standing_directives: Vec<crate::standing_directives::StandingDirectiveV1>,
+    /// #2743: whether `rolling` is known good: the project's open `qa` Issues
+    /// and the newest full-library-green SHA with its age. `None` only when
+    /// the daemon could not read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_health: Option<crate::rolling_queue::RollingHealthV1>,
 }
 
 /// `AgentGlobalOverview` result.
@@ -242,9 +263,21 @@ pub struct GlobalSeatSessionV1 {
     pub provider: SessionProvider,
     pub model: Option<String>,
     pub context_fill_pct: Option<f64>,
+    /// #2558: the percentage of the context window at which this seat is
+    /// rotated, in the same unit and over the same window as `context_fill_pct`
+    /// (live operator settings; `None` when no rotation applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_threshold_pct: Option<f64>,
+    /// Resolved policy for this exact live seat and window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_budget: Option<crate::coordinator_budget::CoordinatorBudgetV1>,
     pub cost_usd: Option<f64>,
     pub updated_at: DateTime<Utc>,
     pub pending_question: bool,
+    /// #2667: the typed code of this seat's finally refused `succeed_manager`
+    /// (the seat is still on this session and nothing is handing it over).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succession_refusal: Option<String>,
     /// #1627: earlier sessions of this seat, newest first, found by walking
     /// `continued_from` (context-cap rotations and successions). Bounded by
     /// [`SEAT_PREDECESSOR_LIMIT`]; read-only history.
@@ -280,7 +313,7 @@ pub struct GlobalWorkspaceProjectV1 {
 }
 
 /// `GetGlobalManagerWorkspace` result.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct GlobalManagerWorkspaceV1 {
     /// The active grant, else the most recent (revoked) grant, else `None`
     /// when no global manager was ever appointed.
@@ -396,6 +429,30 @@ mod tests {
     }
 
     #[test]
+    fn global_grant_accepts_64_launches_and_refuses_65() {
+        let mut request = ConfigureGlobalManagerRequestV1 {
+            session_id: Uuid::new_v4(),
+            project_ids: vec![Uuid::new_v4()],
+            allowed_launches: (0..64)
+                .map(|i| ManagerLaunchChoiceV2 {
+                    model: format!("model-{i}"),
+                    effort: None,
+                    ..launch()
+                })
+                .collect(),
+            project_policy: ManagerPolicyV2::default(),
+            expected_grant_version: 0,
+            idempotency_key: "cap".into(),
+        };
+        assert_eq!(request.validate(), Ok(()));
+        request.allowed_launches.push(ManagerLaunchChoiceV2 {
+            model: "model-64".into(),
+            ..launch()
+        });
+        assert_eq!(request.validate(), Err(GLOBAL_MANAGER_INVALID_REQUEST));
+    }
+
+    #[test]
     fn configure_requires_projects_launches_and_a_key() {
         let mut request = ConfigureGlobalManagerRequestV1 {
             session_id: Uuid::new_v4(),
@@ -426,5 +483,25 @@ mod tests {
             idempotency_key: "k".into(),
         };
         assert_eq!(report.validate(), Err(GLOBAL_MANAGER_INVALID_REQUEST));
+    }
+}
+
+impl Serialize for GlobalManagerWorkspaceV1 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut output = serializer.serialize_struct("GlobalManagerWorkspaceV1", 5)?;
+        output.serialize_field("grant", &self.grant)?;
+        output.serialize_field("seat", &self.seat)?;
+        output.serialize_field("projects", &self.projects)?;
+        output.serialize_field("missing_project_ids", &self.missing_project_ids)?;
+        let launches_display: Vec<_> = self
+            .grant
+            .as_ref()
+            .map_or(&[][..], |grant| grant.allowed_launches.as_slice())
+            .iter()
+            .map(crate::harness_manager_v2::ManagerLaunchChoiceV2::display)
+            .collect();
+        output.serialize_field("launches_display", &launches_display)?;
+        output.end()
     }
 }

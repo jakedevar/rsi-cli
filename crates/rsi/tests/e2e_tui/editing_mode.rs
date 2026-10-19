@@ -52,8 +52,12 @@ async fn typed(term: &Terminal, text: &str) -> E2eResult<()> {
         .map_err(|error| test_error(format!("type {text:?}: {error:?}")))
 }
 
+/// Upper bound for a screen condition. A passing wait returns the moment the
+/// text renders, so the bound only matters on a loaded host (#2421).
+const VISIBLE_DEADLINE: Duration = Duration::from_secs(30);
+
 async fn visible(term: &Terminal, text: &str) -> E2eResult<()> {
-    if let Err(error) = term.expect(text).timeout(Duration::from_secs(8)).await {
+    if let Err(error) = term.expect(text).timeout(VISIBLE_DEADLINE).await {
         let screen = term.screen().await.text();
         return Err(screen_error(
             format!("expected {text:?}: {error:?}"),
@@ -75,6 +79,7 @@ async fn spawn_tui(h: &E2eHarness) -> E2eResult<Terminal> {
         .env("HOME", h.path_string(&h.home_dir)?)
         .env("RSI_DAEMON_SOCKET_PATH", h.path_string(&h.socket_path)?)
         .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+        .env("RSI_SESSION_TOKEN", "")
         .env("PATH", &h.isolated_path)
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
@@ -128,7 +133,7 @@ fn find_field(value: &serde_json::Value, field: &str) -> Option<serde_json::Valu
 
 /// The `editing_mode` value the daemon reports to a fresh operator client.
 async fn daemon_editing_mode(h: &E2eHarness) -> E2eResult<String> {
-    let mut client = DaemonClient::new(h.socket_path.clone());
+    let mut client = DaemonClient::new(h.socket_path.clone()).with_session_token(None);
     client
         .connect()
         .await
@@ -144,13 +149,17 @@ async fn daemon_editing_mode(h: &E2eHarness) -> E2eResult<String> {
 }
 
 async fn wait_daemon_editing_mode(h: &E2eHarness, want: &str) -> E2eResult<()> {
-    let mut last = String::new();
-    for _ in 0..60 {
-        last = daemon_editing_mode(h).await?;
-        if last == want {
-            return Ok(());
+    let deadline = tokio::time::Instant::now() + VISIBLE_DEADLINE;
+    let mut last = daemon_editing_mode(h).await?;
+    while last != want {
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+        last = daemon_editing_mode(h).await?;
+    }
+    if last == want {
+        return Ok(());
     }
     Err(test_error(format!(
         "daemon editing_mode stayed {last:?}, wanted {want:?}"
@@ -180,7 +189,8 @@ async fn seed_session(client: &mut DaemonClient) -> E2eResult<uuid::Uuid> {
         )
         .await
         .map_err(|error| test_error(format!("launch fixture session: {error}")))?;
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + VISIBLE_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         let found = client
             .list_sessions()
             .await
@@ -202,7 +212,7 @@ async fn seed_session(client: &mut DaemonClient) -> E2eResult<uuid::Uuid> {
 
 /// The exact text of the user messages the daemon recorded for the session.
 async fn user_messages(h: &E2eHarness, session: uuid::Uuid) -> E2eResult<Vec<String>> {
-    let mut client = DaemonClient::new(h.socket_path.clone());
+    let mut client = DaemonClient::new(h.socket_path.clone()).with_session_token(None);
     client
         .connect()
         .await
@@ -220,8 +230,9 @@ async fn user_messages(h: &E2eHarness, session: uuid::Uuid) -> E2eResult<Vec<Str
 }
 
 async fn expect_user_message(h: &E2eHarness, session: uuid::Uuid, want: &str) -> E2eResult<()> {
+    let deadline = tokio::time::Instant::now() + VISIBLE_DEADLINE;
     let mut seen = Vec::new();
-    for _ in 0..80 {
+    while tokio::time::Instant::now() < deadline {
         seen = user_messages(h, session).await?;
         if seen.iter().any(|message| message.trim() == want) {
             return Ok(());
@@ -486,6 +497,40 @@ async fn test_e2e_editing_mode_vim_composer_and_palette() -> E2eResult<()> {
 // Live switch through Settings
 // ---------------------------------------------------------------------------
 
+/// Focus the composer with `i` and wait for its mode `indicator`.
+///
+/// The daemon holding a new `editing_mode` does not mean this TUI has applied
+/// it yet (the config reaches the TUI on its next refresh), and the first
+/// session list can render before the authoritative config lands. A single
+/// `i` then focuses a composer in the previous mode, or is dropped. The
+/// condition the test cares about is "the composer shows `indicator`", so
+/// retry the entry until it does, within one generous deadline (#2421).
+async fn enter_composer(term: &Terminal, indicator: &str) -> E2eResult<()> {
+    let deadline = tokio::time::Instant::now() + VISIBLE_DEADLINE * 2;
+    loop {
+        typed(term, "i").await?;
+        if term
+            .expect(indicator)
+            .timeout(Duration::from_secs(3))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let screen = term.screen().await.text();
+            return Err(screen_error(
+                format!("composer never showed {indicator:?}"),
+                &screen,
+            ));
+        }
+        // Back out of whatever mode the composer opened in, then try again.
+        press(term, Key::Escape).await?;
+        press(term, Key::Escape).await?;
+        settled(term).await;
+    }
+}
+
 async fn open_editing_mode_setting(term: &Terminal) -> E2eResult<()> {
     press(term, Key::Char(' ')).await?;
     press(term, Key::Char(',')).await?;
@@ -502,9 +547,12 @@ async fn open_editing_mode_setting(term: &Terminal) -> E2eResult<()> {
         .position(|candidate| *candidate == section)
         .ok_or_else(|| test_error("Editing Mode tab missing from its group"))?;
     // A reopened Settings remembers its last tab; only walk the rail when the
-    // breadcrumb does not already name the Editing Mode page.
-    settled(term).await;
-    if !term.screen().await.text().contains("›  Editing Mode") {
+    // breadcrumb does not already name the Editing Mode page. Read the
+    // breadcrumb only once the Settings title bar has rendered: a fixed pause
+    // could read the screen before it and walk the rail away from a page it
+    // was already on (#2833).
+    let breadcrumb = settings_breadcrumb(term).await?;
+    if !breadcrumb.contains("›  Editing Mode") {
         for _ in 0..group_index {
             press(term, Key::Char('j')).await?;
         }
@@ -519,16 +567,58 @@ async fn open_editing_mode_setting(term: &Terminal) -> E2eResult<()> {
     visible(term, "▌ Editing mode").await
 }
 
+/// The Settings title-bar row (`≡ Settings  ›  <group>  ›  <page>`), once it
+/// has rendered.
+async fn settings_breadcrumb(term: &Terminal) -> E2eResult<String> {
+    const TITLE: &str = "≡ Settings  ›  ";
+    visible(term, TITLE).await?;
+    let screen = term.screen().await.text();
+    screen
+        .lines()
+        .find(|line| line.contains(TITLE))
+        .map(str::to_string)
+        .ok_or_else(|| screen_error("no Settings title bar", &screen))
+}
+
+/// Wait until the daemon's `editing_mode` is no longer `from`; return the new value.
+async fn wait_daemon_editing_mode_change(h: &E2eHarness, from: &str) -> E2eResult<String> {
+    let deadline = tokio::time::Instant::now() + VISIBLE_DEADLINE;
+    loop {
+        let now = daemon_editing_mode(h).await?;
+        if now != from {
+            return Ok(now);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(test_error(format!(
+                "daemon editing_mode stayed {from:?} after Enter and w"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Cycle the setting (`unset` -> `standard` -> `vim`) until the daemon holds `want`.
+/// Enter only stages the next choice (#2241); `w` applies it to the daemon.
+///
+/// One step at a time: each Enter + `w` waits for the daemon to change before
+/// the next. A fixed pause between steps let a slow TUI queue an extra
+/// Enter + `w` behind the first, so the cycle stepped past `want` (#2833).
 async fn cycle_editing_mode_to(h: &E2eHarness, term: &Terminal, want: &str) -> E2eResult<()> {
-    for _ in 0..3 {
-        if daemon_editing_mode(h).await? == want {
+    let mut now = daemon_editing_mode(h).await?;
+    for _ in 0..rsi_common::editing_mode::EDITING_MODE_CHOICES.len() {
+        if now == want {
             return Ok(());
         }
         press(term, Key::Enter).await?;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        press(term, Key::Char('w')).await?;
+        now = wait_daemon_editing_mode_change(h, &now).await?;
     }
-    wait_daemon_editing_mode(h, want).await
+    if now == want {
+        return Ok(());
+    }
+    Err(test_error(format!(
+        "editing_mode cycle never reached {want:?}; daemon holds {now:?}"
+    )))
 }
 
 #[tokio::test]
@@ -548,8 +638,7 @@ async fn test_e2e_editing_mode_live_switch_without_restart() -> E2eResult<()> {
     let outcome = async {
         visible(&term, SESSION_TITLE).await?;
         // Vim: the composer is modal.
-        typed(&term, "i").await?;
-        visible(&term, "INSERT").await?;
+        enter_composer(&term, "INSERT").await?;
         press(&term, Key::Escape).await?;
         visible(&term, "NORMAL").await?;
         // Vim -> Standard in Settings, with the same TUI process.
@@ -557,8 +646,7 @@ async fn test_e2e_editing_mode_live_switch_without_restart() -> E2eResult<()> {
         cycle_editing_mode_to(&h, &term, "standard").await?;
         press(&term, Key::Char('q')).await?;
         visible(&term, SESSION_TITLE).await?;
-        typed(&term, "i").await?;
-        visible(&term, "EDIT").await?;
+        enter_composer(&term, "EDIT").await?;
         typed(&term, "jk: abc").await?;
         visible(&term, "jk: abc").await?;
         // Clear the draft, return to the list, and switch back to Vim.
@@ -570,8 +658,7 @@ async fn test_e2e_editing_mode_live_switch_without_restart() -> E2eResult<()> {
         cycle_editing_mode_to(&h, &term, "vim").await?;
         press(&term, Key::Char('q')).await?;
         visible(&term, SESSION_TITLE).await?;
-        typed(&term, "i").await?;
-        visible(&term, "INSERT").await?;
+        enter_composer(&term, "INSERT").await?;
         press(&term, Key::Escape).await?;
         visible(&term, "NORMAL").await?;
         Ok(())

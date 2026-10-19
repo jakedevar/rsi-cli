@@ -88,7 +88,7 @@ fn supervisor_restarts_and_refreshes_with_one_user_only_front_door() {
     let path = temp.path().join("daemon.sock");
     let daemon = temp.path().join("rsid");
     let supervisor = temp.path().join("rsid-supervisor.sh");
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/rsid-supervisor.sh");
+    let source = Path::new(rsi_common::manifest_dir!()).join("../../scripts/rsid-supervisor.sh");
     fs::copy(source, &supervisor).unwrap();
     fs::set_permissions(&supervisor, fs::Permissions::from_mode(0o700)).unwrap();
     executable(
@@ -192,6 +192,20 @@ fn spawn_failure_releases_the_front_door_and_lease() {
     let path = temp.path().join("daemon.sock");
     let mut holder = Holder::start(&path, &[&temp.path().join("missing")]);
     assert_eq!(holder.wait().code(), Some(1));
+    let lock = fs::File::open(temp.path().join("daemon.sock.holder.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let next = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    drop(next);
+}
+
+#[test]
+fn holder_reaps_delayed_child_exit_without_an_external_signal() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("daemon.sock");
+    let child = temp.path().join("child");
+    executable(&child, "import time, sys\ntime.sleep(0.2)\nsys.exit(23)\n");
+    let mut holder = Holder::start(&path, &[&child]);
+    assert_eq!(holder.wait().code(), Some(23));
     let lock = fs::File::open(temp.path().join("daemon.sock.holder.lock")).unwrap();
     lock.try_lock().unwrap();
     let next = std::os::unix::net::UnixListener::bind(&path).unwrap();

@@ -84,12 +84,31 @@ impl Store {
             .map(|v| serde_json::to_string(v))
             .transpose()
             .map_err(|e| DaemonError::Store(format!("failed to serialize tool_input: {}", e)))?;
-        let metadata_json = event
-            .metadata
+        // #2373: a ToolResult body over the operator's cap is stored as head +
+        // marker + tail, the cut recorded in metadata. Storage only: the caller
+        // keeps `event` whole, so nothing live (provider, TUI, friction) sees
+        // the cut.
+        let truncated = stored_tool_result_body(event);
+        let metadata_json = match truncated.as_ref() {
+            Some(truncated) => Some(
+                serde_json::to_string(&metadata_with_truncation(
+                    event.metadata.as_deref(),
+                    truncated,
+                ))
+                .map_err(|e| DaemonError::Store(format!("failed to serialize metadata: {}", e)))?,
+            ),
+            None => event
+                .metadata
+                .as_ref()
+                .map(|v| serde_json::to_string(v))
+                .transpose()
+                .map_err(|e| DaemonError::Store(format!("failed to serialize metadata: {}", e)))?,
+        };
+        let content: &str = truncated
             .as_ref()
-            .map(|v| serde_json::to_string(v))
-            .transpose()
-            .map_err(|e| DaemonError::Store(format!("failed to serialize metadata: {}", e)))?;
+            .map_or(event.content.as_str(), |truncated| {
+                truncated.content.as_str()
+            });
 
         if let Some(provenance) = provenance {
             let invocation_session: String = tx
@@ -128,7 +147,7 @@ impl Store {
                 event.sequence,
                 event_type_to_str(event.event_type),
                 event.role.map(role_to_str),
-                event.content,
+                content,
                 event.tool_name,
                 tool_input_json,
                 event.created_at.to_rfc3339(),
@@ -184,7 +203,13 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        rows.into_iter().map(Self::convert_event_row).collect()
+        let live = rows
+            .into_iter()
+            .map(Self::convert_event_row)
+            .collect::<Result<Vec<_>>>()?;
+        // #2384: a cold session's archived rows are merged back here, in the one
+        // place every transcript reader goes through.
+        self.merge_cold_events(session_id, since_sequence, live)
     }
 
     /// Load all events for a session, ordered by sequence.
@@ -204,8 +229,18 @@ impl Store {
     /// (context offload — see `update_event_content`) change the total length
     /// without touching either of the others.
     pub fn event_watermark(&self, session_id: Uuid) -> Result<Option<String>> {
+        // #2384: the count and the content length are logical aggregates, live
+        // rows plus the rows archived for a cold session, so the watermark does
+        // not change when a session moves or is restored (see
+        // `cold_archive::LOGICAL_EVENT_COUNT_EXPR`; the maximum sequence is exact
+        // because the newest row always stays live).
         let (count, max_seq, total_len) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(MAX(sequence), -1), COALESCE(SUM(LENGTH(content)), 0)
+            "SELECT COUNT(*) + COALESCE((SELECT archived_event_count FROM cold_archive_sessions
+                                          WHERE session_id = ?1 AND state = 'cold'), 0),
+                    COALESCE(MAX(sequence), -1),
+                    COALESCE(SUM(LENGTH(content)), 0) + COALESCE((SELECT archived_content_len
+                                          FROM cold_archive_sessions
+                                          WHERE session_id = ?1 AND state = 'cold'), 0)
              FROM conversation_events WHERE session_id = ?1",
             params![session_id.to_string()],
             |row| {
@@ -297,6 +332,52 @@ impl Store {
         ))
     }
 
+    /// A decoded cold-archive row (`cold_archive::EVENT_COLUMNS` order) as an
+    /// event: the same conversion a live row gets in `load_events_since`.
+    pub(super) fn event_from_cold_values(
+        values: &[rusqlite::types::Value],
+    ) -> Result<ConversationEvent> {
+        use rusqlite::types::Value;
+        let bad = |index: usize, what: &str| {
+            DaemonError::Store(format!(
+                "cold archive event row column {index} is not {what}: {:?}",
+                values.get(index)
+            ))
+        };
+        let text = |index: usize| match values.get(index) {
+            Some(Value::Text(text)) => Ok(text.clone()),
+            _ => Err(bad(index, "text")),
+        };
+        let optional_text = |index: usize| match values.get(index) {
+            Some(Value::Null) => Ok(None),
+            Some(Value::Text(text)) => Ok(Some(text.clone())),
+            _ => Err(bad(index, "text or NULL")),
+        };
+        let id = match values.first() {
+            Some(Value::Integer(id)) => *id,
+            _ => return Err(bad(0, "an integer")),
+        };
+        let sequence = match values.get(2) {
+            Some(Value::Integer(sequence)) => {
+                i32::try_from(*sequence).map_err(|_| bad(2, "an i32 sequence"))?
+            }
+            _ => return Err(bad(2, "an integer")),
+        };
+        Self::convert_event_row((
+            id,
+            text(1)?,
+            sequence,
+            text(3)?,
+            optional_text(4)?,
+            text(5)?,
+            optional_text(6)?,
+            optional_text(7)?,
+            text(8)?,
+            optional_text(9)?,
+            optional_text(10)?,
+        ))
+    }
+
     fn convert_event_row(
         row: (
             i64,
@@ -374,6 +455,11 @@ impl Store {
         limit: u32,
         event_types: Option<&[EventType]>,
     ) -> Result<(Vec<ConversationEvent>, bool, bool)> {
+        // #2384: a cold session pages over the merged (archive + live tail)
+        // transcript with the same rules as the SQL below.
+        if let Some(page) = self.cold_events_page(session_id, after_sequence, limit, event_types)? {
+            return Ok(page);
+        }
         // The type filter is one bound JSON array (NULL = no filter), so every
         // statement below is a static string the protected-DML audit can prove
         // never writes: no SQL text is assembled from event-type names.
@@ -458,11 +544,223 @@ impl Store {
     }
 
     /// Update the content of a conversation event (for compression/offload).
+    ///
+    /// The row must be live (#2384): an id that matches no row, such as one
+    /// whose session moved to cold storage, is an error, not a silent no-op.
     pub fn update_event_content(&self, event_id: i64, new_content: &str) -> Result<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE conversation_events SET content = ?1 WHERE id = ?2",
             params![new_content, event_id],
         )?;
+        if changed != 1 {
+            return Err(DaemonError::Store(format!(
+                "update_event_content: event {event_id} is not a live conversation event"
+            )));
+        }
         Ok(())
+    }
+}
+
+/// #2373: the capped stored form of a `ToolResult` body. `None` when the event
+/// is not a tool result, the operator turned the cap off, or the body fits (the
+/// row is then written byte-identical).
+fn stored_tool_result_body(
+    event: &ConversationEvent,
+) -> Option<rsid_core::tool_result_cap::StoredBody> {
+    if event.event_type != EventType::ToolResult {
+        return None;
+    }
+    let cap = rsid_core::tool_result_cap::current_cap_bytes()?;
+    rsid_core::tool_result_cap::cap_body(&event.content, cap)
+}
+
+/// The row's metadata with the cut recorded under
+/// [`rsid_core::tool_result_cap::TRUNCATION_METADATA_KEY`]. Existing keys
+/// (`is_error`, ...) are kept; a metadata value that is not an object stays as
+/// it is, and the marker inside the body still names the cut.
+fn metadata_with_truncation(
+    existing: Option<&serde_json::Value>,
+    truncated: &rsid_core::tool_result_cap::StoredBody,
+) -> serde_json::Value {
+    let mut map = match existing {
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(other) => return other.clone(),
+    };
+    map.insert(
+        rsid_core::tool_result_cap::TRUNCATION_METADATA_KEY.to_string(),
+        truncated.metadata(),
+    );
+    serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_session;
+    use rsid_core::tool_result_cap;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn tool_result(
+        session_id: Uuid,
+        sequence: i32,
+        content: String,
+        metadata: Option<serde_json::Value>,
+    ) -> ConversationEvent {
+        ConversationEvent {
+            id: 0,
+            offload_id: None,
+            session_id,
+            sequence,
+            event_type: EventType::ToolResult,
+            role: None,
+            content,
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            created_at: Utc::now(),
+            tool_use_id: Some(format!("tool-{sequence}")),
+            metadata: metadata.map(Box::new),
+        }
+    }
+
+    fn store_with_session() -> (Store, Uuid) {
+        let store = Store::open_in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store
+            .insert_session(&test_session(id, PathBuf::from("/tmp/events")))
+            .unwrap();
+        (store, id)
+    }
+
+    fn stored(store: &Store, session: Uuid, sequence: i32) -> ConversationEvent {
+        store
+            .load_events(session)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.sequence == sequence)
+            .expect("stored event")
+    }
+
+    /// 200 KB of numbered lines: the first and last lines are recognisable.
+    fn big_body() -> String {
+        (0..8000)
+            .map(|line| format!("line {line:05} of the cargo output\n"))
+            .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn an_over_cap_tool_result_is_stored_as_head_marker_tail() {
+        let _guard = tool_result_cap::test_serial_guard();
+        tool_result_cap::set_cap_kib(tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT);
+        let cap = 32 * 1024;
+        let (store, session) = store_with_session();
+        let body = big_body();
+        assert!(body.len() > 6 * cap);
+        let event = tool_result(session, 1, body.clone(), Some(json!({"is_error": true})));
+        store.insert_event(&event).unwrap();
+
+        let row = stored(&store, session, 1);
+        assert!(row.content.len() <= cap, "{}", row.content.len());
+        assert!(row.content.starts_with("line 00000 of the cargo output\n"));
+        assert!(row.content.ends_with("line 07999 of the cargo output\n"));
+        assert!(
+            row.content
+                .contains(&format!("of {} bytes omitted", body.len())),
+            "the marker names the original byte count"
+        );
+        let truncation = row
+            .metadata
+            .as_deref()
+            .and_then(|metadata| metadata.get(tool_result_cap::TRUNCATION_METADATA_KEY))
+            .cloned()
+            .expect("the cut is recorded in metadata");
+        let head = usize::try_from(truncation["head_bytes"].as_u64().unwrap()).unwrap();
+        let tail = usize::try_from(truncation["tail_bytes"].as_u64().unwrap()).unwrap();
+        assert_eq!(truncation["original_bytes"], body.len());
+        assert_eq!(truncation["cap_bytes"], cap);
+        assert!(body.starts_with(&row.content[..head]));
+        assert!(body.ends_with(&row.content[row.content.len() - tail..]));
+        assert_eq!(
+            row.metadata.as_deref().and_then(|m| m.get("is_error")),
+            Some(&json!(true)),
+            "existing metadata keys survive"
+        );
+        // Storage only: the event the caller holds is the whole body.
+        assert_eq!(event.content, body);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn an_over_cap_tool_result_without_metadata_still_records_the_cut() {
+        let _guard = tool_result_cap::test_serial_guard();
+        tool_result_cap::set_cap_kib(tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT);
+        let (store, session) = store_with_session();
+        let body = big_body();
+        store
+            .insert_event(&tool_result(session, 1, body.clone(), None))
+            .unwrap();
+        let row = stored(&store, session, 1);
+        let metadata = row.metadata.expect("cut recorded");
+        assert_eq!(
+            metadata[tool_result_cap::TRUNCATION_METADATA_KEY]["original_bytes"],
+            body.len()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn a_tool_result_within_the_cap_and_other_event_types_are_stored_unchanged() {
+        let _guard = tool_result_cap::test_serial_guard();
+        tool_result_cap::set_cap_kib(tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT);
+        let (store, session) = store_with_session();
+        let small = "ok\n".repeat(10_000);
+        assert!(small.len() < 32 * 1024);
+        let exact = "y".repeat(32 * 1024);
+        store
+            .insert_event(&tool_result(
+                session,
+                1,
+                small.clone(),
+                Some(json!({"is_error": false})),
+            ))
+            .unwrap();
+        store
+            .insert_event(&tool_result(session, 2, exact.clone(), None))
+            .unwrap();
+        let mut message = tool_result(session, 3, big_body(), None);
+        message.event_type = EventType::Message;
+        message.role = Some(Role::Assistant);
+        message.tool_name = None;
+        message.tool_use_id = None;
+        store.insert_event(&message).unwrap();
+
+        let small_row = stored(&store, session, 1);
+        assert_eq!(small_row.content, small);
+        assert_eq!(
+            small_row.metadata.as_deref(),
+            Some(&json!({"is_error": false}))
+        );
+        let exact_row = stored(&store, session, 2);
+        assert_eq!(exact_row.content, exact);
+        assert_eq!(exact_row.metadata, None);
+        assert_eq!(stored(&store, session, 3).content, message.content);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn turning_the_cap_off_stores_tool_results_whole() {
+        let _guard = tool_result_cap::test_serial_guard();
+        tool_result_cap::set_cap_kib(0);
+        let (store, session) = store_with_session();
+        let body = big_body();
+        store
+            .insert_event(&tool_result(session, 1, body.clone(), None))
+            .unwrap();
+        let row = stored(&store, session, 1);
+        tool_result_cap::set_cap_kib(tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT);
+        assert_eq!(row.content, body);
+        assert_eq!(row.metadata, None);
     }
 }

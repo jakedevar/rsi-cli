@@ -18,11 +18,12 @@ PERSONAL = re.compile("jake" + "devar|jacob" + "devarennes")
 ALLOWED_LINE = re.compile(r"github\.com/jake" + "devar/")
 #  * well-known public resolver used as a "not a tailnet address" fixture.
 ALLOWED_PUBLIC_IPS = {"8.8.8.8"}
-#  * the egress classifier (#774) must name real public and range-boundary
+#  * egress classifiers and web-fetch security tests must name public and range-boundary
 #    addresses as test inputs; personal-path checks still apply there.
 IP_FIXTURE_PATHS = {
     "crates/rsi-common/src/egress_policy.rs",
     "crates/rsid/src/session/harness/egress.rs",
+    "crates/rsid/src/session/harness/tools/web_fetch.rs",
 }
 
 SKIP_PREFIXES = ("thoughts/",)

@@ -1656,20 +1656,35 @@ fn render_group_header(
     // Section glyphs repeat the lifecycle vocabulary used by the activity
     // pane's FLOW counts, so a section and its count read as the same thing.
     let glyph = focus_group_header_glyph(name);
+    let count_text = if name == "MANAGERS" {
+        format!(" {count}  ")
+    } else {
+        format!("  {count}  ")
+    };
+    let line = section_header_line(glyph, name, &count_text, color, bg, available);
+    frame.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+}
+
+/// The browser's section header as one line: `  ★ NAME 3  ──────`. Shared
+/// with the other operator views (the global manager workspace, the grant
+/// editor) so every list section reads the same as the session list's.
+pub(crate) fn section_header_line(
+    glyph: &str,
+    name: &str,
+    count_text: &str,
+    color: Color,
+    bg: Color,
+    available: usize,
+) -> Line<'static> {
     let prefix = if glyph.is_empty() {
         "  ".to_string()
     } else {
         format!("  {glyph} ")
     };
     let label = truncate_chars(name, available.saturating_sub(prefix.chars().count()));
-    let count_text = if name == "MANAGERS" {
-        format!(" {count}  ")
-    } else {
-        format!("  {count}  ")
-    };
     let used = prefix.chars().count() + label.chars().count() + count_text.chars().count();
     let rule_width = available.saturating_sub(used).min(14);
-    let line = Line::from(vec![
+    Line::from(vec![
         Span::styled(
             prefix,
             Style::default()
@@ -1685,7 +1700,7 @@ fn render_group_header(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            count_text,
+            count_text.to_string(),
             Style::default()
                 .fg(color)
                 .bg(bg)
@@ -1697,8 +1712,7 @@ fn render_group_header(
                 .fg(theme::browser_decorative_separator())
                 .bg(bg),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+    ])
 }
 
 fn focus_group_header_glyph(name: &str) -> &'static str {
@@ -3497,6 +3511,41 @@ fn running_lines(
     lines
 }
 
+/// #2246: one warning line per project whose codegraph has been Degraded or
+/// Failed for over a day, with the age and the error.
+fn codegraph_health_lines(
+    notices: &[rsi_common::codegraph::CodegraphHealthNoticeV1],
+    bg: Color,
+) -> Vec<Line<'static>> {
+    let warn = Style::default()
+        .fg(theme::peach())
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    notices
+        .iter()
+        .map(|notice| {
+            let age = chrono::DateTime::parse_from_rfc3339(&notice.unhealthy_since)
+                .ok()
+                .map(|since| {
+                    let hours = (chrono::Utc::now() - since.with_timezone(&chrono::Utc))
+                        .num_hours()
+                        .max(0);
+                    if hours >= 48 {
+                        format!(" {}d", hours / 24)
+                    } else {
+                        format!(" {hours}h")
+                    }
+                })
+                .unwrap_or_default();
+            let error = notice.last_error.as_deref().unwrap_or("no error recorded");
+            Line::from(Span::styled(
+                format!("graph {}{age}: {error}", notice.phase),
+                warn,
+            ))
+        })
+        .collect()
+}
+
 /// rsid's own footprint: CPU over the last Health refresh, memory, threads
 /// and descriptors, its background queue, and the store's write path.
 fn daemon_resource_lines(
@@ -3544,6 +3593,8 @@ fn daemon_resource_lines(
         lines.push(Line::from(Span::styled("no supervisor: deploys off", warn)));
         lines.push(Line::from(Span::styled("fix: make release-install", warn)));
     }
+
+    lines.extend(codegraph_health_lines(&sample.codegraph_unhealthy, bg));
 
     let mut cpu = vec![Span::styled("cpu   ", dim)];
     if let Some(percent) = view.cpu_percent {
@@ -4404,6 +4455,20 @@ fn detail_header_metadata(app: &App, state: &SessionState) -> Line<'static> {
     ];
     if let Some(meta) = status::render_session_meta_segment_for(app, state.session.id) {
         spans.extend(meta);
+    }
+    // #2384: an archived session whose rows sit in the cold-storage archive. The
+    // transcript below is whole (reads merge the archive); the badge says where
+    // the rows live and how to put them back.
+    if let Some(badge) = crate::cold_storage::badge_span(app, state.session.id) {
+        spans.push(Span::styled(
+            "  ·  ",
+            Style::default().fg(theme::dim_metadata()),
+        ));
+        spans.push(badge);
+        spans.push(Span::styled(
+            " :cold-restore puts the rows back",
+            Style::default().fg(theme::overlay1()),
+        ));
     }
     let queued = app
         .operator_messages
@@ -6889,6 +6954,7 @@ mod tests {
                 queue_claimed: 0,
                 queue_failed: 0,
                 supervisor_mode: Some(mode.to_string()),
+                codegraph_unhealthy: Vec::new(),
             },
             cpu_percent: None,
             restart_pending: None,
@@ -6917,6 +6983,26 @@ mod tests {
             supervised.lines().count() + 2,
             "{supervised}"
         );
+    }
+
+    #[test]
+    fn unhealthy_codegraph_shows_phase_age_and_error_in_the_rsid_section_2246() {
+        let since = (chrono::Utc::now() - chrono::Duration::hours(72))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let notices = vec![rsi_common::codegraph::CodegraphHealthNoticeV1 {
+            project_id: uuid::Uuid::new_v4(),
+            workspace_id: uuid::Uuid::new_v4(),
+            phase: "failed".into(),
+            unhealthy_since: since,
+            last_error: Some("source path is a symlink".into()),
+            failed_runs: 1590,
+        }];
+        let text = codegraph_health_lines(&notices, Color::Reset)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["graph failed 3d: source path is a symlink"]);
+        assert!(codegraph_health_lines(&[], Color::Reset).is_empty());
     }
 
     #[test]
@@ -12745,6 +12831,7 @@ mod tests {
                             resets_at_epoch: None,
                         })
                         .collect(),
+                    stale_reason: None,
                 },
             );
 

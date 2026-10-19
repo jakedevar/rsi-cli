@@ -34,6 +34,8 @@ pub fn agent_refusal_code(error: &DaemonError) -> &str {
             .or_else(|| code_prefix(message))
             .unwrap_or("structured_refusal"),
         DaemonError::InvalidParam(message) => code_prefix(message).unwrap_or("invalid_param"),
+        // A policy denial is a predictable refusal, never an internal error.
+        DaemonError::PolicyDenied(message) => code_prefix(message).unwrap_or("policy_denied"),
         DaemonError::SessionNotFound(_) => "session_not_found",
         DaemonError::Json(_) => "invalid_json",
         _ => "internal_error",
@@ -82,11 +84,7 @@ pub fn handoff_friction_event(
         .rev()
         .find_map(|line| line.trim().strip_prefix("Friction:"))?
         .trim();
-    let names_issue = line
-        .as_bytes()
-        .windows(2)
-        .any(|pair| pair[0] == b'#' && pair[1].is_ascii_digit());
-    if line.eq_ignore_ascii_case("none") || names_issue {
+    if friction_line_declares_none(line) || friction_line_names_issue(line) {
         return None;
     }
     Some(
@@ -94,6 +92,28 @@ pub fn handoff_friction_event(
             .session(Some(session_id))
             .evidence("session", session_id),
     )
+}
+
+/// The line cites an Issue (`#N`), so the problem it names is filed.
+fn friction_line_names_issue(line: &str) -> bool {
+    line.as_bytes()
+        .windows(2)
+        .any(|pair| pair[0] == b'#' && pair[1].is_ascii_digit())
+}
+
+/// The line says there is no friction: its first word is `none`, whatever
+/// punctuation, markdown or explanation follows (`none.`, `none so far`,
+/// `**none**`, `none (the doc is fixed by the slice)`). Only a line that
+/// leads with something else names an unfiled problem (#124).
+fn friction_line_declares_none(line: &str) -> bool {
+    let word = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let Some(head) = word.get(..4) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    !word[4..].starts_with(|c: char| c.is_alphanumeric())
 }
 
 /// Record one event; friction telemetry never fails the observed operation.
@@ -177,6 +197,16 @@ mod tests {
             "invalid_param"
         );
         assert_eq!(
+            agent_refusal_code(&DaemonError::PolicyDenied("job_kind_not_authorized".into())),
+            "job_kind_not_authorized"
+        );
+        assert_eq!(
+            agent_refusal_code(&DaemonError::PolicyDenied(
+                "/home/u/secret is denied".into()
+            )),
+            "policy_denied"
+        );
+        assert_eq!(
             agent_refusal_code(&DaemonError::Store("disk full".into())),
             "internal_error"
         );
@@ -236,6 +266,54 @@ mod tests {
             ..message
         });
         assert!(handoff_friction_event(session_id, &events).is_none());
+    }
+
+    /// #124: workers write `Friction: none.`, `none so far` (a mid-job turn)
+    /// and `none (<why>)`; each says there is no friction and must not count
+    /// as an unfiled problem. A line that leads with anything else still does.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn handoff_friction_none_variants_are_not_unfiled_problems() {
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+        let session_id = Uuid::new_v4();
+        let event_for = |content: &str| {
+            let events = vec![ConversationEvent {
+                id: 0,
+                offload_id: None,
+                session_id,
+                sequence: 0,
+                event_type: EventType::Message,
+                role: Some(Role::Assistant),
+                content: content.into(),
+                tool_name: None,
+                tool_input: None,
+                tool_use_id: None,
+                metadata: None,
+                created_at: chrono::Utc::now(),
+            }];
+            handoff_friction_event(session_id, &events)
+        };
+        for line in [
+            "Friction: none",
+            "Friction: none.",
+            "Friction: None",
+            "Friction: none so far.",
+            "Friction: none (the stale retired-recipe doc is fixed by the proposed slice, not a new Issue)",
+            "Friction: **none**",
+            "Friction: `none`",
+            "Friction: #266",
+            "Friction: none | #266",
+        ] {
+            assert!(event_for(line).is_none(), "{line}");
+        }
+        for line in [
+            "Friction: nonexistent tool slowed me",
+            "Friction: something rewrites the row to Running, none of it filed",
+            "Friction: not filed because the call was refused",
+            "Friction:",
+        ] {
+            assert!(event_for(line).is_some(), "{line}");
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

@@ -55,6 +55,11 @@ pub const DELEGABLE_OPERATOR_METHODS_V4: [&str; 7] = [
 /// `DelegatedOperatorCallV1`, sorted.
 pub const DELEGABLE_OPERATOR_METHODS: &[&str] = &DELEGABLE_OPERATOR_METHODS_V4;
 
+/// #2060: the one working invocation of every delegated operator method. The
+/// authority catalog prints it beside the method list, because a session
+/// caller's direct `rsi-rpc <Method>` is refused by the attribution gate.
+pub const DELEGATED_OPERATOR_INVOCATION: &str = "Not direct RPC methods (a direct call is refused): invoke each only through `AgentManagerControl` with action `operator_call` and `call` `{\"method\":\"<name>\",\"params\":{...}}`.";
+
 /// The methods an `OperatorDelegation` grant alone unlocks (the v2 allowlist).
 pub const OPERATOR_DELEGATION_METHODS: &[&str] = &DELEGABLE_OPERATOR_METHODS_V2;
 
@@ -75,9 +80,14 @@ pub const DAEMON_SETTINGS_OPERATOR_METHODS: &[&str] = &["ProposeDaemonSetting"];
 /// outside quotas, continuation outside manager gates, deletion, daemon-global
 /// custody, operator kernels and streaming. Disjoint from the allowlist.
 pub const NEVER_DELEGABLE_OPERATOR_METHODS_V1: &[&str] = &[
+    "RequestHubManagerPolicy",
+    // #2750: the hub's reseat of a satellite manager seat, and the operator's own.
+    "RequestHubManagerReseat",
+    "ReseatHarnessManager",
     // Appointment, scope, policy, grant and decisions.
     "ConfigureHarnessManager",
     "ConfigureHarnessManagerPolicy",
+    "ConfigureHarnessManagerWithPolicy",
     "GetHarnessManager",
     "GetHarnessManagerPolicy",
     "ListHarnessManagerEpics",
@@ -434,6 +444,10 @@ pub struct DelegatedSessionRowV1 {
     pub sandbox_cleanup_state: Option<SandboxCleanupState>,
     /// Why a delegated logical `ArchiveSession` would be refused now.
     pub archive_blocker: Option<String>,
+    /// When the 24 h retention window ends for a `Completed` row still inside
+    /// it: skip the row until then (#1794). Absent once eligible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible_at: Option<String>,
 }
 
 /// Bounded result carried by a succeeded `operator_call` receipt.

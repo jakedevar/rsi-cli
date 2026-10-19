@@ -53,6 +53,7 @@
 //! run reports the same decisions with no effects.
 
 mod adopt;
+mod cargo_targets;
 mod fsys;
 mod gitproof;
 mod holders;
@@ -114,6 +115,7 @@ use registry::{CloneBinding, Entry, ManifestState, Registry};
 pub use adopt::{
     AdoptOutcome, AdoptRefusal, LegacyCandidate, LegacyListing, adopt_legacy, list_legacy,
 };
+pub(crate) use cargo_targets::manager_target;
 pub use record::{RECORD_FILE, create_scratch_dir, create_scratch_dir_in};
 
 /// Conservative fixed default: three days.
@@ -157,6 +159,10 @@ pub enum RootKind {
     /// `rsi-rolling-land-*` private landing workspaces (#932). Liveness comes
     /// from the owner file the lander registers, not from age.
     LanderScratch,
+    /// Registered manager targets and explicitly adopted legacy Cargo targets.
+    CargoTarget,
+    /// Dedicated legacy review-target container; every direct child is listed.
+    CargoTargetPool,
 }
 
 impl RootKind {
@@ -173,6 +179,8 @@ impl RootKind {
             }
             Self::WorkerCache => name.starts_with("rsi-") && name.ends_with("-tmp"),
             Self::LanderScratch => name.starts_with(LANDER_SCRATCH_PREFIX),
+            Self::CargoTarget => cargo_targets::allows(name),
+            Self::CargoTargetPool => true,
         }
     }
 
@@ -182,6 +190,7 @@ impl RootKind {
             Self::VarTmp => "var_tmp",
             Self::WorkerCache => "worker_tmp",
             Self::LanderScratch => "lander",
+            Self::CargoTarget | Self::CargoTargetPool => "cargo_target",
         }
     }
 }
@@ -219,6 +228,9 @@ pub struct ScratchConfig {
     /// Drop the registry files of allocations a reclaim finished (tombstoned,
     /// #1171) at the end of a pass. On in production; a test may turn it off.
     pub registry_prune: bool,
+    /// Deploy roots and installed symlinks are consumers even with no process.
+    pub deploy_roots: Vec<PathBuf>,
+    pub install_dirs: Vec<PathBuf>,
     /// Test seam: runs after a candidate was renamed aside, before the
     /// re-proof, to simulate a late writer.
     #[cfg(test)]
@@ -253,6 +265,8 @@ impl ScratchConfig {
             mountinfo: PathBuf::from("/proc/self/mountinfo"),
             registry: registry::default_registry_path(),
             registry_prune: true,
+            deploy_roots: Vec::new(),
+            install_dirs: Vec::new(),
             #[cfg(test)]
             after_rename: None,
             #[cfg(test)]
@@ -274,7 +288,18 @@ impl ScratchConfig {
             roots.push((PathBuf::from(home).join(".cache"), RootKind::WorkerCache));
         }
         roots.extend(lander_scratch_roots());
-        Self::with_roots(roots)
+        roots.extend(cargo_targets::roots());
+        let mut config = Self::with_roots(roots);
+        config.deploy_roots = crate::deploy::DeployService::global()
+            .allowed_roots()
+            .to_vec();
+        if let Some(home) = dirs::home_dir() {
+            config
+                .deploy_roots
+                .push(home.join(".cargo/sat-target-deploy"));
+            config.install_dirs = vec![home.join(".local/bin"), home.join(".rsi/install")];
+        }
+        config
     }
 }
 
@@ -566,6 +591,8 @@ pub fn run_and_log(dry_run: bool, trigger: &str) -> ScratchReport {
         || report.failed > 0
         || report.kept_dirty > 0
         || report.kept_unpublished > 0
+        || report.kept_unrecorded > 0
+        || report.kept_unproven > 0
         || report.refused_roots > 0
         || report.partial > 0
     {
@@ -586,6 +613,22 @@ pub fn run_and_log(dry_run: bool, trigger: &str) -> ScratchReport {
             refused_roots = report.refused_roots,
             budget_exhausted = report.budget_exhausted,
             "Agent scratch reclaim pass completed"
+        );
+    }
+    // A candidate kept for lack of provenance or proof stays on disk until an
+    // operator acts (#2488): name the first few, never silently.
+    for entry in report
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.decision, Decision::Unrecorded | Decision::Unproven))
+        .take(8)
+    {
+        tracing::info!(
+            trigger,
+            path = %entry.path.display(),
+            decision = ?entry.decision,
+            bytes = entry.bytes,
+            "Agent scratch reclaim kept a candidate it could not prove"
         );
     }
     // The processes that kept candidates unproven, for the operator (the same
@@ -697,13 +740,68 @@ fn is_registered_clone(pinned: &Pinned, entry: &Entry, git: &GitRoot) -> bool {
         }))
 }
 
-/// A lander's workspace is private; its registered clone alone is exempt.
+/// Whether `git` is a linked worktree the lander made of its registered private
+/// clone (`git worktree add`: the `candidate-*` and `base-*` checkouts, #2488).
+/// Its `.git` file must name an admin directory directly under
+/// `<workspace>/repo/.git/worktrees/`, by the workspace's registered path (the
+/// text survives the reclaim's rename-aside). Such a checkout owns no objects or
+/// refs of its own: its HEAD is the lander's detached integration merge, which
+/// is unpublished by design, exactly like the clone it borrows from. The gitfile
+/// may outlive a clone an interrupted reclaim already removed; that is the same
+/// private state. A gitfile naming anywhere else is a foreign repository and
+/// gets the full checks.
+fn is_registered_clone_worktree(pinned: &Pinned, entry: &Entry, git: &GitRoot) -> bool {
+    if entry.clone.is_none() || git.bare || git.rel.as_os_str().is_empty() {
+        return false;
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for component in git.rel.components() {
+        match component {
+            std::path::Component::Normal(name) => match name.to_str() {
+                Some(name) => components.push(name),
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    components.push(".git");
+    let Ok(Some(text)) = fsys::read_small_file_below(pinned, &components, OWNER_FILE_LIMIT) else {
+        return false;
+    };
+    let Some(target) = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let admin = Path::new(&entry.path)
+        .join(LANDER_CLONE_DIR)
+        .join(".git")
+        .join("worktrees");
+    let Ok(name) = Path::new(target).strip_prefix(&admin) else {
+        return false;
+    };
+    let mut parts = name.components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+/// A lander's workspace is private: its registered clone and the linked
+/// worktrees it made of that clone are exempt; everything else is checked.
 fn git_exemption<'e>(
     kind: RootKind,
     pinned: &'e Pinned,
     entry: &'e Entry,
 ) -> impl Fn(&GitRoot) -> bool + 'e {
-    move |git| kind == RootKind::LanderScratch && is_registered_clone(pinned, entry, git)
+    move |git| {
+        kind == RootKind::LanderScratch
+            && (is_registered_clone(pinned, entry, git)
+                || is_registered_clone_worktree(pinned, entry, git))
+    }
 }
 
 impl<'a> Pass<'a> {
@@ -836,6 +934,18 @@ impl<'a> Pass<'a> {
                 entry
             }
         };
+        match cargo_targets::has_consumer(&path, &entry.path, self.config, &mut self.budget) {
+            Ok(true) => return Assessment::Keep(Decision::Held),
+            Err(_) => return Assessment::Keep(Decision::Unproven),
+            Ok(false) => {}
+        }
+        // A Cargo target is cache only. Never move manager state or unknown
+        // content, even temporarily, and apply this guard to legacy adoption.
+        if matches!(kind, RootKind::CargoTarget | RootKind::CargoTargetPool)
+            && !cargo_targets::cache_only(&pinned, &mut self.budget)
+        {
+            return Assessment::Keep(Decision::Unproven);
+        }
         // An earlier pass's final proof, if this is a resumed removal. A proof
         // that exists but cannot be used is not "no proof": retain.
         let resume = if aside {
@@ -1073,6 +1183,16 @@ impl<'a> Pass<'a> {
             || !unmounted(root, pinned, &aside_path, mounts.as_deref())
         {
             return Decision::Unproven;
+        }
+        match cargo_targets::has_consumer(
+            &aside_path,
+            &prepared.entry.path,
+            self.config,
+            &mut self.budget,
+        ) {
+            Ok(true) => return Decision::Held,
+            Err(_) => return Decision::Unproven,
+            Ok(false) => {}
         }
         // The allocation must still bind this exact directory.
         if self.allocation(pinned, root, kind).as_ref() != Some(&prepared.entry) {

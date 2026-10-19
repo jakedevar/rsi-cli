@@ -253,6 +253,21 @@ impl RpcServer {
         Ok(serde_json::to_value(result)?)
     }
 
+    /// `ListIssueHandoffs` (#2420): operator-only read of the stored handoff
+    /// records. Absent from `AGENT_VERBS`/`READ_VERBS`; agents read their own
+    /// Issue's handoffs through `AgentGetIssue`.
+    pub(super) async fn handle_list_issue_handoffs(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: ListIssueHandoffsRequestV1 = decode_issue_workspace_params(request)?;
+        let store = self.session_manager.store().lock().await;
+        let result = store
+            .list_issue_workspace_handoffs(&params)
+            .map_err(normalize_issue_workspace_failure)?;
+        Ok(serde_json::to_value(result)?)
+    }
+
     pub(super) async fn handle_archive_issue_v2(
         &self,
         request: &RpcRequest,

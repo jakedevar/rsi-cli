@@ -1,0 +1,71 @@
+#!/bin/sh
+# Issue #2597 - AGENTS.md hard rule 8: commit messages carry no attribution
+# footers. Strip AI-tool attribution (a `Co-Authored-By:` trailer naming an AI
+# tool or vendor, and the "Generated with Claude Code" banner) instead of
+# refusing, so a harness default never costs an agent a retry. A trailer naming
+# a human co-author is kept. The hook edits only the message it is given and
+# never rewrites history.
+#
+# Applies to every committer (agent or human): the rule is repo-wide.
+
+msg_file="$1"
+[ -n "$msg_file" ] && [ -f "$msg_file" ] || exit 0
+
+tmp="$(mktemp "${TMPDIR:-/tmp}/commit-msg.XXXXXX")" || exit 0
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+
+# A `Co-Authored-By:` trailer is AI attribution only on an unambiguous
+# signature (#2600); a bare name or address substring is not one, so a human
+# named Claude, or an address containing "gemini", is kept:
+#   1. the address domain is a known AI vendor domain (or a subdomain of one);
+#   2. the address local part is a known AI bot handle (`...+copilot@`,
+#      `copilot-swe-agent[bot]@`, `cursoragent@`);
+#   3. the name is a known AI product signature (`Claude Code`, `Claude Sonnet
+#      5.5`, `GPT-5`, `ChatGPT`, `GitHub Copilot`, `... [bot]`);
+#   4. the name starts with an AI product name AND the address is a no-reply
+#      mailbox (`Gemini <noreply@google.com>`).
+awk '
+function is_ai_trailer(line,    rest, name, addr, lt, gt, domain, local, at) {
+  rest = tolower(line)
+  sub(/^[ \t]*co-authored-by:[ \t]*/, "", rest)
+  lt = index(rest, "<")
+  gt = index(rest, ">")
+  name = rest
+  addr = ""
+  if (lt > 0) {
+    name = substr(rest, 1, lt - 1)
+    addr = (gt > lt) ? substr(rest, lt + 1, gt - lt - 1) : substr(rest, lt + 1)
+  }
+  gsub(/^[ \t]+|[ \t]+$/, "", name)
+  at = index(addr, "@")
+  local = (at > 0) ? substr(addr, 1, at - 1) : addr
+  domain = (at > 0) ? substr(addr, at + 1) : ""
+
+  if (domain ~ /(^|\.)(anthropic\.com|openai\.com|cursor\.com|cursor\.sh|aider\.chat|devin\.ai|cognition\.ai|openrouter\.ai)$/) return 1
+  if (local ~ /(^|\+)(copilot|claude|codex|chatgpt|cursoragent|aider|devin)(-[a-z-]+)?(\[bot\])?$/ && domain ~ /(^|\.)noreply\.github\.com$/) return 1
+  if (local ~ /\[bot\]$/ && name ~ /(claude|codex|copilot|gemini|cursor|aider|devin|openai)/) return 1
+  if (name ~ /^(claude (code|opus|sonnet|haiku|[0-9]))/) return 1
+  if (name ~ /^(github copilot|chatgpt|openai codex|gpt-?[0-9]|gemini (cli|code assist|[0-9])|cursor agent|aider \()/) return 1
+  if (name ~ /\[bot\]$/ && name ~ /(claude|codex|copilot|gemini|cursor|aider|devin|openai)/) return 1
+  if (name ~ /^(claude|codex|copilot|gemini|cursor|aider|devin|antigravity)([ \t]|$)/ && local ~ /^(no-?reply|noreply[-+a-z0-9]*)$/) return 1
+  return 0
+}
+{
+  if (tolower($0) ~ /^[ \t]*co-authored-by:/ && is_ai_trailer($0)) next
+  if (tolower($0) ~ /^[ \t]*(.?.?.?.?)?generated (with|by) \[?(claude|codex|openai|chatgpt|copilot|gemini)/) next
+  print
+}
+' "$msg_file" > "$tmp"
+
+if cmp -s "$msg_file" "$tmp"; then
+  exit 0
+fi
+
+# Something was stripped: drop the blank lines it leaves at the end.
+awk '
+  /^[[:space:]]*$/ { blank++; next }
+  { while (blank > 0) { print ""; blank-- } print }
+' "$tmp" > "$msg_file"
+
+echo "commit-msg: removed AI attribution trailer(s) from the commit message (AGENTS.md hard rule 8: no attribution footers)." >&2
+exit 0

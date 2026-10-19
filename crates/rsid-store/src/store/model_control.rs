@@ -1874,14 +1874,21 @@ impl Store {
         .transpose()
     }
 
-    /// The session's total cost: the sum of every settled invocation cost the
-    /// session owns (#584). `None` when no invocation recorded a cost (an
+    /// The session's total cost: the sum of every settled invocation's OWN cost
+    /// (#584). Launch/resume rows store the session's running total, so their
+    /// own cost is the increment over the previous such row (#2593,
+    /// `model_control::cost`). `None` when no invocation recorded a cost (an
     /// unpriced model), so an unknown total is NULL, never a fabricated 0.
     pub fn session_model_invocation_cost_total(&self, session_id: Uuid) -> Result<Option<f64>> {
         let total = self.conn.query_row(
-            "SELECT SUM(estimated_cost_usd) FROM model_invocations
-             WHERE session_id = ?1 AND admission_status = 'admitted'
-               AND estimated_cost_usd IS NOT NULL",
+            concat!(
+                "SELECT SUM(ci.cost_increment_usd) FROM model_invocations mi
+             JOIN (",
+                crate::model_control::cost::cost_increment_for_session_sql!(),
+                ") ci ON ci.invocation_id = mi.id
+             WHERE mi.session_id = ?1 AND mi.admission_status = 'admitted'
+               AND ci.cost_increment_usd IS NOT NULL"
+            ),
             params![session_id.to_string()],
             |row| row.get::<_, Option<f64>>(0),
         )?;
@@ -1915,7 +1922,8 @@ impl Store {
                     s.total_cache_creation_tokens, s.total_cache_read_tokens, s.work_time_ms, s.cost_usd,
                     mi.error_class = 'manager_question_cleanup_required',
                     (mi.purpose='session.continue.resume' AND mi.trigger_source='continue_session'
-                     AND (substr(mi.dedup_key,1,15)='manager.answer:' OR substr(mi.dedup_key,1,14)='remote.answer:')), mi.estimated_cost_usd
+                     AND (substr(mi.dedup_key,1,15)='manager.answer:' OR substr(mi.dedup_key,1,14)='remote.answer:')), mi.estimated_cost_usd,
+                    mi.purpose IN (SELECT value FROM json_each(?1))
              FROM model_invocations mi
              LEFT JOIN sessions s ON s.id = mi.session_id
              WHERE mi.admission_status = 'admitted' AND (mi.status = 'running'
@@ -1925,22 +1933,26 @@ impl Store {
                        AND (substr(mi.dedup_key,1,15)='manager.answer:' OR substr(mi.dedup_key,1,14)='remote.answer:')))))",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<f64>>(8)?,
-                    row.get::<_, Option<bool>>(9)?.unwrap_or(false),
-                    row.get::<_, Option<bool>>(10)?.unwrap_or(false),
-                    row.get::<_, Option<f64>>(11)?,
-                ))
-            })?
+            .query_map(
+                params![ModelInvocationPurpose::background_helper_json_array()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<f64>>(8)?,
+                        row.get::<_, Option<bool>>(9)?.unwrap_or(false),
+                        row.get::<_, Option<bool>>(10)?.unwrap_or(false),
+                        row.get::<_, Option<f64>>(11)?,
+                        row.get::<_, Option<bool>>(12)?.unwrap_or(false),
+                    ))
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -1958,8 +1970,32 @@ impl Store {
             question_cleanup,
             manager_answer,
             invocation_cost,
+            background_helper,
         ) in rows
         {
+            // A background helper (embedding index, title, summary, ...) is its
+            // own call: the owning Session's provider totals are not its usage,
+            // so copying them double counts every sum over `model_invocations`
+            // (#700). Its usage stays unknown.
+            let (
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                work_time_ms,
+                cost_usd,
+            ) = if background_helper {
+                (None, None, None, None, None, None)
+            } else {
+                (
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    work_time_ms,
+                    cost_usd,
+                )
+            };
             let invocation_id = Uuid::parse_str(&invocation_id).map_err(|e| {
                 DaemonError::Store(format!(
                     "invalid running model invocation id during reconcile: {e}"
@@ -5492,7 +5528,8 @@ mod tests {
                 .path()
                 .join(format!("capacity-reconcile-{case}.sqlite"));
             let (store, controller, wake, due) = capacity_resume_fixture_with_store(
-                Store::open(&database).expect("open file-backed reconciliation fixture"),
+                Store::open_test_fixture(&database)
+                    .expect("open file-backed reconciliation fixture"),
             );
             let target = if case == "rotated_target" {
                 let mut successor = store.get_session(controller).unwrap().unwrap();
@@ -6050,7 +6087,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
-    fn normal_admits_only_default_enabled_paid_background_purpose() {
+    fn normal_admits_only_default_enabled_paid_background_purposes() {
         let store = Store::open_in_memory().expect("store");
         let agent_registry = registry::lookup(ModelInvocationPurpose::AgentScheduleWakeFresh)
             .copied()
@@ -6085,6 +6122,25 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+
+        // #1773: an operator- or manager-started topology node is a
+        // default-enabled paid background purpose.
+        let node_registry = registry::lookup(ModelInvocationPurpose::WorkflowGraphNode)
+            .copied()
+            .expect("graph node registry");
+        let node_outcome = store
+            .admit_model_invocation(
+                Uuid::new_v4(),
+                node_registry,
+                ModelTier::Premium,
+                &request(
+                    ModelInvocationPurpose::WorkflowGraphNode,
+                    "graph-node-normal",
+                    Uuid::new_v4(),
+                ),
+            )
+            .expect("graph node admission");
+        assert!(matches!(node_outcome, StoreAdmissionOutcome::Admitted(_)));
 
         let scheduled_id = Uuid::new_v4();
         let scheduled_outcome = store
@@ -6547,7 +6603,7 @@ mod tests {
     fn completion_waits_for_a_concurrent_writer_instead_of_failing_busy() {
         let dir = TempDir::new().expect("completion fixture dir");
         let database = dir.path().join("rsi.db");
-        let store = Store::open(&database).expect("completion store");
+        let store = Store::open_test_fixture(&database).expect("completion store");
         let registry = registry::lookup(ModelInvocationPurpose::SessionContinueResume)
             .copied()
             .expect("registry");
@@ -7570,8 +7626,10 @@ mod tests {
             "no priced invocation leaves the session total NULL"
         );
 
+        // Launch rows hold the session's running total (#2593): 0.25, then
+        // 0.25 + 0.5.
         settle("cost-total-a", Some(0.25));
-        settle("cost-total-b", Some(0.5));
+        settle("cost-total-b", Some(0.75));
         settle("cost-total-unpriced-2", None);
         assert_eq!(
             store
@@ -9366,5 +9424,166 @@ mod tests {
             )
             .expect("global active count");
         assert_eq!(active_count, 0);
+    }
+    /// #700: a restart settles a running background-helper invocation without
+    /// copying the owning Session's provider totals into it; a session-turn
+    /// invocation of the same Session still keeps them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn reconcile_does_not_copy_session_usage_into_background_helper_700() {
+        let store = Store::open_in_memory().expect("store");
+        let session_id = Uuid::new_v4();
+        let mut session =
+            crate::test_support::test_session(session_id, std::path::PathBuf::from("/tmp"));
+        session.total_input_tokens = Some(79808);
+        session.total_output_tokens = Some(5004);
+        session.total_cache_read_tokens = Some(1_131_904);
+        session.work_time_ms = Some(103_884);
+        session.cost_usd = Some(1.5);
+        store.insert_session(&session).expect("insert session");
+
+        let admit = |purpose: ModelInvocationPurpose, tier: ModelTier, key: &str| {
+            let registry = registry::lookup(purpose).copied().expect("registry");
+            match store
+                .admit_model_invocation(
+                    Uuid::new_v4(),
+                    registry,
+                    tier,
+                    &request(purpose, key, session_id),
+                )
+                .expect("admit")
+            {
+                StoreAdmissionOutcome::Admitted(id) => id,
+                other => panic!("unexpected admission: {other:?}"),
+            }
+        };
+        let embedding = admit(
+            ModelInvocationPurpose::MemoryEmbeddingIndex,
+            ModelTier::Local,
+            "embed-700",
+        );
+        let turn = admit(
+            ModelInvocationPurpose::SessionLaunchFresh,
+            ModelTier::Premium,
+            "turn-700",
+        );
+
+        store
+            .reconcile_running_model_invocations()
+            .expect("reconcile");
+
+        let read = |id: Uuid| {
+            store
+                .conn
+                .query_row(
+                    "SELECT status, input_tokens, output_tokens, cache_read_tokens,
+                            estimated_cost_usd, usage_confidence
+                     FROM model_invocations WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<f64>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .expect("invocation row")
+        };
+        assert_eq!(
+            read(embedding),
+            (
+                "failed".into(),
+                None,
+                None,
+                None,
+                None,
+                "unavailable".into()
+            )
+        );
+        let (status, input, output, cache_read, _, confidence) = read(turn);
+        assert_eq!(status, "failed");
+        // The turn keeps the session totals net of the admission baselines
+        // (100 input, 20 output, 5 cache read in `request`).
+        assert_eq!(
+            (input, output, cache_read),
+            (Some(79708), Some(4984), Some(1_131_899))
+        );
+        assert_eq!(confidence, "stale");
+    }
+
+    /// #2528 (c): a shutdown that gave up on a live producer records the
+    /// invocation; the next boot reconciles it and closes the record.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn recorded_unsettled_invocation_is_recovered_on_boot_2528() {
+        let store = Store::open_in_memory().expect("store");
+        let registry = registry::lookup(ModelInvocationPurpose::SessionLaunchFresh)
+            .copied()
+            .expect("registry");
+        let invocation_id = match store
+            .admit_model_invocation(
+                Uuid::new_v4(),
+                registry,
+                ModelTier::Premium,
+                &request(
+                    ModelInvocationPurpose::SessionLaunchFresh,
+                    "unsettled-shutdown",
+                    Uuid::new_v4(),
+                ),
+            )
+            .expect("admit")
+        {
+            StoreAdmissionOutcome::Admitted(id) => id,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        assert_eq!(store.open_unsettled_model_invocations().unwrap(), None);
+
+        // The shutdown past its deadline: the running invocation is recorded.
+        let boot = Uuid::new_v4();
+        assert_eq!(
+            store.record_unsettled_model_invocations(boot).unwrap(),
+            vec![invocation_id]
+        );
+        let open = store
+            .open_unsettled_model_invocations()
+            .unwrap()
+            .expect("record is open");
+        assert_eq!(open.boot_id, boot);
+        assert_eq!(open.invocation_ids, vec![invocation_id]);
+
+        // Boot: before reconciliation the invocation is still running, so the
+        // record stays open; after it, the invocation is settled and the record
+        // closes.
+        let before = store
+            .recover_recorded_unsettled_model_invocations()
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status.as_deref(), Some("running"));
+        assert!(store.open_unsettled_model_invocations().unwrap().is_some());
+        store.reconcile_running_model_invocations().unwrap();
+        let after = store
+            .recover_recorded_unsettled_model_invocations()
+            .unwrap();
+        assert_eq!(after[0].invocation_id, invocation_id);
+        assert_eq!(after[0].status.as_deref(), Some("failed"));
+        assert_eq!(store.open_unsettled_model_invocations().unwrap(), None);
+        assert!(
+            store
+                .recover_recorded_unsettled_model_invocations()
+                .unwrap()
+                .is_empty()
+        );
+        // Nothing running records nothing.
+        assert!(
+            store
+                .record_unsettled_model_invocations(boot)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.open_unsettled_model_invocations().unwrap(), None);
     }
 }

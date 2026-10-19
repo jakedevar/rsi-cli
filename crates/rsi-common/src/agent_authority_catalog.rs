@@ -23,11 +23,32 @@ pub const AUTHORITY_CATALOG_UNKNOWN_VERB: &str = "authority_catalog_unknown_verb
 /// Prefix Claude Code puts on the `rsi-agent` MCP server's tools.
 const CLAUDE_MCP_TOOL_PREFIX: &str = "mcp__rsi-agent__";
 
-/// Request: `{}` for the whole manual, or `{"verb": "<name>"}` for just that
-/// control's detail (schema, example, refusals) in the compact envelope. Caller identity is transport-bound, never here.
+/// Longest one-line control description in the summary view, in characters.
+pub const SUMMARY_DESCRIPTION_MAX_CHARS: usize = 100;
+
+/// How much of each control's description a whole-manual response carries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAuthorityCatalogFieldsV1 {
+    /// Roles, guidance and every permitted control by name with a one-line
+    /// description. Small enough for a provider to inline (#308).
+    #[default]
+    Summary,
+    /// Each control's full canonical description (tooling; ~40 KB larger for a
+    /// manager). The same text `rsi-rpc agent` and MCP `tools/list` show.
+    Full,
+}
+
+/// Request: `{}` for the summary manual, `{"fields": "full"}` for the full
+/// descriptions, or `{"verb": "<name>"}` for just that control's detail
+/// (schema, example, refusals) in the compact envelope. Caller identity is
+/// transport-bound, never here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGetAuthorityCatalogRequestV1 {
+    /// `summary` (default) or `full`. Ignored when `verb` is set.
+    #[serde(default)]
+    pub fields: Option<AgentAuthorityCatalogFieldsV1>,
     /// An `Agent*` method (`AgentSpawnChild`), a native tool
     /// (`rsi_control_spawn`) or its Claude MCP spelling
     /// (`mcp__rsi-agent__rsi_control_spawn`).
@@ -109,6 +130,14 @@ pub struct AgentAuthorityCatalogV1 {
     pub authority_revision: String,
     /// Initial role publication has not committed yet; call again shortly.
     pub pending: bool,
+    /// Live coordinator policy; absent for workers and single-verb requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_budget: Option<crate::coordinator_budget::CoordinatorBudgetV1>,
+    /// `summary` when control descriptions are one-liners (the default); the
+    /// full text is `fields: "full"`, one control's detail is `verb`. Omitted
+    /// when the request named a `verb` or asked for `full`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view: String,
     /// `worker` always; plus `epic_lead`, `manager`, `assigned_reviewer`.
     pub roles: Vec<String>,
     /// Operating rules for exactly these roles (Markdown). Omitted when the
@@ -127,13 +156,98 @@ pub struct AgentAuthorityCatalogV1 {
     pub manager_prepared_actions: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegated_operator_methods: Vec<String>,
+    /// #2060: how to call `delegated_operator_methods`. They are not RPC
+    /// methods for a session caller (a direct call is refused); present
+    /// exactly when the list is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub delegated_operator_invocation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<AgentAuthorityControlDetailV1>,
+}
+
+/// Endings that do not close a sentence.
+const ABBREVIATIONS: [&str; 4] = ["e.g.", "i.e.", "etc.", "vs."];
+
+/// The first sentence of a control description, cut at a word boundary to at
+/// most [`SUMMARY_DESCRIPTION_MAX_CHARS`] characters (`...` marks a cut).
+#[must_use]
+pub fn summary_description(description: &str) -> String {
+    let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A sentence ends at `. ` past a short prefix, so "e.g. " and "i.e. " stay.
+    let sentence_end = flat
+        .match_indices(". ")
+        .map(|(index, _)| index + 1)
+        .find(|end| {
+            *end >= 30
+                && !ABBREVIATIONS
+                    .iter()
+                    .any(|abbr| flat[..*end].ends_with(abbr))
+        });
+    let first = sentence_end.map_or(flat.as_str(), |end| &flat[..end]);
+    if first.chars().count() <= SUMMARY_DESCRIPTION_MAX_CHARS {
+        return first.to_string();
+    }
+    let budget = SUMMARY_DESCRIPTION_MAX_CHARS - 3;
+    let cut: String = first.chars().take(budget).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}...", cut.trim_end_matches([',', ';', ':', ' ']))
+}
+
+impl AgentAuthorityCatalogV1 {
+    /// Shorten every control description to its one-line summary and mark the
+    /// view. Names, guidance, roles and manager lists are untouched.
+    pub fn summarize(&mut self) {
+        for control in &mut self.controls {
+            control.description = summary_description(&control.description);
+        }
+        self.view = "summary".to_string();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_description_is_one_bounded_sentence() {
+        assert_eq!(
+            summary_description("Spawn a child agent session. Caller must lead its Epic."),
+            "Spawn a child agent session. Caller must lead its Epic."
+        );
+        let long = "Read one bounded durable progress snapshot for the caller's child cohort or current manager's live scope. More text follows here.";
+        let short = summary_description(long);
+        assert!(
+            short.chars().count() <= SUMMARY_DESCRIPTION_MAX_CHARS,
+            "{short}"
+        );
+        assert!(short.ends_with("..."), "{short}");
+        assert!(short.starts_with("Read one bounded durable progress snapshot"));
+        let two = "Write the thing to the store for every caller, e.g. a worker. Then more words.";
+        assert_eq!(
+            summary_description(two),
+            "Write the thing to the store for every caller, e.g. a worker."
+        );
+        assert_eq!(summary_description("Short."), "Short.");
+    }
+
+    #[test]
+    fn request_fields_parse_and_reject_unknown_values() {
+        let request: AgentGetAuthorityCatalogRequestV1 =
+            serde_json::from_value(serde_json::json!({"fields": "full"})).unwrap();
+        assert_eq!(request.fields, Some(AgentAuthorityCatalogFieldsV1::Full));
+        assert_eq!(
+            AgentGetAuthorityCatalogRequestV1::default()
+                .fields
+                .unwrap_or_default(),
+            AgentAuthorityCatalogFieldsV1::Summary
+        );
+        assert!(
+            serde_json::from_value::<AgentGetAuthorityCatalogRequestV1>(
+                serde_json::json!({"fields": "everything"})
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn verb_accepts_method_native_and_claude_mcp_spellings() {
@@ -144,6 +258,7 @@ mod tests {
         ] {
             let request = AgentGetAuthorityCatalogRequestV1 {
                 verb: Some(name.into()),
+                ..Default::default()
             };
             assert_eq!(
                 request.requested_verb(),
@@ -162,6 +277,7 @@ mod tests {
         ] {
             let request = AgentGetAuthorityCatalogRequestV1 {
                 verb: Some(name.into()),
+                ..Default::default()
             };
             assert_eq!(
                 request.validate(),

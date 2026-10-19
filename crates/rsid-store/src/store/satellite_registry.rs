@@ -164,6 +164,30 @@ impl Store {
             .map_err(|_| DaemonError::Store("invalid satellite registry revision".into()))
     }
 
+    /// Each paired satellite's own provider CLI login probes (#2753), as it
+    /// last reported them in its health snapshot: `(label, probes)`. State,
+    /// method and check time only. A satellite that reports none is absent.
+    pub fn satellite_provider_logins(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            Vec<rsi_common::provider_login::ProviderLoginHealthV1>,
+        )>,
+    > {
+        let view = self.satellite_registry_view()?;
+        Ok(view
+            .peers
+            .into_iter()
+            .filter_map(|peer| {
+                let reported =
+                    crate::store_support::satellite::reported_health(peer.config.peer_id.0)?;
+                (!reported.health.provider_logins.is_empty())
+                    .then(|| (peer.config.label, reported.health.provider_logins))
+            })
+            .collect())
+    }
+
     /// Read one bounded operator view from the hub database. No peer socket is
     /// contacted while serving this view.
     pub fn satellite_registry_view(&self) -> Result<SatelliteRegistryV1> {
@@ -206,6 +230,7 @@ impl Store {
                 links: self.satellite_links_for_peer(peer_id)?,
                 observation: self.satellite_observation_for_peer(peer_id)?,
                 dispatch_scope: self.satellite_peer_scope(peer_id)?,
+                dispatch_project_scope: self.satellite_peer_project_scope(peer_id)?,
             });
         }
         if peers.len() > crate::store_support::satellite::MAX_REGISTERED_PEERS {
@@ -237,6 +262,7 @@ impl Store {
             .find(|peer| peer.config.peer_id == request.peer_id)
             .ok_or_else(|| DaemonError::InvalidParam("satellite peer does not exist".into()))?;
         let observation = peer.observation.unwrap_or(SatelliteObservationV1 {
+            platform: None,
             state: "unconfigured".into(),
             installation_id: None,
             incarnation_id: None,
@@ -244,6 +270,7 @@ impl Store {
             last_error: None,
             cached_session_count: 0,
             stale: true,
+            manager_launches: Vec::new(),
         });
         let allowed = peer.config.enabled
             && peer.config.read_enabled
@@ -383,6 +410,7 @@ impl Store {
             None => 0,
         };
         Ok(Some(SatelliteObservationV1 {
+            platform: crate::store_support::satellite::reported_platform(peer_id),
             stale: state != "healthy",
             state,
             installation_id: installation
@@ -407,6 +435,9 @@ impl Store {
                 .transpose()?,
             last_error,
             cached_session_count,
+            manager_launches: crate::store_support::satellite::reported_health(peer_id)
+                .map(|reported| reported.health.manager_launches)
+                .unwrap_or_default(),
         }))
     }
 

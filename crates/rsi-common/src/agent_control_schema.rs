@@ -11,10 +11,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::LazyLock;
 use uuid::Uuid;
+mod diagnostics;
 mod manager_v2;
+#[cfg(test)]
+mod parameter_names;
 
 /// Version of the deterministic schema-discovery envelope.
 pub const AGENT_CONTROL_SCHEMA_VERSION_V1: u32 = 1;
+
+/// #2313: request parameters that were renamed to the one canonical name for
+/// their concept. Each entry is `(verb, deprecated alias, canonical name)`.
+/// The DTO still accepts the alias for one release (serde `alias`), and the
+/// verb's schema lists it with `"deprecated": true` next to the canonical
+/// property. The `parameter_names` schema test fails on any other
+/// non-canonical name, so a new alias must be registered here on purpose.
+pub const DEPRECATED_PARAMETER_ALIASES: &[(AgentControlVerbV1, &str, &str)] = &[
+    (
+        AgentControlVerbV1::SendMessage,
+        "target_session_id",
+        "session_id",
+    ),
+    (
+        AgentControlVerbV1::ContinueChild,
+        "target_session_id",
+        "session_id",
+    ),
+    (
+        AgentControlVerbV1::ArchiveChild,
+        "target_session_id",
+        "session_id",
+    ),
+    (
+        AgentControlVerbV1::SubmitJob,
+        "sandbox_session_id",
+        "source_session_id",
+    ),
+];
 
 /// The closed v1 agent-control request catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,11 +91,15 @@ pub enum AgentControlVerbV1 {
     ManagerResolveEscalation,
     TopologyUpsert,
     TopologyList,
+    TopologyGet,
     TopologyExecute,
     TopologyGetExecution,
     TopologyInterrupt,
     TopologyResolveAttempt,
     EnqueueLandingSource,
+    ListRollingQueue,
+    CancelRollingQueueEntry,
+    CheckLandingCandidate,
     ReadSessionEvents,
     GetProviderStatus,
     SubmitJob,
@@ -74,7 +110,10 @@ pub enum AgentControlVerbV1 {
     ReportToHub,
     GetDaemonInfo,
     RequestDeploy,
+    PushSatelliteManagerPolicy,
+    ReseatSatelliteManager,
     QueryFailureSignatures,
+    WorkerRoster,
     GlobalOverview,
     GlobalSend,
     GlobalAppointManager,
@@ -86,6 +125,12 @@ pub enum AgentControlVerbV1 {
     ManagerOverview,
     CreateProject,
     UpdateProject,
+    OperatorTodoUpsert,
+    OperatorTodoClose,
+    StandingDirective,
+    ListSourceWorktreeCohorts,
+    AuditSourceWorktreeCohort,
+    ApplySourceWorktreeCohort,
 }
 
 /// Native tool whose advertised input is the same request schema as one
@@ -124,12 +169,15 @@ pub enum NativeAgentControlToolV1 {
     RsiControlManagerWorkView,
     RsiControlTopologyUpsert,
     RsiControlTopologyList,
+    RsiControlTopologyGet,
     RsiControlTopologyExecute,
     RsiControlTopologyGetExecution,
     RsiControlTopologyInterrupt,
     RsiControlTopologyResolveAttempt,
     RsiControlReadSessionEvents,
     RsiControlQueryFailureSignatures,
+    RsiControlWorkerRoster,
+    RsiControlListWakes,
     RsiControlGlobalOverview,
     RsiControlGlobalSend,
     RsiControlReportToGlobal,
@@ -138,6 +186,15 @@ pub enum NativeAgentControlToolV1 {
     RsiControlManagerOverview,
     RsiControlCreateProject,
     RsiControlUpdateProject,
+    RsiControlOperatorTodoUpsert,
+    RsiControlOperatorTodoClose,
+    RsiControlStandingDirective,
+    RsiControlListSourceWorktreeCohorts,
+    RsiControlAuditSourceWorktreeCohort,
+    RsiControlApplySourceWorktreeCohort,
+    RsiControlListRollingQueue,
+    RsiControlCancelRollingQueueEntry,
+    RsiControlCheckLandingCandidate,
 }
 
 impl NativeAgentControlToolV1 {
@@ -178,12 +235,15 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlManagerWorkView => "rsi_control_manager_work_view",
             Self::RsiControlTopologyUpsert => "rsi_control_topology_upsert",
             Self::RsiControlTopologyList => "rsi_control_topology_list",
+            Self::RsiControlTopologyGet => "rsi_control_topology_get",
             Self::RsiControlTopologyExecute => "rsi_control_topology_execute",
             Self::RsiControlTopologyGetExecution => "rsi_control_topology_get_execution",
             Self::RsiControlTopologyInterrupt => "rsi_control_topology_interrupt",
             Self::RsiControlTopologyResolveAttempt => "rsi_control_topology_resolve_attempt",
             Self::RsiControlReadSessionEvents => "rsi_control_read_session_events",
             Self::RsiControlQueryFailureSignatures => "rsi_control_query_failure_signatures",
+            Self::RsiControlWorkerRoster => "rsi_control_worker_roster",
+            Self::RsiControlListWakes => "rsi_control_list_wakes",
             Self::RsiControlGlobalOverview => "rsi_control_global_overview",
             Self::RsiControlGlobalSend => "rsi_control_global_send",
             Self::RsiControlReportToGlobal => "rsi_control_report_to_global",
@@ -192,6 +252,15 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlManagerOverview => "rsi_control_manager_overview",
             Self::RsiControlCreateProject => "rsi_control_create_project",
             Self::RsiControlUpdateProject => "rsi_control_update_project",
+            Self::RsiControlOperatorTodoUpsert => "rsi_control_operator_todo_upsert",
+            Self::RsiControlOperatorTodoClose => "rsi_control_operator_todo_close",
+            Self::RsiControlStandingDirective => "rsi_control_standing_directive",
+            Self::RsiControlListSourceWorktreeCohorts => "rsi_control_list_source_worktree_cohorts",
+            Self::RsiControlAuditSourceWorktreeCohort => "rsi_control_audit_source_worktree_cohort",
+            Self::RsiControlApplySourceWorktreeCohort => "rsi_control_apply_source_worktree_cohort",
+            Self::RsiControlListRollingQueue => "rsi_control_list_rolling_queue",
+            Self::RsiControlCancelRollingQueueEntry => "rsi_control_cancel_rolling_queue_entry",
+            Self::RsiControlCheckLandingCandidate => "rsi_control_check_landing_candidate",
         }
     }
 
@@ -235,12 +304,15 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlManagerWorkView => AgentControlVerbV1::ManagerWorkView,
             Self::RsiControlTopologyUpsert => AgentControlVerbV1::TopologyUpsert,
             Self::RsiControlTopologyList => AgentControlVerbV1::TopologyList,
+            Self::RsiControlTopologyGet => AgentControlVerbV1::TopologyGet,
             Self::RsiControlTopologyExecute => AgentControlVerbV1::TopologyExecute,
             Self::RsiControlTopologyGetExecution => AgentControlVerbV1::TopologyGetExecution,
             Self::RsiControlTopologyInterrupt => AgentControlVerbV1::TopologyInterrupt,
             Self::RsiControlTopologyResolveAttempt => AgentControlVerbV1::TopologyResolveAttempt,
             Self::RsiControlReadSessionEvents => AgentControlVerbV1::ReadSessionEvents,
             Self::RsiControlQueryFailureSignatures => AgentControlVerbV1::QueryFailureSignatures,
+            Self::RsiControlWorkerRoster => AgentControlVerbV1::WorkerRoster,
+            Self::RsiControlListWakes => AgentControlVerbV1::ListWakes,
             Self::RsiControlGlobalOverview => AgentControlVerbV1::GlobalOverview,
             Self::RsiControlGlobalSend => AgentControlVerbV1::GlobalSend,
             Self::RsiControlReportToGlobal => AgentControlVerbV1::ReportToGlobal,
@@ -249,6 +321,21 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlManagerOverview => AgentControlVerbV1::ManagerOverview,
             Self::RsiControlCreateProject => AgentControlVerbV1::CreateProject,
             Self::RsiControlUpdateProject => AgentControlVerbV1::UpdateProject,
+            Self::RsiControlOperatorTodoUpsert => AgentControlVerbV1::OperatorTodoUpsert,
+            Self::RsiControlOperatorTodoClose => AgentControlVerbV1::OperatorTodoClose,
+            Self::RsiControlStandingDirective => AgentControlVerbV1::StandingDirective,
+            Self::RsiControlListSourceWorktreeCohorts => {
+                AgentControlVerbV1::ListSourceWorktreeCohorts
+            }
+            Self::RsiControlAuditSourceWorktreeCohort => {
+                AgentControlVerbV1::AuditSourceWorktreeCohort
+            }
+            Self::RsiControlApplySourceWorktreeCohort => {
+                AgentControlVerbV1::ApplySourceWorktreeCohort
+            }
+            Self::RsiControlListRollingQueue => AgentControlVerbV1::ListRollingQueue,
+            Self::RsiControlCancelRollingQueueEntry => AgentControlVerbV1::CancelRollingQueueEntry,
+            Self::RsiControlCheckLandingCandidate => AgentControlVerbV1::CheckLandingCandidate,
         }
     }
 }
@@ -278,7 +365,7 @@ impl AgentControlDescriptorV1 {
             .expect("checked-in agent-control parameter schema must be valid JSON")
     }
 
-    /// Deterministic, compact v1 discovery envelope.
+    /// Deterministic v1 discovery envelope.
     #[must_use]
     pub fn envelope_json(self) -> String {
         // Method names are fixed ASCII catalog constants. Embedding the
@@ -314,14 +401,20 @@ impl AgentControlVerbV1 {
                 | Self::ManagerProgress
                 | Self::ManagerInspect
                 | Self::ManagerUpdate
+                // #2311: a manager lists its project's workers; a portfolio seat names the project.
+                | Self::WorkerRoster
                 // S1.b: topology, deploy and landing.
                 | Self::TopologyUpsert
                 | Self::TopologyList
+                | Self::TopologyGet
                 | Self::TopologyExecute
                 | Self::TopologyGetExecution
                 | Self::TopologyInterrupt
+                | Self::PushSatelliteManagerPolicy
+                | Self::ReseatSatelliteManager
                 | Self::RequestDeploy
                 | Self::EnqueueLandingSource
+                | Self::ListRollingQueue
                 | Self::SubmitJob
         )
     }
@@ -348,6 +441,38 @@ impl AgentControlVerbV1 {
     /// This deliberately stops before authorization and mutable-state checks:
     /// the daemon remains the authority boundary for those predicates.
     pub fn validate_params(self, value: &Value) -> Result<(), AgentControlParamErrorV1> {
+        self.validate_params_inner(value)
+            .map_err(|error| self.schema_error(value).unwrap_or(error))
+    }
+
+    /// Explain an advertised schema violation without changing DTO or authority policy.
+    pub fn schema_error(self, value: &Value) -> Option<AgentControlParamErrorV1> {
+        diagnostics::validate(value, &self.descriptor().parameters(), "params").err()
+    }
+
+    /// #2313: rewrite each registered deprecated parameter name to its
+    /// canonical name so the schema (which requires the canonical name) judges
+    /// the request the DTO will decode. A request naming both is left as sent;
+    /// the DTO refuses it as a duplicate field.
+    fn with_deprecated_aliases_canonicalized(self, value: &Value) -> Value {
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            for (verb, alias, canonical) in DEPRECATED_PARAMETER_ALIASES {
+                if *verb == self && !object.contains_key(*canonical) {
+                    if let Some(moved) = object.remove(*alias) {
+                        object.insert((*canonical).to_string(), moved);
+                    }
+                }
+            }
+        }
+        value
+    }
+
+    fn validate_params_inner(self, value: &Value) -> Result<(), AgentControlParamErrorV1> {
+        // #2312: a read verb's id may be a prefix; the daemon resolves it.
+        let normalized = crate::agent_id_ref::with_prefixes_as_full_ids(self, value);
+        let normalized = self.with_deprecated_aliases_canonicalized(&normalized);
+        let value = &normalized;
         validate_object(value, self)?;
         macro_rules! decode {
             ($type:ty, $validate:expr) => {{
@@ -528,6 +653,10 @@ impl AgentControlVerbV1 {
                     .validated_limit()
                     .map(drop)
             ),
+            Self::TopologyGet => decode!(
+                crate::topology_agent::AgentTopologyGetRequestV1,
+                |r: &crate::topology_agent::AgentTopologyGetRequestV1| r.validate()
+            ),
             Self::TopologyExecute => decode!(
                 crate::topology_agent::AgentTopologyExecuteRequestV1,
                 |r: &crate::topology_agent::AgentTopologyExecuteRequestV1| r.validate()
@@ -549,6 +678,19 @@ impl AgentControlVerbV1 {
             Self::EnqueueLandingSource => decode!(
                 crate::rolling_queue::AgentEnqueueLandingSourceRequestV1,
                 |r: &crate::rolling_queue::AgentEnqueueLandingSourceRequestV1| r.validate()
+            ),
+            Self::ListRollingQueue => decode!(
+                crate::rolling_queue::AgentListRollingQueueRequestV1,
+                |r: &crate::rolling_queue::AgentListRollingQueueRequestV1| r.validate()
+            ),
+            Self::CancelRollingQueueEntry => decode!(
+                crate::rolling_queue::AgentCancelRollingQueueEntryRequestV1,
+                |r: &crate::rolling_queue::AgentCancelRollingQueueEntryRequestV1| r.validate()
+            ),
+            Self::CheckLandingCandidate => decode!(
+                crate::agent_landing_candidate::AgentCheckLandingCandidateRequestV1,
+                |r: &crate::agent_landing_candidate::AgentCheckLandingCandidateRequestV1| r
+                    .validate()
             ),
             Self::ReadSessionEvents => decode!(
                 crate::agent_session_events::AgentReadSessionEventsRequestV1,
@@ -590,6 +732,19 @@ impl AgentControlVerbV1 {
                 crate::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1,
                 |r: &crate::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1| r
                     .validate()
+            ),
+            Self::WorkerRoster => decode!(
+                crate::agent_worker_roster::AgentWorkerRosterRequestV1,
+                |r: &crate::agent_worker_roster::AgentWorkerRosterRequestV1| r.validate()
+            ),
+            Self::PushSatelliteManagerPolicy => decode!(
+                crate::satellite_manager_policy::AgentPushSatelliteManagerPolicyRequestV1,
+                |r: &crate::satellite_manager_policy::AgentPushSatelliteManagerPolicyRequestV1| r
+                    .validate()
+            ),
+            Self::ReseatSatelliteManager => decode!(
+                crate::manager_reseat::AgentReseatSatelliteManagerRequestV1,
+                |r: &crate::manager_reseat::AgentReseatSatelliteManagerRequestV1| r.validate()
             ),
             Self::RequestDeploy => decode!(
                 crate::agent_deploy::AgentRequestDeployRequestV1,
@@ -639,23 +794,83 @@ impl AgentControlVerbV1 {
                 crate::agent_projects::AgentUpdateProjectRequestV1,
                 |r: &crate::agent_projects::AgentUpdateProjectRequestV1| r.validate()
             ),
+            Self::ListSourceWorktreeCohorts => decode!(
+                crate::cohort_settlement::ListSourceWorktreeCohortsParams,
+                |_r: &crate::cohort_settlement::ListSourceWorktreeCohortsParams| Ok::<(), String>(
+                    ()
+                )
+            ),
+            Self::AuditSourceWorktreeCohort => decode!(
+                crate::cohort_settlement::AgentAuditSourceWorktreeCohortParams,
+                |r: &crate::cohort_settlement::AgentAuditSourceWorktreeCohortParams| r.validate()
+            ),
+            Self::ApplySourceWorktreeCohort => decode!(
+                crate::cohort_settlement::ApplySourceWorktreeCohortParams,
+                |r: &crate::cohort_settlement::ApplySourceWorktreeCohortParams| r.validate()
+            ),
+            Self::OperatorTodoUpsert => decode!(
+                crate::operator_todos::AgentOperatorTodoUpsertRequestV1,
+                |r: &crate::operator_todos::AgentOperatorTodoUpsertRequestV1| r.validate()
+            ),
+            Self::OperatorTodoClose => decode!(
+                crate::operator_todos::AgentOperatorTodoCloseRequestV1,
+                |r: &crate::operator_todos::AgentOperatorTodoCloseRequestV1| r.validate()
+            ),
+            Self::StandingDirective => decode!(
+                crate::standing_directives::AgentStandingDirectiveRequestV1,
+                |r: &crate::standing_directives::AgentStandingDirectiveRequestV1| r.validate()
+            ),
         }
     }
 }
 
-/// Stable, redacted local validation result. `field` is intentionally drawn
-/// from a fixed allowlist and never includes serde diagnostics or input data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Stable validation envelope with bounded scalar schema diagnostics.
+/// Legacy class and field remain unchanged; containers are never echoed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentControlParamErrorV1 {
     pub class: &'static str,
     pub field: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub value_truncated: bool,
 }
 
 impl AgentControlParamErrorV1 {
+    /// Add diagnostics while preserving every existing envelope key.
+    pub fn enrich(&self, envelope: &mut Value) {
+        if !envelope.is_object() {
+            *envelope = if envelope.is_null() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"detail": envelope.clone()})
+            };
+        }
+        let object = envelope.as_object_mut().expect("object envelope");
+        object
+            .entry("code")
+            .or_insert_with(|| Value::String("invalid_input".into()));
+        for (key, value) in serde_json::to_value(self)
+            .expect("validation error serializes")
+            .as_object()
+            .expect("error object")
+        {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
     const fn params() -> Self {
         Self {
             class: "invalid_input",
             field: "params",
+            path: None,
+            constraint: None,
+            value: None,
+            value_truncated: false,
         }
     }
 }
@@ -672,6 +887,7 @@ fn validate_object(
         .as_object()
         .ok_or_else(AgentControlParamErrorV1::params)?;
     if object.keys().any(|key| !properties.contains_key(key))
+        || diagnostics::name_group_violation(object, &schema).is_some()
         || schema["required"].as_array().is_some_and(|required| {
             required
                 .iter()
@@ -828,8 +1044,9 @@ impl AgentCancelWakeParams {
 pub const LIST_WAKES_DEFAULT_LIMIT: u32 = 64;
 pub const LIST_WAKES_MAX_LIMIT: u32 = 256;
 
-/// Supported params for the caller-bound `AgentListWakes` surface. The owner is
-/// the authenticated caller's session only; no field can name another session.
+/// Supported params for the `AgentListWakes` surface. The owner is the
+/// authenticated caller's session unless `session_id` names a live worker the
+/// caller's `AgentWorkerRoster` scope covers (#2418).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentListWakesParams {
@@ -838,6 +1055,13 @@ pub struct AgentListWakesParams {
     pub include_disabled: bool,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Read another session's wakes (#2418). Omitted or the caller's own id
+    /// reads the caller's wakes. Any other id must be a live worker the caller
+    /// could see in `AgentWorkerRoster`; anything else is refused
+    /// `list_wakes_target_not_authorized`. Read-only: no wake is created,
+    /// cancelled or changed through it.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 impl AgentListWakesParams {
@@ -848,20 +1072,1087 @@ impl AgentListWakesParams {
     }
 }
 
-const SPAWN_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","query","idempotency_key"],"properties":{"kind":{"type":"string","enum":["Story","Task","Bug","Feature","Refactor","Research"],"description":"Child session kind"},"provider":{"type":["string","null"],"enum":["Claude","Codex","Pioneer","OpenRouter","Bedrock","Local","Antigravity","CodexAppServer","Harness","Gemini",null],"default":null,"description":"Optional child provider; omit to inherit the caller provider"},"model":{"type":["string","null"],"default":null,"description":"Optional model override for the child"},"effort":{"type":["string","null"],"default":null,"description":"Optional reasoning-effort hint"},"agent_role":{"type":["string","null"],"minLength":1,"maxLength":64,"default":null,"description":"Optional normalized display role; caller and Epic authority remain transport-bound"},"query":{"type":"string","minLength":1,"maxLength":262144,"description":"The child's initial prompt or task"},"topology_node":{"type":["string","null"],"default":null,"description":"Optional bound topology node id"},"iteration":{"type":["integer","null"],"minimum":0,"maximum":4294967295,"default":null,"description":"Optional iteration override; omit to auto-increment"},"tags":{"type":["array","null"],"maxItems":64,"items":{"type":"string"},"default":null,"description":"Optional tag override set"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Required stable dedup key; exact retries return the same request and child IDs"}}}"#;
-const RESERVE_SUCCESSOR_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","query","idempotency_key"],"properties":{"kind":{"type":"string","enum":["Story","Task","Bug","Feature","Refactor","Research"],"description":"Successor session kind"},"model":{"type":["string","null"],"default":null,"description":"Optional model override for the successor"},"effort":{"type":["string","null"],"default":null,"description":"Optional reasoning-effort hint"},"query":{"type":"string","minLength":1,"maxLength":262144,"description":"The successor's initial prompt or task"},"topology_node":{"type":["string","null"],"default":null,"description":"Optional bound topology node id"},"iteration":{"type":["integer","null"],"minimum":0,"maximum":4294967295,"default":null,"description":"Optional iteration override; omit to auto-increment"},"tags":{"type":["array","null"],"maxItems":64,"items":{"type":"string"},"default":null,"description":"Optional tag override set"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Required stable dedup key; exact retries return the same reservation and successor IDs"}}}"#;
-const PROGRESS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"session_ids":{"type":"array","maxItems":256,"items":{"type":"string","format":"uuid"},"default":[],"description":"Optional authorized child subdivision; omit for the full cohort"}}}"#;
-const SEND_MESSAGE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["target_session_id","message","idempotency_key"],"properties":{"target_session_id":{"type":"string","format":"uuid","description":"The child session to queue mail for"},"message":{"type":"string","minLength":1,"maxLength":16384,"description":"Message body queued for the target agent; acceptance does not prove delivery"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Required stable dedup key; exact retries return the original receipt and deadline"},"expires_at":{"type":["string","null"],"format":"date-time","default":null,"description":"Optional RFC3339 deadline; omit or send null for 30 minutes after first acceptance. An explicit deadline is preserved"}}}"#;
-const READ_SESSION_EVENTS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["session_id"],"properties":{"session_id":{"type":"string","format":"uuid","description":"A session you may observe: your own child, a child of an Epic you lead, or a session in your manager scope"},"after_sequence":{"type":["integer","null"],"minimum":0,"default":null,"description":"Forward page: events with a greater sequence, ascending. Omit for the tail (newest events, ascending)."},"limit":{"type":["integer","null"],"minimum":1,"maximum":100,"default":20},"event_types":{"type":["array","null"],"maxItems":8,"items":{"type":"string","enum":["Message","ToolUse","ToolResult","System","Thinking","Compressed","CompletionGate"]},"default":null,"description":"Only these event types"},"max_bytes":{"type":["integer","null"],"minimum":1024,"maximum":262144,"default":32768,"description":"Page byte budget; content, tool_input and metadata are also clipped per event"},"final_message_full":{"type":"boolean","default":false,"description":"Return final_message.content up to 32768 characters instead of the default 8000-character cap"}}}"#;
-const REQUEST_DEPLOY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["sha","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"sha":{"type":"string","minLength":40,"maxLength":40,"pattern":"^[0-9a-f]{40}$","description":"Full lowercase commit SHA the binaries were built from"},"binaries_dir":{"type":["string","null"],"default":null,"description":"Absolute directory of freshly built binaries (rsid required); under the sandbox base, ~/.rsi/staging or ~/.cargo/shared-target"},"build":{"type":["boolean","null"],"default":null,"description":"Reserved: build at sha through the job path; refused deploy_build_not_supported"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Required stable dedup key; an exact retry returns the same deploy"},"max_wait_secs":{"type":["integer","null"],"minimum":1,"maximum":3600,"default":null,"description":"Bound on the wait for a quiet point; default 900"},"peer_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Deploy on this paired satellite over the hub link instead of on this daemon; binaries_dir is then a path on the satellite. Confirm with AgentGetDaemonInfo satellites"},"cancel":{"type":["boolean","null"],"default":null,"description":"true cancels your own waiting deploy named by idempotency_key and sha (binaries_dir not needed): it settles failed with deploy_cancelled and its hold on new launches ends at once; deploy_cancel_too_late once the restart began; not with peer_id"},"interrupt_workers":{"type":["boolean","null"],"default":null,"description":"true: once the operator's drain hold (deploy_drain_hold_secs) is over, a worker still mid-turn no longer blocks the quiet point; the restart interrupts it and the existing post-restart path resumes its turn with a continue prompt. A landing and a local test/build/landing job still block. The outcome lists the interrupted worker session ids and each is an andon friction event (deploy_interrupt). Default false; not with peer_id or cancel"}}}"#;
-const QUERY_FAILURE_SIGNATURES_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"test_id":{"type":["string","null"],"minLength":1,"maxLength":512,"default":null,"description":"Exact libtest/nextest test id, e.g. session::launch::tests::x"},"digest":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$","default":null,"description":"sha256 failure digest (rsi-known-failure block prints it); both fields must match when both are set"}}}"#;
-const MANAGER_OVERVIEW_SCHEMA: &str =
-    r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
-const CREATE_PROJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["name","path"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128,"description":"Unique project name shown in the TUI tab bar"},"path":{"type":"string","minLength":1,"maxLength":4096,"description":"Absolute directory of the repository or working tree; it must exist and sit inside a configured workspace root; with no workspace roots configured, a strict descendant of the daemon user's home directory (not the home directory itself, anything under ~/.rsi, or /)"},"description":{"type":["string","null"],"maxLength":2048,"default":null},"color":{"type":["string","null"],"pattern":"^#[0-9a-fA-F]{6}$","default":null,"description":"Tab color as #rrggbb"}}}"#;
-const UPDATE_PROJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your coverage: your own project (project manager) or a project of your grant (portfolio seat)"},"name":{"type":["string","null"],"minLength":1,"maxLength":128,"default":null},"path":{"type":["string","null"],"minLength":1,"maxLength":4096,"default":null,"description":"New absolute directory; refused while the project has a live session"},"description":{"type":["string","null"],"maxLength":2048,"default":null},"color":{"type":["string","null"],"pattern":"^#[0-9a-fA-F]{6}$","default":null}}}"#;
-const GLOBAL_OVERVIEW_SCHEMA: &str =
-    r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
-const MANAGER_LAUNCH_ISSUE_WORKER_BASE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["issue","brief","launch","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue":{"type":"integer","minimum":1,"description":"The Issue's display number in your project"},"brief":{"type":"string","minLength":1,"maxLength":24576,"description":"The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue"},"launch":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","description":"Provider; must be in your policy's allowed_launches"},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":["string","null"],"maxLength":32,"default":null}}},"parent_epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"The Epic to create the worker under; optional when your scope holds exactly one Epic"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; a replay returns the same worker"}}}"#;
+const LIST_SOURCE_WORKTREE_COHORTS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}"##;
+const AUDIT_SOURCE_WORKTREE_COHORT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "repository_identity"
+  ],
+  "properties": {
+    "fields": {
+      "type": "string",
+      "enum": ["summary", "full"],
+      "description": "summary: counts by disposition, apply inputs and only eligible items; full: complete audit. Omitted: summary when nothing is applyable, full otherwise."
+    },
+    "repository_identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    }
+  }
+}"##;
+const APPLY_SOURCE_WORKTREE_COHORT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "repository_identity",
+    "plan_digest",
+    "authorization",
+    "idempotency_key"
+  ],
+  "properties": {
+    "repository_identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "plan_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "authorization": {
+      "type": "string",
+      "description": "Exact authorization_phrase returned by the audit"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}"##;
+
+const SPAWN_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "query",
+    "idempotency_key"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "Story",
+        "Task",
+        "Bug",
+        "Feature",
+        "Refactor",
+        "Research"
+      ],
+      "description": "Child session kind"
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "Claude",
+        "Codex",
+        "Pioneer",
+        "OpenRouter",
+        "Bedrock",
+        "Local",
+        "Antigravity",
+        "CodexAppServer",
+        "Harness",
+        "Gemini",
+        null
+      ],
+      "default": null,
+      "description": "Optional child provider; omit to inherit the caller provider"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional model override for the child"
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional reasoning-effort hint"
+    },
+    "agent_role": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 64,
+      "default": null,
+      "description": "Optional normalized display role; caller and Epic authority remain transport-bound"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 262144,
+      "description": "The child's initial prompt or task"
+    },
+    "topology_node": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional bound topology node id"
+    },
+    "iteration": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 4294967295,
+      "default": null,
+      "description": "Optional iteration override; omit to auto-increment"
+    },
+    "tags": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 64,
+      "items": {
+        "type": "string"
+      },
+      "default": null,
+      "description": "Optional tag override set"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Required stable dedup key; exact retries return the same request and child IDs"
+    }
+  }
+}"##;
+const RESERVE_SUCCESSOR_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "query",
+    "idempotency_key"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "Story",
+        "Task",
+        "Bug",
+        "Feature",
+        "Refactor",
+        "Research"
+      ],
+      "description": "Successor session kind"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional model override for the successor"
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional reasoning-effort hint"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 262144,
+      "description": "The successor's initial prompt or task"
+    },
+    "topology_node": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional bound topology node id"
+    },
+    "iteration": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 4294967295,
+      "default": null,
+      "description": "Optional iteration override; omit to auto-increment"
+    },
+    "tags": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 64,
+      "items": {
+        "type": "string"
+      },
+      "default": null,
+      "description": "Optional tag override set"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Required stable dedup key; exact retries return the same reservation and successor IDs"
+    }
+  }
+}"##;
+const PROGRESS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "session_ids": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F-]{8,36}$"
+      },
+      "default": [],
+      "description": "Optional authorized child subdivision; omit for the full cohort. Each entry is a session UUID or a unique prefix of at least 8 hex characters inside your scope"
+    }
+  }
+}"##;
+const SEND_MESSAGE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "x-exactly-one-of": [
+    [
+      "session_id",
+      "target_session_id"
+    ]
+  ],
+  "required": [
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The child session to queue mail for"
+    },
+    "target_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "deprecated": true,
+      "description": "Deprecated alias of session_id, accepted for one release (#2313); send session_id"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "Message body queued for the target agent; acceptance does not prove delivery"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Required stable dedup key; exact retries return the original receipt and deadline"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "default": null,
+      "description": "Optional RFC3339 deadline; omit or send null for 30 minutes after first acceptance, or a bounded six hours when the recipient owns an armed result wake or open daemon job. An explicit deadline is preserved"
+    }
+  }
+}"##;
+const READ_SESSION_EVENTS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F-]{8,36}$",
+      "description": "A session you may observe: your own child, a child of an Epic you lead, or a session in your manager scope. A UUID or a unique prefix of at least 8 hex characters inside that scope"
+    },
+    "after_sequence": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "default": null,
+      "description": "Forward page: events with a greater sequence, ascending. Omit for the tail (newest events, ascending)."
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 100,
+      "default": 20
+    },
+    "event_types": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "enum": [
+          "Message",
+          "ToolUse",
+          "ToolResult",
+          "System",
+          "Thinking",
+          "Compressed",
+          "CompletionGate"
+        ]
+      },
+      "default": null,
+      "description": "Only these event types"
+    },
+    "max_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1024,
+      "maximum": 262144,
+      "default": 32768,
+      "description": "Page byte budget; content, tool_input and metadata are also clipped per event"
+    },
+    "final_message_full": {
+      "type": "boolean",
+      "default": false,
+      "description": "Return final_message.content up to 32768 characters instead of the default 8000-character cap"
+    }
+  }
+}"##;
+const RESEAT_SATELLITE_MANAGER_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "peer_id",
+    "remote_session_id",
+    "provider",
+    "reason"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null
+    },
+    "peer_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "remote_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Operator-declared remote manager scope address (the failed seat's session id, or a declared project id); the satellite resolves it to the live seat, which keeps resolving to the successor after the reseat"
+    },
+    "provider": {
+      "type": "string",
+      "enum": [
+        "Claude",
+        "Codex",
+        "Pioneer",
+        "OpenRouter",
+        "Bedrock",
+        "Local",
+        "Antigravity",
+        "CodexAppServer",
+        "Harness"
+      ],
+      "description": "Provider of the successor seat"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Model of the successor; omitted means the project's default for that provider"
+    },
+    "effort": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Why the seat is replaced; recorded on the satellite"
+    },
+    "provider_unavailable": {
+      "type": "boolean",
+      "default": false,
+      "description": "Assert the seat's provider is unavailable; required to replace a seat that is Completed or Interrupted rather than Failed"
+    }
+  }
+}"##;
+const PUSH_SATELLITE_POLICY_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "peer_id",
+    "remote_session_id",
+    "expected_scope_version",
+    "expected_policy_version",
+    "idempotency_key",
+    "policy"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null
+    },
+    "peer_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "remote_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Operator-declared remote manager scope address: a session id, or a declared project id (the satellite resolves that project's current appointed manager, so it follows rotation and re-appointment)"
+    },
+    "expected_scope_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_policy_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_launches",
+        "max_created_sessions",
+        "max_active_sessions",
+        "provider_limits"
+      ],
+      "properties": {
+        "allowed_launches": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "provider",
+              "model"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1
+              },
+              "effort": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "default": null
+              }
+            }
+          }
+        },
+        "max_created_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "max_active_sessions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "provider_limits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "provider",
+              "max_active"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "max_active": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"##;
+
+const REQUEST_DEPLOY_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sha",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "sha": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 40,
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full lowercase commit SHA the binaries were built from"
+    },
+    "binaries_dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Absolute directory of freshly built binaries (rsid required); under the sandbox base, ~/.rsi/staging or ~/.cargo/shared-target"
+    },
+    "build": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null,
+      "description": "Reserved: build at sha through the job path; refused deploy_build_not_supported"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Required stable dedup key; an exact retry returns the same deploy"
+    },
+    "max_wait_secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 3600,
+      "default": null,
+      "description": "Bound on the wait for a quiet point; default 900"
+    },
+    "peer_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Deploy on this paired satellite over the hub link instead of on this daemon; binaries_dir is then a path on the satellite. Confirm with AgentGetDaemonInfo satellites"
+    },
+    "cancel": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null,
+      "description": "true cancels your own waiting deploy named by idempotency_key and sha (binaries_dir not needed): it settles failed with deploy_cancelled and its hold on new launches ends at once; deploy_cancel_too_late once the restart began or the deploy settled. With peer_id, forwards cancellation over the paired link and the satellite applies its own owner and idempotency checks; the hub stores no deploy state"
+    },
+    "interrupt_workers": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null,
+      "description": "true: once the operator's drain hold (deploy_drain_hold_secs) is over, a worker still mid-turn no longer blocks the quiet point; the restart interrupts it and the existing post-restart path resumes its turn with a continue prompt. A landing and a local test/build/landing job still block. The outcome lists the interrupted worker session ids and each is an andon friction event (deploy_interrupt). Default false; not with cancel. With peer_id the paired satellite applies it to its own workers (#2587); a satellite build that predates it is refused satellite_deploy_interrupt_unsupported"
+    }
+  }
+}"##;
+const QUERY_FAILURE_SIGNATURES_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "test_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 512,
+      "default": null,
+      "description": "Exact libtest/nextest test id, e.g. session::launch::tests::x"
+    },
+    "digest": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$",
+      "default": null,
+      "description": "sha256 failure digest (rsi-known-failure block prints it); both fields must match when both are set"
+    }
+  }
+}"##;
+const WORKER_ROSTER_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "The project whose workers to list: its appointed manager, or a portfolio seat whose grant covers it. Omit for your own project when you are its appointed manager; any other caller lists the workers it launched itself"
+    },
+    "states": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "running",
+          "parked_on_job",
+          "parked_on_wake",
+          "stranded",
+          "final_handoff",
+          "failed"
+        ]
+      },
+      "maxItems": 6,
+      "default": [],
+      "description": "Only workers in these derived states; empty lists every state"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 256,
+      "default": null,
+      "description": "Page size, default 64; workers come newest activity first"
+    }
+  }
+}"##;
+const MANAGER_OVERVIEW_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fleet": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary",
+        "full"
+      ],
+      "default": "summary",
+      "description": "Fleet rollup detail: summary is one row per model (1h and 24h invocations, errors, cost) plus active and totals; full is every project, provider and model group over 5m/1h/24h"
+    }
+  }
+}"##;
+const CREATE_PROJECT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "path"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Unique project name shown in the TUI tab bar"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Absolute directory of the repository or working tree; it must exist and sit inside a configured workspace root; with no workspace roots configured, a strict descendant of the daemon user's home directory (not the home directory itself, anything under ~/.rsi, or /)"
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048,
+      "default": null
+    },
+    "color": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "default": null,
+      "description": "Tab color as #rrggbb"
+    }
+  }
+}"##;
+const UPDATE_PROJECT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "project_id"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A project in your coverage: your own project (project manager) or a project of your grant (portfolio seat)"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "default": null
+    },
+    "path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 4096,
+      "default": null,
+      "description": "New absolute directory; refused while the project has a live session"
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048,
+      "default": null
+    },
+    "color": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "default": null
+    }
+  }
+}"##;
+const OPERATOR_TODO_UPSERT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "todo_key",
+    "title",
+    "how",
+    "idempotency_key"
+  ],
+  "properties": {
+    "todo_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable slug for this item in your scope (for example codex-login); send it again to update the same open item"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "What only the operator can do, in one line"
+    },
+    "how": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "The exact command or keys"
+    },
+    "link": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 512,
+      "default": null,
+      "description": "An Issue (issue:#N), a session (session:<uuid>) or a URL"
+    },
+    "priority": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 4,
+      "default": null,
+      "description": "1 is most urgent; 3 when omitted"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; a replay returns the same item"
+    }
+  }
+}"##;
+const STANDING_DIRECTIVE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action"
+  ],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "set",
+        "clear"
+      ],
+      "description": "set relays a directive to a scope below yours; clear ends one a manager relayed"
+    },
+    "scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "For set: the manager scope, project:<uuid>, area:<uuid> or portfolio:<uuid>, strictly below your own"
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048,
+      "default": null,
+      "description": "For set: the operator's instruction, verbatim"
+    },
+    "provenance": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 512,
+      "default": null,
+      "description": "For set: where and when the operator said it (required)"
+    },
+    "expires_in_secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 7776000,
+      "default": null,
+      "description": "For set: seconds until it expires; absent means until cleared"
+    },
+    "idempotency_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "default": null,
+      "description": "For set: replay key; a replay returns the same directive"
+    },
+    "directive_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "For clear: the directive to end"
+    }
+  }
+}"##;
+const OPERATOR_TODO_CLOSE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "evidence",
+    "idempotency_key"
+  ],
+  "properties": {
+    "todo_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "The item to close; set exactly one of todo_id and todo_key"
+    },
+    "todo_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "default": null,
+      "description": "The key of an item in your own scope"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "done",
+        "dismissed"
+      ]
+    },
+    "evidence": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "description": "What you observed (done) or why the item no longer applies (dismissed); recorded on the item"
+    },
+    "observed": {
+      "type": "boolean",
+      "default": false,
+      "description": "Must be true for done: you observed that the thing was done. You never mark an item done on the operator's behalf"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; a replay returns the same closed item"
+    }
+  }
+}"##;
+const GLOBAL_OVERVIEW_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}"##;
+const MANAGER_LAUNCH_ISSUE_WORKER_BASE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "issue",
+    "brief",
+    "launch",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The Issue's display number in your project"
+    },
+    "brief": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24576,
+      "description": "The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue"
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Provider; must be in your policy's allowed_launches"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 32,
+          "default": null
+        }
+      }
+    },
+    "parent_epic_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "The Epic to create the worker under; optional when your scope holds exactly one live Epic. With several, set it: a refusal manager_issue_worker_parent_required lists the candidate Epic ids"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; a replay returns the same worker"
+    }
+  }
+}"##;
 /// #1195: the base schema plus the shared `sandbox_source` property.
 static MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA: LazyLock<String> = LazyLock::new(|| {
     let mut schema: Value = serde_json::from_str(MANAGER_LAUNCH_ISSUE_WORKER_BASE_SCHEMA)
@@ -882,14 +2173,126 @@ static MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA: LazyLock<String> = LazyLock::new(|| {
         "default": null,
         "description": "#1590: display number of the implementer Issue this worker reviews. The daemon copies that Issue's text and its complete latest handoff (landing filters included) into the worker's brief; a bound reviewer cannot read it. Do not paste the handoff yourself."
     });
+    schema["properties"]["related"] = serde_json::json!({
+        "type": "array",
+        "items": {"type": "integer", "minimum": 1},
+        "maxItems": 16,
+        "uniqueItems": true,
+        "default": [],
+        "description": "#218: display numbers of same-project Issues whose COMPLETE text and latest handoff the daemon copies into the worker's brief as read-only context (a snapshot at launch; one too large for the brief is named, never cut, and the worker reads it with AgentGetIssue). The worker may also read each live. Writes, status changes and handoffs stay on `issue`. Not the bound Issue; an unknown number is refused manager_issue_worker_related_unavailable. A `#N` or `#A-#B` in `brief` (a range wider than 32 selects only its endpoints), in the Issue's body or in its handoffs is also readable (read-only) without listing it here; more than 64 distinct selectors in the brief are refused manager_issue_worker_references_overflow. A plain relaunch of the same Issue (no continue_from) also carries over the related Issues of its earlier launches (#275; result carried_related, and skipped_related for one that no longer exists or is archived)."
+    });
     schema["properties"]["qa_lane"] = serde_json::json!({
         "type": "boolean", "default": false,
         "description": "Explicit manager delegation of bounded QA shard jobs (5-90 minutes, two running per owner); default false, including continuation. Not inherited."
     });
     schema.to_string()
 });
-const GLOBAL_SEND_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id","message","idempotency_key"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your grant; the message goes to its current project manager"},"message":{"type":"string","minLength":1,"maxLength":32768,"description":"The full request or note for that project manager, with acceptance criteria"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
-const GLOBAL_APPOINT_MANAGER_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id","launch","query","idempotency_key"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your grant"},"launch":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","enum":["Claude","Codex","Pioneer","OpenRouter","Bedrock","Local","Antigravity","CodexAppServer","Harness","Gemini"],"description":"Provider; must be in your grant's allowed_launches"},"model":{"type":"string","minLength":1,"maxLength":128,"description":"Model; must be in your grant's allowed_launches"},"effort":{"type":["string","null"],"default":null,"description":"Effort; must match the allowlist entry when it names one"}},"description":"The new project manager's launch"},"query":{"type":"string","minLength":1,"maxLength":65536,"description":"The new project manager's self-contained first prompt"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, e.g. gm-<project>-<purpose>-<n>; a replay returns the same session"},"sandbox":{"type":["boolean","null"],"default":null,"description":"Launch in its own git worktree sandbox (default true)"}}}"#;
+const GLOBAL_SEND_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "project_id",
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A project in your grant; the message goes to its current project manager"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "description": "The full request or note for that project manager, with acceptance criteria"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; replay only identical content under it"
+    }
+  }
+}"##;
+const GLOBAL_APPOINT_MANAGER_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "project_id",
+    "launch",
+    "query",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A project in your grant"
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "Claude",
+            "Codex",
+            "Pioneer",
+            "OpenRouter",
+            "Bedrock",
+            "Local",
+            "Antigravity",
+            "CodexAppServer",
+            "Harness",
+            "Gemini"
+          ],
+          "description": "Provider; must be in your grant's allowed_launches"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Model; must be in your grant's allowed_launches"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Effort; must match the allowlist entry when it names one"
+        }
+      },
+      "description": "The new project manager's launch"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "description": "The new project manager's self-contained first prompt"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, e.g. gm-<project>-<purpose>-<n>; a replay returns the same session"
+    },
+    "sandbox": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null,
+      "description": "Launch in its own git worktree sandbox (default true)"
+    }
+  }
+}"##;
 /// #1239: `AgentManagerAppointChild`. The target is a covered project or a
 /// child portfolio node; it has no parent or adopt field (only the operator
 /// creates roots and re-parents).
@@ -924,10 +2327,10 @@ static MANAGER_APPOINT_CHILD_SCHEMA: LazyLock<String> = LazyLock::new(|| {
                         "required": ["kind"],
                         "properties": {
                             "kind": {"type": "string", "enum": ["portfolio"]},
-                            "node_id": uuid("null creates a child node; a child node you granted replaces its seat (then send no other target field but launch_project_id and expected_grant_version)"),
+                            "node_id": uuid("null creates a child node; a child node you granted replaces its seat; your own node id hands your own seat to the new session (then send no other target field but launch_project_id and expected_grant_version)"),
                             "tier_label": {"type": ["string", "null"], "minLength": 1, "maxLength": 32, "default": null, "description": "Display label of a new child (authority never reads it)"},
                             "project_ids": {"type": "array", "items": {"type": "string", "format": "uuid"}, "maxItems": 64, "default": [], "description": "A strict subset of your coverage, disjoint from your other children"},
-                            "allowed_launches": {"type": "array", "items": launch.clone(), "maxItems": 16, "default": [], "description": "Launches the child may make (default: yours); a subset of yours"},
+                            "allowed_launches": {"type": "array", "items": launch.clone(), "maxItems": crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES, "default": [], "description": "Launches the child may make (default: yours); a subset of yours"},
                             "policy": policy("The child's in-project policy (ManagerPolicyV2): capabilities within yours, every finite allowance strictly below yours"),
                             "child_policy": policy("The policy the child hands to the managers it appoints (within policy)"),
                             "max_direct_reports": {"type": ["integer", "null"], "minimum": 0, "maximum": 64, "default": null, "description": "At most yours (default: the smaller of 5 and yours)"},
@@ -940,73 +2343,2286 @@ static MANAGER_APPOINT_CHILD_SCHEMA: LazyLock<String> = LazyLock::new(|| {
             "launch": launch,
             "query": {"type": "string", "minLength": 1, "maxLength": 65536, "description": "The new seat's self-contained first prompt"},
             "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Replay key, scoped to your node; a replay returns the same session"},
-            "sandbox": {"type": ["boolean", "null"], "default": null, "description": "Launch in its own git worktree sandbox (default true)"}
+            "sandbox": {"type": ["boolean", "null"], "default": null, "description": "Launch in its own git worktree sandbox (default true)"},
+            "handoff": {"type": ["string", "null"], "minLength": 1, "maxLength": crate::portfolio_delegation::SEAT_HANDOFF_MAX_BYTES, "default": null, "description": "Seat replacement only: the repo path or commit of the handoff you wrote; recorded with the seat change"}
         }
     });
     schema.to_string()
 });
-const MANAGER_REVOKE_CHILD_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["node_id","expected_grant_version","idempotency_key"],"properties":{"node_id":{"type":"string","format":"uuid","description":"A child node your node granted"},"expected_grant_version":{"type":"integer","minimum":1,"description":"The child's current grant version (CAS)"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; a replay against the revoked child returns it"}}}"#;
-const REPORT_TO_GLOBAL_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","idempotency_key"],"properties":{"message":{"type":"string","minLength":1,"maxLength":32768,"description":"Your report to the global manager: landed work, a gate that blocks you, or your handoff path"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
-const REPORT_UP_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","idempotency_key"],"properties":{"message":{"type":"string","minLength":1,"maxLength":32768,"description":"Your report to the manager one level above you: landed work, a gate that blocks you, or your handoff path"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
-const SEND_DOWN_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["target","message","idempotency_key"],"properties":{"target":{"description":"The descendant manager node to message (a node below yours, inside your coverage)","oneOf":[{"type":"object","additionalProperties":false,"required":["kind","node_id"],"properties":{"kind":{"const":"portfolio"},"node_id":{"type":"string","format":"uuid"}}},{"type":"object","additionalProperties":false,"required":["kind","project_id"],"properties":{"kind":{"const":"project"},"project_id":{"type":"string","format":"uuid"}}},{"type":"object","additionalProperties":false,"required":["kind","node_id"],"properties":{"kind":{"const":"area"},"node_id":{"type":"string","format":"uuid"}}}]},"message":{"type":"string","minLength":1,"maxLength":32768,"description":"The full request or note for that manager, with acceptance criteria"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; replay only identical content under it"}}}"#;
-const GET_DAEMON_INFO_SCHEMA: &str =
-    r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
-const GET_PROVIDER_STATUS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"provider":{"type":["string","null"],"enum":["claude","codex","pioneer","openrouter","bedrock","local","antigravity","codex_app_server","harness","anthropic","openai",null],"default":null,"description":"Provider to report; omit for every provider"}}}"#;
-const TARGET_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Target session UUID; omit to target this session"}}}"#;
-const WAKE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","mode"],"properties":{"message":{"type":"string","description":"Prompt to run when the wake fires"},"in_seconds":{"type":["integer","null"],"minimum":1,"default":null,"description":"Fire this many seconds from now; mutually exclusive with at"},"at":{"type":["string","null"],"format":"date-time","default":null,"description":"RFC3339 absolute fire time; mutually exclusive with in_seconds"},"name":{"type":["string","null"],"default":null,"description":"Optional human-readable job name"},"every_seconds":{"type":["integer","null"],"minimum":1,"default":null,"description":"Optional recurring interval in seconds"},"mode":{"type":"string","enum":["fresh","resume","on_terminal","program_guard","when"],"description":"Required: fresh is a consumed, best-effort root launch after this session is terminal and transfers no hierarchy or lead authority; use AgentReserveSuccessor for master turnover. resume re-invokes this session with context; on_terminal arms a terminal watch; program_guard registers daemon-authoritative program identity; when arms ONE resume wake that the daemon fires when the `when` predicate is true (no model turn is spent polling) and carries each job's id, name, state, exit code and refusal"},"watch_session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Watched subject UUID; requires mode on_terminal and cannot steer the caller-bound wake target"},"when":{"type":["object","null"],"default":null,"additionalProperties":false,"description":"Required with mode when (and only then): exactly one predicate the daemon evaluates. jobs_terminal fires once every listed AgentSubmitJob job you own is terminal (submit them with wake none for one wake per batch); sha_on_rolling fires once that commit is an ancestor of origin/rolling in your repository (polled). in_seconds, at and every_seconds are not accepted with mode when","properties":{"jobs_terminal":{"type":"array","items":{"type":"string","format":"uuid"},"minItems":1,"maxItems":32,"description":"Job ids you own; an unknown or foreign id is refused at scheduling time"},"sha_on_rolling":{"type":"string","pattern":"^[0-9a-f]{40}$","description":"Full lowercase 40-hex commit id"}}},"timeout_seconds":{"type":["integer","null"],"minimum":1,"maximum":604800,"default":null,"description":"mode when only: fire with timed_out true after this many seconds if the predicate is still pending, so you are never stranded"}}}"#;
-const CANCEL_WAKE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"job_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Job id returned by AgentScheduleWake; must be one of your own jobs. Provide exactly one of job_id or name"},"name":{"type":["string","null"],"minLength":1,"maxLength":256,"default":null,"description":"Name of your own scheduled job(s) to disable. Provide exactly one of job_id or name"}}}"#;
-const LIST_WAKES_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"include_disabled":{"type":"boolean","default":false,"description":"Also return disabled (cancelled, fired or suspended) jobs"},"limit":{"type":["integer","null"],"minimum":1,"maximum":256,"default":64,"description":"Maximum jobs returned, soonest fire first"}}}"#;
-const CREATE_ISSUE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["title","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"title":{"type":"string","minLength":1,"maxLength":512},"body":{"type":"string","maxLength":65536,"default":""},"priority":{"type":["integer","null"],"minimum":1,"maximum":4,"default":null},"labels":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128},"default":[]},"assignee":{"type":["string","null"],"maxLength":256,"default":null},"idempotency_key":{"type":"string","minLength":1,"maxLength":128},"harness":{"type":"boolean","default":false,"description":"File in the RSI harness project instead of your own: use for a defect in RSI itself found while working in another project. Cannot combine with project_id"},"source_issue":{"type":["integer","null"],"minimum":1,"default":null,"description":"With harness: display number of the Issue in your own project this one mirrors"}}}"#;
-const LIST_ISSUES_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"status":{"type":["string","null"],"enum":["Open","InProgress","Closed","Cancelled",null],"default":null},"archive":{"type":"string","enum":["Active","Archived","All"],"default":"Active"},"cursor":{"type":["object","null"],"additionalProperties":false,"required":["display_number","issue_id"],"properties":{"display_number":{"type":"integer","minimum":1},"issue_id":{"type":"string","format":"uuid"}},"default":null},"limit":{"type":["integer","null"],"minimum":1,"maximum":256,"default":64},"ready":{"type":"boolean","default":false,"description":"When true, include only open, active Issues with no open or in-progress blockers"},"order":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Sort by display number; desc lists newest first. The cursor works in both orders"},"title_contains":{"type":["string","null"],"minLength":1,"maxLength":128,"default":null,"description":"Case-insensitive substring filter over Issue titles"}}}"#;
-const GET_ISSUE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Issue UUID; set exactly one of issue_id and display_number"},"display_number":{"type":["integer","null"],"minimum":1,"default":null,"description":"Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"}}}"#;
-const UPDATE_ISSUE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["expected_row_version","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Issue UUID; set exactly one of issue_id and display_number"},"display_number":{"type":["integer","null"],"minimum":1,"default":null,"description":"Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128},"title":{"type":["string","null"],"maxLength":512,"default":null},"body":{"type":["string","null"],"maxLength":65536,"default":null},"labels":{"type":["array","null"],"maxItems":64,"items":{"type":"string","maxLength":128},"default":null},"priority":{"type":["integer","null"],"minimum":1,"maximum":4,"default":null},"clear_priority":{"type":"boolean","default":false},"assignee":{"type":["string","null"],"maxLength":256,"default":null},"clear_assignee":{"type":"boolean","default":false}}}"#;
-const UPDATE_ISSUE_STATUS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["status","expected_row_version","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Issue UUID; set exactly one of issue_id and display_number"},"display_number":{"type":["integer","null"],"minimum":1,"default":null,"description":"Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"},"status":{"type":"string","enum":["Open","InProgress","Closed","Cancelled"]},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}}}"#;
-const ISSUE_CAS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["issue_id","expected_row_version","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue_id":{"type":"string","format":"uuid"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}}}"#;
-const LIST_ISSUE_EVENTS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["issue_id"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue_id":{"type":"string","format":"uuid"},"after_sequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":["integer","null"],"minimum":1,"maximum":256,"default":64}}}"#;
+const MANAGER_REVOKE_CHILD_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_id",
+    "expected_grant_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "A child node your node granted"
+    },
+    "expected_grant_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The child's current grant version (CAS)"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; a replay against the revoked child returns it"
+    }
+  }
+}"##;
+const REPORT_TO_GLOBAL_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "description": "Your report to the global manager: landed work, a gate that blocks you, or your handoff path"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; replay only identical content under it"
+    }
+  }
+}"##;
+const REPORT_UP_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "description": "Your report to the manager one level above you: landed work, a gate that blocks you, or your handoff path"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; replay only identical content under it"
+    }
+  }
+}"##;
+const SEND_DOWN_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "target",
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "target": {
+      "description": "The descendant manager node to message (a node below yours, inside your coverage)",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "node_id"
+          ],
+          "properties": {
+            "kind": {
+              "const": "portfolio"
+            },
+            "node_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "project_id"
+          ],
+          "properties": {
+            "kind": {
+              "const": "project"
+            },
+            "project_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "node_id"
+          ],
+          "properties": {
+            "kind": {
+              "const": "area"
+            },
+            "node_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      ]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "description": "The full request or note for that manager, with acceptance criteria"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key; replay only identical content under it"
+    }
+  }
+}"##;
+const GET_DAEMON_INFO_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}"##;
+const GET_PROVIDER_STATUS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "claude",
+        "codex",
+        "pioneer",
+        "openrouter",
+        "bedrock",
+        "local",
+        "antigravity",
+        "codex_app_server",
+        "harness",
+        "anthropic",
+        "openai",
+        null
+      ],
+      "default": null,
+      "description": "Provider to report; omit for every provider"
+    }
+  }
+}"##;
+const STATUS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F-]{8,36}$",
+      "default": null,
+      "description": "Target session UUID, or a unique prefix of at least 8 hex characters inside your scope; omit to target this session"
+    }
+  }
+}"##;
+const TARGET_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Target session UUID; omit to target this session"
+    }
+  }
+}"##;
+const WAKE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message",
+    "mode"
+  ],
+  "properties": {
+    "message": {
+      "type": "string",
+      "description": "Prompt to run when the wake fires"
+    },
+    "in_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Fire this many seconds from now; mutually exclusive with at"
+    },
+    "at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "default": null,
+      "description": "RFC3339 absolute fire time; mutually exclusive with in_seconds"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional human-readable job name"
+    },
+    "every_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Optional recurring interval in seconds"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "resume",
+        "on_terminal",
+        "program_guard",
+        "when"
+      ],
+      "description": "Required: fresh is a consumed, best-effort root launch after this session is terminal and transfers no hierarchy or lead authority; use AgentReserveSuccessor for master turnover. resume re-invokes this session with context; on_terminal arms a terminal watch; program_guard registers daemon-authoritative program identity; when arms ONE resume wake that the daemon fires when the `when` predicate is true (no model turn is spent polling) and carries each job's id, name, state, exit code and refusal"
+    },
+    "watch_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Watched subject UUID; requires mode on_terminal and cannot steer the caller-bound wake target"
+    },
+    "when": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "default": null,
+      "additionalProperties": false,
+      "description": "Required with mode when (and only then): exactly one predicate the daemon evaluates. jobs_terminal fires once every listed AgentSubmitJob job you own is terminal (submit them with wake none for one wake per batch); sha_on_rolling fires once that commit is an ancestor of origin/rolling in your repository (polled). issue_closed fires once that Issue is Closed (the manager closes an Issue when its work is on rolling), so you can wait on a dependency without its SHA; a Cancelled or missing Issue wakes you as unsatisfiable. todo_closed fires once that operator to-do item (in your own manager scope) is done or dismissed and carries its status and evidence, so you wait on the operator without polling; an unknown or out-of-scope item is refused at scheduling time. topology_execution_settled fires once when that topology execution (one you requested, or one under an Epic you manage or lead) is succeeded, failed, cancelled or blocked, and carries its status, error, blocked-reason summary (kind, node_id, attempt_id) and finish time; an owner keeps exactly one enabled settle wake per execution: arming another for the same execution, under any name, replaces the earlier one (reported in replaced_job_ids); a blocked execution that is later resolved needs a new wake, and an unknown or out-of-scope id is refused at scheduling time. settlement_run_settled fires once when that source-worktree settlement run (the run_id AgentApplySourceWorktreeCohort returned while the run was still applying) is finished, every root settled, refused, recovery_required or unattempted, and carries the run state, per-phase counts and terminal error; an unknown run or one outside your cohort authority is refused at scheduling time. health_anomaly (manager seats only; a project manager watches its project, a portfolio seat every project) is the replacement for an hourly check-in turn: the daemon evaluates the PM slots, context fill against the rotation threshold, blocked or overrun topology work, hub disk and CPU temperature, satellite disk, provider faults and an untracked red rolling QA every minute with no model call and resumes you once with a condition=<kind> subject=<id> ignore_key=<kind>:<subject> detail=\"...\" line per anomaly, so a quiet daemon costs you no turn; re-arm after handling, and list a persisting condition's printed ignore_key value, verbatim, in ignore. in_seconds, at and every_seconds are not accepted with mode when",
+      "properties": {
+        "jobs_terminal": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "description": "Job ids you own; an unknown or foreign id is refused at scheduling time"
+        },
+        "sha_on_rolling": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Full lowercase 40-hex commit id"
+        },
+        "issue_closed": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Display number (the N in #N) of an Issue in your project"
+        },
+        "todo_closed": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Id of an operator to-do item in your own manager scope; an unknown or out-of-scope id is refused at scheduling time"
+        },
+        "topology_execution_settled": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Id of a topology execution you requested or can read through its Epic; an unknown or out-of-scope id is refused at scheduling time"
+        },
+        "settlement_run_settled": {
+          "type": "string",
+          "format": "uuid",
+          "description": "run_id of a source-worktree settlement run (from AgentApplySourceWorktreeCohort) you hold cohort authority over; an unknown or out-of-authority id is refused at scheduling time"
+        },
+        "health_anomaly": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Manager seats only (wake_when_health_anomaly_manager_only otherwise). {} watches everything your seat covers; the daemon sets the scope.",
+          "properties": {
+            "ignore": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "keys (the ignore_key= value, verbatim, as the previous wake printed it) you accept and do not want to be woken for again"
+            }
+          }
+        }
+      }
+    },
+    "timeout_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 604800,
+      "default": null,
+      "description": "mode when only: fire with timed_out true after this many seconds if the predicate is still pending, so you are never stranded"
+    }
+  }
+}"##;
+const CANCEL_WAKE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "job_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Job id returned by AgentScheduleWake; must be one of your own jobs. Provide exactly one of job_id or name"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 256,
+      "default": null,
+      "description": "Name of your own scheduled job(s) to disable. Provide exactly one of job_id or name"
+    }
+  }
+}"##;
+const LIST_WAKES_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "include_disabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also return disabled (cancelled, fired or suspended) jobs"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 256,
+      "default": 64,
+      "description": "Maximum jobs returned, soonest fire first"
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Read this live worker's wakes instead of your own. It must be a worker AgentWorkerRoster lists for your current scope (your own launches and the node sessions of topology executions you requested, or your project as its appointed manager, including its topology executions' node sessions, or a project inside a portfolio seat's grant); any other session is refused list_wakes_target_not_authorized. Read-only."
+    }
+  }
+}"##;
+const CREATE_ISSUE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 65536,
+      "default": ""
+    },
+    "priority": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 4,
+      "default": null
+    },
+    "labels": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "maxLength": 128
+      },
+      "default": []
+    },
+    "assignee": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256,
+      "default": null
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "harness": {
+      "type": "boolean",
+      "default": false,
+      "description": "File in the RSI harness project instead of your own: use for a defect in RSI itself found while working in another project. Cannot combine with project_id"
+    },
+    "source_issue": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "With harness: display number of the Issue in your own project this one mirrors"
+    }
+  }
+}"##;
+const LIST_ISSUES_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "labels": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "default": [],
+      "description": "Require all supplied labels (exact, case-sensitive)"
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "Open",
+        "InProgress",
+        "Closed",
+        "Cancelled",
+        null
+      ],
+      "default": null
+    },
+    "archive": {
+      "type": "string",
+      "enum": [
+        "Active",
+        "Archived",
+        "All"
+      ],
+      "default": "Active"
+    },
+    "cursor": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "display_number",
+        "issue_id"
+      ],
+      "properties": {
+        "display_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "issue_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "default": null
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 256,
+      "default": 64
+    },
+    "ready": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, include only open, active Issues with no open or in-progress blockers"
+    },
+    "order": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ],
+      "default": "asc",
+      "description": "Sort by display number; desc lists newest first. The cursor works in both orders"
+    },
+    "title_contains": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "default": null,
+      "description": "Case-insensitive substring filter over Issue titles; required for bound workers"
+    },
+    "fields": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "summary",
+        "full",
+        null
+      ],
+      "default": null,
+      "description": "summary: display_number, id, title, status, labels, priority, created_at, updated_at (no body). full: whole records. Default: summary when title_contains is set, else full. Fetch one body with AgentGetIssue"
+    }
+  }
+}"##;
+const GET_ISSUE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Issue UUID; set exactly one of issue_id and display_number"
+    },
+    "display_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"
+    }
+  }
+}"##;
+const UPDATE_ISSUE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "expected_row_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Issue UUID; set exactly one of issue_id and display_number"
+    },
+    "display_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"
+    },
+    "expected_row_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "include_issue": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include the full Issue snapshot in the mutation receipt"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 512,
+      "default": null
+    },
+    "body": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 65536,
+      "default": null
+    },
+    "labels": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "maxLength": 128
+      },
+      "default": null
+    },
+    "priority": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 4,
+      "default": null
+    },
+    "clear_priority": {
+      "type": "boolean",
+      "default": false
+    },
+    "assignee": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256,
+      "default": null
+    },
+    "clear_assignee": {
+      "type": "boolean",
+      "default": false
+    },
+    "handoff": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 65536,
+      "default": null,
+      "description": "Issue-bound worker only: your complete handoff as its own append-only record (up to 65536 bytes), published even when the body is at its ceiling; set no other field. expected_row_version is not checked. AgentGetIssue returns the newest records in full as handoffs."
+    }
+  }
+}"##;
+const UPDATE_ISSUE_STATUS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "expected_row_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Issue UUID; set exactly one of issue_id and display_number"
+    },
+    "display_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Project-scoped display number (the N in #N); set exactly one of issue_id and display_number"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "Open",
+        "InProgress",
+        "Closed",
+        "Cancelled"
+      ]
+    },
+    "expected_row_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "include_issue": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include the full Issue snapshot in the mutation receipt"
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 2048,
+      "default": null,
+      "description": "Optional why: covered-by SHA, duplicate of #N, moot, landed SHA, or a reopen reason. Recorded on the status-change Issue event; AgentGetIssue returns it as status_note and AgentListIssueEvents as request.note"
+    }
+  }
+}"##;
+const ISSUE_CAS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "issue_id",
+    "expected_row_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "expected_row_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}"##;
+const LIST_ISSUE_EVENTS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "issue_id"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "issue_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "after_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 256,
+      "default": 64
+    }
+  }
+}"##;
 
-const CONTINUE_CHILD_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["target_session_id","query","expected_tip_session_id","expected_event_sequence"],"properties":{"target_session_id":{"type":"string","format":"uuid","description":"The child session to continue; the caller itself is refused"},"query":{"type":"string","minLength":1,"maxLength":262144,"description":"Continuation prompt delivered as the child's next turn"},"expected_tip_session_id":{"type":"string","format":"uuid","description":"Required staleness fence: the lineage tip the caller last observed"},"expected_event_sequence":{"type":"integer","minimum":0,"description":"Required staleness fence: MAX(sequence) of the tip's conversation events as last observed"},"expected_custody_generation":{"type":["integer","null"],"minimum":1,"default":null,"description":"Optional staleness fence: the sandbox custody generation as last observed; must match exactly including absence"}}}"#;
-const ARCHIVE_CHILD_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["target_session_id","expected_tip_session_id","expected_event_sequence"],"properties":{"target_session_id":{"type":"string","format":"uuid","description":"Terminal child to archive; current Epic lead only"},"expected_tip_session_id":{"type":"string","format":"uuid","description":"Required staleness fence: last observed lineage tip"},"expected_event_sequence":{"type":"integer","minimum":0,"description":"Required staleness fence: last observed tip event sequence"},"expected_custody_generation":{"type":["integer","null"],"minimum":1,"default":null,"description":"Optional staleness fence: last observed sandbox custody generation"}}}"#;
+const CONTINUE_CHILD_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "x-exactly-one-of": [
+    [
+      "session_id",
+      "target_session_id"
+    ]
+  ],
+  "required": [
+    "query",
+    "expected_tip_session_id",
+    "expected_event_sequence"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The child session to continue; the caller itself is refused"
+    },
+    "target_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "deprecated": true,
+      "description": "Deprecated alias of session_id, accepted for one release (#2313); send session_id"
+    },
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 262144,
+      "description": "Continuation prompt delivered as the child's next turn"
+    },
+    "expected_tip_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Required staleness fence: the lineage tip the caller last observed"
+    },
+    "expected_event_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required staleness fence: MAX(sequence) of the tip's conversation events as last observed"
+    },
+    "expected_custody_generation": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Optional staleness fence: the sandbox custody generation as last observed; must match exactly including absence"
+    }
+  }
+}"##;
+const ARCHIVE_CHILD_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "x-exactly-one-of": [
+    [
+      "session_id",
+      "target_session_id"
+    ]
+  ],
+  "required": [
+    "expected_tip_session_id",
+    "expected_event_sequence"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Terminal child to archive; current Epic lead only"
+    },
+    "target_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "deprecated": true,
+      "description": "Deprecated alias of session_id, accepted for one release (#2313); send session_id"
+    },
+    "expected_tip_session_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Required staleness fence: last observed lineage tip"
+    },
+    "expected_event_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Required staleness fence: last observed tip event sequence"
+    },
+    "expected_custody_generation": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Optional staleness fence: last observed sandbox custody generation"
+    }
+  }
+}"##;
 
-const MANAGER_PROGRESS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"after_epic_id":{"type":["string","null"],"format":"uuid","description":"Continue after next_after_epic_id from the previous page."},"limit":{"type":["integer","null"],"minimum":1,"maximum":64,"default":32}}}"#;
-const MANAGER_INBOX_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"after_notice_sequence":{"type":"integer","minimum":0,"default":0},"notice_kind":{"type":["string","null"],"enum":["session_state","message","action_result","operator_answer","ledger_change",null],"default":null},"settle_notice_ids":{"type":"array","items":{"type":"string","format":"uuid"},"maxItems":32,"default":[]},"after_sequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":32,"default":32},"request_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Optional recorded request to read within your live manager or feature-lead scope"}}}"#;
-const MANAGER_SEND_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["epic_id","message","idempotency_key"],"properties":{"epic_id":{"type":"string","format":"uuid","description":"An Epic in your operator-appointed manager scope; the daemon resolves its current lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Nonblank request, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"},"informational":{"type":"boolean","default":false,"description":"Deliver auditable information without reserving a pending request slot or requiring a reply"}}}"#;
-const MANAGER_REPLY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["request_id","message","idempotency_key"],"properties":{"request_id":{"type":"string","format":"uuid","description":"Recorded request addressed to the Epic you currently lead"},"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Explicit reply with evidence or a blocker, at most 8192 UTF-8 bytes, without NUL"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"},"still_running":{"type":"boolean","default":false,"description":"Keep the request active after this reply; omit or false to settle it"}}}"#;
-const MANAGER_NOTIFY_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["message","idempotency_key"],"properties":{"message":{"type":"string","minLength":1,"maxLength":8192,"description":"Nonblank informational notice to your current appointed manager, at most 8192 UTF-8 bytes, without NUL; not a request, approval or acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
+const MANAGER_PROGRESS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fields": {"type":"string", "enum":["compact","full"], "default":"compact", "description":"compact bounds titles and latest response excerpts; full restores detailed rows. Fences and paging are unchanged."},
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "after_epic_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "description": "Continue after next_after_epic_id from the previous page."
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 64,
+      "default": 32
+    }
+  }
+}"##;
+const MANAGER_INBOX_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "include_sent": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include the manager seat's outbound sends for audits. Routine reads return incoming mail; request_id or fields:\"full\" also includes sent mail. notice_kind filters still apply."
+    },
+    "after_notice_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "notice_kind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "session_state",
+        "message",
+        "action_result",
+        "operator_answer",
+        "ledger_change",
+        null
+      ],
+      "default": null,
+      "description": "Filter notices by kind. Messages are returned only when omitted/null or set to message, including audit reads."
+    },
+    "settle_notice_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "maxItems": 32,
+      "default": []
+    },
+    "read_notice_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "maxItems": 32,
+      "default": [],
+      "description": "Re-read these exact notices of your seat by id, settled or not, in the fields form chosen. A summary drain settles a notice but keeps its full payload: pass its notice_id here with fields:\"full\" to expand it. Read-only: settles nothing, drains no other notice and moves no cursor; an unknown, retired or foreign id refuses the call."
+    },
+    "fields": {
+      "type": "string",
+      "enum": [
+        "compact",
+        "full",
+        "summary"
+      ],
+      "default": "compact",
+      "description": "compact (default) omits repeated historical work_versions and carries work_versions_count; full restores the complete state payload and includes outbound manager sends. summary drops the state payload and returns a short state_summary string instead (a ledger_change's payload state and reason; an action_result's action_kind, state and outcome; otherwise the record_kind). Returned notices settle in every form. Use summary to drain a routine backlog."
+    },
+    "after_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 32,
+      "default": 32
+    },
+    "request_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Optional recorded request to read within your live manager or feature-lead scope"
+    }
+  }
+}"##;
+const MANAGER_SEND_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "epic_id",
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "epic_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "An Epic in your operator-appointed manager scope; the daemon resolves its current lead"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "Nonblank request, at most 8192 UTF-8 bytes, without NUL"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"
+    },
+    "informational": {
+      "type": "boolean",
+      "default": false,
+      "description": "Deliver auditable information without reserving a pending request slot or requiring a reply"
+    }
+  }
+}"##;
+const MANAGER_REPLY_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Recorded request addressed to the Epic you currently lead"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "Explicit reply with evidence or a blocker, at most 8192 UTF-8 bytes, without NUL"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"
+    },
+    "still_running": {
+      "type": "boolean",
+      "default": false,
+      "description": "Keep the request active after this reply; omit or false to settle it"
+    }
+  }
+}"##;
+const MANAGER_NOTIFY_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "Nonblank informational notice to your current appointed manager, at most 8192 UTF-8 bytes, without NUL; not a request, approval or acceptance"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"
+    }
+  }
+}"##;
 
-const MANAGER_WORK_VIEW_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"work_key":{"type":["string","null"],"minLength":1,"maxLength":256,"default":null,"description":"Optional exact work key in your Epic"},"after_work_key":{"type":["string","null"],"minLength":1,"maxLength":256,"default":null,"description":"Continue after next_after_work_key from the previous page"},"limit":{"type":"integer","minimum":1,"maximum":32,"default":32}}}"#;
-const MANAGER_DELEGATE_NODE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["expected_node_grant_version","expected_parent_authority_epoch","expected_parent_grant_version","expected_parent_policy_version","grant","idempotency_key","node_id","parent_node_id","policy","seat_root_session_id","selector"],"properties":{"node_id":{"type":["string","null"],"format":"uuid"},"parent_node_id":{"type":"string","format":"uuid"},"seat_root_session_id":{"type":"string","format":"uuid"},"selector":{"type":"object"},"grant":{"type":"object"},"policy":{"type":"object"},"expected_parent_grant_version":{"type":"integer","minimum":1},"expected_parent_policy_version":{"type":"integer","minimum":0},"expected_parent_authority_epoch":{"type":"integer","minimum":1},"expected_node_grant_version":{"type":"integer","minimum":0},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}}}"#;
-const MANAGER_ESCALATE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["expected_source_authority_epoch","expected_source_grant_version","expected_target_authority_epoch","expected_target_grant_version","expected_target_session_id","idempotency_key","reason","route","subject_id"],"properties":{"subject_id":{"type":"string","format":"uuid"},"reason":{"type":"string","minLength":1,"maxLength":8192},"route":{"type":"object"},"expected_source_authority_epoch":{"type":"integer","minimum":1},"expected_source_grant_version":{"type":"integer","minimum":1},"expected_target_authority_epoch":{"type":"integer","minimum":1},"expected_target_grant_version":{"type":"integer","minimum":1},"expected_target_session_id":{"type":"string","format":"uuid"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}}}"#;
-const MANAGER_LIST_ESCALATIONS_SCHEMA: &str =
-    r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
-const MANAGER_RESOLVE_ESCALATION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["escalation_id","expected_target_authority_epoch","expected_target_grant_version","expected_target_session_id","expected_version","idempotency_key","ruling"],"properties":{"escalation_id":{"type":"string","format":"uuid"},"expected_version":{"type":"integer","minimum":1},"expected_target_authority_epoch":{"type":"integer","minimum":1},"expected_target_grant_version":{"type":"integer","minimum":1},"expected_target_session_id":{"type":"string","format":"uuid"},"ruling":{"type":["string","null"],"maxLength":8192},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}}}"#;
+const MANAGER_WORK_VIEW_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "work_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 256,
+      "default": null,
+      "description": "Optional exact work key in your Epic"
+    },
+    "after_work_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 256,
+      "default": null,
+      "description": "Continue after next_after_work_key from the previous page"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 32,
+      "default": 32
+    }
+  }
+}"##;
+const MANAGER_DELEGATE_NODE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "expected_node_grant_version",
+    "expected_parent_authority_epoch",
+    "expected_parent_grant_version",
+    "expected_parent_policy_version",
+    "grant",
+    "idempotency_key",
+    "node_id",
+    "parent_node_id",
+    "policy",
+    "seat_root_session_id",
+    "selector"
+  ],
+  "properties": {
+    "node_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "parent_node_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seat_root_session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "selector": {
+      "type": "object"
+    },
+    "grant": {
+      "type": "object"
+    },
+    "policy": {
+      "type": "object"
+    },
+    "expected_parent_grant_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_parent_policy_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_parent_authority_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_node_grant_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}"##;
+const MANAGER_ESCALATE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "expected_source_authority_epoch",
+    "expected_source_grant_version",
+    "expected_target_authority_epoch",
+    "expected_target_grant_version",
+    "expected_target_session_id",
+    "idempotency_key",
+    "reason",
+    "route",
+    "subject_id"
+  ],
+  "properties": {
+    "subject_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "route": {
+      "type": "object"
+    },
+    "expected_source_authority_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_source_grant_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_authority_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_grant_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}"##;
+const MANAGER_LIST_ESCALATIONS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}"##;
+const MANAGER_RESOLVE_ESCALATION_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "escalation_id",
+    "expected_target_authority_epoch",
+    "expected_target_grant_version",
+    "expected_target_session_id",
+    "expected_version",
+    "idempotency_key",
+    "ruling"
+  ],
+  "properties": {
+    "escalation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "expected_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_authority_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_grant_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expected_target_session_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ruling": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 8192
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}"##;
 
-const GET_AUTHORITY_CATALOG_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"verb":{"type":["string","null"],"default":null,"description":"Optional control name: an Agent* method, a native rsi_control_* tool, or its mcp__rsi-agent__ spelling. With verb the response is compact: just that control's detail (whether you may call it, parameter schema, one minimal valid example request, and its stable refusal codes with next steps); omit verb for the full manual."}}}"#;
+const GET_AUTHORITY_CATALOG_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "verb": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null,
+      "description": "Optional control name: an Agent* method, a native rsi_control_* tool, or its mcp__rsi-agent__ spelling. With verb the response is compact: just that control's detail (whether you may call it, parameter schema, one minimal valid example request, and its stable refusal codes with next steps); omit verb for the whole manual."
+    },
+    "fields": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "summary",
+        "full",
+        null
+      ],
+      "default": null,
+      "description": "Whole-manual detail (ignored with verb). summary (default): roles, guidance and every permitted control by name with a one-line description, small enough to read inline. full: each control's complete description (tooling; roughly 40 KB larger for a manager). Schemas, examples and refusals are only ever behind verb."
+    }
+  }
+}"##;
 
-const SUBMIT_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","params"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"sandbox_session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"landing and cloud_gate only: run in this terminal, in-reach session's sandbox"},"kind":{"type":"string","enum":["test","build","landing","cloud_gate","cloud_sweep"]},"params":{"type":"object","description":"test: {recipe: declared name in the worktree .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration} or {scoped_test:{base,head?}: run scripts/scoped-test --base <ref> [--head <ref>] in your sandbox (bare branch, origin/<branch> or 40-hex refs only, no other arguments; submit with wake none, arm ONE AgentScheduleWake mode when, end your turn; result.exit_code and the job log_path are set, result.receipt is the scoped-test receipt {ok,exit_code,base,head,filters,log_dir,packages[{package,status,completed}]}, refusal scoped_test_receipt_missing when none was printed)} or {shard,filterset?} or {package,filters[],lib_only?,exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test)} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every test job also takes timeout_minutes? (5-180; default the operator job_test_timeout_mins, 20; above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two running QA lanes per owner; QA never supports recipe, scoped_test, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build,package|workspace,all_targets?,release?}; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."},"name":{"type":"string","minLength":1,"maxLength":80},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Optional replay key"},"worktree":{"type":"string","description":"Appointed manager only: another worktree of your own repository to run in; default is your sandbox"},"wake":{"type":["string","null"],"enum":["owner","none",null],"default":"owner","description":"owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"}}}"#;
+const SUBMIT_JOB_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "x-at-most-one-of": [
+    [
+      "source_session_id",
+      "sandbox_session_id"
+    ]
+  ],
+  "required": [
+    "kind",
+    "params"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "source_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "landing and cloud_gate only: run in this terminal, in-reach session's sandbox"
+    },
+    "sandbox_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "deprecated": true,
+      "description": "Deprecated alias of source_session_id, accepted for one release (#2313); send source_session_id"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "test",
+        "build",
+        "landing",
+        "cloud_gate",
+        "cloud_sweep"
+      ]
+    },
+    "params": {
+      "type": "object",
+      "description": "test: {recipe: declared name in the worktree .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration; scoped-test/scoped-test-tmpfs names and targets are retired (job_recipe_use_scoped_test); use scoped_test instead} or {scoped_test:{base,head?}: run the rolling-tip scripts/scoped-test --base <ref> [--head <ref>] in your sandbox (candidate tool changes run their own copy; receipt.tool names path, blob, source and rev; bare branch, origin/<branch> or 40-hex refs only, no other arguments; submit with wake none, arm ONE AgentScheduleWake mode when, end your turn; result.exit_code and the job log_path are set, result.receipt is the scoped-test receipt {ok,exit_code,base,head,filters,log_dir,packages[{package,status,completed}]}, refusal scoped_test_receipt_missing when none was printed)} or {shard,filterset?: one or more nextest atoms test(NAME), test(=NAME) or test(/REGEX/) joined by ` | `, at most 32 atoms and 1024 bytes} or {package,filters[],lib_only?,test_target?:integration test name (ASCII letters, digits, underscore or hyphen; no leading hyphen, path or shell syntax; passes cargo --test <name>; requires exact:true and nonempty filters; mutually exclusive with lib_only),exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test; with filters, a run whose whole log proves libtest executed no test, 0 passed and 0 failed in every test binary, settles failed refusal job_filter_matched_no_tests with exit_code 0 kept, so a mistyped name is never green; log evidence you cannot read, such as a custom harness, keeps the ordinary result; optional early feedback for a new runtime or schema assertion, never acceptance: only the committed scoped_test is)} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every package, shard or scoped_test job (not recipe or candidate_receipt) and every build job also takes cpu_quota_percent? (100-1600, percent of one CPU; omitted keeps the daemon-derived budget; the daemon applies the smaller of it and its own ceiling, so a request only lowers the operator/hub budget, before the unit starts: the unit CPUQuota, a scoped_test --cpu-quota, and the build and test thread counts, a scoped_test receipt records the effective cpu_quota); every test job also takes timeout_minutes? (5-180; default the operator job_test_timeout_mins, 20, except a scoped_test job whose default is 60 or job_test_timeout_mins if larger (its tool budgets each package up to the timeout minus 2 minutes, total minus 1; the stamped params and the receipt's job_timeout_minutes show the effective timeout); above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two outstanding QA lanes per owner (queued or running); QA never supports recipe, scoped_test, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build, one of package:<workspace-member-name> or workspace:true, all_targets?,release?,cpu_quota_percent?,sha?:40-lowercase-hex (pins the commit the build compiles; refused job_source_sha_mismatch when the job worktree HEAD differs at submit)} (hub #2954: every build job compiles exactly one commit; the daemon records the job worktree HEAD and whether it has uncommitted changes at submit and rechecks at start, while it runs (slot grant included) and at finish; a moved HEAD, or a clean tree that became dirty, stops the unit and settles it failed refusal job_source_moved naming both SHAs; result.source_head and result.source_dirty carry the HEAD and dirtiness observed at the end so a deploy can compare them with the SHA it installs; a dirty tree at submit is built as is and only a HEAD move fails it) or {command:test_no_run (#2692), package, no_default_features?, then either features?:[test-shard-NAME,...] (one build of the lib test harness, cargo test --lib --no-run) or shards?:[NAME,...] (a shard-feature sweep: each shard built with --no-default-features --features test-shard-NAME one after another, the package cleaned after each so the target holds one harness at a time; at most 32); runs in rsi-build.slice under the hub CPU budget; result.receipt is the SHARD_SWEEP_RECEIPT {ok,package,shards[{shard,features,exit_code,warnings{package:count},warning_keys},...],warnings:<warning-baseline gate verdict>}, settled failed when any shard build fails or the baseline gate reports new_warnings; this is the way to verify shard features, never a self-launched cargo unit}; package names are checked against cargo metadata at submission and unknown names are refused as invalid_input field=params.package; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Optional replay key"
+    },
+    "worktree": {
+      "type": "string",
+      "description": "Appointed manager only: another worktree of your own repository to run in; default is your sandbox"
+    },
+    "wake": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "owner",
+        "none",
+        null
+      ],
+      "default": "owner",
+      "description": "owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"
+    }
+  }
+}"##;
 
-const GET_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["job_id"],"properties":{"job_id":{"type":"string","format":"uuid"}}}"#;
+static SUBMIT_JOB_DETAILED_SCHEMA: LazyLock<String> = LazyLock::new(|| {
+    let mut schema: Value = serde_json::from_str(SUBMIT_JOB_SCHEMA).expect("job schema");
+    diagnostics::add_job_schemas(&mut schema);
+    schema.to_string()
+});
 
-const CANCEL_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["job_id"],"properties":{"job_id":{"type":"string","format":"uuid"}}}"#;
+const GET_JOB_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F-]{8,36}$",
+      "description": "One of your jobs: its UUID, or the unique prefix of at least 8 hex characters that notices print"
+    }
+  }
+}"##;
 
-const LIST_JOBS_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"limit":{"type":"integer","minimum":1,"maximum":100}}}"#;
+const CANCEL_JOB_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}"##;
 
-const REPORT_TO_HUB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","text"],"properties":{"kind":{"type":"string","enum":["enqueue","deploy_ready","result"],"description":"Report line type (ENQUEUE, DEPLOY-READY, RESULT)"},"text":{"type":"string","minLength":1,"maxLength":1024,"description":"Short report line; informational and untrusted on the hub"}}}"#;
-const SEND_SATELLITE_MESSAGE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["peer_id","remote_session_id","message","idempotency_key"],"properties":{"peer_id":{"type":"string","description":"Operator-registered satellite peer id"},"remote_session_id":{"type":"string","description":"Session id on the satellite, inside the operator-declared scope"},"message":{"type":"string","minLength":1,"maxLength":16384,"description":"Message text; queued until the remote session is idle"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"expires_at":{"type":"string","description":"Optional RFC3339 expiry, at most 24 hours ahead; default 30 minutes"}}}"#;
-const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["source_commit","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"source_session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Land from this in-reach session's sandbox instead of your own"},"source_commit":{"type":"string","pattern":"^[0-9a-f]{40}$","description":"Full lowercase 40-hex accepted source commit reachable from your sandbox"},"test_filters":{"type":"array","maxItems":32,"items":{"type":"string","minLength":3,"maxLength":256,"description":"PACKAGE=FILTER; the gate is a compile check plus the named tests"},"default":[]},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
+const LIST_JOBS_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    }
+  }
+}"##;
 
-const TOPOLOGY_UPSERT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["name","definition","scope","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"name":{"type":"string","minLength":1,"maxLength":128,"description":"Topology name, unique per owner"},"definition":{"type":"object","required":["nodes","edges"],"properties":{"nodes":{"type":"array","items":{"type":"object"}},"edges":{"type":"array","items":{"type":"object"}},"until":{"type":["object","null"]}},"description":"TopologyDefinition: nodes (id, kind, label, prereqs, params incl. typed step, custody, explicit provider/model/effort), edges, until; the daemon validates it and returns diagnostics"},"scope":{"type":"string","enum":["epic","manager"],"description":"epic: owned by one Epic (leads may only use this); manager: owned by the current manager"},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Target Epic for a manager epic-scoped upsert; a lead's Epic is daemon-derived and, if given, must match"},"expected_revision":{"type":["integer","null"],"minimum":1,"default":null,"description":"CAS fence to revise an existing topology; omit to create"},"validate_only":{"type":"boolean","default":false,"description":"Report diagnostics without writing"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
-const TOPOLOGY_LIST_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"scope":{"type":["string","null"],"enum":["epic","manager",null],"default":null},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Narrow to one Epic in your scope"},"include_executions":{"type":"boolean","default":false},"cursor":{"type":["string","null"],"maxLength":128,"default":null,"description":"next_cursor from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":32,"default":null}}}"#;
-const TOPOLOGY_EXECUTE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["topology_id","expected_digest","epic_id","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"topology_id":{"type":"string","format":"uuid"},"expected_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$","description":"definition_digest returned by list or upsert"},"epic_id":{"type":"string","format":"uuid","description":"Epic the execution runs under; must be in your scope"},"inputs":{"type":["object","null"],"default":null},"on_call":{"description":"Seat that answers node questions: {\"kind\":\"project_manager\"} (default: the project manager, else the covering portfolio seat) or {\"kind\":\"portfolio\",\"node_id\":uuid}","default":null,"oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"project_manager"}}},{"type":"object","additionalProperties":false,"required":["kind","node_id"],"properties":{"kind":{"const":"portfolio"},"node_id":{"type":"string","format":"uuid"}}}]},"base_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex base; omitted resolves origin/rolling once at acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; a replay returns deduplicated=true"}}}"#;
-const TOPOLOGY_GET_EXECUTION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"execution_id":{"type":"string","format":"uuid"},"after_sequence":{"type":["integer","null"],"minimum":0,"default":null,"description":"next_sequence from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":64,"default":null}}}"#;
-const TOPOLOGY_INTERRUPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","expected_row_version","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"execution_id":{"type":"string","format":"uuid"},"expected_row_version":{"type":"integer","minimum":1,"description":"row_version observed via get_execution; refresh after stale_version"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
-const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","attempt_id","action","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"attempt_id":{"type":"string","format":"uuid","description":"Attempt blocked on preserved work"},"action":{"type":"string","enum":["inspect","accept","retry","discard"],"description":"discard is manager (Automation) only; a lead is refused"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"confirm_preserved_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex preserved_commit; required iff action=discard, refused otherwise"}}}"#;
+const REPORT_TO_HUB_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "text"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "enqueue",
+        "deploy_ready",
+        "result"
+      ],
+      "description": "Report line type (ENQUEUE, DEPLOY-READY, RESULT)"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Short report line; informational and untrusted on the hub"
+    }
+  }
+}"##;
+const SEND_SATELLITE_MESSAGE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "peer_id",
+    "remote_session_id",
+    "message",
+    "idempotency_key"
+  ],
+  "properties": {
+    "peer_id": {
+      "type": "string",
+      "description": "Operator-registered satellite peer id"
+    },
+    "remote_session_id": {
+      "type": "string",
+      "description": "Target on the satellite: a session id inside the operator-declared scope, a declared project id (delivered to that project's current appointed manager, resolved by the satellite), or, with scope_project_id, a session in that project's manager tree"
+    },
+    "scope_project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Optional declared project that authorizes remote_session_id when it is a session in that project's current manager's tree (the manager itself, a descendant, or a rotation predecessor); the satellite resolves the seat live and refuses a target outside it"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "description": "Message text; queued until the remote session is idle"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL"
+    },
+    "expires_at": {
+      "type": "string",
+      "description": "Optional RFC3339 expiry, at most 24 hours ahead; default 30 minutes"
+    },
+    "issue_refs": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "default": [],
+      "description": "Hub Issue display numbers of YOUR OWN project, appended whole (title, status, complete body and acceptance) to the delivered message, read-only, in the order named. The project is never named: only Issues your own AgentGetIssue can read expand. message plus every Issue must fit maxLength 16384 or the call is refused, never truncated. The snapshot is taken once at acceptance; a replay returns the first receipt"
+    }
+  }
+}"##;
+const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_commit",
+    "idempotency_key"
+  ],
+  "properties": {
+    "supersedes": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Replace this queued entry id from the same enqueuer with a descendant source, preserving its queue position and single wake. An admitted/gating entry is queue_entry_in_flight: enqueue normally without supersedes"
+    },
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "source_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Land from this in-reach session's sandbox instead of your own"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full lowercase 40-hex accepted source commit reachable from your sandbox"
+    },
+    "test_filters": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 256,
+        "description": "PACKAGE=FILTER, at most 256 UTF-8 bytes; the gate is a compile check plus the named tests"
+      },
+      "default": [],
+      "description": "Explicit filters, at most 32 of at most 256 bytes each (queue_filter_invalid otherwise). Prefer derive_filters; never copy, prune or split check-touched-shards output by hand"
+    },
+    "derive_filters": {
+      "type": "boolean",
+      "default": false,
+      "description": "Let the queue derive the filters: the daemon runs scripts/check-touched-shards on the source diff against the rolling tip, dedupes focused rsid/rsid-store filters naming the same expression across shards, and splits any filter over 256 bytes into equivalent filters. A derived set over 32 filters is not refused. Mutually exclusive with test_filters. One call is enough: a derivation still running at the call's budget records the entry queued with filters_state deriving (the lander admits it only once its filters land) and returns it; never sleep or call again"
+    },
+    "fixes_issue": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Display number of the red Issue this landing claims to fix: the queue adds the test names its body lists on Failing tests: lines (the qa Issue format) or on the gate base-red Issue's Test: line to fixes_tests (queue_fixes_issue_not_found, queue_fixes_issue_lists_no_failing_tests); the combined claims are capped at 64 (queue_fixes_too_many names the count)"
+    },
+    "fixes_tests": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "pattern": "^[A-Za-z0-9_:.][A-Za-z0-9_:.-]*$",
+        "description": "A test name as the gate and the QA run report it, for example module::tests::name"
+      },
+      "default": [],
+      "description": "Tests this landing claims to turn green. The gate must run each on the candidate and see it pass, or the landing is refused claimed_fix_still_red (even when the base is red on it too); a test the gate's selection does not run is refused the same way, so add a test filter that selects it. Combines with derive_filters or test_filters"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL"
+    }
+  }
+}"##;
 
-static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = LazyLock::new(|| {
+const LIST_ROLLING_QUEUE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Narrow to one project inside your scope (a portfolio seat: one covered project); omit for every entry in your scope"
+    },
+    "state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "queued",
+        "admitted",
+        "gating",
+        "published",
+        "refused",
+        "failed",
+        "superseded",
+        null
+      ],
+      "default": null,
+      "description": "Only entries in this state"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 100,
+      "default": null,
+      "description": "Page size, 100 at most (default 50)"
+    },
+    "before_sequence": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "Page cursor: only entries older than this sequence (the previous page's next_before_sequence)"
+    }
+  }
+}"##;
+
+const CANCEL_ROLLING_QUEUE_ENTRY_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entry_id"
+  ],
+  "properties": {
+    "entry_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Queue entry id from AgentListRollingQueue or the enqueue receipt; only a still-queued entry can be cancelled"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 256,
+      "default": null,
+      "description": "Why, recorded in the entry's outcome detail (at most 256 bytes, no control characters)"
+    }
+  }
+}"##;
+
+const CHECK_LANDING_CANDIDATE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_commit"
+  ],
+  "properties": {
+    "job_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f-]{8,36}$",
+      "default": null,
+      "description": "The verification job: a full id, or a prefix of at least 8 hex characters that is unique inside your scope (candidate_job_id_ambiguous otherwise). Omit it and name source_session_id to check that worker's newest scoped_test job"
+    },
+    "source_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "The worker session that ran the verification. Without job_id, the newest scoped_test job it owns whose receipt head is source_commit is checked, else its newest scoped_test job. With job_id, the job must belong to this session"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full lowercase 40-hex commit you would pass to AgentEnqueueLandingSource"
+    }
+  }
+}"##;
+
+const TOPOLOGY_UPSERT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "definition",
+    "scope",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Topology name, unique per owner"
+    },
+    "definition": {
+      "type": "object",
+      "required": [
+        "nodes",
+        "edges"
+      ],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "until": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "description": "TopologyDefinition: nodes (id, kind, label, prereqs, params incl. typed step, custody, explicit provider/model/effort), edges, until; the daemon validates it and returns diagnostics"
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "epic",
+        "manager"
+      ],
+      "description": "epic: owned by one Epic (leads may only use this); manager: owned by the current manager"
+    },
+    "epic_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Target Epic for a manager epic-scoped upsert; a lead's Epic is daemon-derived and, if given, must match"
+    },
+    "expected_revision": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "default": null,
+      "description": "CAS fence to revise an existing topology; omit to create"
+    },
+    "validate_only": {
+      "type": "boolean",
+      "default": false,
+      "description": "Report diagnostics without writing"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"
+    }
+  }
+}"##;
+const TOPOLOGY_LIST_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "epic",
+        "manager",
+        null
+      ],
+      "default": null
+    },
+    "epic_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Narrow to one Epic in your scope"
+    },
+    "include_executions": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also list the scope's live executions (accepted, running, cancelling, blocked); the default list is live-only"
+    },
+    "include_settled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also list settled executions (succeeded, failed, cancelled): the run history. Implies include_executions. Live executions come first, then settled newest first, at most 32 in all"
+    },
+    "cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128,
+      "default": null,
+      "description": "next_cursor from the previous page"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 32,
+      "default": null
+    }
+  }
+}"##;
+const TOPOLOGY_EXECUTE_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "topology_id",
+    "expected_digest",
+    "epic_id",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "topology_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "expected_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "definition_digest returned by list or upsert"
+    },
+    "epic_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Epic the execution runs under; must be in your scope"
+    },
+    "inputs": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "default": null
+    },
+    "on_call": {
+      "description": "Seat that answers node questions: {\"kind\":\"project_manager\"} (default: the project manager, else the covering portfolio seat) or {\"kind\":\"portfolio\",\"node_id\":uuid}",
+      "default": null,
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "project_manager"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "node_id"
+          ],
+          "properties": {
+            "kind": {
+              "const": "portfolio"
+            },
+            "node_id": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      ]
+    },
+    "base_commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{40}$",
+      "default": null,
+      "description": "Full 40-hex base; omitted resolves origin/rolling once at acceptance"
+    },
+    "supersedes_execution": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "One Issue, one live run (#2427): when inputs.issue already has a live execution the request is refused topology_issue_already_live naming it; pass that execution's id here to interrupt it and start this one instead"
+    },
+    "wake": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "owner",
+        "none",
+        null
+      ],
+      "default": "owner",
+      "description": "owner (default): the daemon arms ONE topology_execution_settled resume wake to you when this execution settles (succeeded, failed, cancelled or blocked), like the outcome wake of AgentEnqueueLandingSource; the receipt's settle_wake_armed says so, and settle_wake_refusal carries the refusal code when the arm was refused (settle wakes have their own per-session cap, apart from other when wakes). An idempotent replay arms no second wake, and nothing is armed when you already own a settle wake for this execution (an owner keeps one enabled settle wake per execution). none: arm nothing (you arm your own AgentScheduleWake mode when with when.topology_execution_settled, e.g. one wake for several executions)"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL; a replay returns deduplicated=true"
+    }
+  }
+}"##;
+const TOPOLOGY_GET_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "topology_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Select by id; give exactly one of topology_id and name"
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 128,
+      "default": null,
+      "description": "Select by name (names are unique across the daemon); give exactly one of topology_id and name"
+    }
+  }
+}"##;
+const TOPOLOGY_GET_EXECUTION_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_id"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "execution_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "after_sequence": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "default": null,
+      "description": "next_sequence from the previous page"
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 64,
+      "default": null
+    }
+  }
+}"##;
+const TOPOLOGY_INTERRUPT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_id",
+    "expected_row_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid",
+      "default": null,
+      "description": "Global manager only: the granted project to act in; omit for your own project"
+    },
+    "execution_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "expected_row_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "row_version observed via get_execution; refresh after stale_version"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL"
+    }
+  }
+}"##;
+const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r##"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_id",
+    "attempt_id",
+    "action",
+    "expected_row_version",
+    "idempotency_key"
+  ],
+  "properties": {
+    "execution_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "attempt_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Attempt blocked on preserved work"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "inspect",
+        "accept",
+        "retry",
+        "discard"
+      ],
+      "description": "discard is manager (Automation) only; a lead is refused"
+    },
+    "expected_row_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Replay key, at most 128 UTF-8 bytes, without NUL"
+    },
+    "confirm_preserved_commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-fA-F]{40}$",
+      "default": null,
+      "description": "Full 40-hex preserved_commit; required iff action=discard, refused otherwise"
+    }
+  }
+}"##;
+
+static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = LazyLock::new(|| {
     [
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetAuthorityCatalog,
             method: "AgentGetAuthorityCatalog",
-            description: "Your operator's manual: your current roles, the operating rules for those roles, and exactly the controls you may call now. Pass verb for one control only: its parameter schema, a minimal valid example and its refusal codes (no full list or guidance is repeated). Read-only and open to every session; call it first and again after a role change or an authority refusal.",
+            description: "Your operator's manual: your current roles, the operating rules for those roles, and exactly the controls you may call now. The default answer lists each control with a one-line description; pass verb for one control only (its parameter schema, a minimal valid example and its refusal codes, no full list or guidance repeated), or fields \"full\" for complete descriptions. Read-only and open to every session; call it first and again after a role change or an authority refusal.",
             parameters_json: GET_AUTHORITY_CATALOG_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlAuthorityCatalog),
         },
@@ -1042,7 +4658,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
             verb: AgentControlVerbV1::GetStatus,
             method: "AgentGetStatus",
             description: "Report status of the caller, its children, or a session in the current manager's live scope.",
-            parameters_json: TARGET_SCHEMA,
+            parameters_json: STATUS_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlStatus),
         },
         AgentControlDescriptorV1 {
@@ -1074,7 +4690,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ScheduleWake,
             method: "AgentScheduleWake",
-            description: "Schedule a future wake/callback; explicit mode is required: fresh, resume, on_terminal, program_guard, or when (use resume for same-session continuation; when is a daemon-evaluated predicate wake: jobs_terminal or sha_on_rolling, one resume wake, optional timeout_seconds). The current manager may watch subjects in its live scope.",
+            description: "Schedule a future wake/callback; explicit mode is required: fresh, resume, on_terminal, program_guard, or when (use resume for same-session continuation; when is a daemon-evaluated predicate wake: jobs_terminal, sha_on_rolling, issue_closed, todo_closed (an operator to-do item done or dismissed) or topology_execution_settled (a topology execution succeeded, failed, cancelled or blocked) or settlement_run_settled (a source-worktree settlement run finished) or health_anomaly (a manager seat only: the daemon checks its health conditions every minute with no model turn and resumes you once, naming each), one resume wake, optional timeout_seconds). The current manager may watch subjects in its live scope.",
             parameters_json: WAKE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::ScheduleWake),
         },
@@ -1088,9 +4704,9 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListWakes,
             method: "AgentListWakes",
-            description: "List your own scheduled wakes (job_id, name, mode, watch target, next_fire_at, enabled, created_at), bounded; caller-bound, so no other session's jobs are visible. RPC-only.",
+            description: "List your own scheduled wakes (job_id, name, mode, watch_session_id, the when predicate and deadline of a mode-when wake, next_fire_at, enabled, created_at, protected, and pending_message when a delivered report or notice is waiting inside the wake), bounded by limit (default 64, max 256); include_disabled adds cancelled or fired history. After a seat change this is how the successor confirms which wakes carried over. Your own wakes by default; `session_id` reads a live worker's wakes (read-only) when AgentWorkerRoster lists that worker for your current scope, otherwise `list_wakes_target_not_authorized`.",
             parameters_json: LIST_WAKES_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlListWakes),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::CreateIssue,
@@ -1102,21 +4718,21 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListIssues,
             method: "AgentListIssues",
-            description: "List a bounded page of Issues in the project owned by the Epic you currently lead, or by an appointed manager with issue-coordinate authority. Set ready=true to filter to the operator ready-work projection, order=desc for newest first, and title_contains for a case-insensitive title filter.",
+            description: "List a bounded page of project Issues. `fields` is `summary` (display_number, id, title, status, labels, priority, created_at, updated_at; no body) or `full` (whole records); omitted, a title_contains search returns summary rows and any other list keeps full records, so dedupe searches stay small (read one body with AgentGetIssue). A live Issue-bound worker must set title_contains and omit project_id; it always receives summary rows from its bound project for deduplication. A live topology session node follows the same rule for its execution's project. Filters: title_contains (case-insensitive), labels (all exact matches), status, ready, archive, order and cursor.",
             parameters_json: LIST_ISSUES_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlListIssues),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetIssue,
             method: "AgentGetIssue",
-            description: "Read one Issue by issue_id or display_number (exactly one) with up to 256 blocked_by and blocks entries (each list has a *_truncated flag) in the project owned by the Epic you currently lead, or by an appointed manager with issue-coordinate authority.",
+            description: "Read one Issue by issue_id or display_number (exactly one) with up to 256 blocked_by and blocks entries (each list has a *_truncated flag) in the project owned by the Epic you currently lead, or by an appointed manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) reads, while that binding is live, its own Issue, its review Issues and the same-project Issues it references with a `#N` or `#A-#B` selector in that Issue's body or handoffs or in its launch brief, or that the launch attached (`related`); read-only, and a foreign project, a missing number or an unreferenced Issue is refused agent_issue_authority_denied.",
             parameters_json: GET_ISSUE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlGetIssue),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::UpdateIssue,
             method: "AgentUpdateIssue",
-            description: "CAS-update active Issue content (target by issue_id or display_number, exactly one) as the current owning-Epic lead or manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) may, while that binding is live, append to that Issue only: send just body, holding the current body unchanged as its prefix plus your note or handoff, with the row_version you read; any other field, Issue or status change is refused.",
+            description: "CAS-update active Issue content (target by issue_id or display_number, exactly one) as the current owning-Epic lead or manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) may, while that binding is live, publish to that Issue only: send just handoff (your complete handoff, stored as its own record; no body copy, any positive expected_row_version) or, as the non-default alternative, body holding the current body unchanged as its prefix plus your section; any other field, Issue or status change is refused.",
             parameters_json: UPDATE_ISSUE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlUpdateIssue),
         },
@@ -1158,7 +4774,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerInbox,
             method: "AgentManagerInbox",
-            description: "Retrieve durable manager requests/replies; page notices with after_notice_sequence and notice_kind, or settle_notice_ids belonging to your seat. Returned notices settle automatically; retrieval does not reply, answer a decision, clear a question, grant approval, or prove provider acceptance.",
+            description: "Retrieve incoming manager mail; include_sent:true, request_id or fields:\"full\" also returns outbound sends for audits. A notice_kind other than message suppresses messages. Page notices with after_notice_sequence and notice_kind, or settle_notice_ids belonging to your seat; fields:\"summary\" returns each notice without its state payload (a short state_summary instead) to drain a routine backlog cheaply. Returned notices settle automatically, in either form, and stay retained: read_notice_ids re-reads settled notices by id with their full payload; retrieval does not reply, answer a decision, clear a question, grant approval, or prove provider acceptance.",
             parameters_json: MANAGER_INBOX_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerInbox),
         },
@@ -1186,7 +4802,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerInspect,
             method: "AgentManagerInspect",
-            description: "Read bounded scoped manager state and current policy fences; traversal completeness is not feature acceptance.",
+            description: "Read bounded scoped manager state and current policy fences. Workers default to actionable rows newest first: live, pending work/jobs/landings/questions, and recent (7 days) failures or unpublished sandbox results. Set include_history:true for all retained workers in creation order. Cursors bind the view; traversal completeness is not feature acceptance.",
             parameters_json: manager_v2::INSPECT.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerInspect),
         },
@@ -1228,14 +4844,14 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerGetAction,
             method: "AgentManagerGetAction",
-            description: "Read one manager action receipt within the authenticated current manager's project and logical manager scope. A queued action that a waiting deploy holds also carries held {reason: deploy_draining, deploy_id, release_by}. A queued create_session (Issue-worker launches included) that the daemon holds while the host's 1-minute load is above the operator's host_load_admission_threshold carries held {reason: host_load, load, threshold, recent_admissions}: it stays queued, never refused, and starts on its own when the load drops, held creates released oldest-first across projects.",
+            description: "Read one manager action receipt within the authenticated current manager's project and logical manager scope. A queued action that a waiting deploy holds also carries held {reason: deploy_draining, deploy_id, release_by}. A queued create_session (Issue-worker launches included) that the daemon holds while the host's 1-minute load is above the operator's host_load_admission_threshold carries held {reason: host_load, load, threshold, recent_admissions}: it stays queued, never refused, and starts on its own when the load drops, held creates released oldest-first across projects. The same hold applies while the host CPU is at or above job_thermal_ceiling_c (held {reason: thermal, temperature_c, ceiling_c}) or free disk is below the governor min_free_disk_gb floor (held {reason: disk_pressure, free_disk_gb, min_free_disk_gb}). A create the sandbox allocator refused for free space (the operator-configured sandbox floor) is held the same way (held {reason: sandbox_free_space, free_disk_gb, min_free_disk_gb}) and retried on its own; a refusal at the sandbox root-count cap ends blocked manager_v2_sandbox_source_root_limit.",
             parameters_json: manager_v2::GET_ACTION.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerGetAction),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerLaunchIssueWorker,
             method: "AgentManagerLaunchIssueWorker",
-            description: "Manager seat (#1100): launch one worker bound to one Issue in a single idempotent call. The daemon runs the create_session action (same authority, allowlist, capacity and Epic scope as AgentManagerControl; refused before any effect), appends an Issue note naming the worker, sets the Issue InProgress and arms your on_terminal watch on the worker once it exists. Needs the SessionCreate and IssueCoordinate grants. The bound worker may read only its own Issue with AgentGetIssue, so do not paste the Issue text into the brief; while it is live it may also append its handoff to that Issue's body with AgentUpdateIssue (no other field, status or Issue). A replay under the same idempotency_key returns the same worker. Poll the returned action with AgentManagerGetAction. The worker's sandbox branches from the freshly fetched origin/rolling tip by default; pass sandbox_source {\"path\": \"<your sandbox_root>\"} to build on your unlanded commits, or {\"commit\": \"<40-hex>\"} for an exact commit. For a review Issue pass review_of: <implementer Issue number>: the daemon copies that Issue's text and complete latest handoff into the reviewer's brief (a bound reviewer cannot read it; never paste a truncated copy). When a worker passed the baton (its context filled; you got a worker_context_cap notice) and has ended its turn, pass continue_from: <that worker's session id> to relaunch from its committed HEAD with its lineage and handoff in one call.",
+            description: "Manager seat (#1100): launch one worker bound to one Issue in a single idempotent call. The daemon runs the create_session action (same authority, allowlist, capacity and Epic scope as AgentManagerControl; refused before any effect), appends an Issue note naming the worker, sets the Issue InProgress and arms your on_terminal watch on the worker once it exists. Needs the SessionCreate and IssueCoordinate grants. The bound worker reads its own Issue, the review Issues launched with review_of = it and the same-project Issues it references (a `#N` or `#A-#B` selector in the Issue's body or handoffs or in this brief, or listed in `related`) with AgentGetIssue, all read-only (#218); it publishes to its own Issue only, and the compiled brief names that Issue as the only publication target whatever the brief says. Do not paste Issue text into the brief: pass `related` to attach complete texts; a launch of an Issue that has review Issues appends the latest review of each (complete, never cut mid-finding; one too large is named for the worker to read) to the brief (#1845); it also includes up to five recent commits from the bounded origin/rolling history whose messages name the Issue, in the receipt and worker brief (#1988); Git discovery failure returns an empty list and never blocks launch. While it is live it may also publish its handoff to that Issue with AgentUpdateIssue {handoff} (no other field, status or Issue). One worker per Issue (#2212): a launch is refused manager_issue_worker_already_live, naming the worker, while another launch is running or queued or its worker is running, or has ended its turn but is parked on a wake or daemon job it owns and has not written its final PIPELINE HANDOFF; continue_from that worker is the explicit way to replace it. A replay under the same idempotency_key returns the same worker. Poll the returned action with AgentManagerGetAction. The worker's sandbox branches from the freshly fetched origin/rolling tip by default; pass sandbox_source {\"path\": \"<your sandbox_root>\"} to build on your unlanded commits, or {\"commit\": \"<40-hex>\"} for an exact commit. For either explicit source, the returned action receipt has the frozen pin in `action.sandbox_source.commit`; include that commit as the worker brief's scoped-test base so verification covers only work after launch. For the default rolling source, use `origin/rolling`. The merge-queue gate still compares the full candidate against rolling. For a review Issue pass review_of: <implementer Issue number>: the daemon copies that Issue's text and complete latest handoff into the reviewer's brief (a bound reviewer cannot read it; never paste a truncated copy). When a worker passed the baton (its context filled; you got a worker_context_cap notice) and has ended its turn, pass continue_from: <that worker's session id> to relaunch from its committed HEAD with its lineage and handoff in one call.",
             parameters_json: MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerLaunchIssueWorker),
         },
@@ -1277,7 +4893,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::TopologyUpsert,
             method: "AgentTopologyUpsert",
-            description: "Create, revise or validate a scoped deterministic topology (current manager with Automation, or an Epic lead for its own Epic). Every session/review triple must be explicit and operator-allowed; returns the definition digest and diagnostics.",
+            description: "Create, revise or validate a scoped deterministic topology (current manager with Automation, or an Epic lead for its own Epic). Every session/review triple must be explicit and operator-allowed; returns the definition digest and diagnostics. Any other live session may pass validate_only:true to check a definition it designs: it writes nothing, returns the structural diagnostics in full and reports a policy problem only as \"launch not granted\", without the grant.",
             parameters_json: TOPOLOGY_UPSERT_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyUpsert),
         },
@@ -1289,9 +4905,16 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
             native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyList),
         },
         AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::TopologyGet,
+            method: "AgentTopologyGet",
+            description: "Read one topology visible in your manager or Epic-lead scope by topology_id or name: the stored definition JSON, digest, revision, owner and shared flag. Use it to improve a topology (AgentTopologyUpsert with expected_revision) or fork it under a new name.",
+            parameters_json: TOPOLOGY_GET_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyGet),
+        },
+        AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::TopologyExecute,
             method: "AgentTopologyExecute",
-            description: "Start one daemon-run execution of a visible topology on an Epic in your scope, fenced by its definition digest; policy is rechecked and created sessions are charged. Idempotent on the key.",
+            description: "Start one daemon-run execution of a visible topology on an Epic in your scope, fenced by its definition digest; policy is rechecked and created sessions are charged. Idempotent on the key. Arms one topology_execution_settled resume wake to you by default (a replay arms none; wake:\"none\" opts out), so the settle wakes you without a separate AgentScheduleWake.",
             parameters_json: TOPOLOGY_EXECUTE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyExecute),
         },
@@ -1319,9 +4942,30 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::EnqueueLandingSource,
             method: "AgentEnqueueLandingSource",
-            description: "Enqueue one accepted source commit on the daemon-owned rolling merge queue (current appointed manager or current Epic lead). The queue gates and publishes it; the outcome wakes you once. Refused with queue_disabled while the operator has the queue off.",
+            description: "Enqueue one accepted source commit on the daemon-owned rolling merge queue (current appointed manager or current Epic lead). Pass derive_filters:true so the queue derives the test filters itself (no hand-copied, pruned or split check-touched-shards output; explicit test_filters are capped at 32 filters of 256 bytes). The queue gates and publishes it; the outcome wakes you once. One call is enough: when the filter derivation outlasts the call (a Rust diff takes 10-45 s) the entry is recorded queued with filters_state deriving, is admitted only after its filters land, and a derivation that fails settles it refused (queue_filter_derivation_failed) with that same single wake; end your turn, never sleep, retry or poll. A fix for known-red tests passes fixes_issue (the red Issue) and/or fixes_tests: the gate then requires those tests green and refuses claimed_fix_still_red otherwise. Optional supersedes names your own queued entry to replace with a descendant commit at the same queue position; admitted/gating entries return queue_entry_in_flight: enqueue normally without supersedes. Refused with queue_disabled while the operator has the queue off.",
             parameters_json: ENQUEUE_LANDING_SOURCE_SCHEMA,
             native_tool: None,
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ListRollingQueue,
+            method: "AgentListRollingQueue",
+            description: "List rolling merge queue entries in your scope, newest first (#1964; the current appointed manager of the project, a portfolio seat inside its grant, or the session an entry's outcome would wake). Each row: sequence, state, source commit, enqueuer, wake target, batch id and a bounded outcome summary, plus qa_green: the latest rolling SHA a full-library QA run proved green (sha, passed_at, job_id; null before any pass). Filter by state or project; page with before_sequence. Read-only; the operator-wide view stays operator-only.",
+            parameters_json: LIST_ROLLING_QUEUE_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlListRollingQueue),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::CancelRollingQueueEntry,
+            method: "AgentCancelRollingQueueEntry",
+            description: "Withdraw one still-queued rolling merge queue entry (#1964): a compare-and-swap queued -> superseded with outcome queue_entry_cancelled, by the project's current appointed manager (the seat is followed across a rotation), a portfolio seat in Execute mode inside its grant, or the session the entry's outcome would wake. An admitted or gating entry belongs to the lander and is refused queue_entry_in_flight; a settled one is refused queue_entry_settled. A cancel replays as success. The entry's owner gets one wake naming the cancel when it is not you. Re-enqueue the commit with a new idempotency_key.",
+            parameters_json: CANCEL_ROLLING_QUEUE_ENTRY_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlCancelRollingQueueEntry),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::CheckLandingCandidate,
+            method: "AgentCheckLandingCandidate",
+            description: "Check, before AgentEnqueueLandingSource, whether a worker's scoped_test job verifies source_commit (#2310; the worker's appointed manager, a portfolio seat over its project, or the Epic lead; read-only). Name the job (full id or a unique prefix of at least 8 hex) or the worker's source_session_id. Returns ok, a verdict refusal (candidate_no_verification_job, candidate_job_not_terminal, candidate_admission_timeout, candidate_receipt_missing, candidate_job_not_green, candidate_new_failures, candidate_head_mismatch, candidate_conflicts_with_rolling), the job id, kind, state, exit code and own refusal, the receipt head and whether it equals source_commit, new_failures, baseline_reds, tests_completed, the plan (precise or targeted_subset, gate_covers_rest), and, for a head mismatch, whether the delta between the receipt head and source_commit touches documentation only. The receipt's merges_cleanly_onto_rolling and conflict_paths (#348) and a fresh, fetch-free trial merge of source_commit onto the local origin/rolling (merges_cleanly_onto_rolling_now, conflict_paths_now) are reported; a conflict is the last verdict refusal, candidate_conflicts_with_rolling, and its detail names the paths. Baseline reds alone do not block: the landing gate is no new failures relative to rolling. A caller outside those seats is refused candidate_not_authorized; an unknown or out-of-scope job or session is refused candidate_not_found.",
+            parameters_json: CHECK_LANDING_CANDIDATE_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlCheckLandingCandidate),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ReadSessionEvents,
@@ -1340,8 +4984,8 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SubmitJob,
             method: "AgentSubmitJob",
-            description: "Run a long test (including a declared just/make recipe), build, landing or cloud-gate operation as a daemon-owned durable job in your sandbox. Linux uses systemd; macOS uses launchd for package test/build and recipe jobs (shard, candidate-receipt, landing and cloud workflows, and other operating systems, are refused job_platform_unsupported). Package test params accept exact:true for whole test-name matching (libtest --exact; default false keeps substring filters). It survives your turn ending, your session and a daemon restart; one resume wake carries the typed result (wake none suppresses that per-job wake: submit a batch with wake none, then arm one AgentScheduleWake mode when with when.jobs_terminal for a single wake). The execution timeout (timeout_minutes, default job_test_timeout_mins) starts when the unit launches: a job held behind a deploy drain does not spend it, and settles failed with job_admission_timed_out if it is still unlaunched after the drain hold cap plus a margin. Dispatch it and end your turn.",
-            parameters_json: SUBMIT_JOB_SCHEMA,
+            description: "Run a long test (including a declared just/make recipe), build, landing or cloud-gate operation as a daemon-owned durable job in your sandbox. Linux uses systemd; macOS uses launchd for package test/build and recipe jobs (shard, candidate-receipt, landing and cloud workflows, and other operating systems, are refused job_platform_unsupported). Package test params accept exact:true for whole test-name matching (libtest --exact; default false keeps substring filters), and test_target for one integration test target (requires exact:true and nonempty filters; mutually exclusive with lib_only). It survives your turn ending, your session and a daemon restart; one resume wake carries the typed result (wake none suppresses that per-job wake: submit a batch with wake none, then arm one AgentScheduleWake mode when with when.jobs_terminal for a single wake). The timeout (timeout_minutes, default job_test_timeout_mins) starts at the wrapper's job-start. Ordinary jobs exclude build-slot and sandbox/artifact-lock waits; scoped_test jobs include waits in their wall budget and reserve 120 seconds for runtime after admission. A scoped_test diff selecting no Rust package takes no governor slot. Local test/build peers from the same owner and sandbox queue in submission order before unit launch, without spending build admission or execution time. Unit start has a separate ten-minute cap (job_start_timed_out); build admission lasts the job's own timeout (at least ten minutes) for an ordinary test job, one hour for a build job, or the remaining wall budget minus the runtime reserve for scoped_test jobs (job_admission_timed_out), so a job queued behind others on the governor is not failed after a fixed ten minutes. Receipts retain the last phase. While a hub deploy is draining, or a staged interrupt_workers deploy would stop a test job after its grace, a new test or build job is accepted but held (held=held_for_deploy, receipt release_by): no unit starts and no timeout clock runs; it starts in submission order once the deploy settles or is abandoned, and its one wake fires at its real terminal state. The receipt carries the id as job_id; if a reply is cut off, list yours with AgentListJobs. Dispatch it and end your turn.",
+            parameters_json: &SUBMIT_JOB_DETAILED_SCHEMA,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
@@ -1354,21 +4998,21 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListJobs,
             method: "AgentListJobs",
-            description: "List your daemon-owned jobs, newest first.",
+            description: "List the jobs you submitted, newest first (limit 1-100, default 20): recover a job id a truncated AgentSubmitJob reply lost. Another session's jobs stay unlisted; a manager seat also lists its rotation predecessors' jobs (#2470).",
             parameters_json: LIST_JOBS_SCHEMA,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::CancelJob,
             method: "AgentCancelJob",
-            description: "Stop one of your own running daemon-owned jobs (a mistaken or over-broad run) through its platform service label: the service is stopped and the job settles failed with refusal job_cancelled. Cancelling a job that already settled changes nothing.",
+            description: "Stop one of your own running daemon-owned jobs (a mistaken or over-broad run) through its platform service label: the service is stopped and the job settles failed with refusal job_cancelled. Cancelling a job that already settled changes nothing. The current appointed manager (or a portfolio seat inside its grant) may also cancel an ordinary test or build job owned by a session in its live scope (#2213); the result names it as cancelled_by_manager and the job detail names it and the owner. A landing, cloud gate or sweep, release build or automatic full-library QA run is never cancelled by a manager (#2232). Every other job, and every refusal that would show a caller a job it has no authority over, is job_not_found (#2233).",
             parameters_json: CANCEL_JOB_SCHEMA,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SendSatelliteMessage,
             method: "AgentSendSatelliteMessage",
-            description: "Queue one message for an idle session on a paired satellite host (current appointed manager only; the operator must enable dispatch and declare the target in scope). Delivery waits until the remote session is idle and never interrupts; `queued` is acceptance, not delivery. Every refusal is the same target_not_authorized.",
+            description: "Queue one message for an idle session on a paired satellite host (current appointed manager only; the operator must enable dispatch and declare the target in scope). Delivery waits until the remote session is idle and never interrupts; `queued` is acceptance, not delivery. `issue_refs` expands up to 8 of your own project's Issues, whole and read-only, into the message (the satellite cannot read hub Issues itself; this is the one way their body and acceptance reach it). Every peer or target refusal is the same target_not_authorized; an unreadable Issue ref is one satellite_issue_ref_unavailable, raised only after the target was authorized.",
             parameters_json: SEND_SATELLITE_MESSAGE_SCHEMA,
             native_tool: None,
         },
@@ -1382,14 +5026,28 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetDaemonInfo,
             method: "AgentGetDaemonInfo",
-            description: "Read the running hub daemon's identity and health for the current appointed manager or Epic lead: embedded build SHA, sha256 of the running binary, start time, schema version, disk free for the data dir and sandbox base, 1/5/15 load average, and supervisor mode. `host_load` reports the host-load admission (threshold, supported, load, recent_admissions, holding and the held manager creates and topology nodes, oldest first). The appointed manager also gets `satellites`: each enabled paired satellite read over the link now (build_sha, binary_sha256, started_at, schema_version, supervisor_mode, last_deploy, or reachable:false). Secret-free: never returns an environment value. RPC-only.",
+            description: "Read the running hub daemon's identity and health for the current appointed manager or Epic lead: embedded build SHA, sha256 of the running binary, start time, schema version, disk free for the data dir and sandbox base, 1/5/15 load average, and supervisor mode. `host_load` reports the host-load admission (threshold, supported, load, recent_admissions, holding and the held manager creates and topology nodes, oldest first); its `build_disk` {min_free_gb, free_gb, open} is the governor disk floor every build/test job waits on in admission (separate from a launch floor), so read it before promising verification. `target_pool` is the warm target pool status: the newest pool and, when no pool was built, the typed reason (`last_skip` pool_skipped_disk_headroom with free/floor/expected GiB; a failed build with reason pool_aborted_disk_floor) and `last_reclaim` (idle pools evicted for a worker waiting on the disk floor). The appointed manager also gets `satellites`: each enabled paired satellite read over the link now (build_sha, binary_sha256, started_at, schema_version, supervisor_mode, last_deploy, launches (`none` when a manager seat has no launch choices: the hub must push a list), or reachable:false). Secret-free: never returns an environment value. RPC-only.",
             parameters_json: GET_DAEMON_INFO_SCHEMA,
+            native_tool: None,
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::PushSatelliteManagerPolicy,
+            method: "AgentPushSatelliteManagerPolicy",
+            description: "Push explicit launch choices and session caps to a paired, dispatch-enabled satellite manager in declared scope, using the deploy link and Deploy authority (Execute, unpaused). Every authorization failure is target_not_authorized. Choices and caps must fit the hub's effective project grant; widening is refused. Expected satellite scope/policy versions prevent overwriting a later operator save. Exact retries return a durable provenance receipt. Other policy fields remain operator-owned. RPC-only.",
+            parameters_json: PUSH_SATELLITE_POLICY_SCHEMA,
+            native_tool: None,
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ReseatSatelliteManager,
+            method: "AgentReseatSatelliteManager",
+            description: "Move a paired satellite's failed manager seat to another provider in one step (#2750), using the deploy link and Deploy authority (Execute, unpaused). A seat whose provider is down (a lost login, a quota) cannot succeed itself and a session's provider is fixed at creation. The satellite resolves the declared address to its live seat, launches a successor on `provider` (optionally `model`/`effort`) with continued_from set to that seat, re-appoints it with the project's saved scope and policy (wakes and open requests follow) and records `reason`. The seat must be Failed, or Completed/Interrupted with provider_unavailable true; a running seat is refused. Your declared scope needs no edit: the address you already use resolves to the successor through lineage. Every authorization failure is target_not_authorized. A retry after success finds the healthy successor and is refused. RPC-only.",
+            parameters_json: RESEAT_SATELLITE_MANAGER_SCHEMA,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::RequestDeploy,
             method: "AgentRequestDeploy",
-            description: "Ask the daemon to deploy already-built binaries (current appointed manager holding the operator-granted Deploy capability, Execute mode, not paused). The daemon stages and verifies them, waits for a quiet point (no lander, job or scoped worker mid-turn; bounded by max_wait_secs), swaps them in, restarts under rsid-supervisor.sh with its environment intact and wakes you once with the outcome. A restart interrupts any worker still mid-turn (provider processes are not re-adopted; the interrupted turn is resumed), so the deploy waits for workers. While it waits it holds new worker starts, your own creates included, for at most the operator's deploy_drain_hold_secs (default 600); past that it waits for a lull without holding anything (AgentGetDaemonInfo deploy_drain shows waiting, release_by and blockers; AgentManagerGetAction shows a held action's reason). If a busy fleet never reaches a quiet point (a worker is always mid-turn), send the same request with interrupt_workers: true (keep max_wait_secs above the hold): past that hold a worker mid-turn no longer blocks, the restart interrupts it, the existing post-restart path resumes its turn with a continue prompt, the outcome wake lists the interrupted worker session ids and each is an andon friction event; a landing and a local test/build/landing job still block. To withdraw a waiting deploy, send its sha and idempotency_key with cancel: true and omit interrupt_workers. With peer_id it does the same on a paired satellite over the link (#1017; the operator must enable dispatch and declare the satellite's scope): the satellite runs its own deploy flow, nothing is stored on the hub, and you confirm through AgentGetDaemonInfo satellites (build_sha, last_deploy) and your own resume wake. RPC-only.",
+            description: "Ask the daemon to deploy already-built binaries (current appointed manager holding the operator-granted Deploy capability, Execute mode, not paused). The daemon stages and verifies them, waits for a quiet point (no lander, job or scoped worker mid-turn; bounded by max_wait_secs), swaps them in, restarts under rsid-supervisor.sh with its environment intact and wakes you once with the outcome. A restart interrupts any worker still mid-turn (provider processes are not re-adopted; the interrupted turn is resumed), so the deploy waits for workers. While it waits it holds new worker starts, your own creates included, for at most the operator's deploy_drain_hold_secs (default 600); past that it waits for a lull without holding anything (AgentGetDaemonInfo deploy_drain shows waiting, release_by and blockers; AgentManagerGetAction shows a held action's reason). If a busy fleet never reaches a quiet point (a worker is always mid-turn), send the same request with interrupt_workers: true (keep max_wait_secs above the hold): past that hold a worker mid-turn no longer blocks, the restart interrupts it, the existing post-restart path resumes its turn with a continue prompt, the outcome wake lists the interrupted worker session ids and each is an andon friction event; a landing and a local test/build/landing job still block. To withdraw a waiting deploy, send its sha and idempotency_key with cancel: true and omit interrupt_workers. With peer_id, interrupt_workers is forwarded too and the satellite interrupts its own mid-turn workers after its own hold (#2587; a satellite build without the deploy_interrupt capability is refused satellite_deploy_interrupt_unsupported, nothing sent), and the cancellation is forwarded over the paired satellite link (#1017; the operator must enable dispatch and declare the satellite's scope); the satellite applies its own owner and idempotency checks and refuses deploy_cancel_too_late once restart has begun or the deploy settled. The hub stores no deploy state; confirm through AgentGetDaemonInfo satellites (build_sha, last_deploy) and your own resume wake. RPC-only.",
             parameters_json: REQUEST_DEPLOY_SCHEMA,
             native_tool: None,
         },
@@ -1399,6 +5057,13 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
             description: "Before debugging a red, ask whether it is already known: read the known-failure signature records (#1016) that open Issues of your project carry, by exact test_id and/or failure digest (at least one). Each record names its owner Issue (record.issue, issue_id), class (regression, flake, env, seed) and matcher; a record whose owner Issue is Closed, Cancelled or archived is never returned, so expiry is live. Read-only, project-scoped, open to every session; no Issue body is returned. An unknown query returns records [] (a clean, not-known answer); malformed_issues lists open Issues whose signature blocks did not parse.",
             parameters_json: QUERY_FAILURE_SIGNATURES_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlQueryFailureSignatures),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::WorkerRoster,
+            method: "AgentWorkerRoster",
+            description: "Read each worker's real state in one call (#2311): session id, bound Issue number, provider/model/effort, derived state (running, parked_on_job, parked_on_wake, stranded, final_handoff, failed), its newest daemon job (id, kind, state, exit_code, refusal, receipt_head), its open job count, its armed wakes (mode, when-predicate, next_fire_at), last activity time and whether the latest turn carries a final PIPELINE HANDOFF. A `Completed` session is parked on its job or wake, stranded (nothing will resume it) or finished: the roster tells them apart. Scope: the workers you launched yourself; a project's appointed manager gets its whole project by default, and project_id names a project you manage (a portfolio seat: one inside its grant). Filter with `states`; `counts` and `truncated` describe the page. Read-only; no receipt check (read the job's receipt_head and compare it yourself).",
+            parameters_json: WORKER_ROSTER_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlWorkerRoster),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GlobalOverview,
@@ -1445,7 +5110,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerAppointChild,
             method: "AgentManagerAppointChild",
-            description: "Portfolio manager seat at any tier (#1239): in one idempotent call, launch a Standard root session (launch must be in your grant's allowed_launches) and seat it as a child: the project manager of a project in your coverage (displacing the current one as the operator's appoint does, saved with your child_policy), a new child manager node over a strict subset of your coverage (it narrows your grant in every dimension; sibling coverage stays disjoint; at most max_direct_reports children and project managers under you), or the replacement seat of a child node you granted (its grant, ledger and workers stay; the old seat loses authority at once). Every refusal happens before any session is created. Only the operator creates roots, adopts or re-parents. Returns {appointment_id, session_id, target_ref, scope_version, policy_version, deduplicated}; a replay returns the same session. AgentGlobalAppointManager is its project-target alias. RPC-only.",
+            description: "Portfolio manager seat at any tier (#1239): in one idempotent call, launch a Standard root session (launch must be in your grant's allowed_launches) and seat it as a child: the project manager of a project in your coverage (displacing the current one as the operator's appoint does, saved with your child_policy), a new child manager node over a strict subset of your coverage (it narrows your grant in every dimension; sibling coverage stays disjoint; at most max_direct_reports children and project managers under you), or the replacement seat of a child node you granted (its grant, ledger and workers stay; the old seat loses authority at once), or your own seat: node_id = your own node hands the seat to the session this call launches (#2021), whoever granted the node, fenced on expected_grant_version (the grant version advances; the grantor is preserved); the node, grant limits, authority epoch, ledger, escalations, workers, terminal watches, operator to-do scope and pending wakes carry over, the operator may still re-seat or revoke it (an operator re-seat in flight wins), and the handoff reference is recorded and shown in AgentManagerOverview. Put the handoff path in handoff and in the successor's query, then end your turn. Every refusal happens before any session is created. Only the operator creates roots, adopts or re-parents. Returns {appointment_id, session_id, target_ref, scope_version, policy_version, deduplicated}; a replay returns the same session. AgentGlobalAppointManager is its project-target alias. RPC-only.",
             parameters_json: MANAGER_APPOINT_CHILD_SCHEMA.as_str(),
             native_tool: None,
         },
@@ -1459,7 +5124,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerOverview,
             method: "AgentManagerOverview",
-            description: "Any manager seat (area, project or portfolio of any tier; #1240): one bounded read of your own manager node: its grant and seat, parent_of it, each child (child portfolio nodes, the project managers you manage directly, child areas) as a digest with its seat status, model, context fill %, grant version, coverage, summed Issue and session counts and pending escalations, the projects you manage directly (project manager seat and policy, Issue counts, Running and WaitingApproval counts, pending questions and approvals), the escalations waiting on you and a fleet rollup of your coverage (active agents, usage over 5m/1h/24h by project, provider and model). A child node's own projects and inbox are never included: send down to that child to ask. Refused for a caller that holds no manager node seat (manager_tier_not_node_seat). Read-only. AgentGlobalOverview is its v0-shaped alias.",
+            description: "Any manager seat (area, project or portfolio of any tier; #1240): one bounded read of your own manager node: its grant and seat, parent_of it, each child (child portfolio nodes, the project managers you manage directly, child areas) as a digest with its seat status, model, context fill %, grant version, coverage, summed Issue and session counts and pending escalations, the projects you manage directly (project manager seat and policy, Issue counts, Running and WaitingApproval counts, pending questions and approvals), the escalations waiting on you and a fleet rollup of your coverage. `fleet` picks its detail: `summary` (default: active agents, 1h and 24h totals and one row per model with invocations, errors and cost), `none` (fleet null) or `full` (usage over 5m/1h/24h by project, provider and model). A child node's own projects and inbox are never included: send down to that child to ask. Refused for a caller that holds no manager node seat (manager_tier_not_node_seat). Read-only. AgentGlobalOverview is its v0-shaped alias.",
             parameters_json: MANAGER_OVERVIEW_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerOverview),
         },
@@ -1477,6 +5142,48 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = Lazy
             parameters_json: UPDATE_PROJECT_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlUpdateProject),
         },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::OperatorTodoUpsert,
+            method: "AgentOperatorTodoUpsert",
+            description: "Any manager seat (area, project or portfolio of any tier; #1747): put a thing only the operator can do on the operator's to-do list instead of repeating it in chat. Give a stable todo_key, a one-line title, the exact command or keys in how, an optional link (issue:#N, session:<uuid> or a URL) and a priority (1 most urgent, default 3). The daemon derives the item's scope from your seat (your project, area or portfolio node); you cannot name another. The same todo_key in your scope updates the open item; a closed item stays closed (operator_todo_closed): use a new key. A replay under the same idempotency_key returns the same item. At most 64 open items per scope (operator_todo_limit). Refused: operator_todo_not_authorized, operator_todo_invalid_request.",
+            parameters_json: OPERATOR_TODO_UPSERT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlOperatorTodoUpsert),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::OperatorTodoClose,
+            method: "AgentOperatorTodoClose",
+            description: "Any manager seat (#1747): close an operator to-do item when you observe it was done (status done, observed true, evidence = what you saw) or no longer applies (status dismissed, evidence = why). Evidence is always recorded on the item; you never mark an item done on the operator's behalf. Name the item by todo_id or by the todo_key of an item in your own scope. A project or area seat closes only items of its own scope (operator_todo_not_in_scope); a portfolio seat may close any item by todo_id. A replay under the same idempotency_key returns the same closed item, and so does a close of an item that is already closed (the operator or another seat closed it first; nothing is written and the reply carries the recorded status and evidence). Refused: operator_todo_evidence_required, operator_todo_not_found, operator_todo_not_authorized.",
+            parameters_json: OPERATOR_TODO_CLOSE_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlOperatorTodoClose),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::StandingDirective,
+            method: "AgentStandingDirective",
+            description: "Any manager seat (#2649): relay an operator's standing instruction to a manager scope strictly below your own so it survives every seat rotation without a hand-copied handoff, or clear one a manager relayed. The daemon holds the directive on the scope (project:<uuid>, area:<uuid> or portfolio:<uuid>), not on a session, and puts it verbatim in the authority catalog of every seat of that scope, in a context-cap successor's launch prompt, and in AgentManagerOverview / AgentGlobalOverview. action set needs scope, text (the operator's words, at most 2048 bytes), provenance (where and when the operator said it: a relay without it is refused), idempotency_key, and may carry expires_in_secs (for a while-away directive; absent means until cleared); at most 8 active per scope. action clear needs only directive_id. You cannot write your own scope, and a directive the operator wrote only the operator clears. The author is derived from your seat, never read from the request. Refused: standing_directive_not_authorized, standing_directive_invalid_request, standing_directive_not_found, standing_directive_limit, standing_directive_idempotency_conflict, manager_tier_target_unknown.",
+            parameters_json: STANDING_DIRECTIVE_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlStandingDirective),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ListSourceWorktreeCohorts,
+            method: "AgentListSourceWorktreeCohorts",
+            description: "List source-worktree cohorts covered by your operator-granted storage_control capability. Only a current Execute-mode, unpaused project manager or portfolio seat may call this. Scope is checked per root: every foreign owner, participant and receipt owner, regardless of status, is retained with a typed audit disposition. Only covered terminal owners without live consumers may settle through these agent controls. Runs locally on the hub or satellite under its own seat policy.",
+            parameters_json: LIST_SOURCE_WORKTREE_COHORTS_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlListSourceWorktreeCohorts),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::AuditSourceWorktreeCohort,
+            method: "AgentAuditSourceWorktreeCohort",
+            description: "Audit a covered repository cohort without writes, using the operator settlement proof. Requires storage_control on a current Execute-mode, unpaused PM or portfolio seat. fields summary returns counts_by_disposition, applyable, plan_digest, authorization_phrase, only eligible items and last_run_retained_root_count (within your coverage); fields full keeps every item and last_run_retained_roots. Omitted fields defaults to summary when nothing is applyable, full otherwise. Summary preserves the exact apply inputs. Only terminal, clean, integrated-ancestor sandbox worktrees with no live custody or path dependencies can be eligible. Dirty and non-ancestor work is retained.",
+            parameters_json: AUDIT_SOURCE_WORKTREE_COHORT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlAuditSourceWorktreeCohort),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::ApplySourceWorktreeCohort,
+            method: "AgentApplySourceWorktreeCohort",
+            description: "Settle eligible merged source worktrees yourself when disk is low; never ask the operator to perform settlement. Requires operator-granted storage_control on a current Execute-mode, unpaused PM or portfolio seat associated with the repository; ownership is checked per root. Send the audit plan_digest, exact authorization_phrase as authorization and a stable idempotency_key. Calls the same audited apply as the operator: records durable intent, rechecks authority and Git/custody proof before removing only clean terminal integrated-ancestor sandbox roots and their exact source branches. Returns at once (within seconds, however many roots) with the durable run receipt while the run keeps applying in the daemon (finished_at is unset while it runs; a whole cohort can take many minutes, so never wait on this call); exact retries return the run's current receipt and never start a second driver. To wait for the end without polling, arm AgentScheduleWake mode when with when.settlement_run_settled set to the receipt's run_id; the wake reports the run state and per-phase counts, and a retry of this call then returns the finished receipt. Dirty, non-ancestor and dependent work is retained. No database rows are deleted.",
+            parameters_json: APPLY_SOURCE_WORKTREE_COHORT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlApplySourceWorktreeCohort),
+        },
     ]
 });
 
@@ -1489,6 +5196,21 @@ pub fn agent_control_catalog_v1() -> &'static [AgentControlDescriptorV1] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn allowed_launches_schema_caps_match_daemon_limit() {
+        let cap = crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES as u64;
+        let push: Value = serde_json::from_str(PUSH_SATELLITE_POLICY_SCHEMA).unwrap();
+        assert_eq!(
+            push["properties"]["policy"]["properties"]["allowed_launches"]["maxItems"],
+            cap
+        );
+        let appoint: Value = serde_json::from_str(&MANAGER_APPOINT_CHILD_SCHEMA).unwrap();
+        assert_eq!(
+            appoint["properties"]["target"]["oneOf"][1]["properties"]["allowed_launches"]["maxItems"],
+            cap
+        );
+    }
+
     use crate::agent_coordination::{
         AgentArchiveChildRequestV1, AgentContinueChildRequestV1, AgentGetProgressParamsV1,
         AgentReserveSuccessorRequestV1, AgentSendMessageRequestV1, AgentSpawnChildRequestV1,
@@ -1507,7 +5229,8 @@ mod tests {
     };
     use crate::topology_agent::{
         AgentTopologyExecuteRequestV1, AgentTopologyGetExecutionRequestV1,
-        AgentTopologyInterruptRequestV1, AgentTopologyListRequestV1, AgentTopologyUpsertRequestV1,
+        AgentTopologyGetRequestV1, AgentTopologyInterruptRequestV1, AgentTopologyListRequestV1,
+        AgentTopologyUpsertRequestV1,
     };
     use crate::types::IssueEventPageRequestV1;
     use std::collections::BTreeSet;
@@ -1645,6 +5368,9 @@ mod tests {
             AgentControlVerbV1::TopologyList => {
                 serde_json::from_value::<AgentTopologyListRequestV1>(value).map(drop)
             }
+            AgentControlVerbV1::TopologyGet => {
+                serde_json::from_value::<AgentTopologyGetRequestV1>(value).map(drop)
+            }
             AgentControlVerbV1::TopologyExecute => {
                 serde_json::from_value::<AgentTopologyExecuteRequestV1>(value).map(drop)
             }
@@ -1679,6 +5405,18 @@ mod tests {
                 crate::rolling_queue::AgentEnqueueLandingSourceRequestV1,
             >(value)
             .map(drop),
+            AgentControlVerbV1::ListRollingQueue => serde_json::from_value::<
+                crate::rolling_queue::AgentListRollingQueueRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::CancelRollingQueueEntry => serde_json::from_value::<
+                crate::rolling_queue::AgentCancelRollingQueueEntryRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::CheckLandingCandidate => serde_json::from_value::<
+                crate::agent_landing_candidate::AgentCheckLandingCandidateRequestV1,
+            >(value)
+            .map(drop),
             AgentControlVerbV1::ReadSessionEvents => serde_json::from_value::<
                 crate::agent_session_events::AgentReadSessionEventsRequestV1,
             >(value)
@@ -1701,6 +5439,18 @@ mod tests {
             .map(drop),
             AgentControlVerbV1::QueryFailureSignatures => serde_json::from_value::<
                 crate::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::WorkerRoster => serde_json::from_value::<
+                crate::agent_worker_roster::AgentWorkerRosterRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::PushSatelliteManagerPolicy => serde_json::from_value::<
+                crate::satellite_manager_policy::AgentPushSatelliteManagerPolicyRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::ReseatSatelliteManager => serde_json::from_value::<
+                crate::manager_reseat::AgentReseatSatelliteManagerRequestV1,
             >(value)
             .map(drop),
             AgentControlVerbV1::RequestDeploy => {
@@ -1751,6 +5501,30 @@ mod tests {
                 serde_json::from_value::<crate::agent_projects::AgentUpdateProjectRequestV1>(value)
                     .map(drop)
             }
+            AgentControlVerbV1::ListSourceWorktreeCohorts => serde_json::from_value::<
+                crate::cohort_settlement::ListSourceWorktreeCohortsParams,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::AuditSourceWorktreeCohort => serde_json::from_value::<
+                crate::cohort_settlement::AgentAuditSourceWorktreeCohortParams,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::ApplySourceWorktreeCohort => serde_json::from_value::<
+                crate::cohort_settlement::ApplySourceWorktreeCohortParams,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::OperatorTodoUpsert => serde_json::from_value::<
+                crate::operator_todos::AgentOperatorTodoUpsertRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::OperatorTodoClose => serde_json::from_value::<
+                crate::operator_todos::AgentOperatorTodoCloseRequestV1,
+            >(value)
+            .map(drop),
+            AgentControlVerbV1::StandingDirective => serde_json::from_value::<
+                crate::standing_directives::AgentStandingDirectiveRequestV1,
+            >(value)
+            .map(drop),
         }
     }
 
@@ -1781,7 +5555,6 @@ mod tests {
                 "AgentContinueChild",
                 "AgentArchiveChild",
                 "AgentCancelWake",
-                "AgentListWakes",
                 "AgentManagerDelegateNode",
                 "AgentManagerEscalate",
                 "AgentManagerListEscalations",
@@ -1796,6 +5569,8 @@ mod tests {
                 "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentPushSatelliteManagerPolicy",
+                "AgentReseatSatelliteManager",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
@@ -1833,6 +5608,42 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_catalog_documents_and_validates_integration_test_targets() {
+        let descriptor = agent_control_catalog_v1()
+            .into_iter()
+            .find(|entry| entry.method == "AgentSubmitJob")
+            .unwrap();
+        let schema = descriptor.parameters();
+        assert!(
+            schema["properties"]["params"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("test_target?")
+        );
+        assert!(descriptor.description.contains("test_target"));
+        let valid = serde_json::json!({"kind":"test","params":{"package":"rsi-common","test_target":"manifest_dir_guard","exact":true,"filters":["tests::one"]}});
+        assert!(descriptor.verb.validate_params(&valid).is_ok());
+        for extra in [
+            serde_json::json!({"test_target":"../guard"}),
+            serde_json::json!({"test_target":"guard;id"}),
+            serde_json::json!({"test_target":true}),
+            serde_json::json!({"lib_only":true}),
+            serde_json::json!({"exact":false}),
+            serde_json::json!({"filters":[]}),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["params"]
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                descriptor.verb.validate_params(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn submit_job_catalog_documents_and_validates_package_exact_matching() {
         let descriptor = agent_control_catalog_v1()
             .into_iter()
@@ -1862,7 +5673,6 @@ mod tests {
                 "{{\"schema_version\":1,\"method\":\"{}\",\"parameters\":{{",
                 descriptor.method
             )));
-            assert!(!first.contains('\n'));
         }
     }
 
@@ -1932,35 +5742,39 @@ mod tests {
             AgentControlVerbV1::ListIssues.validate_params(&serde_json::json!({"ready":true})),
             Ok(())
         );
-        assert_eq!(
+        assert!(
             AgentControlVerbV1::ListIssues
-                .validate_params(&serde_json::json!({"ready":true,"extra":false})),
-            Err(AgentControlParamErrorV1::params())
+                .validate_params(&serde_json::json!({"ready":true,"extra":false}))
+                .is_err()
         );
-        assert_eq!(
-            AgentControlVerbV1::GetIssue.validate_params(&serde_json::json!({
-                "issue_id":"5d73c05d-1040-49f7-92ab-0123456789ab","extra":false
-            })),
-            Err(AgentControlParamErrorV1::params())
+        assert!(
+            AgentControlVerbV1::GetIssue
+                .validate_params(&serde_json::json!({
+                    "issue_id":"5d73c05d-1040-49f7-92ab-0123456789ab","extra":false
+                }))
+                .is_err()
         );
 
         let mut zero_fence = fixture(AgentControlVerbV1::ManagerControl);
         zero_fence["fence"]["scope_version"] = serde_json::json!(0);
-        assert_eq!(
-            AgentControlVerbV1::ManagerControl.validate_params(&zero_fence),
-            Err(AgentControlParamErrorV1::params())
+        assert!(
+            AgentControlVerbV1::ManagerControl
+                .validate_params(&zero_fence)
+                .is_err()
         );
         let oversized = serde_json::json!({
             "kind":"Task", "query":"x".repeat(262_145), "idempotency_key":"key"
         });
-        assert_eq!(
-            AgentControlVerbV1::SpawnChild.validate_params(&oversized),
-            Err(AgentControlParamErrorV1::params())
+        assert!(
+            AgentControlVerbV1::SpawnChild
+                .validate_params(&oversized)
+                .is_err()
         );
         let forged = serde_json::json!({"session_id":"5d73c05d-1040-49f7-92ab-0123456789ab","caller_session_id":"x"});
-        assert_eq!(
-            AgentControlVerbV1::GetStatus.validate_params(&forged),
-            Err(AgentControlParamErrorV1::params())
+        assert!(
+            AgentControlVerbV1::GetStatus
+                .validate_params(&forged)
+                .is_err()
         );
     }
 
@@ -1968,7 +5782,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn fixed_schema_contract_fixtures_pin_all_verbs() {
         let shapes: &[(AgentControlVerbV1, &[&str], &[&str])] = &[
-            (AgentControlVerbV1::GetAuthorityCatalog, &["verb"], &[]),
+            (
+                AgentControlVerbV1::GetAuthorityCatalog,
+                &["fields", "verb"],
+                &[],
+            ),
             (
                 AgentControlVerbV1::SpawnChild,
                 &[
@@ -2006,9 +5824,10 @@ mod tests {
                     "expires_at",
                     "idempotency_key",
                     "message",
+                    "session_id",
                     "target_session_id",
                 ],
-                &["target_session_id", "message", "idempotency_key"],
+                &["message", "idempotency_key"],
             ),
             (AgentControlVerbV1::GetStatus, &["session_id"], &[]),
             (AgentControlVerbV1::Halt, &["session_id"], &[]),
@@ -2019,10 +5838,10 @@ mod tests {
                     "expected_event_sequence",
                     "expected_tip_session_id",
                     "query",
+                    "session_id",
                     "target_session_id",
                 ],
                 &[
-                    "target_session_id",
                     "query",
                     "expected_tip_session_id",
                     "expected_event_sequence",
@@ -2034,13 +5853,10 @@ mod tests {
                     "expected_custody_generation",
                     "expected_event_sequence",
                     "expected_tip_session_id",
+                    "session_id",
                     "target_session_id",
                 ],
-                &[
-                    "target_session_id",
-                    "expected_tip_session_id",
-                    "expected_event_sequence",
-                ],
+                &["expected_tip_session_id", "expected_event_sequence"],
             ),
             (
                 AgentControlVerbV1::ScheduleWake,
@@ -2060,7 +5876,7 @@ mod tests {
             (AgentControlVerbV1::CancelWake, &["job_id", "name"], &[]),
             (
                 AgentControlVerbV1::ListWakes,
-                &["include_disabled", "limit"],
+                &["include_disabled", "limit", "session_id"],
                 &[],
             ),
             (
@@ -2082,6 +5898,8 @@ mod tests {
                 &[
                     "archive",
                     "cursor",
+                    "fields",
+                    "labels",
                     "limit",
                     "order",
                     "ready",
@@ -2104,7 +5922,9 @@ mod tests {
                     "clear_priority",
                     "display_number",
                     "expected_row_version",
+                    "handoff",
                     "idempotency_key",
+                    "include_issue",
                     "issue_id",
                     "labels",
                     "priority",
@@ -2118,7 +5938,9 @@ mod tests {
                     "display_number",
                     "expected_row_version",
                     "idempotency_key",
+                    "include_issue",
                     "issue_id",
+                    "note",
                     "status",
                 ],
                 &["status", "expected_row_version", "idempotency_key"],
@@ -2140,7 +5962,7 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ManagerProgress,
-                &["after_epic_id", "limit"],
+                &["after_epic_id", "fields", "limit"],
                 &[],
             ),
             (
@@ -2148,8 +5970,11 @@ mod tests {
                 &[
                     "after_notice_sequence",
                     "after_sequence",
+                    "fields",
+                    "include_sent",
                     "limit",
                     "notice_kind",
+                    "read_notice_ids",
                     "request_id",
                     "settle_notice_ids",
                 ],
@@ -2172,7 +5997,7 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ManagerInspect,
-                &["cursor", "epic_id", "limit", "section"],
+                &["cursor", "epic_id", "include_history", "limit", "section"],
                 &[],
             ),
             (
@@ -2215,6 +6040,7 @@ mod tests {
                     "launch",
                     "parent_epic_id",
                     "qa_lane",
+                    "related",
                     "review_of",
                     "sandbox_source",
                 ],
@@ -2316,7 +6142,19 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::TopologyList,
-                &["cursor", "epic_id", "include_executions", "limit", "scope"],
+                &[
+                    "cursor",
+                    "epic_id",
+                    "include_executions",
+                    "include_settled",
+                    "limit",
+                    "scope",
+                ],
+                &[],
+            ),
+            (
+                AgentControlVerbV1::TopologyGet,
+                &["name", "topology_id"],
                 &[],
             ),
             (
@@ -2328,7 +6166,9 @@ mod tests {
                     "idempotency_key",
                     "inputs",
                     "on_call",
+                    "supersedes_execution",
                     "topology_id",
+                    "wake",
                 ],
                 &[
                     "topology_id",
@@ -2355,6 +6195,7 @@ mod tests {
                     "name",
                     "params",
                     "sandbox_session_id",
+                    "source_session_id",
                     "wake",
                     "worktree",
                 ],
@@ -2366,12 +6207,31 @@ mod tests {
             (
                 AgentControlVerbV1::EnqueueLandingSource,
                 &[
+                    "derive_filters",
+                    "fixes_issue",
+                    "fixes_tests",
                     "idempotency_key",
                     "source_commit",
                     "source_session_id",
+                    "supersedes",
                     "test_filters",
                 ],
                 &["source_commit", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::ListRollingQueue,
+                &["before_sequence", "limit", "state"],
+                &[],
+            ),
+            (
+                AgentControlVerbV1::CancelRollingQueueEntry,
+                &["entry_id", "reason"],
+                &["entry_id"],
+            ),
+            (
+                AgentControlVerbV1::CheckLandingCandidate,
+                &["job_id", "source_commit", "source_session_id"],
+                &["source_commit"],
             ),
             (AgentControlVerbV1::GetProviderStatus, &["provider"], &[]),
             (AgentControlVerbV1::GetDaemonInfo, &[], &[]),
@@ -2380,8 +6240,9 @@ mod tests {
                 &["digest", "test_id"],
                 &[],
             ),
+            (AgentControlVerbV1::WorkerRoster, &["limit", "states"], &[]),
             (AgentControlVerbV1::GlobalOverview, &[], &[]),
-            (AgentControlVerbV1::ManagerOverview, &[], &[]),
+            (AgentControlVerbV1::ManagerOverview, &["fleet"], &[]),
             (
                 AgentControlVerbV1::CreateProject,
                 &["color", "description", "name", "path"],
@@ -2391,6 +6252,43 @@ mod tests {
                 AgentControlVerbV1::UpdateProject,
                 &["color", "description", "name", "path", "project_id"],
                 &["project_id"],
+            ),
+            (
+                AgentControlVerbV1::OperatorTodoUpsert,
+                &[
+                    "how",
+                    "idempotency_key",
+                    "link",
+                    "priority",
+                    "title",
+                    "todo_key",
+                ],
+                &["todo_key", "title", "how", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::OperatorTodoClose,
+                &[
+                    "evidence",
+                    "idempotency_key",
+                    "observed",
+                    "status",
+                    "todo_id",
+                    "todo_key",
+                ],
+                &["status", "evidence", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::StandingDirective,
+                &[
+                    "action",
+                    "directive_id",
+                    "expires_in_secs",
+                    "idempotency_key",
+                    "provenance",
+                    "scope",
+                    "text",
+                ],
+                &["action"],
             ),
             (
                 AgentControlVerbV1::GlobalSend,
@@ -2425,13 +6323,52 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ManagerAppointChild,
-                &["idempotency_key", "launch", "query", "sandbox", "target"],
+                &[
+                    "handoff",
+                    "idempotency_key",
+                    "launch",
+                    "query",
+                    "sandbox",
+                    "target",
+                ],
                 &["target", "launch", "query", "idempotency_key"],
             ),
             (
                 AgentControlVerbV1::ManagerRevokeChild,
                 &["expected_grant_version", "idempotency_key", "node_id"],
                 &["node_id", "expected_grant_version", "idempotency_key"],
+            ),
+            (
+                AgentControlVerbV1::PushSatelliteManagerPolicy,
+                &[
+                    "expected_policy_version",
+                    "expected_scope_version",
+                    "idempotency_key",
+                    "peer_id",
+                    "policy",
+                    "remote_session_id",
+                ],
+                &[
+                    "peer_id",
+                    "remote_session_id",
+                    "expected_scope_version",
+                    "expected_policy_version",
+                    "idempotency_key",
+                    "policy",
+                ],
+            ),
+            (
+                AgentControlVerbV1::ReseatSatelliteManager,
+                &[
+                    "effort",
+                    "model",
+                    "peer_id",
+                    "provider",
+                    "provider_unavailable",
+                    "reason",
+                    "remote_session_id",
+                ],
+                &["peer_id", "remote_session_id", "provider", "reason"],
             ),
             (
                 AgentControlVerbV1::RequestDeploy,
@@ -2457,9 +6394,11 @@ mod tests {
                 &[
                     "expires_at",
                     "idempotency_key",
+                    "issue_refs",
                     "message",
                     "peer_id",
                     "remote_session_id",
+                    "scope_project_id",
                 ],
                 &["peer_id", "remote_session_id", "message", "idempotency_key"],
             ),
@@ -2478,6 +6417,27 @@ mod tests {
                     "attempt_id",
                     "action",
                     "expected_row_version",
+                    "idempotency_key",
+                ],
+            ),
+            (AgentControlVerbV1::ListSourceWorktreeCohorts, &[], &[]),
+            (
+                AgentControlVerbV1::AuditSourceWorktreeCohort,
+                &["fields", "repository_identity"],
+                &["repository_identity"],
+            ),
+            (
+                AgentControlVerbV1::ApplySourceWorktreeCohort,
+                &[
+                    "authorization",
+                    "idempotency_key",
+                    "plan_digest",
+                    "repository_identity",
+                ],
+                &[
+                    "repository_identity",
+                    "plan_digest",
+                    "authorization",
                     "idempotency_key",
                 ],
             ),
@@ -2563,8 +6523,8 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(
-            progress["properties"]["session_ids"]["items"]["format"],
-            "uuid"
+            progress["properties"]["session_ids"]["items"]["pattern"],
+            crate::agent_id_ref::ID_REF_PATTERN
         );
 
         let message = AgentControlVerbV1::SendMessage.descriptor().parameters();
@@ -2595,13 +6555,44 @@ mod tests {
                 serde_json::json!(["string", "null"])
             );
             assert_eq!(target["properties"]["session_id"]["default"], Value::Null);
-            assert_eq!(target["properties"]["session_id"]["format"], "uuid");
+            if verb == AgentControlVerbV1::GetStatus {
+                // #2312: a read verb takes a unique id prefix too.
+                assert_eq!(
+                    target["properties"]["session_id"]["pattern"],
+                    crate::agent_id_ref::ID_REF_PATTERN
+                );
+            } else {
+                assert_eq!(target["properties"]["session_id"]["format"], "uuid");
+            }
         }
 
         let wake = AgentControlVerbV1::ScheduleWake.descriptor().parameters();
         assert_eq!(
             wake["properties"]["mode"]["enum"],
             serde_json::json!(["fresh", "resume", "on_terminal", "program_guard", "when"])
+        );
+        // #2261: the topology execution predicate is listed beside the others.
+        let predicates = wake["properties"]["when"]["properties"]
+            .as_object()
+            .expect("when predicates");
+        for name in [
+            "jobs_terminal",
+            "sha_on_rolling",
+            "issue_closed",
+            "todo_closed",
+            "topology_execution_settled",
+            "settlement_run_settled",
+            "health_anomaly",
+        ] {
+            assert!(predicates.contains_key(name), "{name}");
+        }
+        assert_eq!(predicates["topology_execution_settled"]["format"], "uuid");
+        assert_eq!(predicates["settlement_run_settled"]["format"], "uuid");
+        assert!(
+            wake["properties"]["when"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("topology_execution_settled")
         );
         assert_eq!(wake["properties"]["in_seconds"]["minimum"], 1);
         assert_eq!(wake["properties"]["every_seconds"]["minimum"], 1);
@@ -2649,10 +6640,12 @@ mod tests {
         );
         assert_eq!(update["properties"]["title"]["maxLength"], 512);
         assert_eq!(update["properties"]["body"]["maxLength"], 65_536);
+        assert_eq!(update["properties"]["handoff"]["maxLength"], 65_536);
         assert_eq!(update["properties"]["labels"]["maxItems"], 64);
         assert_eq!(update["properties"]["priority"]["maximum"], 4);
         assert_eq!(update["properties"]["clear_priority"]["default"], false);
         assert_eq!(update["properties"]["clear_assignee"]["default"], false);
+        assert_eq!(update["properties"]["include_issue"]["default"], false);
 
         let status = AgentControlVerbV1::UpdateIssueStatus
             .descriptor()
@@ -2662,6 +6655,7 @@ mod tests {
             serde_json::json!(["Open", "InProgress", "Closed", "Cancelled"])
         );
         assert_eq!(status["properties"]["expected_row_version"]["minimum"], 1);
+        assert_eq!(status["properties"]["include_issue"]["default"], false);
 
         for verb in [
             AgentControlVerbV1::ArchiveIssue,
@@ -2818,6 +6812,9 @@ mod tests {
         );
         assert_eq!(inbox["properties"]["request_id"]["format"], "uuid");
         assert_eq!(defaults.request_id, None);
+        assert!(!defaults.include_sent);
+        assert_eq!(inbox["properties"]["include_sent"]["type"], "boolean");
+        assert_eq!(inbox["properties"]["include_sent"]["default"], false);
         assert_eq!(
             inbox["properties"]["after_notice_sequence"]["default"],
             defaults.after_notice_sequence
@@ -2831,7 +6828,25 @@ mod tests {
             inbox["properties"]["settle_notice_ids"]["items"]["format"],
             "uuid"
         );
+        assert_eq!(
+            inbox["properties"]["read_notice_ids"]["maxItems"],
+            HARNESS_MANAGER_MAX_INBOX_PAGE
+        );
+        assert_eq!(
+            inbox["properties"]["read_notice_ids"]["items"]["format"],
+            "uuid"
+        );
+        assert!(defaults.read_notice_ids.is_empty());
         assert_eq!(inbox["properties"]["notice_kind"]["default"], Value::Null);
+        assert_eq!(inbox["properties"]["fields"]["default"], "compact");
+        assert_eq!(
+            inbox["properties"]["fields"]["enum"],
+            serde_json::json!(["compact", "full", "summary"])
+        );
+        assert_eq!(
+            defaults.fields,
+            crate::harness_manager::AgentManagerInboxFieldsV1::Compact
+        );
         for limit in [0, HARNESS_MANAGER_MAX_INBOX_PAGE + 1] {
             assert!(
                 AgentManagerInboxRequestV1 {
@@ -2991,6 +7006,7 @@ mod tests {
             [
                 ("AgentTopologyUpsert", Some("rsi_control_topology_upsert")),
                 ("AgentTopologyList", Some("rsi_control_topology_list")),
+                ("AgentTopologyGet", Some("rsi_control_topology_get")),
                 ("AgentTopologyExecute", Some("rsi_control_topology_execute")),
                 (
                     "AgentTopologyGetExecution",
@@ -3038,32 +7054,23 @@ mod tests {
             request("discard", Some("abc")),
             request("retry", Some(commit)),
         ] {
-            assert_eq!(
-                resolve.validate_params(&invalid),
-                Err(AgentControlParamErrorV1::params()),
-                "{invalid}"
-            );
+            assert!(resolve.validate_params(&invalid).is_err(), "{invalid}");
         }
         let execute = AgentControlVerbV1::TopologyExecute;
         let mut spoof = fixture(execute);
         spoof["requested_by_session_id"] = serde_json::json!(id);
-        assert_eq!(
-            execute.validate_params(&spoof),
-            Err(AgentControlParamErrorV1::params())
-        );
+        assert!(execute.validate_params(&spoof).is_err());
         let mut digest = fixture(execute);
         digest["expected_digest"] = serde_json::json!("sha256:ABC");
-        assert_eq!(
-            execute.validate_params(&digest),
-            Err(AgentControlParamErrorV1::params())
-        );
+        assert!(execute.validate_params(&digest).is_err());
         assert_eq!(
             AgentControlVerbV1::TopologyList.validate_params(&serde_json::json!({})),
             Ok(())
         );
-        assert_eq!(
-            AgentControlVerbV1::TopologyList.validate_params(&serde_json::json!({"limit": 33})),
-            Err(AgentControlParamErrorV1::params())
+        assert!(
+            AgentControlVerbV1::TopologyList
+                .validate_params(&serde_json::json!({"limit": 33}))
+                .is_err()
         );
     }
 

@@ -539,7 +539,8 @@ async fn manager_v2_successor_service_cleanup_failure_and_reopen_retain_capacity
             );
         }
         f.manager.persistence.barrier().await.unwrap();
-        *f.manager.store.lock().await = Store::open(&f.dir.path().join("rsi.db")).unwrap();
+        *f.manager.store.lock().await =
+            Store::open_test_fixture(&f.dir.path().join("rsi.db")).unwrap();
         let _lease = inventory.scoped_runtime_reap_root(id).unwrap();
         let error = f
             .manager

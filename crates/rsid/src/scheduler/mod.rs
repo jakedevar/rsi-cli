@@ -1,9 +1,21 @@
 mod child_gate;
 #[cfg(test)]
 mod child_gate_tests;
+#[cfg(test)]
+mod delivery_claim_tests;
+#[cfg(test)]
+mod gone_wake_tests;
+#[cfg(test)]
+mod refusal_code_tests;
+#[cfg(test)]
+mod wake_delivery_tests;
+mod wake_recovery;
+#[cfg(test)]
+mod wake_recovery_tests;
 mod wake_when;
 #[cfg(test)]
-mod wake_when_tests;
+pub(crate) mod wake_when_tests;
+pub(crate) use wake_when::{arm_authorized, arm_authorized_deduped};
 
 pub(crate) use crate::store_support::wake_target::is_live_wake_target;
 use std::sync::Arc;
@@ -33,12 +45,15 @@ use crate::watchdog::LoopHeartbeat;
 /// target or its message, so the same wake may succeed unchanged once the
 /// condition clears. `DaemonError` renders them as text (e.g.
 /// `Policy denied: Invalid parameter: manager_v2_concurrency_capacity`), so the
-/// match is by stable code substring.
-const TRANSIENT_RESUME_REFUSAL_CODES: [&str; 4] = [
+/// match is by stable code substring. `tree_occupied` (#1185) is the effective
+/// worktree fence: a live fresh-wake lineage writes the target's tree, so the
+/// resume never ran and succeeds unchanged once that writer settles.
+const TRANSIENT_RESUME_REFUSAL_CODES: [&str; 5] = [
     "manager_v2_concurrency_capacity",
     "manager_v2_provider_capacity",
     "background model work is paused",
     "all model work is stopped",
+    crate::session::tree_admission::TREE_OCCUPIED_CODE,
 ];
 
 /// The transient capacity/pause code carried by `error`, if any.
@@ -58,11 +73,69 @@ pub(crate) fn retryable_resume_refusal(error: &DaemonError) -> bool {
         || transient_resume_refusal_code(error).is_some()
         // #1073: the drain engaged between the wake precheck and the
         // continuation; the wake stays due and is retried after the deploy.
-        || crate::deploy_drain::is_draining_error(error)
+        || crate::deploy_drain::is_held_for_restart(error)
         // #1157: effect admission surrendered a busy custody stripe after its
         // bounded wait; nothing ran, so the wake backs off and the scheduler
         // keeps serving other jobs.
         || crate::store::custody_lock_order::is_lock_order_busy_error(error)
+}
+
+/// #2477: refusals that mean "not now" for a satisfied predicate wake and
+/// resolve without any action on the wake: the target is mid-turn, or the
+/// provider circuit is open. They are re-checked on this delay and spend no
+/// retry budget.
+fn unspent_wake_delay(error: &DaemonError) -> Option<chrono::Duration> {
+    if continuation_fence_code(error)
+        == Some(crate::store::manager_actions::fence::CONTINUATION_TARGET_BUSY)
+    {
+        return Some(chrono::Duration::seconds(30));
+    }
+    error
+        .to_string()
+        .contains(PROVIDER_CIRCUIT_OPEN)
+        .then(|| chrono::Duration::seconds(60))
+}
+
+/// The admission denial reason of an open provider circuit
+/// (`model_control` `circuit_open`).
+const PROVIDER_CIRCUIT_OPEN: &str = "provider circuit is open";
+
+/// Every sandbox-custody refusal class (`SandboxCustodyErrorCodeV1`) as the
+/// `sandbox_custody:<code>` text a refusal renders and a retry records.
+const SANDBOX_CUSTODY_REFUSAL_CODES: [&str; 17] = [
+    "sandbox_custody:tuple_incomplete",
+    "sandbox_custody:historical_purged",
+    "sandbox_custody:historical_transferred",
+    "sandbox_custody:cleanup_failed",
+    "sandbox_custody:root_missing",
+    "sandbox_custody:root_outside_base",
+    "sandbox_custody:root_identity_mismatch",
+    "sandbox_custody:worktree_mismatch",
+    "sandbox_custody:ownership_missing",
+    "sandbox_custody:ownership_conflict",
+    "sandbox_custody:custody_changed",
+    "sandbox_custody:reclaim_prepared",
+    "sandbox_custody:root_busy",
+    "sandbox_custody:source_revision_unavailable",
+    "sandbox_custody:source_worktree_dirty",
+    "sandbox_custody:allocation_failed",
+    "sandbox_custody:persistence_transition_failed",
+];
+
+/// The `sandbox_custody:<code>` class of a custody refusal, so a wake the
+/// target's missing or foreign custody keeps refusing is logged and recorded
+/// under its real cause, not as a continuation fence (#2956).
+fn sandbox_custody_refusal_code(error: &DaemonError) -> Option<&'static str> {
+    let text = error.to_string();
+    let start = text.find("sandbox_custody:")?;
+    let rest = &text[start..];
+    SANDBOX_CUSTODY_REFUSAL_CODES
+        .iter()
+        .find(|code| {
+            rest.strip_prefix(**code)
+                .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_lowercase() || c == '_'))
+        })
+        .copied()
 }
 
 /// The retry code recorded and logged for a retained wake refusal.
@@ -73,6 +146,9 @@ fn resume_refusal_code(error: &DaemonError) -> &'static str {
             crate::store::custody_lock_order::is_lock_order_busy_error(error)
                 .then_some("custody_root_busy")
         })
+        // After the busy check: `root_busy` is itself a custody class with its
+        // own recorded code.
+        .or_else(|| sandbox_custody_refusal_code(error))
         .unwrap_or("continuation_fence")
 }
 
@@ -251,6 +327,11 @@ async fn process_due_jobs(
     launcher: &Arc<dyn SessionLauncher>,
     heartbeat: Option<&LoopHeartbeat>,
 ) {
+    // #2528: once the daemon has decided to restart, no tick reads or fires a
+    // due job (nor reconciles the watches that would wake a manager).
+    if launcher.restart_draining() {
+        return;
+    }
     let now = Utc::now();
     let due_jobs = {
         let guard = store.lock().await;
@@ -273,19 +354,29 @@ async fn process_due_jobs(
     };
 
     for job in due_jobs {
+        // #2528: the restart decision may land between two jobs of one tick.
+        // The remaining due rows stay pending for the next incarnation.
+        if launcher.restart_draining() {
+            tracing::info!("Scheduler paused: daemon restart in progress; due jobs stay pending");
+            return;
+        }
         fire_job(store, bus, launcher, &job).await;
         if let Some(heartbeat) = heartbeat {
             heartbeat.mark_completed();
         }
     }
+    reconcile_provider_window_notices(store, bus).await;
 }
 
 /// The fast lane: fire only the due predicate wakes.
-async fn process_due_wake_when(
+pub(crate) async fn process_due_wake_when(
     store: &Arc<Mutex<Store>>,
     bus: &Arc<EventBus>,
     launcher: &Arc<dyn SessionLauncher>,
 ) {
+    if launcher.restart_draining() {
+        return;
+    }
     let due = {
         let guard = store.lock().await;
         match guard.list_due_wake_when_jobs(&Utc::now()) {
@@ -297,7 +388,26 @@ async fn process_due_wake_when(
         }
     };
     for job in due {
+        if launcher.restart_draining() {
+            return;
+        }
         fire_job(store, bus, launcher, &job).await;
+    }
+    reconcile_provider_window_notices(store, bus).await;
+}
+
+async fn reconcile_provider_window_notices(store: &Arc<Mutex<Store>>, bus: &Arc<EventBus>) {
+    match store
+        .lock()
+        .await
+        .reconcile_provider_window_notices(Utc::now())
+    {
+        Ok(jobs) => {
+            for job_id in jobs {
+                bus.publish(DaemonEvent::ManagerNoticeQueued { job_id });
+            }
+        }
+        Err(error) => tracing::error!(%error, "provider window notices will retry next tick"),
     }
 }
 
@@ -307,6 +417,10 @@ async fn fire_job_by_id(
     launcher: &Arc<dyn SessionLauncher>,
     job_id: &Uuid,
 ) {
+    if launcher.restart_draining() {
+        tracing::info!(job_id = %job_id, "manual trigger held: daemon restart in progress");
+        return;
+    }
     let job = {
         let guard = store.lock().await;
         match guard.program_guard_owner_for_job_id(job_id) {
@@ -363,6 +477,14 @@ async fn fire_job_inner(
     job: &rsi_common::types::ScheduledJob,
     manual: bool,
 ) {
+    // #2528: the last line of the pause. Every delivery path (resume, watch,
+    // capacity, fresh) passes through here, so a wake that was already past the
+    // tick-level checks when the restart was decided still leaves its row
+    // untouched and fires on the next incarnation.
+    if launcher.restart_draining() {
+        tracing::debug!(job_id = %job.id, "scheduled job held: daemon restart in progress");
+        return;
+    }
     // A restart or long scheduler stall must not deliver a heal outside its
     // wall-clock budget. Persist exhaustion before publishing its final notice.
     //
@@ -509,7 +631,7 @@ async fn fire_job_inner(
                 }
                 // #1073: a waiting deploy holds the capacity wake; the due slot
                 // stays retained and is retried once the deploy settles.
-                Err(error) if crate::deploy_drain::is_draining_error(&error) => {
+                Err(error) if crate::deploy_drain::is_held_for_restart(&error) => {
                     tracing::debug!(job_id = %job.id, "capacity wake held: deploy_draining");
                 }
                 Err(error) => {
@@ -559,11 +681,32 @@ async fn fire_job_inner(
     // #1006: a predicate wake is evaluated by the daemon; it resumes its owner
     // only once the predicate settles (true, unsatisfiable or timed out).
     let predicate_job;
+    // #2477: a daemon-evaluated predicate wake carries the daemon's own
+    // completion signal; its delivery is never consumed by a refusal.
+    let mut is_predicate = false;
     let job = if job.wake_mode == WakeMode::Resume {
-        match wake_when::gate(store, job, manual).await {
+        match wake_when::gate(store, launcher, job, manual).await {
             wake_when::Gate::NotPredicate => job,
             wake_when::Gate::Pending => return,
+            wake_when::Gate::Retire => {
+                // #1935: the owner handed off after arming this wake.
+                let retired = {
+                    let guard = store.lock().await;
+                    child_gate::retire_keepalive(&guard, job)
+                };
+                match retired {
+                    Ok(()) => tracing::info!(
+                        job_id = %job.id,
+                        "when wake retired: its owner already wrote a handoff"
+                    ),
+                    Err(error) => {
+                        tracing::error!(job_id = %job.id, %error, "failed to retire superseded wake")
+                    }
+                }
+                return;
+            }
             wake_when::Gate::Deliver(message) => {
+                is_predicate = true;
                 predicate_job = rsi_common::types::ScheduledJob {
                     message,
                     ..job.clone()
@@ -617,6 +760,33 @@ async fn fire_job_inner(
                 // manual trigger bypasses both, and any read failure delivers
                 // exactly as before this gate existed.
                 if !manual {
+                    // A manager whose `succeed_manager` is unresolved is handing
+                    // its seat over: a resume now would refuse the succession as
+                    // `manager_succession_predecessor_changed`. The row stays due.
+                    // Its publication hands the seat's wakes to the successor (or
+                    // retires them with the displaced seat), and a failed succession
+                    // releases the hold, so the wake is neither lost nor delivered to
+                    // the displaced seat. Any read failure delivers as before.
+                    let handing_over = store
+                        .lock()
+                        .await
+                        .session_has_unresolved_manager_succession(target);
+                    match handing_over {
+                        Ok(true) => {
+                            tracing::debug!(
+                                job_id = %job.id,
+                                target = %target,
+                                "scheduled resume held: manager succession unresolved"
+                            );
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            job_id = %job.id,
+                            %error,
+                            "manager succession state unavailable; delivering the wake"
+                        ),
+                    }
                     // #1073: a waiting deploy holds a child's resume; the row
                     // stays due and is delivered once the deploy settles.
                     if launcher.deploy_holds_resume(target).await {
@@ -670,6 +840,19 @@ async fn fire_job_inner(
                 // payload as daemon traffic. Slash-command payloads pass
                 // through verbatim inside `wrap`.
                 let delivery = rsi_common::daemon_message::wrap("scheduled-wake", &job.message);
+                // #797: claim the delivery durably BEFORE the continuation
+                // launches. A daemon that dies after the provider effect and
+                // before the settlement below leaves the claim behind; the
+                // next incarnation settles it as uncertain instead of
+                // delivering the same wake again.
+                let in_flight = if manual {
+                    None
+                } else {
+                    match claim_resume_delivery(store, bus, job).await {
+                        ResumeClaim::Claimed(guard) => Some(guard),
+                        ResumeClaim::Skip => return,
+                    }
+                };
                 // Bound to this exact row: a stale due-list snapshot of a job
                 // retired or disabled since capture must not resume its target.
                 // #872: a global-manager message is always delivered through the
@@ -684,12 +867,32 @@ async fn fire_job_inner(
                         .resume_scheduled_job(target, delivery, vec![job.id])
                         .await
                 };
+                if resumed.is_err() && in_flight.is_some() {
+                    // A refusal or failure is settled by the arms below as
+                    // before; the claim only guards a crash, not a live error.
+                    if let Err(error) = store.lock().await.clear_delivery_claim(job.id) {
+                        tracing::error!(job_id = %job.id, %error, "failed to clear the delivery claim of a refused wake");
+                    }
+                }
                 match resumed {
                     Ok(session_id) => {
+                        if let Err(error) = store
+                            .lock()
+                            .await
+                            .record_provider_window_wake_resumed(job.id, target)
+                        {
+                            tracing::error!(job_id = %job.id, %error, "could not record provider window wake recovery");
+                        }
                         tracing::info!(
                             "Scheduled resume job '{}' -> resumed session {session_id}",
                             job.name
                         );
+                        // #797 test cut: the daemon dies after the delivery and
+                        // before the settlement below.
+                        #[cfg(test)]
+                        if take_fault_for_test(job.id, "crash_before_wake_settlement") {
+                            return;
+                        }
                         // Delivery settles the row and clears the K2 retry
                         // state in one write.
                         advance_job_after_attempt_clearing_retry(store, job).await;
@@ -732,7 +935,7 @@ async fn fire_job_inner(
                     // #1073: the drain engaged between the precheck and the
                     // continuation. The row stays due, untouched (no retry
                     // attempt is spent), and is delivered after the deploy.
-                    Err(e) if crate::deploy_drain::is_draining_error(&e) => {
+                    Err(e) if crate::deploy_drain::is_held_for_restart(&e) => {
                         tracing::debug!(
                             job_id = %job.id,
                             target = %target,
@@ -745,6 +948,42 @@ async fn fire_job_inner(
                         let until = crate::provider_exhaustion::hold_error_until(&e)
                             .unwrap_or_else(Utc::now);
                         hold_wake_for_provider_exhaustion(store, bus, job, target, until).await;
+                    }
+                    // #3066: the provider's plan window (five-hour, seven-day) is
+                    // exhausted. The refusal names the account, not the wake, so
+                    // it spends no retry budget: the wake is held to the window's
+                    // reset and delivered then, instead of being escalated and
+                    // settled mid-outage with its parked worker stranded. A manual
+                    // trigger keeps the typed refusal arm below.
+                    Err(e)
+                        if !manual && crate::provider_exhaustion::is_usage_window_refusal(&e) =>
+                    {
+                        let until = provider_window_hold_until(store, target).await;
+                        hold_wake_for_provider_exhaustion(store, bus, job, target, until).await;
+                    }
+                    // Permanent source/ownership failures cannot authorize this
+                    // session again. Give the preserved result a recovery owner
+                    // immediately, before the generic predicate retry path.
+                    Err(e) if wake_recovery::permanent_custody_refusal(&e) => {
+                        wake_recovery::settle_recoverable_wake(
+                            store,
+                            bus,
+                            job,
+                            target,
+                            &e.to_string(),
+                            true,
+                        )
+                        .await;
+                    }
+                    // #2477: a satisfied predicate wake whose target is mid-turn
+                    // (or whose provider is briefly refusing) keeps its result.
+                    // It is re-checked on a short delay and spends no retry
+                    // budget: the target ends its turn, the circuit closes, and
+                    // the daemon's completion signal is then delivered.
+                    Err(e) if is_predicate && unspent_wake_delay(&e).is_some() => {
+                        let delay =
+                            unspent_wake_delay(&e).unwrap_or_else(|| chrono::Duration::seconds(30));
+                        hold_predicate_wake_after_refusal(store, job, target, &e, delay).await;
                     }
                     // K2/#996: a retryable refusal (custody fence or transient
                     // capacity/pause) retains the wake with bounded durable
@@ -813,6 +1052,18 @@ async fn fire_job_inner(
                         );
                         advance_job_after_attempt(store, job).await;
                     }
+                    // #2477: any other refusal of a predicate wake (the target
+                    // still exists) retains it with bounded backoff; a settled
+                    // wake is escalated durably, never dropped with a log line.
+                    Err(e)
+                        if is_predicate
+                            && !matches!(e, DaemonError::SessionNotFound(_))
+                            && continuation_fence_code(&e).is_none()
+                            && !crate::error::is_retryable_custody_wake_error(&e) =>
+                    {
+                        tracing::warn!(job_id = %job.id, error = %e, "predicate wake delivery refused; retaining the wake");
+                        settle_retryable_resume_refusal(store, bus, job, target, &e).await;
+                    }
                     Err(e) => {
                         if crate::error::is_retryable_custody_wake_error(&e) {
                             defer_retryable_custody_wake(store, job, &WatchFireCapture::default())
@@ -823,6 +1074,15 @@ async fn fire_job_inner(
                         // #652: a terminal custody refusal is also a durable
                         // manager notice, not only a bus message.
                         record_custody_refusal_notice(store, job, target, &e).await;
+                        // #2451: a gone target (no session row to resume) must
+                        // not retire the one-shot with only a log line. Give
+                        // the outcome a durable owner first; a transient store
+                        // failure leaves the wake due so the next tick retries.
+                        if matches!(e, DaemonError::SessionNotFound(_))
+                            && !escalate_gone_wake_target(store, job, &e).await
+                        {
+                            return;
+                        }
                         bus.publish(DaemonEvent::SystemMessage {
                             level: "error".into(),
                             message: format!("Scheduled resume job '{}' failed: {e}", job.name),
@@ -1005,6 +1265,7 @@ async fn fire_job_inner(
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     };
 
     match launcher
@@ -1462,6 +1723,27 @@ async fn settle_unconsumed_watch(
 /// that is already (nearly) over cannot re-fire on the scheduler cadence.
 const PROVIDER_HOLD_MIN_REARM: chrono::Duration = chrono::Duration::seconds(30);
 
+/// #3066: when the target's provider plan window resets, from the rate-limit
+/// windows the daemon already stores; a short re-check when none is readable.
+async fn provider_window_hold_until(
+    store: &Arc<Mutex<Store>>,
+    target: Uuid,
+) -> chrono::DateTime<Utc> {
+    let now = Utc::now();
+    let guard = store.lock().await;
+    let until = guard
+        .get_session(target)
+        .ok()
+        .flatten()
+        .and_then(|session| {
+            guard
+                .provider_usage_window_hold_until(session.provider, now)
+                .ok()
+                .flatten()
+        });
+    until.unwrap_or(now + crate::provider_exhaustion::exhaustion_backoff(1))
+}
+
 /// #572: re-arm a due wake at the provider hold's deadline. No retry attempt is
 /// spent and the row stays enabled; one operator-visible notice is published
 /// when the row actually moves (it will not be due again before `until`).
@@ -1475,10 +1757,30 @@ async fn hold_wake_for_provider_exhaustion(
     let rearm_at = until.max(Utc::now() + PROVIDER_HOLD_MIN_REARM);
     let moved = {
         let guard = store.lock().await;
-        guard.defer_wake_when(job.id, rearm_at)
+        guard.defer_wake_when(job.id, rearm_at).map(|()| {
+            let plan_window = (|| -> crate::error::Result<bool> {
+                let Some(session) = guard.get_session(target)? else { return Ok(false) };
+                let Some(reset) = guard.provider_usage_window_hold_until(session.provider, Utc::now())? else { return Ok(false) };
+                if let Some(project) = session.project_id.or(job.project_id)
+                    && let Some(job_id) = guard.record_provider_window_held_work(
+                        project, session.provider, reset, "wake", job.id, &job.name, target, rearm_at,
+                    )?
+                {
+                    bus.publish(DaemonEvent::ManagerNoticeQueued { job_id });
+                }
+                Ok(true)
+            })();
+            match plan_window {
+                Ok(held) => held,
+                Err(error) => {
+                    tracing::error!(job_id = %job.id, %error, "could not record provider window notice");
+                    false
+                }
+            }
+        })
     };
     match moved {
-        Ok(()) => {
+        Ok(plan_window) => {
             tracing::info!(
                 job_id = %job.id,
                 %target,
@@ -1486,15 +1788,17 @@ async fn hold_wake_for_provider_exhaustion(
                 code = crate::provider_exhaustion::PROVIDER_USAGE_LIMIT_HOLD_CODE,
                 "Scheduled resume held by the provider usage limit; wake re-armed"
             );
-            bus.publish(DaemonEvent::SystemMessage {
+            if !plan_window {
+                bus.publish(DaemonEvent::SystemMessage {
                 level: "warn".into(),
                 message: format!(
-                    "Scheduled resume job '{}' (id={}) held: {}; Codex usage limit, retrying no earlier than {rearm_at}",
+                    "Scheduled resume job '{}' (id={}) held: {}; provider usage limit, retrying no earlier than {rearm_at}",
                     job.name,
                     job.id,
                     crate::provider_exhaustion::PROVIDER_USAGE_LIMIT_HOLD_CODE,
                 ),
             });
+            }
         }
         Err(error) => {
             tracing::error!(job_id = %job.id, %error, "could not re-arm a provider-held wake; it stays due");
@@ -1516,6 +1820,69 @@ pub(crate) async fn record_custody_refusal_notice(
         .record_manager_custody_refusal_notice(target, error)
     {
         tracing::error!(job_id = %job.id, %record_error, "could not record custody refusal notice");
+    }
+}
+
+/// How long a gone-target wake waits before retrying when the operator
+/// to-do list is full (#2473).
+const GONE_WAKE_ESCALATION_CAPACITY_BACKOFF: chrono::Duration = chrono::Duration::minutes(5);
+
+/// #2451: record the durable escalation for a wake whose target is gone.
+/// Returns whether the wake may now be settled: `true` once the escalation is
+/// recorded (or refused deterministically, which a retry cannot change),
+/// `false` after a transient store failure (stays due) or a full operator
+/// to-do list (deferred with a backoff, #2473) so the wake stays armed.
+pub(crate) async fn escalate_gone_wake_target(
+    store: &Arc<Mutex<Store>>,
+    job: &rsi_common::types::ScheduledJob,
+    error: &DaemonError,
+) -> bool {
+    escalate_wake_outcome(store, job, &error.to_string(), true).await
+}
+
+async fn escalate_wake_outcome(
+    store: &Arc<Mutex<Store>>,
+    job: &rsi_common::types::ScheduledJob,
+    refusal: &str,
+    target_gone: bool,
+) -> bool {
+    let result = {
+        let guard = store.lock().await;
+        if target_gone {
+            guard.escalate_gone_wake_target(job, refusal, Utc::now())
+        } else {
+            guard.escalate_undelivered_wake(job, refusal, Utc::now())
+        }
+    };
+    match result {
+        Ok(escalation) => {
+            tracing::warn!(job_id = %job.id, ?escalation, "wake target gone; escalated");
+            true
+        }
+        // #2473: a full operator to-do list is capacity, not a verdict. The
+        // list drains as the operator closes items, so the wake stays armed
+        // and retries after a backoff instead of losing the outcome.
+        Err(DaemonError::InvalidParam(code))
+            if code == rsi_common::operator_todos::OPERATOR_TODO_LIMIT =>
+        {
+            let retry_at = Utc::now() + GONE_WAKE_ESCALATION_CAPACITY_BACKOFF;
+            tracing::warn!(
+                job_id = %job.id, %code, %retry_at,
+                "operator to-do list full; gone-target wake stays armed"
+            );
+            if let Err(defer_error) = store.lock().await.defer_wake_when(job.id, retry_at) {
+                tracing::error!(job_id = %job.id, %defer_error, "could not back off gone-target wake; it stays due");
+            }
+            false
+        }
+        Err(DaemonError::InvalidParam(code)) => {
+            tracing::error!(job_id = %job.id, %code, "gone-target wake escalation refused");
+            true
+        }
+        Err(error) => {
+            tracing::error!(job_id = %job.id, %error, "could not record gone-target wake escalation; retrying");
+            false
+        }
     }
 }
 
@@ -1593,6 +1960,86 @@ async fn disable_watch_jobs(
     }
 }
 
+/// #2477: keep a satisfied predicate wake armed after a "not now" refusal,
+/// due again after `delay`. Fenced like the other retry writes, so an edit or
+/// disarm made meanwhile owns the schedule.
+async fn hold_predicate_wake_after_refusal(
+    store: &Arc<Mutex<Store>>,
+    job: &rsi_common::types::ScheduledJob,
+    target: Uuid,
+    error: &DaemonError,
+    delay: chrono::Duration,
+) {
+    let guard = store.lock().await;
+    if !retry_fence_holds(&guard, job) {
+        tracing::debug!(job_id = %job.id, "job changed during the refused resume; stale hold dropped");
+        return;
+    }
+    let retry_at = Utc::now() + delay;
+    match guard.defer_wake_when(job.id, retry_at) {
+        Ok(()) => tracing::info!(
+            job_id = %job.id,
+            %target,
+            %retry_at,
+            refusal = %error,
+            "predicate wake delivery deferred; wake stays armed"
+        ),
+        Err(defer_error) => {
+            tracing::error!(job_id = %job.id, %defer_error, "could not defer a refused predicate wake; it stays due")
+        }
+    }
+}
+
+/// A refused resume's retry write is fenced on the row version the fire
+/// observed: `update_scheduled_job` bumps `updated_at`, and a disarm or delete
+/// changes `enabled` or removes the row. The retry bookkeeping itself never
+/// touches `updated_at`, so consecutive retries keep passing the fence (#1162).
+fn retry_fence_holds(guard: &Store, job: &rsi_common::types::ScheduledJob) -> bool {
+    match guard.get_scheduled_job(&job.id) {
+        Ok(Some(current)) => current.enabled && current.updated_at == job.updated_at,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::error!(job_id = %job.id, %error, "retry epoch unavailable; wake retained");
+            false
+        }
+    }
+}
+
+/// One escalation per contention episode: an error notice on the bus and a
+/// durable manager notice (existing `session_state` kind, keyed by the
+/// episode's first deferral so a repeated pass never duplicates it).
+async fn escalate_custody_contention(
+    store: &Arc<Mutex<Store>>,
+    bus: &Arc<EventBus>,
+    job: &rsi_common::types::ScheduledJob,
+    target: Uuid,
+    episode: &crate::store::scheduled_jobs::CustodyContentionV1,
+) {
+    let message = format!(
+        "custody_contention: scheduled resume job '{}' (id={}) deferred {} times since {} on a busy custody root; the wake stays armed",
+        job.name, job.id, episode.count, episode.first_at,
+    );
+    tracing::error!("{message}");
+    bus.publish(DaemonEvent::SystemMessage {
+        level: "error".into(),
+        message,
+    });
+    let notice = store.lock().await.record_manager_heal_notice(
+        target,
+        &format!("custody_contention:{}:{}", job.id, episode.first_at),
+        &serde_json::json!({
+            "recovery_code": "custody_contention",
+            "job_id": job.id,
+            "deferrals": episode.count,
+            "first_at": episode.first_at,
+            "next_action": "inspect_custody",
+        }),
+    );
+    if let Err(error) = notice {
+        tracing::error!(job_id = %job.id, %error, "could not record custody contention notice");
+    }
+}
+
 /// Advance or disable a scheduled job after a fire attempt (success or failure).
 /// K2 settlement of a retryable continuation-fence refusal of a scheduled
 /// Resume: record bounded backoff and keep the job enabled; on exhaustion
@@ -1606,21 +2053,37 @@ async fn settle_retryable_resume_refusal(
     target: Uuid,
     error: &crate::error::DaemonError,
 ) {
+    let busy = crate::store::custody_lock_order::is_lock_order_busy_error(error);
     let heal = {
         let guard = store.lock().await;
+        // #1162: effect admission may have waited seconds on a busy stripe.
+        // An edit, disarm or delete of the job meanwhile owns the schedule;
+        // this stale refusal must not overwrite it.
+        if !retry_fence_holds(&guard, job) {
+            tracing::debug!(job_id = %job.id, "job changed during the refused resume; stale retry write dropped");
+            return;
+        }
         match guard.transient_heal_state(job.id) {
             Ok(Some(_)) => {
                 // A pause, capacity or drain refusal means the session never
                 // ran: keep the backoff but spend no heal budget (#1082).
                 let spend = transient_resume_refusal_code(error).is_none()
-                    && !crate::deploy_drain::is_draining_error(error)
-                    && !crate::store::custody_lock_order::is_lock_order_busy_error(error);
-                Some(guard.defer_transient_heal(
+                    && !crate::deploy_drain::is_held_for_restart(error)
+                    && !busy;
+                let outcome = guard.defer_transient_heal(
                     job.id,
                     resume_refusal_code(error),
                     Utc::now(),
                     spend,
-                ))
+                );
+                // Contention spends no heal budget, so count it separately and
+                // escalate the episode once (#1162).
+                let escalation = if busy && matches!(outcome, Ok(_)) {
+                    guard.record_custody_contention(job.id, Utc::now())
+                } else {
+                    Ok(None)
+                };
+                Some((outcome, escalation))
             }
             Ok(None) => None,
             Err(error) => {
@@ -1629,7 +2092,16 @@ async fn settle_retryable_resume_refusal(
             }
         }
     };
-    if let Some(outcome) = heal {
+    if let Some((outcome, escalation)) = heal {
+        match escalation {
+            Ok(Some(episode)) => {
+                escalate_custody_contention(store, bus, job, target, &episode).await
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(job_id = %job.id, %error, "could not record custody contention")
+            }
+        }
         crate::session::transient_heal::publish_heal_outcome(bus, target, outcome);
         return;
     }
@@ -1637,8 +2109,19 @@ async fn settle_retryable_resume_refusal(
     let transient = transient_resume_refusal_code(error).is_some();
     let recorded = {
         let guard = store.lock().await;
+        if !retry_fence_holds(&guard, job) {
+            return;
+        }
         let tip = guard.published_lineage_tip(target).ok().flatten();
-        guard.record_continuation_retry(job.id, code, tip, Utc::now(), true)
+        #[cfg(test)]
+        let injected = take_fault_for_test(job.id, "record_retry");
+        #[cfg(not(test))]
+        let injected = false;
+        if injected {
+            Err(DaemonError::Store("injected retry record failure".into()))
+        } else {
+            guard.record_continuation_retry(job.id, code, tip, Utc::now(), true)
+        }
     };
     match recorded {
         Ok(crate::store::scheduled_jobs::ContinuationRetryOutcome::Backoff {
@@ -1679,7 +2162,7 @@ async fn settle_retryable_resume_refusal(
             tracing::error!("{message}");
             bus.publish(DaemonEvent::SystemMessage {
                 level: "error".into(),
-                message,
+                message: message.clone(),
             });
             // Review round 2: the terminal settlement and the retry reset are
             // one write. Before it commits the recorded attempts stay durable.
@@ -1687,13 +2170,89 @@ async fn settle_retryable_resume_refusal(
             if crash_before_exhausted_settlement_for_test(job.id) {
                 return;
             }
-            advance_job_after_attempt_clearing_retry(store, job).await;
+            // #2477: a predicate wake carries a result nobody else will read.
+            // Settle it only once that result has a durable owner. When the
+            // classification itself cannot be read the row stays due (#2487):
+            // treating it as an ordinary wake would disable a satisfied `Once`
+            // predicate with no delivery and no escalation.
+            match is_predicate_wake(store, job).await {
+                Ok(_) => {
+                    wake_recovery::settle_recoverable_wake(
+                        store, bus, job, target, &message, false,
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(job_id = %job.id, %error, "could not classify an exhausted wake; it stays due");
+                    return;
+                }
+            }
         }
         Err(record_error) => {
-            tracing::error!(job_id = %job.id, error = %record_error, "failed to record continuation retry; settling as an attempt");
-            advance_job_after_attempt(store, job).await;
+            // #2487: a predicate wake's satisfied result has no other owner, so
+            // a failed retry write must not settle it; it stays due and the
+            // next tick retries the durable settlement. Only a wake known not to
+            // be a predicate settles as an attempt.
+            match is_predicate_wake(store, job).await {
+                Ok(false) => {
+                    tracing::error!(job_id = %job.id, error = %record_error, "failed to record continuation retry; settling as an attempt");
+                    advance_job_after_attempt(store, job).await;
+                }
+                Ok(true) => {
+                    tracing::error!(job_id = %job.id, error = %record_error, "failed to record continuation retry; predicate wake stays due");
+                }
+                Err(error) => {
+                    tracing::error!(job_id = %job.id, error = %record_error, classify_error = %error, "failed to record continuation retry and to classify the wake; it stays due");
+                }
+            }
         }
     }
+}
+
+/// Whether `job` is a daemon-evaluated predicate wake. A read error is an
+/// error, never `false`: the caller keeps the row due instead of settling it.
+async fn is_predicate_wake(
+    store: &Arc<Mutex<Store>>,
+    job: &rsi_common::types::ScheduledJob,
+) -> crate::error::Result<bool> {
+    #[cfg(test)]
+    if fail_classification_for_test(job.id) {
+        return Err(DaemonError::Store(
+            "injected wake classification failure".into(),
+        ));
+    }
+    Ok(store.lock().await.wake_when_state(job.id)?.is_some())
+}
+
+/// Test fault points for #2487: each fails the named step once for a job id.
+#[cfg(test)]
+fn fault_points() -> &'static std::sync::Mutex<std::collections::HashSet<(Uuid, &'static str)>> {
+    static POINTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(Uuid, &'static str)>>,
+    > = std::sync::OnceLock::new();
+    POINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_fault_for_test(job_id: Uuid, point: &'static str) {
+    fault_points()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((job_id, point));
+}
+
+#[cfg(test)]
+fn take_fault_for_test(job_id: Uuid, point: &'static str) -> bool {
+    fault_points()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(job_id, point))
+}
+
+#[cfg(test)]
+fn fail_classification_for_test(job_id: Uuid) -> bool {
+    take_fault_for_test(job_id, "classify")
 }
 
 /// Test crash point between retry exhaustion and its terminal settlement:
@@ -1730,6 +2289,105 @@ async fn advance_job_after_attempt(
 
 /// A scheduled Resume attempt that settles the row and clears the K2 retry
 /// state atomically (delivery or retry exhaustion).
+/// Wakes whose delivery this process is attempting right now (#797). A claim
+/// found in the store for a job NOT in this set belongs to an earlier
+/// incarnation of the daemon.
+fn deliveries_in_flight() -> &'static std::sync::Mutex<std::collections::HashSet<Uuid>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Removes the job from the in-flight set when the delivery attempt ends.
+struct InFlightDelivery(Uuid);
+
+impl Drop for InFlightDelivery {
+    fn drop(&mut self) {
+        deliveries_in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+enum ResumeClaim {
+    /// The delivery is claimed; the guard lives for the attempt.
+    Claimed(InFlightDelivery),
+    /// Nothing is delivered on this pass (settled as uncertain, in flight
+    /// elsewhere, or the claim could not be recorded). The row stays as is
+    /// unless this pass settled it.
+    Skip,
+}
+
+/// #797: reserve a scheduled resume's delivery before the continuation runs.
+///
+/// A leftover claim means an earlier attempt died before it settled the row:
+/// - `effect == false`: the continuation never reached its first durable
+///   write, so nothing was delivered and the wake proceeds normally;
+/// - `effect == true`: the wake may have reached its target. It is settled as
+///   an attempt (a `Once` wake is spent, a recurring wake moves to its next
+///   tick) and reported, never delivered a second time.
+///
+/// If the claim cannot be written the row stays due and nothing is delivered
+/// (fail closed): a delivery without a claim is the replay window itself.
+async fn claim_resume_delivery(
+    store: &Arc<Mutex<Store>>,
+    bus: &Arc<EventBus>,
+    job: &rsi_common::types::ScheduledJob,
+) -> ResumeClaim {
+    let in_flight = {
+        let mut set = deliveries_in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !set.insert(job.id) {
+            tracing::debug!(job_id = %job.id, "scheduled resume already being delivered; skipping");
+            return ResumeClaim::Skip;
+        }
+        InFlightDelivery(job.id)
+    };
+    let leftover = store.lock().await.delivery_claim(job.id);
+    match leftover {
+        Ok(None) => {}
+        Ok(Some(claim)) if !claim.effect => {
+            tracing::warn!(
+                job_id = %job.id,
+                claimed_at = %claim.claimed_at,
+                "stale delivery claim never reached an effect; delivering the wake"
+            );
+        }
+        Ok(Some(claim)) => {
+            let message = format!(
+                "uncertain_wake_delivery: scheduled resume job '{}' (id={}) was claimed at {} and \
+                 reached its continuation, but the daemon stopped before it settled the wake; it \
+                 may or may not have reached its target and is not delivered again",
+                job.name, job.id, claim.claimed_at,
+            );
+            tracing::error!("{message}");
+            bus.publish(DaemonEvent::SystemMessage {
+                level: "error".into(),
+                message,
+            });
+            advance_job_after_attempt_clearing_retry(store, job).await;
+            return ResumeClaim::Skip;
+        }
+        Err(error) => {
+            tracing::error!(job_id = %job.id, %error, "delivery claim unreadable; wake retained");
+            return ResumeClaim::Skip;
+        }
+    }
+    match store.lock().await.record_delivery_claim(job.id, Utc::now()) {
+        Ok(true) => ResumeClaim::Claimed(in_flight),
+        Ok(false) => {
+            tracing::debug!(job_id = %job.id, "scheduled resume no longer enabled; nothing claimed");
+            ResumeClaim::Skip
+        }
+        Err(error) => {
+            tracing::error!(job_id = %job.id, %error, "failed to claim the wake delivery; wake retained");
+            ResumeClaim::Skip
+        }
+    }
+}
+
 async fn advance_job_after_attempt_clearing_retry(
     store: &Arc<Mutex<Store>>,
     job: &rsi_common::types::ScheduledJob,
@@ -1755,6 +2413,10 @@ async fn advance_job_after_attempt_inner(
     let next = next_fire_time(&job.schedule, now, now);
     let should_disable = matches!(job.schedule.recurrence, Recurrence::Once) || next.is_none();
     let guard = store.lock().await;
+    if clear_continuation_retry && !retry_fence_holds(&guard, job) {
+        tracing::debug!(job_id = %job.id, "job changed before retry settlement; newer epoch preserved");
+        return;
+    }
     // Review F1 (defense layer b): AND the written `enabled` with the row's
     // CURRENT DB value (read under the same store guard as the write) — a
     // fire attempt must never re-enable a row something else disabled
@@ -1823,6 +2485,7 @@ mod tests {
         fire_watch_outcomes: StdMutex<VecDeque<crate::error::Result<WatchFireOutcome>>>,
         usage_hold: StdMutex<Option<chrono::DateTime<Utc>>>,
         scheduled_fresh_outcomes: StdMutex<VecDeque<crate::error::Result<Uuid>>>,
+        restart_draining: std::sync::atomic::AtomicBool,
     }
 
     impl MockLauncher {
@@ -1839,6 +2502,7 @@ mod tests {
                 fire_watch_outcomes: StdMutex::new(outcomes.into()),
                 usage_hold: StdMutex::new(None),
                 scheduled_fresh_outcomes: StdMutex::new(VecDeque::new()),
+                restart_draining: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -1881,6 +2545,11 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(target))
+        }
+
+        fn restart_draining(&self) -> bool {
+            self.restart_draining
+                .load(std::sync::atomic::Ordering::Acquire)
         }
 
         async fn provider_usage_hold(&self, _target: Uuid) -> Option<chrono::DateTime<Utc>> {
@@ -2034,6 +2703,292 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!disarmed.enabled);
+    }
+
+    /// #2528 (a): once the daemon has decided to restart, a wake that comes due
+    /// fires nothing and its row stays pending, untouched. The next incarnation
+    /// (a launcher that is no longer draining) fires it exactly once.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn a_resume_due_during_the_restart_drain_fires_only_after_the_restart_2528() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let bus = Arc::new(EventBus::new(64));
+        let target = Uuid::new_v4();
+        let mut job = mk_fresh_job(Some(target));
+        job.wake_mode = WakeMode::Resume;
+        store.lock().await.insert_scheduled_job(&job).unwrap();
+        let mock = MockLauncher::new(Vec::new());
+        let launcher: Arc<dyn SessionLauncher> = mock.clone();
+
+        mock.restart_draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        process_due_jobs(&store, &bus, &launcher, None).await;
+        process_due_wake_when(&store, &bus, &launcher).await;
+        fire_job(&store, &bus, &launcher, &job).await;
+        fire_job_by_id(&store, &bus, &launcher, &job.id).await;
+        assert!(
+            mock.resume_calls.lock().unwrap().is_empty(),
+            "no resume is delivered once the restart is decided"
+        );
+        let pending = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(pending.enabled);
+        assert_eq!(pending.last_fired_at, None);
+        assert_eq!(pending.next_fire_at, job.next_fire_at);
+
+        // The next incarnation.
+        mock.restart_draining
+            .store(false, std::sync::atomic::Ordering::Release);
+        process_due_jobs(&store, &bus, &launcher, None).await;
+        assert_eq!(*mock.resume_calls.lock().unwrap(), vec![target]);
+        let settled = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(!settled.enabled, "the one-shot is spent by its delivery");
+    }
+
+    /// #2528 (criterion 5): a one-shot wake whose continuation is refused because
+    /// the restart drain engaged between the scheduler's check and the launch is
+    /// not consumed by the refusal. It stays due and is delivered after restart.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn a_resume_refused_by_the_restart_drain_is_not_consumed_2528() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let bus = Arc::new(EventBus::new(64));
+        let target = Uuid::new_v4();
+        let mut job = mk_fresh_job(Some(target));
+        job.wake_mode = WakeMode::Resume;
+        store.lock().await.insert_scheduled_job(&job).unwrap();
+        let mock = MockLauncher::new(Vec::new());
+        mock.resume_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::deploy_drain::restart_drain_error()));
+        let launcher: Arc<dyn SessionLauncher> = mock.clone();
+
+        fire_job(&store, &bus, &launcher, &job).await;
+        assert_eq!(*mock.resume_calls.lock().unwrap(), vec![target]);
+        let held = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(held.enabled, "the refusal must not spend the one-shot");
+        assert_eq!(held.last_fired_at, None);
+        assert_eq!(held.next_fire_at, job.next_fire_at);
+
+        fire_job(&store, &bus, &launcher, &held).await;
+        assert_eq!(mock.resume_calls.lock().unwrap().len(), 2);
+        let settled = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(!settled.enabled);
+    }
+
+    /// #1162: effect admission may wait seconds before surrendering `root_busy`.
+    /// An operator edit made meanwhile owns the schedule; the stale refusal's
+    /// retry write must not move it or record retry state.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn root_busy_retry_write_does_not_clobber_a_concurrent_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            Store::open(&directory.path().join("root-busy-fence.sqlite")).unwrap(),
+        ));
+        let bus = Arc::new(EventBus::new(64));
+        let target = Uuid::new_v4();
+        let mut job = mk_fresh_job(Some(target));
+        job.wake_mode = WakeMode::Resume;
+        store.lock().await.insert_scheduled_job(&job).unwrap();
+        // The fire observed `job`; the operator edits the row while admission
+        // is still waiting on the stripe.
+        let edited_next = Utc::now() + chrono::Duration::hours(6);
+        store
+            .lock()
+            .await
+            .update_scheduled_job(
+                &job.id,
+                &crate::store::scheduled_jobs::ScheduledJobUpdate {
+                    message: Some("edited while admission waited".into()),
+                    next_fire_at: Some(edited_next),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mock = MockLauncher::new(Vec::new());
+        mock.resume_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(retryable_custody_error(
+                rsi_common::types::SandboxCustodyErrorCodeV1::RootBusy,
+            )));
+        let launcher: Arc<dyn SessionLauncher> = mock;
+
+        fire_job(&store, &bus, &launcher, &job).await;
+
+        let guard = store.lock().await;
+        let row = guard.get_scheduled_job(&job.id).unwrap().unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.message, "edited while admission waited");
+        assert_eq!(row.next_fire_at, edited_next, "the edit's schedule stands");
+        assert!(guard.continuation_retry(job.id).unwrap().is_none());
+    }
+
+    /// #1162: a RootBusy deferral of a heal wake spends no heal budget, so it
+    /// is counted separately and escalated exactly once per episode (bus error
+    /// plus one deduplicated notice), without a migration.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn persistent_root_busy_heal_deferral_escalates_once_per_episode() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let bus = Arc::new(EventBus::new(256));
+        let mut rx = bus.subscribe();
+        let covered = manager_watch_fixture(&*store.lock().await);
+        let mut session = store
+            .lock()
+            .await
+            .get_session(covered.leads[0])
+            .unwrap()
+            .unwrap();
+        session.status = rsi_common::types::SessionStatus::Failed;
+        session.terminal_reason = Some("aborted_streaming".into());
+        {
+            let guard = store.lock().await;
+            guard
+                .update_session_status(session.id, session.status)
+                .unwrap();
+            guard.update_session_metadata(&session).unwrap();
+            guard.update_retry_state(session.id, None, None).unwrap();
+        }
+        let heal = match store
+            .lock()
+            .await
+            .schedule_transient_heal(session.id, Utc::now())
+            .unwrap()
+        {
+            crate::store::transient_heal::TransientHealOutcome::Scheduled(heal) => heal,
+            other => panic!("expected Scheduled, got {other:?}"),
+        };
+        let busy =
+            || retryable_custody_error(rsi_common::types::SandboxCustodyErrorCodeV1::RootBusy);
+        let threshold = crate::store::scheduled_jobs::CUSTODY_CONTENTION_ESCALATE_AFTER;
+        for deferral in 1..=threshold + 3 {
+            let job = store
+                .lock()
+                .await
+                .get_scheduled_job(&heal.job_id)
+                .unwrap()
+                .unwrap();
+            settle_retryable_resume_refusal(&store, &bus, &job, session.id, &busy()).await;
+            let state = store
+                .lock()
+                .await
+                .custody_contention(heal.job_id)
+                .unwrap()
+                .expect("contention is counted");
+            assert_eq!(state.count, deferral);
+            assert_eq!(state.escalated, deferral >= threshold);
+        }
+        // Contention spent no heal budget.
+        let heal_state = store
+            .lock()
+            .await
+            .transient_heal_state(heal.job_id)
+            .unwrap()
+            .unwrap();
+        assert!(!heal_state.exhausted);
+        assert_eq!(heal_state.attempts, 1, "RootBusy spends no heal attempts");
+        let mut escalations = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let DaemonEvent::SystemMessage { level, message } = &*event
+                && message.starts_with("custody_contention:")
+            {
+                assert_eq!(level, "error");
+                escalations += 1;
+            }
+        }
+        assert_eq!(escalations, 1, "one escalation for the whole episode");
+
+        let notices: i64 = store.lock().await.conn.query_row(
+            "SELECT COUNT(*) FROM harness_manager_notices WHERE subject_id=?1 AND subject_version LIKE 'custody_contention:%'",
+            [session.id.to_string()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(notices, 1, "one durable manager notice for the episode");
+
+        // A delivered resume ends the episode; the next one escalates anew.
+        store
+            .lock()
+            .await
+            .clear_continuation_retry(heal.job_id)
+            .unwrap();
+        assert!(
+            store
+                .lock()
+                .await
+                .custody_contention(heal.job_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn custody_contention_escalates_by_age_and_an_edit_resets_the_episode() {
+        let store = Store::open_in_memory().unwrap();
+        let job = mk_fresh_job(Some(Uuid::new_v4()));
+        store.insert_scheduled_job(&job).unwrap();
+        let first = Utc::now();
+        assert!(
+            store
+                .record_custody_contention(job.id, first)
+                .unwrap()
+                .is_none()
+        );
+        let later = first
+            + chrono::Duration::minutes(
+                crate::store::scheduled_jobs::CUSTODY_CONTENTION_ESCALATE_MINUTES,
+            );
+        let escalation = store
+            .record_custody_contention(job.id, later)
+            .unwrap()
+            .unwrap();
+        assert_eq!(escalation.count, 2);
+        assert!(escalation.escalated);
+        assert!(
+            store
+                .record_custody_contention(job.id, later)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .update_scheduled_job(
+                &job.id,
+                &crate::store::scheduled_jobs::ScheduledJobUpdate {
+                    message: Some("edited wake".into()),
+                    schedule: Some(job.schedule.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(store.custody_contention(job.id).unwrap().is_none());
+        assert!(
+            store
+                .record_custody_contention(job.id, later)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.custody_contention(job.id).unwrap().unwrap().count, 1);
     }
 
     /// #572: a due 60-second Resume wake on an exhausted provider account is
@@ -2197,6 +3152,74 @@ mod tests {
             vec![target, target],
             "the re-armed wake must run once capacity frees"
         );
+        let settled = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(!settled.enabled, "a delivered one-shot is settled/disabled");
+    }
+
+    /// #1185: a scheduled Resume refused because a live fresh-wake lineage
+    /// writes the target's tree never ran. It is retained with bounded backoff
+    /// (visible, no heal budget) instead of being consumed, and is delivered
+    /// once the occupying writer settles.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn tree_occupied_resume_is_retained_without_consuming_the_wake() {
+        let (store, bus) = fixture();
+        let target = Uuid::new_v4();
+        let mut job = mk_fresh_job(Some(target));
+        job.wake_mode = WakeMode::Resume;
+        job.schedule.recurrence = Recurrence::Once;
+        store.lock().await.insert_scheduled_job(&job).unwrap();
+        let mock = MockLauncher::new(Vec::new());
+        mock.resume_outcomes.lock().unwrap().push_back(Err(
+            crate::session::tree_admission::tree_occupied_error(
+                "live session already writes the worktree",
+            ),
+        ));
+        let launcher: Arc<dyn SessionLauncher> = mock.clone();
+        let mut rx = bus.subscribe();
+
+        fire_job(&store, &bus, &launcher, &job).await;
+
+        let retained = store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained.enabled,
+            "an occupied tree must not consume a resume"
+        );
+        assert!(retained.next_fire_at > Utc::now());
+        assert_eq!(retained.last_fired_at, None);
+        let retry = store
+            .lock()
+            .await
+            .continuation_retry(job.id)
+            .unwrap()
+            .expect("bounded retry state recorded");
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(retry.last_code, "tree_occupied");
+        let mut saw_notice = false;
+        while let Ok(event) = rx.try_recv() {
+            if let DaemonEvent::SystemMessage { level, message } = &*event
+                && level == "warn"
+                && message.contains("tree_occupied")
+            {
+                saw_notice = true;
+            }
+        }
+        assert!(saw_notice, "the retained refusal must be visible");
+
+        // The occupying writer settles: the retained wake runs and settles.
+        mock.resume_outcomes.lock().unwrap().push_back(Ok(target));
+        fire_job(&store, &bus, &launcher, &job).await;
+        assert_eq!(*mock.resume_calls.lock().unwrap(), vec![target, target]);
         let settled = store
             .lock()
             .await

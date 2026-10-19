@@ -625,7 +625,8 @@ token-attributed session uses these six `Agent*` verbs instead (native tools
 | Verb | Request | Result |
 |---|---|---|
 | `AgentTopologyUpsert` | `{name, definition, scope:"epic"\|"manager", epic_id?, expected_revision?, validate_only, idempotency_key}` | `{topology_id?, revision?, definition_digest, diagnostics[], deduplicated}` |
-| `AgentTopologyList` | `{scope?, epic_id?, include_executions, cursor?, limit≤32}` | `{topologies[], executions[], next_cursor?}` |
+| `AgentTopologyList` | `{scope?, epic_id?, include_executions, include_settled, cursor?, limit≤32}` | `{topologies[], executions[], next_cursor?}` |
+| `AgentTopologyGet` | `{topology_id?\|name?}` (exactly one) | `{topology{topology_id,name,owner_kind,epic_id,revision,definition_digest,shared,updated_at}, definition, owner_session_id?, project_id?, created_at}` |
 | `AgentTopologyExecute` | `{topology_id, expected_digest, epic_id, inputs?, base_commit?, idempotency_key}` | `{execution_id, accepted_at, base_commit, deduplicated}` |
 | `AgentTopologyGetExecution` | `{execution_id, after_sequence?, limit≤64}` | `{execution, nodes[], events[], next_sequence}` |
 | `AgentTopologyInterrupt` | `{execution_id, expected_row_version, idempotency_key}` | `{execution_id, status, interrupt_requested_at, deduplicated}` |
@@ -657,7 +658,8 @@ definition refusals). Codes include `authority_denied`, `capability_denied`,
 `topology_not_visible`, `topology_changed`,
 `stale_row_version`, `idempotency_conflict`, `creation_limit`,
 `executor_disabled`, `discard_requires_manager`, `preserved_commit_mismatch`,
-and `request_failed` (internal failures are logged, never echoed).
+`review_accept_requires_manager`, `review_round_unavailable` and
+`review_acceptance_refused` (a blocked review's resolution, #2280), and `request_failed` (internal failures are logged, never echoed).
 
 **Audit.** Every call after token resolution (all six verbs, reads,
 malformed requests and every refusal) appends exactly one row to the
@@ -673,10 +675,62 @@ first non-refused request in the same transaction as the write: an identical
 replay returns the original receipt with `deduplicated: true` and writes
 nothing; a changed name, definition, scope, Epic or `expected_revision` under
 the same key is `idempotency_conflict`. A refused request never binds its key,
-and `validate_only` never binds. `AgentTopologyExecute` re-reads the topology
+and `validate_only` never binds. `validate_only` is also open to any live leaf
+session without topology authority (#2267): structural diagnostics in full, the
+policy diagnostics reduced to `launch not granted`, no `topology_id`/`revision`. `AgentTopologyExecute` re-reads the topology
 under the accepting lock after resolving its base: an unshared, archived or
 out-of-scope topology refuses `topology_not_visible`, and a revised definition
 refuses `topology_changed`; neither persists an execution.
+
+---
+
+## Typed steps (#635, #1641)
+
+Rules and error messages: [topology-validation.md](topology-validation.md)
+(source `crates/rsid-store/src/store_support/topology_validation.rs`). Types:
+`crates/rsi-common/src/types.rs` (`TopologyStep`, `CatalogOp`, `GateCondition`,
+`EdgeWhen`). The `definition` of `CreateTopology`, `UpdateTopology` and
+`AgentTopologyUpsert` carries them in each node's `params`; every typed object
+rejects unknown fields.
+
+A node's `params.step` is tagged by `kind`:
+
+```json
+{"kind": "session", "expects_commit": true, "pass_content": false}
+{"kind": "command", "op": {"name": "cargo_test_focused", "crate": "rsid", "filter": "topology::", "lib_only": true}}
+{"kind": "gate",    "condition": {"op": "eq", "path": "nodes.test.exit_code", "value": 0}}
+{"kind": "review",  "of": "fix", "max_rounds": 2,
+ "reviewer": {"provider": "<SessionProvider>", "model": "<model>", "effort": "<effort>"}}
+{"kind": "land",    "accepted": "review", "test_filters": ["rsid=shard:store-01:test(NAME)"]}
+```
+
+| `kind` | Fields | Notes |
+|---|---|---|
+| `session` | `expects_commit?`, `pass_content?` | The default for a node with no `step`. |
+| `command` | `op` | `op.name` is one of `cargo_test_focused` (`crate`, `filter?`, `lib_only?`), `cargo_clippy_crate` (`crate`), `cargo_check_crate` (`crate`), `rolling_baseline` (`crates?`). Never argv, env, script or effect class. |
+| `gate` | `condition` | `op` is one of `eq ne in exists lt le gt ge and or not`; paths are `nodes.<ancestor>.<field>…`. |
+| `review` | `of`, `reviewer`, `max_rounds?` (1..=3, default 2) | `of` is a `session` node with `expects_commit`. Reviewer launch must be explicit. |
+| `land` | `accepted`, `test_filters?` | `accepted` is a `review` node; the land node's only input is its `verdict_accepted` edge. |
+
+Edge routing is `params.when` on the **target** node, mapping a source node id
+to an `EdgeWhen`: `success` (default), `failure`, `completed`, `gate_true`,
+`gate_false`, `verdict_accepted`, `verdict_changes_requested`,
+`review_required` (a `land` node refused `land_requires_review`):
+
+```json
+{"id": "land", "kind": "Task", "label": "Land",
+ "params": {"step": {"kind": "land", "accepted": "review"},
+            "when": {"review": "verdict_accepted"}}}
+```
+
+A node with more than one input also needs `params.custody.from`
+(`base` or `node:<id>`). Definition refusals come back as
+`invalid_definition` with the rule message in `diagnostics[]`.
+
+Typed command, gate, review and land nodes run only on the durable executor
+(`crates/rsid/src/topology/executor.rs`, kill switch `topology_executor_enabled`);
+with it off the call is refused `executor_disabled`. Starter definitions are in
+[README.md](README.md) "Operational Starters (#1641)".
 
 ---
 

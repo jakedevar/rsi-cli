@@ -50,7 +50,7 @@ if [[ -n "$ssh_config" ]]; then transport_ssh_args+=(-F "$ssh_config"); fi
 
 if [[ "$action" == "prepare" ]]; then
   prepare_ssh_args=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
-  prepare_ssh_args+=("${transport_ssh_args[@]}" -- "$RSI_SATELLITE_HUB" sh -s -- "$RSI_SATELLITE_REMOTE_SOCKET")
+  prepare_ssh_args+=(${transport_ssh_args[@]+"${transport_ssh_args[@]}"} -- "$RSI_SATELLITE_HUB" sh -s -- "$RSI_SATELLITE_REMOTE_SOCKET")
   exec ssh "${prepare_ssh_args[@]}" <<'SH'
 exec python3 - "$1" <<'PYTHON'
 import errno
@@ -91,7 +91,7 @@ fi
 
 if [[ "$action" == "secure" ]]; then
   secure_ssh_args=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
-  secure_ssh_args+=("${transport_ssh_args[@]}" -- "$RSI_SATELLITE_HUB" sh -s -- "$RSI_SATELLITE_REMOTE_SOCKET")
+  secure_ssh_args+=(${transport_ssh_args[@]+"${transport_ssh_args[@]}"} -- "$RSI_SATELLITE_HUB" sh -s -- "$RSI_SATELLITE_REMOTE_SOCKET")
   exec ssh "${secure_ssh_args[@]}" <<'SH'
 socket_path=$1
 attempt=0
@@ -116,5 +116,5 @@ tunnel_ssh_args=(
   -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3
 )
-tunnel_ssh_args+=("${transport_ssh_args[@]}" -R "${RSI_SATELLITE_REMOTE_SOCKET}:${RSI_SATELLITE_LOCAL_SOCKET}" -- "$RSI_SATELLITE_HUB")
+tunnel_ssh_args+=(${transport_ssh_args[@]+"${transport_ssh_args[@]}"} -R "${RSI_SATELLITE_REMOTE_SOCKET}:${RSI_SATELLITE_LOCAL_SOCKET}" -- "$RSI_SATELLITE_HUB")
 exec ssh "${tunnel_ssh_args[@]}"

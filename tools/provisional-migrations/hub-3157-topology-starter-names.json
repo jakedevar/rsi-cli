@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "version": 182,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v182.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:c59355c186925368972378d1c1ad71b5f4c61f3a71190097ee41acdbacddbba4",
+      "sites": [
+        {
+          "anchor": "fn migrate_v182(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 182 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 182)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:0afbd6414f5ce1f7b18750895df42d627ab861b6ea7c53e9fa1418a05dae05ab",
+      "sites": [
+        {
+          "anchor": "(182, &[\"topologies\", \"sqlite_autoindex_topologies_2\"]),",
+          "replacement": "(${VERSION}, &[\"topologies\", \"sqlite_autoindex_topologies_2\"]),",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:97376e7f1b23bcdb5e5f509392b770793d4e5938e71c5dfeeba3a3c2fcdcbd65",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 182;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 182 && target < 182 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": ".pragma_update(None, \"user_version\", 182 - 1)",
+          "replacement": ".pragma_update(None, \"user_version\", ${VERSION} - 1)",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 182,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

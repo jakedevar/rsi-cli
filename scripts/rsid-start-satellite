@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Start the deployed rsid on a satellite whose daemon is down (#2820), for
+# example after a reboot of a host with no enabled rsid.service.
+#
+# It starts what is installed, never a build: ~/.rsi/install/rsid under
+# ~/.rsi/install/rsid-supervisor.sh behind the socket holder, in a detached,
+# collected systemd user unit that outlives the ssh session (hard rule 12).
+# Before the start it applies the limits in ~/.rsi/rsid-scope.env to
+# rsi-workers.slice and persists them: a reboot clears the runtime-only values,
+# and rsid then refuses every worker launch ("rsi-workers.slice is missing or
+# its aggregate limits differ from settings").
+#
+# macOS (#2936): the same deployed chain runs as the launchd user agent
+# dev.rsi.rsid (scripts/rsid-launchd.sh): the plist is refreshed into
+# ~/Library/LaunchAgents and the agent is loaded (`launchctl bootstrap
+# gui/$UID`) or started (`launchctl kickstart`); launchd then keeps it running.
+#
+# Usage: scripts/rsid-start-satellite
+# Exit 0: a daemon answers GetHealthStatus (started here, or already running).
+# Nonzero: nothing healthy was started; the message names the cause.
+#
+# Env: RSI_INSTALL_HEALTH_WAIT_SECS (default 90) bounds the health wait.
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/rsid-processes.sh"
+source "$ROOT/scripts/rsid-health.sh"
+source "$ROOT/scripts/rsid-scope.sh"
+source "$ROOT/scripts/rsid-launchd.sh"
+
+RSI_HOME_DIR="$HOME/.rsi"
+INSTALL_DIR="$RSI_HOME_DIR/install"
+DAEMON_LOG="$RSI_HOME_DIR/daemon.log"
+RSID_SCOPE_SETTINGS="$RSI_HOME_DIR/rsid-scope.env"
+RSID_BIN="$INSTALL_DIR/rsid"
+RSI_RPC_BIN="$INSTALL_DIR/rsi-rpc"
+SOCKET_HOLD_BIN="$INSTALL_DIR/rsi-socket-hold"
+SUPERVISOR="$INSTALL_DIR/rsid-supervisor.sh"
+SOCKET_PATH="${RSI_DAEMON_SOCKET_PATH:-${RSI_SOCKET:-${MOTHERSHIP_SOCKET:-${FLYWHEEL_SOCKET:-$RSI_HOME_DIR/daemon.sock}}}}"
+
+platform="$(uname -s)"
+if [[ "$platform" != Linux && "$platform" != Darwin ]]; then
+    echo "rsid-start-satellite supports Linux (systemd user units) and macOS (a launchd user agent), not $platform." >&2
+    exit 1
+fi
+if [[ "$platform" == Darwin ]] && ! rsid_launchd_available; then
+    echo "rsid-start-satellite on macOS starts the launchd agent $RSID_LAUNCHD_LABEL; launchctl is unavailable or RSI_LAUNCHD_AGENT=0." >&2
+    exit 1
+fi
+for needed in "$RSID_BIN" "$RSI_RPC_BIN" "$SOCKET_HOLD_BIN" "$SUPERVISOR"; do
+    if [[ ! -x "$needed" ]]; then
+        echo "Not deployed: $needed is missing or not executable; install or deploy the release first." >&2
+        exit 1
+    fi
+done
+
+running="$(rsid_running_pids)"
+if [[ -n "$running" ]]; then
+    echo "rsid is already running (PID(s): $(echo "$running" | tr '\n' ' ')); nothing to start. Restart it through the deploy route."
+    exit 0
+fi
+
+wait_secs="${RSI_INSTALL_HEALTH_WAIT_SECS:-90}"
+if [[ "$platform" == Darwin ]]; then
+    # Create the log (0600) before launchd redirects into it (#1852).
+    (
+        umask 077
+        mkdir -p "$RSI_HOME_DIR"
+        : >>"$DAEMON_LOG"
+    )
+    plist_state="$(rsid_launchd_write_plist "$ROOT/scripts/launchd/$RSID_LAUNCHD_LABEL.plist.in" \
+        "$INSTALL_DIR" "$SOCKET_PATH" "$DAEMON_LOG")"
+    echo "launchd agent $(rsid_launchd_plist): $plist_state"
+    if ! rsid_launchd_start "$wait_secs" \
+        || ! wait_for_rsid_health "$RSI_RPC_BIN" "$SOCKET_PATH" "$wait_secs" "" "${RSID_LAUNCHD_PID:-0}"; then
+        echo "No healthy daemon answered GetHealthStatus on $SOCKET_PATH -- NO DAEMON IS RUNNING from this launch; check $DAEMON_LOG and \`launchctl print $(rsid_launchd_service)\` (docs/satellites.md, \"macOS satellites\")." >&2
+        exit 1
+    fi
+    echo "rsid started from $RSID_BIN as launchd agent $(rsid_launchd_service), logging to $DAEMON_LOG"
+    exit 0
+fi
+
+load_rsid_scope_settings
+provision_worker_slice
+persist_worker_slice_limits
+
+managed=0
+if systemctl --user cat rsid.service >/dev/null 2>&1; then
+    managed=1
+fi
+
+if [[ "$managed" -eq 1 ]]; then
+    echo "Starting managed rsid.service ..."
+    systemctl --user start rsid.service
+    main_pid="$(systemctl --user show rsid.service --property=MainPID --value)"
+    wait_for_rsid_health "$RSI_RPC_BIN" "$SOCKET_PATH" "$wait_secs" rsid.service "${main_pid:-0}"
+    verify_rsid_scope rsid.service
+    echo "rsid.service started from $RSID_BIN"
+    exit 0
+fi
+
+# Create the log (0600) before anything redirects into it (#1852).
+(
+    umask 077
+    mkdir -p "$RSI_HOME_DIR"
+    : >>"$DAEMON_LOG"
+)
+rsid_daemon_environment
+unit="rsid-satellite-$(date +%s)-$$-$RANDOM.service"
+systemd-run --user --collect --service-type=exec --unit="$unit" \
+    --slice=user.slice \
+    --property="MemoryHigh=${RSID_SCOPE_MEMORY_HIGH_MIB}M" \
+    --property="MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
+    --property="MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
+    --property="CPUWeight=${RSID_SCOPE_CPU_WEIGHT}" \
+    --property=StandardInput=null \
+    --property="StandardOutput=append:$DAEMON_LOG" \
+    --property="StandardError=append:$DAEMON_LOG" \
+    "${DAEMON_ENV_ARGS[@]}" \
+    --setenv="RSI_SOCKET=$SOCKET_PATH" \
+    --setenv="RSI_DAEMON_SOCKET_PATH=$SOCKET_PATH" \
+    -- "$SOCKET_HOLD_BIN" "$SOCKET_PATH" -- "$SUPERVISOR" "$RSID_BIN"
+launcher_pid="$(systemctl --user show "$unit" --property=MainPID --value)"
+
+if ! wait_for_rsid_health "$RSI_RPC_BIN" "$SOCKET_PATH" "$wait_secs" "$unit" "${launcher_pid:-0}"; then
+    echo "No healthy daemon answered GetHealthStatus on $SOCKET_PATH -- NO DAEMON IS RUNNING from this launch; check $DAEMON_LOG, then see scripts/systemd/README.md (\"Recovery\")." >&2
+    exit 1
+fi
+verify_rsid_scope "$unit"
+echo "rsid started from $RSID_BIN in $unit, logging to $DAEMON_LOG"

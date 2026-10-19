@@ -8,12 +8,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from unittest import mock
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 SCRIPT = Path(__file__).resolve().parents[1] / "agent-dev-queue.py"
 SPEC = importlib.util.spec_from_file_location("agent_dev_queue", SCRIPT)
 Q = importlib.util.module_from_spec(SPEC)
@@ -22,7 +23,7 @@ SPEC.loader.exec_module(Q)
 
 class PilotTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-batch-qa-test-")
+        self.temp = scratch_tempdir("rsi-batch-qa-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
@@ -105,8 +106,7 @@ sys.exit(int(os.environ.get("QA_EXIT", "0")))
         self.serial = 0
 
     def git(self, *args, repo=None):
-        return subprocess.check_output(["git", "-C", str(repo or self.repo), *args],
-                                       stderr=subprocess.PIPE, text=True).strip()
+        return scratch_git(repo or self.repo, *args).stdout.strip()
 
     @contextlib.contextmanager
     def queue(self):

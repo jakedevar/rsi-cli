@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rsi_common::agent_contract::{PipelineStatusV2, parse_pipeline_handoff_v2};
+use rsi_common::agent_contract::{
+    PipelineStatusV2, parse_pipeline_handoff_v2, validate_first_line,
+};
 use rsi_common::types::{
     CatalogOp, EdgeWhen, FailurePolicy, GraphExecutionUpdate, SessionStatus, TopologyStep,
     UntilCondition,
@@ -34,6 +36,7 @@ use crate::topology::custody::{
 use crate::topology::graph::{
     GraphShape, InstanceState, MAX_ATTEMPTS_PER_NODE, RegionDecision, RegionProgress,
 };
+use crate::topology::issue_close::{IssueClose, IssueCloseRequest, close_input_issue};
 use crate::topology::land::{LandEnqueue, LandRequest, LandStatus};
 use crate::topology::launch::NodeLaunchBuilder;
 use crate::topology::oncall;
@@ -45,9 +48,13 @@ use crate::topology::store::{
     self as rows, AttemptRow, AttemptStatus, ExecutionRow, ExecutionStatus, NewAttempt, Settlement,
     failure,
 };
+use crate::topology::verify;
 
 /// Wall-time bound for one session node attempt (plan §2.5, fixes F-4).
 pub(crate) const SESSION_WALL_TIME: chrono::TimeDelta = chrono::TimeDelta::hours(4);
+/// #2697: default share of the node wall time, in percent, after which the
+/// execution's owner gets one progress notice. `0` turns the notice off.
+pub(crate) const WALL_TIME_NOTICE_PERCENT: u32 = 50;
 /// Periodic reconciliation tick (plan §2.3).
 pub(crate) const EXECUTOR_TICK: Duration = Duration::from_secs(30);
 /// Bounded inner rounds per `advance` call; a step that keeps changing state
@@ -55,10 +62,16 @@ pub(crate) const EXECUTOR_TICK: Duration = Duration::from_secs(30);
 const ADVANCE_ROUNDS: usize = 32;
 /// Settled executions cleaned per settlement-cleanup pass.
 pub(crate) const CLEANUP_BATCH: usize = 64;
+/// #2476: how long after an owned job settles a completed node without a
+/// handoff still counts as between turns while the job's wake resumes it.
+const RESUME_IN_FLIGHT_GRACE_SECS: i64 = 180;
 
 /// The prompt a restart-cut node session continues with: the same words the
 /// restart journal's own continuation uses.
 const RESTART_RESUME_PROMPT: &str = "The daemon restarted after interrupting your active turn. Continue the task from its durable state.";
+
+/// A restart snapshot could not be read; no guarded continuation is safe.
+pub(crate) const RESTART_OBSERVATION_UNAVAILABLE: &str = "topology_restart_observation_unavailable";
 
 /// How a restart resume of a node session ended (#1728).
 enum ResumeOutcome {
@@ -90,7 +103,8 @@ pub(crate) struct SessionObservation {
     /// see, only this total (#1704). `None` when the daemon does not know.
     pub(crate) waited_ms: Option<u64>,
     /// #1728: classification, journal ownership and turn cursor read in
-    /// one store snapshot. Production recovery defers if this is unavailable.
+    /// one store snapshot. If unavailable, recovery records a refused resume
+    /// and falls back to preserving/retrying the interrupted attempt.
     pub(crate) restart_cut_fence: Option<crate::store::manager_actions::fence::RestartCutFenceV1>,
 }
 
@@ -116,6 +130,61 @@ impl SessionObservation {
     }
 }
 
+impl SessionObservation {
+    /// #2549: the daemon's restart lost this session and will not continue it:
+    /// a restart cut nothing resumed (`cut_by_restart`), or the restart journal
+    /// refused because the provider cannot resume or the dispatch failed. An
+    /// operator hold (`operator_paused`, `pending_question`, `review_owned`) or
+    /// another owner's claim is not a loss and stays out.
+    pub(crate) fn lost_to_restart(&self) -> bool {
+        self.cut_by_restart()
+            || (self.status == SessionStatus::Interrupted
+                && matches!(
+                    self.stop_reason.as_deref().map(str::trim),
+                    Some(
+                        "daemon_restart_resume:not_resumable"
+                            | "daemon_restart_resume:dispatch_failed"
+                    )
+                ))
+    }
+}
+
+impl SessionObservation {
+    /// #2569: the restart journal refused to resume this session because an
+    /// operator hold or another owner has it (`operator_paused`,
+    /// `pending_question`, `review_owned`). The hold, not the executor, decides
+    /// when the session continues; a replacement must never bypass it.
+    pub(crate) fn journal_hold(&self) -> bool {
+        self.status == SessionStatus::Interrupted
+            && matches!(
+                self.stop_reason.as_deref().map(str::trim),
+                Some(
+                    "daemon_restart_resume:operator_paused"
+                        | "daemon_restart_resume:pending_question"
+                        | "daemon_restart_resume:review_owned"
+                )
+            )
+    }
+}
+
+/// What became of an unverified node's chance to be continued (#2263).
+enum UnverifiedOutcome {
+    /// The session was continued; the attempt stays `running`.
+    Continued,
+    /// Another continuation owns the session; the next observation follows it.
+    Deferred,
+    /// Not continued: the node fails `verification_failed`.
+    Fail,
+    /// A claimed continuation cannot be shown to have landed; it is not resent
+    /// and the node fails `verification_failed` naming the uncertainty.
+    Uncertain(String),
+}
+
+/// Failure text prefix of a node whose verification continuation was claimed
+/// but not shown to have reached the session.
+pub(crate) const VERIFICATION_CONTINUATION_UNCERTAIN: &str =
+    "topology_verification_continuation_uncertain";
+
 /// One answer delivery to a parked node's session (#1715).
 #[derive(Clone, Debug)]
 pub(crate) struct AnswerContinuation {
@@ -124,11 +193,22 @@ pub(crate) struct AnswerContinuation {
     pub(crate) binding: crate::topology::store::AnswerBinding,
 }
 
+/// The `admission_hold` kind of a launch refused because the provider's plan
+/// window is exhausted (#3066).
+pub(crate) const WAITING_ON_PROVIDER: &str = "waiting_on_provider";
+
 /// #1641 S4b: the `admission_hold` kind of a launch refused by the sandbox
 /// capacity gate (`launch.rs`, JSON-RPC code -32029), or `None` for any other
 /// error. A direct-root limit is `source_root_limit`; a free-space shortfall is
 /// `disk_floor`.
 pub(crate) fn admission_hold_kind(error: &DaemonError) -> Option<&'static str> {
+    // #3066: a provider plan window that ran out (the five-hour window) is an
+    // outage of the account, not a defect of the node. The launch returns to
+    // `Reserved` and is retried each tick until the window resets, so an
+    // outage never settles a node `launch_refused`.
+    if crate::provider_exhaustion::is_usage_window_refusal(error) {
+        return Some(WAITING_ON_PROVIDER);
+    }
     let DaemonError::StructuredRpc {
         rpc_code: -32029,
         data,
@@ -155,9 +235,20 @@ pub(crate) struct LaunchRequest {
 pub(crate) trait NodeEffects: Send + Sync + 'static {
     fn enabled(&self) -> bool;
     fn launch(&self, request: LaunchRequest) -> impl Future<Output = Result<Uuid>> + Send;
+    /// Freeze the same effective identity the launch will use, including
+    /// project defaults, so an outage notice names the refused provider.
+    fn prepare_launch_identity(
+        &self,
+        _config: &mut crate::claude::LaunchConfig,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn session(&self, session_id: Uuid) -> impl Future<Output = Option<SessionObservation>> + Send;
     fn output(&self, session_id: Uuid) -> impl Future<Output = Result<NodeData>> + Send;
     fn interrupt(&self, session_id: Uuid) -> impl Future<Output = ()> + Send;
+    /// #3038: stop the node session's own open `test`/`build` jobs (a cancelled
+    /// execution must not wait for a job its parked node was waiting on).
+    fn cancel_open_jobs(&self, session_id: Uuid) -> impl Future<Output = Result<()>> + Send;
     fn reclaim(&self, session_id: Uuid) -> impl Future<Output = ()> + Send;
     fn release_sandbox(&self, session_id: Uuid) -> impl Future<Output = Result<()>> + Send;
     fn predicate_met(
@@ -195,21 +286,41 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
     fn kill_stale_group(&self, pgid: i32, sandbox: Option<&std::path::Path>);
     /// Operator setting `topology_max_concurrent_build_nodes`.
     fn build_node_cap(&self) -> u32;
+    /// Operator setting `structured_handoff_default` (#2759): every session
+    /// node behaves as if marked `structured_handoff`. Off by default.
+    fn structured_handoff_default(&self) -> bool {
+        false
+    }
+    /// The provider the node's session runs on, for the handoff counters
+    /// (#2759). `None` when the daemon does not know.
+    fn session_provider(
+        &self,
+        _session_id: Uuid,
+    ) -> impl Future<Output = Option<rsi_common::types::SessionProvider>> + Send {
+        async { None }
+    }
     /// Suspension point between a resolution's key pre-check and its
     /// recording transaction. Production: no-op; tests force a key race.
     fn before_resolution_record(&self, _execution_id: Uuid) -> impl Future<Output = ()> + Send {
         async {}
     }
-    /// Host-load admission (#1417): `true` while the daemon holds this
-    /// attempt's launch because the host is too loaded for a new worker. The
-    /// attempt stays `Reserved`, nothing is written and the driver asks again
-    /// on its next tick. `unattended` is false only for the first launches of
-    /// an operator-requested execution (an operator start is immediate); every
+    /// Host admission (#1417, #2562): `Some(reason)` (`host_load`, `thermal` or
+    /// `disk_pressure`) while the daemon holds this attempt's launch because the
+    /// host is too loaded, too hot or too full for a new worker. The attempt
+    /// stays `Reserved`, one `admission_hold{kind: reason}` event is written per
+    /// transition and the driver asks again on its next tick. `unattended` is
+    /// false only for the first launches of an operator-requested execution (an
+    /// operator start skips the load queue, but never host pressure); every
     /// later node of any execution is held like any other (#1641 S4b). `since`
     /// (the execution's age) orders held launches oldest-first. Production
-    /// forwards to the host-load gate; the default never holds.
-    fn launch_held(&self, _unattended: bool, _since: DateTime<Utc>, _attempt: &AttemptRow) -> bool {
-        false
+    /// forwards to the host-admission gate; the default never holds.
+    fn launch_held(
+        &self,
+        _unattended: bool,
+        _since: DateTime<Utc>,
+        _attempt: &AttemptRow,
+    ) -> Option<&'static str> {
+        None
     }
     /// #1641 S4b: a command node that runs cargo takes a governor build slot
     /// (which also applies the disk floor, `min_free_disk_gb`) before it
@@ -237,6 +348,22 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
     /// durable state on every call (never cached).
     fn review_status(&self, _assignment_id: Uuid) -> impl Future<Output = ReviewStatus> + Send {
         async { ReviewStatus::Unsettled("review_service_unavailable".into()) }
+    }
+    /// Review nodes (#2570): the merge-queue gate's receipt for a published
+    /// land entry, shown to the reviewer of the landed source as its test
+    /// evidence. The default has none.
+    fn land_gate_receipt(
+        &self,
+        _entry_id: Uuid,
+    ) -> impl Future<Output = Option<crate::topology::land::GateReceipt>> + Send {
+        async { None }
+    }
+    /// Review nodes (#2423): the topology gave up on `assignment_id`
+    /// (`review_unsettled`). Stop its reviewer if that session is still alive
+    /// (a reviewer can keep running after an immutable `blocked` receipt) and
+    /// return the session it interrupted. The default has no reviewer to stop.
+    fn stop_reviewer(&self, _assignment_id: Uuid) -> impl Future<Output = Option<Uuid>> + Send {
+        async { None }
     }
     /// Review nodes (#1715): whether one more round of an exhausted review is
     /// policy-valid, re-derived from the review ledger. The default offers the
@@ -295,10 +422,66 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
             }
         }
     }
+    /// Land nodes (#2599): the published tip when `source` is an ancestor of a
+    /// freshly fetched `origin/rolling` of `repo`; `None` when it is not or git
+    /// cannot say. A refused entry whose source is already on rolling landed.
+    fn landed_source_tip(
+        &self,
+        _repo: PathBuf,
+        _source: String,
+    ) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
+    /// Land nodes (#3036): the live merge-queue entries of `project_id` ahead
+    /// of refused entry `entry_id` (queued, admitted or gating, enqueued
+    /// before it) whose own change conflicts with its source. A repair that
+    /// merged rolling now would be refused again once such an entry publishes,
+    /// so the land waits for each to settle first. Empty when none or when git
+    /// cannot say: the repair then runs at once.
+    fn land_conflict_blockers(
+        &self,
+        _repo: PathBuf,
+        _project_id: Option<Uuid>,
+        _entry_id: Uuid,
+    ) -> impl Future<Output = Vec<Uuid>> + Send {
+        async { Vec::new() }
+    }
+    /// #2732: whether `commit` is supplied work not yet on a freshly fetched
+    /// `origin/rolling` (git positively says it is no ancestor). An execution
+    /// started with such a `base_commit` verifies and lands it, so its
+    /// implement node may hand off that commit unchanged. The default says no,
+    /// which keeps the new-commit rule.
+    fn commit_off_rolling(
+        &self,
+        _repo: PathBuf,
+        _commit: String,
+    ) -> impl Future<Output = bool> + Send {
+        async { false }
+    }
     /// #1641 S3a: one operator attention message (the daemon's system
     /// message bus). Called once per transition into a visible wait, never
     /// per tick. The default drops it.
     fn notify_operator(&self, _level: &str, _message: String) {}
+
+    /// #2697: the percentage of the node wall time after which the owner gets
+    /// its single progress notice (`0` is off).
+    fn wall_time_notice_percent(&self) -> u32 {
+        WALL_TIME_NOTICE_PERCENT
+    }
+
+    /// #2697: one notice for the execution's owner (`None`: an operator
+    /// execution, so the operator's message bus). `from_session` is the node's
+    /// own session, `key` is stable per attempt. Best effort; the default
+    /// drops it.
+    fn notify_owner(
+        &self,
+        _owner: Option<Uuid>,
+        _from_session: Uuid,
+        _key: String,
+        _message: String,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// #1641 S3c / #1715: deliver a ruling's answer to the node's own
     /// (finished) session through the continue path, bound to the exact
@@ -332,6 +515,19 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
                 "this daemon cannot continue a topology node session".into(),
             ))
         }
+    }
+
+    /// #2263: continue a finished `require_verified` node's own session with
+    /// its missing evidence. Production takes the fenced continue path for the
+    /// exact session (published tip, spawn guard), so a continuation that got
+    /// there first refuses this one with a typed fence code. The default is the
+    /// plain continuation.
+    fn continue_unverified(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.continue_session(session_id, prompt)
     }
 
     /// #1728: continue a node session a daemon restart cut off. Production
@@ -447,6 +643,25 @@ impl<'a> AttemptIndex<'a> {
     }
 }
 
+/// #2651: what an accepted `already_satisfied` handoff recorded.
+struct AlreadySatisfied {
+    evidence_commit: String,
+    /// What closing the input Issue did (it stays open when refused).
+    issue_close: Option<IssueClose>,
+}
+
+/// Whether `source`'s result is an accepted `already_satisfied` handoff
+/// (#2651): it has nothing to land, review or follow up, so its `success` and
+/// `completed` edges are untaken and the downstream paths are dead.
+fn is_already_satisfied(index: &AttemptIndex<'_>, source: &str, at: u32) -> bool {
+    index
+        .result(source, at)
+        .and_then(|attempt| attempt.output.as_ref())
+        .and_then(|output| output.pointer("/fields/already_satisfied"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Whether a terminally failed latest attempt earns another attempt.
 fn retry_due(
     shape: &GraphShape,
@@ -481,6 +696,13 @@ fn retry_due(
         // `MAX_ATTEMPTS_PER_NODE` per instance on top of it.
         Some(failure::LOST_BEFORE_SESSION | failure::LOST_AFTER_SESSION | failure::INTERRUPTED) => {
             count(&failure::INFRASTRUCTURE) < MAX_ATTEMPTS_PER_NODE as usize
+        }
+        // A reviewer that could not run a check it needed reported
+        // infrastructure, not a verdict (#2570): a fresh review, bounded apart
+        // from the node's own budget (`review::REVIEW_INFRASTRUCTURE_RETRIES`).
+        Some(failure::REVIEW_INFRASTRUCTURE) => {
+            count(&[failure::REVIEW_INFRASTRUCTURE])
+                <= crate::topology::review::REVIEW_INFRASTRUCTURE_RETRIES
         }
         // A review with no usable verdict earns exactly one new assignment;
         // the second one blocks (settled as `blocked`, never reaching here).
@@ -524,6 +746,14 @@ fn instance_state(
         AttemptStatus::Blocked => InstanceState::Blocked,
         AttemptStatus::Skipped => InstanceState::Dead,
         _ if retry_due(shape, execution, index, latest) => InstanceState::InFlight,
+        // #2688: a land refused `land_requires_review` is routed by its
+        // `review_required` edge (and by no other failure edge).
+        AttemptStatus::Failed
+            if latest.failure_class.as_deref() == Some(failure::LAND_REQUIRES_REVIEW)
+                && shape.steps().routes_review_required(node) =>
+        {
+            InstanceState::Routed
+        }
         // A cancelled attempt is never routed.
         AttemptStatus::Failed | AttemptStatus::Interrupted | AttemptStatus::Lost
             if shape.steps().routes_failure(node) =>
@@ -546,7 +776,9 @@ fn edge_taken(
     let when = shape.steps().when(&edge.source, &edge.target);
     match instance_state(shape, execution, index, &edge.source, at) {
         InstanceState::Complete => match when {
-            EdgeWhen::Success | EdgeWhen::Completed => true,
+            EdgeWhen::Success | EdgeWhen::Completed => {
+                !is_already_satisfied(index, &edge.source, at)
+            }
             EdgeWhen::GateTrue | EdgeWhen::GateFalse => {
                 index
                     .result(&edge.source, at)
@@ -568,11 +800,25 @@ fn edge_taken(
                     .and_then(Value::as_str)
                     == Some(verdict)
             }
-            EdgeWhen::Failure => false,
+            EdgeWhen::Failure | EdgeWhen::ReviewRequired => false,
         },
         // Legacy `FailurePolicy::Skip`: downstream still runs.
         InstanceState::Skipped => when == EdgeWhen::Success,
-        InstanceState::Routed => matches!(when, EdgeWhen::Failure | EdgeWhen::Completed),
+        InstanceState::Routed => {
+            // #2688: a land refused `land_requires_review` takes only its
+            // `review_required` edges (and `completed`), never the repair
+            // route of an ordinary failure; every other routed failure takes
+            // no `review_required` edge.
+            let needs_review = index.latest(&edge.source, at).is_some_and(|latest| {
+                latest.failure_class.as_deref() == Some(failure::LAND_REQUIRES_REVIEW)
+            });
+            match when {
+                EdgeWhen::ReviewRequired => needs_review,
+                EdgeWhen::Failure => !needs_review,
+                EdgeWhen::Completed => true,
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -741,6 +987,17 @@ impl<E: NodeEffects> Executor<E> {
             .collect();
         let mut changed = false;
         for attempt in &in_flight {
+            // A node's pending ruling holds new effects in this execution,
+            // while already running nodes and the answer wait still reconcile.
+            if attempt.status == AttemptStatus::Reserved {
+                let store = self.store.lock().await;
+                if rows::load_attempts(&store, execution.id)?
+                    .iter()
+                    .any(|other| crate::topology::decision::marker_key(other).is_some())
+                {
+                    continue;
+                }
+            }
             changed |= self.drive_attempt(&execution, attempt).await?;
         }
         if changed {
@@ -790,6 +1047,12 @@ impl<E: NodeEffects> Executor<E> {
         attempts: &[AttemptRow],
         waiting: Step,
     ) -> Result<Option<Step>> {
+        if attempts
+            .iter()
+            .any(|attempt| crate::topology::decision::marker_key(attempt).is_some())
+        {
+            return Ok(Some(Step::Wait));
+        }
         let shape = GraphShape::from_workflow(&execution.definition)?;
         let index = AttemptIndex::new(attempts);
         let progress = rows::load_region_progress(
@@ -828,7 +1091,13 @@ impl<E: NodeEffects> Executor<E> {
                     node_id: attempt.node_id.clone(),
                     iteration: attempt.iteration,
                     attempt_no: attempt.attempt_no + 1,
-                    base_commit: attempt.base_commit.clone(),
+                    // #2549: a restart-preserved attempt retries from its
+                    // preserved commit; the work is never dropped.
+                    base_commit: attempt
+                        .preserved_commit
+                        .clone()
+                        .filter(|_| attempt.status == AttemptStatus::Interrupted)
+                        .unwrap_or_else(|| attempt.base_commit.clone()),
                     query: attempt.query().to_owned(),
                     node_kind,
                     catalog_op,
@@ -850,7 +1119,7 @@ impl<E: NodeEffects> Executor<E> {
             if waiting == Step::Wait {
                 return Ok(Some(Step::Wait));
             }
-            let error = format!(
+            let mut error = format!(
                 "node '{}' failed: {}",
                 failed.node_id,
                 failed
@@ -859,6 +1128,15 @@ impl<E: NodeEffects> Executor<E> {
                     .or(failed.failure_class.as_deref())
                     .unwrap_or("failed")
             );
+            // #2584: a failure after the source landed names the landed SHA and
+            // the review verdicts, so it is never read as a bare `failed`.
+            let context = {
+                let store = self.store.lock().await;
+                crate::topology::outcome::failure_context(&store, execution.id)
+            };
+            if let Some(context) = context {
+                error.push_str(&format!("; {context}"));
+            }
             self.transition(
                 execution,
                 &[ExecutionStatus::Running],
@@ -1142,7 +1420,7 @@ impl<E: NodeEffects> Executor<E> {
     ) -> Result<()> {
         let update = {
             let store = self.store.lock().await;
-            rows::transition_execution(
+            let update = rows::transition_execution(
                 &store,
                 execution.id,
                 from,
@@ -1150,7 +1428,10 @@ impl<E: NodeEffects> Executor<E> {
                 error,
                 output,
                 blocked_reason,
-            )?
+            )?;
+            // #2427: a run that ends without landing frees its Issue.
+            crate::topology::issue_hold::release(&store, execution, to);
+            update
         };
         self.publish(update);
         Ok(())
@@ -1264,21 +1545,17 @@ impl<E: NodeEffects> Executor<E> {
                     })?
             }
         };
-        let input = if shape.is_source(node_id) {
-            let mut input = crate::topology::starters::source_input(execution.input.as_ref());
+        let execution_input = crate::topology::starters::source_input(execution.input.as_ref());
+        let issue = execution_input
+            .get(crate::topology::starters::ISSUE_INPUT_KEY)
+            .and_then(crate::topology::starters::render_issue);
+        let mut input = if shape.is_source(node_id) {
+            let mut input = execution_input;
             input.remove("base_commit");
             // The on-call seat is the executor's, not the node's.
             input.remove(rsi_common::topology_agent::ON_CALL_INPUT_KEY);
-            // #1641 S5a: the accepted Issue snapshot reads as the Issue.
-            if let Some(issue) = input
-                .get(crate::topology::starters::ISSUE_INPUT_KEY)
-                .and_then(crate::topology::starters::render_issue)
-            {
-                input.insert(
-                    crate::topology::starters::ISSUE_INPUT_KEY,
-                    GraphValue::String(issue),
-                );
-            }
+            // The review policy is the daemon's landing check, not prompt text.
+            input.remove(crate::topology::review_policy::REVIEW_POLICY_INPUT_KEY);
             input
         } else {
             // Typed downstream rendering (plan §3): one section per taken
@@ -1328,6 +1605,17 @@ impl<E: NodeEffects> Executor<E> {
             input
         };
         let (node_kind, catalog_op, effect_class) = attempt_kind(shape.steps(), node_id);
+        // Every session receives the accepted Issue snapshot, independent of
+        // upstream edges and pass_content. Replacing the root's raw value
+        // keeps exactly one Issue section; non-Issue inputs retain their meaning.
+        if (shape.is_source(node_id) || node_kind == "session")
+            && let Some(issue) = issue
+        {
+            input.insert(
+                crate::topology::starters::ISSUE_INPUT_KEY,
+                GraphValue::String(issue),
+            );
+        }
         Ok(NewAttempt {
             node_id: node_id.to_owned(),
             iteration,
@@ -1507,9 +1795,8 @@ impl<E: NodeEffects> Executor<E> {
             // #1641 S4b: the hold covers every execution's later nodes; only
             // the first launches of an operator-requested execution are
             // immediate (nothing has settled yet).
-            if attempt.attempt_no == 1
-                && attempt.status == AttemptStatus::Reserved
-                && self.effects.launch_held(
+            let held = if attempt.attempt_no == 1 && attempt.status == AttemptStatus::Reserved {
+                self.effects.launch_held(
                     execution.agent_requested()
                         || rows::load_attempts(&store, execution.id)?
                             .iter()
@@ -1517,8 +1804,14 @@ impl<E: NodeEffects> Executor<E> {
                     execution.created_at,
                     attempt,
                 )
-            {
-                return Ok(false);
+            } else {
+                None
+            };
+            if let Some(kind) = held {
+                drop(store);
+                // #2562: the hold is visible on the attempt, one event per
+                // transition, and the node stays `Reserved` for the next tick.
+                return self.hold_attempt(execution, attempt, kind).await;
             }
             // #633 (plan §5.3): an agent-requested launch re-checks live
             // manager policy and charges `max_created_sessions`; a refusal
@@ -1544,7 +1837,7 @@ impl<E: NodeEffects> Executor<E> {
                 return Ok(false);
             }
         }
-        let request = match Self::launch_request(execution, attempt) {
+        let mut request = match Self::launch_request(execution, attempt) {
             Ok(request) => request,
             Err(error) => {
                 self.settle(
@@ -1561,7 +1854,17 @@ impl<E: NodeEffects> Executor<E> {
                 return Ok(true);
             }
         };
-        match self.effects.launch(request).await {
+        let prepared = self
+            .effects
+            .prepare_launch_identity(&mut request.config)
+            .await;
+        let provider = request.config.provider.unwrap_or_default();
+        let project = request.config.project_id;
+        let launched = match prepared {
+            Ok(()) => self.effects.launch(request).await,
+            Err(error) => Err(error),
+        };
+        match launched {
             Ok(_) => {
                 let update = {
                     let store = self.store.lock().await;
@@ -1573,6 +1876,31 @@ impl<E: NodeEffects> Executor<E> {
                 if let Some(observed) = self.effects.session(attempt.session_id).await {
                     self.adopt(execution, attempt, observed).await?;
                 } else if let Some(kind) = admission_hold_kind(&error) {
+                    if kind == WAITING_ON_PROVIDER
+                        && let Some(project) = project
+                    {
+                        let store = self.store.lock().await;
+                        let notice = (|| -> Result<()> {
+                            if let Some(reset) =
+                                store.provider_usage_window_hold_until(provider, Utc::now())?
+                            {
+                                store.record_provider_window_held_work(
+                                    project,
+                                    provider,
+                                    reset,
+                                    "topology_launch",
+                                    attempt.id,
+                                    &format!("{} / {}", execution.name, attempt.node_id),
+                                    attempt.session_id,
+                                    reset,
+                                )?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = notice {
+                            tracing::error!(%error, attempt = %attempt.id, "could not record provider window launch notice");
+                        }
+                    }
                     // #1641 S4b: capacity pressure (-32029) is a delay, never
                     // a failure: the sandbox gate refused before any session
                     // or invocation existed, so the attempt returns to
@@ -1710,6 +2038,8 @@ impl<E: NodeEffects> Executor<E> {
             .await?;
         // The restart journal owns a session it cut off (deploy drain or
         // graceful restart) and continues it at startup: live, never settled.
+        let lost_to_restart = observed.lost_to_restart();
+        let journal_hold = observed.journal_hold();
         let journal_owned = observed.restart_intent_pending
             && matches!(
                 observed.status,
@@ -1732,6 +2062,33 @@ impl<E: NodeEffects> Executor<E> {
                 ResumeOutcome::Refused => {}
             }
         }
+        // #2549: a restart-lost node with diverged work earns one automatic
+        // retry from its preservation point, charged as infrastructure, before
+        // the work blocks the execution for a manager.
+        let restart_retry = previous_boot
+            && lost_to_restart
+            && !self.restart_retry_spent(execution, attempt).await?;
+        // #3038: a cancelling execution does not wait for a node session that
+        // ended its turn to wait on its own wake or job (a `Completed` session
+        // between turns, or one whose process died while parked). Interrupting
+        // reaches no turn, so its job and wakes are withdrawn here and the
+        // attempt settles `cancelled` within this pass.
+        let cancel_parked = execution.status == ExecutionStatus::Cancelling
+            && match observed.status {
+                SessionStatus::Completed => {
+                    self.between_turns_without_handoff(attempt.session_id)
+                        .await?
+                }
+                SessionStatus::Interrupted | SessionStatus::Failed => {
+                    self.parked_awaiting_resume(attempt.session_id).await?
+                }
+                _ => false,
+            };
+        if cancel_parked && !self.withdraw_parked_session(attempt.session_id).await {
+            // A job's unit would not stop: the attempt stays running and the
+            // next pass retries.
+            return Ok(false);
+        }
         let (status, settlement) = match observed.status {
             // A cancelling execution does not wait on the journal: the
             // session is terminal, so there is nothing to interrupt and the
@@ -1742,11 +2099,40 @@ impl<E: NodeEffects> Executor<E> {
             {
                 return self.observe_live(execution, attempt, paused).await;
             }
+            // #2625: a session the daemon will resume (an armed own wake or a
+            // live owned job) is running, not terminal, whatever its sandbox
+            // holds: a process death between turns leaves it `Interrupted`
+            // with a dirty tree, and the wake continues it. Dirty state is
+            // judged only once nothing will resume the session.
+            SessionStatus::Interrupted | SessionStatus::Failed
+                if execution.status != ExecutionStatus::Cancelling
+                    && self.parked_awaiting_resume(attempt.session_id).await? =>
+            {
+                return self.observe_live(execution, attempt, paused).await;
+            }
+            SessionStatus::Completed if cancel_parked => (
+                AttemptStatus::Cancelled,
+                Settlement {
+                    failure_class: Some(failure::CANCELLED),
+                    ..Settlement::default()
+                },
+            ),
+            SessionStatus::Completed
+                if self
+                    .between_turns_without_handoff(attempt.session_id)
+                    .await? =>
+            {
+                // #1783: the node ended a turn to wait on its own job or wake
+                // (the worker contract runs scoped tests as a job). It has not
+                // handed off yet; keep it running under its wall-time limit.
+                return self.observe_live(execution, attempt, paused).await;
+            }
             SessionStatus::Completed => {
                 let observed = self.observe_completed(execution, attempt, sandbox).await?;
-                if observed.0 == AttemptStatus::Waiting {
-                    // Parked on a question for the on-call manager; nothing
-                    // to settle.
+                if matches!(observed.0, AttemptStatus::Waiting | AttemptStatus::Running) {
+                    // Parked on a question for the on-call manager, or
+                    // continued with its missing verification evidence (#2263);
+                    // nothing to settle.
                     return Ok(true);
                 }
                 observed
@@ -1762,14 +2148,28 @@ impl<E: NodeEffects> Executor<E> {
                     ..Settlement::default()
                 },
             ),
+            // #2569: the restart journal's explicit hold over a session whose
+            // sandbox still holds nothing of its own: the attempt stays held
+            // (running, bounded by its wall time and the execution deadline)
+            // with no new provider work, and follows the session when the hold
+            // lifts. Diverged work falls through and is preserved as before.
+            SessionStatus::Interrupted
+                if journal_hold && Self::sandbox_untouched(attempt, &sandbox) =>
+            {
+                return self.observe_live(execution, attempt, paused).await;
+            }
             // Startup restore marks every provider that was live when the
             // daemon died `Failed`; for an attempt this incarnation never saw
             // alive that is the restart interrupting it (plan §2.4 → §3.4).
-            SessionStatus::Failed => {
-                Self::interrupted_outcome(execution, attempt, sandbox, SessionStatus::Interrupted)
-            }
+            SessionStatus::Failed => Self::interrupted_outcome(
+                execution,
+                attempt,
+                sandbox,
+                SessionStatus::Interrupted,
+                restart_retry,
+            ),
             // Interrupted, Archived or Deleted before completing.
-            ended => Self::interrupted_outcome(execution, attempt, sandbox, ended),
+            ended => Self::interrupted_outcome(execution, attempt, sandbox, ended, restart_retry),
         };
         self.settle(execution, attempt, status, settlement).await?;
         // Interrupt-path and terminal reclaim alike: only this attempt's cache.
@@ -1794,14 +2194,22 @@ impl<E: NodeEffects> Executor<E> {
         if rows::node_resume_tried(&*self.store.lock().await, attempt.id, self.boot_id)? {
             return Ok(ResumeOutcome::Refused);
         }
-        let outcome = self
-            .effects
-            .resume_cut_session(
-                attempt.session_id,
-                rsi_common::daemon_message::wrap("daemon-restart", RESTART_RESUME_PROMPT),
-                observed_restart_cut,
-            )
-            .await;
+        let outcome = match observed_restart_cut {
+            Some(fence) => {
+                self.effects
+                    .resume_cut_session(
+                        attempt.session_id,
+                        rsi_common::daemon_message::wrap("daemon-restart", RESTART_RESUME_PROMPT),
+                        Some(fence),
+                    )
+                    .await
+            }
+            // A read failure is not evidence of a competing turn. Bound it
+            // with the existing once-per-boot resume record and fallback.
+            None => Err(DaemonError::InvalidParam(
+                RESTART_OBSERVATION_UNAVAILABLE.into(),
+            )),
+        };
         // Another continuation already owns the session (an operator got
         // there first), or has run since this observation (the turn cursor
         // moved): the observation is stale, so nothing is recorded, nothing
@@ -1992,6 +2400,8 @@ impl<E: NodeEffects> Executor<E> {
             return Ok(false);
         }
         if !wall_time_expired_after(execution, attempt, paused) {
+            self.notice_wall_time_progress(execution, attempt, paused)
+                .await?;
             return Ok(false);
         }
         self.effects.interrupt(attempt.session_id).await;
@@ -2002,6 +2412,140 @@ impl<E: NodeEffects> Executor<E> {
         self.settle(execution, attempt, AttemptStatus::Failed, settlement)
             .await?;
         Ok(true)
+    }
+
+    /// #2697: once an attempt has used the configured share of its node wall
+    /// time (waiting on an answer excluded), tell the execution's owner what
+    /// it has to show for it, while a re-scope can still save the remaining
+    /// time. One durable `node_wall_time_notice` event per attempt keeps it to
+    /// a single notice across ticks and daemon restarts.
+    async fn notice_wall_time_progress(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        paused: chrono::TimeDelta,
+    ) -> Result<()> {
+        let percent = self.effects.wall_time_notice_percent();
+        if percent == 0 || execution.status == ExecutionStatus::Cancelling {
+            return Ok(());
+        }
+        let started = attempt.started_at.unwrap_or(execution.created_at);
+        let now = Utc::now();
+        let elapsed = now - started - paused;
+        if elapsed < SESSION_WALL_TIME * i32::try_from(percent.min(100)).unwrap_or(100) / 100 {
+            return Ok(());
+        }
+        let progress = attempt
+            .sandbox_root
+            .as_deref()
+            .filter(|sandbox| sandbox.exists())
+            .and_then(|sandbox| custody::sandbox_progress(sandbox, &attempt.base_commit).ok());
+        let owner = execution
+            .requested_by_session_id
+            .or(execution.parent_session_id);
+        let noted = {
+            let store = self.store.lock().await;
+            rows::note_land_issue(
+                &store,
+                execution.id,
+                attempt,
+                owner,
+                "node_wall_time_notice",
+                serde_json::json!({
+                    "elapsed_secs": elapsed.num_seconds(),
+                    "commits": progress.map(|progress| progress.commits),
+                    "last_commit_at": progress.and_then(|progress| progress.last_commit_at),
+                    "iteration": attempt.iteration,
+                    "attempt_no": attempt.attempt_no,
+                }),
+            )?
+        };
+        let Some(update) = noted else {
+            return Ok(());
+        };
+        self.publish([update]);
+        let message = wall_time_notice(execution, attempt, elapsed, progress, now);
+        self.effects
+            .notify_owner(
+                owner,
+                attempt.session_id,
+                format!("topology-wall-time:{}", attempt.id),
+                message,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// #2625: the daemon will resume this session: it owns an armed result wake,
+    /// a live job with the default `owner` wake, or a job that settled since its
+    /// last assistant turn within `RESUME_IN_FLIGHT_GRACE_SECS` (the wake fired
+    /// and the resume turn has not started). The one predicate for "parked",
+    /// shared by a `Completed` session between turns (#1783) and an
+    /// `Interrupted`/`Failed` one whose process died while parked.
+    async fn parked_awaiting_resume(&self, session_id: Uuid) -> Result<bool> {
+        let store = self.store.lock().await;
+        Ok(store.owner_armed_result_wake(session_id)?.is_some()
+            || store.session_has_live_owner_wake_job(session_id)?
+            || store.session_job_settled_since_last_turn(
+                session_id,
+                Utc::now(),
+                chrono::Duration::seconds(RESUME_IN_FLIGHT_GRACE_SECS),
+            )?)
+    }
+
+    /// #3038: take a cancelled node's parked session out of the daemon's
+    /// resume set: stop its open jobs, then disable every wake it owns. A
+    /// session whose result wake already fired and whose resume turn is about
+    /// to start cannot be recalled, so it is also interrupted. `false` when a
+    /// job could not be stopped (retried on the next pass).
+    async fn withdraw_parked_session(&self, session_id: Uuid) -> bool {
+        if let Err(error) = self.effects.cancel_open_jobs(session_id).await {
+            tracing::warn!(%session_id, %error, "cancelling execution: parked node job not stopped");
+            return false;
+        }
+        let disabled = {
+            let store = self.store.lock().await;
+            store.disable_session_wakes(session_id)
+        };
+        match disabled {
+            Ok(ids) if !ids.is_empty() => {
+                tracing::info!(%session_id, wakes = ids.len(), "cancelling execution: parked node wakes withdrawn");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "cancelling execution: parked node wakes not withdrawn");
+                return false;
+            }
+        }
+        self.effects.interrupt(session_id).await;
+        true
+    }
+
+    /// #1783: a completed node session whose last message carries no pipeline
+    /// handoff while the daemon will resume it is between turns, not finished.
+    /// "Will resume it" is the daemon's parked predicate: an armed result wake
+    /// (`resume`, `when`, `on_terminal`; `owner_armed_result_wake`, as
+    /// `AgentWorkerRoster` #2311) or a live job with the default `owner` wake
+    /// (#2262: its resume wake is armed only when the job settles). A handoff is
+    /// a marker line the strict parser accepts (`validate_first_line`, the
+    /// check `parse_pipeline_handoff_v2` opens with), not a mention of the
+    /// words in prose (#2363) and not an indented or backtick-wrapped example
+    /// marker (#2370); a real handoff always settles, whatever wakes remain.
+    /// #2476: the rule is the same for every node kind (implement, repair,
+    /// review ...). The window in which the job has settled and its wake has
+    /// fired but the resume turn has not started has neither a wake row nor a
+    /// live job; a job settled since the last assistant message, within
+    /// `RESUME_IN_FLIGHT_GRACE_SECS`, still counts as parked.
+    async fn between_turns_without_handoff(&self, session_id: Uuid) -> Result<bool> {
+        if !self.parked_awaiting_resume(session_id).await? {
+            return Ok(false);
+        }
+        let output = self.effects.output(session_id).await?;
+        let content = match output.get("content") {
+            Some(GraphValue::String(content)) => content.as_str(),
+            _ => "",
+        };
+        Ok(validate_first_line(content).is_err())
     }
 
     /// Plan §4 rule 3: observe git, never trust a reported SHA.
@@ -2040,6 +2584,23 @@ impl<E: NodeEffects> Executor<E> {
             if self.parks_on_question(execution, attempt).await? {
                 return Ok((AttemptStatus::Waiting, Settlement::default()));
             }
+            // #2563: a finished commit-expecting node that handed off complete
+            // and left a few paths uncommitted is asked once, as the same
+            // session, to commit or discard them and repeat its handoff.
+            if self
+                .finished_complete_with_commit(execution, attempt)
+                .await?
+                && let UnverifiedOutcome::Continued | UnverifiedOutcome::Deferred = self
+                    .continue_dirty_node(
+                        execution,
+                        attempt,
+                        custody::inspect_sandbox(&sandbox, &attempt.base_commit)
+                            .map_or(0, |report| report.dirty_paths.len()),
+                    )
+                    .await?
+            {
+                return Ok((AttemptStatus::Running, Settlement::default()));
+            }
             // T1's `uncommitted_work` is preserved work, never discarded.
             return Ok(Self::preserve(execution, attempt, &sandbox));
         }
@@ -2051,9 +2612,28 @@ impl<E: NodeEffects> Executor<E> {
             Some(GraphValue::String(content)) => content.clone(),
             _ => String::new(),
         };
+        // #2759: a schema-validated last message (Codex's JSON text) is read as
+        // the canonical handoff block everywhere below; Claude's arrives
+        // already rendered. Free text is unchanged.
+        let content =
+            rsi_common::structured_handoff::normalize_structured_handoff(&content).into_owned();
+        // Whether the turn that wrote this message carried the handoff schema.
+        let structured_turn = crate::structured_handoff::finish_turn(attempt.session_id);
+        let provider = self.effects.session_provider(attempt.session_id).await;
+        crate::structured_handoff::record_observed(provider, structured_turn);
         let handoff = match parse_pipeline_handoff_v2(&content, "") {
             Ok(handoff) => handoff,
             Err(error) => {
+                crate::structured_handoff::record_invalid(provider, structured_turn);
+                // #2584: the session is asked once, as itself, to repeat the
+                // handoff with the parser's error and the required first line;
+                // only a second malformed handoff fails the node.
+                if let UnverifiedOutcome::Continued | UnverifiedOutcome::Deferred = self
+                    .continue_handoff_format(execution, attempt, &error.to_string())
+                    .await?
+                {
+                    return Ok((AttemptStatus::Running, Settlement::default()));
+                }
                 return Ok((
                     AttemptStatus::Failed,
                     Settlement {
@@ -2064,7 +2644,8 @@ impl<E: NodeEffects> Executor<E> {
                 ));
             }
         };
-        if handoff.strict_status != PipelineStatusV2::Complete {
+        let satisfied_claim = handoff.strict_status == PipelineStatusV2::AlreadySatisfied;
+        if !satisfied_claim && handoff.strict_status != PipelineStatusV2::Complete {
             if self
                 .park_on_blocker_question(execution, attempt, &handoff, &content)
                 .await?
@@ -2085,7 +2666,93 @@ impl<E: NodeEffects> Executor<E> {
                 },
             ));
         }
-        if steps.expects_commit(&attempt.node_id) && observed.head == attempt.base_commit {
+        // #2568: a retry forked from a preserved commit already holds the
+        // earlier attempt's work; its result is measured from the base that work
+        // started at, so a complete preserved result may stand unchanged.
+        let work_base = self
+            .preserved_origin_base(execution, attempt)
+            .await?
+            .unwrap_or_else(|| attempt.base_commit.clone());
+        // #2651: a worker that proved the Issue's acceptance already holds on
+        // the base hands off `already_satisfied` instead of a commit.
+        //
+        // #3045: the Issue closes without landing, so the evidence must already
+        // be on a freshly fetched `origin/rolling`. Evidence reachable only from
+        // a supplied `base_commit` that is not on rolling is unlanded work: it
+        // is handled as the #2732 `complete` handoff at that base (land runs)
+        // when that route applies, otherwise refused.
+        let evidence_unlanded = if satisfied_claim && let Some(evidence) = &handoff.evidence_commit
+        {
+            self.effects
+                .commit_off_rolling(execution.repo_root.clone(), evidence.clone())
+                .await
+        } else {
+            false
+        };
+        if evidence_unlanded
+            && !(steps.expects_commit(&attempt.node_id)
+                && observed.head == work_base
+                && work_base == execution.base_commit)
+        {
+            return Ok((
+                AttemptStatus::Failed,
+                Settlement {
+                    failure_class: Some(failure::HANDOFF_INVALID),
+                    error: Some(
+                        "already_satisfied evidence_commit is not on origin/rolling; \
+                         unlanded work is not already satisfied"
+                            .into(),
+                    ),
+                    ..Settlement::default()
+                },
+            ));
+        }
+        let satisfied = if satisfied_claim && !evidence_unlanded {
+            match self
+                .accept_already_satisfied(
+                    execution,
+                    attempt,
+                    &steps,
+                    &handoff,
+                    &content,
+                    &observed.head,
+                    &work_base,
+                    &sandbox,
+                )
+                .await?
+            {
+                Ok(accepted) => Some(accepted),
+                Err(error) => {
+                    return Ok((
+                        AttemptStatus::Failed,
+                        Settlement {
+                            failure_class: Some(failure::HANDOFF_INVALID),
+                            error: Some(error),
+                            ..Settlement::default()
+                        },
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        // #2732: an execution started on a supplied `base_commit` that is not
+        // on `origin/rolling` exists to verify and land that commit, so its
+        // first implement node may hand it off unchanged (its own scoped_test
+        // receipt at that head still gates a `require_verified` node).
+        let supplied_unlanded = satisfied.is_none()
+            && steps.expects_commit(&attempt.node_id)
+            && observed.head == work_base
+            && work_base == execution.base_commit
+            && self
+                .effects
+                .commit_off_rolling(execution.repo_root.clone(), work_base.clone())
+                .await;
+        if satisfied.is_none()
+            && !supplied_unlanded
+            && steps.expects_commit(&attempt.node_id)
+            && observed.head == work_base
+        {
             return Ok((
                 AttemptStatus::Failed,
                 Settlement {
@@ -2096,7 +2763,9 @@ impl<E: NodeEffects> Executor<E> {
             ));
         }
         let pin = node_pin_ref(execution.id, &attempt.node_id, attempt.iteration);
-        if let Err(error) = custody::pin_commit(&sandbox, &pin, &observed.head) {
+        if satisfied.is_none()
+            && let Err(error) = custody::pin_commit(&sandbox, &pin, &observed.head)
+        {
             return Ok((
                 AttemptStatus::Failed,
                 Settlement {
@@ -2106,12 +2775,49 @@ impl<E: NodeEffects> Executor<E> {
                 },
             ));
         }
+        // #2249: a verified node settles only on its own scoped_test receipt
+        // for exactly this commit. The pin above stays; the failed attempt
+        // carries what the daemon read, so a `failure` edge can route it.
+        let verification = if satisfied.is_none() && steps.require_verified(&attempt.node_id) {
+            match self
+                .verify_result(execution, attempt, &observed.head)
+                .await?
+            {
+                Ok(evidence) => Some(evidence),
+                Err(unverified) => {
+                    // #2263: first the same session gets its missing evidence.
+                    let uncertain = match self
+                        .continue_unverified_node(execution, attempt, &unverified)
+                        .await?
+                    {
+                        UnverifiedOutcome::Continued | UnverifiedOutcome::Deferred => {
+                            return Ok((AttemptStatus::Running, Settlement::default()));
+                        }
+                        UnverifiedOutcome::Fail => None,
+                        UnverifiedOutcome::Uncertain(detail) => Some(detail),
+                    };
+                    return Self::verification_failure(&unverified, &observed.head, uncertain);
+                }
+            }
+        } else {
+            None
+        };
         let mut typed_handoff = std::collections::BTreeMap::new();
         typed_handoff.insert(
             "stage".into(),
             GraphValue::String(handoff.handoff.stage.as_str().to_ascii_lowercase()),
         );
-        typed_handoff.insert("status".into(), GraphValue::String("complete".into()));
+        typed_handoff.insert(
+            "status".into(),
+            GraphValue::String(
+                if satisfied.is_some() {
+                    "already_satisfied"
+                } else {
+                    "complete"
+                }
+                .into(),
+            ),
+        );
         // `artifacts[path@commit]`: the handoff doc when it lives in the
         // sandbox, addressed by the pinned result commit.
         let artifacts: Vec<GraphValue> = std::path::Path::new(&handoff.handoff.doc_path)
@@ -2126,15 +2832,32 @@ impl<E: NodeEffects> Executor<E> {
         );
         output.insert("handoff", GraphValue::Map(typed_handoff));
         output.insert("artifacts", GraphValue::List(artifacts));
-        output.insert(
-            "base_commit",
-            GraphValue::String(attempt.base_commit.clone()),
-        );
-        output.insert("result_commit", GraphValue::String(observed.head.clone()));
-        output.insert(
-            "changed",
-            GraphValue::Bool(observed.head != attempt.base_commit),
-        );
+        output.insert("base_commit", GraphValue::String(work_base.clone()));
+        if let Some(accepted) = &satisfied {
+            // No result commit and nothing to land: the downstream land,
+            // review and follow-up paths are dead (`edge_taken`).
+            output.insert("already_satisfied", GraphValue::Bool(true));
+            output.insert(
+                "evidence_commit",
+                GraphValue::String(accepted.evidence_commit.clone()),
+            );
+            if let Some(close) = &accepted.issue_close {
+                output.insert(
+                    "issue_close",
+                    serde_json::from_value::<GraphValue>(close.to_json())?,
+                );
+            }
+            output.insert("changed", GraphValue::Bool(false));
+        } else {
+            output.insert("result_commit", GraphValue::String(observed.head.clone()));
+            output.insert("changed", GraphValue::Bool(observed.head != work_base));
+        }
+        if let Some(evidence) = verification {
+            output.insert(
+                "verification",
+                serde_json::from_value::<GraphValue>(evidence.to_json(None))?,
+            );
+        }
         output.insert(
             "content_tail",
             GraphValue::String(
@@ -2171,14 +2894,374 @@ impl<E: NodeEffects> Executor<E> {
         } else {
             serde_json::to_value(&output)?
         };
+        let (result_commit, pin_ref) = if satisfied.is_some() {
+            (None, None)
+        } else {
+            (Some(observed.head), Some(pin))
+        };
         Ok((
             AttemptStatus::Succeeded,
             Settlement {
-                result_commit: Some(observed.head),
-                pin_ref: Some(pin),
+                result_commit,
+                pin_ref,
                 output: Some(output),
                 ..Settlement::default()
             },
+        ))
+    }
+
+    /// #2651: accept an `already_satisfied` handoff, or name why it is refused
+    /// (`handoff_invalid`). Accepted only for an Issue-pipeline implement node
+    /// (a commit-expecting session in a workflow that closes its input Issue),
+    /// with no new commit, when the evidence commit is an ancestor of the
+    /// attempt's base; the sandbox is already known clean. Accepting closes the
+    /// input Issue (idempotently, keyed by the attempt) with a note naming the
+    /// evidence commit and the worker's verification lines; a close the owner
+    /// may not write is data on the output and leaves the Issue open, as for a
+    /// land.
+    ///
+    /// # Errors
+    /// A transient store or git error; the caller asks again on its next tick.
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_already_satisfied(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        steps: &WorkflowSteps,
+        handoff: &rsi_common::agent_contract::StrictPipelineHandoffV2,
+        content: &str,
+        head: &str,
+        work_base: &str,
+        sandbox: &std::path::Path,
+    ) -> Result<std::result::Result<AlreadySatisfied, String>> {
+        if !steps.expects_commit(&attempt.node_id) || !steps.has_close_issue() {
+            return Ok(Err(
+                "already_satisfied is only valid on an Issue pipeline's implement node".into(),
+            ));
+        }
+        let Some(evidence) = handoff.evidence_commit.as_deref() else {
+            return Ok(Err(
+                "already_satisfied handoff requires evidence_commit".into()
+            ));
+        };
+        if head != work_base {
+            return Ok(Err(
+                "already_satisfied handoff must not carry a new commit".into()
+            ));
+        }
+        if !custody::commit_is_ancestor(sandbox, evidence, &attempt.base_commit)? {
+            return Ok(Err(format!(
+                "evidence_commit {evidence} is not an ancestor of the attempt base {}",
+                attempt.base_commit
+            )));
+        }
+        let note = crate::topology::issue_close::already_satisfied_note(evidence, content);
+        let close = match IssueCloseRequest::for_already_satisfied(execution, attempt, note) {
+            Ok(request) => {
+                let store = self.store.lock().await;
+                close_input_issue(&store, &request)?
+            }
+            Err(refused) => refused,
+        };
+        Ok(Ok(AlreadySatisfied {
+            evidence_commit: evidence.to_owned(),
+            issue_close: Some(close),
+        }))
+    }
+
+    /// The failed outcome of a node whose commit stayed unverified (#2249). An
+    /// `uncertain` continuation is named in the error and shown to the operator
+    /// by the caller; the failure still carries what the daemon read.
+    fn verification_failure(
+        unverified: &verify::Unverified,
+        head: &str,
+        uncertain: Option<String>,
+    ) -> Result<(AttemptStatus, Settlement)> {
+        let output = node_data(&serde_json::json!({
+            "verification": unverified.to_json(),
+            "result_commit": head,
+        }));
+        let mut error = format!("{}: {}", unverified.reason.as_str(), unverified.detail);
+        if let Some(detail) = uncertain {
+            error = format!("{VERIFICATION_CONTINUATION_UNCERTAIN}: {detail}; {error}");
+        }
+        Ok((
+            AttemptStatus::Failed,
+            Settlement {
+                failure_class: Some(failure::VERIFICATION_FAILED),
+                error: Some(error),
+                output: Some(serde_json::to_value(output)?),
+                ..Settlement::default()
+            },
+        ))
+    }
+
+    /// #2263: an unverified `require_verified` node is continued, as the same
+    /// session, with its missing evidence, at most
+    /// [`rows::MAX_VERIFICATION_CONTINUATIONS`] times per attempt; the next
+    /// unverified completion fails `verification_failed`. The attempt stays
+    /// `running` and its wall time is not touched. A cancelling execution or a
+    /// passed deadline stops the continuation.
+    ///
+    /// Delivery is at most once: the `node_verification_continued` event is the
+    /// durable claim, recorded before the provider effect. A claim whose user
+    /// turn cannot be found in the conversation is uncertain: shown, never
+    /// resent. Only a typed fence refusal, raised before any effect, takes the
+    /// claim back.
+    async fn continue_unverified_node(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        unverified: &verify::Unverified,
+    ) -> Result<UnverifiedOutcome> {
+        self.continue_node(
+            execution,
+            attempt,
+            &rows::VERIFICATION_CONTINUATION,
+            unverified.reason.as_str(),
+            |n, max, delivery_id| unverified.continuation_message(n, max, delivery_id),
+        )
+        .await
+    }
+
+    /// #2563: a finished implement/repair node that left uncommitted paths is
+    /// continued once, as the same session, to commit or discard them and repeat
+    /// its handoff line. Same at-most-once claim as the verification
+    /// continuation, counted apart from it. `Fail` means "not continued": the
+    /// caller preserves the dirty tree and blocks as before.
+    async fn continue_dirty_node(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        dirty_paths: usize,
+    ) -> Result<UnverifiedOutcome> {
+        self.continue_node(
+            execution,
+            attempt,
+            &rows::UNCOMMITTED_CONTINUATION,
+            "uncommitted_work",
+            |n, max, delivery_id| {
+                verify::uncommitted_continuation_message(dirty_paths, n, max, delivery_id)
+            },
+        )
+        .await
+    }
+
+    /// #2584: a finished node whose last message the handoff parser refused is
+    /// continued once, as the same session, with the parse error and the required
+    /// first line. Same at-most-once claim as the other continuations, counted
+    /// apart. `Fail`/`Uncertain` mean "not continued": the node fails
+    /// `handoff_invalid`.
+    async fn continue_handoff_format(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        parse_error: &str,
+    ) -> Result<UnverifiedOutcome> {
+        // #2759: this is the turn the daemon opens to obtain the handoff, so a
+        // structured node has the harness validate its shape. The next provider
+        // launch of the session consumes the arm; a continuation that is not
+        // delivered takes it back, leaving the turn as free text.
+        let structured = self.structured_handoff_node(execution, attempt);
+        if structured {
+            crate::structured_handoff::arm(attempt.session_id);
+        }
+        let outcome = self
+            .continue_node(
+                execution,
+                attempt,
+                &rows::HANDOFF_FORMAT_CONTINUATION,
+                failure::HANDOFF_INVALID,
+                |n, max, delivery_id| {
+                    verify::handoff_format_continuation_message(parse_error, n, max, delivery_id)
+                },
+            )
+            .await;
+        if structured && !matches!(outcome, Ok(UnverifiedOutcome::Continued)) {
+            crate::structured_handoff::disarm(attempt.session_id);
+        }
+        outcome
+    }
+
+    /// #2759: the node asks for a schema-validated handoff, by its own
+    /// `structured_handoff` field or the daemon setting
+    /// `structured_handoff_default`.
+    fn structured_handoff_node(&self, execution: &ExecutionRow, attempt: &AttemptRow) -> bool {
+        self.effects.structured_handoff_default()
+            || WorkflowSteps::from_workflow(&execution.definition)
+                .is_ok_and(|steps| steps.structured_handoff(&attempt.node_id))
+    }
+
+    async fn continue_node(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        kind: &rows::ContinuationKind,
+        reason: &str,
+        message: impl FnOnce(u32, u32, Uuid) -> String,
+    ) -> Result<UnverifiedOutcome> {
+        if execution.status == ExecutionStatus::Cancelling
+            || crate::topology::decision::execution_deadline_passed(execution)
+        {
+            return Ok(UnverifiedOutcome::Fail);
+        }
+        // An earlier claim must have landed before another may be made.
+        let previous = {
+            let store = self.store.lock().await;
+            match rows::continuations_of(&store, attempt.id, kind)?.pop() {
+                Some(claim) => Some((
+                    verify::continuation_turn_observed(
+                        &store,
+                        attempt.session_id,
+                        claim.delivery_id,
+                    )?,
+                    claim,
+                )),
+                None => None,
+            }
+        };
+        if let Some((false, claim)) = previous {
+            return Ok(self
+                .uncertain_verification_continuation(
+                    execution,
+                    attempt,
+                    kind,
+                    &claim,
+                    "no user-turn event is tied to the claimed continuation",
+                )
+                .await);
+        }
+        let claim = {
+            let store = self.store.lock().await;
+            rows::claim_continuation(&store, execution.id, attempt, kind, reason)?
+        };
+        let (continuation, update) = match claim {
+            rows::VerificationClaim::Claimed {
+                continuation,
+                update,
+            } => (continuation, update),
+            rows::VerificationClaim::Stopped | rows::VerificationClaim::Exhausted => {
+                return Ok(UnverifiedOutcome::Fail);
+            }
+        };
+        self.publish([update]);
+        let prompt = message(continuation.n, kind.max, continuation.delivery_id);
+        let outcome = self
+            .effects
+            .continue_unverified(attempt.session_id, prompt)
+            .await;
+        let Err(error) = outcome else {
+            return Ok(UnverifiedOutcome::Continued);
+        };
+        use crate::store::manager_actions::fence::{
+            CONTINUATION_TARGET_BUSY, CONTINUATION_TIP_CHANGED, CONTINUATION_TURN_CHANGED,
+            continuation_fence_code,
+        };
+        match continuation_fence_code(&error) {
+            // Another continuation owns or has moved the session: the fence
+            // refused before any effect, so the claim is taken back and the
+            // next observation follows the session.
+            Some(
+                code @ (CONTINUATION_TARGET_BUSY
+                | CONTINUATION_TURN_CHANGED
+                | CONTINUATION_TIP_CHANGED),
+            ) => {
+                let update = {
+                    let store = self.store.lock().await;
+                    rows::withdraw_continuation(
+                        &store,
+                        execution.id,
+                        attempt,
+                        kind,
+                        &continuation,
+                        code,
+                    )?
+                };
+                self.publish([update]);
+                tracing::info!(
+                    execution_id = %execution.id,
+                    node = %attempt.node_id,
+                    code,
+                    "verification continuation deferred: another continuation owns the session"
+                );
+                Ok(UnverifiedOutcome::Deferred)
+            }
+            // Any other typed refusal precedes the effect too, but retrying
+            // would repeat it: the node fails with the evidence it has.
+            Some(_) => Ok(UnverifiedOutcome::Fail),
+            None => {
+                // The error does not say whether the effect started. Only this
+                // continuation's own turn proves it landed.
+                let landed = {
+                    let store = self.store.lock().await;
+                    verify::continuation_turn_observed(
+                        &store,
+                        attempt.session_id,
+                        continuation.delivery_id,
+                    )?
+                };
+                if landed {
+                    return Ok(UnverifiedOutcome::Continued);
+                }
+                Ok(self
+                    .uncertain_verification_continuation(
+                        execution,
+                        attempt,
+                        kind,
+                        &continuation,
+                        &error.to_string(),
+                    )
+                    .await)
+            }
+        }
+    }
+
+    /// The continuation's provider effect may have started and nothing shows
+    /// it landed: show it and never send it again (#945).
+    async fn uncertain_verification_continuation(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        kind: &rows::ContinuationKind,
+        claim: &rows::VerificationContinuation,
+        detail: &str,
+    ) -> UnverifiedOutcome {
+        self.effects.notify_operator(
+            "warn",
+            format!(
+                "Topology execution {} ({}): node '{}' was sent {} continuation {} but \
+                 the daemon cannot tell whether the session received it ({detail}). It is not \
+                 sent again; continue the session yourself if it did not.",
+                execution.id, execution.name, attempt.node_id, kind.label, claim.n
+            ),
+        );
+        UnverifiedOutcome::Uncertain(detail.to_owned())
+    }
+
+    /// #2249: read the node session's own `scoped_test` jobs and the project's
+    /// open failure signatures, and judge whether `head` is verified. Reads
+    /// recorded state only; a store error is transient (asked again next tick).
+    async fn verify_result(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        head: &str,
+    ) -> Result<std::result::Result<verify::Evidence, verify::Unverified>> {
+        let (jobs, signatures) = {
+            let store = self.store.lock().await;
+            let jobs = store.list_agent_jobs(attempt.session_id, verify::JOBS_READ)?;
+            let signatures = match execution.project_id {
+                Some(project) => store.open_failure_signature_issues(project)?,
+                None => Vec::new(),
+            };
+            (jobs, signatures)
+        };
+        let jobs: Vec<_> = jobs.into_iter().map(|row| row.job).collect();
+        Ok(verify::judge(
+            &jobs,
+            attempt.session_id,
+            head,
+            &verify::known_failures(&signatures),
         ))
     }
 
@@ -2204,13 +3287,97 @@ impl<E: NodeEffects> Executor<E> {
             .await
     }
 
+    /// Whether a finished session ended on a complete handoff for a node that
+    /// expects a commit (an implement or repair node), the only node a dirty
+    /// tree is continued for (#2563).
+    async fn finished_complete_with_commit(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+    ) -> Result<bool> {
+        let steps = WorkflowSteps::from_workflow(&execution.definition)
+            .map_err(DaemonError::InvalidParam)?;
+        if !steps.expects_commit(&attempt.node_id) {
+            return Ok(false);
+        }
+        let output = self.effects.output(attempt.session_id).await?;
+        let Some(GraphValue::String(content)) = output.get("content") else {
+            return Ok(false);
+        };
+        Ok(parse_pipeline_handoff_v2(content, "")
+            .is_ok_and(|handoff| handoff.strict_status == PipelineStatusV2::Complete))
+    }
+
+    /// #2568: when the attempt was forked from a commit an earlier attempt of
+    /// the same node instance preserved (an automatic restart retry or a
+    /// resolved `retry`), the base that earlier work started at. `None` for an
+    /// ordinary attempt, whose base is its own.
+    async fn preserved_origin_base(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+    ) -> Result<Option<String>> {
+        let store = self.store.lock().await;
+        let attempts = rows::load_attempts(&store, execution.id)?;
+        let mut origin: Option<String> = None;
+        let mut base = attempt.base_commit.clone();
+        for _ in 0..attempts.len() {
+            let Some(earlier) = attempts.iter().find(|row| {
+                row.node_id == attempt.node_id
+                    && row.iteration == attempt.iteration
+                    && row.id != attempt.id
+                    && row.attempt_no < attempt.attempt_no
+                    && row.preserved_commit.as_deref() == Some(base.as_str())
+                    && row.base_commit != base
+            }) else {
+                break;
+            };
+            base.clone_from(&earlier.base_commit);
+            origin = Some(base.clone());
+        }
+        Ok(origin)
+    }
+
+    /// Whether this node instance already used its one automatic retry from a
+    /// restart-preserved commit (#2549); the next loss blocks as before.
+    async fn restart_retry_spent(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+    ) -> Result<bool> {
+        let store = self.store.lock().await;
+        Ok(rows::load_attempts(&store, execution.id)?
+            .iter()
+            .any(|row| {
+                row.node_id == attempt.node_id
+                    && row.iteration == attempt.iteration
+                    && row.id != attempt.id
+                    && row.status == AttemptStatus::Interrupted
+                    && row.preserved_commit.is_some()
+            }))
+    }
+
+    /// Whether the attempt's sandbox is absent or still clean at its base: no
+    /// work to preserve. A sandbox that cannot be read is not untouched.
+    fn sandbox_untouched(attempt: &AttemptRow, sandbox: &Option<PathBuf>) -> bool {
+        match sandbox {
+            Some(sandbox) if sandbox.exists() => custody::observe_sandbox(sandbox)
+                .is_ok_and(|observed| !observed.dirty && observed.head == attempt.base_commit),
+            _ => true,
+        }
+    }
+
     /// An interrupted or lost session: diverged work is preserved and blocks;
-    /// an unchanged sandbox is retryable.
+    /// an unchanged sandbox is retryable. `restart_retry` (#2549): the session
+    /// was lost to a daemon restart and the instance has its automatic retry
+    /// left, so diverged work is preserved and settled `interrupted`
+    /// (infrastructure), and the next attempt forks from the preserved commit.
     fn interrupted_outcome(
         execution: &ExecutionRow,
         attempt: &AttemptRow,
         sandbox: Option<PathBuf>,
         status: SessionStatus,
+        restart_retry: bool,
     ) -> (AttemptStatus, Settlement) {
         let clean = || {
             if status == SessionStatus::Interrupted {
@@ -2234,7 +3401,28 @@ impl<E: NodeEffects> Executor<E> {
         match sandbox {
             Some(sandbox) if sandbox.exists() => match custody::observe_sandbox(&sandbox) {
                 Ok(observed) if !observed.dirty && observed.head == attempt.base_commit => clean(),
-                Ok(_) => Self::preserve(execution, attempt, &sandbox),
+                Ok(_) => {
+                    let (settled, settlement) = Self::preserve(execution, attempt, &sandbox);
+                    if restart_retry
+                        && settled == AttemptStatus::Blocked
+                        && settlement.failure_class == Some(failure::PRESERVED_WORK)
+                    {
+                        (
+                            AttemptStatus::Interrupted,
+                            Settlement {
+                                failure_class: Some(failure::INTERRUPTED),
+                                error: Some(
+                                    "interrupted by a daemon restart; diverged work preserved and \
+                                     the node retries from it"
+                                        .into(),
+                                ),
+                                ..settlement
+                            },
+                        )
+                    } else {
+                        (settled, settlement)
+                    }
+                }
                 Err(error) => (
                     AttemptStatus::Failed,
                     Settlement {
@@ -2321,6 +3509,43 @@ impl<E: NodeEffects> Executor<E> {
         .await?;
         Ok(Some(execution.status))
     }
+}
+
+/// The text of the #2697 progress notice.
+fn wall_time_notice(
+    execution: &ExecutionRow,
+    attempt: &AttemptRow,
+    elapsed: chrono::TimeDelta,
+    progress: Option<custody::SandboxProgress>,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let minutes = |delta: chrono::TimeDelta| {
+        let total = delta.num_minutes().max(0);
+        format!("{}h{:02}m", total / 60, total % 60)
+    };
+    let work = match progress {
+        Some(progress) => match progress.last_commit_at {
+            Some(at) => format!(
+                "{} commit(s) on its branch since the base, the last {} ago (at {})",
+                progress.commits,
+                minutes(now - at),
+                at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            None => "no commits on its branch since the base".to_owned(),
+        },
+        None => "its branch could not be read".to_owned(),
+    };
+    format!(
+        "Topology execution {} ({}): node '{}' (attempt {}) has run {} of its {} wall-time \
+         limit with {work}. At the limit it is killed and only its work in progress is kept; \
+         if it is not converging, re-scope it now.",
+        execution.id,
+        execution.name,
+        attempt.node_id,
+        attempt.attempt_no,
+        minutes(elapsed),
+        minutes(SESSION_WALL_TIME),
+    )
 }
 
 /// Whether the attempt outlived its node wall time or the execution deadline.

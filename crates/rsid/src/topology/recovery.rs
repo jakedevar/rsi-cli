@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::topology::custody;
-use crate::topology::executor::{Executor, NodeEffects, Step};
+#[cfg(test)]
+use crate::topology::executor::Step;
+use crate::topology::executor::{Executor, NodeEffects};
 use crate::topology::store as rows;
 
 /// Failure pins survive this long for forensics (plan §4 rule 3).
@@ -25,8 +27,10 @@ const CLEANUP_LIMIT: usize = 256;
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryReport {
     /// Executions advanced by this pass, with the step each reached.
+    #[cfg(test)]
     pub(crate) advanced: Vec<(Uuid, Step)>,
     /// More drivable executions exist than the budget allowed.
+    #[cfg(test)]
     pub(crate) deferred: bool,
     /// Two-phase discards whose effects this pass completed.
     pub(crate) discards_completed: usize,
@@ -35,8 +39,64 @@ pub(crate) struct RecoveryReport {
 }
 
 /// One bounded pass over executions left `accepted|running|cancelling` (or
-/// blocked with in-flight attempts) by a previous daemon incarnation.
+/// blocked with in-flight attempts) by a previous daemon incarnation, then the
+/// settlement recovery. The daemon runs the two halves separately
+/// ([`recover_executions`] before readiness, [`recover_settlements`] after);
+/// this composition serves the tests and any single-shot caller.
+#[cfg(test)]
 pub(crate) async fn recover_after_restart<E: NodeEffects>(
+    executor: &Executor<E>,
+    max_executions: usize,
+    time_budget: Duration,
+) -> Result<RecoveryReport> {
+    let mut report = recover_executions(executor, max_executions, time_budget).await?;
+    recover_settlements(executor, &mut report).await;
+    Ok(report)
+}
+
+/// Executions whose lease this incarnation claimed at startup.
+#[derive(Debug, Default)]
+pub(crate) struct ClaimedExecutions {
+    pub(crate) ids: Vec<Uuid>,
+    /// More drivable executions exist than the budget allowed.
+    pub(crate) deferred: bool,
+}
+
+/// The only part of execution restart recovery that precedes request
+/// readiness (#2526): claim this incarnation's lease on every drivable
+/// execution so no RPC sees one still owned by the dead boot. It never runs
+/// `advance`, because an advance launches node sessions (sandbox allocation,
+/// target seeding, provider spawn) and readiness must not wait for those; the
+/// daemon drives the claimed executions after `request_ready`.
+pub(crate) async fn claim_recovery_leases<E: NodeEffects>(
+    executor: &Executor<E>,
+    max_executions: usize,
+    time_budget: Duration,
+) -> Result<ClaimedExecutions> {
+    let mut claimed = ClaimedExecutions::default();
+    if !executor.effects.enabled() {
+        return Ok(claimed);
+    }
+    let started = Instant::now();
+    let store = executor.store.lock().await;
+    let ids = rows::drivable_execution_ids(&store, max_executions.saturating_add(1))?;
+    claimed.deferred = ids.len() > max_executions;
+    for execution_id in ids.into_iter().take(max_executions) {
+        if started.elapsed() > time_budget {
+            claimed.deferred = true;
+            break;
+        }
+        rows::claim_lease(&store, execution_id, executor.boot_id)?;
+        claimed.ids.push(execution_id);
+    }
+    Ok(claimed)
+}
+
+/// Claim this incarnation's lease on every drivable execution and run the
+/// idempotent `advance` (single-shot callers and tests; the daemon splits it:
+/// [`claim_recovery_leases`] before readiness, the drivers after it, #2526).
+#[cfg(test)]
+pub(crate) async fn recover_executions<E: NodeEffects>(
     executor: &Executor<E>,
     max_executions: usize,
     time_budget: Duration,
@@ -68,12 +128,23 @@ pub(crate) async fn recover_after_restart<E: NodeEffects>(
             }
         }
     }
+    Ok(report)
+}
+
+/// Pending two-phase discards and settlement cleanup (#2375). Both are durable
+/// and idempotent, and the live supervisor already runs them concurrently with
+/// RPC traffic every `EXECUTOR_TICK * 120`, so the daemon runs this after
+/// request readiness: the git proofs behind sandbox release take seconds on a
+/// big retained set and gate nothing request admission needs.
+pub(crate) async fn recover_settlements<E: NodeEffects>(
+    executor: &Executor<E>,
+    report: &mut RecoveryReport,
+) {
     report.discards_completed = executor
         .complete_pending_discards(CLEANUP_LIMIT)
         .await
         .unwrap_or_default();
     report.cleanup_steps = settlement_cleanup(executor, CLEANUP_LIMIT).await;
-    Ok(report)
 }
 
 /// Settlement cleanup (plan §4 rules 3 and 5): release node pins and
@@ -100,6 +171,11 @@ pub(crate) async fn settlement_cleanup<E: NodeEffects>(
         }
         if item.sessions && release_sessions(executor, &item).await {
             completed += 1;
+        }
+        // Not counted: settling review Work rows is ledger bookkeeping, not a
+        // custody release.
+        if item.review_work {
+            settle_review_work(executor, &item).await;
         }
     }
     completed
@@ -140,6 +216,36 @@ async fn release_sessions<E: NodeEffects>(executor: &Executor<E>, item: &rows::C
         return false;
     }
     record(executor, item.execution_id, "sessions_released", released).await
+}
+
+/// #2607: integrate the review Work rows the execution landed and retire the
+/// rest. Recorded (`review_work_settled`) only once every row is settled, so a
+/// missing ledger or a failed write is retried by the next pass. It also
+/// backfills executions that settled before the executor owned these rows.
+async fn settle_review_work<E: NodeEffects>(
+    executor: &Executor<E>,
+    item: &rows::CleanupDue,
+) -> bool {
+    let report = match executor
+        .settle_review_work(item.execution_id, item.repo_root.clone(), true)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::warn!(execution_id = %item.execution_id, %error, "topology review work settlement deferred");
+            return false;
+        }
+    };
+    if report.open > 0 {
+        return false;
+    }
+    record(
+        executor,
+        item.execution_id,
+        "review_work_settled",
+        report.integrated + report.retired,
+    )
+    .await
 }
 
 async fn record<E: NodeEffects>(

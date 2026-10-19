@@ -59,6 +59,9 @@ impl SessionManager {
             self.apply_manager_daemon_setting(&params.key, params.value)
                 .await?
         };
+        // #2166: the same post-save hooks as the operator path.
+        let build_slice =
+            crate::build_budget::after_setting_saved(&params.key, "manager_setting").await;
         tracing::info!(
             key = %params.key,
             previous = previous,
@@ -68,12 +71,18 @@ impl SessionManager {
         );
         let result = OperatorCallResultV1::Scalar {
             method: "ProposeDaemonSetting".into(),
-            result: serde_json::json!({
-                "key": params.key,
-                "previous": previous,
-                "value": params.value,
-                "reason": params.reason,
-            }),
+            result: {
+                let mut result = serde_json::json!({
+                    "key": params.key,
+                    "previous": previous,
+                    "value": params.value,
+                    "reason": params.reason,
+                });
+                if let Some(report) = &build_slice {
+                    result["build_slice"] = report.to_json();
+                }
+                result
+            },
         };
         result.validate().map_err(refused)?;
         self.store
@@ -196,9 +205,7 @@ impl SessionManager {
             }
             DelegatedOperatorCallV1::GetSandboxStorageStatus(_) => {
                 // Same bounded preview the operator status RPC runs.
-                let report = self
-                    .run_sandbox_build_cache_reclaim_wire_for_trigger(true, "preview")
-                    .await?;
+                let report = self.cached_sandbox_storage_preview().await?;
                 self.finish_delegated_storage_result(claim, "GetSandboxStorageStatus", report)
                     .await?;
             }

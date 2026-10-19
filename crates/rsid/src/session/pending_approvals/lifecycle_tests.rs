@@ -284,7 +284,7 @@ async fn appserver_approval_resolved_after_uncertain_enqueue_keeps_uncertainty_a
         delivery.key
     );
     w.quiesce().await;
-    let reopened = Store::open(&w._dir.path().join("approvals.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w._dir.path().join("approvals.db")).unwrap();
     reopened.expire_appserver_approvals(&[]).unwrap();
     reopened
         .manager_v2_refresh_question_decisions(&w.config)
@@ -391,7 +391,7 @@ async fn appserver_approval_concurrent_reopen_preserves_each_identity_as_unavail
     w.assert_actionable(&a).await;
     w.assert_actionable(&b).await;
     w.quiesce().await;
-    let reopened = Store::open(&w._dir.path().join("approvals.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w._dir.path().join("approvals.db")).unwrap();
     reopened.expire_appserver_approvals(&[]).unwrap();
     reopened
         .manager_v2_refresh_question_decisions(&w.config)
@@ -624,7 +624,7 @@ async fn appserver_approval_failed_closure_persistence_reopen_retains_exact_unce
     w.resolve(json!(261));
     tokio::time::timeout(Duration::from_secs(5),async {loop {let state:String=w.manager.store.lock().await.conn.query_row("SELECT closure_state FROM appserver_approval_publications WHERE publication_id=?1",[target["publication_id"].as_str().unwrap()],|r|r.get(0)).unwrap();if state=="ambiguous" {break;}tokio::task::yield_now().await;}}).await.unwrap();
     w.quiesce().await;
-    let reopened = Store::open(&w._dir.path().join("approvals.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w._dir.path().join("approvals.db")).unwrap();
     reopened.expire_appserver_approvals(&[]).unwrap();
     reopened
         .manager_v2_refresh_question_decisions(&w.config)
@@ -650,7 +650,7 @@ async fn appserver_approval_failed_closure_persistence_reopen_retains_exact_unce
 #[tokio::test]
 async fn appserver_approval_wrong_thread_and_duplicate_resolution_leave_other_requests_actionable()
 {
-    let mut w = World::new().await;
+    let w = World::new().await;
     w.inject(json!(271), METHOD);
     let a = w.publication(None, "published").await;
     w.resolve_on_thread(json!(271), "different-thread");

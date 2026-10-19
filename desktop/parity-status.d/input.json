@@ -1,0 +1,315 @@
+{
+  "version": 1,
+  "rows": {
+    "global:backspace/quick-launch-continue-input-line": {
+      "status": "substitute",
+      "location": "src/launch.ts, src/actions/detail.ts",
+      "note": "the launch and continue dialogs replace the TUI line; their text boxes delete with Backspace"
+    },
+    "global:char/quick-launch-continue-input-line": {
+      "status": "substitute",
+      "location": "src/launch.ts, src/actions/detail.ts",
+      "note": "the launch and continue dialogs replace the TUI line; typing appends to their text boxes"
+    },
+    "global:ctrl-0/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "resets the top open dialog's size and position and forgets the saved geometry"
+    },
+    "global:ctrl-alt-g/any-context": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/keyhelp.ts",
+      "note": "Ctrl-Alt-G toggles the keybindings help from anywhere, a text field or a dialog included, without typing into the field"
+    },
+    "global:ctrl-c/any-context": {
+      "status": "substitute",
+      "location": "src/registry.ts, src/keybindings.ts",
+      "note": "Ctrl-C (Cmd-C) copies in a desktop app; quit is Cmd-Q / File › Quit, ZZ, ZQ or :quit"
+    },
+    "global:ctrl-down/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "moves the top open dialog down 24 px; saved per dialog"
+    },
+    "global:ctrl-enter/create-form-daemon-config-pending": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src/actions/hierarchy-run.ts",
+      "note": "Ctrl+Enter (Cmd+Enter) in the create-entity form (G2, <Space>G / E / gS / gT / B) submits through the form, so while the daemon config is not loaded (GetDaemonConfig, polled) the create is refused with the TUI notice and the draft stays; the launch dialog shares the gate"
+    },
+    "global:ctrl-enter/launch-prompt-daemon-config-pending": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl+Enter (Cmd+Enter) in the launch dialog submits it; while the daemon config is not loaded (GetDaemonConfig, polled) the submission is refused with the TUI notice and the draft stays"
+    },
+    "global:ctrl-h/other-pane-focused-normal-mode-no-overl…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src/actions/detail.ts",
+      "note": "from the transcript or the message box (Standard mode too) Ctrl-H focuses the session list"
+    },
+    "global:ctrl-h/session-list-focused-normal-mode-no-ove…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "with the session list focused Ctrl-H steps the zone back (Main → Archived → Jobs, wrapping; stepZone, the Jobs zone is G2’s gj)"
+    },
+    "global:ctrl-i/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl-I (Cmd-I) goes forward in the session jumplist; also Go › Forward in session history"
+    },
+    "global:ctrl-l/other-pane-focused-normal-mode-no-overl…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src/actions/detail.ts",
+      "note": "Ctrl-L focuses the pane to the right (the transcript); it stops at the edge"
+    },
+    "global:ctrl-l/session-list-focused-normal-mode-no-ove…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "with the session list focused Ctrl-L steps the zone on (Main → Jobs → Archived, wrapping; stepZone, the Jobs zone is G2’s gj)"
+    },
+    "global:ctrl-left/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "moves the top open dialog left 24 px (also from a text field, as in the TUI); saved per dialog"
+    },
+    "global:ctrl-left/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "from the session list (or with no session open) Ctrl-Left focuses the pane to the left; it stops at the edge"
+    },
+    "global:ctrl-left/session-detail-focused-normal-mode-no-o…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "with the transcript focused Ctrl-Left moves the transcript column 40 px left; at the edge it snaps to Left Aligned (a notice says so); kept across restarts"
+    },
+    "global:ctrl-o/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl-O (Cmd-O) goes back in the session jumplist (every session opened), skipping sessions no longer listed; also Go › Back in session history"
+    },
+    "global:ctrl-right/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "moves the top open dialog right 24 px; saved per dialog"
+    },
+    "global:ctrl-right/normal-mode-no-overlay-not-inserting": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "from the session list Ctrl-Right focuses the transcript of the open session"
+    },
+    "global:ctrl-right/session-detail-focused-normal-mode-no-o…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "with the transcript focused Ctrl-Right moves the column 40 px right, leaving Left Aligned"
+    },
+    "global:ctrl-s/launch-prompt-daemon-config-pending": {
+      "status": "substitute",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the desktop has no splits, so the launch dialog has one submission (Launch, Ctrl+Enter); it is refused with the TUI notice while the daemon config is pending, the draft kept"
+    },
+    "global:ctrl-shift-down/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the top open dialog gets taller by 24 px, within the window; saved per dialog"
+    },
+    "global:ctrl-shift-left/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the top open dialog gets narrower by 24 px (not under 240 px); saved per dialog"
+    },
+    "global:ctrl-shift-left/normal-mode-no-overlay": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "narrows the session-list sidebar by 24 px (not under 200 px), kept across restarts; also View › Narrow session list"
+    },
+    "global:ctrl-shift-right/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the top open dialog gets wider by 24 px, within the window; saved per dialog"
+    },
+    "global:ctrl-shift-right/normal-mode-no-overlay": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "widens the session-list sidebar by 24 px (up to 70% of the window), kept across restarts; also View › Widen session list"
+    },
+    "global:ctrl-shift-tab/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl-Shift-Tab moves the list cursor to the next session"
+    },
+    "global:ctrl-shift-up/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the top open dialog gets shorter by 24 px (physical Ctrl); the geometry is saved per dialog and restored when it opens"
+    },
+    "global:ctrl-t/launch-prompt-daemon-config-pending": {
+      "status": "substitute",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the desktop has no tabs, so the launch dialog has one submission (Launch, Ctrl+Enter); it is refused with the TUI notice while the daemon config is pending, the draft kept"
+    },
+    "global:ctrl-tab/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl-Tab moves the list cursor to the previous session (as keybindings.md documents)"
+    },
+    "global:ctrl-up/movable-overlay-open": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "moves the top open dialog up 24 px, kept inside the window, also from its text fields; saved per dialog"
+    },
+    "global:ctrl-v/any-context-press-or-release": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src-tauri/src/input.rs",
+      "note": "Ctrl-V (Cmd-V on macOS) with no text field focused pastes into the open session's message box, or into the open dialog's first field; a vim field in normal mode enters insert first. An image on the clipboard is sent to rsid (UploadPasteImage), which stores it under ~/.rsi/paste/rsid/ on the daemon host, and the returned path is inserted as @path"
+    },
+    "global:down/session-detail-focused": {
+      "status": "done",
+      "location": "src/actions/detail.ts, src/detail-model.ts, src/actions/input.ts",
+      "note": "Down scrolls the transcript 3 lines (also from the message box: always in vim insert mode, while the draft is one line otherwise); a selected event scrolled out of view moves to the nearest shown one, so the selection stays visible"
+    },
+    "global:enter/create-form-normal-mode-one-line-field-…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src/actions/hierarchy-run.ts",
+      "note": "Enter in a one-line field of the create-entity form (G2) submits it; while the daemon config is pending the gate (data-config-gate) refuses it with the TUI notice and the draft stays"
+    },
+    "global:enter/quick-launch-continue-input-line": {
+      "status": "substitute",
+      "location": "src/launch.ts, src/actions/detail.ts, src/actions/input.ts",
+      "note": "the TUI opens no quick-launch / continue line in production (only tests set InputMode::Input); the launch dialog (Ctrl-N) and the continue dialog (:continue) replace it: Ctrl+Enter launches or sends the typed text"
+    },
+    "global:enter/quick-launch-input-daemon-config-pending": {
+      "status": "substitute",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "the TUI opens no quick-launch line in production (only tests set InputMode::Input); its desktop counterpart, the launch dialog, is refused with the TUI notice (\"Daemon configuration is still loading; draft preserved\") until get_daemon_config answers, and the dialog and draft stay open"
+    },
+    "global:esc/quick-launch-continue-input-line": {
+      "status": "substitute",
+      "location": "src/launch.ts, src/actions/detail.ts",
+      "note": "the launch and continue dialogs replace the TUI line: Esc closes them; the continue dialog keeps its draft"
+    },
+    "global:left/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Left moves the list cursor to the previous session when the list or detail has the keys (not in a text field or another pane)"
+    },
+    "global:right/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Right moves the list cursor to the next session"
+    },
+    "global:shift-left/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Shift-Left moves to the previous session and opens it; with the transcript focused on a folded Group or Epic it unfolds it instead"
+    },
+    "global:shift-right/session-list-or-detail-focused-not-inse…": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "Shift-Right moves to the next session and opens it; with the transcript focused on a folded Group or Epic it unfolds it instead"
+    },
+    "global:up/session-detail-focused": {
+      "status": "done",
+      "location": "src/actions/detail.ts, src/detail-model.ts, src/actions/input.ts",
+      "note": "Up scrolls the transcript 3 lines (also from the message box: always in vim insert mode, while the draft is one line otherwise); a selected event scrolled out of view moves to the nearest shown one, so the selection stays visible"
+    },
+    "section:character-search-f-t-f-t": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "f t F T on the line with counts, ; repeats and , reverses (t skips an adjacent target), and as operator motions (df), ct\")"
+    },
+    "section:context-sensitive-behavior": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/actions/input-spec.ts, src/keybindings.ts",
+      "note": "i/a/o/O enter the message box with vim cursor semantics and from the list open the session under the cursor first; Esc returns immediately; j/k move the list only; Up/Down scroll the transcript with the selection kept visible; the wheel scrolls natively; fold keys act on the selected event (l and e are their own Normal-mode rows)"
+    },
+    "section:correction-preview": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts, src-tauri/src/input.rs",
+      "note": "Ctrl+Y compiles the draft (CompilePrompt, result from the compile_prompt_completed event) and Ctrl+Shift+G fixes grammar (GenerateText); a CORRECTING… badge shows while it runs, then a preview above the message box: a accepts (not for CLARIFY), d / Esc discard, Ctrl+Enter sends the original, Ctrl+Y / Ctrl+Shift+G retry. The daemon's configured prompt-compiler model is used"
+    },
+    "section:count-modifiers": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/keyengine.ts",
+      "note": "in the vim fields counts prefix motions, operators and edits (3w, 2dd, 3x, 2dw, d2w, 10l); 1-9 start a count, 0 continues it; the list motions keep theirs (5j, NG)"
+    },
+    "section:direct-editing": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "x s r{char} D C J ~ with counts, p / P (linewise registers put lines), u and Ctrl-R undo / redo; y copies to the system clipboard too"
+    },
+    "section:dot-repeat": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": ". replays the last change with what an insert typed (dw ., ciw new Esc w ., rX l ., 3x . deletes one more); one u undoes a repeat"
+    },
+    "section:input-bar-vs-overlay": {
+      "status": "done",
+      "location": "src/actions/detail.ts, src/actions/input.ts, src/vim-field.ts",
+      "note": "the continue / launch dialogs and the Ctrl+G editor are the overlay, the message box under the transcript the input bar; both have vim modal editing and slash command suggestions"
+    },
+    "section:insert-mode": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/vim-field.ts, src-tauri/src/input.rs",
+      "note": "focus or i/a/o/O enters insert; Esc → normal; Enter sends and Shift+Enter adds a line (View › Submit on Enter; off, Ctrl+Enter sends); Ctrl+Enter always sends; Ctrl+V pastes text or an image (@path); Ctrl+Shift+A asks about the draft, Ctrl+G opens the large editor, Ctrl+Y compiles, Ctrl+Shift+G fixes grammar; Up/Down scroll the transcript; / at a line start suggests the root's .claude commands and skills from rsid (ListSlashCommands; Tab accepts, Down/Ctrl-N, Up/Ctrl-P, Esc dismisses). A busy session's message is queued (QueueOperatorMessage)"
+    },
+    "section:key-sequence-timing": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "a chord prefix (g, ], <Space>…) waits 1 s (vim's timeoutlen) for its next key; a slower key starts a new sequence and the which-key hint closes"
+    },
+    "section:modal-toggle-behavior": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/input-model.ts",
+      "note": "a dialog opened by Ctrl-M, T, <Space>p or <Space>s closes when that key is pressed again inside it (not while typing into its text field unless it is a Ctrl chord); Esc closes every dialog, q closes a dialog from a vim field in normal mode"
+    },
+    "section:mode-transitions": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "i a A I o O enter insert mode at vim's positions; from the list i/a/o/O also open the session under the cursor. In a one-line field (an <input>) o opens at the end like A and O at the start like I, so the field never gains a line; a mode tag (INSERT / NORMAL / VISUAL / V-LINE) follows a focused dialog field, the TUI's mode row"
+    },
+    "section:motions": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "h j k l and the arrows, w b e, 0 $ ^, gg G (NG), { }, % in the vim fields; j/k keep the wanted column"
+    },
+    "section:normal-mode-automatic-when-input-bar-has-content": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/vim-field.ts, src/vim-editor.ts",
+      "note": "Esc in the message box enters normal mode (NORMAL badge before the text): with a draft the vim keys edit it and an unknown key passes to the session detail; with an empty draft every key does; Ctrl+Enter sends, Ctrl+Shift+A / Ctrl+G / Ctrl+Y / Ctrl+Shift+G as in insert mode"
+    },
+    "section:operator-messages-and-restart": {
+      "status": "done",
+      "location": "src/operator-messages.ts, src/input-model.ts, src-tauri/src/input.rs",
+      "note": "a follow-up for a running session is queued (QueueOperatorMessage) and the header shows pending: N; :pending lists queued / dispatching / uncertain messages with edit and withdraw (ListOperatorMessages, EditOperatorMessage, WithdrawOperatorMessage), :pending edit <id> <text> and :pending withdraw <id> act directly, :drain requests RestartDaemonDrain and :drain status shows GetDrainRestartStatus; typing /pending or /drain as a message does the same. X is the emergency slice's row"
+    },
+    "section:operators-text-objects": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "d c y with motions and dd cc yy, dgg cgg ygg; text objects iw aw i\" a\" i' a' i( a( ib i{ a{ iB i[ a[ is as ip ap; real-key evidence in headless Chrome (scripts/smoke-vim.mjs: text-objects, counts, dot-undo-register) and the model's tests/vim-parity.test.mjs. Source-backed exceptions: a count before a text object (2di() is ignored as in the TUI); visual-block, R and gU are not in the TUI"
+    },
+    "section:recent-files": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "gf1..gf9 open the Nth newest distinct file_path of the open session's Edit / MultiEdit / Write / Read tool events in the file viewer (inside the session's root); Go › Open recent file… lists them"
+    },
+    "section:standard-editing-mode": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/actions/detail.ts, src/vim-field.ts",
+      "note": "Vim keys off (View › Vim keys, Settings › Editing Mode): the message box has no modes; Enter sends, Shift+Enter adds a line (Submit on Enter), Up/Down scroll the transcript on a one-line draft, Esc returns to the list, Ctrl-H/L and Ctrl-O/I still move focus and the jumplist"
+    },
+    "section:standard-editing-mode-standard-editing-in-overlays-palettes-editors-and-search": {
+      "status": "done",
+      "location": "src/actions/input.ts, src/vim-field.ts",
+      "note": "with Vim keys off (the desktop's Standard editing) every text field is a plain field: cursor, selection, Ctrl/Cmd+A/C/X/V/Z, word moves; Esc closes a dialog; Ctrl-Arrows still move a dialog, Ctrl-Alt-G opens help; real-key evidence: scripts/smoke-vim.mjs vim-off (typing, ArrowLeft+Backspace, literal dw, a double click selects a word, Esc closes the dialog, the Actions menu opens by mouse, no mode tag)"
+    },
+    "section:vim-integration": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts, src/keyengine.ts",
+      "note": "the navigation layer is the key engine (keyengine.ts); text fields use the vim editor (vim-editor.ts) with counts, operators and text objects, visual mode, dot repeat and character search, while Vim keys is on. Fields: see the README's \"Vim text fields\" inventory; the one-line fields of forms and settings are vim fields (data-vim=on), secret / password fields, search and filter boxes, the palette and the terminal never are"
+    },
+    "section:visual-mode": {
+      "status": "done",
+      "location": "src/vim-editor.ts, src/vim-text.ts, src/vim-field.ts, src/actions/input.ts",
+      "note": "v and V, toggling and switching; motions and text objects extend the selection (shown as the field's selection); d/x, c/s, y act on it; Esc leaves"
+    }
+  }
+}

@@ -116,10 +116,18 @@ impl App {
         }
     }
 
-    /// Mark the UI as needing a redraw on the next render tick.
+    /// Mark the UI as needing a redraw on the next render tick, for a reason
+    /// that is not named (counted as `other`; prefer [`Self::mark_dirty_for`]).
     #[inline]
     pub fn mark_dirty(&mut self) {
+        self.mark_dirty_for(crate::draw_stats::DirtyReason::Other);
+    }
+
+    /// Mark the UI as needing a redraw and count why (#332).
+    #[inline]
+    pub fn mark_dirty_for(&mut self, reason: crate::draw_stats::DirtyReason) {
         self.needs_redraw = true;
+        self.draw_stats.mark(reason);
     }
 
     /// Set sort order, re-sort the session list, and persist to disk.

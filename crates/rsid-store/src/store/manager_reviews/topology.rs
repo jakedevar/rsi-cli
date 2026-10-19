@@ -16,13 +16,18 @@ use crate::store::manager_ledger::LedgerObservation;
 pub const REVIEW_NO_MANAGER_LEDGER: &str = "review_no_manager_ledger";
 
 /// Ledger event kind of an on-call manager's acceptance of an exhausted review
-/// (#1740). Keyed by the accepted assignment; the payload names the exact
-/// commit, so it admits that commit only.
+/// (#1740) or of a review whose reviewer submitted `blocked` (#2280). Keyed by
+/// the accepted assignment; the payload names the exact commit, so it admits
+/// that commit only.
 pub const TOPOLOGY_ONCALL_ACCEPTANCE: &str = "topology_oncall_acceptance";
 
+/// The unsettled reason of a review whose reviewer submitted a `blocked`
+/// receipt (it could not finish its required checks).
+const REVIEW_BLOCKED_REASON: &str = "manager_review_blocked";
+
 /// The ruling an on-call acceptance records: which execution, review attempt
-/// and decision produced it (audit only; the admission keys are the assignment
-/// and the commit).
+/// and decision produced it. The assignment, Work revision and commit fence
+/// admission; the attempt must be the one that requested this assignment.
 #[derive(Debug, Clone)]
 pub struct TopologyOncallAcceptance {
     pub execution_id: Uuid,
@@ -149,6 +154,54 @@ impl Store {
         Err(refused("manager_review_supersession_unbounded"))
     }
 
+    /// The reviewer session of the review `assignment_id` heads, if one was
+    /// ever allocated (#2423). A topology that gives up on a review
+    /// (`review_unsettled`) stops that reviewer rather than leave it spending
+    /// a session on a verdict nobody reads.
+    pub fn topology_review_reviewer_session(&self, assignment_id: Uuid) -> Result<Option<Uuid>> {
+        let head = self.topology_review_head(assignment_id)?;
+        Ok(self.manager_review_assignment(head)?.reviewer_session_id)
+    }
+
+    /// An on-call ruling follows only infrastructure replacements of its own
+    /// request. A manager re-review, even for the same commit, needs a new ruling.
+    fn topology_oncall_review_head(&self, assignment_id: Uuid) -> Result<ReviewAssignment> {
+        let mut assignment = self.manager_review_assignment(assignment_id)?;
+        for _ in 0..MAX_SUPERSESSION_HOPS {
+            let next: Option<String> = self.conn.query_row(
+                "SELECT superseded_by_assignment_id FROM manager_review_assignments
+                  WHERE assignment_id=?1",
+                [assignment.assignment_id.to_string()],
+                |row| row.get(0),
+            )?;
+            let Some(next) = next else {
+                return Ok(assignment);
+            };
+            let successor = self.manager_review_assignment(parse_uuid(next)?)?;
+            // Infra retries clone the request, refreshing only the retry link
+            // and contributor observations. Require every other field to hold.
+            let mut expected = assignment.request.clone();
+            expected.infra_retry_of = Some(assignment.assignment_id);
+            expected.contributor_session_ids = successor.request.contributor_session_ids.clone();
+            expected.contributor_families = successor.request.contributor_families.clone();
+            if assignment.request.topology_attempt_id.is_none()
+                || assignment.project_id != successor.project_id
+                || assignment.epic_id != successor.epic_id
+                || assignment.manager_session_id != successor.manager_session_id
+                || assignment.scope_version != successor.scope_version
+                || assignment.work_key != successor.work_key
+                || assignment.spec_revision != successor.spec_revision
+                || assignment.author_session_id != successor.author_session_id
+                || assignment.source_sha != successor.source_sha
+                || serde_json::to_value(expected)? != serde_json::to_value(&successor.request)?
+            {
+                return Err(refused("topology_oncall_acceptance_superseded"));
+            }
+            assignment = successor;
+        }
+        Err(refused("manager_review_supersession_unbounded"))
+    }
+
     /// The finding keys a delta round must resolve: the previous receipt's
     /// blocking findings (all of them when none blocks).
     fn topology_review_finding_keys(&self, assignment_id: Uuid) -> Result<Vec<String>> {
@@ -266,6 +319,7 @@ impl Store {
                             note: String::new(),
                             evidence: None,
                             admission: None,
+                            job_evidence: None,
                             updated_at: now(),
                         })
                         .collect(),
@@ -475,8 +529,10 @@ impl Store {
     /// Record, as one immutable review-ledger event, that the owning manager's
     /// on-call ruling accepted the exhausted review `assignment_id` for exactly
     /// `commit` (#1740). It admits only that assignment's own commit, only
-    /// while the assignment is still the current head under the manager scope
-    /// it was reserved in, and only for a review that asked for changes. A
+    /// while the assignment or its same-request infra retry is the current head
+    /// under the manager scope it was reserved in, and only for a review that
+    /// asked for changes or whose reviewer submitted `blocked` (#2280: the
+    /// ruling stands in for the checks the reviewer could not finish). A
     /// reject ruling records nothing. Idempotent.
     pub fn topology_record_oncall_acceptance(
         &self,
@@ -485,14 +541,17 @@ impl Store {
         ruling: &TopologyOncallAcceptance,
     ) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let head = self.topology_review_head(assignment_id)?;
-        let assignment = self.manager_review_assignment(head)?;
+        let assignment = self.topology_oncall_review_head(assignment_id)?;
+        let head = assignment.assignment_id;
         if assignment.source_sha != commit {
             return Err(refused("topology_oncall_acceptance_commit_mismatch"));
         }
         let expected_key = topology_review_work_key(ruling.execution_id, &ruling.node_id);
         if assignment.work_key != expected_key {
             return Err(refused("topology_oncall_acceptance_work_mismatch"));
+        }
+        if assignment.request.topology_attempt_id != Some(ruling.attempt_id) {
+            return Err(refused("topology_oncall_acceptance_attempt_mismatch"));
         }
         let config = self
             .get_harness_manager(assignment.project_id)?
@@ -501,8 +560,15 @@ impl Store {
                     && config.row_version == assignment.scope_version
             })
             .ok_or_else(|| refused("topology_oncall_acceptance_scope_changed"))?;
+        if !self.topology_oncall_work_current(&config, &assignment)? {
+            return Err(refused("topology_oncall_acceptance_work_changed"));
+        }
         match self.topology_review_outcome(head)? {
             TopologyReviewOutcome::ChangesRequested { .. } => {}
+            TopologyReviewOutcome::Unsettled(reason)
+                if reason == REVIEW_BLOCKED_REASON
+                    || reason == rsi_common::harness_manager_v2::REVIEW_INFRASTRUCTURE_REASON
+                    || reason == rsi_common::harness_manager_v2::REVIEW_INTERRUPTED_REASON => {}
             TopologyReviewOutcome::Accepted { .. } => {
                 // Already admitted (a prior tick recorded it, or a receipt did).
                 tx.commit()?;
@@ -527,6 +593,7 @@ impl Store {
                 "decision_key": ruling.decision_key,
                 "assignment_id": head,
                 "work_key": assignment.work_key,
+                "spec_revision": assignment.spec_revision,
                 "source_commit": assignment.source_sha,
             }),
         )?;
@@ -534,16 +601,33 @@ impl Store {
         Ok(())
     }
 
-    /// Whether an on-call acceptance event admits exactly this assignment's
-    /// commit under the manager scope the assignment was reserved in.
+    fn topology_oncall_work_current(
+        &self,
+        config: &HarnessManagerConfigV1,
+        assignment: &ReviewAssignment,
+    ) -> Result<bool> {
+        let Some(record) = self.manager_v2_record(config, "work", &assignment.work_key)? else {
+            return Ok(false);
+        };
+        let work = decode::<WorkRecord>(&record)?;
+        Ok(work.epic_id == assignment.epic_id
+            && work.spec_revision == assignment.spec_revision
+            && work.source_commit.as_deref() == Some(assignment.source_sha.as_str()))
+    }
+
+    /// Whether the immutable event admits this exact assignment, Work revision
+    /// and commit under the manager scope the assignment was reserved in.
     fn topology_oncall_accepted(&self, assignment: &ReviewAssignment) -> Result<bool> {
-        let in_scope = self
+        let Some(config) = self
             .get_harness_manager(assignment.project_id)?
-            .is_some_and(|config| {
+            .filter(|config| {
                 config.manager_session_id == assignment.manager_session_id
                     && config.row_version == assignment.scope_version
-            });
-        if !in_scope {
+            })
+        else {
+            return Ok(false);
+        };
+        if !self.topology_oncall_work_current(&config, assignment)? {
             return Ok(false);
         }
         Ok(self
@@ -552,14 +636,24 @@ impl Store {
                 "SELECT 1 FROM harness_manager_v2_events
                   WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                     AND kind=?4 AND record_key=?5
-                    AND json_extract(payload_json,'$.source_commit')=?6 LIMIT 1",
+                    AND json_extract(payload_json,'$.source_commit')=?6
+                    AND json_extract(payload_json,'$.spec_revision')=?7
+                    AND json_extract(payload_json,'$.assignment_id')=?5
+                    AND json_extract(payload_json,'$.work_key')=?8
+                    AND json_extract(payload_json,'$.actor.attempt_id')=?9 LIMIT 1",
                 params![
                     assignment.project_id.to_string(),
                     assignment.manager_session_id.to_string(),
                     assignment.scope_version,
                     TOPOLOGY_ONCALL_ACCEPTANCE,
                     assignment.assignment_id.to_string(),
-                    assignment.source_sha
+                    assignment.source_sha,
+                    assignment.spec_revision,
+                    assignment.work_key,
+                    assignment
+                        .request
+                        .topology_attempt_id
+                        .map(|id| id.to_string())
                 ],
                 |_| Ok(()),
             )
@@ -603,6 +697,7 @@ impl Store {
               ORDER BY blocking DESC,finding_key",
         )?;
         let mut blocking = false;
+        let mut typed: Vec<(String, bool)> = Vec::new();
         let findings = statement
             .query_map([receipt_id], |row| {
                 let key: String = row.get(0)?;
@@ -614,15 +709,22 @@ impl Store {
                     Some(location) => format!("{key} [{severity}] {summary} ({location})"),
                     None => format!("{key} [{severity}] {summary}"),
                 };
-                Ok((text, is_blocking))
+                Ok((key, text, is_blocking))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .map(|(text, is_blocking)| {
+            .map(|(key, text, is_blocking)| {
                 blocking |= is_blocking;
+                typed.push((key, is_blocking));
                 text
             })
             .collect::<Vec<_>>();
+        let infrastructure_only =
+            rsi_common::harness_manager_v2::review_receipt_is_infrastructure_only(
+                typed
+                    .iter()
+                    .map(|(key, blocking)| (key.as_str(), *blocking)),
+            );
         // An "accepted" receipt that still carries a blocking finding is not an
         // acceptance (`manager_v2_accepted_source` refuses it too); delta
         // eligibility reads the same effective verdict.
@@ -675,6 +777,33 @@ impl Store {
                     reviewed_commit: assignment.source_sha.clone(),
                     findings,
                 })
+            }
+            // #2280: the on-call ruling over a `blocked` receipt admits the
+            // commit exactly like one over an exhausted review.
+            "blocked" if self.topology_oncall_accepted(assignment)? => {
+                Ok(TopologyReviewOutcome::Accepted {
+                    reviewed_commit: assignment.source_sha.clone(),
+                    findings,
+                })
+            }
+            // #2809: a `blocked` receipt from a reviewer a hub deploy cut off
+            // is an interrupted review, not a verdict on the code; the executor
+            // retries it as an uncharged infrastructure loss.
+            "blocked"
+                if self.review_reviewer_deploy_interrupted(
+                    &assignment.assignment_id.to_string(),
+                )? =>
+            {
+                Ok(TopologyReviewOutcome::Unsettled(
+                    rsi_common::harness_manager_v2::REVIEW_INTERRUPTED_REASON.into(),
+                ))
+            }
+            // #2570: a receipt whose only blocking findings say a check could
+            // not run is no verdict on the code; the executor retries it.
+            "changes_requested" | "blocked" if infrastructure_only => {
+                Ok(TopologyReviewOutcome::Unsettled(
+                    rsi_common::harness_manager_v2::REVIEW_INFRASTRUCTURE_REASON.into(),
+                ))
             }
             "changes_requested" => Ok(TopologyReviewOutcome::ChangesRequested { findings }),
             other => Ok(TopologyReviewOutcome::Unsettled(format!(

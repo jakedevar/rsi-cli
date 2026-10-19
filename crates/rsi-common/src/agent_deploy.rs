@@ -13,7 +13,9 @@ use uuid::Uuid;
 /// Artifacts the daemon may replace, by file name. `rsid` is mandatory; every
 /// other member is deployed (and sha-verified) when present in the binaries
 /// directory and reported in the receipt's `skipped` list when absent (#1110).
-pub const DEPLOY_BINARIES: [&str; 11] = [
+/// A missing `cargo-slot` or `target-pool` is never silent either: it is named
+/// in `skipped` like any other absent member (#2722).
+pub const DEPLOY_BINARIES: [&str; 14] = [
     "rsid",
     "rsi",
     "rsi-rpc",
@@ -25,7 +27,23 @@ pub const DEPLOY_BINARIES: [&str; 11] = [
     "rsi-turn-shim",
     "rsi-socket-hold",
     "rsid-supervisor.sh",
+    "cargo-slot",
+    "target-pool",
+    "rsi-spill",
 ];
+
+/// The scripts the daemon executes from `~/.rsi/bin` (not from the install
+/// directory the binaries go to): `cargo-slot` wraps every job's cargo unit and
+/// `target-pool` seeds each worker sandbox's target (#1741). `rsi-spill` is the
+/// stable copy `~/.local/bin/rsi-spill` links (hub #2958). A deploy publishes
+/// them from the binaries directory next to the supervisor (#2722).
+pub const DEPLOY_TOOL_SCRIPTS: [&str; 3] = ["cargo-slot", "target-pool", "rsi-spill"];
+
+/// Whether `name` is one of [`DEPLOY_TOOL_SCRIPTS`].
+#[must_use]
+pub fn is_deploy_tool_script(name: &str) -> bool {
+    DEPLOY_TOOL_SCRIPTS.contains(&name)
+}
 
 /// Managed binaries a deploy did not carry: those named in `DEPLOY_BINARIES`
 /// with no entry in `manifest`, in managed-set order.
@@ -40,9 +58,31 @@ pub fn skipped_binaries(manifest: &[DeployBinaryV1]) -> Vec<String> {
 pub const DEPLOY_DEFAULT_MAX_WAIT_SECS: u32 = 900;
 pub const DEPLOY_MAX_WAIT_SECS: u32 = 3600;
 pub const DEPLOY_MAX_KEY_BYTES: usize = 128;
-/// Restarts a deploy may use in the supervisor's one-hour window; the
-/// supervisor allows three, and one stays free for a rollback or watchdog.
-pub const DEPLOY_MAX_RESTARTS_PER_HOUR: i64 = 2;
+/// Default of the operator setting `deploy_restarts_per_hour` (#1777): the
+/// deploy restarts allowed in a rolling hour. The supervisor adds a separate
+/// rollback/watchdog restart reserve to this value.
+pub const DEPLOY_RESTARTS_PER_HOUR_DEFAULT: u64 = 2;
+/// Lower bound of `deploy_restarts_per_hour`.
+pub const DEPLOY_RESTARTS_PER_HOUR_MIN: u64 = 1;
+/// Upper bound of `deploy_restarts_per_hour`. The supervisor adds one
+/// rollback/watchdog reserve above this value, with a total ceiling of 13.
+pub const DEPLOY_RESTARTS_PER_HOUR_MAX: u64 = 12;
+/// Additional supervisor restart reserved for rollback/watchdog recovery.
+pub const SUPERVISOR_RESTART_RESERVE: u64 = 1;
+/// Absolute supervisor restart budget ceiling, including the reserve.
+pub const SUPERVISOR_RESTART_BUDGET_MAX: u64 = 13;
+/// Default of the operator setting `supervisor_shutdown_grace_secs` (#2561):
+/// how long the supervisor lets a daemon shutdown run before it sends SIGTERM
+/// again, then SIGKILL to the daemon's process group, and restarts it.
+pub const SUPERVISOR_SHUTDOWN_GRACE_DEFAULT_SECS: u64 = 120;
+/// Lower bound of `supervisor_shutdown_grace_secs`: the daemon's own bounded
+/// shutdown (operator drain plus stages) must be able to finish first.
+pub const SUPERVISOR_SHUTDOWN_GRACE_MIN_SECS: u64 = 60;
+/// Upper bound of `supervisor_shutdown_grace_secs`.
+pub const SUPERVISOR_SHUTDOWN_GRACE_MAX_SECS: u64 = 3600;
+/// Marker the `deploy_restart_budget` refusal carries before the RFC3339
+/// time the budget next has room.
+pub const DEPLOY_RETRY_AFTER_MARKER: &str = " retry_after=";
 
 pub const DEPLOY_NOT_AUTHORIZED: &str = "deploy_not_authorized";
 pub const DEPLOY_CAPABILITY_REQUIRED: &str = "deploy_capability_required";
@@ -77,6 +117,18 @@ pub const DEPLOY_NOT_FOUND: &str = "deploy_not_found";
 /// Default (seconds) of the operator setting `deploy_drain_hold_secs`: how
 /// long an agent deploy may hold new worker starts while it waits.
 pub const DEPLOY_DRAIN_HOLD_DEFAULT_SECS: u64 = 600;
+/// #2048: how long a staged `interrupt_workers` deploy waits for running
+/// `test`/`scoped_test` jobs (counted from the request) before it stops them
+/// with `interrupted_by_deploy`. A fixed policy, not an operator setting: it
+/// only bounds how long re-runnable verification may hold the line, and the
+/// receipt reports it. Build and landing jobs are never stopped.
+pub const DEPLOY_JOB_GRACE_SECS: u64 = 300;
+/// #2278: after a staged `interrupt_workers` deploy times out, new and
+/// requeued `test`/`build` jobs stay held this long (seconds), so an immediate
+/// retry of the deploy meets the same held set instead of a fresh crop of
+/// running jobs. A retry inside the window keeps the hold through its own life;
+/// with none, the hold ends when the window does.
+pub const DEPLOY_JOB_RETRY_HOLD_SECS: u64 = 300;
 /// Upper bound of `deploy_drain_hold_secs` (a deploy waits at most this long).
 pub const DEPLOY_DRAIN_HOLD_MAX_SECS: u64 = DEPLOY_MAX_WAIT_SECS as u64;
 /// Satellite deploy: the satellite has no local session to own the deploy
@@ -84,6 +136,10 @@ pub const DEPLOY_DRAIN_HOLD_MAX_SECS: u64 = DEPLOY_MAX_WAIT_SECS as u64;
 pub const SATELLITE_DEPLOY_OWNER_REQUIRED: &str = "satellite_deploy_owner_required";
 /// Satellite deploy: no enabled link reached the paired satellite.
 pub const SATELLITE_DEPLOY_UNREACHABLE: &str = "satellite_deploy_unreachable";
+/// Satellite deploy (#2587): `interrupt_workers` was asked of a satellite whose
+/// build does not advertise `deploy_interrupt`. Nothing was sent: dropping the
+/// option would leave the deploy waiting on a mid-turn worker until it timed out.
+pub const SATELLITE_DEPLOY_INTERRUPT_UNSUPPORTED: &str = "satellite_deploy_interrupt_unsupported";
 
 /// Lifecycle state. Strings match the SQLite CHECK exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +212,8 @@ pub struct AgentRequestDeployRequestV1 {
     /// #1320/#1311: cancel the caller's own waiting deploy recorded under
     /// `idempotency_key` (and `sha`) instead of requesting one. Stops its hold
     /// on new launches at once; refused `deploy_cancel_too_late` once the
-    /// restart began. Not available with `peer_id`.
+    /// restart began. With `peer_id`, the paired satellite applies the same
+    /// owner and idempotency checks to its own stored deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel: Option<bool>,
     /// #1461: once the operator's drain hold (`deploy_drain_hold_secs`) is over,
@@ -165,7 +222,11 @@ pub struct AgentRequestDeployRequestV1 {
     /// a continue prompt. A landing and a local test/build/landing job still
     /// block. Default false (workers block, as always).
     /// The outcome lists the interrupted worker session ids and each one is an
-    /// andon friction event. Not available with `peer_id` or `cancel`.
+    /// andon friction event. With `peer_id` (#2587) the satellite applies the
+    /// same semantics to its own workers, provided it advertises the
+    /// `deploy_interrupt` capability; an older satellite is refused
+    /// `satellite_deploy_interrupt_unsupported` rather than silently waiting.
+    /// Not available with `cancel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_workers: Option<bool>,
 }
@@ -205,15 +266,11 @@ impl AgentRequestDeployRequestV1 {
         }
         if self.is_cancel() {
             // A cancel names an existing deploy; the source fields are ignored.
-            return if self.peer_id.is_some() || self.interrupts_workers() {
+            return if self.interrupts_workers() {
                 Err(DEPLOY_INVALID_REQUEST)
             } else {
                 Ok(())
             };
-        }
-        if self.interrupts_workers() && self.peer_id.is_some() {
-            // The satellite runs its own deploy flow, which has no such option.
-            return Err(DEPLOY_INVALID_REQUEST);
         }
         match (self.binaries_dir.as_deref(), self.build) {
             (Some(_), Some(true)) => Err(DEPLOY_SOURCE_AMBIGUOUS),
@@ -265,6 +322,52 @@ fn default_prior_present() -> bool {
     true
 }
 
+/// #2056: one thing a staged deploy waits for, with the ids that name it so
+/// the owner needs no source or SQL to find it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployBlockerV1 {
+    /// `landing_in_progress`, `job_running` or `worker_mid_turn`.
+    pub kind: String,
+    /// What holds the quiet point, oldest first; capped at
+    /// [`DEPLOY_BLOCKER_SUBJECTS_MAX`] (`subjects_total` is the full count).
+    #[serde(default)]
+    pub subjects: Vec<DeployBlockerSubjectV1>,
+    #[serde(default)]
+    pub subjects_total: u32,
+}
+
+/// Most subjects listed per blocker kind.
+pub const DEPLOY_BLOCKER_SUBJECTS_MAX: usize = 8;
+
+/// One subject of a [`DeployBlockerV1`]; only the fields of its kind are set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployBlockerSubjectV1 {
+    /// `landing_in_progress`: the rolling queue entry's sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_sequence: Option<i64>,
+    /// `landing_in_progress`: `admitted` or `gating`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_state: Option<String>,
+    /// `landing_in_progress`: the gating batch, once the entry has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<Uuid>,
+    /// `job_running`: the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_kind: Option<String>,
+    /// `job_running`: the session that owns the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<Uuid>,
+    /// `worker_mid_turn`: the worker session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    /// RFC3339 nanos: when the subject entered that state (queue enqueue,
+    /// job start); absent for a worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
 /// Receipt: the deploy row as accepted (or replayed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRequestDeployReceiptV1 {
@@ -290,6 +393,32 @@ pub struct AgentRequestDeployReceiptV1 {
     /// began (each gets a continue prompt after it); empty until the restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interrupted_workers: Vec<Uuid>,
+    /// #2048: with `interrupt_workers`, the grace (seconds from the request)
+    /// after which running `test`/`scoped_test` jobs are stopped as
+    /// `interrupted_by_deploy`; absent without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_grace_secs: Option<u64>,
+    /// #2048: the jobs this deploy stopped; empty until the grace passes. A test
+    /// job it stopped is requeued under its own id (#2278): the owner's wake
+    /// fires once, when the rerun ends. A hub QA run settles
+    /// `interrupted_by_deploy` instead and wakes its owner at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_jobs: Vec<Uuid>,
+    /// #2056: while the deploy is `staged`, what holds its quiet point right
+    /// now, read live on each call (a replay is the way to ask again). An
+    /// `interrupt_workers` deploy stops waiting for `worker_mid_turn` once the
+    /// operator's drain hold is over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<DeployBlockerV1>,
+    /// #2056: RFC3339 nanos the deploy was requested, so the owner sees how
+    /// long it has waited; set with `blockers` while staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since: Option<String>,
+    /// #2743: warnings about the deployed SHA. `not_qa_green` means the SHA is
+    /// not covered by the latest full-library-green SHA of `AgentListRollingQueue`
+    /// (`qa_green`); it names the open `qa` Issues. The deploy is not refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qa_warnings: Vec<crate::rolling_queue::DeployQaWarningV1>,
 }
 
 #[cfg(test)]
@@ -335,7 +464,7 @@ mod tests {
         cancel.cancel = Some(true);
         assert_eq!(cancel.validate(), Ok(()), "a cancel needs no source");
         cancel.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
-        assert_eq!(cancel.validate(), Err(DEPLOY_INVALID_REQUEST));
+        assert_eq!(cancel.validate(), Ok(()), "peer cancellation is supported");
         assert!(
             serde_json::from_value::<AgentRequestDeployRequestV1>(serde_json::json!({
                 "sha": "a".repeat(40), "binaries_dir": "/x", "idempotency_key": "k", "env": {}
@@ -345,9 +474,9 @@ mod tests {
     }
 
     /// #1461: `interrupt_workers` is optional and off by default, travels on the
-    /// wire only when set, and is not available with a satellite deploy.
+    /// wire only when set, and (#2587) is available with a satellite deploy.
     #[test]
-    fn interrupt_workers_is_optional_off_by_default_and_not_for_a_peer() {
+    fn interrupt_workers_is_optional_off_by_default_and_allowed_for_a_peer() {
         let plain = request();
         assert!(!plain.interrupts_workers());
         assert!(
@@ -373,7 +502,9 @@ mod tests {
         assert!(!explicit_false.interrupts_workers());
         let mut with_peer = parsed;
         with_peer.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
-        assert_eq!(with_peer.validate(), Err(DEPLOY_INVALID_REQUEST));
+        // #2587: a satellite deploy carries the same option.
+        assert_eq!(with_peer.validate(), Ok(()));
+        assert!(with_peer.interrupts_workers());
     }
 
     #[test]
@@ -403,13 +534,23 @@ mod tests {
             reason: None,
             interrupt_workers: false,
             interrupted_workers: Vec::new(),
+            job_grace_secs: None,
+            cancelled_jobs: Vec::new(),
+            blockers: Vec::new(),
+            waiting_since: None,
+            qa_warnings: Vec::new(),
         };
         let value = serde_json::to_value(&receipt).unwrap();
         assert!(value.get("interrupt_workers").is_none());
         assert!(value.get("interrupted_workers").is_none());
         receipt.interrupt_workers = true;
         receipt.interrupted_workers = vec![worker];
+        let job = Uuid::new_v4();
+        receipt.job_grace_secs = Some(DEPLOY_JOB_GRACE_SECS);
+        receipt.cancelled_jobs = vec![job];
         let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["job_grace_secs"], DEPLOY_JOB_GRACE_SECS);
+        assert_eq!(value["cancelled_jobs"], serde_json::json!([job]));
         assert_eq!(value["interrupt_workers"], true);
         assert_eq!(value["interrupted_workers"], serde_json::json!([worker]));
         assert_eq!(

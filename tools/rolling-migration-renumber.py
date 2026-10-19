@@ -180,7 +180,7 @@ def is_migration_unit_file(name: str) -> bool:
     return guard.migration_file_version(name) is not None
 
 
-def revision_inventory(repo: Path, revision: str) -> dict:
+def revision_inventory(repo: Path, revision: str, base: str | None = None) -> dict:
     raw = show(repo, revision, MANIFEST)
     if raw is None:
         raise Refusal(f"{MANIFEST} missing at {revision}")
@@ -190,7 +190,11 @@ def revision_inventory(repo: Path, revision: str) -> dict:
         files = {name: (show(repo, revision, name) or b"").decode() for name in names}
         if any(show(repo, revision, name) is None for name in files):
             raise Refusal("manifest names a missing protected source")
-        guard.validate_manifest(manifest, guard.inventory(files), "provisional inventory")
+        base_raw = show(repo, base, MANIFEST) if base is not None else None
+        manifest, _deferred = guard.validated_inventory(
+            manifest, guard.inventory(files), "provisional inventory",
+            base_raw.decode() if base_raw is not None else None, base or "base"
+        )
         return manifest
     except (UnicodeError, KeyError, guard.GuardError) as error:
         raise Refusal(f"invalid migration inventory at {revision}: {error}") from error
@@ -206,25 +210,34 @@ def inspect(repo: Path, base: str, source: str, target: str,
                       env=safe_env()).returncode:
         raise Refusal("accepted base is not an ancestor of source")
     base_manifest = revision_inventory(repo, base)
-    source_manifest = revision_inventory(repo, source)
+    source_manifest = revision_inventory(repo, source, base)
     target_manifest = revision_inventory(repo, target)
+    prior = base_manifest["latest_schema_version"]
     try:
-        guard.validate_append_only(base_manifest, source_manifest)
-    except guard.GuardError as error:
+        gaps = guard.parse_pending_predecessors(
+            [text.decode() for text in (
+                show(repo, source, name) for name in changed(repo, base, source)
+                if name.startswith(DECLARATIONS) and name.endswith(".json")) if text is not None],
+            prior)
+        guard.validate_append_only(base_manifest, source_manifest, gaps)
+    except (guard.GuardError, UnicodeError) as error:
         raise Refusal(f"source changed released prefix: {error}") from error
     try:
         guard.validate_append_only(base_manifest, target_manifest)
     except guard.GuardError as error:
         raise Refusal(f"target changed accepted base's released prefix: {error}") from error
     old = source_manifest["latest_schema_version"]
-    prior = base_manifest["latest_schema_version"]
     if old == prior:
         return None
     if layout_of(source_manifest) != layout_of(target_manifest):
         raise Refusal("migration layout differs between source and target; port the "
                       f"provisional migration to {MIGRATION_DIR}/vNNN.rs before landing")
-    if old != prior + 1 or set(source_manifest["blocks"]) - set(base_manifest["blocks"]) != {str(old)}:
+    if (old != prior + 1 + len(gaps) or
+            set(source_manifest["blocks"]) - set(base_manifest["blocks"]) != {str(old)}):
         raise Refusal("accepted source has more than one provisional migration")
+    if gaps and target_manifest["latest_schema_version"] < old - 1:
+        raise Refusal(f"declared pending predecessor migrations {gaps} are not on the target yet; "
+                      "land the sibling slice first")
     if target_manifest["latest_schema_version"] < prior:
         raise Refusal("target schema head is behind the accepted base")
     if target_manifest["latest_schema_version"] >= 2_147_483_647:
@@ -247,11 +260,29 @@ def inspect(repo: Path, base: str, source: str, target: str,
         declaration = json.loads(raw)
     except (TypeError, ValueError) as error:
         raise Refusal("invalid provisional site declaration") from error
-    if (set(declaration) != {"schema_version", "version", "files"} or
+    if (set(declaration) - {"pending_predecessors"} != {"schema_version", "version", "files"} or
             declaration["schema_version"] != 1 or declaration["version"] != old or
             not isinstance(declaration["files"], list) or not declaration["files"] or
             len(declaration["files"]) > MAX_DECLARED_FILES):
         raise Refusal("invalid provisional declaration shape or version")
+    if (allow_noop and layout_of(source_manifest) == "dir" and
+            show(repo, target, declaration_path) is not None and
+            str(old) in target_manifest["blocks"]):
+        # A stacked source can carry a declaration already landed through a
+        # different commit. It has no new migration to inventory or renumber.
+        # Require the same declaration path as well as the full migration file,
+        # so independent declarations using this number still get renumbered.
+        unit_file = f"{source_manifest['migration_dir']}/v{old:03d}.rs"
+        if not any(file.get("path") == unit_file for file in declaration["files"]):
+            raise Refusal(f"migration file must be declared: {unit_file}")
+        if show(repo, source, unit_file) != show(repo, target, unit_file):
+            raise Refusal(
+                f"declared migration {unit_file} is already on rolling with differing content; "
+                "re-merge the source onto origin/rolling, retain rolling's released migration, "
+                "and re-submit the merged commit")
+        return {"base": base, "source": source, "target": target,
+                "old_version": old, "new_version": old, "renumber_noop": True,
+                "migration_already_landed": True}
     all_changed = changed(repo, base, source)
     version_pattern = re.compile(rb"(?<![0-9])" + str(old).encode() + rb"(?![0-9])")
     declared_paths: set[str] = set()
@@ -288,6 +319,7 @@ def inspect(repo: Path, base: str, source: str, target: str,
             raise Refusal("invalid provisional site list")
         covered = bytearray(len(original))
         converted = original
+        introduced = introduced_ranges(repo, base, source, source_path, original)
         for site in file["sites"]:
             anchor, replacement = site["anchor"], site["replacement"]
             if (not isinstance(anchor, str) or not isinstance(replacement, str) or
@@ -298,6 +330,9 @@ def inspect(repo: Path, base: str, source: str, target: str,
             if original.count(before) != 1 or not version_pattern.search(before):
                 raise Refusal(f"site anchor is missing, duplicate, or unversioned: {source_path}")
             start = original.index(before)
+            if not any(
+                    lo < start + len(before) and start < hi for lo, hi in introduced):
+                raise Refusal(f"declared site on an unchanged base line: {source_path}")
             if any(covered[start:start + len(before)]):
                 raise Refusal("overlapping provisional site anchors")
             covered[start:start + len(before)] = b"\1" * len(before)
@@ -308,7 +343,6 @@ def inspect(repo: Path, base: str, source: str, target: str,
                                  "scope": site["scope"],
                                  "source_blob": sha(original),
                                  "before_offset": start})
-        introduced = introduced_ranges(repo, base, source, source_path, original)
         for match in version_pattern.finditer(original):
             if (not all(covered[match.start():match.end()]) and
                     in_ranges(introduced, match.start(), match.end())):
@@ -355,6 +389,7 @@ def inspect(repo: Path, base: str, source: str, target: str,
     return {"base": base, "source": source, "target": target,
             "declaration": declaration_path, "old_version": old,
             "new_version": target_manifest["latest_schema_version"] + 1,
+            "base_latest": prior,
             "source_manifest": source_manifest, "target_manifest": target_manifest,
             "files": declaration["files"], "sites": replacements}
 
@@ -476,7 +511,9 @@ def allowed_mask(repo: Path, unit: dict, filename: str, transformed: bytes) -> b
 def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) -> bytearray:
     """Bound the target side of a conflict to its appended migration tail."""
     mask = bytearray(len(target))
-    prior = unit["source_manifest"]["latest_schema_version"] - 1
+    # The target's tail is everything past the accepted base (a declared pending sibling
+    # sits between the base head and the source's own version, #1285).
+    prior = unit.get("base_latest", unit["source_manifest"]["latest_schema_version"] - 1)
     latest = unit["target_manifest"]["latest_schema_version"]
     if latest <= prior:
         return mask

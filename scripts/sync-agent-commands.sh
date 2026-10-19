@@ -28,7 +28,7 @@ usage() {
 is_canonical_command() {
   local candidate="$1"
   local command
-  for command in "${CANONICAL_COMMANDS[@]}"; do
+  for command in ${CANONICAL_COMMANDS[@]+"${CANONICAL_COMMANDS[@]}"}; do
     [[ "$command" == "$candidate" ]] && return 0
   done
   return 1
@@ -157,7 +157,7 @@ if [[ $# -gt 0 ]]; then
   full_catalog=false
   selected_commands=("$@")
 else
-  selected_commands=("${CANONICAL_COMMANDS[@]}")
+  selected_commands=(${CANONICAL_COMMANDS[@]+"${CANONICAL_COMMANDS[@]}"})
 fi
 
 for command in "${selected_commands[@]}"; do

@@ -84,9 +84,12 @@ pub fn render_model_dropdown(
             ),
             Span::styled(
                 format!(
-                    " {}{} ",
+                    " {}{}{} ",
                     provider_label,
-                    if provider_available { "" } else { " (offline)" }
+                    if provider_available { "" } else { " (offline)" },
+                    catalog_note(state.provider)
+                        .map(|note| format!(" · {note}"))
+                        .unwrap_or_default()
                 ),
                 title_style,
             ),
@@ -304,6 +307,37 @@ const MODEL_DROPDOWN_SEARCH_HINT: &str = "↑↓ · Enter pick · Tab provider �
 const MODEL_DROPDOWN_FILTERED_HINT: &str = "j/k · Enter/1-9 pick · / edit · Esc close";
 
 /// Get a human-readable label for a provider.
+/// Catalog provenance per provider (`live 2m`, `bundled (degraded: ...)`,
+/// #2752), written when a discovery result arrives and read by the title. A
+/// process-wide map because dropdowns are created in many places from the
+/// cached model list and none of them carries the daemon's provenance.
+static CATALOG_NOTES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<rsi_common::types::SessionProvider, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Record (or clear, with `None`) the catalog provenance shown for `provider`.
+pub fn set_catalog_note(provider: rsi_common::types::SessionProvider, note: Option<String>) {
+    let mut notes = CATALOG_NOTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match note {
+        Some(note) => {
+            notes.insert(provider, note);
+        }
+        None => {
+            notes.remove(&provider);
+        }
+    }
+}
+
+fn catalog_note(provider: rsi_common::types::SessionProvider) -> Option<String> {
+    CATALOG_NOTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&provider)
+        .cloned()
+}
+
 fn provider_label(provider: rsi_common::types::SessionProvider) -> &'static str {
     use rsi_common::types::SessionProvider;
 

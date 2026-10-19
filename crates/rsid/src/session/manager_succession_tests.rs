@@ -199,21 +199,22 @@ impl RootWorld {
             }
         };
         AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
-                scope_version: config.row_version,
-                policy_version: policy.row_version,
-            },
-            idempotency_key: key.into(),
-            operation: ManagerActionV2::SucceedManager {
-                expected,
-                launch: ManagerLaunchChoiceV2 {
-                    provider,
-                    model: model.into(),
-                    effort: effort.map(str::to_string),
+            ..AgentManagerControlRequestV2::new(
+                ManagerFenceV2 {
+                    scope_version: config.row_version,
+                    policy_version: policy.row_version,
                 },
-                handoff: self.handoff.clone(),
-            },
+                key.into(),
+                ManagerActionV2::SucceedManager {
+                    expected,
+                    launch: ManagerLaunchChoiceV2 {
+                        provider,
+                        model: model.into(),
+                        effort: effort.map(str::to_string),
+                    },
+                    handoff: self.handoff.clone(),
+                },
+            )
         }
     }
     async fn enqueue(
@@ -396,6 +397,30 @@ async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establ
     // when many tests start together (#1095).
     let w = RootWorld::with_rotation_enabled(false).await;
     tokio::time::timeout(Duration::from_secs(30), async {
+        // Overview readiness names the denial the admission below gives.
+        {
+            let store = w.manager.store.lock().await;
+            let config = store.get_harness_manager(w.project).unwrap().unwrap();
+            match store.manager_succession_preflight(&config).unwrap() {
+                ManagerSuccessionPreflightV2::Ineligible { denial, .. } => {
+                    assert_eq!(denial.reason, ManagerSuccessionDenialReasonV2::ContextRotationDisabled);
+                    assert_eq!(
+                        denial.required_action,
+                        ManagerSuccessionRequiredActionV2::OperatorEnableContextRotation
+                    );
+                }
+                other => panic!("disabled rotation must be ineligible: {other:?}"),
+            }
+            // Persisted-enabled with the live choice off: the request fence is
+            // observable, and the live recheck alone must refuse it early.
+            store
+                .conn
+                .execute(
+                    "UPDATE daemon_settings SET value='true' WHERE key='context_rotation_enabled'",
+                    [],
+                )
+                .unwrap();
+        }
         let request = w
             .request(
                 w.owner,
@@ -412,17 +437,27 @@ async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establ
             .await
             .manager_authority_epoch(w.project)
             .unwrap();
-        let disabled = w
-            .manager
-            .agent_control()
-            .agent_manager_control(w.owner, request.clone())
-            .await
-            .unwrap_err();
-        assert_eq!(
-            crate::session::manager_actions::safe_action_error(&disabled),
-            "manager_succession_rotation_disabled"
-        );
-        {
+        for persisted in ["true", "false"] {
+            w.manager
+                .store
+                .lock()
+                .await
+                .conn
+                .execute(
+                    "UPDATE daemon_settings SET value=?1 WHERE key='context_rotation_enabled'",
+                    [persisted],
+                )
+                .unwrap();
+            let disabled = w
+                .manager
+                .agent_control()
+                .agent_manager_control(w.owner, request.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::session::manager_actions::safe_action_error(&disabled),
+                "manager_succession_rotation_disabled"
+            );
             let store = w.manager.store.lock().await;
             let reservations: i64 = store
                 .conn
@@ -488,6 +523,209 @@ async fn manager_root_runtime_live_rotation_enable_after_disabled_startup_establ
     })
     .await
     .expect("live rotation enable must settle within the local fixture deadline");
+}
+
+impl RootWorld {
+    /// The Overview `manager_control` row exactly as an agent reads it.
+    async fn overview_control_row(&self) -> serde_json::Value {
+        let page = self
+            .manager
+            .agent_control()
+            .agent_manager_inspect(self.owner, AgentManagerInspectRequestV2::default())
+            .await
+            .unwrap();
+        page.rows
+            .into_iter()
+            .find(|row| row["type"] == "manager_control")
+            .expect("Overview carries the manager_control row")
+    }
+    async fn forget_persisted_rotation_setting(&self) {
+        self.manager
+            .store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "DELETE FROM daemon_settings WHERE key='context_rotation_enabled'",
+                [],
+            )
+            .unwrap();
+    }
+    async fn wake_state(&self) -> (i64, i64) {
+        self.manager
+            .store
+            .lock()
+            .await
+            .conn
+            .query_row(
+                "SELECT count(*), coalesce(sum(enabled),0) FROM scheduled_jobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_overview_denies_live_disabled_rotation_even_with_no_persisted_row() {
+    let w = RootWorld::with_rotation_enabled(false).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let expected_denial = serde_json::json!({
+            "reason":"context_rotation_disabled",
+            "required_action":"operator_enable_context_rotation"
+        });
+        let epoch = w.manager.store.lock().await.manager_authority_epoch(w.project).unwrap();
+        let wakes = w.wake_state().await;
+        // Persisted-absent + live-off, then persisted-true + live-off: the Store
+        // alone says eligible, the live overlay must agree with admission.
+        for persisted in [None, Some("true")] {
+            match persisted {
+                None => w.forget_persisted_rotation_setting().await,
+                Some(value) => {
+                    w.manager
+                        .store
+                        .lock()
+                        .await
+                        .conn
+                        .execute(
+                            "INSERT OR REPLACE INTO daemon_settings(key,value,updated_at) VALUES('context_rotation_enabled',?1,'2026-10-15T00:00:00.000000000Z')",
+                            [value],
+                        )
+                        .unwrap();
+                }
+            }
+            {
+                let store = w.manager.store.lock().await;
+                let config = store.get_harness_manager(w.project).unwrap().unwrap();
+                assert!(matches!(
+                    store.manager_succession_preflight(&config).unwrap(),
+                    ManagerSuccessionPreflightV2::Eligible { .. }
+                ));
+            }
+            let row = w.overview_control_row().await;
+            assert_eq!(row["eligibility"], "ineligible");
+            assert_eq!(row["denial"], expected_denial);
+            assert_eq!(row["logical_manager_session_id"], serde_json::json!(w.owner));
+            assert_eq!(row["current_session_id"], serde_json::json!(w.owner));
+            assert!(row.get("expected").is_none() && row.get("unresolved_operation_id").is_none());
+            // Admission gives the refusal the row advertised, with nothing reserved.
+            let request = w
+                .request(w.owner, "overlay-refuse", SessionProvider::Codex, "gpt-6-astra", None)
+                .await;
+            let refusal = w
+                .manager
+                .agent_control()
+                .agent_manager_control(w.owner, request)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::session::manager_actions::safe_action_error(&refusal),
+                "manager_succession_rotation_disabled"
+            );
+            let store = w.manager.store.lock().await;
+            let reservations: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM manager_root_successions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(reservations, 0);
+            assert_eq!(store.manager_authority_epoch(w.project).unwrap(), epoch);
+            assert_eq!(
+                store.get_harness_manager(w.project).unwrap().unwrap().current_session_id,
+                Some(w.owner)
+            );
+            drop(store);
+            assert_eq!(w.wake_state().await, wakes);
+        }
+        // Live choice back on: readiness is eligible again with its fences and
+        // normal admission queues exactly one occurrence.
+        w.set_live_rotation_enabled(true).await;
+        let row = w.overview_control_row().await;
+        assert_eq!(row["eligibility"], "eligible");
+        assert_eq!(row["expected"]["authority_epoch"], serde_json::json!(epoch));
+        let request = w
+            .request(w.owner, "overlay-enabled", SessionProvider::Codex, "gpt-6-astra", None)
+            .await;
+        let (receipt, _root) = w.enqueue(w.owner, request).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    })
+    .await
+    .expect("overview overlay scenario must settle within the local fixture deadline");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_queued_succession_stays_visible_and_replays_with_rotation_off() {
+    let w = RootWorld::new().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let request = w
+            .request(
+                w.owner,
+                "lost-receipt",
+                SessionProvider::Codex,
+                "gpt-6-astra",
+                None,
+            )
+            .await;
+        let (receipt, root) = w.enqueue(w.owner, request.clone()).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+        // Live off only (persisted still on), then live and persisted off.
+        for persisted_too in [false, true] {
+            if persisted_too {
+                w.set_live_rotation_enabled(false).await;
+            } else {
+                w.manager
+                    .runtime_config
+                    .update_field("context_rotation_enabled", &serde_json::json!(false))
+                    .unwrap();
+            }
+            // (a) the identical retry gets the stored receipt, not a refusal.
+            let (replay, replay_root) = w.enqueue(w.owner, request.clone()).await;
+            assert!(replay.deduplicated);
+            assert_eq!(replay.operation_id, receipt.operation_id);
+            assert_eq!(replay_root.candidate_session_id, root.candidate_session_id);
+            // (b) Overview still points at the in-flight occurrence.
+            let row = w.overview_control_row().await;
+            assert_eq!(row["eligibility"], "eligible");
+            assert_eq!(
+                row["unresolved_operation_id"],
+                serde_json::json!(receipt.operation_id)
+            );
+            // A different key is a new occurrence and is still refused.
+            let other = w
+                .request(
+                    w.owner,
+                    "new-occurrence",
+                    SessionProvider::Codex,
+                    "gpt-6-astra",
+                    None,
+                )
+                .await;
+            let refusal = w
+                .manager
+                .agent_control()
+                .agent_manager_control(w.owner, other)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::session::manager_actions::safe_action_error(&refusal),
+                "manager_succession_rotation_disabled"
+            );
+            let reservations: i64 = w
+                .manager
+                .store
+                .lock()
+                .await
+                .conn
+                .query_row("SELECT count(*) FROM manager_root_successions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(reservations, 1);
+        }
+    })
+    .await
+    .expect("queued succession replay scenario must settle within the local fixture deadline");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -989,7 +1227,7 @@ async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_
             "retained on escalation"
         );
         w.stop_scripted(new.id, &script2).await;
-        let reopened = Store::open(&w.dir.path().join("rsi.db")).unwrap();
+        let reopened = Store::open_test_fixture(&w.dir.path().join("rsi.db")).unwrap();
         assert_eq!(
             reopened
                 .get_harness_manager(w.project)
@@ -1262,9 +1500,11 @@ async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknow
             );
             drop_controller_candidate_test_process(root.candidate_session_id);
         } else {
+            // Case 4: the live rotation choice is off, so admission refuses
+            // before any reservation (#155) instead of blocking at the effect.
             assert!(
-                case == 0 || case == 3 || case == 5,
-                "zero creation or restricted choice rejects before queue (case {case})"
+                case == 0 || case == 3 || case == 4 || case == 5,
+                "zero creation, restricted choice or disabled rotation rejects before queue (case {case})"
             );
         }
     }
@@ -1336,6 +1576,7 @@ async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_w
                     .is_err()
             );
         }
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let pid = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
@@ -1362,7 +1603,7 @@ async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_w
                     .unwrap(),
                 0
             );
-            let reopened = Store::open(&w.dir.path().join("rsi.db")).unwrap();
+            let reopened = Store::open_test_fixture(&w.dir.path().join("rsi.db")).unwrap();
             let pending = reopened
                 .manager_succession(root.operation_id)
                 .unwrap()
@@ -1542,7 +1783,7 @@ async fn manager_root_runtime_unpublished_admission_reopen_settles_without_resen
             .path()
             .join(root.candidate_session_id.to_string());
         assert!(retained.is_dir());
-        let reopened = Store::open(&w.dir.path().join("rsi.db")).unwrap();
+        let reopened = Store::open_test_fixture(&w.dir.path().join("rsi.db")).unwrap();
         let runtime_config = RuntimeConfig::from_config(&Config::from_env());
         let restarted = SessionManager::new(
             Arc::new(EventBus::new(16)),
@@ -1747,8 +1988,8 @@ async fn manager_root_runtime_pause_during_initialize_prevents_productive_wire_r
     assert!(
         methods
             .iter()
-            .all(|m| m == "initialize" || m == "notifications/initialized"),
-        "only handshake control messages precede the refused productive request"
+            .all(|m| m == "initialize" || m == "initialized"),
+        "only handshake control messages precede the refused productive request: {methods:?}"
     );
     let store = w.manager.store.lock().await;
     assert_eq!(
@@ -1878,7 +2119,8 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
             .unwrap();
         final_receipt_version
     };
-    let candidate_token = "checked-stop-candidate-token".to_string();
+    let candidate_token =
+        "ac7b77935f90e1bd6fccb40d941b6bda088d2b3b3f59a148439f4e2a698843a6".to_string();
     w.manager
         .register_agent_token(candidate_token.clone(), root.candidate_session_id)
         .await;
@@ -2006,4 +2248,231 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
     assert_eq!(pending_action_versions, 0);
     assert_eq!(scripted.productive_start_count.load(Ordering::SeqCst), 1);
     drop_controller_candidate_test_stream(root.candidate_session_id);
+}
+
+impl RootWorld {
+    /// #2667: one settled turn of `owner`, made the session's current
+    /// invocation (what a resume for a decision-class notice leaves behind).
+    async fn settled_turn(&self) -> Uuid {
+        let store = self.manager.store.lock().await;
+        let id = Uuid::new_v4();
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store.conn.execute(
+            "INSERT INTO model_invocations
+             (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,session_id,created_at)
+             VALUES(?1,'session.launch','session','foreground','paid','admitted','succeeded','launch_session',?2,?3)",
+            rusqlite::params![id.to_string(), self.owner.to_string(), at],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET model_invocation_id=?1 WHERE id=?2",
+                rusqlite::params![id.to_string(), self.owner.to_string()],
+            )
+            .unwrap();
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        id
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_runtime_decision_notice_turn_after_queueing_still_establishes_2667() {
+    let w = RootWorld::new().await;
+    let frozen_turn = w.settled_turn().await;
+    let request = w
+        .request(
+            w.owner,
+            "notice-turn",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (_, root) = w.enqueue(w.owner, request).await;
+    assert_eq!(root.frozen.predecessor_invocation_id, Some(frozen_turn));
+    // The decision-class notice resumed the predecessor after the handoff was
+    // queued: it took a turn and settled again before the daemon ran the action.
+    let notice_turn = w.settled_turn().await;
+    w.terminal(w.owner).await;
+    let process = install_controller_candidate_test_process(root.candidate_session_id);
+    assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    {
+        let store = w.manager.store.lock().await;
+        let current = store
+            .manager_succession(root.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, ManagerRootState::Committed);
+        // The candidate still descends from the invocation that wrote the handoff.
+        assert_eq!(current.frozen.predecessor_invocation_id, Some(frozen_turn));
+        assert_ne!(Some(notice_turn), current.frozen.predecessor_invocation_id);
+        assert_eq!(
+            store
+                .manager_action_operation(root.operation_id)
+                .unwrap()
+                .unwrap()
+                .receipt
+                .state,
+            ManagerActionStateV2::Succeeded
+        );
+        assert_eq!(
+            store
+                .get_harness_manager(w.project)
+                .unwrap()
+                .unwrap()
+                .current_session_id,
+            Some(root.candidate_session_id)
+        );
+        assert!(store.manager_succession_refusal(w.owner).unwrap().is_none());
+    }
+    w.stop_scripted(root.candidate_session_id, &process).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_runtime_finally_refused_succession_wakes_predecessor_and_shows_code_2667() {
+    let w = RootWorld::new().await;
+    w.settled_turn().await;
+    let request = w
+        .request(
+            w.owner,
+            "turn-flood",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (_, root) = w.enqueue(w.owner, request).await;
+    // A predecessor that keeps taking turns is not handing the seat over: past
+    // the bound the succession is refused, and the seat is told why.
+    for _ in 0..6 {
+        w.settled_turn().await;
+    }
+    w.terminal(w.owner).await;
+    let process = install_controller_candidate_test_process(root.candidate_session_id);
+    assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
+    {
+        let store = w.manager.store.lock().await;
+        let current = store
+            .manager_succession(root.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, ManagerRootState::Blocked);
+        let action = store
+            .manager_action_operation(root.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.receipt.state, ManagerActionStateV2::Blocked);
+        assert_eq!(
+            action.receipt.outcome.as_deref(),
+            Some("manager_succession_predecessor_changed")
+        );
+        // The predecessor seat is woken with the typed reason.
+        let notices: Vec<_> = store
+            .manager_inbox(w.owner, &Default::default())
+            .unwrap()
+            .notices
+            .into_iter()
+            .filter(|n| n.kind == "action_result" && n.subject_id == root.operation_id.to_string())
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].state["state"], "blocked");
+        assert_eq!(
+            notices[0].state["outcome"],
+            "manager_succession_predecessor_changed"
+        );
+        assert_eq!(
+            store
+                .manager_succession_refusal(w.owner)
+                .unwrap()
+                .as_deref(),
+            Some("manager_succession_predecessor_changed")
+        );
+    }
+    // Both overviews are built from the seat views.
+    let seat = w
+        .manager
+        .agent_control()
+        .seat_view(Some(w.owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        seat.succession_refusal.as_deref(),
+        Some("manager_succession_predecessor_changed")
+    );
+    drop_controller_candidate_test_process(root.candidate_session_id);
+}
+
+/// #2747: the #2667 state (a finished seat whose succession was finally refused)
+/// is a `pm_seat_succession_blocked` health condition naming the project, so a
+/// manager's armed `health_anomaly` wake hears of it with no model turn.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_runtime_refused_succession_on_a_finished_seat_is_a_health_anomaly_2747() {
+    use crate::health_anomaly::{Inputs, Scope, Sustain, collect_store_facts, evaluate};
+    use rsi_common::health_anomaly::{HealthAnomalySpec, KIND_PM_SEAT_BLOCKED};
+
+    let w = RootWorld::new().await;
+    w.settled_turn().await;
+    let request = w
+        .request(
+            w.owner,
+            "turn-flood",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (_, root) = w.enqueue(w.owner, request).await;
+    // Before the refusal the succession is only queued: nothing to report.
+    {
+        let store = w.manager.store.lock().await;
+        let facts = collect_store_facts(
+            &store,
+            &Scope::portfolio(vec![w.project]),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        assert!(facts.seats.is_empty(), "{:?}", facts.seats);
+    }
+    for _ in 0..6 {
+        w.settled_turn().await;
+    }
+    w.terminal(w.owner).await;
+    let process = install_controller_candidate_test_process(root.candidate_session_id);
+    assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+    {
+        let store = w.manager.store.lock().await;
+        let now = chrono::Utc::now();
+        let facts = collect_store_facts(&store, &Scope::portfolio(vec![w.project]), now).unwrap();
+        assert_eq!(facts.seats.len(), 1, "{:?}", facts.seats);
+        assert_eq!(facts.seats[0].project_id, w.project);
+        assert_eq!(
+            facts.seats[0].refusal,
+            "manager_succession_predecessor_changed"
+        );
+        let found = evaluate(
+            &Inputs {
+                store: facts,
+                ..Inputs::default()
+            },
+            &Default::default(),
+            &HealthAnomalySpec::default(),
+            &mut Sustain::default(),
+            now,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, KIND_PM_SEAT_BLOCKED);
+        assert_eq!(found[0].subject, w.project.to_string());
+        // Another project's wake does not hear of it.
+        let other =
+            collect_store_facts(&store, &Scope::project(uuid::Uuid::new_v4()), now).unwrap();
+        assert!(other.seats.is_empty());
+    }
+    let _ = process;
+    drop_controller_candidate_test_process(root.candidate_session_id);
 }

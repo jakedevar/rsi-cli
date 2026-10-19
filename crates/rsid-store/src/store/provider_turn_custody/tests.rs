@@ -7,6 +7,7 @@ fn turn(store: &Store) -> NewProviderTurnCustody {
     store.insert_session(&session).unwrap();
     let invocation_id = invocation(store, session.id);
     NewProviderTurnCustody {
+        worker_scope: None,
         invocation_id,
         session_id: session.id,
         spool_dir: std::env::temp_dir()
@@ -179,7 +180,7 @@ fn cursor_progress_requires_current_boot_and_exact_previous_offset() {
 fn restart_claim_is_atomic_across_connections_and_fences_old_readers() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("custody.sqlite");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let turn = turn(&store);
     store.insert_provider_turn_custody(&turn).unwrap();
     store
@@ -397,18 +398,11 @@ fn refuses_conflicting_identity_spools_and_invalid_input_without_mutation() {
 fn migration_replays_from_previous_head_without_changing_existing_rows() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("upgrade.sqlite");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     crate::store::tests::rewind_post_v121_tail_to(&store.conn, 160);
     let turn = turn(&store);
     let session_before = store.get_session(turn.session_id).unwrap().unwrap();
-    let old_catalog: Vec<(String, String)> = store
-        .conn
-        .prepare("SELECT name,COALESCE(sql,'') FROM sqlite_master ORDER BY name")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
+    let old_catalog = crate::store::catalog_sql_by_name(&store.conn);
     drop(store);
     let store = Store::open(&path).unwrap();
     assert_eq!(
@@ -423,17 +417,7 @@ fn migration_replays_from_previous_head_without_changing_existing_rows() {
         serde_json::to_value(session_after).unwrap(),
         serde_json::to_value(session_before).unwrap()
     );
-    for (name, sql) in old_catalog {
-        let actual: String = store
-            .conn
-            .query_row(
-                "SELECT COALESCE(sql,'') FROM sqlite_master WHERE name=?1",
-                [name],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(actual, sql);
-    }
+    crate::store::assert_catalog_preserved_across_replay(&old_catalog, &store.conn, 160);
     store.insert_provider_turn_custody(&turn).unwrap();
     assert_eq!(get(&store, &turn).state, ProviderTurnCustodyState::Live);
     let violations: i64 = store
@@ -753,6 +737,280 @@ fn retained_turn_history_clearly_refuses_permanent_purge_and_preserves_soft_dele
     assert_eq!(get(&store, &turn).state, ProviderTurnCustodyState::Finished);
 }
 
+/// Every column of one stored custody row, to prove an attack changed nothing.
+fn custody_snapshot(store: &Store) -> Vec<Vec<String>> {
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT invocation_id,session_id,spool_dir,pid,COALESCE(start_time,-1),boot_id,
+                    stdout_offset,state,created_at,updated_at,COALESCE(worker_scope,'')
+             FROM provider_turn_custody ORDER BY invocation_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            (0..11)
+                .map(|index| {
+                    row.get::<_, rusqlite::types::Value>(index)
+                        .map(|v| format!("{v:?}"))
+                })
+                .collect()
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn raw_sql_cannot_delete_or_replace_custody_identity_or_terminal_history_1671() {
+    let store = Store::open_in_memory().unwrap();
+    let live = turn(&store);
+    store.insert_provider_turn_custody(&live).unwrap();
+    let finished = turn(&store);
+    store.insert_provider_turn_custody(&finished).unwrap();
+    assert!(
+        store
+            .finish_provider_turn_custody(finished.invocation_id, finished.boot_id)
+            .unwrap()
+    );
+    let abandoned = turn(&store);
+    store.insert_provider_turn_custody(&abandoned).unwrap();
+    store
+        .abandon_provider_turn_custody(abandoned.invocation_id, abandoned.boot_id)
+        .unwrap();
+    let before = custody_snapshot(&store);
+    assert_eq!(before.len(), 3);
+
+    // Deleting a live, finished or abandoned row is refused, singly and in bulk.
+    for turn in [&live, &finished, &abandoned] {
+        let error = store
+            .conn
+            .execute(
+                "DELETE FROM provider_turn_custody WHERE invocation_id=?1",
+                [turn.invocation_id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("append only"), "{error}");
+    }
+    assert!(
+        store
+            .conn
+            .execute("DELETE FROM provider_turn_custody", [])
+            .is_err()
+    );
+
+    // Replacing a row by any of its unique identities is refused: the same invocation,
+    // the same spool directory under a new invocation, and a second active turn for
+    // the live row's session (which the partial unique index would otherwise replace).
+    let other_session_invocation = invocation(&store, live.session_id);
+    for (invocation, session, spool, state) in [
+        (
+            finished.invocation_id,
+            finished.session_id,
+            finished.spool_dir.clone(),
+            "live",
+        ),
+        (
+            finished.invocation_id,
+            finished.session_id,
+            finished.spool_dir.clone(),
+            "finished",
+        ),
+        (
+            abandoned.invocation_id,
+            abandoned.session_id,
+            "/other-spool".into(),
+            "abandoned",
+        ),
+        (
+            other_session_invocation,
+            live.session_id,
+            "/second-active".into(),
+            "live",
+        ),
+        (
+            other_session_invocation,
+            live.session_id,
+            live.spool_dir.clone(),
+            "adopted",
+        ),
+        (
+            other_session_invocation,
+            live.session_id,
+            finished.spool_dir.clone(),
+            "finished",
+        ),
+    ] {
+        for verb in ["INSERT OR REPLACE", "REPLACE", "INSERT OR IGNORE", "INSERT"] {
+            let result = store.conn.execute(
+                // sql-dynamic-ok: verbs are fixed test fixture literals above.
+                &format!(
+                    "{verb} INTO provider_turn_custody
+                     (invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at)
+                     VALUES(?1,?2,?3,999,1,?4,0,?5,?6,?6)"
+                ),
+                params![
+                    invocation.to_string(),
+                    session.to_string(),
+                    spool.to_string_lossy(),
+                    Uuid::new_v4().to_string(),
+                    state,
+                    now(),
+                ],
+            );
+            assert!(
+                result.is_err_and(|e| e.to_string().contains("cannot be replaced")),
+                "{verb} {state} must be refused"
+            );
+        }
+    }
+    // An upsert collision cannot rewrite identity either.
+    assert!(
+        store
+            .conn
+            .execute(
+                "INSERT INTO provider_turn_custody
+                 (invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at)
+                 VALUES(?1,?2,'/x',999,1,?3,0,'live',?4,?4)
+                 ON CONFLICT(invocation_id) DO UPDATE SET pid=999,state='live'",
+                params![
+                    finished.invocation_id.to_string(),
+                    finished.session_id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    now()
+                ],
+            )
+            .is_err()
+    );
+    // Replacement stays refused when recursive triggers would also fire the delete guard.
+    store
+        .conn
+        .execute_batch("PRAGMA recursive_triggers=ON")
+        .unwrap();
+    assert!(
+        store
+            .conn
+            .execute("DELETE FROM provider_turn_custody", [])
+            .is_err()
+    );
+
+    assert_eq!(custody_snapshot(&store), before);
+    assert_eq!(get(&store, &live).state, ProviderTurnCustodyState::Live);
+    assert_eq!(
+        get(&store, &finished).state,
+        ProviderTurnCustodyState::Finished
+    );
+    assert_eq!(
+        get(&store, &abandoned).state,
+        ProviderTurnCustodyState::Abandoned
+    );
+    // A legitimate new turn for a session with only terminal history still inserts.
+    let next = invocation(&store, finished.session_id);
+    store
+        .insert_provider_turn_custody(&NewProviderTurnCustody {
+            invocation_id: next,
+            spool_dir: finished.spool_dir.with_file_name(next.to_string()),
+            boot_id: Uuid::new_v4(),
+            ..finished.clone()
+        })
+        .unwrap();
+    assert_eq!(custody_snapshot(&store).len(), 4);
+}
+
+/// #1671: the table's primary key is TEXT, so the implicit rowid is a unique key too. A
+/// REPLACE that collides only on the rowid, or an UPDATE that moves a row onto another
+/// row's rowid, deletes the occupant without firing the delete guard.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn raw_sql_cannot_replace_custody_through_the_implicit_rowid_1671() {
+    let store = Store::open_in_memory().unwrap();
+    let finished = turn(&store);
+    store.insert_provider_turn_custody(&finished).unwrap();
+    assert!(
+        store
+            .finish_provider_turn_custody(finished.invocation_id, finished.boot_id)
+            .unwrap()
+    );
+    let live = turn(&store);
+    store.insert_provider_turn_custody(&live).unwrap();
+    let terminal_rowid: i64 = store
+        .conn
+        .query_row(
+            "SELECT rowid FROM provider_turn_custody WHERE invocation_id=?1",
+            [finished.invocation_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let before = custody_snapshot(&store);
+    assert_eq!(before.len(), 2);
+
+    // A fresh, valid invocation with fresh spool and every other key distinct, aimed at
+    // the terminal row's rowid through each alias and each replacing verb.
+    let fresh_session = turn(&store);
+    for column in ["rowid", "_rowid_", "oid"] {
+        for verb in ["INSERT OR REPLACE", "REPLACE"] {
+            let result = store.conn.execute(
+                // sql-dynamic-ok: verbs and aliases are fixed test fixture literals above.
+                &format!(
+                    "{verb} INTO provider_turn_custody
+                     ({column},invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at)
+                     VALUES(?1,?2,?3,?4,999,1,?5,0,'live',?6,?6)"
+                ),
+                params![
+                    terminal_rowid,
+                    fresh_session.invocation_id.to_string(),
+                    fresh_session.session_id.to_string(),
+                    fresh_session.spool_dir.to_string_lossy(),
+                    Uuid::new_v4().to_string(),
+                    now(),
+                ],
+            );
+            assert!(
+                result.is_err_and(|e| e.to_string().contains("cannot be replaced")),
+                "{verb} through {column} must be refused"
+            );
+        }
+    }
+
+    // Moving a live row onto the terminal row's rowid is refused for every conflict mode.
+    for mode in ["", "OR REPLACE", "OR IGNORE", "OR FAIL"] {
+        let result = store.conn.execute(
+            // sql-dynamic-ok: modes are fixed test fixture literals above.
+            &format!("UPDATE {mode} provider_turn_custody SET rowid=?1 WHERE invocation_id=?2"),
+            params![terminal_rowid, live.invocation_id.to_string()],
+        );
+        assert!(
+            result.is_err_and(|e| e.to_string().contains("rowid is immutable")),
+            "UPDATE {mode} SET rowid must be refused"
+        );
+    }
+    // So is any rowid change, onto an unused value too.
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE provider_turn_custody SET rowid=rowid+1000 WHERE invocation_id=?1",
+                [live.invocation_id.to_string()],
+            )
+            .is_err()
+    );
+
+    assert_eq!(custody_snapshot(&store), before);
+    assert_eq!(
+        get(&store, &finished).state,
+        ProviderTurnCustodyState::Finished
+    );
+    assert_eq!(get(&store, &live).state, ProviderTurnCustodyState::Live);
+    // The legitimate lifecycle still updates the live row (rowid unchanged).
+    assert!(
+        store
+            .finish_provider_turn_custody(live.invocation_id, live.boot_id)
+            .unwrap()
+    );
+    assert_eq!(get(&store, &live).state, ProviderTurnCustodyState::Finished);
+}
+
 #[cfg(target_os = "linux")]
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
@@ -856,4 +1114,135 @@ fn startup_reconciliation_preserves_only_current_boot_exact_detached_invocation(
     );
     store.set_program_run_boot_id(Uuid::new_v4()).unwrap();
     assert_eq!(store.reconcile_running_model_invocations().unwrap(), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn finished_spool_cleanup_preserves_live_adopted_and_stale_boot_custody() {
+    let store = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap(); // tmpfs-fixture-ok: spool only
+    let mut turn = turn(&store);
+    turn.spool_dir = dir.path().join(turn.invocation_id.to_string());
+    std::fs::create_dir(&turn.spool_dir).unwrap();
+    std::fs::write(turn.spool_dir.join("stdin"), "private prompt").unwrap();
+    std::fs::write(turn.spool_dir.join("stdout"), "output").unwrap();
+    store.insert_provider_turn_custody(&turn).unwrap();
+    let lock = std::fs::File::create(turn.spool_dir.join("alive.lock")).unwrap();
+    lock.lock().unwrap();
+    assert!(
+        !store
+            .finish_provider_turn_custody(turn.invocation_id, turn.boot_id)
+            .unwrap()
+    );
+    store.cleanup_ended_provider_turn_spools().unwrap();
+    assert_eq!(get(&store, &turn).state, ProviderTurnCustodyState::Live);
+    assert!(turn.spool_dir.join("stdin").is_file());
+    let boot = Uuid::new_v4();
+    assert!(
+        store
+            .claim_provider_turn_custody(turn.invocation_id, turn.boot_id, boot)
+            .unwrap()
+    );
+    store.cleanup_ended_provider_turn_spools().unwrap();
+    assert!(turn.spool_dir.join("stdout").is_file());
+    assert!(
+        !store
+            .finish_provider_turn_custody(turn.invocation_id, boot)
+            .unwrap()
+    );
+    assert_eq!(get(&store, &turn).state, ProviderTurnCustodyState::Adopted);
+    drop(lock);
+    assert!(
+        !store
+            .finish_provider_turn_custody(turn.invocation_id, turn.boot_id)
+            .unwrap()
+    );
+    assert!(turn.spool_dir.exists());
+    assert!(
+        store
+            .finish_provider_turn_custody(turn.invocation_id, boot)
+            .unwrap()
+    );
+    assert_eq!(get(&store, &turn).state, ProviderTurnCustodyState::Finished);
+    assert!(!turn.spool_dir.exists());
+    assert!(
+        !store
+            .finish_provider_turn_custody(turn.invocation_id, boot)
+            .unwrap()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn startup_cleanup_removes_finished_and_abandoned_spools_once_the_shim_is_gone() {
+    let store = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap(); // tmpfs-fixture-ok: spool only
+    for abandoned in [false, true] {
+        let mut turn = turn(&store);
+        turn.spool_dir = dir.path().join(turn.invocation_id.to_string());
+        std::fs::create_dir(&turn.spool_dir).unwrap();
+        std::fs::write(turn.spool_dir.join("output.json"), "decoder metadata").unwrap();
+        std::fs::write(turn.spool_dir.join("stderr"), "failure evidence").unwrap();
+        store.insert_provider_turn_custody(&turn).unwrap();
+        // Simulate a crash between the state commit and filesystem cleanup.
+        let state = if abandoned {
+            ProviderTurnCustodyState::Abandoned
+        } else {
+            ProviderTurnCustodyState::Finished
+        };
+        store
+            .settle_provider_turn_custody(turn.invocation_id, turn.boot_id, state)
+            .unwrap();
+        let lock = std::fs::File::create(turn.spool_dir.join("alive.lock")).unwrap();
+        lock.lock().unwrap();
+        store.cleanup_ended_provider_turn_spools().unwrap();
+        assert!(turn.spool_dir.join("output.json").is_file());
+        drop(lock);
+        store.cleanup_ended_provider_turn_spools().unwrap();
+        // An abandoned turn's evidence is swept like a finished one's.
+        assert!(!turn.spool_dir.exists());
+        assert_eq!(get(&store, &turn).state, state);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn abandoned_ended_turn_removes_prompt_and_retains_output_evidence() {
+    let store = Store::open_in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap(); // tmpfs-fixture-ok: spool only
+    let mut turn = turn(&store);
+    turn.spool_dir = dir.path().join(turn.invocation_id.to_string());
+    std::fs::create_dir(&turn.spool_dir).unwrap();
+    std::fs::write(turn.spool_dir.join("stdin"), "private prompt").unwrap();
+    std::fs::write(turn.spool_dir.join("stderr"), "failure evidence").unwrap();
+    store.insert_provider_turn_custody(&turn).unwrap();
+    assert!(
+        store
+            .abandon_provider_turn_custody(turn.invocation_id, turn.boot_id)
+            .unwrap()
+    );
+    assert!(!turn.spool_dir.join("stdin").exists());
+    assert_eq!(
+        std::fs::read_to_string(turn.spool_dir.join("stderr")).unwrap(),
+        "failure evidence"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn launch_scope_is_immutable_and_survives_adoption() {
+    let store = Store::open_in_memory().unwrap();
+    let mut turn = turn(&store);
+    turn.worker_scope = Some(format!("rsi-worker-{}-owned.scope", turn.invocation_id));
+    store.insert_provider_turn_custody(&turn).unwrap();
+    assert!(store.conn.execute(
+        "UPDATE provider_turn_custody SET worker_scope='rsi-worker-forged.scope' WHERE invocation_id=?1",
+        [turn.invocation_id.to_string()],
+    ).is_err());
+    assert!(
+        store
+            .claim_provider_turn_custody(turn.invocation_id, turn.boot_id, Uuid::new_v4())
+            .unwrap()
+    );
+    assert_eq!(get(&store, &turn).worker_scope, turn.worker_scope);
 }

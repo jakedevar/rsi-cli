@@ -1,5 +1,13 @@
 use thiserror::Error;
 
+/// #3141: the stable code of a refused OpenRouter Harness preflight, shared by
+/// the error text, the RPC error `data.code`, the invocation error class and a
+/// continued or rotated session's terminal reason.
+#[must_use]
+pub fn openrouter_preflight_code(cause: &str) -> String {
+    format!("openrouter_harness_preflight:{cause}")
+}
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error("IO error: {0}")]
@@ -39,6 +47,11 @@ pub enum DaemonError {
     #[error("Process error: {0}")]
     Process(String),
 
+    /// A bounded holder inventory could not finish. Retain the quarantine and
+    /// retry the complete proof later; this is not evidence of a live holder.
+    #[error("quarantine_proof_deferred: quarantine holder proof exceeded its deadline")]
+    QuarantineProofDeferred,
+
     /// A Codex CLI resume would replay an invalid persisted tool conversation.
     /// The caller must recover from a fresh conversation boundary instead of
     /// retrying the same thread or guessing the outcome of an interrupted tool.
@@ -53,7 +66,13 @@ pub enum DaemonError {
     #[error("Codex resume rollout torn tail")]
     CodexResumeTornTail,
 
-    #[error("OpenRouter Harness route preflight failed: {cause}")]
+    /// #3141: the OpenRouter Harness preflight failed and the Codex fallback is
+    /// off (the default). The message leads with the stable code
+    /// `openrouter_harness_preflight:<cause>`, which the RPC error also carries
+    /// as `data.code`; no Codex process was spawned.
+    #[error(
+        "openrouter_harness_preflight:{cause}: OpenRouter Harness route preflight failed ({cause}); the launch was refused and did not fall back to the Codex CLI"
+    )]
     OpenRouterRoutePreflight { cause: &'static str },
 
     /// Startup could not prove and terminate the complete exact-stamped
@@ -249,7 +268,7 @@ pub fn agent_issue_error_envelope(
     let next_action = match code {
         AgentIssueErrorCodeV1::InvalidRequest => "correct the request fields and retry",
         AgentIssueErrorCodeV1::AuthorityDenied => {
-            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue may only append to that Issue's body while its binding is live"
+            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue reads, with AgentGetIssue, that Issue, its review Issues and the same-project Issues its launch attached (`related`) or that `#N` selectors in its Issue or brief name (a missing number, such as a hub number, is refused the same way); to read another Issue, ask the manager to attach it with `related` on the launch (name it in your handoff) or find it with AgentListIssues title_contains; publish only a handoff or body append to your own Issue while its binding is live"
         }
         AgentIssueErrorCodeV1::NotFoundInScope => {
             "verify the Issue id from the current owning Epic project"
@@ -260,7 +279,7 @@ pub fn agent_issue_error_envelope(
         AgentIssueErrorCodeV1::StaleVersion => "refresh the Issue and retry with its row_version",
         AgentIssueErrorCodeV1::NoSemanticChange => "make a semantic change before retrying",
         AgentIssueErrorCodeV1::InvalidTransition => {
-            "use a lifecycle transition allowed from the current Issue status"
+            "AgentUpdateIssue edits only Open or InProgress Issues (a live bound worker's own handoff excepted): for a Closed or Cancelled Issue file a follow-up with AgentCreateIssue, or reopen it with AgentUpdateIssueStatus Open only when the work really resumes; AgentUpdateIssueStatus moves Open or InProgress to any other status and Closed or Cancelled only back to Open"
         }
         AgentIssueErrorCodeV1::Archived => "restore the Issue before updating it",
         AgentIssueErrorCodeV1::NotArchived => "archive the terminal Issue before restoring it",
@@ -275,10 +294,10 @@ pub fn agent_issue_error_envelope(
             "a bound worker may update only the Issue it was launched for; omit project_id or name that Issue"
         }
         AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed => {
-            "send only body, expected_row_version and idempotency_key; omit title, labels, priority and assignee"
+            "send only body (or handoff), expected_row_version and idempotency_key; omit title, labels, priority and assignee"
         }
         AgentIssueErrorCodeV1::BoundIssueNotAppendOnly => {
-            "re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text"
+            "send {handoff} alone (no body copy) instead; to append to body, re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text (#1750)"
         }
     };
     AgentIssueErrorV1 {
@@ -342,6 +361,51 @@ mod agent_issue_error_tests {
         AgentIssueErrorCodeV1, AgentIssueErrorV1, AgentIssueValidationClassV1,
         AgentIssueValidationFieldV1, AgentIssueValidationV1,
     };
+
+    #[test]
+    fn authority_denied_names_the_bound_worker_read_and_how_to_get_access() {
+        let envelope =
+            agent_issue_error_envelope(AgentIssueErrorCodeV1::AuthorityDenied, None, None);
+        assert!(
+            envelope
+                .next_action
+                .contains("its launch attached (`related`)"),
+            "{}",
+            envelope.next_action
+        );
+        assert!(
+            envelope
+                .next_action
+                .contains("ask the manager to attach it with `related` on the launch"),
+            "{}",
+            envelope.next_action
+        );
+        assert!(
+            envelope
+                .next_action
+                .contains("find it with AgentListIssues title_contains"),
+            "{}",
+            envelope.next_action
+        );
+    }
+
+    #[test]
+    fn invalid_transition_names_the_content_update_fence_and_the_status_rules() {
+        let envelope =
+            agent_issue_error_envelope(AgentIssueErrorCodeV1::InvalidTransition, None, None);
+        for expected in [
+            "AgentUpdateIssue edits only Open or InProgress Issues",
+            "AgentCreateIssue",
+            "AgentUpdateIssueStatus Open",
+            "Closed or Cancelled only back to Open",
+        ] {
+            assert!(
+                envelope.next_action.contains(expected),
+                "{expected}: {}",
+                envelope.next_action
+            );
+        }
+    }
 
     #[test]
     fn normalization_rebuilds_canonical_next_action_and_preserves_typed_evidence() {

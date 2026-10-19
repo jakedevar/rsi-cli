@@ -105,7 +105,7 @@ pub(in crate::store) fn apply_v133_migration(store: &Store) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v133-topology-agent-requests-migration
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) const V133_CATALOG_OBJECTS: [(&str, &str); 4] = [
     ("table", "topology_agent_requests"),
     ("index", "idx_topology_agent_requests_key"),
@@ -114,7 +114,7 @@ pub(crate) const V133_CATALOG_OBJECTS: [(&str, &str); 4] = [
 ];
 
 /// Test teardown: rewind a head database to the exact V132 catalog.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn rewind_v133_fixture_to_v132(connection: &Connection) {
     let version: i32 = connection

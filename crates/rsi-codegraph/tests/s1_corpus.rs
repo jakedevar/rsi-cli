@@ -30,7 +30,7 @@ fn manifest(metadata_digest: &str) -> StagedExtraction {
 #[allow(clippy::too_many_lines)] // The corpus capture, publication, and two-snapshot golden form one gate.
 fn full_temporary_rsi_corpus_has_deterministic_ready_goldens() {
     let started = Instant::now();
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crate_dir = Path::new(rsi_common::manifest_dir!());
     let repo = crate_dir.parent().unwrap().parent().unwrap();
     let listing = Command::new("git")
         .args(["ls-files", "-z"])

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stable entry point; install-release.sh keeps the implementation in ~/.rsi/lib.
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/../lib/cargo-slot" "$@"

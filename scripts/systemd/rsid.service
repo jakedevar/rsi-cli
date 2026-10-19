@@ -10,8 +10,13 @@ WorkingDirectory=%h
 Environment="PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/.config/rsi/rsid.env
 ExecStartPre=/usr/bin/bash -c 'mode=$$(/usr/bin/stat -c %%a %h/.config/rsi/rsid.env); test "$$mode" = 600'
-ExecStart=%h/.local/bin/rsid
+ExecStart=%h/.rsi/install/rsid-supervisor.sh %h/.local/bin/rsid
 Restart=on-failure
+# #2590: a stop must outlast the supervisor's shutdown backstop (#2561): the
+# largest operator grace (supervisor_shutdown_grace_secs, 3600 s) plus its
+# SIGTERM wait (5 s) and slack. systemd otherwise SIGKILLs the whole unit at the
+# default 90 s, before the supervisor's own grace ends.
+TimeoutStopSec=3700
 RestartSec=3
 Slice=rsi.slice
 UMask=0077

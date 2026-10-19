@@ -147,6 +147,10 @@ mod unix {
         Ok(held)
     }
 
+    // XNU/FreeBSD discard blocked SIGCHLD with SIG_DFL. A real disposition
+    // makes it pending for sigwait; the handler is never run while blocked.
+    extern "C" fn child_changed(_: nix::libc::c_int) {}
+
     fn spawn_and_wait(invocation: &Invocation, held: &HeldSocket) -> io::Result<ExitStatus> {
         let mut signals = SigSet::empty();
         for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
@@ -155,7 +159,16 @@ mod unix {
         let mut child_mask = signals.thread_swap_mask(SigmaskHow::SIG_BLOCK)?;
         let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
         for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGCHLD] {
-            unsafe { signal::sigaction(sig, &default)? };
+            let action = if sig == Signal::SIGCHLD {
+                SigAction::new(
+                    SigHandler::Handler(child_changed),
+                    SaFlags::empty(),
+                    SigSet::empty(),
+                )
+            } else {
+                default
+            };
+            unsafe { signal::sigaction(sig, &action)? };
             child_mask.remove(sig);
         }
         let fd = held.listener.as_raw_fd();

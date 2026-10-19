@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""Bounded, same-user sampling of an approved RSI executable. No ptrace, perf
+executable, or raw output. --target selects exactly one of rsid (default), rsi or
+rsi-agent-mcp; any other executable is refused.
+
+Linux x86-64 ABI: linux/perf_event.h (attr v3, mmap page, sample ordering),
+asm/perf_regs.h (SP=7), asm/unistd_64.h (perf_event_open=298).
+Only aggregate symbol counts leave memory. Stack words are approximate callers
+and can include stale words from earlier calls on the same thread: trust the leaf
+and unmatched-leaf tables first and check the thread's /proc/<pid>/task/<tid>/io.
+Agent performance guidance: docs/agents/performance.md.
+"""
+
+import argparse
+from bisect import bisect_right
+from collections import Counter
+from contextlib import ExitStack
+import ctypes
+import ctypes.util
+import errno
+import math
+import mmap
+import os
+from pathlib import Path
+import platform
+import selectors
+import struct
+import subprocess
+import sys
+import time
+
+
+MAX_THREADS = 8
+MAX_TASKS = 4096
+MAX_SAMPLES = 30000
+MAX_SYMBOL_BYTES = 64 * 1024 * 1024
+MAX_MLOCK = 516 * 1024
+# Approved targets: the executable file name /proc/<pid>/exe must carry, and the
+# crate paths whose symbols are reported. Anything else is refused, so adding a
+# target is a reviewed edit of this table, never an argument.
+TARGETS = {
+    "rsid": ("rsid", ("rsid::", "rsid_store::")),
+    "rsi": ("rsi", ("rsi::",)),
+    "rsi-agent-mcp": ("rsi-agent-mcp", ("rsi_agent_mcp::", "rsi_common::")),
+}
+# Extra symbol prefixes reported besides the target's own crates (#2943): the
+# other workspace crates linked into rsid and the bundled SQLite, so a hot
+# rsi_codegraph or sqlite3 frame is not mistaken for stale rsid frames. They
+# never satisfy the "unstripped executable" check or pick alias names.
+CONTEXT_PREFIXES = {
+    "rsid": ("rsi_codegraph::", "rsi_common::", "rsid_core::", "rsid_remote_read::",
+             "rusqlite::", "libsqlite3_sys::", "sqlite3"),
+}
+DEFAULT_TARGET = "rsid"
+SAMPLE_TYPE = (1 << 0) | (1 << 1) | (1 << 12) | (1 << 13)
+REG_MASK = 1 << 7  # PERF_REG_X86_SP; one u64 when ABI is nonzero
+ENABLE, DISABLE = 0x2400, 0x2401
+
+
+class SamplerError(Exception):
+    pass
+
+
+def supported(system, machine, byteorder):
+    if system != "Linux" or machine not in ("x86_64", "AMD64") or byteorder != "little":
+        raise SamplerError("unsupported: requires Linux little-endian x86-64")
+
+
+def bounded_read(path, limit=65536):
+    with open(path, "rb") as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise SamplerError("proc/ELF input exceeds safety limit")
+    return data
+
+
+def task_stat(data):
+    # comm may contain spaces and ')'. Fields after the final ')' start at #3.
+    fields = data[data.rindex(b")") + 2:].split()
+    return int(fields[11]) + int(fields[12]), int(fields[19])
+
+
+def validate_process(pid, target=DEFAULT_TARGET):
+    root = Path("/proc") / str(pid)
+    status = bounded_read(root / "status").decode("ascii")
+    rows = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+    if any(int(uid) != os.getuid() for uid in rows["Uid"].split()):
+        raise SamplerError("target must have the same real/effective/saved/filesystem UID")
+    if int(rows["Tgid"]) != pid:
+        raise SamplerError("target PID must be a process leader")
+    expected = TARGETS[target][0]
+    if Path(os.readlink(root / "exe").removesuffix(" (deleted)")).name != expected:
+        raise SamplerError(f"target executable must be {expected}")
+    return task_stat(bounded_read(root / "stat"))[1]
+
+
+def snapshot_tasks(pid):
+    root = Path("/proc") / str(pid) / "task"
+    result = {}
+    with os.scandir(root) as entries:
+        for index, entry in enumerate(entries):
+            if index >= MAX_TASKS:
+                raise SamplerError("thread discovery exceeds 4096-task limit")
+            if entry.name.isdecimal():
+                try:
+                    result[int(entry.name)] = task_stat(bounded_read(Path(entry.path) / "stat"))
+                except FileNotFoundError:
+                    pass  # A thread may exit during discovery.
+    return result
+
+
+def hottest(before, after, count):
+    # starttime is a reuse fence; rank by user+system CPU delta, then TID.
+    ranked = [(max(0, ticks - before[tid][0]), tid, start)
+              for tid, (ticks, start) in after.items()
+              if tid in before and start == before[tid][1]]
+    return sorted(ranked, key=lambda item: (-item[0], item[1]))[:count]
+
+
+def ring_plan(threads, stack_bytes, page_size, mlock_kb):
+    budget = min(mlock_kb * 1024, MAX_MLOCK)
+    # A ring must fit at least two maximum records, including header and regs.
+    minimum = 1
+    while minimum * page_size < 2 * (stack_bytes + 64):
+        minimum *= 2
+    count = min(threads, budget // ((minimum + 1) * page_size))
+    if count < 1:
+        raise SamplerError("perf_event_mlock_kb too small for even one metadata+data ring")
+    pages = minimum
+    while pages < 32 and count * (2 * pages + 1) * page_size <= budget:
+        pages *= 2
+    allocation = count * (pages + 1) * page_size
+    return count, pages, allocation, budget
+
+
+def make_attr(stack_bytes, hz):
+    attr = bytearray(96)  # PERF_ATTR_SIZE_VER3
+    struct.pack_into("<IIQQQQQ", attr, 0, 1, 96, 1, 1_000_000_000 // hz,
+                     SAMPLE_TYPE, 0, 1 | (1 << 5) | (1 << 6))
+    struct.pack_into("<I", attr, 48, 1)  # wakeup_events
+    struct.pack_into("<QI", attr, 80, REG_MASK, stack_bytes)
+    return attr
+
+
+class Atomics:
+    """Use libatomic acquire/release operations; do not guess Python barriers."""
+
+    def __init__(self):
+        name = ctypes.util.find_library("atomic")
+        if not name:
+            raise SamplerError("unsupported: libatomic is required for perf ring ordering")
+        self.lib = ctypes.CDLL(name)
+        self.load = getattr(self.lib, "__atomic_load_8")
+        self.load.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.load.restype = ctypes.c_uint64
+        self.store = getattr(self.lib, "__atomic_store_8")
+        self.store.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+        self.store.restype = None
+
+    def head(self, mapping):
+        return self.load(ctypes.addressof(ctypes.c_char.from_buffer(mapping, 1024)), 2)
+
+    def tail(self, mapping, value):
+        self.store(ctypes.addressof(ctypes.c_char.from_buffer(mapping, 1032)), value, 3)
+
+
+def ring_records(mapping, offset, size, tail, head):
+    """Decode one published snapshot, including wraps; return records/new tail/errors.
+
+    No resynchronization through arbitrary stack bytes. Corruption/overrun drops
+    the snapshot, and partial records stay unread until the next published head.
+    """
+    if head < tail or head - tail > size:
+        return [], head, 1
+
+    def copy(position, length):
+        start = position % size
+        first = min(length, size - start)
+        return (mapping[offset + start:offset + start + first]
+                + mapping[offset:offset + length - first])
+
+    records = []
+    while head - tail >= 8:
+        kind, misc, length = struct.unpack("<IHH", copy(tail, 8))
+        if length < 8 or length > size or length % 8:
+            return records, head, 1
+        if length > head - tail:
+            break
+        records.append((kind, misc, copy(tail + 8, length - 8)))
+        tail += length
+    return records, tail, 0
+
+
+def decode_sample(payload, stack_limit):
+    """IP,TID,REGS_USER,STACK_USER in UAPI order; ABI_NONE has no regs."""
+    if len(payload) < 32:
+        raise ValueError("short sample")
+    ip, pid, tid, abi = struct.unpack_from("<QIIQ", payload)
+    if abi not in (0, 2):  # NONE or PERF_SAMPLE_REGS_ABI_64
+        raise ValueError("unsupported register ABI")
+    position = 24 + (8 if abi else 0)
+    size = struct.unpack_from("<Q", payload, position)[0]
+    position += 8
+    if size > stack_limit or size % 8:
+        raise ValueError("invalid stack size")
+    end = position + size
+    if len(payload) != end + (8 if size else 0):
+        raise ValueError("sample length mismatch")
+    dynamic = struct.unpack_from("<Q", payload, end)[0] if size else 0
+    if dynamic > size:
+        raise ValueError("invalid dynamic stack size")
+    words = struct.unpack_from("<" + "Q" * (dynamic // 8), payload, position)
+    return ip, pid, tid, words
+
+
+def elf_segments(source):
+    source.seek(0)
+    header = source.read(64)
+    if len(header) != 64 or header[:6] != b"\x7fELF\x02\x01":
+        raise SamplerError("unsupported: target must be little-endian ELF64")
+    elf_type, machine = struct.unpack_from("<HH", header, 16)
+    if elf_type not in (2, 3) or machine != 62:
+        raise SamplerError("unsupported: target must be x86-64 ET_EXEC or ET_DYN")
+    phoff = struct.unpack_from("<Q", header, 32)[0]
+    stride, count = struct.unpack_from("<HH", header, 54)
+    if stride != 56 or count > 256 or phoff + stride * count > os.fstat(source.fileno()).st_size:
+        raise SamplerError("invalid ELF program headers")
+    source.seek(phoff)
+    segments = []
+    for _ in range(count):
+        kind, flags, offset, vaddr, _, filesz, _, _ = struct.unpack("<IIQQQQQQ", source.read(56))
+        if kind == 1 and flags & 1:
+            segments.append((offset, vaddr, filesz))
+    if not segments:
+        raise SamplerError("ELF has no executable load segment")
+    return segments
+
+
+def executable_maps(data, identity):
+    result = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        fields = line.split(None, 5)
+        if len(fields) < 5 or "x" not in fields[1]:
+            continue
+        major, minor = (int(part, 16) for part in fields[3].split(":"))
+        if (major, minor, int(fields[4])) == identity:
+            start, end = (int(part, 16) for part in fields[0].split("-"))
+            result.append((start, end, int(fields[2], 16)))
+    if not result:
+        raise SamplerError("no executable mapping matches target executable inode/device")
+    return result
+
+
+def load_bias(mappings, segments, page_size):
+    biases = set()
+    for start, _, map_offset in mappings:
+        matches = {start - (vaddr + map_offset - offset)
+                   for offset, vaddr, filesz in segments
+                   if offset // page_size * page_size <= map_offset < offset + filesz}
+        if len(matches) != 1:
+            raise SamplerError("unsupported/ambiguous ELF executable mapping")
+        biases.update(matches)
+    if len(biases) != 1:
+        raise SamplerError("executable mappings disagree on ASLR load bias")
+    return biases.pop()
+
+
+def is_rsid(name, prefixes=TARGETS[DEFAULT_TARGET][1]):
+    """True when a crate path of the target appears in a demangled symbol.
+
+    A prefix counts only at a path boundary, so ``rsi::`` does not match
+    ``rsid::`` or ``xrsi::``.
+    """
+    for prefix in prefixes:
+        start = name.find(prefix)
+        while start != -1:
+            if start == 0 or not (name[start - 1].isalnum() or name[start - 1] in "_:"):
+                return True
+            start = name.find(prefix, start + 1)
+    return False
+
+
+class Symbols:
+    def __init__(self, text, mappings, bias, prefixes=TARGETS[DEFAULT_TARGET][1], context=()):
+        self.prefixes = prefixes
+        self.context = context
+        is_rsid = self.is_target
+        by_address = {}
+        for line in text.splitlines():
+            fields = line.split(None, 3)
+            if len(fields) != 4 or fields[2] not in ("t", "T", "w", "W"):
+                continue
+            try:
+                start, size = int(fields[0], 16), int(fields[1], 16)
+            except ValueError:
+                continue
+            name = fields[3]
+            if not size or len(name) > 4096:
+                continue
+            prior = by_address.get(start)
+            if prior is None or (is_rsid(name), size) > (is_rsid(prior[2]), prior[1]):
+                by_address[start] = (start, size, name)
+        self.entries = sorted(by_address.values())
+        self.starts = [item[0] for item in self.entries]
+        self.mappings, self.bias = mappings, bias
+        if not any(is_rsid(item[2]) for item in self.entries):
+            raise SamplerError(f"no {'/'.join(p[:-2] for p in prefixes)} symbols: "
+                               "use an unstripped executable and GNU nm")
+
+    def is_target(self, name):
+        return is_rsid(name, self.prefixes)
+
+    def is_reported(self, name):
+        return is_rsid(name, self.prefixes + self.context)
+
+    def lookup(self, address):
+        if not any(start <= address < end for start, end, _ in self.mappings):
+            return None
+        address -= self.bias
+        index = bisect_right(self.starts, address) - 1
+        if index >= 0:
+            start, size, name = self.entries[index]
+            if address < start + size:
+                return name
+        return None
+
+
+def nm_symbols(exe_fd):
+    # Bounded stdout and deadline, no shell, no stderr/path/raw diagnostic output.
+    try:
+        process = subprocess.Popen(["nm", "-n", "-S", "-C", "--defined-only",
+                                    f"/proc/self/fd/{exe_fd}"], pass_fds=(exe_fd,),
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env={"PATH": os.defpath, "LC_ALL": "C"})
+    except FileNotFoundError:
+        raise SamplerError("GNU nm is required (the perf executable is not)") from None
+    with process, selectors.DefaultSelector() as selector:
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            data = bytearray()
+            deadline = time.monotonic() + 15
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise SamplerError("symbol decoding exceeded 15-second limit")
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_SYMBOL_BYTES:
+                    raise SamplerError("symbol decoding exceeded 64-MiB limit")
+            if process.wait(timeout=max(0.01, deadline - time.monotonic())):
+                raise SamplerError("nm failed to read daemon symbols")
+            return data.decode("utf-8", "replace")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+
+class Ring:
+    def __init__(self, tid, attr, pages, page_size, atomics):
+        # Imports delayed so non-Linux hosts can still report unsupported cleanly.
+        import fcntl
+        self.ioctl = fcntl.ioctl
+        self.fd, self.mapping = None, None
+        self.atomics, self.tail_value = atomics, 0
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        buf = (ctypes.c_char * len(attr)).from_buffer(attr)
+        fd = libc.syscall(ctypes.c_long(298), ctypes.byref(buf), ctypes.c_int(tid),
+                          ctypes.c_int(-1), ctypes.c_int(-1), ctypes.c_ulong(8))
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "perf_event_open")
+        self.fd = fd
+        try:
+            self.mapping = mmap.mmap(fd, (pages + 1) * page_size, flags=mmap.MAP_SHARED,
+                                     prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            self.offset, self.size = struct.unpack_from("<QQ", self.mapping, 1040)
+            if (self.offset, self.size) != (page_size, pages * page_size):
+                raise SamplerError("unsupported perf mmap layout")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        try:
+            if self.mapping is not None:
+                self.mapping.close()
+                self.mapping = None
+        finally:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+
+    def drain(self):
+        records, tail, errors = ring_records(self.mapping, self.offset, self.size,
+                                            self.tail_value, self.atomics.head(self.mapping))
+        self.atomics.tail(self.mapping, tail)
+        self.tail_value = tail
+        return records, errors
+
+
+class Counts:
+    def __init__(self):
+        self.samples = self.lost = self.malformed = self.throttled = self.unmatched = 0
+        self.leaf, self.inclusive = Counter(), Counter()
+        self.unmatched_leaf = Counter()  # Leaf symbols outside every reported crate.
+
+    def consume(self, record, symbols, pid, tid, stack_bytes):
+        kind, misc, payload = record
+        if kind == 2 and len(payload) == 16:
+            self.lost += struct.unpack_from("<Q", payload, 8)[0]
+        elif kind == 5:
+            self.throttled += 1
+        elif kind == 9:
+            try:
+                ip, sample_pid, sample_tid, words = decode_sample(payload, stack_bytes)
+                if (sample_pid, sample_tid) != (pid, tid) or misc & 7 != 2:
+                    raise ValueError("wrong sample identity/mode")
+            except (ValueError, struct.error):
+                self.malformed += 1
+                return
+            self.samples += 1
+            leaf = symbols.lookup(ip)
+            frames = {name for word in words if word and (name := symbols.lookup(word - 1))
+                      and symbols.is_reported(name)}
+            if leaf and symbols.is_reported(leaf):
+                self.leaf[leaf] += 1
+                frames.add(leaf)
+            else:
+                self.unmatched += 1
+                self.unmatched_leaf[leaf or UNRESOLVED_LEAF] += 1
+            self.inclusive.update(frames)  # Each symbol counts once per sample.
+
+
+UNRESOLVED_LEAF = "<outside target executable: libc, vdso or unresolved>"
+
+
+def safe_symbol(name):
+    return "".join(char if char.isprintable() else "?" for char in name)[:240]
+
+
+def sample(args):
+    supported(platform.system(), platform.machine(), sys.byteorder)
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    mlock_kb = int(bounded_read("/proc/sys/kernel/perf_event_mlock_kb", 64))
+    count, pages, allocation, budget = ring_plan(args.threads, args.stack_bytes, page_size, mlock_kb)
+    starttime = validate_process(args.pid, args.target)
+    before = snapshot_tasks(args.pid)
+    time.sleep(args.discover_seconds)
+    selected = hottest(before, snapshot_tasks(args.pid), count)
+    if not selected:
+        raise SamplerError("no stable threads found")
+    root = Path("/proc") / str(args.pid)
+    with ExitStack() as cleanup:
+        exe = cleanup.enter_context(open(root / "exe", "rb"))
+        stat = os.fstat(exe.fileno())
+        identity = (os.major(stat.st_dev), os.minor(stat.st_dev), stat.st_ino)
+        mappings = executable_maps(bounded_read(root / "maps", 4 * 1024 * 1024), identity)
+        symbols = Symbols(nm_symbols(exe.fileno()), mappings,
+                          load_bias(mappings, elf_segments(exe), page_size),
+                          TARGETS[args.target][1], CONTEXT_PREFIXES.get(args.target, ()))
+        atomics = Atomics()
+        attr = make_attr(args.stack_bytes, args.hz)
+        allocation = len(selected) * (pages + 1) * page_size
+        print(f"target={args.target} pid={args.pid} threads={len(selected)}/{args.threads} seconds={args.seconds:g} "
+              f"hz={args.hz} stack_bytes={args.stack_bytes} data_pages={pages} "
+              f"mmap_bytes={allocation} budget_bytes={budget} mlock_kb={mlock_kb}", flush=True)
+        print("Approximate stack-word scan; inclusive counts are unique symbols per sample "
+              "and can include stale stack words (earlier calls on the same thread). "
+              "Trust the leaf and unmatched-leaf tables first; confirm a frame with the "
+              "thread's /proc/<pid>/task/<tid>/io before acting on it.", flush=True)
+        rings = []
+        for ticks, tid, thread_start in selected:
+            if validate_process(args.pid, args.target) != starttime:
+                raise SamplerError("target identity changed")
+            if task_stat(bounded_read(root / "task" / str(tid) / "stat"))[1] != thread_start:
+                raise SamplerError("selected thread identity changed")
+            # Re-read the actual budget immediately before every allocation.
+            if allocation > min(int(bounded_read("/proc/sys/kernel/perf_event_mlock_kb", 64)) * 1024, MAX_MLOCK):
+                raise SamplerError("perf mlock budget decreased; refusing allocation")
+            ring = Ring(tid, attr, pages, page_size, atomics)
+            cleanup.callback(ring.close)
+            if (validate_process(args.pid, args.target) != starttime
+                    or task_stat(bounded_read(root / "task" / str(tid) / "stat"))[1] != thread_start):
+                raise SamplerError("target/thread changed while opening event")
+            rings.append((tid, ticks, ring, Counts()))
+        for _, _, ring, _ in rings:
+            ring.ioctl(ring.fd, ENABLE, 0)
+        deadline = time.monotonic() + args.seconds
+        records_seen = 0
+        capped = False
+        while True:
+            for tid, _, ring, counts in rings:
+                records, errors = ring.drain()
+                counts.malformed += errors
+                for record in records:
+                    if records_seen >= MAX_SAMPLES:
+                        capped = True
+                        break
+                    counts.consume(record, symbols, args.pid, tid, args.stack_bytes)
+                    records_seen += 1
+            if capped or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        for _, _, ring, _ in rings:
+            ring.ioctl(ring.fd, DISABLE, 0)
+        # Final drain after disabling; never exceed the global processing cap.
+        for tid, _, ring, counts in rings:
+            records, errors = ring.drain()
+            counts.malformed += errors
+            for record in records:
+                if records_seen >= MAX_SAMPLES:
+                    capped = True
+                    break
+                counts.consume(record, symbols, args.pid, tid, args.stack_bytes)
+                records_seen += 1
+        if (validate_process(args.pid, args.target) != starttime
+                or executable_maps(bounded_read(root / "maps", 4 * 1024 * 1024), identity) != mappings):
+            raise SamplerError("target/executable mappings changed; aggregate results discarded")
+        total = 0
+        for tid, ticks, _, counts in rings:
+            total += counts.samples
+            print(f"tid={tid} discovery_cpu_ticks={ticks} samples={counts.samples} "
+                  f"lost={counts.lost} malformed={counts.malformed} "
+                  f"throttled={counts.throttled} unmatched_leaf={counts.unmatched}")
+            names = "/".join(p.removesuffix("::") for p in
+                             TARGETS[args.target][1] + CONTEXT_PREFIXES.get(args.target, ()))
+            for label, counter in (("leaf", counts.leaf), ("inclusive", counts.inclusive),
+                                   ("unmatched leaf", counts.unmatched_leaf)):
+                print(f"  top {label} {names}:" if label != "unmatched leaf"
+                      else "  top unmatched leaf (outside those crates):")
+                for name, hits in counter.most_common(args.top):
+                    print(f"    {hits:6d} {safe_symbol(name)}")
+        print(f"total_samples={total} records={records_seen} record_cap={MAX_SAMPLES} capped={str(capped).lower()}")
+        if capped:
+            raise SamplerError("record processing limit reached; aggregates are partial")
+        if not total:
+            raise SamplerError("no user samples collected (idle target, perf denial, or throttling)")
+        if not any(counts.inclusive for _, _, _, counts in rings):
+            raise SamplerError(f"samples collected but no {args.target} frames resolved")
+
+
+def arguments(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pid", type=int, required=True,
+                        help="same-user process leader of the approved --target executable")
+    parser.add_argument("--target", choices=sorted(TARGETS), default=DEFAULT_TARGET,
+                        help="approved executable name to sample (default: rsid)")
+    parser.add_argument("--threads", type=int, default=3, help="hottest threads, 1..8 (budget may reduce)")
+    parser.add_argument("--seconds", type=float, default=5, help="sampling wall time, 0.1..30")
+    parser.add_argument("--discover-seconds", type=float, default=0.5, help="CPU ranking interval, 0.1..2")
+    parser.add_argument("--stack-bytes", type=int, default=4096, help="256..8192, multiple of 8")
+    parser.add_argument("--hz", type=int, default=100, help="task-clock samples per CPU second, 1..100")
+    parser.add_argument("--top", type=int, default=20, help="symbols per table, 1..50")
+    args = parser.parse_args(argv)
+    if (args.pid <= 0 or not 1 <= args.threads <= MAX_THREADS
+            or not math.isfinite(args.seconds) or not 0.1 <= args.seconds <= 30
+            or not math.isfinite(args.discover_seconds) or not 0.1 <= args.discover_seconds <= 2
+            or not 256 <= args.stack_bytes <= 8192 or args.stack_bytes % 8
+            or not 1 <= args.hz <= 100 or not 1 <= args.top <= 50):
+        parser.error("arguments exceed bounded sampler limits (see --help)")
+    return args
+
+
+def main(argv=None):
+    args = arguments(argv)
+    try:
+        sample(args)
+        return 0
+    except SamplerError as error:
+        print(f"rsid-sample-stacks: {error}", file=sys.stderr)
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.EACCES):
+            print("rsid-sample-stacks: denied by perf/proc policy or shared mlock budget; "
+                  "no permission or sysctl changes attempted", file=sys.stderr)
+        else:
+            print(f"rsid-sample-stacks: OS failure errno={error.errno}; no raw diagnostics", file=sys.stderr)
+    except (ValueError, KeyError, struct.error, AttributeError):
+        print("rsid-sample-stacks: unsupported or malformed proc/ELF/perf ABI input", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("rsid-sample-stacks: interrupted; perf maps and FDs closed", file=sys.stderr)
+        return 130
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

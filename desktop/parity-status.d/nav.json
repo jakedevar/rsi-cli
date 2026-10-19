@@ -1,0 +1,350 @@
+{
+  "version": 1,
+  "rows": {
+    "key:j": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "moves the session-list cursor (counts work; Go menu, palette); hands the keys back to the list. The TUI's j does nothing in session detail (action_handler dispatch_editor), so there is no transcript scroll to mirror; Up/Down and Ctrl-d/u scroll it"
+    },
+    "key:k": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "moves the session-list cursor up; as j"
+    },
+    "key:gg": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts, src/actions/detail.ts",
+      "note": "session list: the first row, NG = row N; while the transcript has the keys, the first event is selected and shown (jump_to_top), claimed by the G2 navigation slice"
+    },
+    "key:G": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts, src/actions/detail.ts",
+      "note": "session list: the last row, NG = row N; while the transcript has the keys, the last event (jump_to_bottom)"
+    },
+    "key:/": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/sessionlist-run.ts",
+      "note": "focuses the incremental session filter (Enter keeps it, Esc clears it); with a session open, n / N jump to the conversation events that contain it, the TUI's detail search"
+    },
+    "key:ga": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/lifecycle-spec.ts",
+      "note": "Archived sessions view; U restores the cursor session (slice 6)"
+    },
+    "cmd:archives": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts",
+      "note": "same as ga (named here because it is the same feature as the Normal-mode row)"
+    },
+    "key:gs": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/tree.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "the Main zone: the Active view without the root sessions scheduled jobs launched (app/sessions.rs); leaves the Jobs zone"
+    },
+    "key:gj": {
+      "status": "done",
+      "location": "src/tree.ts, src/sessions.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "the Jobs zone: the root sessions scheduled jobs launched (scheduled_job_id, no parent), every status, under the project filter and the list filter; a Jobs segment beside Active and Archived, and View > Jobs"
+    },
+    "key:i": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/actions/input.ts, src/vim-editor.ts",
+      "note": "focuses the message box at its caret (EnterInputBarInsert Insert): the binding passes its key and G1’s focusComposer (actions/input.ts) enters insert mode"
+    },
+    "key:a": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/actions/input.ts, src/vim-editor.ts",
+      "note": "focuses the message box with the caret one character on (Append), through G1’s focusComposer (actions/input.ts)"
+    },
+    "key:o": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/actions/input.ts, src/vim-editor.ts",
+      "note": "opens a new line below the caret’s line and puts the caret on it (OpenBelow), through G1’s focusComposer (actions/input.ts)"
+    },
+    "key:O": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/actions/input.ts, src/vim-editor.ts",
+      "note": "opens a new line above the caret’s line (OpenAbove), through G1’s focusComposer (actions/input.ts)"
+    },
+    "key:e": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "opens the cursor session with the keys in the transcript instead of the message box (EnterSessionNormalMode)"
+    },
+    "key:Backspace": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "from the transcript, hands the keys back to the list; in the list, ascends one container (the - / H ascend); at the root nothing (AscendOrBack)"
+    },
+    "key:<Space>q": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "closes the focused pane: the terminal, the file viewer or explorer, the graph or DAG pane, a manager view or the Issues workspace, else the open session; also :close"
+    },
+    "cmd:close": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "same as <Space>q"
+    },
+    "key:>": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: the desktop has one window with no workspace tabs; > steps the project filter to the next project (All projects included), the desktop's workspace equivalent (<Space>p), as Workspace Management's > next project workspace; also :tabnext"
+    },
+    "key:<": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: steps the project filter to the previous project; also :tabprev"
+    },
+    "cmd:tabnext": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: same as >"
+    },
+    "cmd:tabprev": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: same as <"
+    },
+    "section:workspace-management": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: > / < step the project filter, the desktop's workspace (no per-project workspace panes)"
+    },
+    "key:<Space>T": {
+      "status": "substitute",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "substitute: the desktop has one window and no tabs, so <Space>T opens the session in place (the open action)"
+    },
+    "key:Ctrl-M": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "the model dropdown for the next launch: a picker of the discovered models of the default provider (Ctrl-P cycles the provider, Ctrl-M or Esc closes); the choice is the New session dialog's provider and model from then on (remembered); :model <id> sets it directly. Physical Ctrl-M on macOS (Cmd-M minimises)"
+    },
+    "cmd:model": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "same as Ctrl-M; :model <id> sets the default model directly"
+    },
+    "section:model-selection": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "Ctrl-M and :model"
+    },
+    "key:gf1": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 1 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf2": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 2 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf3": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 3 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf4": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 4 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf5": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 5 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf6": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 6 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf7": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 7 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf8": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 8 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf9": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts, src/actions/input.ts, src/input-model.ts, src/files.ts",
+      "note": "opens recent file 9 of the open session in the file viewer (G1’s open-recent-file): the distinct file_path of its Edit / MultiEdit / Write / Read tool calls, newest first (compute_recent_files)"
+    },
+    "key:gf": {
+      "status": "done",
+      "location": "src/actions/input-spec.ts",
+      "note": "prefix of gf1..gf9 (the engine waits for the digit)"
+    },
+    "key:<Space>gg": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "runs lazygit in the embedded terminal (slice 12) in the session's working directory; a POSIX shell says when it is not installed"
+    },
+    "key:<Space>bb": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "runs btop in the embedded terminal when it is installed"
+    },
+    "leader:<Space>b": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "prefix of <Space>bb (system tools)"
+    },
+    "leader:<Space>g": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "prefix of the <Space>g manager, Git, creation and landing chords"
+    },
+    "key:D": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": "prefix of DD (the engine waits for the second D)"
+    },
+    "key:y": {
+      "status": "done",
+      "location": "src/keyengine.ts",
+      "note": "prefix of yy"
+    },
+    "key:<Space>": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "the leader key, with the which-key hint"
+    },
+    "key:<Space>gr": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:<Space>R": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:<Space>S": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gt": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:<Space>o": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:g?": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gX": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gq": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gn": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gc": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gv": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gp": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gK": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gG": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gE": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gS": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gT": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:gB": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts",
+      "note": "retired TUI chord kept inert: the engine answers with the TUI's reason and never falls through to another key's action (keyengine.ts buildKeymap)"
+    },
+    "key:<Space>;": {
+      "status": "done",
+      "location": "src/palette.ts, src/registry.ts",
+      "note": "the command palette (also Ctrl-K / Cmd-K, toolbar Actions…, View menu): every action with its keys, and a query starting with : runs a TUI command line, the same palette as :"
+    },
+    "section:leader-key-and-g-chord-migration-space": {
+      "status": "done",
+      "location": "src/keyengine.ts, src/vimkeys.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "<Space> leader and g chords with a which-key hint; every migrated leaf runs (all Normal-mode keys are bound but <Space>gP, which waits for a prompt-file RPC), retired g sequences stay inert"
+    },
+    "section:all-normal-mode-keys-generated": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/actions/*.ts",
+      "note": "every row of the generated table is tracked as its own key: row; all are bound (<Space>gP opens the prompt creator over the prompt-file RPCs)"
+    },
+    "section:navigation-context-sensitive": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "gs / gj zones; l and Enter open; Left / Ctrl-Tab and Right / Ctrl-Shift-Tab move the list from the list or the transcript, Shift-Left / Shift-Right also open; Backspace ascends or goes back"
+    },
+    "section:session-hierarchy-navigation": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts, src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "Enter / L open; - / H ascend; Backspace ascends, or from the transcript goes back to the list; the z folds. The tree is inline, so a container's children show beneath it instead of a descent"
+    },
+    "section:standard-vim-motions-inherited-from-modalkit": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts",
+      "note": "j / k / gg / G as above; Ctrl-d / Ctrl-u scroll half a page and Ctrl-f / Ctrl-b a full page in the pane that has the keys (the transcript, else the list)"
+    },
+    "section:window-split-management-inherited-from-modalkit": {
+      "status": "done",
+      "location": "src/actions/nav-run.ts, src/nav-model.ts, src/actions/input.ts, src/input-model.ts",
+      "note": "Ctrl-h / Ctrl-l step the session-list zone (Main, Jobs, Archived) while the list has the keys and move the focus otherwise, and Ctrl-Left / Ctrl-Right move the focus (G1’s routeGlobal, one owner with the Global rows); Ctrl-w then h / l / k / j focuses the list, the transcript or the message box (G2)"
+    },
+    "section:mouse-interactions": {
+      "status": "done",
+      "location": "src/actions/nav.ts, src/actions/nav-run.ts, src/nav-model.ts, src/actions/detail.ts, src/markdown.ts, src-tauri/src/nav.rs",
+      "note": "a left click on an event sets the event cursor (slice 5); a left click on a link copies its URL and a code block has a Copy button (markdown.ts); a left click on a file path (inline code) copies the path resolved against the session directory; a right click on a web link opens it in the system browser (open_url) and on a file path opens it in the file viewer; the wheel scrolls natively"
+    }
+  }
+}

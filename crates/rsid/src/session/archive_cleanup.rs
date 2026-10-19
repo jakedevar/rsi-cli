@@ -1951,7 +1951,7 @@ mod tests {
             session.updated_at = chrono::Utc::now();
 
             let database = temp.path().join("archive.db");
-            let mut store = crate::store::Store::open(&database).expect("store");
+            let mut store = crate::store::Store::open_test_fixture(&database).expect("store");
             store
                 .insert_session_with_custody(
                     &session,
@@ -2022,7 +2022,8 @@ mod tests {
         ) -> SessionManager {
             SessionManager::new(
                 event_bus,
-                crate::store::Store::open(&self.database).expect("reopen projection store"),
+                crate::store::Store::open_test_fixture(&self.database)
+                    .expect("reopen projection store"),
                 false,
                 self._temp
                     .path()
@@ -2149,7 +2150,7 @@ mod tests {
                 memory_db.to_path_buf(),
             );
             let main_store = Arc::new(tokio::sync::Mutex::new(
-                crate::store::Store::open(&self.database).expect("memory main store"),
+                crate::store::Store::open_test_fixture(&self.database).expect("memory main store"),
             ));
             let (tx, rx) = tokio::sync::mpsc::channel(8);
             let handle = MemoryHandle::new(tx);
@@ -2820,7 +2821,7 @@ mod tests {
             // handshake proves it reached the busy stripe and released the Store.
             let contended =
                 crate::store::custody_lock_order::admission_contention_signal(custody_id);
-            let mut admission = runtime
+            let admission = runtime
                 .spawn(async move { custody.prepare_handoff_resume(&session).await.map(|_| ()) });
             contended
                 .recv_timeout(std::time::Duration::from_secs(60))
@@ -2847,7 +2848,7 @@ mod tests {
                 .expect("archive thread")
                 .expect("archive settles after the proof resumes");
             fixture.assert_settled(&receipt, &fixture.allocation_oid);
-            runtime
+            let _ = runtime
                 .block_on(async {
                     tokio::time::timeout(std::time::Duration::from_secs(60), admission).await
                 })

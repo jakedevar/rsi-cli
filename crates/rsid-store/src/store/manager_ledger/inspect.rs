@@ -19,6 +19,7 @@ struct Cursor {
     scope: i64,
     anchor: Uuid,
     section: ManagerInspectSectionV2,
+    include_history: bool,
     epic: Option<Uuid>,
     revision: i64,
     graph_stamp: Option<String>,
@@ -244,6 +245,7 @@ impl Store {
             if c.scope != config.row_version
                 || c.anchor != config.manager_session_id
                 || c.section != q.section
+                || c.include_history != q.include_history
                 || c.epic != q.epic_id
                 || c.graph_stamp != graph_stamp
                 || (!matches!(
@@ -324,7 +326,10 @@ impl Store {
                 // #669: durable seat observation beside manager_available.
                 let manager_seat = self.manager_seat_state(config)?;
                 for kind in ["program", "product"] {
-                    let ws: Vec<_> = work.iter().filter(|r| r["kind"] == kind).collect();
+                    let ws: Vec<_> = work
+                        .iter()
+                        .filter(|r| r["kind"] == kind && r["retired"] != true)
+                        .collect();
                     let accepted = ws.iter().filter(|r| r["source_accepted"] == true).count();
                     let integrated = ws.iter().filter(|r| r["integrated"] == true).count();
                     let weight: u64 = ws.iter().map(|r| r["weight"].as_u64().unwrap_or(0)).sum();
@@ -344,6 +349,9 @@ impl Store {
                     for record in self.manager_v2_records(config, kind)? {
                         if q.epic_id.is_none_or(|epic| record.epic_id == Some(epic)) {
                             let mut row = record_row(record);
+                            if kind == "intent" {
+                                summarize_intent_work(&mut row, &work);
+                            }
                             // Keys remain unique across the mixed overview page.
                             row["key"] = json!(format!(
                                 "{kind}:{}",
@@ -648,6 +656,7 @@ impl Store {
                         scope: config.row_version,
                         anchor: config.manager_session_id,
                         section: q.section,
+                        include_history: q.include_history,
                         epic: q.epic_id,
                         revision,
                         graph_stamp: graph_stamp.clone(),
@@ -696,8 +705,10 @@ impl Store {
                 "installation_id":observation.and_then(|o| o.installation_id).map(|id| id.0),
                 "incarnation_id":observation.and_then(|o| o.incarnation_id).map(|id| id.0),
                 "cached_session_count":observation.map_or(0, |o| o.cached_session_count),
+                "diagnostics":crate::store_support::satellite::reachability(peer_id),
                 "health_reported_at":reported.as_ref().map(|r| r.received_at),
                 "health":reported.map(|r| json!({
+                    "platform":r.health.platform,
                     "daemon_version":r.health.daemon_version,
                     "binary_sha256":r.health.binary_sha256,
                     "uptime_seconds":r.health.uptime_seconds,
@@ -710,6 +721,9 @@ impl Store {
                     "started_at":r.health.started_at,
                     "supervisor_mode":r.health.supervisor_mode,
                     "last_deploy":r.health.last_deploy,
+                    "latest_watchdog_trip":r.health.latest_watchdog_trip,
+                    "launches":rsi_common::satellite_manager_policy::launches_summary(&r.health.manager_launches),
+                    "manager_launches":r.health.manager_launches,
                 })),
             }));
         }
@@ -982,7 +996,9 @@ impl Store {
                 && w.integration
                     .as_ref()
                     .is_some_and(|i| Some(&i.source_commit) == w.source_commit.as_ref());
+            let retired = record.archived;
             let mut value = record_row(record);
+            value["retired"] = json!(retired);
             let review = self.manager_review_projection(config, &w)?;
             let db_review = review["mode"] == "db_native";
             value["review"] = review;
@@ -1507,6 +1523,18 @@ impl Store {
             .collect();
         let work_total = work.len();
         let pending_total = work.iter().filter(|w| w["integrated"] != true).count();
+        let pending_jobs: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM agent_jobs WHERE owner_session_id IN (?1,?2)
+                AND state IN ('queued','running')",
+            params![s.id.to_string(), tip.id.to_string()],
+            |r| r.get(0),
+        )?;
+        let pending_landings: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rolling_queue_entries WHERE source_session_id IN (?1,?2)
+                AND state IN ('queued','admitted','gating')",
+            params![s.id.to_string(), tip.id.to_string()],
+            |r| r.get(0),
+        )?;
         let summaries:Vec<_>=work.iter().take(16).map(|w|json!({"key":w["key"],"title":w["title"],"source_commit":w["source_commit"],"source_accepted":w["source_accepted"],"integrated":w["integrated"],"blockers":w["blockers"],"stages":w["stages"].as_array().map(|stages|stages.iter().map(|s|json!({"stage":s["stage"],"state":s["state"]})).collect::<Vec<_>>())})).collect();
         let question = serde_json::to_value(&tip.pending_question)?;
         let question = if serde_json::to_vec(&question)?.len() > 8192 {
@@ -1516,7 +1544,7 @@ impl Store {
         };
         let meaningful = work.iter().filter_map(|w| w["updated_at"].as_str()).max();
         Ok(
-            json!({"type":"worker","key":s.id,"session_id":s.id,"lineage_tip_id":tip.id,"continued_from":s.continued_from,"lineage":lineage,"epic_id":epic,"parent_id":s.parent_id,"title":bounded(tip.title.as_deref().unwrap_or(&tip.query),512),"logical_title":bounded(s.title.as_deref().unwrap_or(&s.query),512),"active_task":tip.active_task.as_deref().map(|s|bounded(s,2048)),"status":tip.status,"stop_reason":tip.stop_reason,"status_updated_at":tip.updated_at,"last_event_at":last_event,"event_sequence":sequence,"last_meaningful_progress_at":meaningful,"pipeline_artifact":tip.pipeline_artifact,"pending_question":question,"branch":tip.sandbox_branch,"sandbox_root":tip.sandbox_root,"custody_id":custody.as_ref().map(|c|c.custody_id),"custody_generation":custody.as_ref().map(|c|c.generation),"base_commit":custody.as_ref().map(|c|&c.source_commit),"custody_state":if custody.is_some(){"verified"}else{"unknown"},"work":summaries,"work_count":work_total,"work_complete":work_total<=16,"pending_work":pending_total}),
+            json!({"type":"worker","key":s.id,"session_id":s.id,"lineage_tip_id":tip.id,"continued_from":s.continued_from,"lineage":lineage,"epic_id":epic,"parent_id":s.parent_id,"title":bounded(tip.title.as_deref().unwrap_or(&tip.query),512),"logical_title":bounded(s.title.as_deref().unwrap_or(&s.query),512),"active_task":tip.active_task.as_deref().map(|s|bounded(s,2048)),"status":tip.status,"stop_reason":tip.stop_reason,"status_updated_at":tip.updated_at,"last_event_at":last_event,"event_sequence":sequence,"last_meaningful_progress_at":meaningful,"pipeline_artifact":tip.pipeline_artifact,"pending_question":question,"branch":tip.sandbox_branch,"sandbox_root":tip.sandbox_root,"custody_id":custody.as_ref().map(|c|c.custody_id),"custody_generation":custody.as_ref().map(|c|c.generation),"base_commit":custody.as_ref().map(|c|&c.source_commit),"custody_state":if custody.is_some(){"verified"}else{"unknown"},"work":summaries,"work_count":work_total,"work_complete":work_total<=16,"pending_work":pending_total,"pending_jobs":pending_jobs,"pending_landings":pending_landings}),
         )
     }
     pub fn manager_v2_request_rows(
@@ -1619,6 +1647,59 @@ impl Store {
         Ok(rows)
     }
 }
+/// Project current Work facts instead of replaying a stale intent snapshot's
+/// unbounded history. Keep the array's entry shape, with an explicit format
+/// marker: it now contains only the newest unfinished versions.
+fn summarize_intent_work(row: &mut Value, work: &[Value]) {
+    let mut counts = ManagerIntentWorkCountsV1::default();
+    let mut unfinished = Vec::new();
+    let epic = row["epic_id"].clone();
+    let mut total = 0;
+    for item in work.iter().filter(|item| item["epic_id"] == epic) {
+        total += 1;
+        if item["retired"] == true {
+            counts.retired += 1;
+        } else if item["integrated"] == true {
+            counts.integrated += 1;
+        } else {
+            if item["source_accepted"] == true {
+                counts.accepted += 1;
+            } else if item["source_commit"].is_string() {
+                counts.partial += 1;
+            } else {
+                counts.pending += 1;
+            }
+            unfinished.push(item);
+        }
+    }
+    unfinished.sort_by(|a, b| {
+        b["updated_at"]
+            .as_str()
+            .cmp(&a["updated_at"].as_str())
+            .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+    });
+    let unfinished_count = unfinished.len();
+    row["work_versions"] = json!(
+        unfinished
+            .into_iter()
+            .take(MANAGER_INTENT_WORK_LIMIT)
+            .map(
+                |item| json!({"key":item["key"],"version":item["row_version"],
+            "source_accepted":item["source_accepted"],"integrated":item["integrated"]})
+            )
+            .collect::<Vec<_>>()
+    );
+    row["work_versions_format"] = json!("work_summary_v1");
+    row["work_versions_count"] = json!(total);
+    row["work_counts"] = json!(counts);
+    row["work_versions_unfinished_count"] = json!(unfinished_count);
+    row["work_versions_limit"] = json!(MANAGER_INTENT_WORK_LIMIT);
+    row["work_versions_truncated"] = json!(unfinished_count > MANAGER_INTENT_WORK_LIMIT);
+    // A query hint starts a fresh, fully scoped pagination; an Overview cursor
+    // cannot be reused by Work. It deliberately includes retained history.
+    row["work_query"] = json!({"section":"work","epic_id":epic,"limit":32});
+}
+
 pub(crate) fn record_row(r: ManagerRecordV2) -> Value {
     let mut v = r.payload;
     v["type"] = json!(r.kind);

@@ -24,6 +24,20 @@
 //! let _ = rsid_store::idea_control::BoundControllerWriteAuthority {};
 //! ```
 
+// A test shard (`--features test-shard-*`) compiles only that shard's tests, so
+// every helper, import and fixture used solely by another shard's tests looks
+// unused by construction. Those two lints are silenced for the shard-mode test
+// unit only; the ordinary lib-test build (the warning-baseline gate) keeps both
+// lints, so a helper no shard uses is still reported there (#2666).
+#![cfg_attr(
+    all(test, feature = "test-shard-mode"),
+    allow(dead_code, unused_imports)
+)]
+// `RuntimeConfig::to_json` is one `serde_json::json!` object literal with one
+// entry per runtime setting; its macro expansion depth grows with the entry
+// count and the default limit (128) was reached by the 2760 setting.
+#![recursion_limit = "256"]
+
 pub mod bedrock;
 pub mod bedrock_setup;
 pub mod bus;

@@ -135,7 +135,7 @@ impl SessionManager {
             let tokens = self.agent_tokens.read().await;
             let mut live_controllers = HashMap::new();
             for session_id in active.keys().copied() {
-                if tokens.token_for_session(session_id).is_some()
+                if tokens.binding_for_session(session_id).is_some()
                     && let Some(grant) = store.controller_grant_v1(session_id)
                     && let Ok(epoch) = u64::try_from(grant.controller_epoch())
                 {
@@ -254,7 +254,7 @@ async fn collect_liveness_snapshots(
 
 /// Signal a session's monitor task to finalize (process is dead or zombie).
 /// Publishes a `SessionReconciled` bus event.
-async fn signal_finalization(
+pub(crate) async fn signal_finalization(
     active: &RwLock<HashMap<Uuid, TrackedSession>>,
     session_id: Uuid,
     event_bus: &EventBus,
@@ -263,6 +263,10 @@ async fn signal_finalization(
     if let Some(tracked) = active_guard.get_mut(&session_id) {
         let old_status = tracked.session.status;
         // Do NOT set interrupt_requested = true: this is a process failure, not user intent.
+        // Record the provider exit as the source so the terminal cause says so (#2514).
+        tracked
+            .interrupt_source
+            .get_or_insert(crate::terminal_cause::InterruptSource::ProviderExit);
         // Signal the monitor loop to exit, which triggers finalize_session().
         let _ = tracked.stop_tx.try_send(());
 
@@ -300,6 +304,18 @@ pub(crate) async fn reconcile_store_consistency(
     // Sessions active in SQLite but not in memory: mark as Failed
     for session_id in store_active_ids.difference(&active_ids) {
         let sid = *session_id;
+        // #2586: a launch holds the per-session spawn guard from before it
+        // persists the `Starting` row until the process is registered in
+        // `active`. A row visible while that guard is held is a spawn in
+        // flight, not a store desync: failing it here kills a topology node
+        // 0.3 s after creation. Skip it; the next pass sees the settled state.
+        // The guard is dropped before any follow-up that may take it itself.
+        let Some(spawn_guard) =
+            crate::store_support::spawn_single_flight::try_acquire_spawn_guard(sid)
+        else {
+            tracing::debug!(session_id = %sid, "Reconciliation: spawn in flight; skipping store-desync check");
+            continue;
+        };
         // A5-P2 TOCTOU guard (review 2026-07-04): `active_ids` was snapshotted at
         // the top of this fn BEFORE `store_active_ids`, and this loop runs
         // PERIODICALLY (not only at boot). A session that finished launching in
@@ -399,6 +415,7 @@ pub(crate) async fn reconcile_store_consistency(
                 ))
             }
         };
+        drop(spawn_guard);
         let Some(staged) = staged else { continue };
         if let Err(e) = staged {
             tracing::error!(
@@ -407,6 +424,15 @@ pub(crate) async fn reconcile_store_consistency(
                 "Reconciliation: failed to update store status"
             );
         } else {
+            // #2462: name the cause where the session's own log shows it, so a
+            // worker failed here is never silent (`terminal_reason` + System event).
+            if let Err(error) = store.lock().await.record_session_failure_cause(
+                sid,
+                "terminal_failure:store-desync",
+                "Session was marked Failed by reconciliation: the store listed it as active but the daemon tracked no running process for it (store-desync)",
+            ) {
+                tracing::warn!(session_id = %sid, %error, "store-desync cause not recorded");
+            }
             // #33: a daemon that died without a graceful drain never ran the
             // finalizer, so the sandbox's uncommitted work was never observed.
             // Record it now so the lead's progress view reports it instead of
@@ -859,6 +885,57 @@ mod tests {
             );
 
             // ...and the row the reap precedes is now Failed.
+            let (status, terminal_reason) = {
+                let row = store
+                    .lock()
+                    .await
+                    .get_session(sid)
+                    .expect("get_session")
+                    .expect("row present");
+                (row.status, row.terminal_reason)
+            };
+            assert_eq!(
+                status,
+                SessionStatus::Failed,
+                "row must be flipped to Failed"
+            );
+            // #2462: the failure names its cause in the row and its own log.
+            assert_eq!(
+                terminal_reason.as_deref(),
+                Some("terminal_failure:store-desync")
+            );
+            let events = store.lock().await.load_events(sid).expect("events");
+            assert!(
+                events.iter().any(|event| {
+                    event.event_type == rsi_common::types::EventType::System
+                        && event.content.contains("store-desync")
+                }),
+                "{events:?}"
+            );
+        }
+
+        /// #2586: a launch persists the `Starting` row while holding the
+        /// per-session spawn guard and registers the process in `active` only
+        /// afterwards. A reconciliation pass in that window must leave the row
+        /// alone; once the launch settles (guard released) the same pass still
+        /// fails a genuine orphan.
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn spawn_in_flight_session_is_not_failed_as_store_desync() {
+            let sid = Uuid::new_v4();
+            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let mut row = active_session_row(sid);
+            row.status = SessionStatus::Starting;
+            store.lock().await.insert_session(&row).expect("insert");
+
+            let spawn_guard =
+                crate::store_support::spawn_single_flight::acquire_spawn_guard(sid).await;
+            let active = RwLock::new(HashMap::new());
+            let event_bus = EventBus::new(16);
+            let mut events = event_bus.subscribe();
+
+            reconcile_store_consistency(&active, &store, &event_bus, None).await;
+
             let status = store
                 .lock()
                 .await
@@ -866,11 +943,20 @@ mod tests {
                 .expect("get_session")
                 .expect("row present")
                 .status;
-            assert_eq!(
-                status,
-                SessionStatus::Failed,
-                "row must be flipped to Failed"
-            );
+            assert_eq!(status, SessionStatus::Starting);
+            assert!(events.try_recv().is_err(), "no reconciliation event");
+
+            // The launch ended without ever registering a process: now a desync.
+            drop(spawn_guard);
+            reconcile_store_consistency(&active, &store, &event_bus, None).await;
+            let status = store
+                .lock()
+                .await
+                .get_session(sid)
+                .expect("get_session")
+                .expect("row present")
+                .status;
+            assert_eq!(status, SessionStatus::Failed);
         }
 
         /// #33: a session orphaned by a daemon that died without draining is
@@ -1112,7 +1198,7 @@ mod tests {
         use crate::idea_control::BoundControllerWriteAuthority;
 
         let temp = tempfile::tempdir()?;
-        let store = Store::open(&temp.path().join("reconciliation.db"))?;
+        let store = Store::open_test_fixture(&temp.path().join("reconciliation.db"))?;
         let session_id = Uuid::new_v4();
         store.install_controller_grant_v1(BoundControllerWriteAuthority::new(
             Uuid::new_v4(),

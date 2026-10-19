@@ -1,0 +1,70 @@
+# XcodeGen spec for the RSI Remote iOS app (hub #2963). XcodeGen is a
+# build-time tool only: `xcodegen generate` (run by scripts/ios/dev-install.sh
+# and scripts/ios/test.sh) writes RSIRemote.xcodeproj, which is not committed.
+# Signing: the operator's free Personal Team id is passed at build time as
+# DEVELOPMENT_TEAM (environment or local config); it is never committed.
+name: RSIRemote
+options:
+  bundleIdPrefix: dev.rsi
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+targets:
+  RSIRemote:
+    type: application
+    platform: iOS
+    sources:
+      - path: RSIRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(RSI_IOS_BUNDLE_ID)
+        RSI_IOS_BUNDLE_ID: dev.rsi.remote
+        PRODUCT_NAME: RSIRemote
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: RSI Remote
+        # The rainbow golden-ratio spiral (RSIRemote/Assets.xcassets/AppIcon.appiconset),
+        # rendered by `swift tools/make-app-icon.swift <out.png> 1024`.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_PREVIEWS: YES
+  RSIRemoteTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: RSIRemoteTests
+      - path: ../contracts/v1/fixtures/corpus.json
+        buildPhase: resources
+      # The v2 contract fixtures, as a folder: Bundle subdirectory "fixtures".
+      - path: ../contracts/v2/fixtures
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: RSIRemote
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(RSI_IOS_BUNDLE_ID).tests
+        RSI_IOS_BUNDLE_ID: dev.rsi.remote
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: $(TEST_HOST)
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/RSIRemote.app/RSIRemote
+schemes:
+  RSIRemote:
+    build:
+      targets:
+        RSIRemote: all
+        RSIRemoteTests: [test]
+    test:
+      targets:
+        - RSIRemoteTests

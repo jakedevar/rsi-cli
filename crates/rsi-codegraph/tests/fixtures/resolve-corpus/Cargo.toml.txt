@@ -1,0 +1,13 @@
+[package]
+name = "rsi-codegraph"
+version = "0.0.0"
+
+[dependencies]
+blake3 = "1"
+serde = "1"
+serde_json = "1"
+uuid = "1"
+
+[[bin]]
+name = "rsi-test-impact"
+path = "src/bin/rsi-test-impact.rs"

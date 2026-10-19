@@ -23,7 +23,7 @@ use rsi_common::global_manager::{
 use rsi_common::harness_manager_v2::{
     ConfigureHarnessManagerPolicyRequestV2, ManagerLaunchChoiceV2,
 };
-use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, Session, SessionStatus, WakeMode};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -152,6 +152,13 @@ pub(crate) fn apply_migration(store: &Store, version: i32) -> Result<()> {
     Ok(())
 }
 // RSI-RELEASED-MIGRATION-END: global-manager-migration
+
+/// #2560: how long a seat handover (succession or rotation) keeps a parent's
+/// terminal watch on the outgoing seat quiet before the watch fires anyway.
+const SEAT_CHANGE_GRACE: chrono::Duration = chrono::Duration::minutes(30);
+/// #118: the most recent displaced appointments of a project whose lineages a
+/// current manager seat may read back (`manager_seat_reads_predecessor`).
+const PREDECESSOR_APPOINTMENTS_MAX: i64 = 32;
 
 /// Most undelivered global-manager messages one grant may hold, across all
 /// recipients. Queued mail follows a PM's rotation at delivery, so a
@@ -412,11 +419,20 @@ impl Store {
                 record.child_policy.clone(),
                 record.max_direct_reports,
             ),
-            _ => (
-                0,
-                None,
-                rsi_common::portfolio_nodes::PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS,
-            ),
+            // #1902: the shim request has no child policy or direct-report
+            // limit, so a new root after a revoke keeps the last revoked
+            // root's over the same coverage instead of the defaults.
+            _ => match rsi_common::portfolio_nodes::prefill_from_revoked_root(
+                &self.list_portfolio_nodes(true)?,
+                &request.project_ids,
+            ) {
+                Some(prefill) => (0, prefill.child_policy, prefill.max_direct_reports),
+                None => (
+                    0,
+                    None,
+                    rsi_common::portfolio_nodes::PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS,
+                ),
+            },
         };
         let saved = self
             .configure_portfolio_node_as_in_tx_confirmed(
@@ -600,7 +616,172 @@ impl Store {
         {
             return Ok(false);
         }
-        Ok(self.global_live_manager(project)? == Some(target))
+        Ok(self.global_live_manager(project)? == Some(target)
+            || self.project_manager_lineage_seat(project, target)?)
+    }
+
+    /// #2560: whether `target` is a past seat of `project`'s manager slot: a
+    /// hop of the appointed manager's succession lineage (same project, same
+    /// parent), whatever its status. Read-only reach uses it so the portfolio
+    /// seat above can still read a retired seat's final message and terminal
+    /// reason; no mutation path consults it.
+    pub(crate) fn project_manager_lineage_seat(&self, project: Uuid, target: Uuid) -> Result<bool> {
+        let Some(config) = self
+            .get_harness_manager(project)?
+            .filter(|config| !config.is_revoked())
+        else {
+            return Ok(false);
+        };
+        Ok(super::harness_manager::manager_lineage_hops_on(
+            &self.conn,
+            config.manager_session_id,
+            project,
+        )
+        .contains(&target))
+    }
+
+    /// #2531: whether `caller` is the live holder of a project manager slot
+    /// and `target` an earlier seat of that same slot (a hop of the appointed
+    /// manager's succession lineage before `caller`, whatever its status).
+    /// A successor reads its predecessor's tail with it. Read-only reach: no
+    /// mutation, watch or mail path consults it, a revoked appointment grants
+    /// nothing, and a later seat, a sibling project or the caller itself is
+    /// never reachable.
+    pub fn manager_seat_reads_predecessor(&self, caller: Uuid, target: Uuid) -> Result<bool> {
+        if caller == target {
+            return Ok(false);
+        }
+        let Some(project) = self.get_session(caller)?.and_then(|s| s.project_id) else {
+            return Ok(false);
+        };
+        let Some(config) = self
+            .get_harness_manager_notice_config(project)?
+            .filter(|config| !config.is_revoked() && config.current_session_id == Some(caller))
+        else {
+            return Ok(false);
+        };
+        let hops = super::harness_manager::manager_lineage_hops_on(
+            &self.conn,
+            config.manager_session_id,
+            project,
+        );
+        let Some(own) = hops.iter().position(|id| *id == caller) else {
+            return Ok(false);
+        };
+        if let Some(earlier) = hops.iter().position(|id| *id == target) {
+            return Ok(earlier < own);
+        }
+        // #118: an explicit reappointment (the operator seats a fresh,
+        // parentless session to pick up from the old manager) starts a new
+        // lineage, so the displaced seat is no hop of it. The appointment
+        // transaction records the displaced anchor in the forward-only,
+        // never-deleted `harness_manager_notice_scope_retirements` (same
+        // project), so the seats of those earlier appointments' lineages are
+        // earlier holders of this slot too. Only that durable record counts;
+        // a prompt, title or launch brief never does.
+        let mut retired = self.conn.prepare(
+            "SELECT manager_session_id FROM harness_manager_notice_scope_retirements
+             WHERE project_id=?1 AND manager_session_id<>?2
+             GROUP BY manager_session_id
+             ORDER BY MAX(retired_at) DESC LIMIT ?3",
+        )?;
+        let anchors = retired
+            .query_map(
+                params![
+                    project.to_string(),
+                    config.manager_session_id.to_string(),
+                    PREDECESSOR_APPOINTMENTS_MAX
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for anchor in anchors {
+            let Ok(anchor) = Uuid::parse_str(&anchor) else {
+                continue;
+            };
+            let hops = super::harness_manager::manager_lineage_hops_on(&self.conn, anchor, project);
+            // A retired lineage that somehow reaches the caller still only
+            // exposes the seats before it.
+            let end = hops
+                .iter()
+                .position(|id| *id == caller)
+                .unwrap_or(hops.len());
+            if hops[..end].contains(&target) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// #1755: a Completed manager turn is interim while a continuation wake
+    /// or live child remains. Failure and interruption still notify the
+    /// portfolio immediately, even if the manager left its watches armed.
+    pub fn portfolio_terminal_watch_pending(&self, session: &Session) -> Result<bool> {
+        if session.status != SessionStatus::Completed {
+            return Ok(false);
+        }
+        // #2560: a seat that is handing itself over (a `succeed_manager` or a
+        // context-cap rotation in flight) is not a slot left empty. The watch
+        // stays quiet; once the handover publishes, the watch follows the
+        // slot to the successor, and a handover that fails or outlives the
+        // grace window lets the watch fire with the seat's own terminal.
+        if self.manager_seat_change_in_flight(session.id, SEAT_CHANGE_GRACE)? {
+            return Ok(true);
+        }
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
+                WHERE wake_session_id=?1 AND enabled=1
+                  AND (wake_mode='resume' OR wake_mode LIKE 'on_terminal:%'
+                       OR json_type(schedule_json,'$.wake_when') IS NOT NULL))
+             OR EXISTS(SELECT 1 FROM sessions s
+                WHERE s.parent_id=?1 AND s.status IN ('Starting','Running','WaitingApproval'))
+             OR EXISTS(SELECT 1 FROM harness_manager_v2_entities e
+                JOIN sessions s ON s.id=e.session_id
+                WHERE e.manager_session_id=?1
+                  AND s.status IN ('Starting','Running','WaitingApproval'))",
+            params![session.id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// #2560: whether `session` is mid-handover to a successor seat: a manager
+    /// succession (`reserved`, `executing` or `established`, not `committed`) or
+    /// a rotation that has entered and not yet completed, refused or been
+    /// suppressed, started within `grace`. A handover older than `grace` is
+    /// stuck, not routine, so the caller stops holding for it.
+    pub fn manager_seat_change_in_flight(
+        &self,
+        session: Uuid,
+        grace: chrono::Duration,
+    ) -> Result<bool> {
+        let cutoff = Utc::now() - grace;
+        let fresh = |stamp: String| {
+            chrono::DateTime::parse_from_rfc3339(&stamp)
+                .is_ok_and(|at| at.with_timezone(&Utc) >= cutoff)
+        };
+        let mut succession = self.conn.prepare(
+            "SELECT updated_at FROM manager_root_successions
+             WHERE predecessor_session_id=?1 AND state IN ('reserved','executing','established')",
+        )?;
+        let stamps = succession
+            .query_map([session.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if stamps.into_iter().any(fresh) {
+            return Ok(true);
+        }
+        let mut rotation = self.conn.prepare(
+            "SELECT e.created_at FROM rotation_events e
+             WHERE e.session_id=?1 AND e.event_type='entered'
+               AND NOT EXISTS(SELECT 1 FROM rotation_events d
+                              WHERE d.session_id=e.session_id AND d.rotation_id=e.rotation_id
+                                AND (d.event_type='completed'
+                                     OR d.event_type='suppressed_final_handoff'
+                                     OR d.event_type LIKE 'refused:%'))",
+        )?;
+        let stamps = rotation
+            .query_map([session.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(stamps.into_iter().any(fresh))
     }
 
     /// The grant and project of a PM reporting up: `caller` must be the
@@ -863,12 +1044,18 @@ impl Store {
     /// (#1238) retire the queued tier mail and open escalation hops at either
     /// end under it.
     pub(super) fn retire_global_grant_messages(&self, grant_id: Uuid, now: &str) -> Result<()> {
+        self.disable_global_grant_messages(grant_id, now)?;
+        self.retire_tier_grant(grant_id, now)
+    }
+
+    /// Disable every pending global-manager message of a replaced grant.
+    pub(super) fn disable_global_grant_messages(&self, grant_id: Uuid, now: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE enabled=1 AND id IN
              (SELECT id FROM global_manager_messages WHERE grant_id=?1)",
             params![grant_id.to_string(), now],
         )?;
-        self.retire_tier_grant(grant_id, now)
+        Ok(())
     }
 
     /// Disable every pending global-manager message to a project's PM seat
@@ -881,6 +1068,18 @@ impl Store {
         )?;
         // #1238: queued tier mail to the seat and its own reports.
         self.retire_tier_project_seat(project_id, now)
+    }
+
+    /// (#2468) A project's PM seat was displaced by another session: pending
+    /// global-manager messages are disabled, tier mail follows the project to
+    /// the new seat.
+    pub(crate) fn rehome_global_project_messages(&self, project_id: Uuid, now: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE enabled=1 AND id IN
+             (SELECT id FROM global_manager_messages WHERE project_id=?1 AND direction='to_manager')",
+            params![project_id.to_string(), now],
+        )?;
+        self.rehome_tier_project_seat(project_id, now)
     }
 
     /// Delivery-time fence for a scheduled job. Non-global jobs pass. A global
@@ -1029,11 +1228,10 @@ impl Store {
         grant: &GlobalManagerGrantV1,
         launch: &ManagerLaunchChoiceV2,
     ) -> Result<()> {
-        let allowed = grant.allowed_launches.iter().any(|choice| {
-            choice.provider == launch.provider
-                && choice.model == launch.model
-                && (choice.effort.is_none() || choice.effort == launch.effort)
-        });
+        let allowed = grant
+            .allowed_launches
+            .iter()
+            .any(|choice| choice.allows(launch));
         if allowed {
             return Ok(());
         }

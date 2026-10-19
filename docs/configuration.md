@@ -50,6 +50,19 @@ set `retry_max_default=N` (`N>0`) rather than `retry_enabled=true` alone — the
 disable zeroes `retry_max_default`, and setting the default back also re-enables
 `retry_enabled`.
 
+### Applying several runtime fields at once
+
+`UpdateDaemonConfig` takes either one field, `{"field": "...", "value": ...}`, or an atomic
+list, `{"updates": [{"field": "...", "value": ...}, ...]}` (at most 128 distinct fields). The
+Settings page applies its staged edits (`w`) as one such list (#2236). The daemon validates
+every value first and refuses the whole request, naming the field, on an invalid value, an
+unknown or repeated field, or an invalid combination (a low target-cache watermark above the
+high one, an `rsid` scope limit set whose `MemoryHigh` is not below its `MemoryMax`). It then
+writes the durable rows in one SQLite transaction, publishes the live values once and runs each
+save side effect (snapshot files, spend-caps file, build CPU slice, dreamer wake) once; a failure
+after the live values moved restores them and the rows. Like the single form it is operator-only:
+it is not an `Agent*` verb and not a native tool.
+
 ## Model Control
 
 ### Codex CLI models and reasoning effort

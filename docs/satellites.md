@@ -108,6 +108,13 @@ the laptop home, installs a systemd user unit and launcher under
 connection metadata in `~/.config/rsi/satellites/NAME-direct.env` with mode
 `0600`. It creates no keys and does not modify SSH configuration.
 
+Both unit templates retry forever with backoff (`StartLimitIntervalSec=0`,
+`RestartSec=20s`, `RestartSteps=6`, `RestartMaxDelaySec=5min`; systemd older than
+254 ignores the last two and keeps the fixed 20s retry). `install-direct.sh`
+refuses to overwrite a differing installed `rsi-satellite-direct@.service` while
+another instance (enabled, drop-in or env file) has no `NAME-direct.env`, since
+it would fail to start; write those env files, or pass `--replace-template`.
+
 The hub service forwards `~/.rsi/satellites/NAME-direct.sock` to the laptop's
 `~/.rsi/daemon.sock`. Its socket directory is owned by the hub user with mode
 `0700`, and the forwarded socket is checked for hub-user ownership and set to
@@ -131,6 +138,63 @@ systemctl --user status rsi-satellite-direct@arch-laptop.service
 journalctl --user -u rsi-satellite-direct@arch-laptop.service
 ~/rsi/scripts/satellite/hub-list.sh
 ```
+
+### Pair a direct satellite with one command (#2944)
+
+After `install-direct.sh` the tunnel is up but the peer is not paired. Pairing is
+operator-only RPCs on two daemons whose inputs depend on each other. The
+operator runs one command on the hub (stdlib Python, drives `rsi-rpc --socket`
+for the hub socket and the tunnel socket; it refuses to start with
+`RSI_SESSION_TOKEN` set, so an agent cannot run it):
+
+```bash
+~/rsi/scripts/satellite/pair-direct.py mac-mini --repo /Users/example/rsi \
+  --project-name Rsi --appoint-manager --manager-provider Claude \
+  --manager-model claude-opus-5-5 --manager-effort high
+```
+
+It reads `~/.config/rsi/satellites/NAME-direct.env`, then in order: reads both
+installation ids (the satellite's through the tunnel, directly); on the hub
+`PutSatellitePeer` (unpaired), `PutSatelliteLink` (`direct_local_forward`, the
+trust reference `ssh ALIAS = user@host with KEY; host key TYPE SHA256:... (known_hosts)`
+computed from `ssh -G` and `ssh-keygen -F`) and `ProbeSatelliteLink`; **it stops
+unless the probed installation id equals the tunnel's**; on the satellite
+`CreateProject` (if no project has that path) and `PutSatelliteInboundPolicy`
+(adds the hub installation and the project, keeps every existing entry), then with
+`--appoint-manager` `LaunchSession` (the brief is the first prompt) and
+`ConfigureHarnessManagerWithPolicy`; finally on the hub the paired peer is
+read-enabled (`--dispatch` also dispatch-enabled) and `PutSatellitePeerScope`
+adds the project. It prints a summary (peer, link, project, manager session,
+registry revision) and, when dispatch was left off, the exact `--dispatch`
+rerun. Enable dispatch only after the hub runs a build that checks the satellite's
+platform before QA placement (#2935).
+
+It is idempotent: rerunning finds the peer by label or installation, the link by
+socket path, the project by path, merges inbound entries instead of replacing
+them, appoints a manager only when the project has none live, and writes nothing
+when everything already holds. `--dry-run` reads and prints every call and changes
+nothing. It refuses (exit 2, nothing written) when the peer is already paired with
+a different installation, the label belongs to another installation, the host key
+fingerprint changed (`--update-trust-reference` accepts it), the repository path is
+missing on the satellite (`--no-repo-check` skips the ssh probe), or a project of
+that name exists at another path.
+
+The seat policy is the Execute preset made conservative for a small host:
+`max_active_sessions` 4 (`--max-active-sessions`), 32 created sessions, no
+topology, git-effect, storage, daemon-setting or deploy capability (the hub
+restarts satellites), and the launch choices from `--allowed-launch
+PROVIDER:MODEL[:EFFORT]` (default: the seat's own). `--manager-policy-file`
+supplies a whole `ManagerPolicyV2` JSON instead. The brief defaults to
+`scripts/satellite/manager-brief.md` (`--manager-brief FILE` overrides;
+`{{SATELLITE_NAME}}`, `{{REPO}}`, `{{PROJECT_NAME}}`, `{{PROJECT_ID}}` and
+`{{HUB_INSTALLATION_ID}}` are filled in). A seat that was launched but not
+appointed (the second call was refused) is appointed by rerunning with
+`--appoint-manager --manager-session <id>`. An appointed seat counts as live only when
+the satellite's `GetSatelliteScopeStatus` reports the project `live` (#2952): an
+archived or otherwise dead seat exits 1 with the recovery (reseat from the hub with
+`AgentReseatSatelliteManager`, or rerun with `--manager-session <live id>`), never
+"already appointed". Tests:
+`python3 -m unittest scripts.tests.test_pair_direct` (stub `rsi-rpc`).
 
 ## Network reachability choices
 
@@ -215,6 +279,64 @@ The hub client must use the same Unix user that owns the hub-side socket. A
 forwarded RSI daemon socket grants full operator control of that daemon,
 including its sessions and data.
 
+The identity health report carries optional `latest_watchdog_trip` evidence:
+restart ID, trip time, last healthy time (RFC3339 UTC with nanoseconds), and the
+closed failed-probe codes `rpc_timeout`, `store_probe_timeout`,
+`scheduler_tick_stale`, `reconciliation_tick_stale`. It comes from the durable
+watchdog record imported at daemon startup, so the hub can read the cause after
+recovery. It contains no log text, paths or credentials. Older peers omit it;
+no record means no known trip. It describes the latest historical trip, not the
+peer's current reachability. The hub keeps the last successful health report
+through an outage in its process-local cache; after a hub restart it must poll
+successfully to recover this evidence. Staged connect/auth/transport/RPC/store
+diagnostics are a separate follow-up to this first protection/reporting slice.
+
+## Full-library QA on the satellite (#2120)
+
+The merge queue's async full `rsid`/`rsid-store` run (`rolling-library-qa`,
+#2092/#2112) goes to a satellite instead of the hub when one qualifies: an
+enabled, paired, read- and dispatch-enabled peer with a declared scope, whose
+latest poll is healthy and under 15 minutes old, and whose live identity
+reports `health.platform.os` equal to the hub's `std::env::consts::OS`,
+advertises the `qa_run` capability and a QA admission that admits. Thus Linux
+hub QA stays on Linux satellites. `GetSatelliteIdentity.health.platform`
+carries `os` and `arch` from `std::env::consts`; architecture is displayed but
+does not restrict placement. A missing platform (including older builds)
+fails closed with `satellite_platform_unknown`; a different OS gives
+`satellite_platform_mismatch`. Peer rows in the TUI, `AgentGetDaemonInfo`
+satellites and QA fallback reasons show the reported platform (or `unknown`).
+Manager satellite inspection rows also include `health.platform`.
+The satellite computes that admission from the same gates the
+run's job meets: its build governor's disk floor (`min_free_disk_gb`,
+default 30 GiB, never below 20 GiB) and its load, memory and slot gates, its
+host-load admission, and no other full-library job running; it reports it on
+its health and rechecks it when the run starts, so it never accepts a run that
+would only time out in build admission. The hub sends the exact published SHA with
+`RequestHubQaRun` (operator-only wire method, allowlisted hub installation
+only) and polls it about once a minute; the satellite's exit code, failing
+tests and job log come back into the hub's queue receipts and `qa` Issue.
+
+On the satellite the run is an ordinary durable recipe job owned by the live
+declared scope seat, checked out from that seat's working directory (fetching
+`origin/rolling` once when the commit is missing) into
+`~/.rsi/jobs/rolling-library-qa/hub-<run>/source`. Every run reuses the one
+registered cargo target for that directory, and the previous hub snapshot is
+removed when the next run starts. The satellite refuses a run while another
+full-library job is queued or running, while its own host-load admission holds,
+or below the disk floor; a deploy drain records it `queued` until the restart.
+A listed refusal (the satellite raises it before it records a run), or no
+qualifying peer, makes the hub run it itself and record `ran_on: hub` with the
+reason. When the start was sent but its reply was lost, or the satellite
+answered with an error that does not prove it started nothing (for example a
+launch error whose job stayed running, #2156), the run may already be going on
+the satellite, so it stays bound to that satellite and run id: the hub starts
+nothing itself, offers it to no other satellite, and each poll replays the same
+idempotent start (without a fresh-placement admission check) until the
+satellite reports the run. The hub records the peer, run id and commit before
+it sends a start, so a hub that stops after the satellite accepted it binds
+that same run on the next pass instead of starting a second copy (#2155). A satellite run that stays unreachable for 240 minutes after
+dispatch settles as incomplete coverage.
+
 ## Satellite reports to the hub manager (#1103)
 
 The satellite's appointed manager (when it is also the declared seat or its
@@ -229,18 +351,203 @@ informational satellite report. It carries no authority and the wake text never
 includes the satellite's words; the hub still verifies every SHA it acts on.
 
 Bounds: 1024 bytes of text, 32 queued reports per satellite, 8 per pull, and 12
-recorded per peer per 5 minutes (enforced on the hub; excess is refused and
-dropped). The hub needs exactly one harness manager project, an enabled, paired,
-read- and dispatch-enabled peer, and a declared peer scope. Delivery is at most
-once: the satellite queue is in memory, so a satellite restart loses unsent
-reports. A replayed report never creates a second notice or wake: the dedup key
-is the peer plus the report id, looked up across every notice job, so it holds
-across manager re-scoping, re-appointment and retrieval. Notices are immutable
-and never deleted, so the hub keeps at most 2048 report notices per peer; at
-that cap new reports stay on the satellite (its 32-slot outbox then refuses
-more) while already-seen ids still dedupe. A revoked manager scope or policy
-ends the right to report, and reports fetched from an installation that is no
-longer the peer's pin by the time they are ingested are dropped, not recorded.
+recorded per peer per 5 minutes (enforced on the hub; a report over the limit is
+held on the satellite and retried, not dropped). The hub needs an enabled,
+paired, read- and dispatch-enabled peer and a declared peer scope.
+
+**Routing (#2242).** A report names no hub session. The hub routes it by project
+to the project's current manager: the only project with a manager, or (when the
+hub runs several) the project of the session that most recently wrote to this
+peer among the projects whose manager is live; several live managers with no
+dispatcher is `ambiguous_manager_project`, not a guess. The notice is recorded
+for the manager seat of that moment. The report is acknowledged once recorded,
+but a re-appointment retires the old scope's unretrieved notices (#1310), so
+every pull round the hub re-homes the project's retired, never-retrieved reports
+onto the current manager (same report id, original timestamp, a `carried_over`
+mark naming the old seat) and arms its wake like a new report. Nothing is
+re-homed while no live manager exists; it moves when one is appointed. Before
+this, a land request recorded for a replaced seat was lost for good (61 of 131
+reports in two weeks).
+
+**Delivery state (#2242).** `AgentReportToHub` answers `queued` (acceptance, not
+delivery). The reporting seat reads each report's fate in `AgentGetDaemonInfo`
+`hub_reports`: `queued` (the hub has not pulled it), `fetched`, `held` (the hub
+pulled it and cannot record it yet; `reason` is `no_manager_project_for_peer`,
+`manager_unavailable`, `ambiguous_manager_project`, `rate_limited`,
+`retention_cap` or `record_failed`), `delivered` (recorded as a notice for the
+current manager), `refused` (permanent, with the hub's class) and the typed
+failure `undelivered` (nothing happened for 180 s: `hub_not_pulling` or
+`hub_not_acknowledging`). The hub sends its `held` and `refused` verdicts on the
+next pull only to a satellite whose identity advertises `report_outcomes`; an
+older satellite sees acknowledgements only (a refused report then reads as
+delivered). While the hub has not pulled for 180 s with a report waiting,
+`AgentReportToHub` refuses `satellite_report_hub_unreachable` instead of
+promising delivery; keep the report in the manager's own outbox note and retry
+after `hub_pulling` is true again. At 32 unacknowledged reports it refuses
+`satellite_report_queue_full` and the message says what is stuck (#135): `depth`, the
+oldest pending report's `oldest_queued_at` and `oldest_age_secs`, `pending_by_kind`
+(result, enqueue, deploy_ready) and `last_hub_pull_at`; `hub_reports.backlog` carries
+the same numbers at any time. Wait for the hub to acknowledge, fold further results
+into one RESULT line, and never re-send an ENQUEUE or DEPLOY-READY that is pending.
+
+Delivery is at most once: the satellite queue and this state are in memory, so a
+satellite restart loses unsent reports and forgets the states. A replayed report
+never creates a second notice or wake: the dedup key is the peer plus the report
+id, looked up across every notice job, so it holds across manager re-scoping,
+re-appointment, re-homing and retrieval. Notices are immutable and never
+deleted, so the hub keeps at most 2048 report notices per peer (a re-homed copy
+counts); at that cap new reports stay on the satellite (its 32-slot outbox then
+refuses more) while already-seen ids still dedupe. A revoked manager scope or
+policy ends the right to report, and reports fetched from an installation that
+is no longer the peer's pin by the time they are ingested are dropped, not
+recorded.
+
+## Deploying a build to a satellite (#171)
+
+The satellite never restarts its own rsid. It builds and stages with
+`scripts/install-release.sh --stage-dir ~/.rsi/staging/bin-<sha>` and reports
+`deploy_ready`; the hub restarts it with `AgentRequestDeploy {sha, binaries_dir,
+peer_id}`; the satellite then verifies `AgentGetDaemonInfo` `hub.build_sha` and
+`hub.last_deploy.state` and reports the result. Only the operator can change that
+route, and manager mail never overrides a standing operator restriction (a
+conflict is surfaced, not followed). The step-by-step is in
+`.claude/skills/rsi-project-manager/SKILL.md` ("Satellite (arch-laptop)").
+
+### Starting a satellite daemon that is down (#2820)
+
+After a reboot of a satellite with no enabled `rsid.service`, no daemon runs,
+and the runtime-only `rsi-workers.slice` limits are gone (rsid then refuses every
+worker launch with `rsi-workers.slice is missing or its aggregate limits differ
+from settings`). Over ssh, run the one documented fallback:
+
+```
+~/rsi/scripts/rsid-start-satellite
+```
+
+It starts the **deployed** `~/.rsi/install/rsid` under
+`~/.rsi/install/rsid-supervisor.sh` behind the socket holder, in a detached
+collected systemd user unit (it survives the ssh session), after applying the
+`~/.rsi/rsid-scope.env` limits to `rsi-workers.slice` and persisting them. It
+waits for `GetHealthStatus`, exits nonzero with no daemon started otherwise, and
+leaves a running daemon alone. It never builds. When `rsid.service` is installed
+it starts that unit instead. Enabling the managed service is the durable fix.
+On macOS it loads the launchd agent instead (next section).
+
+## macOS satellites (#2936)
+
+A Mac (the `mac-mini` satellite) runs the same `rsid` as a Linux satellite. Two
+things differ: how the hub reaches it and what keeps its daemon running.
+
+**Reaching it: direct mode only.** The dial-home installer and its forward are
+systemd user units, so a Mac uses the hub-initiated direct tunnel ("Direct: hub
+initiates SSH" above): `install-direct.sh mac-mini mac-mini` on the hub forwards
+`~/.rsi/satellites/mac-mini-direct.sock` to the Mac's `~/.rsi/daemon.sock`. The
+Mac needs Remote Login (sshd) on and the hub's key authorized. A non-interactive
+ssh session there has PATH `/usr/bin:/bin:/usr/sbin:/sbin`, so call tools by
+absolute path or through `zsh -lc '...'` (rustup's `cargo` lives in
+`/opt/homebrew/opt/rustup/bin`, which a login shell may still lack).
+
+**Keeping it running: the launchd user agent `dev.rsi.rsid`.**
+`scripts/install-release.sh` (so `make release-install`) and
+`scripts/rsid-start-satellite` render `scripts/launchd/dev.rsi.rsid.plist.in`
+into `~/Library/LaunchAgents/dev.rsi.rsid.plist` and run the daemon through it,
+never as a detached process:
+
+- The job runs the same chain as Linux: `~/.rsi/install/rsi-socket-hold
+  ~/.rsi/daemon.sock -- ~/.rsi/install/rsid-supervisor.sh ~/.rsi/install/rsid`.
+  `RunAtLoad` starts it at login; `KeepAlive` restarts the chain whenever the
+  holder exits (launchd waits `ThrottleInterval`, 10 s, after a run shorter than
+  that). Output goes to `~/.rsi/daemon.log` (created `0600`); `Umask` is `077`;
+  `ExitTimeOut` (3700 s) outlasts the supervisor's largest shutdown grace, like
+  `TimeoutStopSec` in `rsid.service`; the open-file soft limit is 8192 (launchd's
+  default is 256).
+- The environment is only `HOME`, `PATH`, `LANG` and the socket path. Provider
+  keys stay in `~/.rsi/.env`; nothing secret is written into the plist. launchd
+  gives a job only the system PATH, so the installer writes one: `~/.local/bin`,
+  `~/.cargo/bin`, the newest `~/.nvm/versions/node/*/bin`, `~/.bun/bin`,
+  `/opt/homebrew/opt/rustup/bin`, `/opt/homebrew/bin`, `/opt/homebrew/sbin` and
+  `/usr/local/bin` where they exist, then the installing shell's own lasting
+  entries (temporary and sandbox directories are dropped), then the system
+  directories. `RSI_LAUNCHD_PATH=<path>` replaces it. `GetHealthStatus`
+  `provider_clis_missing` shows a CLI the PATH still misses.
+- Every live install refreshes the plist. A restart that is not a quiet one
+  (`make release-install NOW=1`, a daemon that is down, or one the daemon says is
+  unsupervised) boots the loaded job out, stops any rsid started outside launchd
+  (an older detached chain), loads the job again (`launchctl bootstrap
+  gui/$UID`) and waits for a `GetHealthStatus` answered from inside the job's
+  process tree. A quiet restart keeps the running job: the daemon swaps the
+  binaries and exits 75, and the supervisor relaunches rsid inside the same job;
+  a changed plist then takes effect at the next load. A quiet restart takes a
+  `binaries_dir` only under `~/.rsi/staging`, `~/.rsi/sandboxes` or
+  `~/.cargo/shared-target`, so from a checkout whose target is `~/rsi/target` it
+  is refused `deploy_dir_not_allowed`: use `NOW=1`, or stage
+  (`install-release.sh --stage-dir ~/.rsi/staging/<name>`) and deploy that.
+- `scripts/rsid-start-satellite` on a Mac refreshes the plist and loads the job,
+  or `launchctl kickstart`s a loaded job with no process, then waits for health.
+- `RSI_LAUNCHD_AGENT=0` keeps the old detached holder chain (no plist, nothing
+  survives a reboot); `rsid-start-satellite` then refuses.
+
+Operate it with:
+
+```bash
+launchctl print gui/$(id -u)/dev.rsi.rsid      # state, pid, runs, last exit code
+launchctl kickstart -k gui/$(id -u)/dev.rsi.rsid  # restart the chain now
+launchctl bootout gui/$(id -u)/dev.rsi.rsid    # stop it (KeepAlive restarts any other exit)
+tail -f ~/.rsi/daemon.log
+```
+
+What restarts what (verified on the Mac mini, 2026-10-18): rsid crashing or
+killed ends the supervisor (a non-75 exit outside a deploy), the holder exits
+with it and launchd restarts the chain at once. A killed holder makes launchd
+send SIGTERM to the rest of the job's process group; the supervisor forwards it
+and rsid shuts down gracefully before the restart. If the holder and the
+supervisor are both SIGKILLed, rsid (its own process group) notices its parent
+is gone within 2 s and shuts itself down (`rsid-supervisor.sh exited while rsid
+runs`), so launchd's next holder finds the socket stale instead of crashlooping
+on a live one.
+
+Notes:
+
+- rsid reads its parent's argv with `sysctl` `KERN_PROCARGS2` (macOS has no
+  `/proc`), so a launchd satellite reports `supervisor_mode:
+  rsid-supervisor.sh` and accepts deploys. A build without it refuses every
+  deploy `deploy_needs_supervisor`.
+- The supervisor runs under macOS `/bin/bash` 3.2 unless a newer bash comes
+  first on the agent's PATH (`brew install bash` puts one in
+  `/opt/homebrew/bin`). It is 3.2-safe (no empty-array expansion under
+  `set -u`, which ended it at the first daemon exit); without `wait -n` it notices
+  a daemon exit up to one poll (1 s) late.
+- The hub-driven deploy (#171, "Deploying a build to a satellite" above) works
+  unchanged: the Mac stages with `--stage-dir ~/.rsi/staging/bin-<sha>`, the hub
+  calls `AgentRequestDeploy {peer_id}`, and rsid comes back inside the same
+  launchd job.
+
+**Operator-only steps** (they need an admin password or the console, so agents
+cannot do them):
+
+1. Restart after a power loss and never sleep: `sudo pmset -a autorestart 1`
+   and `sudo pmset -a sleep 0` (System Settings > Energy: "Start up
+   automatically after a power failure", "Prevent automatic sleeping when the
+   display is off"). `sudo pmset -a womp 1` keeps wake-on-network.
+2. After a reboot the agent starts only once the user is logged in (it is a gui
+   user agent). FileVault is on, so automatic login is unavailable: someone
+   unlocks the disk at the console, which logs that user in and starts the
+   agent. For a planned reboot, `sudo fdesetup authrestart` skips that unlock
+   once.
+3. Provider logins on the Mac itself: `claude` (`/login`) and `codex login`, as
+   the same user; `GetHealthStatus` `provider_logins` shows the result.
+4. Remote Login on, with the hub's dedicated key authorized (above).
+
+## Python verification in satellite briefs (#221)
+
+A brief that delegates Python-only work to a satellite names the stdlib runner,
+`python3 -m unittest -v <file>`, the one both hosts and the lander have. It never
+requires `pytest`: neither the hub nor the laptop installs it. A host that lacks
+a planned runner reports the typed `runner_unavailable` (the runner, zero executed
+tests, a red job) in the `scoped_test` receipt's `python` entries instead of a
+generic exit 1, and no other runner is substituted. Treat it as a missing
+prerequisite to report, not a test result. Detail: `docs/agents/worker-contract.md`
+("Python verification").
 
 ## Remove
 
@@ -276,6 +583,14 @@ instances use them:
 rm "$HOME/.config/systemd/user/rsi-satellite@.service"
 rm "$HOME/.local/libexec/rsi-satellite/dial-home.sh"
 systemctl --user daemon-reload
+```
+
+On a Mac, unload the launchd agent and remove its plist (the next
+`make release-install` would install it again):
+
+```bash
+launchctl bootout gui/$(id -u)/dev.rsi.rsid
+rm "$HOME/Library/LaunchAgents/dev.rsi.rsid.plist"
 ```
 
 If a stale hub socket remains after removing an instance, remove that

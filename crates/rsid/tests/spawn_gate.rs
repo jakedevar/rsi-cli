@@ -85,6 +85,7 @@ fn cfg(kind: SessionKind) -> LaunchConfig {
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     }
 }
 

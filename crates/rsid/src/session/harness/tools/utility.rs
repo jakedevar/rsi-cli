@@ -186,11 +186,15 @@ impl HarnessTool for ContextStatusTool {
 
 pub(crate) struct CompactTool {
     state: Arc<UtilityToolState>,
+    store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
 }
 
 impl CompactTool {
-    pub(crate) fn new(state: Arc<UtilityToolState>) -> Self {
-        Self { state }
+    pub(crate) fn new(
+        state: Arc<UtilityToolState>,
+        store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+    ) -> Self {
+        Self { state, store }
     }
 }
 
@@ -225,6 +229,23 @@ impl HarnessTool for CompactTool {
             return error("compact focus must be nonempty");
         }
 
+        if parsed.fresh_window
+            && let (Some(store), Some(session_id)) = (&self.store, context.session_id)
+            && let Err(refusal) = store
+                .lock()
+                .await
+                .ensure_rotation_not_blocked_on_transferred_custody(session_id)
+        {
+            return match refusal {
+                crate::error::DaemonError::StructuredRpc {
+                    mut data, message, ..
+                } => {
+                    data["message"] = json!(message);
+                    error(data.to_string())
+                }
+                other => error(other.to_string()),
+            };
+        }
         self.state.set_compaction_focus(parsed.focus.clone()).await;
         if parsed.fresh_window
             && let Some(sink) = &context.event_sink
@@ -264,7 +285,7 @@ mod tests {
         registry.utility_state = Arc::clone(&state);
         registry.register(Arc::new(UpdatePlanTool));
         registry.register(Arc::new(ContextStatusTool::new(Arc::clone(&state))));
-        registry.register(Arc::new(CompactTool::new(state)));
+        registry.register(Arc::new(CompactTool::new(state, None)));
         registry
     }
 

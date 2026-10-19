@@ -17,7 +17,6 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 /// Tauri event carrying a [`LiveEvent`].
 pub const EVENT_NAME: &str = "daemon-event";
@@ -227,12 +226,13 @@ fn subscribe_request() -> Vec<u8> {
 /// One connect + subscribe + stream cycle. Emits `Link(true)` after the ack
 /// and an `Event` per valid line; returns when the stream ends.
 pub async fn stream_once<F: Fn(LiveMsg) + Sync>(socket: &Path, emit: &F) -> StreamEnd {
-    let stream = match tokio::time::timeout(CONNECT_DEADLINE, UnixStream::connect(socket)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return StreamEnd::Failed(format!("connect: {e}")),
-        Err(_) => return StreamEnd::Failed("connect timed out".into()),
-    };
-    let (read, mut write) = stream.into_split();
+    let stream =
+        match tokio::time::timeout(CONNECT_DEADLINE, crate::daemon::connect_socket(socket)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return StreamEnd::Failed(format!("connect: {e}")),
+            Err(_) => return StreamEnd::Failed("connect timed out".into()),
+        };
+    let (read, mut write) = tokio::io::split(stream);
     if let Err(e) = write.write_all(&subscribe_request()).await {
         return StreamEnd::Failed(format!("subscribe write: {e}"));
     }
@@ -302,12 +302,16 @@ pub async fn run<F: Fn(LiveMsg) + Send + Sync>(socket: PathBuf, emit: F, mut bac
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     const SID: &str = "e2cae1d4-1833-48eb-a7e8-6f1dd480fdae";
 
+    #[cfg(unix)]
     fn collector() -> (Arc<Mutex<Vec<LiveMsg>>>, impl Fn(LiveMsg)) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = Arc::clone(&seen);
@@ -386,6 +390,7 @@ mod tests {
         assert_eq!(read_bounded_line(&mut r, 32).await.unwrap(), Line::Eof);
     }
 
+    #[cfg(unix)]
     /// Accept one connection, check the Subscribe request, ack, push lines.
     async fn serve_once(listener: &UnixListener, push: &[u8], expect_filter: bool) {
         let (stream, _) = listener.accept().await.unwrap();
@@ -411,6 +416,7 @@ mod tests {
         w.flush().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn streams_events_after_ack_then_reports_loss() {
         let dir = tempfile::tempdir().unwrap();
@@ -444,6 +450,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refused_subscribe_is_failure_without_link_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -466,6 +473,7 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_reconnects_and_reports_link_transitions() {
         let dir = tempfile::tempdir().unwrap();

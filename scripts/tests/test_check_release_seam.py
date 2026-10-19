@@ -31,7 +31,13 @@ class CheckReleaseSeamTest(unittest.TestCase):
             result = self.run_check(f"rsid-store v0.1.0 (/x/crates/rsid-store) {features}\nrsid v0.1.0 (/x)\n")
             self.assertEqual(result.returncode, 1, features)
             self.assertIn("rsid-store", result.stderr)
-            self.assertIn("test-seam is enabled in the release dependency graph", result.stderr)
+            self.assertIn("is enabled in the release dependency graph", result.stderr)
+
+    def test_the_e2e_seed_feature_on_a_normal_edge_is_refused_and_named(self):
+        for features in ("e2e-seed", "foo,e2e-seed", "e2e-seed,bar"):
+            result = self.run_check(f"rsid v0.1.0 (/x/crates/rsid) {features}\n")
+            self.assertEqual(result.returncode, 1, features)
+            self.assertIn("e2e-seed", result.stderr)
 
     def test_a_similarly_named_feature_is_not_the_seam(self):
         result = self.run_check("rsid-store v0.1.0 (/x) test-seamless,not-test-seam\n")

@@ -70,8 +70,9 @@ pub enum FrictionKind {
     /// (`AgentRequestDeploy {interrupt_workers: true}`):
     /// `deploy_interrupt:<blocker>`, one event per interrupted worker session.
     DeployInterrupt,
-    /// A session ended Failed for a structural terminal reason:
-    /// `terminal:<stop_reason>`.
+    /// A session ended for a structural terminal reason:
+    /// `terminal:<stop_reason>` (Failed), or `terminal:manager_question_stall`
+    /// (#1861: a manager seat ended its turn asking a question in chat).
     Terminal,
     /// The merge queue refused or failed a landing: `lander:<state>:<code>`.
     Lander,
@@ -83,6 +84,15 @@ pub enum FrictionKind {
     RunawayProcess,
     /// One sandbox Cargo cache was staged for reclamation.
     SandboxTargetReclaim,
+    /// #2384: a cold-archive pass, verification, read, restore or compaction
+    /// failed: `cold_archive:<code>`.
+    ColdArchive,
+    /// #2561: the supervisor ended a daemon shutdown that did not finish in
+    /// its grace period: `forced_shutdown:<trigger>`.
+    ForcedShutdown,
+    /// #2603: one helper-LLM purpose (title, description, memory, dream, ...)
+    /// failed many calls in a row: `helper_llm:<purpose>:<cause>`.
+    HelperLlm,
 }
 
 impl FrictionKind {
@@ -99,6 +109,9 @@ impl FrictionKind {
             Self::AgentJob => "agent_job",
             Self::RunawayProcess => "runaway_process",
             Self::SandboxTargetReclaim => "sandbox_target_reclaim",
+            Self::ColdArchive => "cold_archive",
+            Self::ForcedShutdown => "forced_shutdown",
+            Self::HelperLlm => "helper_llm",
         }
     }
 }

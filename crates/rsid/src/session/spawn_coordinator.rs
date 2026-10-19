@@ -117,11 +117,13 @@ pub enum SpawnRejectReason {
         effort: String,
         valid: &'static [&'static str],
     },
-    /// The emitter runs under a Harness tool policy (#792), which a spawned
+    /// The emitter runs under a tool policy (#792, #2758), which a spawned
     /// child inherits unchanged. A child on a provider that cannot enforce it
-    /// would escape the policy, so the spawn is refused.
+    /// would escape the policy, so the spawn is refused with the typed
+    /// `tool_policy_unsupported_for_provider:<what>` in `refusal`.
     ToolPolicyProviderUnsupported {
         provider: rsi_common::types::SessionProvider,
+        refusal: String,
     },
     /// The child's model is not on the operator launch-model allowlist
     /// (issue #692). Refused synchronously, before any spawn request, session
@@ -214,11 +216,10 @@ impl std::fmt::Display for SpawnRejectReason {
                 rsi_common::launch_allowlist::launch_model_refusal(allowed, Some(model))
             ),
             Self::ProviderProfileRefused { message } => write!(f, "{message}"),
-            Self::ToolPolicyProviderUnsupported { provider } => write!(
+            Self::ToolPolicyProviderUnsupported { provider, refusal } => write!(
                 f,
-                "{}: the emitter runs under a Harness tool policy that a {provider:?} child \
-                 cannot enforce",
-                rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_PROVIDER
+                "{refusal}: the emitter runs under a tool policy that a {provider:?} child \
+                 cannot enforce"
             ),
         }
     }
@@ -1016,11 +1017,15 @@ impl SpawnCoordinator {
             },
         );
         if emitter_under_policy
-            && !rsi_common::harness_tool_policy::provider_runs_harness_loop(child_provider)
+            && let Some(refusal) = rsi_common::harness_tool_policy::provider_policy_refusal(
+                child_provider,
+                inherited_tool_policy.as_ref(),
+            )
         {
             return SpawnState::Rejected {
                 reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
                     provider: child_provider,
+                    refusal,
                 },
             };
         }
@@ -1342,6 +1347,7 @@ impl SpawnCoordinator {
             topology_node_id: bound_node_id,
             topology_iteration: bound_iteration,
             closure_selector: None,
+            structured_handoff: false,
         };
 
         let req = SpawnRequest {
@@ -1585,7 +1591,7 @@ mod tests {
     fn open_store() -> (Arc<tokio::sync::Mutex<Store>>, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("rsi.db");
-        let store = Store::open(&path).expect("open store");
+        let store = Store::open_test_fixture(&path).expect("open store");
         (Arc::new(tokio::sync::Mutex::new(store)), dir)
     }
 
@@ -1983,11 +1989,77 @@ mod tests {
             state,
             SpawnState::Rejected {
                 reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
-                    provider: SessionProvider::Claude
+                    provider: SessionProvider::Claude,
+                    ..
                 }
             }
         ));
         assert!(rx.try_recv().is_err(), "no spawn request for the escape");
+    }
+
+    /// #2758: a read-only Claude emitter's children inherit the policy and stay
+    /// on a CLI that enforces it; a Harness or Local child would escape it and is
+    /// refused with the typed code.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn a_read_only_emitters_child_inherits_it_and_cannot_leave_an_enforcing_cli() {
+        use rsi_common::harness_tool_policy::{CliAccessMode, HarnessToolPolicy};
+        let (store, _td) = open_store();
+        let (tx, mut rx) = mpsc::channel(8);
+        let coord = SpawnCoordinator::new(tx);
+        let epic_id = Uuid::new_v4();
+        let emitter_id = Uuid::new_v4();
+        insert(
+            &store,
+            &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+        )
+        .await;
+        let mut emitter = mk_session(emitter_id, SessionKind::Task, Some(epic_id), None);
+        emitter.provider = SessionProvider::Claude;
+        insert(&store, &emitter).await;
+        seed_root_invocation(&store, emitter_id, "premium", "high").await;
+        let policy = HarnessToolPolicy {
+            cli_access: Some(CliAccessMode::ReadOnly),
+            ..HarnessToolPolicy::default()
+        };
+        store
+            .lock()
+            .await
+            .insert_session_tool_policy(emitter_id, &policy, chrono::Utc::now())
+            .unwrap();
+
+        let state =
+            handle_for_test(&coord, emitter_id, 81, directive(SessionKind::Task), &store).await;
+        assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+        assert_eq!(
+            rx.try_recv().expect("spawn request").config.tool_policy,
+            Some(policy)
+        );
+
+        for (hash, provider, what) in [
+            (
+                82,
+                SessionProvider::Local,
+                "tool_policy_unsupported_for_provider:local",
+            ),
+            (
+                83,
+                SessionProvider::Harness,
+                "tool_policy_unsupported_for_provider:harness:cli_access",
+            ),
+        ] {
+            let mut escape = directive(SessionKind::Task);
+            escape.provider = Some(provider);
+            let state = handle_for_test(&coord, emitter_id, hash, escape, &store).await;
+            let SpawnState::Rejected {
+                reason: SpawnRejectReason::ToolPolicyProviderUnsupported { refusal, .. },
+            } = state
+            else {
+                panic!("{provider:?}: expected a tool-policy refusal, got {state:?}");
+            };
+            assert_eq!(refusal, what);
+        }
+        assert!(rx.try_recv().is_err(), "no spawn request for an escape");
     }
 
     /// A Harness emitter with NO stored row but restricted by the daemon-wide
@@ -2045,7 +2117,8 @@ mod tests {
                     state,
                     SpawnState::Rejected {
                         reason: SpawnRejectReason::ToolPolicyProviderUnsupported {
-                            provider: SessionProvider::Claude
+                            provider: SessionProvider::Claude,
+                            ..
                         }
                     }
                 ));
@@ -3065,20 +3138,6 @@ worker prompt body\n\
             to: to.to_string(),
             loop_edge: false,
         }
-    }
-
-    async fn handle_with_maps(
-        coord: &SpawnCoordinator,
-        emitter_id: Uuid,
-        block_hash: u64,
-        directive: SpawnDirective,
-        active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-        completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
-    ) -> SpawnState {
-        coord
-            .handle(emitter_id, block_hash, directive, active, completed, store)
-            .await
     }
 
     /// Setup: epic + lead in store, epic has workflow_id = topology_id.

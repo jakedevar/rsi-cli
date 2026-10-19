@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use rsi_codegraph::{
     CodegraphError, CodegraphStore, ExtractionContract, ExtractionMode, ExtractorIdentity,
     PublishFault, ReadySnapshot, SourceVersion, StagedExtraction,
+    cargo_metadata::CargoWorkspace,
     invalidate::ExtractionCache,
-    lifecycle::{IndexLifecyclePhase, IndexRunMetrics},
+    lifecycle::{IndexLifecyclePhase, IndexPartialReason, IndexRunMetrics},
 };
 
 use super::{IndexError, RegisteredWorkspace, Result, discovery, retention};
@@ -32,6 +33,43 @@ pub struct WorkerState {
     before_publish_commit: Option<Box<dyn FnMut() + Send>>,
 }
 
+/// #2464: the inputs of a workspace's last publication, which are all a pass
+/// needs to recognise an unchanged workspace and confirm its ready head
+/// instead of extracting and publishing an identical generation. A few
+/// hundred bytes, so the manager keeps them for every workspace when it drops
+/// the ~340 MB extraction caches (one resident at a time).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishedDigests {
+    source: Option<String>,
+    config: Option<String>,
+    cargo_metadata: Option<String>,
+}
+
+impl WorkerState {
+    /// The digests of this state's last publication.
+    #[must_use]
+    pub fn published_digests(&self) -> PublishedDigests {
+        PublishedDigests {
+            source: self.last_source_digest.clone(),
+            config: self.last_config_digest.clone(),
+            cargo_metadata: self.last_cargo_metadata_digest.clone(),
+        }
+    }
+
+    /// A state with no extraction cache that still knows its workspace's last
+    /// publication: an unchanged workspace confirms its head, a changed one
+    /// extracts in full exactly as a fresh state would.
+    #[must_use]
+    pub fn from_published_digests(digests: PublishedDigests) -> Self {
+        Self {
+            last_source_digest: digests.source,
+            last_config_digest: digests.config,
+            last_cargo_metadata_digest: digests.cargo_metadata,
+            ..Self::default()
+        }
+    }
+}
+
 pub struct RunOutcome {
     pub ready: ReadySnapshot,
     pub files_discovered: usize,
@@ -42,6 +80,73 @@ pub struct RunOutcome {
     pub changed_paths: usize,
     pub staged_files: usize,
     pub published: bool,
+    pub skipped_symlinks: usize,
+    pub partial_reasons: Vec<IndexPartialReason>,
+}
+
+/// Cargo facts for one run. A workspace whose locked dependencies cannot be
+/// resolved offline degrades to its packages and targets, then to no Cargo
+/// facts, and says so instead of failing the whole index.
+struct CargoRead {
+    workspace: Option<CargoWorkspace>,
+    partial: Option<IndexPartialReason>,
+}
+
+impl CargoRead {
+    fn read(root: &Path) -> Self {
+        if !root.join("Cargo.toml").is_file() {
+            return Self {
+                workspace: None,
+                partial: None,
+            };
+        }
+        let resolved_error = match rsi_codegraph::cargo_metadata::read_workspace(root) {
+            Ok(workspace) => {
+                return Self {
+                    workspace: Some(workspace),
+                    partial: None,
+                };
+            }
+            Err(error) => error,
+        };
+        match rsi_codegraph::cargo_metadata::read_workspace_no_deps(root) {
+            Ok(workspace) => {
+                tracing::debug!(%resolved_error, "cargo metadata unresolved; indexing workspace packages only");
+                Self {
+                    workspace: Some(workspace),
+                    partial: Some(IndexPartialReason::CargoMetadataNoDeps),
+                }
+            }
+            Err(no_deps_error) => {
+                tracing::debug!(%resolved_error, %no_deps_error, "cargo metadata unavailable; indexing without Cargo facts");
+                Self {
+                    workspace: None,
+                    partial: Some(IndexPartialReason::CargoMetadataUnavailable),
+                }
+            }
+        }
+    }
+
+    /// The publish fence: re-read in the mode this run used and report whether
+    /// the Cargo inputs still match. The unavailable mode has nothing to
+    /// compare, and a retry of a known-failing read is not worth its wall time.
+    fn unchanged(&self, root: &Path) -> Result<bool> {
+        let current = match (&self.workspace, self.partial) {
+            (None, _) => return Ok(true),
+            (Some(_), None) => rsi_codegraph::cargo_metadata::read_workspace(root)?,
+            (Some(_), Some(_)) => rsi_codegraph::cargo_metadata::read_workspace_no_deps(root)?,
+        };
+        Ok(self
+            .workspace
+            .as_ref()
+            .is_some_and(|prior| prior.metadata_digest == current.metadata_digest))
+    }
+
+    fn digest(&self) -> Option<&str> {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.metadata_digest.as_str())
+    }
 }
 
 pub fn project_db_path(index_root: &Path, project_id: uuid::Uuid) -> std::path::PathBuf {
@@ -56,14 +161,14 @@ pub(super) fn extraction_manifest() -> StagedExtraction {
         .to_string();
     StagedExtraction {
         extraction: ExtractionContract {
-            mode: ExtractionMode::ExtractedV1_0,
+            mode: ExtractionMode::ExtractedInferredV1_1,
             extractor: ExtractorIdentity {
                 name: "rsi-codegraph".into(),
-                version: "s1-v3".into(),
+                version: "s2-v1".into(),
             },
         },
         grammar_version: "tree-sitter-s1".into(),
-        rule_version: "resolve-unique-s1".into(),
+        rule_version: "resolve-module-tree-s2".into(),
         normalization_version: "s1".into(),
         config_digest,
     }
@@ -71,6 +176,7 @@ pub(super) fn extraction_manifest() -> StagedExtraction {
 
 /// Discover, extract, stage the whole inventory, and publish only if this
 /// request remains current and the exact source bytes still match.
+#[cfg(test)]
 pub fn index_once(
     state: &mut WorkerState,
     workspace: &RegisteredWorkspace,
@@ -89,6 +195,7 @@ pub fn index_once(
     )
 }
 
+#[cfg(test)]
 pub fn index_once_with_events(
     state: &mut WorkerState,
     workspace: &RegisteredWorkspace,
@@ -121,6 +228,10 @@ pub(super) fn index_once_with_events_and_gate(
     events: Option<&EventBus>,
     enabled: &AtomicBool,
 ) -> Result<RunOutcome> {
+    let ceiling = db_path.parent().and_then(Path::parent).map_or(
+        retention::GLOBAL_DETAIL_CEILING_BYTES,
+        retention::effective_ceiling_bytes,
+    );
     index_once_with_ceiling_and_gate(
         state,
         workspace,
@@ -129,12 +240,13 @@ pub(super) fn index_once_with_events_and_gate(
         observed_revision,
         overflow_count,
         events,
-        retention::GLOBAL_DETAIL_CEILING_BYTES,
+        ceiling,
         Some(enabled),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn index_once_with_ceiling(
     state: &mut WorkerState,
     workspace: &RegisteredWorkspace,
@@ -221,33 +333,16 @@ fn index_once_with_ceiling_and_gate(
     }
     let discovered_count = discovery.files.len();
     let manifest = extraction_manifest();
-    let cargo_metadata = if workspace.root.join("Cargo.toml").is_file() {
-        match rsi_codegraph::cargo_metadata::read_workspace(&workspace.root) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                return preflight_failure(
-                    &mut store,
-                    workspace,
-                    previous_ready.is_some(),
-                    error.into(),
-                    overflow_count,
-                    events,
-                );
-            }
-        }
-    } else {
-        None
-    };
+    let cargo = CargoRead::read(&workspace.root);
+    let skipped_symlinks = discovery.skipped_symlinks.len();
+    let partial_reasons = cargo.partial.into_iter().collect::<Vec<_>>();
     if let (Some(ready), Some(last_source), Some(last_config)) = (
         previous_ready.as_ref(),
         state.last_source_digest.as_deref(),
         state.last_config_digest.as_deref(),
     ) && last_source == discovery.digest
         && last_config == manifest.config_digest
-        && state.last_cargo_metadata_digest.as_deref()
-            == cargo_metadata
-                .as_ref()
-                .map(|metadata| metadata.metadata_digest.as_str())
+        && state.last_cargo_metadata_digest.as_deref() == cargo.digest()
     {
         if store.confirm_index_ready(workspace.workspace_id, &discovery.digest, overflow_count)? {
             publish_status_hint(&store, workspace, events);
@@ -262,6 +357,8 @@ fn index_once_with_ceiling_and_gate(
             changed_paths: 0,
             staged_files: 0,
             published: false,
+            skipped_symlinks,
+            partial_reasons,
         });
     }
     if let Err(error) = retention::admit_write_with_ceiling(index_root, db_path, &store, ceiling) {
@@ -279,7 +376,7 @@ fn index_once_with_ceiling_and_gate(
     let mut reused_files = 0usize;
     let mut extracted_files = 0usize;
     let result = (|| -> Result<(RunOutcome, Vec<SourceVersion>)> {
-        let update = if let Some(metadata) = &cargo_metadata {
+        let update = if let Some(metadata) = &cargo.workspace {
             state.cache.update_with_cargo(discovery.files, metadata)?
         } else {
             state.cache.update(discovery.files)?
@@ -323,10 +420,7 @@ fn index_once_with_ceiling_and_gate(
             if discovery::discover(workspace)?.digest != discovery.digest {
                 return Err(IndexError::SourceChanged);
             }
-            if let Some(metadata) = &cargo_metadata
-                && rsi_codegraph::cargo_metadata::read_workspace(&workspace.root)?.metadata_digest
-                    != metadata.metadata_digest
-            {
+            if !cargo.unchanged(&workspace.root)? {
                 return Err(IndexError::SourceChanged);
             }
             if revision.load(Ordering::Acquire) != observed_revision {
@@ -354,7 +448,7 @@ fn index_once_with_ceiling_and_gate(
                     state.last_source_digest = Some(discovery.digest);
                     state.last_config_digest = Some(manifest.config_digest);
                     state.last_cargo_metadata_digest =
-                        cargo_metadata.map(|metadata| metadata.metadata_digest);
+                        cargo.workspace.map(|metadata| metadata.metadata_digest);
                     return Ok((
                         RunOutcome {
                             ready,
@@ -366,6 +460,8 @@ fn index_once_with_ceiling_and_gate(
                             changed_paths,
                             staged_files: owners.len(),
                             published: true,
+                            skipped_symlinks,
+                            partial_reasons: partial_reasons.clone(),
                         },
                         owners,
                     ));
@@ -379,7 +475,8 @@ fn index_once_with_ceiling_and_gate(
                 Err(error) => return Err(error.into()),
             }
         }
-    })();
+    })()
+    .map_err(|error| retention::typed_budget_failure(error, index_root, ceiling));
     let metrics = match &result {
         Ok((outcome, _)) => IndexRunMetrics {
             files_discovered: outcome.files_discovered,
@@ -394,6 +491,8 @@ fn index_once_with_ceiling_and_gate(
             pending_rescan: revision.load(Ordering::Acquire) != observed_revision,
             rescan_reason: (revision.load(Ordering::Acquire) != observed_revision)
                 .then(|| "revision_changed".into()),
+            skipped_symlinks: outcome.skipped_symlinks,
+            partial_reasons: outcome.partial_reasons.clone(),
         },
         Err(_) => IndexRunMetrics {
             files_discovered: discovered_count,
@@ -407,6 +506,8 @@ fn index_once_with_ceiling_and_gate(
             overflow_count,
             pending_rescan: true,
             rescan_reason: Some("run_failed".into()),
+            skipped_symlinks,
+            partial_reasons: partial_reasons.clone(),
         },
     };
     match &result {
@@ -548,6 +649,39 @@ mod tests {
                 "current-ready rows differ in {table}"
             );
         }
+    }
+
+    /// #2464: the manager keeps one extraction cache resident, so a workspace's
+    /// next pass often starts from its published digests alone. An unchanged
+    /// tree then confirms its ready head (no extraction, no new generation for
+    /// retention to prune); a changed tree still extracts and publishes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn unchanged_workspace_confirms_its_head_from_published_digests_2464() {
+        let root = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn ready() {}\n").unwrap();
+        let workspace = RegisteredWorkspace::primary(uuid::Uuid::new_v4(), root.path()).unwrap();
+        let db = project_db_path(indexes.path(), workspace.project_id);
+        let revision = AtomicU64::new(1);
+        let mut resident = WorkerState::default();
+        let first = index_once(&mut resident, &workspace, &db, &revision, 1).unwrap();
+        assert!(first.published);
+        let mut evicted = WorkerState::from_published_digests(resident.published_digests());
+        drop(resident);
+
+        let unchanged = index_once(&mut evicted, &workspace, &db, &revision, 1).unwrap();
+        assert!(
+            !unchanged.published,
+            "identical input publishes no generation"
+        );
+        assert_eq!(unchanged.files_extracted, 0);
+        assert_eq!(unchanged.ready, first.ready);
+
+        std::fs::write(root.path().join("lib.rs"), "pub fn changed() {}\n").unwrap();
+        let changed = index_once(&mut evicted, &workspace, &db, &revision, 1).unwrap();
+        assert!(changed.published);
+        assert!(changed.ready.generation > first.ready.generation);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -1205,5 +1339,196 @@ mod tests {
         compare();
         std::fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"cg_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"changed\"\n[workspace]\n").unwrap();
         compare();
+    }
+
+    fn cargo_fact_nodes(db: &std::path::Path, ready: &rsi_codegraph::ReadySnapshot) -> i64 {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM cg_nodes WHERE workspace_id = ?1 AND generation = ?2 \
+                 AND kind IN ('Crate', 'CargoTarget')",
+                rusqlite::params![ready.workspace_id.to_string(), ready.generation],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn rsi_shaped_workspace_with_symlinked_agent_docs_now_indexes() {
+        // The shape that failed all 1,590 attempts on the hub: AGENTS.md is the
+        // source, CLAUDE.md and GEMINI.md are tracked symlinks to it, and a
+        // member crate repeats the pattern.
+        let root = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/rsid/src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/rsid\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"rsid_fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("crates/rsid/Cargo.toml"),
+            "[package]\nname = \"rsid_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("crates/rsid/src/lib.rs"),
+            "pub fn alpha() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "# Agents\n").unwrap();
+        std::fs::write(root.path().join("crates/rsid/AGENTS.md"), "# Daemon\n").unwrap();
+        for link in ["CLAUDE.md", "GEMINI.md", "crates/rsid/CLAUDE.md"] {
+            std::os::unix::fs::symlink("AGENTS.md", root.path().join(link)).unwrap();
+        }
+        let workspace = RegisteredWorkspace::primary(uuid::Uuid::new_v4(), root.path()).unwrap();
+        let db = project_db_path(indexes.path(), workspace.project_id);
+        let revision = AtomicU64::new(1);
+
+        let outcome = index_once(&mut WorkerState::default(), &workspace, &db, &revision, 1)
+            .expect("symlinked agent docs must not fail the workspace");
+        assert!(outcome.published);
+        assert_eq!(outcome.skipped_symlinks, 3);
+        assert!(outcome.partial_reasons.is_empty());
+
+        let store = CodegraphStore::open(&db, workspace.project_id).unwrap();
+        let paths = store
+            .index_manifest(workspace.workspace_id)
+            .unwrap()
+            .into_iter()
+            .map(|source| source.relative_path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "AGENTS.md",
+                "Cargo.lock",
+                "Cargo.toml",
+                "crates/rsid/AGENTS.md",
+                "crates/rsid/Cargo.toml",
+                "crates/rsid/src/lib.rs",
+            ]
+        );
+        let status = store.index_status(workspace.workspace_id).unwrap().unwrap();
+        assert_eq!(status.phase, IndexLifecyclePhase::Ready);
+        assert_eq!(status.metrics.skipped_symlinks, 3);
+        assert!(status.metrics.partial_reasons.is_empty());
+        assert!(
+            !store
+                .search_name(workspace.workspace_id, "alpha", 1)
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+        assert!(cargo_fact_nodes(&db, &outcome.ready) > 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn unresolvable_locked_dependency_degrades_to_workspace_packages_and_marks_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        // No Cargo.lock and a crate that no offline registry holds: resolved
+        // `cargo metadata --offline --locked` cannot succeed, `--no-deps` can.
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"cg_partial\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n\
+             [dependencies]\nabsent-crate-zzz = \"1.2.3\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let workspace = RegisteredWorkspace::primary(uuid::Uuid::new_v4(), root.path()).unwrap();
+        let db = project_db_path(indexes.path(), workspace.project_id);
+        let revision = AtomicU64::new(1);
+        let mut state = WorkerState::default();
+
+        let outcome = index_once(&mut state, &workspace, &db, &revision, 1)
+            .expect("an unavailable dependency must not fail the workspace");
+        assert!(outcome.published);
+        assert_eq!(
+            outcome.partial_reasons,
+            [IndexPartialReason::CargoMetadataNoDeps]
+        );
+        let store = CodegraphStore::open(&db, workspace.project_id).unwrap();
+        let status = store.index_status(workspace.workspace_id).unwrap().unwrap();
+        assert_eq!(status.phase, IndexLifecyclePhase::Ready);
+        assert_eq!(
+            status.metrics.partial_reasons,
+            [IndexPartialReason::CargoMetadataNoDeps]
+        );
+        assert!(
+            !store
+                .search_name(workspace.workspace_id, "alpha", 1)
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+        assert!(
+            cargo_fact_nodes(&db, &outcome.ready) > 0,
+            "workspace packages and targets survive the degrade"
+        );
+
+        // Unchanged inputs take the confirm path and keep reporting the gap.
+        let again = index_once(&mut state, &workspace, &db, &revision, 1).unwrap();
+        assert!(!again.published);
+        assert_eq!(
+            again.partial_reasons,
+            [IndexPartialReason::CargoMetadataNoDeps]
+        );
+        let status = store.index_status(workspace.workspace_id).unwrap().unwrap();
+        assert_eq!(
+            status.metrics.partial_reasons,
+            [IndexPartialReason::CargoMetadataNoDeps]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn unreadable_cargo_manifest_publishes_without_cargo_facts_and_marks_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        // Valid TOML, invalid manifest (no package name): cargo refuses it in
+        // every mode, so there are no Cargo facts to keep.
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let workspace = RegisteredWorkspace::primary(uuid::Uuid::new_v4(), root.path()).unwrap();
+        let db = project_db_path(indexes.path(), workspace.project_id);
+        let revision = AtomicU64::new(1);
+
+        let outcome = index_once(&mut WorkerState::default(), &workspace, &db, &revision, 1)
+            .expect("an unreadable manifest must not fail the workspace");
+        assert!(outcome.published);
+        assert_eq!(
+            outcome.partial_reasons,
+            [IndexPartialReason::CargoMetadataUnavailable]
+        );
+        let store = CodegraphStore::open(&db, workspace.project_id).unwrap();
+        let status = store.index_status(workspace.workspace_id).unwrap().unwrap();
+        assert_eq!(status.phase, IndexLifecyclePhase::Ready);
+        assert_eq!(
+            status.metrics.partial_reasons,
+            [IndexPartialReason::CargoMetadataUnavailable]
+        );
+        assert!(
+            !store
+                .search_name(workspace.workspace_id, "alpha", 1)
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+        assert_eq!(cargo_fact_nodes(&db, &outcome.ready), 0);
     }
 }

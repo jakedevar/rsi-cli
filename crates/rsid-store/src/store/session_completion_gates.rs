@@ -12,6 +12,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use uuid::Uuid;
 
 // The provisional number is assigned at landing.
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: session-completion-gates-migration
 /// Provisional schema version of the completion-gate table.
 pub(crate) const SESSION_COMPLETION_GATES_SCHEMA_VERSION: i32 = 148;

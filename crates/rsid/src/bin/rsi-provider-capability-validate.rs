@@ -17,7 +17,7 @@ fn run() -> Result<(), String> {
         print!("{}", render_provider_capability_documentation()?);
         return Ok(());
     }
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = PathBuf::from(rsi_common::manifest_dir!())
         .parent()
         .and_then(|path| path.parent())
         .ok_or_else(|| "failed to resolve repository root".to_string())?

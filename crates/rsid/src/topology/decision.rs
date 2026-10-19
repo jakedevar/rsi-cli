@@ -34,6 +34,7 @@ use crate::topology::review::{ExtraRound, OncallAcceptance};
 use crate::topology::store::{
     self as rows, AttemptRow, AttemptStatus, ExecutionRow, ExecutionStatus, Settlement, failure,
 };
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 /// Questions one attempt may ask before it blocks.
 pub(crate) const MAX_QUESTIONS_PER_ATTEMPT: u32 = 3;
@@ -52,11 +53,62 @@ pub(crate) const fn blocker_gate(class: Option<PipelineBlockerClassV1>) -> Optio
     match class {
         Some(PipelineBlockerClassV1::Production) => Some("main_or_release"),
         Some(PipelineBlockerClassV1::Destructive) => Some("data_deletion"),
-        Some(PipelineBlockerClassV1::Resource) => Some("spend"),
         Some(PipelineBlockerClassV1::Authority) => Some("credentials"),
+        Some(PipelineBlockerClassV1::Resource) => Some("spend"),
         Some(PipelineBlockerClassV1::ForbiddenScope | PipelineBlockerClassV1::TechnicalImpasse)
         | None => None,
     }
+}
+
+/// Resource is operator-owned unless it explicitly names tooling and carries
+/// no money signal. Keep this wider vocabulary out of ordinary manager asks.
+fn handoff_blocker_gate(class: Option<PipelineBlockerClassV1>, text: &str) -> Option<&'static str> {
+    let declared = if class == Some(PipelineBlockerClassV1::Resource) {
+        let lower = text.to_lowercase();
+        let words: Vec<_> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect();
+        // Match complete words/phrases, allowing punctuation such as cargo-slot.
+        let normalized = format!(" {} ", words.join(" "));
+        let tooling = [
+            "tool copy",
+            "stale binary",
+            "stale tool",
+            "redeploy rsid",
+            "restart rsid",
+            "cargo slot",
+            "target pool",
+            "build cache",
+            "target dir",
+            "disk",
+            "sandbox",
+            "worktree",
+            "installed tools",
+            "deploy",
+        ]
+        .iter()
+        .any(|phrase| normalized.contains(&format!(" {phrase} ")));
+        // Currency words/codes are conservative signals even without an amount;
+        // this also covers either order around an amount. Symbols and the old
+        // buy/pay/rent vocabulary remain covered by scan_decision_gate below.
+        let money = words.iter().any(|word| {
+            [
+                "usd", "eur", "gbp", "jpy", "dollar", "dollars", "euro", "euros", "pound",
+                "pounds", "cost", "costs", "costing", "price", "priced", "paid", "charge",
+                "charged", "credit", "credits", "billed",
+            ]
+            .contains(word)
+        });
+        if tooling && !money {
+            None
+        } else {
+            Some("spend")
+        }
+    } else {
+        blocker_gate(class)
+    };
+    declared.or_else(|| crate::store::manager_decisions::scan_decision_gate(text))
 }
 
 /// `topology:<execution>:<node>:<iteration>:<attempt>` for the first question
@@ -142,7 +194,7 @@ fn round_unavailable_text(reason: &str) -> &'static str {
 }
 
 /// Whether the execution's absolute deadline, if it has one, has passed.
-fn execution_deadline_passed(execution: &ExecutionRow) -> bool {
+pub(super) fn execution_deadline_passed(execution: &ExecutionRow) -> bool {
     execution
         .deadline_at
         .is_some_and(|deadline| chrono::Utc::now() >= deadline)
@@ -157,6 +209,73 @@ fn clip(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+fn answer_delivery_marker(delivery_id: Uuid) -> String {
+    format!("[Topology answer delivery {delivery_id}]")
+}
+
+fn answer_prompt(answer: &str, delivery_id: Uuid) -> String {
+    format!(
+        "My answer to your question: {answer}\n\n{}",
+        answer_delivery_marker(delivery_id)
+    )
+}
+
+/// Bind the exact prompt before the continuation claims delivery. Its unique
+/// reference survives the claim and identifies the user event of this turn.
+/// The continue path persists that event only after spawning the provider.
+pub(super) fn bind_answer_continuation(
+    store: &crate::store::Store,
+    binding: &rows::AnswerBinding,
+    session_id: Uuid,
+    answer: &str,
+) -> Result<String> {
+    let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)?;
+    rows::answer_delivery_live(store, binding, session_id)?;
+    let text: String = tx.query_row(
+        "SELECT output_json FROM topology_node_attempts WHERE id=?1",
+        [binding.attempt_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let mut marker: Value = serde_json::from_str(&text)?;
+    if marker["delivery"]["state"] == rows::DELIVERY_STARTED {
+        return Err(crate::error::DaemonError::PolicyDenied(
+            rows::ANSWER_UNCERTAIN.into(),
+        ));
+    }
+    let delivery_id = Uuid::new_v4();
+    marker["answer_delivery_id"] = json!(delivery_id);
+    rows::update_decision_marker(store, binding.attempt_id, &marker)?;
+    tx.commit()?;
+    Ok(answer_prompt(answer, delivery_id))
+}
+
+/// A live session, another assistant message or an admission alone says
+/// nothing about this answer. Require the user-turn event with this delivery's
+/// unique marker, which survives continuation wrappers. Old claims without a reference
+/// have no correlated evidence and remain uncertain.
+fn answer_turn_observed(
+    store: &crate::store::Store,
+    session_id: Uuid,
+    marker: &Value,
+) -> Result<bool> {
+    let Some(delivery_id) = marker["answer_delivery_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+    else {
+        return Ok(false);
+    };
+    Ok(store
+        .conn
+        .query_row(
+            "SELECT 1 FROM conversation_events WHERE session_id=?1
+           AND event_type='Message' AND role='User' AND instr(content,?2)>0 LIMIT 1",
+            params![session_id.to_string(), answer_delivery_marker(delivery_id)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 impl<E: NodeEffects> Executor<E> {
@@ -324,7 +443,12 @@ impl<E: NodeEffects> Executor<E> {
             return Ok(false);
         }
         let digest = rows::digest(content);
-        let gate = blocker_gate(handoff.blocker_class);
+        let gate_text = format!(
+            "{}\n{}\n{question}",
+            handoff.handoff.blocker.as_deref().unwrap_or_default(),
+            handoff.blocker_evidence.as_deref().unwrap_or_default(),
+        );
+        let gate = handoff_blocker_gate(handoff.blocker_class, &gate_text);
         let context = format!(
             "Topology execution `{}`, node `{}` (iteration {}, attempt {}). Blocker class: {}. \
              Evidence: {}",
@@ -459,8 +583,8 @@ impl<E: NodeEffects> Executor<E> {
     /// Delivery is at most once (#1715). The continuation durably claims the
     /// delivery (`delivery.state = "started"` in the attempt marker) before the
     /// provider effect and rechecks the exact execution/attempt binding there.
-    /// A claim found without a session that shows the answer was taken (live,
-    /// or finished with new output) is uncertain: shown, never replayed. With
+    /// A claim without its exact continued user-turn event is uncertain:
+    /// shown, never replayed. With
     /// no claim the answer was never sent, whatever the session has done since
     /// (#1740).
     async fn continue_after_answer(
@@ -486,46 +610,46 @@ impl<E: NodeEffects> Executor<E> {
             .await?;
             return Ok(true);
         }
-        // Whether the session took the answer is judged against the claimed
-        // delivery only (#1740): with no claim nothing was sent, so whatever
-        // else the session did (an operator's manual continuation, a restart)
-        // is not the answer and the answer is delivered. With a claim, a live
-        // session or new output is the sign the provider took it.
+        // Only this delivery's turn proves the answer was sent (#1740).
+        // Session status and assistant output can belong to unrelated turns.
         let continued = if !claimed {
             false
         } else {
-            match observed {
-                Some(observed) if !observed.status.is_terminal() => true,
-                _ => {
-                    let output = self.effects.output(attempt.session_id).await?;
-                    let content = match output.get("content") {
-                        Some(rsi_graph::data::Value::String(content)) => content.clone(),
-                        _ => String::new(),
-                    };
-                    marker["handoff_digest"].as_str() != Some(rows::digest(&content).as_str())
-                }
-            }
+            let store = self.store.lock().await;
+            answer_turn_observed(&store, attempt.session_id, &marker)?
         };
         if claimed && !continued {
             return self
                 .block_uncertain_delivery(
                     execution,
                     attempt,
-                    "the session shows no sign the answer was taken",
+                    "no user-turn event is tied to the claimed answer delivery",
                 )
                 .await;
         }
         if !continued {
-            let request = AnswerContinuation {
-                session_id: attempt.session_id,
-                prompt: format!("My answer to your question: {answer}"),
-                binding: rows::AnswerBinding {
-                    execution_id: execution.id,
-                    attempt_id: attempt.id,
-                    decision_key: key.to_owned(),
-                },
+            let binding = rows::AnswerBinding {
+                execution_id: execution.id,
+                attempt_id: attempt.id,
+                decision_key: key.to_owned(),
             };
-            if let Err(error) = self.effects.continue_with_answer(request).await {
+            let result = {
+                let store = self.store.lock().await;
+                bind_answer_continuation(&store, &binding, attempt.session_id, answer)
+            };
+            let result = match result {
+                Ok(prompt) => {
+                    self.effects
+                        .continue_with_answer(AnswerContinuation {
+                            session_id: attempt.session_id,
+                            prompt,
+                            binding,
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
                 // The attempt row, not the error, says whether the provider
                 // effect may have started.
                 let started = {
@@ -868,6 +992,64 @@ mod unit_tests {
             ("", ExhaustionRuling::Stop),
         ] {
             assert_eq!(ExhaustionRuling::parse(answer), ruling, "{answer:?}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn resource_tooling_exception_requires_explicit_words_and_preserves_other_gates() {
+        use PipelineBlockerClassV1::Resource;
+        for tooling in [
+            "tool copy",
+            "stale binary",
+            "stale tool",
+            "redeploy rsid",
+            "restart rsid",
+            "cargo-slot",
+            "target-pool",
+            "build cache",
+            "target dir",
+            "disk",
+            "sandbox",
+            "worktree",
+            "installed tools",
+            "deploy",
+        ] {
+            assert_eq!(
+                handoff_blocker_gate(Some(Resource), &tooling.to_uppercase()),
+                None,
+                "{tooling}"
+            );
+            assert_eq!(
+                handoff_blocker_gate(Some(Resource), &format!("{tooling}: paid run")),
+                Some("spend"),
+                "{tooling}"
+            );
+        }
+        for unknown in [
+            "capacity unavailable",
+            "tool unavailable",
+            "deployment",
+            "sandboxed",
+            "worktrees",
+        ] {
+            assert_eq!(
+                handoff_blocker_gate(Some(Resource), unknown),
+                Some("spend"),
+                "{unknown}"
+            );
+        }
+        for (text, gate) in [
+            ("redeploy rsid for $25", "spend"),
+            ("redeploy rsid: API key needed", "credentials"),
+            ("deploy to production", "main_or_release"),
+            ("sandbox: delete user data", "data_deletion"),
+        ] {
+            assert_eq!(
+                handoff_blocker_gate(Some(Resource), text),
+                Some(gate),
+                "{text}"
+            );
         }
     }
 

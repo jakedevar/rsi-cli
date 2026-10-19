@@ -115,11 +115,13 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--surface0); border: 1px solid var(--red); color: var(--text); white-space: pre-wrap;
 }
 .toast.ok { border-color: var(--green); }
+.toast { z-index: 12; }
 dialog { background: var(--base); color: var(--text); border: 1px solid var(--surface1); border-radius: 10px; width: min(720px, 92vw); padding: 0; }
 dialog::backdrop { background: rgba(0,0,0,.5); }
 .launch-form { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; }
 .launch-form h2 { margin: 0; font-size: 16px; }
 .launch-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--subtext); }
+.launch-form label.check { flex-direction: row; align-items: center; gap: 8px; }
 .launch-form .row { display: flex; gap: 10px; }
 .launch-form .row label { flex: 1; }
 .launch-form .row label.grow { flex: 2; }
@@ -159,3 +161,149 @@ dialog::backdrop { background: rgba(0,0,0,.5); }
 .session-item.attn { box-shadow: inset 3px 0 var(--yellow); }
 .pause-state { font-size: 12px; color: var(--peach); align-self: center; }
 dialog.confirm { width: min(440px, 92vw); }
+/* Vim keys: list cursor, which-key hint and the : command line. */
+.session-item.cursor { outline: 1px dashed var(--mauve); outline-offset: -2px; }
+.keyhint {
+  position: fixed; left: 16px; bottom: 16px; max-width: min(900px, calc(100vw - 32px)); max-height: 50vh; overflow: auto;
+  padding: 10px 14px; border-radius: 8px; background: var(--crust); border: 1px solid var(--surface1); font-size: 12px; z-index: 10;
+}
+.keyhint-head { font-family: var(--mono); color: var(--mauve); margin-bottom: 6px; }
+.keyhint-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 2px 18px; }
+.keyhint-row { display: flex; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.keyhint-row .k { font-family: var(--mono); color: var(--blue); min-width: 64px; }
+.keyhint-row.prefix .t { color: var(--mauve); }
+.keyhint-row.unbound { opacity: .55; }
+.cmdline {
+  position: fixed; left: 0; right: 0; bottom: 0; padding: 6px 14px; z-index: 11;
+  background: var(--crust); border-top: 1px solid var(--surface1); font-family: var(--mono); font-size: 13px;
+}
+.cmdline-caret { display: inline-block; width: 7px; height: 1.1em; vertical-align: text-bottom; background: var(--text); margin-left: 1px; }
+.cmdline-completions { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--subtext); font-size: 12px; }
+.cmdline-completions .sel { color: var(--crust); background: var(--blue); border-radius: 3px; padding: 0 4px; }
+.cmdline-completions:empty { display: none; }
+/* Command palette (Ctrl-K / Cmd-K): every registry action with its keys. */
+dialog.palette {
+  width: min(640px, 92vw); margin: 12vh auto auto; padding: 0; display: none; flex-direction: column;
+  background: var(--mantle); color: var(--text); border: 1px solid var(--surface1); border-radius: 10px; max-height: 70vh;
+}
+dialog.palette[open] { display: flex; }
+#palette-input {
+  margin: 10px; padding: 8px 10px; background: var(--base); border: 1px solid var(--surface1); border-radius: 6px; font-size: 15px;
+}
+.palette-list { list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; }
+.palette-item {
+  display: grid; grid-template-columns: 64px 1fr auto; gap: 10px; align-items: center; padding: 6px 14px; cursor: pointer;
+}
+.palette-item.sel { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
+.palette-item.disabled { opacity: .5; }
+.palette-group { font-size: 11px; color: var(--overlay0); text-transform: uppercase; }
+.palette-main { display: flex; flex-direction: column; min-width: 0; }
+.palette-title mark { background: none; color: var(--blue); font-weight: 600; }
+.palette-detail { font-size: 12px; color: var(--subtext); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-keys { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.palette-keys kbd {
+  font-family: var(--mono); font-size: 11px; padding: 0 5px; border: 1px solid var(--surface1); border-radius: 4px; color: var(--subtext);
+}
+.palette-empty { padding: 10px 14px; color: var(--subtext); }
+
+/* Slice 4 (hub #3006): session list tools, pickers, forms, label chips. */
+.list-tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0; }
+.list-tools .btn { padding: 2px 8px; font-size: 12px; }
+.list-scope { padding: 6px 12px 0; font-size: 11px; color: var(--overlay0); }
+.label-head { padding: 6px 12px 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--mauve); background: var(--crust); border-bottom: 1px solid var(--surface0); }
+.label-chip { grid-column: 2 / 4; justify-self: start; font-size: 10px; padding: 0 6px; border-radius: 8px; color: var(--crust); background: var(--chip, var(--mauve)); }
+.ev.search-hit { outline: 2px solid var(--yellow); outline-offset: 1px; }
+dialog.pick { background: var(--mantle); color: var(--text); border: 1px solid var(--surface1); border-radius: 10px; padding: 14px 16px; min-width: 380px; max-width: 560px; }
+dialog.pick::backdrop { background: rgba(0, 0, 0, .45); }
+dialog.pick h2 { margin: 0 0 10px; font-size: 15px; color: var(--mauve); }
+dialog.pick input[type="text"] { width: 100%; box-sizing: border-box; background: var(--base); color: var(--text); border: 1px solid var(--surface1); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
+.pick-list { list-style: none; margin: 0 0 8px; padding: 0; max-height: 300px; overflow: auto; }
+.pick-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+.pick-item.sel, .pick-item:hover { background: var(--surface0); }
+.pick-mark { width: 12px; color: var(--green); }
+.pick-detail { margin-left: auto; font-size: 11px; color: var(--overlay0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.pick-empty { padding: 8px; color: var(--overlay0); }
+.swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.pick-actions { display: flex; gap: 6px; justify-content: flex-end; margin-bottom: 6px; }
+.pick-hint { font-size: 11px; color: var(--overlay0); }
+.color-row { display: flex; gap: 6px; }
+.color-radio { appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--sw); border: 2px solid transparent; cursor: pointer; margin: 0; }
+.color-radio:checked { border-color: var(--text); }
+.color-radio:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+dialog.pick .form-error { color: var(--red); font-size: 12px; margin: 4px 0; }
+.info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0 0 10px; font-size: 13px; }
+.info-rows dt { color: var(--overlay0); }
+.info-rows dd { margin: 0; word-break: break-word; font-family: var(--mono); }
+/* Issues workspace (hub #3010). */
+.layout[hidden], .issues[hidden], .issues-retry[hidden] { display: none; }
+.issues { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.issues-head {
+  display: flex; align-items: center; gap: 10px; padding: 8px 14px; flex-wrap: wrap;
+  background: var(--mantle); border-bottom: 1px solid var(--surface0);
+}
+.issues-head h1 { margin: 0; font-size: 16px; }
+.issues-head select, .launch-form select, .launch-form input[type="text"], .launch-form input[type="password"], .launch-form textarea {
+  background: var(--surface0); border: 1px solid var(--surface1); border-radius: 6px; padding: 5px 8px;
+}
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-size: 11px; color: var(--subtext); background: var(--surface0); border-radius: 8px; padding: 1px 8px; }
+.meta.err { color: var(--red); }
+.issues-retry {
+  background: var(--yellow); color: var(--crust); border: 0; padding: 6px 14px; text-align: left; cursor: pointer;
+}
+.issues-body { flex: 1; display: flex; min-height: 0; }
+.issues-listpane { width: 46%; min-width: 320px; display: flex; flex-direction: column; border-right: 1px solid var(--surface0); }
+.issues-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; }
+.issues-list:focus { outline: none; }
+.issue-item {
+  display: grid; grid-template-columns: auto auto 1fr auto; gap: 8px; align-items: baseline;
+  padding: 6px 12px; cursor: pointer; border-bottom: 1px solid var(--surface0);
+}
+.issue-item:hover { background: var(--mantle); }
+.issue-item.selected { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
+.issue-item .ref { font-family: var(--mono); color: var(--blue); }
+.issue-item .prio { font-size: 11px; color: var(--subtext); }
+.issue-item .prio.p1 { color: var(--red); }
+.issue-item .prio.p2 { color: var(--peach); }
+.issue-item .ititle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.issue-item .istatus { font-size: 11px; color: var(--subtext); }
+.issue-item .iready { grid-column: 3 / -1; font-size: 11px; color: var(--subtext); }
+.issue-item.ready .iready { color: var(--green); }
+.issue-item.blocked .iready { color: var(--yellow); }
+.issue-item.done .ititle { color: var(--overlay0); }
+.issues-pager { display: flex; justify-content: space-between; padding: 8px 12px; border-top: 1px solid var(--surface0); }
+.issues-empty { padding: 14px; color: var(--subtext); }
+.issues-inspector { flex: 1; overflow-y: auto; padding: 14px 18px; }
+.issues-inspector:focus { outline: none; }
+.iv-head h2 { margin: 0 0 8px; font-size: 16px; }
+.iv-meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 16px; margin-bottom: 10px; }
+.kv { display: flex; gap: 8px; font-size: 12px; }
+.kv .k { color: var(--subtext); min-width: 62px; }
+.iv-body { white-space: pre-wrap; word-break: break-word; font: 13px/1.5 var(--mono); background: var(--mantle); border-radius: 6px; padding: 10px 12px; margin: 0 0 12px; }
+.iv-tabs { display: flex; margin-bottom: 8px; }
+.iv-tabs .seg { background: var(--base); color: var(--subtext); border: 1px solid var(--surface1); padding: 4px 12px; cursor: pointer; font: inherit; }
+.iv-tabs .seg.active { background: var(--surface0); color: var(--text); }
+.iv-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.iv-list li { padding: 3px 0; font-size: 13px; }
+.iv-list .dep { cursor: pointer; }
+.iv-list .dep:hover { color: var(--blue); }
+.ev-line { font-family: var(--mono); font-size: 12px; color: var(--subtext); }
+.handoff summary { cursor: pointer; font-size: 12px; color: var(--subtext); }
+dialog.issue-dialog { width: min(640px, 94vw); max-height: 90vh; overflow-y: auto; }
+.form-intro { margin: 0; white-space: pre-wrap; color: var(--subtext); font-size: 13px; }
+.form-fields { display: flex; flex-direction: column; gap: 10px; }
+.ff small { color: var(--overlay0); }
+.issue-dialog .form-error { color: var(--red); white-space: pre-wrap; font-size: 13px; margin: 0; }
+.stale-bar { display: flex; gap: 8px; }
+
+/* First-run guidance in the empty detail pane, and the boot-failure banner. */
+.empty { max-width: 560px; padding: 24px; text-align: left; }
+.empty .onboard-title { margin: 0 0 12px; font-size: 18px; font-weight: 600; color: var(--text); }
+.empty .onboard-line { margin: 0 0 10px; line-height: 1.5; color: var(--subtext); }
+.empty[data-onboarding="daemon-down"] .onboard-title,
+.empty[data-onboarding="backend-error"] .onboard-title { color: var(--red); }
+.empty .onboard-actions { display: flex; gap: 8px; margin-top: 16px; }
+.boot-banner { padding: 8px 14px; background: var(--surface0); border-bottom: 2px solid var(--red); color: var(--red); font-size: 13px; }
+.boot-banner[hidden] { display: none; }
+.empty .btn { color: var(--text); }
+.empty .btn.primary { color: var(--crust); }

@@ -481,7 +481,7 @@ mod tests {
             "Node": {
                 "StableID": NODE,
                 "User": OWNER,
-                "MachineAuthorized": true,
+                "MachineAuthorized": null,
                 "Expired": false,
                 "KeyExpiry": "2027-01-01T00:00:00Z",
                 "Addresses": ["100.101.102.103/32", "fd7a:115c:a1e0::1/128"],
@@ -820,6 +820,48 @@ mod tests {
             client_identity(&encode(&stale), &policy(), source(), now()),
             Err(Denial::KeyExpiring)
         );
+    }
+
+    #[test]
+    fn real_whois_null_machine_authorized_owner_and_source_still_deny() {
+        let mut wrong_owner = real_whois_1_102();
+        wrong_owner["Node"]["User"] = json!(1);
+        assert_eq!(
+            client_identity(&encode(&wrong_owner), &policy(), source(), now()),
+            Err(Denial::WrongOwner)
+        );
+        let other_source: IpAddr = "100.64.0.9".parse().unwrap();
+        assert_eq!(
+            client_identity(&encode(&real_whois_1_102()), &policy(), other_source, now()),
+            Err(Denial::SourceMismatch)
+        );
+    }
+
+    #[test]
+    fn real_self_whois_null_machine_authorized_obeys_every_layer() {
+        let binding = server_binding(&encode(&status()), &policy(), now()).unwrap();
+        let real_self = || {
+            let mut v = real_whois_1_102();
+            v["Node"]["StableID"] = json!(binding.node_id);
+            v
+        };
+        let check = |v: &Value| self_whois_matches(&encode(v), &binding, now());
+        assert_eq!(check(&real_self()), Ok(()));
+        let mut explicit_false = real_self();
+        explicit_false["Node"]["MachineAuthorized"] = json!(false);
+        assert_eq!(check(&explicit_false), Err(Denial::NotAuthorized));
+        let mut other_node = real_self();
+        other_node["Node"]["StableID"] = json!("nOTHER");
+        assert_eq!(check(&other_node), Err(Denial::ServerMismatch));
+        let mut wrong_owner = real_self();
+        wrong_owner["Node"]["User"] = json!(1);
+        assert_eq!(check(&wrong_owner), Err(Denial::WrongOwner));
+        let mut stale = real_self();
+        stale["Node"]["KeyExpiry"] = json!("2020-01-01T00:00:00Z");
+        assert_eq!(check(&stale), Err(Denial::KeyExpiring));
+        let mut expired = real_self();
+        expired["Node"]["Expired"] = json!(true);
+        assert_eq!(check(&expired), Err(Denial::Expired));
     }
 
     #[test]

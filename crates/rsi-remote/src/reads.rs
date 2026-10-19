@@ -11,7 +11,13 @@ use crate::{config::Config, ingress};
 use rsi_common::{
     harness_manager_v2::{AnswerHarnessManagerDecisionRequestV2, ManagerMutationReceiptV2},
     remote_decision_targets::RemoteGetDecisionTargetsV1,
+    remote_manager_v2::{
+        ConversationRequestV2, ConversationResponseV2, ListManagerSeatsRequestV2,
+        ListManagerSeatsResponseV2, METHOD_CONVERSATION, METHOD_LIST_SEATS, METHOD_SEND,
+        SendMessageReceiptV2, SendMessageRequestV2,
+    },
     remote_read::ReadRequestV1,
+    rpc::REMOTE_BUSY,
 };
 use serde_json::{Value, json};
 use std::{
@@ -71,6 +77,19 @@ impl ReadError {
             Self::Daemon(_) => "daemon_error",
         }
     }
+
+    /// The gateway status for a failed read. Only `Connect` and `PeerMismatch`
+    /// mean rsid is really unreachable (502); a busy daemon or a read that
+    /// timed out is a 503 the phone retries; the rest are a reply the gateway
+    /// could not use, named by the body code (never "rsid is down").
+    #[must_use]
+    pub const fn http_status(self) -> u16 {
+        match self {
+            Self::Busy | Self::Timeout => 503,
+            Self::Connect | Self::PeerMismatch => 502,
+            Self::Oversize | Self::Malformed | Self::Daemon(_) => 500,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +112,9 @@ pub fn build_request(
     policy: &Config,
 ) -> Result<ReadRequestV1, ReadDenial> {
     let method = ingress::read_method(path).ok_or(ReadDenial::NoRoute)?;
+    if query.pending_after.is_some() {
+        return Err(ReadDenial::InvalidRequest);
+    }
     let segments: Vec<&str> = path.split('/').collect();
     let project = segments.get(4).copied();
     let session = segments.get(6).copied();
@@ -176,7 +198,11 @@ pub fn build_request(
 /// [`ReadDenial::ProjectOutOfScope`] for a project outside `policy.project_ids`
 /// (checked first, before the typed request), and [`ReadDenial::InvalidRequest`]
 /// when the typed request rejects the path UUIDs.
-pub fn build_decision_targets(path: &str, policy: &Config) -> Result<OperatorCall, ReadDenial> {
+pub fn build_decision_targets(
+    path: &str,
+    query: &ingress::Query,
+    policy: &Config,
+) -> Result<OperatorCall, ReadDenial> {
     if ingress::read_method(path) != Some("RemoteGetDecisionTargetsV1") {
         return Err(ReadDenial::NoRoute);
     }
@@ -186,9 +212,19 @@ pub fn build_decision_targets(path: &str, policy: &Config) -> Result<OperatorCal
         return Err(ReadDenial::ProjectOutOfScope);
     }
     let session = segments.get(6).copied().ok_or(ReadDenial::NoRoute)?;
+    if query.cursor.is_some()
+        || query.before.is_some()
+        || query
+            .pending_after
+            .as_deref()
+            .is_some_and(|after| !ingress::pending_after_token(after))
+    {
+        return Err(ReadDenial::InvalidRequest);
+    }
     let request = serde_json::from_value(json!({
         "project_id": project,
         "session_id": session,
+        "pending_after": query.pending_after,
     }))
     .map_err(|_| ReadDenial::InvalidRequest)?;
     Ok(OperatorCall::DecisionTargets(request))
@@ -203,6 +239,26 @@ pub trait ReadDispatch: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<u8>, ReadError>> + Send;
 }
 
+/// Every daemon method the gateway can send (hub #3151): the GET routes of
+/// [`ingress::read_method`] and [`ingress::v2_read_method`] and each
+/// [`OperatorCall`]. rsid's operator-only fences read it; a new route or call
+/// adds its method here in the same change (pinned by
+/// `gateway_daemon_methods_name_every_route_and_operator_call`).
+pub const GATEWAY_DAEMON_METHODS: &[&str] = &[
+    "RemoteGetInfoV1",
+    "RemoteListProjectsV1",
+    "RemoteListSessionsV1",
+    "RemoteGetSessionV1",
+    "RemoteGetHistoryPageV1",
+    "RemoteGetDecisionsV1",
+    "RemoteGetDecisionTargetsV1",
+    METHOD_LIST_SEATS,
+    METHOD_CONVERSATION,
+    "AnswerHarnessManagerDecision",
+    "AnswerPendingDecisionV1",
+    METHOD_SEND,
+];
+
 /// The two operator-only daemon calls the answer slice is allowed to make.
 /// Every variant is added explicitly here; there is no name-derived routing.
 #[derive(Debug, Clone)]
@@ -210,6 +266,12 @@ pub enum OperatorCall {
     DecisionTargets(RemoteGetDecisionTargetsV1),
     Answer(AnswerHarnessManagerDecisionRequestV2),
     AnswerPending(rsi_common::remote_pending_decisions::AnswerPendingDecisionV1),
+    /// API v2 (#2962): the exposed projects' manager seats (read).
+    ManagerSeats(ListManagerSeatsRequestV2),
+    /// API v2: one seat's conversation page (read).
+    ManagerConversation(ConversationRequestV2),
+    /// API v2: one message to a seat (the closed write, `messages`).
+    SendManagerMessage(SendMessageRequestV2),
 }
 
 impl OperatorCall {
@@ -219,14 +281,25 @@ impl OperatorCall {
             Self::DecisionTargets(_) => "RemoteGetDecisionTargetsV1",
             Self::Answer(_) => "AnswerHarnessManagerDecision",
             Self::AnswerPending(_) => "AnswerPendingDecisionV1",
+            Self::ManagerSeats(_) => METHOD_LIST_SEATS,
+            Self::ManagerConversation(_) => METHOD_CONVERSATION,
+            Self::SendManagerMessage(_) => METHOD_SEND,
         }
     }
 
-    pub(crate) fn wire(&self) -> Result<Value, ReadError> {
+    /// The JSON-RPC request this call sends on the daemon socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError::Malformed`] when the params do not serialize.
+    pub fn wire(&self) -> Result<Value, ReadError> {
         let params = match self {
             Self::DecisionTargets(request) => serde_json::to_value(request),
             Self::Answer(request) => serde_json::to_value(request),
             Self::AnswerPending(request) => serde_json::to_value(request),
+            Self::ManagerSeats(request) => serde_json::to_value(request),
+            Self::ManagerConversation(request) => serde_json::to_value(request),
+            Self::SendManagerMessage(request) => serde_json::to_value(request),
         }
         .map_err(|_| ReadError::Malformed)?;
         Ok(json!({
@@ -300,7 +373,7 @@ impl DaemonReads {
         let object = response.as_object().ok_or(ReadError::Malformed)?;
         if let Some(error) = object.get("error") {
             let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
-            return Err(ReadError::Daemon(code));
+            return Err(daemon_error(code));
         }
         let result = object.get("result").ok_or(ReadError::Malformed)?;
         if !result.is_object() {
@@ -357,6 +430,16 @@ impl DaemonReads {
     }
 }
 
+/// The daemon answers a contended read with its typed busy code: the daemon is
+/// up and the phone should retry, so it is the remote's own `Busy`, not a fault.
+fn daemon_error(code: i64) -> ReadError {
+    if code == i64::from(REMOTE_BUSY) {
+        ReadError::Busy
+    } else {
+        ReadError::Daemon(code)
+    }
+}
+
 impl ReadDispatch for DaemonReads {
     async fn dispatch(&self, request: &ReadRequestV1) -> Result<Vec<u8>, ReadError> {
         let _permit = self
@@ -386,6 +469,9 @@ impl OperatorDispatch for DaemonReads {
             .as_object()
             .ok_or(OperatorError::Transport(ReadError::Malformed))?;
         if let Some(error) = object.get("error") {
+            if error.get("code").and_then(Value::as_i64) == Some(i64::from(REMOTE_BUSY)) {
+                return Err(OperatorError::Transport(ReadError::Busy));
+            }
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -406,6 +492,23 @@ impl OperatorDispatch for DaemonReads {
             return Err(OperatorError::Transport(ReadError::Malformed));
         }
         if matches!(call, OperatorCall::AnswerPending(_)) && serde_json::from_value::<rsi_common::remote_pending_decisions::RemoteAnswerReceiptV1>(result.clone()).is_err() {
+            return Err(OperatorError::Transport(ReadError::Malformed));
+        }
+        // The v2 results are checked against their typed shapes, so a gateway
+        // never forwards (or reports as sent) an object it cannot name.
+        let typed_ok = match call {
+            OperatorCall::ManagerSeats(_) => {
+                serde_json::from_value::<ListManagerSeatsResponseV2>(result.clone()).is_ok()
+            }
+            OperatorCall::ManagerConversation(_) => {
+                serde_json::from_value::<ConversationResponseV2>(result.clone()).is_ok()
+            }
+            OperatorCall::SendManagerMessage(_) => {
+                serde_json::from_value::<SendMessageReceiptV2>(result.clone()).is_ok()
+            }
+            _ => true,
+        };
+        if !typed_ok {
             return Err(OperatorError::Transport(ReadError::Malformed));
         }
         serde_json::to_vec(result).map_err(|_| OperatorError::Transport(ReadError::Malformed))
@@ -447,10 +550,11 @@ pub async fn serve_read<D: ReadDispatch>(
 /// authorized, or [`ServeError::Failed`] with the dispatch transport error.
 pub async fn serve_operator<D: OperatorDispatch>(
     path: &str,
+    query: &ingress::Query,
     policy: &Config,
     dispatch: &D,
 ) -> Result<Vec<u8>, ServeError> {
-    let call = build_decision_targets(path, policy).map_err(ServeError::Denied)?;
+    let call = build_decision_targets(path, query, policy).map_err(ServeError::Denied)?;
     dispatch
         .call(&call)
         .await
@@ -490,6 +594,7 @@ mod tests {
         Query {
             cursor: cursor.map(str::to_string),
             before,
+            ..Query::default()
         }
     }
 
@@ -787,7 +892,12 @@ mod tests {
     #[test]
     fn decision_targets_builds_only_its_typed_request() {
         let policy = policy();
-        let call = build_decision_targets(&project_path("/decision-targets"), &policy).unwrap();
+        let call = build_decision_targets(
+            &project_path("/decision-targets"),
+            &Query::default(),
+            &policy,
+        )
+        .unwrap();
         assert_eq!(call.method(), "RemoteGetDecisionTargetsV1");
         let OperatorCall::DecisionTargets(request) = &call else {
             panic!("expected the decision-targets variant");
@@ -798,13 +908,58 @@ mod tests {
         );
 
         assert_eq!(
-            build_decision_targets(&project_path("/decisions/answer"), &policy).unwrap_err(),
+            build_decision_targets(
+                &project_path("/decisions/answer"),
+                &Query::default(),
+                &policy
+            )
+            .unwrap_err(),
             ReadDenial::NoRoute
         );
         assert_eq!(
-            build_decision_targets("/api/v1/info", &policy).unwrap_err(),
+            build_decision_targets("/api/v1/info", &Query::default(), &policy).unwrap_err(),
             ReadDenial::NoRoute
         );
+    }
+
+    #[tokio::test]
+    async fn decision_targets_forward_pending_after_and_deny_invalid_queries() {
+        let policy = policy();
+        let path = project_path("/decision-targets");
+        let cursor = format!("pending-approval:{SESSION}");
+        let query = Query {
+            pending_after: Some(cursor.clone()),
+            ..Query::default()
+        };
+        let call = build_decision_targets(&path, &query, &policy).unwrap();
+        assert_eq!(call.wire().unwrap()["params"]["pending_after"], cursor);
+        let dispatch = CountingDispatch::new();
+        for query in [
+            Query {
+                pending_after: Some(String::new()),
+                ..Query::default()
+            },
+            Query {
+                pending_after: Some("x".repeat(161)),
+                ..Query::default()
+            },
+            Query {
+                cursor: Some("x".into()),
+                ..Query::default()
+            },
+            Query {
+                before: Some((1, 2)),
+                ..Query::default()
+            },
+        ] {
+            assert_eq!(
+                serve_operator(&path, &query, &policy, &dispatch)
+                    .await
+                    .unwrap_err(),
+                ServeError::Denied(ReadDenial::InvalidRequest)
+            );
+        }
+        assert_eq!(dispatch.operator_calls(), 0);
     }
 
     #[tokio::test]
@@ -813,7 +968,9 @@ mod tests {
         let dispatch = CountingDispatch::new();
         let path = format!("/api/v1/projects/{OTHER}/sessions/{SESSION}/decision-targets");
         assert_eq!(
-            serve_operator(&path, &policy, &dispatch).await.unwrap_err(),
+            serve_operator(&path, &Query::default(), &policy, &dispatch)
+                .await
+                .unwrap_err(),
             ServeError::Denied(ReadDenial::ProjectOutOfScope)
         );
         assert_eq!(dispatch.operator_calls(), 0);
@@ -835,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_call_sends_typed_params_without_a_session_token() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, seen) = start_fake(dir.path(), RECEIPT_LINE.to_vec());
         let reads = DaemonReads::new(socket);
         let call = answer_call();
@@ -863,7 +1020,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_calls_have_their_own_permit_pool() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, _) = start_fake(dir.path(), RECEIPT_LINE.to_vec());
         let reads = DaemonReads::new(socket);
         let held: Vec<_> = (0..4)
@@ -892,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_error_is_refused_with_the_daemon_message() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, _) = start_fake(
             dir.path(),
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"manager_v2_decision_changed\"}}\n"
@@ -907,7 +1064,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_non_object_result_is_transport_malformed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, _) = start_fake(
             dir.path(),
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":42}\n".to_vec(),
@@ -930,7 +1087,7 @@ mod tests {
             r#"{"event_sequence":9,"key":7,"row_version":4,"deduplicated":false}"#,
             r#"{"event_sequence":9,"key":"answer-1","row_version":4,"deduplicated":"no"}"#,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::short_tempdir().unwrap();
             let (socket, _) = start_fake(
                 dir.path(),
                 format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{result}}}\n").into_bytes(),
@@ -977,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_sends_one_jsonrpc_object_without_a_session_token() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, seen) = start_fake(
             dir.path(),
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n".to_vec(),
@@ -997,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_error_object_maps_to_daemon_code() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, _) = start_fake(
             dir.path(),
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"nope\"}}\n"
@@ -1011,8 +1168,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_busy_code_is_the_remote_busy_error() {
+        let dir = crate::test_support::short_tempdir().unwrap();
+        let (socket, _) = start_fake(
+            dir.path(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"busy\",\"data\":{\"remote_code\":\"busy\"}}}\n"
+                .to_vec(),
+        );
+        let reads = DaemonReads::new(socket);
+        assert_eq!(
+            reads.dispatch(&info_request()).await.unwrap_err(),
+            ReadError::Busy
+        );
+    }
+
+    #[test]
+    fn failures_map_to_distinct_statuses() {
+        assert_eq!(ReadError::Busy.http_status(), 503);
+        assert_eq!(ReadError::Timeout.http_status(), 503);
+        assert_eq!(ReadError::Connect.http_status(), 502);
+        assert_eq!(ReadError::PeerMismatch.http_status(), 502);
+        assert_eq!(ReadError::Malformed.http_status(), 500);
+        assert_eq!(ReadError::Oversize.http_status(), 500);
+        assert_eq!(ReadError::Daemon(-32603).http_status(), 500);
+    }
+
+    #[tokio::test]
     async fn non_object_result_is_malformed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let (socket, _) = start_fake(
             dir.path(),
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":42}\n".to_vec(),
@@ -1026,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_line_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let mut reply = vec![b'x'; MAX_RESPONSE_BYTES + 1];
         reply.push(b'\n');
         let (socket, _) = start_fake(dir.path(), reply);
@@ -1039,7 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn silent_daemon_times_out() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         tokio::spawn(async move {
@@ -1055,7 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_socket_is_connect_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::short_tempdir().unwrap();
         let reads = DaemonReads::new(dir.path().join("absent.sock"));
         assert_eq!(
             reads.dispatch(&info_request()).await.unwrap_err(),
@@ -1075,5 +1258,47 @@ mod tests {
         assert_eq!(ReadError::Oversize.code(), "oversize");
         assert_eq!(ReadError::Malformed.code(), "malformed");
         assert_eq!(ReadError::Daemon(-1).code(), "daemon_error");
+    }
+
+    /// hub #3151: the gateway's method list is exactly what its route tables
+    /// and operator calls can name.
+    #[test]
+    fn gateway_daemon_methods_name_every_route_and_operator_call() {
+        let id = "8a0e0c3e-6d1f-4c38-9c9e-2b7c1e4f5a60";
+        let v1 = [
+            "/api/v1/info".to_string(),
+            "/api/v1/projects".to_string(),
+            format!("/api/v1/projects/{id}/sessions"),
+            format!("/api/v1/projects/{id}/sessions/{id}"),
+            format!("/api/v1/projects/{id}/sessions/{id}/history"),
+            format!("/api/v1/projects/{id}/sessions/{id}/decisions"),
+            format!("/api/v1/projects/{id}/sessions/{id}/decision-targets"),
+        ];
+        let v2 = [
+            "/api/v2/projects".to_string(),
+            format!("/api/v2/projects/{id}/managers/{id}/conversation"),
+        ];
+        let mut named: Vec<&str> = v1
+            .iter()
+            .map(|path| ingress::read_method(path).expect(path))
+            .chain(
+                v2.iter()
+                    .map(|path| ingress::v2_read_method(path).expect(path)),
+            )
+            .collect();
+        // Each `OperatorCall` variant's method (`OperatorCall::method`).
+        named.extend([
+            "RemoteGetDecisionTargetsV1",
+            "AnswerHarnessManagerDecision",
+            "AnswerPendingDecisionV1",
+            METHOD_LIST_SEATS,
+            METHOD_CONVERSATION,
+            METHOD_SEND,
+        ]);
+        named.sort_unstable();
+        named.dedup();
+        let mut listed = GATEWAY_DAEMON_METHODS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, named);
     }
 }

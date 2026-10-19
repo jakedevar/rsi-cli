@@ -105,6 +105,7 @@ pub(crate) struct SnapshotMetadata {
 }
 
 pub(crate) enum BootstrapEvent {
+    TargetPoolStatus(Result<rsi_common::target_pool::TargetPoolStatus, String>),
     Handshake {
         attempt: u64,
         result: Result<HandshakeSuccess, String>,
@@ -172,6 +173,9 @@ pub(crate) struct BootstrapCoordinator {
     usage_refresh_requested: bool,
     config_refresh_generation: u64,
     active_config_refresh_generation: Option<u64>,
+    /// The client's config-write epoch when the active refresh was requested;
+    /// a refresh that finishes under a different epoch raced a write (#2882).
+    config_refresh_write_epoch: u64,
     usage_refresh_generation: u64,
     active_usage_refresh_generation: Option<u64>,
     first_frame_recorded: bool,
@@ -208,6 +212,7 @@ impl Default for BootstrapCoordinator {
             usage_refresh_requested: false,
             config_refresh_generation: 0,
             active_config_refresh_generation: None,
+            config_refresh_write_epoch: 0,
             usage_refresh_generation: 0,
             active_usage_refresh_generation: None,
             first_frame_recorded: false,
@@ -363,6 +368,16 @@ impl BootstrapCoordinator {
         Some((generation, self.tx.clone()))
     }
 
+    /// True while the last storage preview settled successfully less than
+    /// `max_age` ago and nothing newer is pending (#2604).
+    fn storage_status_is_recent(&self, max_age: Duration) -> bool {
+        matches!(self.storage_status, SandboxStorageStatus::Fresh { .. })
+            && self.last_storage_success_at.is_some_and(|at| {
+                chrono::Duration::from_std(max_age)
+                    .is_ok_and(|max_age| Utc::now().signed_duration_since(at) < max_age)
+            })
+    }
+
     fn admit_automatic_storage_refresh(&mut self) -> bool {
         self.storage_admission_ready = true;
         self.storage_requested_for_attempt && !self.storage_started_for_attempt
@@ -445,6 +460,12 @@ impl BootstrapCoordinator {
         let generation = self.config_refresh_generation;
         self.active_config_refresh_generation = Some(generation);
         Some((self.attempt, generation, self.tx.clone()))
+    }
+
+    /// Whether the refresh requested under `write_epoch` raced a daemon-config
+    /// write and so may hold a value older than the one just written.
+    fn config_refresh_raced_write(&self, current_write_epoch: u64) -> bool {
+        self.config_refresh_write_epoch != current_write_epoch
     }
 
     fn finish_config_refresh(&mut self, generation: u64) -> bool {
@@ -687,6 +708,7 @@ async fn run_storage_status(
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
+    let pool_socket_path = socket_path.clone();
     let mut client = DaemonClient::new(socket_path);
     let result = async {
         client.connect().await.map_err(|error| error.to_string())?;
@@ -700,6 +722,17 @@ async fn run_storage_status(
     let _ = tx
         .send(BootstrapEvent::StorageStatus { generation, result })
         .await;
+    // #1882: the warm pools ride the same refresh; a failure shows in its row.
+    let pools = async {
+        let mut client = DaemonClient::new(pool_socket_path);
+        client.connect().await.map_err(|error| error.to_string())?;
+        client
+            .get_target_pool_status()
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    let _ = tx.send(BootstrapEvent::TargetPoolStatus(pools)).await;
 }
 
 async fn run_daemon_config_refresh(
@@ -848,6 +881,10 @@ impl App {
     }
 
     pub(crate) fn apply_authoritative_daemon_config(&mut self, json: &Value) {
+        self.coordinator_context_budgets = json
+            .get("coordinator_context_budgets")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         let recovered = !self.authoritative_config_ready();
         crate::settings::DaemonFeatureEntry::update_from_json(&mut self.daemon_features, json);
         self.sync_provider_profile();
@@ -951,6 +988,10 @@ impl App {
         let socket_path = self.client.socket_path().to_path_buf();
         let active_draft = self.graph_review_draft_id();
         let config_syncs = if self.authoritative_config_ready() {
+            // hub #3039: load the daemon's custom providers; the handler then
+            // points each model role at its provider.
+            self.pending_lc_actions
+                .push(crate::modalkit_types::LcAction::RefreshCustomProviders);
             self.bootstrap_config_syncs()
         } else {
             Vec::new()
@@ -1015,6 +1056,7 @@ impl App {
         let Some((attempt, generation, tx)) = self.bootstrap.prepare_config_refresh() else {
             return;
         };
+        self.bootstrap.config_refresh_write_epoch = self.client.config_write_epoch();
         let socket_path = self.client.socket_path().to_path_buf();
         self.bootstrap.config_refresh_handle = Some(tokio::spawn(run_daemon_config_refresh(
             socket_path,
@@ -1024,29 +1066,11 @@ impl App {
         )));
     }
 
+    /// The TUI-owned model fields pushed at connect. A custom provider's base
+    /// URL and key are not among them: the daemon resolves both for each
+    /// role (`SetCustomProviderRoute`, sent after the provider list loads,
+    /// hub #3039).
     fn bootstrap_config_syncs(&self) -> Vec<(String, Value)> {
-        let title_custom = self.settings.title_model_custom_provider_id.and_then(|id| {
-            self.settings
-                .custom_providers
-                .iter()
-                .find(|entry| entry.id == id)
-        });
-        let memory_custom = self
-            .settings
-            .memory_model_fallback_custom_provider_id
-            .and_then(|id| {
-                self.settings
-                    .custom_providers
-                    .iter()
-                    .find(|entry| entry.id == id)
-            });
-        let dream_custom = self.settings.dream_model_custom_provider_id.and_then(|id| {
-            self.settings
-                .custom_providers
-                .iter()
-                .find(|entry| entry.id == id)
-        });
-
         vec![
             (
                 "title_model_local".into(),
@@ -1061,14 +1085,6 @@ impl App {
                 serde_json::json!(self.settings.title_model_provider),
             ),
             (
-                "title_model_base_url".into(),
-                serde_json::json!(title_custom.map(|entry| entry.base_url.clone())),
-            ),
-            (
-                "title_model_api_key".into(),
-                serde_json::json!(title_custom.map(|entry| entry.api_key.clone())),
-            ),
-            (
                 "memory_model_local".into(),
                 serde_json::json!(self.settings.memory_model_local),
             ),
@@ -1081,28 +1097,12 @@ impl App {
                 serde_json::json!(self.settings.memory_model_fallback_provider),
             ),
             (
-                "memory_model_fallback_base_url".into(),
-                serde_json::json!(memory_custom.map(|entry| entry.base_url.clone())),
-            ),
-            (
-                "memory_model_fallback_api_key".into(),
-                serde_json::json!(memory_custom.map(|entry| entry.api_key.clone())),
-            ),
-            (
                 "dream_model".into(),
                 serde_json::json!(self.settings.dream_model),
             ),
             (
                 "dream_model_provider".into(),
                 serde_json::json!(self.settings.dream_model_provider),
-            ),
-            (
-                "dream_model_base_url".into(),
-                serde_json::json!(dream_custom.map(|entry| entry.base_url.clone())),
-            ),
-            (
-                "dream_model_api_key".into(),
-                serde_json::json!(dream_custom.map(|entry| entry.api_key.clone())),
             ),
             (
                 "prompt_compile_model_local".into(),
@@ -1112,15 +1112,19 @@ impl App {
                 "prompt_compile_model_provider".into(),
                 serde_json::json!(self.settings.prompt_processor.provider),
             ),
-            (
-                "prompt_compile_model_base_url".into(),
-                serde_json::json!(self.settings.prompt_processor.custom_base_url),
-            ),
-            (
-                "prompt_compile_model_api_key".into(),
-                serde_json::json!(self.settings.prompt_processor.custom_api_key),
-            ),
         ]
+    }
+
+    /// Request a storage preview unless a settled one is younger than
+    /// `max_age`. Event-driven callers use this so a stream of model-call
+    /// events with the Settings panel open cannot multiply the daemon's
+    /// full-store scan (#2604); the handshake and explicit previews still ask
+    /// unconditionally.
+    pub(crate) fn request_storage_status_refresh_if_stale(&mut self, max_age: Duration) {
+        if self.bootstrap.storage_status_is_recent(max_age) {
+            return;
+        }
+        self.request_storage_status_refresh();
     }
 
     pub(crate) fn request_storage_status_refresh(&mut self) {
@@ -1550,6 +1554,14 @@ impl App {
                 self.finish_direct_storage_refresh(generation, result);
                 true
             }
+            BootstrapEvent::TargetPoolStatus(result) => {
+                crate::settings::DaemonFeatureEntry::update_target_pool_status(
+                    &mut self.daemon_features,
+                    &result,
+                );
+                self.mark_dirty();
+                true
+            }
             BootstrapEvent::DaemonConfigRefresh {
                 attempt,
                 generation,
@@ -1560,6 +1572,16 @@ impl App {
                     return false;
                 }
                 match result {
+                    // A read that overlapped one of our own config writes may
+                    // hold the pre-write value and would revert the TUI's
+                    // mirror of it (#2882): drop it and read again.
+                    Ok(_)
+                        if self
+                            .bootstrap
+                            .config_refresh_raced_write(self.client.config_write_epoch()) =>
+                    {
+                        self.request_daemon_config_refresh();
+                    }
                     Ok(json) => self.apply_authoritative_daemon_config(&json),
                     Err(error) if self.authoritative_config_ready() => {
                         tracing::warn!(attempt, %error, "Optional daemon configuration refresh failed");
@@ -1646,21 +1668,13 @@ mod tests {
             "title_model_local",
             "title_model_fallback",
             "title_model_provider",
-            "title_model_base_url",
-            "title_model_api_key",
             "memory_model_local",
             "memory_model_fallback",
             "memory_model_fallback_provider",
-            "memory_model_fallback_base_url",
-            "memory_model_fallback_api_key",
             "dream_model",
             "dream_model_provider",
-            "dream_model_base_url",
-            "dream_model_api_key",
             "prompt_compile_model_local",
             "prompt_compile_model_provider",
-            "prompt_compile_model_base_url",
-            "prompt_compile_model_api_key",
         ]
         .into_iter()
         .map(str::to_string)
@@ -1714,6 +1728,23 @@ mod tests {
             candidate_budget_exhausted: false,
             stop_reason: SandboxBuildCacheReclaimStopReason::Completed,
         }
+    }
+
+    #[test]
+    fn storage_status_recency_gates_event_driven_refreshes() {
+        let mut coordinator = BootstrapCoordinator::default();
+        coordinator.storage_admission_ready = true;
+        let window = Duration::from_secs(30);
+        assert!(!coordinator.storage_status_is_recent(window));
+        let (generation, _) = coordinator
+            .prepare_automatic_storage_refresh()
+            .expect("first automatic refresh starts");
+        assert!(!coordinator.storage_status_is_recent(window));
+        coordinator.finish_storage_refresh(generation, Ok(report(1)));
+        assert!(coordinator.storage_status_is_recent(window));
+        assert!(!coordinator.storage_status_is_recent(Duration::ZERO));
+        coordinator.last_storage_success_at = Some(Utc::now() - chrono::Duration::seconds(31));
+        assert!(!coordinator.storage_status_is_recent(window));
     }
 
     #[test]
@@ -1938,5 +1969,104 @@ mod tests {
             .prepare_handshake()
             .expect("one retry starts after its bounded delay");
         assert_eq!(retry_attempt, attempt + 1);
+    }
+    /// Answer `count` `UpdateDaemonConfig` calls with ok on one connection.
+    async fn answer_config_writes(listener: tokio::net::UnixListener, count: usize) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let Ok((stream, _)) = listener.accept().await else {
+            panic!("client never connected");
+        };
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        for _ in 0..count {
+            let Ok(Some(line)) = lines.next_line().await else {
+                return;
+            };
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                panic!("bad request: {line}");
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"ok": true},
+            });
+            let Ok(()) = write.write_all(format!("{response}\n").as_bytes()).await else {
+                panic!("failed to answer");
+            };
+        }
+    }
+
+    /// #2882: a `GetDaemonConfig` read that was in flight while this TUI wrote
+    /// `editing_mode` holds the pre-write value. Applying it reverted the
+    /// cached setting, so the composer kept the previous mode until some later
+    /// refresh. The stale result is dropped and read again instead.
+    #[tokio::test]
+    async fn a_config_read_that_raced_a_write_never_reverts_the_written_value() {
+        use crate::settings::DaemonFeatureEntry;
+        use rsi_common::editing_mode::EditingMode;
+
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("tempdir");
+        };
+        let socket = dir.path().join("daemon.sock");
+        let Ok(listener) = tokio::net::UnixListener::bind(&socket) else {
+            panic!("bind");
+        };
+        let server = tokio::spawn(answer_config_writes(listener, 1));
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = crate::client::DaemonClient::new(socket);
+        let Ok(()) = app.client.connect().await else {
+            panic!("connect");
+        };
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": "vim" }),
+        );
+
+        // A refresh starts and reads "vim" ...
+        app.request_daemon_config_refresh();
+        let attempt = app.bootstrap.attempt();
+        let generation = app.bootstrap.active_config_refresh_generation;
+        let Some(generation) = generation else {
+            panic!("a refresh is active");
+        };
+        // ... then this TUI writes "standard" and mirrors it ...
+        let Ok(()) = app
+            .client
+            .update_daemon_config("editing_mode", serde_json::json!("standard"))
+            .await
+        else {
+            panic!("write");
+        };
+        DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": "standard" }),
+        );
+        // ... and only then the stale "vim" read arrives.
+        app.apply_bootstrap_event(BootstrapEvent::DaemonConfigRefresh {
+            attempt,
+            generation,
+            result: Ok(serde_json::json!({ "editing_mode": "vim" })),
+        });
+        assert_eq!(app.editing_mode(), Some(EditingMode::Standard));
+        // The dropped read is replaced by a fresh one.
+        assert_ne!(
+            app.bootstrap.active_config_refresh_generation,
+            Some(generation)
+        );
+        assert!(app.bootstrap.active_config_refresh_generation.is_some());
+        let Ok(()) = server.await else {
+            panic!("server");
+        };
+    }
+
+    #[test]
+    fn a_config_read_with_no_write_in_between_is_applied() {
+        let mut coordinator = BootstrapCoordinator::default();
+        coordinator.config_refresh_write_epoch = 4;
+        assert!(!coordinator.config_refresh_raced_write(4));
+        assert!(coordinator.config_refresh_raced_write(6));
     }
 }

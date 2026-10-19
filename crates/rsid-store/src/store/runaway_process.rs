@@ -70,7 +70,7 @@ impl RunawayProcessReport {
     #[must_use]
     pub fn suggested_action(&self) -> String {
         let halt = format!(
-            "AgentHalt {{\"session_id\":\"{}\"}}, then AgentContinueChild with a scoped instruction (filters from scripts/check-touched-shards; scripts/scoped-test)",
+            "AgentHalt {{\"session_id\":\"{}\"}}, then AgentContinueChild with a scoped instruction (verify with one scoped_test job; the merge queue derives the landing filters)",
             self.session_id
         );
         if self.tree == "session" {
@@ -103,6 +103,30 @@ impl RunawayProcessReport {
     }
 }
 
+/// One typed runaway record, ready to route (#1337 process, #2682 disk).
+pub(super) struct RunawayRecord {
+    /// `runaway_process` or `runaway_disk`: the record kind and subject prefix.
+    pub(super) kind: &'static str,
+    /// The idempotency version of the manager notice.
+    pub(super) version: String,
+    pub(super) state: Value,
+    /// One line naming what was measured, for the Epic-lead mail.
+    pub(super) headline: String,
+    pub(super) suggested: String,
+    pub(super) idempotency_key: String,
+    pub(super) observed_at: DateTime<Utc>,
+}
+
+impl RunawayRecord {
+    fn mail_issue(&self) -> &'static str {
+        if self.kind == RUNAWAY_PROCESS_NOTICE {
+            "#1337"
+        } else {
+            "#2682"
+        }
+    }
+}
+
 fn parse_uuid(text: &str) -> Result<Uuid> {
     Uuid::parse_str(text).map_err(|error| DaemonError::Store(format!("invalid stored id: {error}")))
 }
@@ -117,33 +141,57 @@ impl Store {
         &self,
         report: &RunawayProcessReport,
     ) -> Result<RunawayNoticeRoute> {
-        let Some(session) = self.get_session(report.session_id)? else {
+        self.route_runaway_record(
+            report.session_id,
+            &RunawayRecord {
+                kind: RUNAWAY_PROCESS_NOTICE,
+                version: report.tree_id.to_string(),
+                state: report.state(),
+                headline: report.state().to_string(),
+                suggested: report.suggested_action(),
+                idempotency_key: format!("runaway-process:{}", report.tree_id),
+                observed_at: report.observed_at,
+            },
+        )
+    }
+
+    /// Route one typed runaway record (process or disk) to whoever can stop it:
+    /// the project's live manager, else the Epic lead's mail, else nobody.
+    /// Idempotent on the record's `version`.
+    pub(super) fn route_runaway_record(
+        &self,
+        session_id: Uuid,
+        record: &RunawayRecord,
+    ) -> Result<RunawayNoticeRoute> {
+        let Some(session) = self.get_session(session_id)? else {
             return Ok(RunawayNoticeRoute::Unrouted);
         };
         if let Some(project) = session.project_id
-            && let Some(job) = self.record_runaway_manager_notice(project, report)?
+            && let Some(job) = self.record_runaway_manager_notice(project, session_id, record)?
         {
             return Ok(RunawayNoticeRoute::ManagerNotice(job));
         }
-        let Some(launcher) = self.worker_baton_launcher(report.session_id)? else {
+        let Some(launcher) = self.worker_baton_launcher(session_id)? else {
             return Ok(RunawayNoticeRoute::Unrouted);
         };
-        if launcher.kind != WorkerLauncherKind::EpicLead || launcher.launcher == report.session_id {
+        if launcher.kind != WorkerLauncherKind::EpicLead || launcher.launcher == session_id {
             return Ok(RunawayNoticeRoute::Unrouted);
         }
         let mail = self.accept_agent_message(
-            report.session_id,
+            session_id,
             None,
             &AgentSendMessageRequestV1 {
                 target_session_id: launcher.launcher,
                 message: format!(
-                    "[rsi daemon, #1337 runaway_process] {}\nStop it now unless it is about to finish: {}. Report the stopped run in your handoff.",
-                    report.state(),
-                    report.suggested_action()
+                    "[rsi daemon, {} {}] {}\nStop it now unless it is about to finish: {}. Report the stopped run in your handoff.",
+                    record.mail_issue(),
+                    record.kind,
+                    record.headline,
+                    record.suggested
                 ),
-                idempotency_key: format!("runaway-process:{}", report.tree_id),
+                idempotency_key: record.idempotency_key.clone(),
                 expires_at: Some(
-                    report.observed_at + chrono::Duration::hours(RUNAWAY_MAIL_EXPIRY_HOURS),
+                    record.observed_at + chrono::Duration::hours(RUNAWAY_MAIL_EXPIRY_HOURS),
                 ),
             },
         )?;
@@ -155,7 +203,8 @@ impl Store {
     fn record_runaway_manager_notice(
         &self,
         project: Uuid,
-        report: &RunawayProcessReport,
+        session_id: Uuid,
+        record: &RunawayRecord,
     ) -> Result<Option<Uuid>> {
         let Some(config) = self.get_harness_manager_notice_config(project)? else {
             return Ok(None);
@@ -163,8 +212,8 @@ impl Store {
         if config.current_session_id.is_none() || config.is_revoked() {
             return Ok(None);
         }
-        let subject = format!("{RUNAWAY_PROCESS_NOTICE}:{}", report.session_id);
-        let version = report.tree_id.to_string();
+        let subject = format!("{}:{session_id}", record.kind);
+        let version = record.version.clone();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing: Option<String> = self
             .conn
@@ -194,10 +243,10 @@ impl Store {
                 project.to_string(),
                 config.manager_session_id.to_string(),
                 config.row_version,
-                report.session_id.to_string(),
+                session_id.to_string(),
                 subject,
                 version,
-                serde_json::to_string(&report.state())?,
+                serde_json::to_string(&record.state)?,
                 super::harness_manager_v2::now(),
             ],
         )?;
@@ -254,6 +303,8 @@ mod tests {
         let suggested = state["suggested"].as_str().unwrap();
         assert!(suggested.starts_with(&format!("AgentHalt {{\"session_id\":\"{session}\"}}")));
         assert!(suggested.contains("AgentContinueChild"));
+        assert!(suggested.contains("scoped_test"), "{suggested}");
+        assert!(!suggested.contains("check-touched-shards"), "{suggested}");
         let job = report(session, "job_test").suggested_action();
         assert!(job.contains("AgentCancelJob"), "{job}");
         assert!(job.contains(&Uuid::from_u128(7).to_string()), "{job}");

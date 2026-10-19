@@ -257,6 +257,8 @@ pub struct GlobalManagerWorkspaceState {
     pub target: Option<ManagerNodeRefV1>,
     /// #1240: the node snapshot behind `snapshot` when `target` is set.
     pub node: Option<ManagerNodeWorkspaceV1>,
+    /// #2502: the Budget panel (`b`), while open.
+    pub budget: Option<crate::overlay::gm_budget::BudgetPanel>,
 }
 
 fn sum<I: IntoIterator<Item = i64>>(values: I) -> i64 {
@@ -544,7 +546,7 @@ impl GlobalManagerWorkspaceState {
                     "{:?}/{}/{}",
                     launch.provider,
                     launch.model,
-                    launch.effort.as_deref().unwrap_or("default")
+                    launch.effort_label()
                 )
             })
             .collect();
@@ -638,6 +640,22 @@ impl GlobalManagerWorkspaceState {
                     line.push_str(&format!(" · granted by {grantor}"));
                 }
                 lines.push(line);
+                if let Some(handoff) = &node.last_seat_handoff {
+                    let reference = handoff.handoff.as_deref().map_or_else(String::new, |text| {
+                        format!(" · handoff {}", text.chars().take(80).collect::<String>())
+                    });
+                    let changed = if handoff.handoff_changed_after_appointment {
+                        " · handoff edited after the handover"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!(
+                        "Seat handed on {} -> {} at {}{reference}{changed}",
+                        short(handoff.old_seat),
+                        short(handoff.new_seat),
+                        handoff.handed_at.format("%Y-%m-%d %H:%MZ"),
+                    ));
+                }
             }
             ManagerNodeRefV1::Project { .. } => {
                 if let Some(project) = node.projects.first() {
@@ -1059,44 +1077,86 @@ pub fn seat_header(width: usize) -> String {
     out.trim_end().to_string()
 }
 
-/// One seat's list row (without the selection marker), aligned under
-/// `seat_header(width)`. Columns appear as the width allows.
+/// A seat-list column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatColumn {
+    Name,
+    Health,
+    Context,
+    Issues,
+    Model,
+    Running,
+    Waiting,
+    Questions,
+    Approvals,
+    Updated,
+}
+
+/// One seat's list cells, aligned under `seat_header(width)`. Each cell
+/// carries its own leading separator, so the cells joined are the row text
+/// (`seat_row_text`). Columns appear as the width allows.
 #[must_use]
-pub fn seat_row_text(seat: &SeatEntry, width: usize) -> String {
+pub fn seat_cells(seat: &SeatEntry, width: usize) -> Vec<(SeatColumn, String)> {
     let indent = "  ".repeat(seat.depth);
-    let name = fit(&format!("{indent}{}", seat.label), 20);
     let issues = seat.issues.map_or_else(
         || "-".into(),
         |(open, prog, req)| format!("{open}/{prog}/{req}"),
     );
-    let mut out = format!(
-        "{name} {:<8} {:>4}  {:<8}",
-        seat.health.label(),
-        pct(seat.context_fill_pct),
-        issues
-    );
+    let mut cells = vec![
+        (
+            SeatColumn::Name,
+            fit(&format!("{indent}{}", seat.label), 20),
+        ),
+        (SeatColumn::Health, format!(" {:<8}", seat.health.label())),
+        (
+            SeatColumn::Context,
+            format!(" {:>4}", pct(seat.context_fill_pct)),
+        ),
+        (SeatColumn::Issues, format!("  {issues:<8}")),
+    ];
     if width >= MODEL_WIDTH {
-        out.push_str(&format!(
-            " {}",
-            fit(seat.model.as_deref().unwrap_or("-"), 18)
+        cells.push((
+            SeatColumn::Model,
+            format!(" {}", fit(seat.model.as_deref().unwrap_or("-"), 18)),
         ));
     }
     if width >= ACTIVITY_WIDTH {
-        match seat.activity {
-            Some((run, wait, q, appr)) => {
-                out.push_str(&format!(" {run:>4} {wait:>4} {q:>2} {appr:>4}"));
-            }
-            None => out.push_str(&format!(" {:>4} {:>4} {:>2} {:>4}", "-", "-", "-", "-")),
-        }
+        let (run, wait, q, appr) = match seat.activity {
+            Some((run, wait, q, appr)) => (
+                run.to_string(),
+                wait.to_string(),
+                q.to_string(),
+                appr.to_string(),
+            ),
+            None => ("-".into(), "-".into(), "-".into(), "-".into()),
+        };
+        cells.push((SeatColumn::Running, format!(" {run:>4}")));
+        cells.push((SeatColumn::Waiting, format!(" {wait:>4}")));
+        cells.push((SeatColumn::Questions, format!(" {q:>2}")));
+        cells.push((SeatColumn::Approvals, format!(" {appr:>4}")));
     }
     if width >= UPDATED_WIDTH {
-        out.push_str(&format!(
-            "  {}",
-            seat.updated_at
-                .map_or_else(|| "-".into(), |at| at.format("%m-%d %H:%M").to_string())
+        cells.push((
+            SeatColumn::Updated,
+            format!(
+                "  {}",
+                seat.updated_at
+                    .map_or_else(|| "-".into(), |at| at.format("%m-%d %H:%M").to_string())
+            ),
         ));
     }
-    out.trim_end().to_string()
+    cells
+}
+
+/// One seat's list row as plain text (without the rail and status glyph),
+/// aligned under `seat_header(width)`.
+#[must_use]
+pub fn seat_row_text(seat: &SeatEntry, width: usize) -> String {
+    let text: String = seat_cells(seat, width)
+        .into_iter()
+        .map(|(_, cell)| cell)
+        .collect();
+    text.trim_end().to_string()
 }
 
 /// The selected seat's description, shown above its conversation: who it
@@ -1191,7 +1251,12 @@ pub fn open_conversation_session(app: &App) -> Option<Uuid> {
 /// overlay leader must not take Space.
 #[must_use]
 pub fn owns_text_entry(state: &GlobalManagerWorkspaceState) -> bool {
-    state.launch.is_some() || state.focus == WorkspaceFocus::Input
+    state.launch.is_some()
+        || state.focus == WorkspaceFocus::Input
+        || state
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.entry.is_some())
 }
 
 /// Open the workspace above whatever overlay or pane is showing, or refresh
@@ -1625,7 +1690,7 @@ fn open_project_tab(app: &mut App) {
 }
 
 /// Open the instantiate-a-manager form for the selected seat (`n`).
-fn open_launch_form(app: &mut App) {
+async fn open_launch_form(app: &mut App) {
     let projects = app.projects.clone();
     let active_project = app.active_project_id();
     let Some(workspace) = state(app) else { return };
@@ -1651,15 +1716,30 @@ fn open_launch_form(app: &mut App) {
         }
         _ => LaunchRole::Global,
     };
-    workspace.launch = Some(LaunchForm::new(
-        role,
-        &projects,
-        workspace.grant(),
-        active_project,
-    ));
+    let revoked_grant = workspace
+        .grant()
+        .is_some_and(|grant| grant.state != "active");
+    let mut form = LaunchForm::new(role, &projects, workspace.grant(), active_project);
     workspace.focus = WorkspaceFocus::Seats;
     workspace.error = None;
     workspace.notice = None;
+    // #1902: tell the operator, before saving, that the appointment starts
+    // from the last revoked root grant and how it differs from the defaults.
+    if role == LaunchRole::Global && revoked_grant {
+        let coverage = form.checked_projects();
+        if let Ok(Some(prefill)) =
+            crate::overlay::global_manager_command::revoked_prefill(app, &coverage).await
+        {
+            form.prefill_note = Some(crate::overlay::global_manager_command::prefill_summary(
+                &prefill,
+            ));
+            // #2237: the grant editor starts from that grant too.
+            form.reseed_global_grant(prefill.policy.clone(), prefill.allowed_launches.clone());
+        }
+    }
+    if let Some(workspace) = state(app) {
+        workspace.launch = Some(form);
+    }
 }
 
 /// #1240: open the shown node's parent (`Backspace`); the global's console
@@ -1690,6 +1770,17 @@ async fn submit_launch(app: &mut App, confirm_cap_reductions: bool) {
             return;
         }
     };
+    // #2237: an edited grant is checked here, before anything launches; the
+    // editor opens on the row to fix.
+    if form.grant_visited
+        && let Err((row, message)) = form.grant.validate()
+    {
+        form.grant.select_row(row);
+        form.grant.error = Some(message.clone());
+        form.grant_open = true;
+        form.error = Some(message);
+        return;
+    }
     let mut launched = form.launched;
     let result = launch_and_appoint(app, &request, &mut launched, confirm_cap_reductions).await;
     let Some(workspace) = state(app) else { return };
@@ -1882,6 +1973,10 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
 
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
     let Some(workspace) = state(app) else { return };
+    if workspace.budget.is_some() {
+        crate::overlay::gm_budget::handle_key(app, key).await;
+        return;
+    }
     if workspace.launch.is_some() {
         handle_launch_key(app, key).await;
         app.mark_dirty();
@@ -1912,7 +2007,8 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => halt_seat(app, false).await,
         KeyCode::Char('X') => halt_seat(app, true).await,
         KeyCode::Char('a') => archive_seat(app).await,
-        KeyCode::Char('n') => open_launch_form(app),
+        KeyCode::Char('n') => open_launch_form(app).await,
+        KeyCode::Char('b') => crate::overlay::gm_budget::open(app).await,
         KeyCode::Tab => {
             if workspace.conversation_session_id().is_some() {
                 workspace.focus = WorkspaceFocus::Conversation;

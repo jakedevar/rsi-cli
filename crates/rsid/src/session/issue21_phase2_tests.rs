@@ -8,8 +8,9 @@ use crate::store::Store;
 use crate::store::agent_coordination::{
     AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS, AcknowledgeAgentMessageOutcome, AgentMessageClaimCasLoss,
     AgentMessageDispatchEligibility, ClaimAgentMessageOutcome, ClaimAgentMessageRequest,
-    NoEffectDisposition, RecordAdmissionOutcome,
+    DispatchableAgentMessage, NoEffectDisposition, RecordAdmissionOutcome,
     TARGET_SESSION_TERMINAL_BEFORE_DELIVERY_ERROR_CLASS,
+    override_dispatch_scan_max_millis_for_test,
 };
 use crate::store::capacity_recovery::{
     CapacityCloseKind, CapacityCloseOutcome, CapacityCommitKind,
@@ -263,11 +264,8 @@ mod p2_07_gate_permit_spine {
     /// acknowledgement seams to a `correlated` + `effect_acknowledged`
     /// AppServer attempt at exactly [`TURN`].
     ///
-    /// One fill is raw SQL and deliberately so: `correlation_state='correlated'`
-    /// has NO production writer anywhere in the tree yet — the AppServer
-    /// correlation path is Family B/C's, not P2-07's. Seeding it is fixture,
-    /// not a mock of anything this slice claims to cover; every gate and permit
-    /// writer under test below is the real production method.
+    /// Every fill is a real production method, including
+    /// `correlation_state='correlated'`, which the acknowledgement writes (#47).
     fn correlated_world(store: &Store, key: &str) -> GateWorld {
         let owner = Uuid::new_v4();
         let target = Uuid::new_v4();
@@ -328,17 +326,21 @@ mod p2_07_gate_permit_spine {
             "the fixture's acknowledgement must commit, got {acknowledged:?}"
         );
 
-        store
+        // No seeding: the real acknowledgement above is the production writer
+        // of `correlated` (#47). Assert it, so a regression fails here and not
+        // as an inexplicable closed gate further down.
+        let (correlation, source): (String, Option<String>) = store
             .conn
-            .execute(
-                "UPDATE agent_message_delivery_attempts
-                    SET correlation_state='correlated',
-                        correlation_source='app_server_response',
-                        correlated_at=updated_at
+            .query_row(
+                "SELECT correlation_state, correlation_source
+                   FROM agent_message_delivery_attempts
                   WHERE message_id=?1 AND attempt_number=1",
                 rusqlite::params![message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("seed the correlation Family B/C has not built a writer for yet");
+            .expect("read the correlation custody");
+        assert_eq!(correlation, "correlated");
+        assert_eq!(source.as_deref(), Some("app_server_response"));
 
         GateWorld {
             message_id,
@@ -380,6 +382,192 @@ mod p2_07_gate_permit_spine {
             tool_use_id: None,
             metadata: None,
         }
+    }
+
+    type CorrelationRow = (String, Option<String>, Option<String>, Option<String>);
+
+    fn correlation_row(store: &Store, message_id: Uuid) -> CorrelationRow {
+        store
+            .conn
+            .query_row(
+                "SELECT correlation_state, boundary_value, correlation_source, correlated_at
+                   FROM agent_message_delivery_attempts
+                  WHERE message_id=?1 AND attempt_number=1",
+                rusqlite::params![message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read correlation custody")
+    }
+
+    /// #47: the production acknowledgement of an AppServer attempt is what
+    /// writes `correlated` -- with the provider turn as the boundary, its
+    /// source, and its timestamp -- so the gate-open precondition
+    /// (`correlated` + `effect_acknowledged`) holds without any raw SQL.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn production_acknowledgement_correlates_an_app_server_attempt() {
+        let store = Store::open_in_memory().expect("open V81 store");
+        let world = correlated_world(&store, "p47-correlate");
+        let (state, boundary, source, at) = correlation_row(&store, world.message_id);
+        assert_eq!(state, "correlated");
+        assert_eq!(boundary.as_deref(), Some(TURN));
+        assert_eq!(source.as_deref(), Some("app_server_response"));
+        assert!(at.is_some(), "a correlation carries its timestamp");
+        let effect: String = store
+            .conn
+            .query_row(
+                "SELECT effect_classification FROM agent_message_delivery_attempts
+                  WHERE message_id=?1 AND attempt_number=1",
+                rusqlite::params![world.message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read effect classification");
+        assert_eq!(effect, "effect_acknowledged");
+        // The consumer of the state: the real gate-open path accepts it.
+        let generation = store
+            .open_app_server_turn_gate_v1(&world.fence, chrono::Utc::now())
+            .expect("gate open runs");
+        assert!(
+            matches!(generation, GateOpenOutcomeV1::Opened { .. }),
+            "a production-correlated attempt must open the turn gate, got {generation:?}"
+        );
+    }
+
+    /// #47: sealing is irreversible. An attempt that sealed before the
+    /// acknowledgement landed stays `sealed_live_uncertain` and is never
+    /// correlated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn a_sealed_attempt_is_never_correlated_by_acknowledgement() {
+        let store = Store::open_in_memory().expect("open V81 store");
+        let owner = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        live_session(&store, owner, SessionStatus::Running);
+        live_session(&store, target, SessionStatus::Running);
+        let invocation_id = Uuid::new_v4();
+        admitted_invocation(&store, invocation_id, target);
+        let message_id = accepted_message(&store, owner, target, "p47-sealed");
+        let ClaimAgentMessageOutcome::Claimed(fence) = store
+            .claim_agent_message_exact(&ClaimAgentMessageRequest {
+                message_id,
+                owner_session_id: owner,
+                logical_root_session_id: target,
+                expected_state_version: 0,
+                expected_current_attempt_number: None,
+                delivery_session_id: target,
+                expected_session_generation: 0,
+                expected_prior_model_invocation_id: None,
+                delivery_model_invocation_id: invocation_id,
+                delivery_boot_id: Uuid::new_v4(),
+                claim_token: Uuid::new_v4(),
+                provider_kind: BoundaryProviderKindV1::CodexAppServer,
+                claim_expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+                authority_id: Uuid::new_v4(),
+            })
+            .expect("claim succeeds")
+        else {
+            panic!("the AppServer claim must commit");
+        };
+        store
+            .record_agent_message_admission(
+                &fence,
+                &app_server_admission(&fence),
+                NoEffectDisposition::Requeue,
+                Uuid::new_v4(),
+            )
+            .expect("admission recorded");
+        store
+            .commit_app_server_evidence_seal_v1(
+                message_id,
+                1,
+                "ingress_mailbox_overflow",
+                chrono::Utc::now(),
+            )
+            .expect("seal commits");
+        // V81 refuses any acknowledgement of a sealed attempt ("a late
+        // response can never ack it"), so the correlation write -- part of the
+        // same UPDATE -- cannot slip through behind the seal either.
+        let refused = store.insert_event_and_acknowledge_agent_message(
+            &fence,
+            &provider_event(target),
+            None,
+            Some(TURN),
+            Uuid::new_v4(),
+        );
+        assert!(
+            refused.is_err(),
+            "a sealed attempt must refuse acknowledgement, got {refused:?}"
+        );
+        let (state, _, source, at) = correlation_row(&store, message_id);
+        assert_eq!(state, "sealed_live_uncertain");
+        assert_eq!(source, None);
+        assert_eq!(at, None);
+    }
+
+    /// #47: only an AppServer attempt has correlation custody; a Harness
+    /// attempt acknowledges and stays `not_applicable`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn acknowledgement_leaves_a_non_app_server_attempt_not_applicable() {
+        let store = Store::open_in_memory().expect("open V81 store");
+        let owner = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        live_session(&store, owner, SessionStatus::Running);
+        live_session(&store, target, SessionStatus::Running);
+        let invocation_id = Uuid::new_v4();
+        admitted_invocation(&store, invocation_id, target);
+        let message_id = accepted_message(&store, owner, target, "p47-harness");
+        let ClaimAgentMessageOutcome::Claimed(fence) = store
+            .claim_agent_message_exact(&ClaimAgentMessageRequest {
+                message_id,
+                owner_session_id: owner,
+                logical_root_session_id: target,
+                expected_state_version: 0,
+                expected_current_attempt_number: None,
+                delivery_session_id: target,
+                expected_session_generation: 0,
+                expected_prior_model_invocation_id: None,
+                delivery_model_invocation_id: invocation_id,
+                delivery_boot_id: Uuid::new_v4(),
+                claim_token: Uuid::new_v4(),
+                provider_kind: BoundaryProviderKindV1::Harness,
+                claim_expires_at: chrono::Utc::now() + chrono::Duration::seconds(120),
+                authority_id: Uuid::new_v4(),
+            })
+            .expect("claim succeeds")
+        else {
+            panic!("the Harness claim must commit");
+        };
+        let admission = BoundaryAdmissionV1 {
+            provider_kind: BoundaryProviderKindV1::Harness,
+            capability_kind: BoundaryCapabilityKindV1::HarnessToolBoundary,
+            delivery_session_id: fence.delivery_session_id,
+            session_generation: fence.delivery_session_generation,
+            model_invocation_id: fence.delivery_model_invocation_id,
+            native_turn_id: None,
+            classification: BoundaryClassificationV1::AdmittedEffectPossible,
+            provider_error_class: None,
+        };
+        let acknowledged = store
+            .insert_event_and_acknowledge_agent_message(
+                &fence,
+                &provider_event(target),
+                Some(&admission),
+                None,
+                Uuid::new_v4(),
+            )
+            .expect("acknowledgement runs");
+        assert!(
+            matches!(
+                acknowledged,
+                AcknowledgeAgentMessageOutcome::Acknowledged { .. }
+            ),
+            "got {acknowledged:?}"
+        );
+        let (state, _, source, at) = correlation_row(&store, message_id);
+        assert_eq!(state, "not_applicable");
+        assert_eq!(source, None);
+        assert_eq!(at, None);
     }
 
     /// Land ONE provider-request ledger row, already advanced to
@@ -8001,12 +8189,18 @@ mod p2_07_gate_permit_spine {
             frozen_v114_catalog_has_only_versioned_caller(&discovered);
         let mut report = WriterScan::default();
         let mut include_context = ExecutableIncludeContext::new(limits);
-        let mut by_root: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
+        // Each root keeps one copy of its production items (the catalog's own
+        // `(scope, items)` vector) next to the per-unit path metadata; the AST is
+        // not cloned a second time just to build the catalog.
+        type UnitPaths = (std::path::PathBuf, String);
+        let mut by_root: std::collections::BTreeMap<
+            _,
+            (Vec<(Vec<String>, Vec<syn::Item>)>, Vec<UnitPaths>),
+        > = std::collections::BTreeMap::new();
         for source in &discovered.units {
-            by_root.entry(source.root.clone()).or_default().push((
+            let entry = by_root.entry(source.root.clone()).or_default();
+            entry.0.push((
                 source.scope.clone(),
-                source.path.clone(),
-                source.relative.clone(),
                 source
                     .file
                     .items
@@ -8015,14 +8209,11 @@ mod p2_07_gate_permit_spine {
                     .cloned()
                     .collect::<Vec<syn::Item>>(),
             ));
+            entry.1.push((source.path.clone(), source.relative.clone()));
         }
-        for units in by_root.values() {
-            let catalog_units: Vec<_> = units
-                .iter()
-                .map(|(scope, _, _, items)| (scope.clone(), items.clone()))
-                .collect();
-            let catalog = SourceCatalog::collect_units(&catalog_units);
-            for (scope, path, relative, items) in units {
+        for (catalog_units, paths) in by_root.values() {
+            let catalog = SourceCatalog::collect_units(catalog_units);
+            for ((scope, items), (path, relative)) in catalog_units.iter().zip(paths) {
                 let prior_rejections = report.dynamic_rejections.len();
                 let prior_writers = report.writers.len();
                 scan_items(
@@ -9099,7 +9290,7 @@ mod p2_07_gate_permit_spine {
     #[test]
     fn scanner_expands_generated_migrations_include_to_every_collected_file() {
         let source_root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rsid-store/src");
+            std::path::PathBuf::from(rsi_common::manifest_dir!()).join("../rsid-store/src");
         let declaring = source_root.join("store/mod.rs");
         let invocation: syn::Macro = syn::parse_quote! {
             include!(concat!(env!("OUT_DIR"), "/store_migrations.rs"))
@@ -10595,7 +10786,7 @@ mod p2_07_gate_permit_spine {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn released_queue_migration_provenance_fails_closed_on_drift() {
-        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = std::path::PathBuf::from(rsi_common::manifest_dir!()).join("../..");
         let source = repo.join("crates/rsid-store/src/store/rolling_queue.rs");
         let expected = [RELEASED_QUEUE_REJECTION.to_string()];
         let real_root = repo.join("crates/rsid-store/src");
@@ -10652,7 +10843,7 @@ mod p2_07_gate_permit_spine {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn tier_routing_and_portable_bundle_provenance_fails_closed_on_drift() {
-        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = std::path::PathBuf::from(rsi_common::manifest_dir!()).join("../..");
         let real_root = repo.join("crates/rsid-store/src");
         let tier = real_root.join("store/manager_tier_routing.rs");
         let expected = vec![RELEASED_TIER_ROUTING_REJECTION.to_string(); 2];
@@ -10716,7 +10907,7 @@ mod p2_07_gate_permit_spine {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn frozen_v114_catalog_provenance_fails_closed_on_source_or_sink_drift() {
-        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let source = std::path::PathBuf::from(rsi_common::manifest_dir!())
             .join("../rsid-store/src/store/catalog_convergence.rs");
         let expected = FROZEN_V114_CATALOG_REJECTIONS.map(str::to_string);
         assert!(
@@ -10742,7 +10933,7 @@ mod p2_07_gate_permit_spine {
     fn exactly_one_production_writer_of_gate_closing_and_effect_permits() {
         // Both crates: the protected writers live in `rsid-store` (owner paths
         // are relative to its `src`), and `rsid` must not grow a second one.
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::path::PathBuf::from(rsi_common::manifest_dir!());
         let mut report = scan_crate_production_writers(&manifest.join("src"))
             .expect("every rsid production source must be discoverable and parseable Rust")
             .report;
@@ -13690,9 +13881,62 @@ fn expected_fifo_order(store: &Store) -> Vec<Uuid> {
     ids
 }
 
+/// The progress guarantee the drain and the boundary pull rely on: even a `0` ms
+/// bound (the scan is out of time before it starts) still resolves one row and
+/// hands back a cursor, and walking those cursors yields every row once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn a_zero_millisecond_scan_bound_still_returns_one_row_and_a_cursor() {
+    let store = Store::open_in_memory().expect("open V81 store");
+    let owner = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    live_session(&store, owner, SessionStatus::Running);
+    live_session(&store, target, SessionStatus::Running);
+    for index in 0..3 {
+        accepted_message(&store, owner, target, &format!("zero-bound-{index}"));
+    }
+    let expected = expected_fifo_order(&store);
+
+    let mut seen = Vec::new();
+    let mut after = None;
+    for page_index in 0..expected.len() {
+        let page = store
+            .list_dispatchable_agent_messages_within(after, AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS, 0)
+            .expect("zero-bound scan succeeds");
+        assert_eq!(
+            page.messages.len(),
+            1,
+            "page {page_index} holds exactly one row"
+        );
+        seen.push(page.messages[0].message_id);
+        after = page.next_cursor;
+        if page_index + 1 < expected.len() {
+            assert!(
+                after.is_some(),
+                "more rows are queued, so a cursor is offered"
+            );
+        }
+    }
+    assert_eq!(
+        seen, expected,
+        "the cursor walk visits every row once, in order"
+    );
+
+    // The thread-local override reaches the callers that take no bound.
+    let _bound = override_dispatch_scan_max_millis_for_test(0);
+    let page = store
+        .list_dispatchable_agent_messages(None, AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS)
+        .expect("overridden scan succeeds");
+    assert_eq!(page.messages.len(), 1);
+    assert!(page.next_cursor.is_some());
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn dispatch_selection_is_fifo_bounded_and_resumable_by_keyset() {
+    // Page SHAPE must not depend on the machine: lift the 10 ms scan bound
+    // (#2207). Production keeps its default.
+    let _scan_bound = override_dispatch_scan_max_millis_for_test(u64::MAX);
     let store = Store::open_in_memory().expect("open V81 store");
     let owner = Uuid::new_v4();
     let target = Uuid::new_v4();
@@ -13910,7 +14154,7 @@ async fn the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity() {
 
     let dir = tempfile::TempDir::new().expect("temp dir");
     let db_path = dir.path().join("rsi.db");
-    let store = Store::open(&db_path).expect("open production store");
+    let store = Store::open_test_fixture(&db_path).expect("open production store");
 
     // Captured BEFORE the manager exists, so it is provably the constructor
     // seed and not the daemon's.
@@ -13990,6 +14234,9 @@ async fn the_delivery_witness_a_consumer_reads_is_the_seeded_daemon_identity() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn boundary_pull_pages_past_the_scan_bound_to_reach_its_tip() {
+    // Page SHAPE must not depend on the machine: lift the 10 ms scan bound
+    // (#2207). Production keeps its default.
+    let _scan_bound = override_dispatch_scan_max_millis_for_test(u64::MAX);
     let store = Store::open_in_memory().expect("open V81 store");
     let owner = Uuid::new_v4();
     let crowding_root = Uuid::new_v4();
@@ -14130,6 +14377,9 @@ fn boundary_pull_pages_past_the_scan_bound_to_reach_its_tip() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn a_page_two_row_cannot_forge_a_new_root_head_at_the_production_boundary() {
+    // Page SHAPE must not depend on the machine: lift the 10 ms scan bound
+    // (#2207). Production keeps its default.
+    let _scan_bound = override_dispatch_scan_max_millis_for_test(u64::MAX);
     let store = Store::open_in_memory().expect("open V81 store");
     let owner = Uuid::new_v4();
     let root = Uuid::new_v4();
@@ -14609,14 +14859,23 @@ async fn global_quarantine_caps_seal_once_across_sessions_and_restart() {
         "C-P2-13: an overflow seal must never be reported as provider death"
     );
 
+    // A tick is bounded by a 2 ms wall clock, so a preempted host may settle
+    // fewer than two latches per tick (#2831). Drive bounded ticks until the
+    // seals commit; the totals, not the per-tick split, are the contract.
     let mut worker = AppServerSealWorker::new(Arc::clone(&plane), Arc::clone(&store));
-    let tick = worker.tick().await;
-    assert_eq!(
-        tick.committed, 2,
-        "both attempts must durably seal: {tick:?}"
-    );
-    assert_eq!(tick.already_sealed, 0);
-    assert_eq!(tick.store_errors, 0);
+    let (mut committed, mut already_sealed, mut store_errors) = (0, 0, 0);
+    for _ in 0..8 {
+        let tick = worker.tick().await;
+        committed += tick.committed;
+        already_sealed += tick.already_sealed;
+        store_errors += tick.store_errors;
+        if plane.dirty_latch_count() == 0 {
+            break;
+        }
+    }
+    assert_eq!(committed, 2, "both attempts must durably seal");
+    assert_eq!(already_sealed, 0);
+    assert_eq!(store_errors, 0);
     assert_eq!(
         plane.dirty_latch_count(),
         0,
@@ -14654,16 +14913,25 @@ async fn global_quarantine_caps_seal_once_across_sessions_and_restart() {
         2
     );
     let mut rescan_worker = AppServerSealWorker::new(Arc::clone(&rescan_plane), Arc::clone(&store));
-    let rescan = rescan_worker.tick().await;
+    let (mut rescan_committed, mut rescan_already, mut rescan_errors) = (0, 0, 0);
+    for _ in 0..8 {
+        let rescan = rescan_worker.tick().await;
+        rescan_committed += rescan.committed;
+        rescan_already += rescan.already_sealed;
+        rescan_errors += rescan.store_errors;
+        if rescan_plane.dirty_latch_count() == 0 {
+            break;
+        }
+    }
     assert_eq!(
-        rescan.committed, 0,
-        "re-scanning an already-sealed attempt must commit nothing: {rescan:?}"
+        rescan_committed, 0,
+        "re-scanning an already-sealed attempt must commit nothing"
     );
     assert_eq!(
-        rescan.already_sealed, 2,
+        rescan_already, 2,
         "the second pass must recognise the seal as already in force"
     );
-    assert_eq!(rescan.store_errors, 0, "a duplicate seal is not an error");
+    assert_eq!(rescan_errors, 0, "a duplicate seal is not an error");
 
     {
         let guard = store.lock().await;
@@ -15014,6 +15282,23 @@ fn claimed_fixture_on_boot(
     (target, message_id, fence)
 }
 
+/// The production reconciliation budget with its wall-clock bound lifted.
+///
+/// The drain clock (`AGENT_MESSAGE_RECONCILE_MAX_MILLIS_PER_DRAIN`, 50 ms) is a
+/// production resource guard, not part of what a test about WHICH rows a pass
+/// touches is checking. Under CPU contention (the full-library QA sweep runs
+/// thousands of tests in parallel) a pass can overrun it, stop with
+/// `stopped_by_time_budget` and leave `expiry_exhausted` unset, so the outcome
+/// would depend on machine speed (#2191). Page bounds are counted, not timed,
+/// and stay at their production value. The two tests that exercise the clock
+/// itself set `max_millis_per_drain` explicitly and do not use this.
+fn deterministic_reconciliation_budget() -> ReconciliationPassBudget {
+    ReconciliationPassBudget {
+        max_millis_per_drain: 60_000,
+        ..ReconciliationPassBudget::default()
+    }
+}
+
 /// `(state, current_attempt_number)` for one aggregate.
 fn aggregate_state_and_pointer(store: &Store, message_id: Uuid) -> (String, Option<i64>) {
     store
@@ -15078,6 +15363,35 @@ fn terminal_transition_evidence(store: &Store, message_id: Uuid) -> TerminalTran
             },
         )
         .expect("read terminal transition evidence")
+}
+
+/// Every queued message the selection scan offers, following the continuation
+/// cursor until the scan reports the end of the queue.
+///
+/// One `list_dispatchable_agent_messages` call is bounded by a wall-clock
+/// budget (`AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS`) on top of its row bound, so
+/// how many rows a SINGLE page holds depends on machine speed: a loaded host may
+/// cut a page after its first row. The walk across pages does not: the keyset
+/// cursor hands every row back exactly once, in order, however the pages are
+/// cut. A test that asserts on WHICH messages the scan selects, rather than on
+/// where a page ends, must therefore read through this walk and not a lone page.
+fn list_all_dispatchable_agent_messages(store: &Store) -> Vec<DispatchableAgentMessage> {
+    let mut selected = Vec::new();
+    let mut after = None;
+    // A page always carries at least the row it was cut after, so the walk
+    // advances on every iteration; the iteration cap only turns a non-advancing
+    // cursor into a failure instead of a hang.
+    for _ in 0..10_000 {
+        let page = store
+            .list_dispatchable_agent_messages(after, AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS)
+            .expect("selection scan succeeds");
+        selected.extend(page.messages);
+        match page.next_cursor {
+            Some(cursor) => after = Some(cursor),
+            None => return selected,
+        }
+    }
+    panic!("the selection scan's continuation cursor never reached the end of the queue");
 }
 
 fn count(store: &Store, sql: &str, params: &[&dyn rusqlite::ToSql]) -> i64 {
@@ -15523,7 +15837,7 @@ fn reconciliation_strands_a_dispatching_attempt_and_never_requeues_it() {
         .expect("the durable pre-dispatch marker commits before any send");
 
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(report.requeued, 1, "only the pre-marker row is requeueable");
     assert_eq!(report.stranded_uncertain, 1);
@@ -15575,7 +15889,7 @@ fn reconciliation_strands_a_dispatching_attempt_and_never_requeues_it() {
 
     // A SECOND pass must not reopen it. Stranded means stranded.
     let second =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
     assert_eq!(second.stranded_uncertain, 0);
     assert_eq!(second.requeued, 0);
     assert_eq!(second.errors, 0);
@@ -15702,7 +16016,7 @@ fn issue_46_all_terminal_statuses_settle_with_exact_null_attempt_evidence() {
     }
 
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(report.terminal_failed, messages.len());
     assert_eq!(report.expired, 0);
@@ -15811,7 +16125,7 @@ fn issue_46_live_and_reserved_targets_remain_queued() {
     ));
 
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(
         (report.terminal_failed, report.expired, report.errors),
@@ -15864,7 +16178,7 @@ fn issue_46_expired_terminal_mail_takes_expiry_not_failure() {
         .expect("stage recovery ownership behind passed expiry");
 
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(
         (report.expired, report.terminal_failed, report.errors),
@@ -15949,8 +16263,11 @@ fn issue_46_live_rotation_tip_and_stale_terminal_selection_remain_queued() {
         after_rotation.messages[0].eligibility,
         AgentMessageDispatchEligibility::Ready
     );
-    let report =
-        reconcile_agent_messages_pass(&store, Uuid::new_v4(), ReconciliationPassBudget::default());
+    let report = reconcile_agent_messages_pass(
+        &store,
+        Uuid::new_v4(),
+        deterministic_reconciliation_budget(),
+    );
     assert_eq!((report.terminal_failed, report.errors), (0, 0));
     assert_eq!(aggregate_state_and_pointer(&store, message_id).0, "queued");
 }
@@ -15965,7 +16282,7 @@ fn issue_46_second_pass_and_reopen_replay_are_idempotent() {
     let live_boot = Uuid::new_v4();
     let message_id;
     {
-        let store = Store::open(&database).expect("open durable store");
+        let store = Store::open_test_fixture(&database).expect("open durable store");
         let owner = Uuid::new_v4();
         let target = Uuid::new_v4();
         live_session(&store, owner, SessionStatus::Running);
@@ -15976,9 +16293,9 @@ fn issue_46_second_pass_and_reopen_replay_are_idempotent() {
             .expect("archive target");
 
         let first =
-            reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+            reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
         let second =
-            reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+            reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
         assert_eq!((first.terminal_failed, second.terminal_failed), (1, 0));
         assert!(!second.did_work());
     }
@@ -15987,7 +16304,7 @@ fn issue_46_second_pass_and_reopen_replay_are_idempotent() {
     let replay = reconcile_agent_messages_pass(
         &reopened,
         Uuid::new_v4(),
-        ReconciliationPassBudget::default(),
+        deterministic_reconciliation_budget(),
     );
     assert_eq!((replay.terminal_failed, replay.errors), (0, 0));
     assert!(!replay.did_work());
@@ -16020,7 +16337,7 @@ fn issue_46_terminal_settlement_preserves_historical_attempt_pointer() {
     let (_owner, target, message_id, _fence) = claimed_fixture(&store, "issue-46-pointer");
 
     let requeue =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
     assert_eq!(requeue.requeued, 1);
     assert_eq!(
         aggregate_state_and_pointer(&store, message_id),
@@ -16031,7 +16348,7 @@ fn issue_46_terminal_settlement_preserves_historical_attempt_pointer() {
         .expect("fail target");
 
     let settlement =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
     assert_eq!((settlement.terminal_failed, settlement.errors), (1, 0));
     let aggregate = terminal_aggregate_evidence(&store, message_id);
     assert_eq!(aggregate.0, "failed");
@@ -16105,7 +16422,7 @@ fn issue_46_claimed_dispatching_and_effect_possible_custody_is_untouched() {
     }
 
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!((report.requeued, report.stranded_uncertain), (0, 0));
     assert_eq!((report.terminal_failed, report.errors), (0, 0));
@@ -16135,6 +16452,9 @@ fn issue_46_claimed_dispatching_and_effect_possible_custody_is_untouched() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_bounded_scan_reaches_expired_and_terminal_rows_behind_healthy_mail() {
+    // Page SHAPE must not depend on the machine: lift the 10 ms scan bound
+    // (#2207). Production keeps its default.
+    let _scan_bound = override_dispatch_scan_max_millis_for_test(u64::MAX);
     let store = Store::open_in_memory().expect("open V81 store");
     let live_boot = Uuid::new_v4();
     let owner = Uuid::new_v4();
@@ -16220,7 +16540,7 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
         let marker_key = c5_autofile_pending_key(target);
 
         {
-            let store = Store::open(&database).expect("open durable C5 fixture");
+            let store = Store::open_test_fixture(&database).expect("open durable C5 fixture");
             live_session(&store, owner, SessionStatus::Running);
             live_session(&store, target, SessionStatus::Running);
             message_id = accepted_message(
@@ -16250,7 +16570,7 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
                 let report = reconcile_agent_messages_pass(
                     &store,
                     Uuid::new_v4(),
-                    ReconciliationPassBudget::default(),
+                    deterministic_reconciliation_budget(),
                 );
                 assert_eq!(
                     (report.terminal_failed, report.expired, report.errors),
@@ -16266,7 +16586,7 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
             let replay = reconcile_agent_messages_pass(
                 &reopened,
                 Uuid::new_v4(),
-                ReconciliationPassBudget::default(),
+                deterministic_reconciliation_budget(),
             );
             assert_eq!((replay.terminal_failed, replay.errors), (0, 0));
             assert_eq!(
@@ -16295,12 +16615,12 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
             let released = reconcile_agent_messages_pass(
                 &reopened,
                 Uuid::new_v4(),
-                ReconciliationPassBudget::default(),
+                deterministic_reconciliation_budget(),
             );
             let second = reconcile_agent_messages_pass(
                 &reopened,
                 Uuid::new_v4(),
-                ReconciliationPassBudget::default(),
+                deterministic_reconciliation_budget(),
             );
             assert_eq!((released.terminal_failed, released.errors), (1, 0));
             assert_eq!((second.terminal_failed, second.errors), (0, 0));
@@ -16314,7 +16634,7 @@ fn issue_46_c5_marker_holds_failed_mail_across_drain_and_reopen_then_release_set
         let replay = reconcile_agent_messages_pass(
             &replayed,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((replay.terminal_failed, replay.errors), (0, 0));
         assert_eq!(
@@ -16356,7 +16676,7 @@ fn issue_46_retry_admission_follows_the_true_successor_without_premature_failure
         let report = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((report.terminal_failed, report.errors), (0, 0));
     }
@@ -16425,7 +16745,7 @@ fn issue_46_open_capacity_owner_holds_across_reopen_and_exact_replay() {
     let incident_id;
 
     {
-        let store = Store::open(&database).expect("open capacity fixture");
+        let store = Store::open_test_fixture(&database).expect("open capacity fixture");
         live_session(&store, owner, SessionStatus::Running);
         issue_46_task_session(
             &store,
@@ -16481,7 +16801,7 @@ fn issue_46_open_capacity_owner_holds_across_reopen_and_exact_replay() {
         let report = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((report.terminal_failed, report.errors), (0, 0));
         assert_eq!(aggregate_state_and_pointer(&store, message_id).0, "queued");
@@ -16541,7 +16861,7 @@ fn issue_46_open_capacity_owner_holds_across_reopen_and_exact_replay() {
     let report = reconcile_agent_messages_pass(
         &reopened,
         Uuid::new_v4(),
-        ReconciliationPassBudget::default(),
+        deterministic_reconciliation_budget(),
     );
     assert_eq!((report.terminal_failed, report.errors), (0, 0));
     assert_eq!(
@@ -16610,7 +16930,7 @@ fn issue_46_capacity_scope_and_live_delivery_matrix() {
         let report = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((report.terminal_failed, report.errors), (1, 0));
         assert_eq!(aggregate_state_and_pointer(&store, message_id).0, "failed");
@@ -16686,7 +17006,7 @@ fn issue_46_capacity_scope_and_live_delivery_matrix() {
         let report = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((report.terminal_failed, report.errors), (1, 0));
         assert_eq!(aggregate_state_and_pointer(&store, message_id).0, "failed");
@@ -16757,12 +17077,12 @@ fn issue_46_capacity_scope_and_live_delivery_matrix() {
         let first = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         let second = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
         assert_eq!((first.terminal_failed, second.terminal_failed), (1, 0));
         assert_eq!(aggregate_state_and_pointer(&store, message_id).0, "failed");
@@ -16916,16 +17236,16 @@ fn issue_46_96_link_lineage_finds_live_and_terminal_true_tips() {
         SessionStatus::Archived,
         SessionStatus::Running,
     );
-    let selected = store
-        .list_dispatchable_agent_messages(None, 64)
-        .expect("select both deep lineages");
+    // Resolving a 96-hop lineage costs enough that the scan's wall-clock budget
+    // may cut the page between the two messages on a loaded host. Which message
+    // is selected, and its resolved tip, must not depend on that: walk the
+    // continuation cursor to the end instead of reading one page.
+    let selected = list_all_dispatchable_agent_messages(&store);
     let live = selected
-        .messages
         .iter()
         .find(|message| message.message_id == live_message)
         .expect("live deep-lineage message selected");
     let terminal = selected
-        .messages
         .iter()
         .find(|message| message.message_id == terminal_message)
         .expect("terminal deep-lineage message selected");
@@ -17039,6 +17359,9 @@ fn issue_46_lineage_cycle_corruption_fails_closed_in_selection_and_writer() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[test]
 fn issue_46_recovery_pending_rows_preserve_pagination_and_accounting() {
+    // Page SHAPE must not depend on the machine: lift the 10 ms scan bound
+    // (#2207). Production keeps its default.
+    let _scan_bound = override_dispatch_scan_max_millis_for_test(u64::MAX);
     let store = Store::open_in_memory().expect("open recovery pagination fixture");
     let owner = Uuid::new_v4();
     let pending_target = Uuid::new_v4();
@@ -17152,8 +17475,11 @@ fn reconciliation_expires_only_queued_messages_past_their_acceptance_deadline() 
     let (_claimed_target, claimed_overdue, _fence) =
         claimed_fixture_on_boot(&store, "expiry-claimed", live_boot, Some(past));
 
+    // This test pins WHICH rows the pass touches, not how fast it is: it runs
+    // under the deterministic budget, so a loaded host cannot stop the drain on
+    // the clock right after the expiry commits and leave `expiry_exhausted` unset.
     let report =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(
         report.expired, 1,
@@ -17264,7 +17590,7 @@ fn a_failing_reconciliation_pass_is_reported_and_never_fails_the_daemon() {
         let report = reconcile_agent_messages_pass(
             &store,
             Uuid::new_v4(),
-            ReconciliationPassBudget::default(),
+            deterministic_reconciliation_budget(),
         );
 
         assert_eq!(report.errors, 1);
@@ -17295,7 +17621,7 @@ fn a_failing_reconciliation_pass_is_reported_and_never_fails_the_daemon() {
         .expect("refuse every write on this connection");
 
     let failed =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
 
     assert_eq!(
         failed.errors, 3,
@@ -17323,7 +17649,7 @@ fn a_failing_reconciliation_pass_is_reported_and_never_fails_the_daemon() {
         .execute_batch("PRAGMA query_only=OFF;")
         .expect("restore writes");
     let recovered =
-        reconcile_agent_messages_pass(&store, live_boot, ReconciliationPassBudget::default());
+        reconcile_agent_messages_pass(&store, live_boot, deterministic_reconciliation_budget());
     assert_eq!(recovered.requeued, 3);
     assert_eq!(recovered.errors, 0);
     assert!(recovered.fully_reconciled());

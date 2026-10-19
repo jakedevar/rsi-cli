@@ -1945,6 +1945,7 @@ fn launch_config_from_envelope(envelope: &RecursiveDagLiveLaunchEnvelope) -> Lau
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     }
 }
 
@@ -2125,7 +2126,7 @@ mod tests {
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let db_path = dir.path().join("rsi.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         (dir, store)
     }
 
@@ -2134,7 +2135,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp db dir");
         let sandbox_base = tempfile::TempDir::new().expect("temp sandbox dir");
         let db_path = dir.path().join("rsi.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         let mut config = Config::from_env();
         config.retry_max_backoff_ms = 1;
         let runtime_config = RuntimeConfig::from_config(&config);

@@ -1,11 +1,11 @@
 //! Global manager v0 (#872 Slice B) and portfolio node (#1236) RPC handlers.
 //!
 //! `ConfigureGlobalManager`, `GetGlobalManager`, `RevokeGlobalManager` and
-//! `GetGlobalManagerWorkspace` (#1213) are operator-only: they are not declared in the attributed verb registry, so a
+//! `GetGlobalManagerWorkspace` (#1213) and `GetGlobalManagerBudget` (#2502) are operator-only: they are not declared in the attributed verb registry, so a
 //! tokened caller is default-denied (AGENTS.md rule 10). Since #1236 they are
 //! shims over the single active root labelled `global`.
-//! `ListPortfolioNodes`, `GetPortfolioNode`, `ConfigurePortfolioNode` and
-//! `RevokePortfolioNode` are operator-only on the same terms, and so is
+//! `ListPortfolioNodes`, `GetPortfolioNode`, `ConfigurePortfolioNode`,
+//! `ConfigurePortfolioNodeLaunches` (#2103) and `RevokePortfolioNode` are operator-only on the same terms, and so is
 //! `GetManagerNodeWorkspace` (#1240); its agent counterpart is
 //! `AgentManagerOverview` (the caller's own node).
 
@@ -22,8 +22,9 @@ use rsi_common::manager_tier_routing::{
     MANAGER_TIER_INVALID_REQUEST, RuleOperatorEscalationRequestV1,
 };
 use rsi_common::portfolio_nodes::{
-    ConfigurePortfolioNodeRequestV1, GetPortfolioNodeRequestV1, ListPortfolioNodesRequestV1,
-    ListPortfolioNodesResultV1, PORTFOLIO_INVALID_REQUEST, RevokePortfolioNodeRequestV1,
+    ConfigurePortfolioNodeLaunchesRequestV1, ConfigurePortfolioNodeRequestV1,
+    GetPortfolioNodeRequestV1, ListPortfolioNodesRequestV1, ListPortfolioNodesResultV1,
+    PORTFOLIO_INVALID_REQUEST, RevokePortfolioNodeRequestV1,
 };
 
 fn decode<T: serde::de::DeserializeOwned>(request: &RpcRequest) -> Result<T> {
@@ -80,6 +81,22 @@ impl RpcServer {
             .operator_global_workspace()
             .await?;
         Ok(serde_json::to_value(workspace)?)
+    }
+
+    /// #2502: operator-only Budget panel of a portfolio node (the global
+    /// node by default): every cap along each covered project's chain.
+    pub(super) async fn handle_get_global_manager_budget(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::manager_budget::GetGlobalManagerBudgetRequestV1 = decode(request)?;
+        let budget = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .global_manager_budget(params.node_id)?;
+        Ok(serde_json::to_value(budget)?)
     }
 
     /// #1240: operator-only snapshot of any manager node.
@@ -171,6 +188,30 @@ impl RpcServer {
         Ok(serde_json::to_value(node)?)
     }
 
+    /// #2103: add or remove launches on a node without re-typing its grant.
+    pub(super) async fn handle_configure_portfolio_node_launches(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let confirmed: rsi_common::portfolio_nodes::PortfolioCapConfirmation<
+            ConfigurePortfolioNodeLaunchesRequestV1,
+        > = decode_portfolio(request)?;
+        let params = confirmed.request;
+        params
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        self.session_manager
+            .validate_manager_launch_models(&params.add)
+            .await?;
+        let store = self.session_manager.store();
+        let node = store.lock().await.configure_portfolio_node_launches(
+            &params,
+            "operator_rpc",
+            confirmed.confirm_cap_reductions,
+        )?;
+        Ok(serde_json::to_value(node)?)
+    }
+
     pub(super) async fn handle_revoke_portfolio_node(
         &self,
         request: &RpcRequest,
@@ -209,9 +250,9 @@ impl RpcServer {
         let result = self
             .session_manager
             .agent_control()
-            .agent_manager_overview(caller, params)
+            .agent_manager_overview_value(caller, params)
             .await?;
-        Ok(serde_json::to_value(result)?)
+        Ok(result)
     }
 
     pub(super) async fn handle_agent_global_send(

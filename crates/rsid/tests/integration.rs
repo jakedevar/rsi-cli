@@ -139,6 +139,8 @@ fn test_response_error_format() {
 #[test]
 fn test_health_status_response_format() {
     let response = rsi_common::rpc::HealthStatusResponse {
+        daemon_pid: None,
+        daemon_started_at: None,
         persistence_queue_depth: 5,
         persistence_queue_capacity: 256,
         last_command_duration_ms: 42,
@@ -167,6 +169,7 @@ fn test_health_status_response_format() {
         process_memory: None,
         provider_credentials: None,
         supervisor_mode: None,
+        codegraph_unhealthy: Vec::new(),
     };
 
     let json = serde_json::to_value(&response).expect("serialize HealthStatusResponse");

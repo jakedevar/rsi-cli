@@ -8,7 +8,7 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// A completed operation that `u` can reverse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,12 +222,8 @@ pub fn move_to_trash(trash_dir: &Path, path: &Path) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .ok_or_else(|| "Cannot delete the filesystem root".to_string())?;
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let batch = trash_dir.join(format!(
-        "{}-{}",
-        chrono::Local::now().format("%Y%m%dT%H%M%S"),
-        &id[..8]
-    ));
+    // The batch name records its UTC time: the shared prune rule reads it.
+    let batch = trash_dir.join(rsi_common::trash_prune::new_batch_name(chrono::Utc::now()));
     fs::create_dir_all(&batch).map_err(|e| format!("Cannot create trash: {e}"))?;
     let origin = batch.with_extension("origin");
     let _ = fs::write(&origin, path.display().to_string());
@@ -247,6 +243,12 @@ pub fn move_to_trash(trash_dir: &Path, path: &Path) -> Result<PathBuf, String> {
 
 /// Move a trashed entry back to `original`.
 pub fn restore_from_trash(original: &Path, trashed: &Path) -> Result<(), String> {
+    if !exists_no_follow(trashed) {
+        return Err(format!(
+            "Cannot restore: {} is no longer in the trash (entries are kept 7 days)",
+            name_of(original)
+        ));
+    }
     if exists_no_follow(original) {
         return Err(format!(
             "Cannot restore: {} exists again",
@@ -261,25 +263,11 @@ pub fn restore_from_trash(original: &Path, trashed: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// Remove trash batches older than `max_age` (best effort).
+/// Remove trash batches older than `max_age` (best effort), by the time
+/// their names record, without following symlinks: the one rule the
+/// daemon's project-file trash shares ([`rsi_common::trash_prune`]).
 pub fn prune_trash(trash_dir: &Path, max_age: Duration) {
-    let Ok(read_dir) = fs::read_dir(trash_dir) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in read_dir.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let expired = meta
-            .modified()
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > max_age);
-        if expired {
-            let _ = remove_all(&entry.path());
-        }
-    }
+    let _ = rsi_common::trash_prune::prune_trash(trash_dir, max_age, chrono::Utc::now());
 }
 
 fn is_empty_entry(path: &Path) -> bool {

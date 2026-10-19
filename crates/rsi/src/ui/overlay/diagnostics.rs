@@ -53,9 +53,14 @@ pub(super) fn render_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("cache hit rate: ", label_style),
             Span::styled(fmt_pct(m.last_cache_hit_rate), value_style),
         ]),
+    ]
+    .into_iter()
+    .chain(draw_stat_lines(app, label_style, value_style))
+    .chain([
         Line::from(""),
         Line::from(vec![Span::styled("q / Esc  close", label_style)]),
-    ];
+    ])
+    .collect::<Vec<_>>();
 
     let block = theme::overlay_block()
         .title(Span::styled(
@@ -67,4 +72,33 @@ pub(super) fn render_diagnostics(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draw counts by dirty reason since the TUI started (#332). Reasons that never
+/// fired are left out; `marks` can exceed `draws` because marks coalesce.
+fn draw_stat_lines(app: &App, label_style: Style, value_style: Style) -> Vec<Line<'static>> {
+    let snap = app.draw_stats.snapshot();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("frames        : ", label_style),
+            Span::styled(
+                format!(
+                    "{} in {} s (animation {}, unattributed {})",
+                    snap.frames, snap.window_secs, snap.animation_frames, snap.unattributed_frames
+                ),
+                value_style,
+            ),
+        ]),
+    ];
+    for (name, counts) in snap.by_reason.iter().filter(|(_, c)| c.marks > 0) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name:<12}: "), label_style),
+            Span::styled(
+                format!("{} draws / {} marks", counts.draws, counts.marks),
+                value_style,
+            ),
+        ]));
+    }
+    lines
 }

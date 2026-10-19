@@ -153,6 +153,18 @@ pub struct AgentFinalMessageV1 {
     pub created_at: DateTime<Utc>,
 }
 
+/// Where `AgentReadSessionEvents` read a session's events from (#2384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventsStorageV1 {
+    /// Every event is in the live database.
+    #[default]
+    Live,
+    /// The session is in cold storage: its archived rows were merged with its
+    /// live tail, so the events are the same ones a hot session returns.
+    Cold,
+}
+
 /// Result of `AgentReadSessionEvents`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentReadSessionEventsResultV1 {
@@ -174,6 +186,10 @@ pub struct AgentReadSessionEventsResultV1 {
     /// Something was clipped: a field, or the page by `max_bytes`.
     pub truncated: bool,
     pub final_message: Option<AgentFinalMessageV1>,
+    /// `live`, or `cold` when the session's rows were read from cold storage
+    /// (#2384). The events are identical either way.
+    #[serde(default)]
+    pub storage: AgentEventsStorageV1,
 }
 
 /// Clip `text` to at most `max_chars` characters on a char boundary.

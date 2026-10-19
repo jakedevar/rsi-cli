@@ -1,0 +1,99 @@
+{
+  "run": {
+    "adapter_tree_hash": "cccccccccccccccccccccccccccccccccccccccc",
+    "concurrency": 4,
+    "config_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "dataset_commit": "2fd12b88aafdd04a52c298e3940bcb189f9766d6",
+    "dataset_repo": "harbor-framework/terminal-bench-2",
+    "effort": "high",
+    "finished_at": "2026-10-19T13:00:00.000000000Z",
+    "harbor_version": "0.24.0",
+    "harness_build_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "host": "bench-host-1",
+    "image_digests": {
+      "build-pov-ray": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "fix-git": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "k": 1,
+    "model": "claude-sonnet-5-5",
+    "observation_fingerprint": "sha256:fc82c4d7dccbd3ae2a510ff03a4a2befa41b38b1f207b3e54921b9a0d96ea77f",
+    "route": "direct",
+    "sampling": {
+      "temperature": 0.0
+    },
+    "split": "held_out",
+    "started_at": "2026-10-19T12:00:00.000000000Z",
+    "tasks": [
+      "build-pov-ray",
+      "fix-git"
+    ],
+    "timeouts": {
+      "agent_sec": 900,
+      "multiplier": 1.0,
+      "verifier_sec": 600
+    },
+    "totals": {
+      "cached_tokens": 1200,
+      "cost_usd": 0.5,
+      "invalid_trials": 0,
+      "output_tokens": 600,
+      "passed_trials": 1,
+      "prompt_tokens": 2000,
+      "reasoning_tokens": 100,
+      "trials": 2,
+      "valid_trials": 2,
+      "wall_ms": 24000
+    }
+  },
+  "schema_version": 1,
+  "trials": [
+    {
+      "attempt": 0,
+      "cached_tokens": 600,
+      "cost_usd": 0.25,
+      "exception_type": null,
+      "failure_cause": null,
+      "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "infra_interrupted": false,
+      "invalid_route": false,
+      "output_tokens": 300,
+      "passed": true,
+      "prompt_tokens": 1000,
+      "reasoning_tokens": 50,
+      "reward": 1.0,
+      "reward_valid": true,
+      "session_id": "session-build-pov-ray-0",
+      "split": "held_out",
+      "stop_reason": "end_turn",
+      "suspected_solution_lookup": false,
+      "task": "build-pov-ray",
+      "trace_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "turns": 7,
+      "wall_ms": 12000
+    },
+    {
+      "attempt": 0,
+      "cached_tokens": 600,
+      "cost_usd": 0.25,
+      "exception_type": "AgentTimeoutError",
+      "failure_cause": "verifier_failed",
+      "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "infra_interrupted": false,
+      "invalid_route": false,
+      "output_tokens": 300,
+      "passed": false,
+      "prompt_tokens": 1000,
+      "reasoning_tokens": 50,
+      "reward": 0.0,
+      "reward_valid": true,
+      "session_id": "session-fix-git-0",
+      "split": "held_out",
+      "stop_reason": null,
+      "suspected_solution_lookup": false,
+      "task": "fix-git",
+      "trace_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "turns": 7,
+      "wall_ms": 12000
+    }
+  ]
+}

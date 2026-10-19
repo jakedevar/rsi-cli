@@ -28,7 +28,7 @@ fn tempdir_keeping_btime() -> tempfile::TempDir {
     if fixture_filesystem(system.path()) {
         return system;
     }
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch-test-tmp");
+    let fallback = Path::new(rsi_common::manifest_dir!()).join("../../target/scratch-test-tmp");
     fs::create_dir_all(&fallback).unwrap();
     let dir = tempfile::tempdir_in(&fallback).unwrap();
     assert!(
@@ -1701,6 +1701,122 @@ fn dead_lander_workspace_with_its_registered_shared_clone_is_reclaimed() {
     assert!(!workspace.exists());
 }
 
+// #2488: the lander's `candidate-*` and `base-*` checkouts are linked
+// worktrees of its registered clone. Their detached HEAD (the integration
+// merge) is unpublished and the base checkout was built in, so a dead owner's
+// workspace with them must still be swept, also when a partial reclaim already
+// removed the clone and left only the worktrees.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn dead_lander_workspace_with_linked_base_and_candidate_worktrees_is_reclaimed() {
+    let fx = Fx::new();
+    let origins = tempfile::tempdir().unwrap();
+    let source = origins.path().join("source");
+    published_repo(&source, origins.path());
+
+    let whole = lander_with_clone(&fx, "rsi-rolling-land-worktrees", &source);
+    let repo = whole.join(LANDER_CLONE_DIR);
+    fs::create_dir(whole.join("candidate-scratch")).unwrap();
+    for (rel, dirty) in [("candidate-scratch/candidate-1", false), ("base-abc", true)] {
+        let worktree = whole.join(rel);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        git(&worktree, &["commit", "-q", "--allow-empty", "-m", "merge"]);
+        if dirty {
+            fs::write(worktree.join("built.txt"), b"build output").unwrap();
+        }
+    }
+
+    // The clone is gone (an interrupted earlier reclaim), the worktrees stay.
+    let orphaned = lander_with_clone(&fx, "rsi-rolling-land-orphaned", &source);
+    let orphan_repo = orphaned.join(LANDER_CLONE_DIR);
+    let worktree = orphaned.join("base-def");
+    git(
+        &orphan_repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    git(&worktree, &["commit", "-q", "--allow-empty", "-m", "merge"]);
+    fs::remove_dir_all(&orphan_repo).unwrap();
+
+    let report = run_pass(&fx.config(RootKind::LanderScratch, OLD));
+
+    assert_eq!(report.reclaimed, 2, "{report:?}");
+    assert!(!whole.exists());
+    assert!(!orphaned.exists());
+}
+
+// #2488: only worktrees of the registered clone are exempt. A linked worktree
+// of any other repository, or a gitfile naming a path outside the clone's
+// worktree admin directory, keeps the full checks.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn foreign_worktrees_in_a_lander_workspace_are_still_checked() {
+    let fx = Fx::new();
+    let origins = tempfile::tempdir().unwrap();
+    let source = origins.path().join("source");
+    published_repo(&source, origins.path());
+
+    // A worktree of a repository the user owns, with a commit only it has.
+    let foreign = lander_with_clone(&fx, "rsi-rolling-land-foreign", &source);
+    let mine = origins.path().join("mine");
+    published_repo(&mine, origins.path());
+    let moved_in = foreign.join("base-mine");
+    git(
+        &mine,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            moved_in.to_str().unwrap(),
+        ],
+    );
+    git(&moved_in, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    // A gitfile that reaches the clone's admin directory by `..` from outside.
+    let sneaky = lander_with_clone(&fx, "rsi-rolling-land-sneaky", &source);
+    let escape = sneaky.join("base-sneaky");
+    git(
+        &mine,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            escape.to_str().unwrap(),
+        ],
+    );
+    git(&escape, &["commit", "-q", "--allow-empty", "-m", "mine"]);
+    fs::write(
+        escape.join(".git"),
+        format!(
+            "gitdir: {}/repo/.git/worktrees/../../../../../{}\n",
+            sneaky.display(),
+            mine.join(".git/worktrees/base-sneaky").display()
+        ),
+    )
+    .unwrap();
+
+    let report = run_pass(&fx.config(RootKind::LanderScratch, OLD));
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(moved_in.join(".git").exists());
+    assert!(escape.join(".git").exists());
+}
+
 // R3: the exemption is the one registered clone, not the workspace: any other
 // repository inside it, or a replaced clone, gets the full checks.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1937,6 +2053,136 @@ fn mountinfo_fields_are_unescaped_and_a_table_not_wholly_understood_is_refused()
     assert!(fsys::read_mounts(&garbled).is_none());
 }
 
+// Valid mountinfo rows beyond the plain fixture shape stay understood: any
+// number of optional fields before the separator, escaped absolute paths.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn valid_optional_fields_and_escaped_absolute_paths_are_accepted() {
+    let meta = tempfile::tempdir().unwrap();
+    let table = meta.path().join("valid");
+    fs::write(
+        &table,
+        concat!(
+            "1 0 8:1 / / rw,relatime - ext4 /dev/root rw\n",
+            "2 1 0:5 / /run/a rw shared:1 - tmpfs tmpfs rw\n",
+            "3 1 0:6 /tab\\011dir /var/tmp/a\\040b\\134c rw shared:2 master:3 unbindable - tmpfs none rw,size=1k\n",
+            "4 1 0:7 / /run/b ro,nosuid,nodev master:4 propagate_from:5 - tmpfs tmpfs rw\n",
+        ),
+    )
+    .unwrap();
+
+    let mounts = fsys::read_mounts(&table).expect("a valid table is an inventory");
+
+    assert_eq!(mounts.len(), 4);
+    assert!(fsys::mount_at_or_under(&mounts, Path::new("/run/b")));
+    assert!(fsys::mount_at_or_under(&mounts, Path::new("/run/a")));
+    assert!(fsys::mount_at_or_under(
+        &mounts,
+        Path::new("/var/tmp/a b\\c")
+    ));
+}
+
+// One row that is not wholly understood makes the whole table unproven, even
+// beside rows that are fine and rows that carry five or more fields.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_malformed_row_refuses_the_whole_mount_table() {
+    let meta = tempfile::tempdir().unwrap();
+    let good = "1 0 8:1 / / rw - ext4 /dev/root rw\n";
+    for (i, bad) in [
+        "x x x x /",
+        "x x x x / rw - ext4 /dev/root rw",
+        "1 0 8:1 / / rw",
+        "1 0 8:1 / / rw shared:1",
+        "1 0 8:1 / / rw - ext4",
+        "1 0 8:1 / / rw - ext4 /dev/root",
+        "1 0 8:1 / /mnt rw ext4 /dev/root rw",
+        "1 0 81 / / rw - ext4 /dev/root rw",
+        "1 0 8:x / / rw - ext4 /dev/root rw",
+        "1 0 8:1 relative / rw - ext4 /dev/root rw",
+        "1 0 8:1 / relative rw - ext4 /dev/root rw",
+        "1 0 8:1 / /a\\0x rw - ext4 /dev/root rw",
+        "1 0 8:1 / /a\\777 rw - ext4 /dev/root rw",
+        "1 0 8:1 / /a\\ b rw - ext4 /dev/root rw",
+        "2 1 8:1 / /var/tmp/rsi-live child rw - ext4 /dev/root rw",
+        "1 0 8:1 / / rw - ext4 /dev/root rw extra",
+        "1 0 8:1 / / rw - ext4 /dev/root rw extra more",
+        "1 0 8:1 / / rw shared:x - ext4 /dev/root rw",
+        "1 0 8:1 / / rw bogus - ext4 /dev/root rw",
+        "1 0 8:1 / / rw,,nosuid - ext4 /dev/root rw",
+        "1 0 8:1 / / nosuid - ext4 /dev/root rw",
+        "2 1 8:1 / /var/tmp/rsi-\\377 rw - ext4 /dev/root rw",
+        "2 1 8:1 / /var/tmp/rsi-\\000 rw - ext4 /dev/root rw",
+        "2 1 8:1 /r\\377 /a rw - ext4 /dev/root rw",
+        "1 0 8:1 / /a rw  - ext4 /dev/root rw",
+        "- 0 8:1 / /a rw - ext4 /dev/root rw",
+        "",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let table = meta.path().join(format!("bad-{i}"));
+        fs::write(&table, format!("{good}{bad}\n{good}")).unwrap();
+        assert!(fsys::read_mounts(&table).is_none(), "accepted {bad:?}");
+    }
+}
+
+// F1: a mount table the parser does not wholly understand is no inventory, so
+// nothing is deleted, even when the bad row has the five-field shape.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn malformed_mount_table_retains_everything() {
+    let fx = Fx::new();
+    let meta = tempfile::tempdir().unwrap();
+    let dir = fx.scratch("rsi-mount-malformed", RootKind::VarTmp);
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.mountinfo = meta.path().join("mountinfo");
+    fs::write(
+        &cfg.mountinfo,
+        "1 0 8:1 / / rw - ext4 /dev/root rw\nx x x x /\n",
+    )
+    .unwrap();
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.kept_unproven, 1, "{report:?}");
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(dir.join("data.bin").exists());
+}
+
+// A shifted-field row, a row with trailing garbage and rows whose escapes decode
+// to NUL or invalid UTF-8 make the table unproven: all candidates are retained.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn shifted_trailing_and_undecodable_rows_retain_everything() {
+    for (i, bad) in [
+        "2 1 8:1 / /var/tmp/rsi-live child rw - ext4 /dev/root rw",
+        "2 1 8:1 / /var/tmp/rsi-live rw - ext4 /dev/root rw trailing",
+        "2 1 8:1 / /var/tmp/rsi-\\377 rw - ext4 /dev/root rw",
+        "2 1 8:1 / /var/tmp/rsi-\\000 rw - ext4 /dev/root rw",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let fx = Fx::new();
+        let meta = tempfile::tempdir().unwrap();
+        let dir = fx.scratch(&format!("rsi-mount-bad-{i}"), RootKind::VarTmp);
+        let mut cfg = fx.config(RootKind::VarTmp, OLD);
+        cfg.mountinfo = meta.path().join("mountinfo");
+        fs::write(
+            &cfg.mountinfo,
+            format!("1 0 8:1 / / rw - ext4 /dev/root rw\n{bad}\n"),
+        )
+        .unwrap();
+
+        let report = run_pass(&cfg);
+
+        assert_eq!(report.kept_unproven, 1, "{bad:?}: {report:?}");
+        assert_eq!(report.reclaimed, 0, "{bad:?}: {report:?}");
+        assert!(dir.join("data.bin").exists(), "{bad:?}");
+    }
+}
+
 // A mount id the kernel cannot report is not a mount boundary we can rule out.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
@@ -1994,10 +2240,7 @@ fn recent_deep_write_keeps_the_tree_young() {
 #[test]
 fn shell_helper_allocation_is_accepted_and_existing_dirs_are_refused() {
     let fx = Fx::new();
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/rsi-scratch-mkdir"
-    );
+    let script = rsi_common::manifest_dir!("/../../scripts/rsi-scratch-mkdir");
     let mkdir = |kind: &str, name: &str| {
         Command::new(script)
             .args([kind, name])
@@ -3534,4 +3777,389 @@ fn a_released_custody_lock_stays_held_by_a_child_that_has_not_yet_exec_d() {
 
     assert!(refused, "the forked child no longer shares the descriptor");
     assert!(granted);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn manager_targets_reuse_release_artifacts_and_isolate_source_worktrees() {
+    let fx = Fx::new();
+    let source = tempdir_keeping_btime();
+    let other = tempdir_keeping_btime();
+    let first = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    fs::create_dir_all(first.join("release/deps")).unwrap();
+    fs::write(first.join("release/deps/warm.rlib"), b"warm release").unwrap();
+    let again = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    assert_eq!(first, again);
+    assert_eq!(
+        fs::read(again.join("release/deps/warm.rlib")).unwrap(),
+        b"warm release"
+    );
+    let second = cargo_targets::manager_target_in(fx.root(), fx.registry(), other.path()).unwrap();
+    assert_ne!(first, second);
+    let report = run_pass(&fx.config(RootKind::CargoTarget, OLD));
+    assert_eq!(report.reclaimed, 2, "{report:?}");
+}
+
+/// #2536: the QA trim's stamp at the target root is the daemon's own
+/// bookkeeping; it must never make the manager-target layout proof refuse the
+/// target the next QA build environment prepares.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn manager_target_with_qa_trim_stamp_still_passes_the_layout_proof() {
+    let fx = Fx::new();
+    let source = tempdir_keeping_btime();
+    let first = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    fs::create_dir_all(first.join("debug/deps")).unwrap();
+    crate::qa_target_trim::trim_superseded(&first).unwrap();
+    assert!(first.join(crate::qa_target_trim::TRIM_STAMP).is_file());
+    let again = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    assert_eq!(first, again);
+}
+
+/// Every marker the daemon writes at a target root is accepted by `cache_only`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cache_only_accepts_every_daemon_written_target_root_marker() {
+    let fx = Fx::new();
+    let source = tempdir_keeping_btime();
+    let target = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    for marker in [
+        crate::qa_target_trim::TRIM_STAMP,
+        crate::sandbox::execution_scratch::BUILD_ENV_RECORD,
+    ] {
+        fs::write(target.join(marker), b"").unwrap();
+        let again =
+            cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+        assert_eq!(target, again, "{marker}");
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cargo_target_with_manager_state_is_retained_and_never_adopted() {
+    let fx = Fx::new();
+    let dir = create_scratch_dir_in(
+        fx.registry(),
+        fx.root(),
+        "review-target-state",
+        RootKind::CargoTarget,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("debug/deps")).unwrap();
+    fs::write(dir.join("handoff.md"), b"manager state").unwrap();
+    let cfg = fx.config(RootKind::CargoTarget, OLD);
+    let report = run_pass(&cfg);
+    assert_eq!(report.kept_unproven, 1, "{report:?}");
+    assert_eq!(fs::read(dir.join("handoff.md")).unwrap(), b"manager state");
+    let legacy = fx.root().join("review-target-legacy");
+    fs::create_dir_all(legacy.join("debug/deps")).unwrap();
+    fs::write(legacy.join("notes.txt"), b"keep").unwrap();
+    let result = adopt_legacy(&cfg, later(), &[legacy.clone()]);
+    assert!(!result[0].adopted, "{result:?}");
+    assert!(legacy.join("notes.txt").is_file());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn legacy_review_targets_are_visible_and_require_operator_adoption() {
+    let fx = Fx::new();
+    let dir = fx.root().join("review-target-old");
+    fs::create_dir_all(dir.join("debug/deps")).unwrap();
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let cfg = fx.config(RootKind::CargoTarget, OLD);
+    let report = run_pass(&cfg);
+    assert_eq!(report.kept_unrecorded, 1, "{report:?}");
+    let listing = list_legacy(&cfg, later());
+    assert_eq!(listing.candidates.len(), 1, "{listing:?}");
+    assert_eq!(listing.candidates[0].path, dir);
+    assert_eq!(listing.candidates[0].blocker, None);
+    let adopted = adopt_legacy(&cfg, later(), &[dir.clone()]);
+    assert!(adopted[0].adopted, "{adopted:?}");
+    assert!(
+        dir.join("debug/deps").is_dir(),
+        "adoption records without deleting"
+    );
+    assert_eq!(run_pass(&cfg).reclaimed, 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cargo_targets_retain_live_holders_and_dirty_nested_worktrees() {
+    let fx = Fx::new();
+    let dir = create_scratch_dir_in(
+        fx.registry(),
+        fx.root(),
+        "review-target-held",
+        RootKind::CargoTarget,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("debug/deps")).unwrap();
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .current_dir(&dir)
+        .spawn()
+        .unwrap();
+    fx.watch(&child);
+    let report = run_pass(&fx.config(RootKind::CargoTarget, OLD));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(report.kept_held, 1, "{report:?}");
+    let repo = dir.join("debug/fixture");
+    fs::create_dir_all(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(repo.join("uncommitted.txt"), b"work").unwrap();
+    let report = run_pass(&fx.config(RootKind::CargoTarget, OLD));
+    assert_eq!(report.kept_dirty, 1, "{report:?}");
+    assert_eq!(fs::read(repo.join("uncommitted.txt")).unwrap(), b"work");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn release_singleton_keeps_its_lock_inodes_under_the_generic_scratch_sweep() {
+    let fx = Fx::new();
+    let dir = create_scratch_dir_in(
+        fx.registry(),
+        fx.root(),
+        "release-target",
+        RootKind::CargoTarget,
+    )
+    .unwrap();
+    fs::write(dir.join(".rsi-job-admission.lock"), b"lock").unwrap();
+    fs::create_dir_all(dir.join("release/deps")).unwrap();
+    fs::write(dir.join("release/deps/warm.rlib"), b"warm").unwrap();
+    let before = fs::metadata(dir.join(".rsi-job-admission.lock")).unwrap();
+    let report = run_pass(&fx.config(RootKind::CargoTarget, OLD));
+    assert_eq!(report.reclaimed, 0);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::metadata(dir.join(".rsi-job-admission.lock"))
+            .unwrap()
+            .ino(),
+        before.ino()
+    );
+    assert_eq!(
+        fs::read(dir.join("release/deps/warm.rlib")).unwrap(),
+        b"warm"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cargo_targets_keep_deploy_roots_and_idle_installed_links() {
+    let fx = Fx::new();
+    let install = tempdir_keeping_btime();
+    let mut cfg = fx.config(RootKind::CargoTarget, OLD);
+    cfg.install_dirs = vec![install.path().join("bin"), install.path().join("install")];
+    for dir in &cfg.install_dirs {
+        fs::create_dir(dir).unwrap();
+    }
+    for name in [
+        "shared-target",
+        "sat-target-deploy",
+        "review-target-bin",
+        "review-target-install",
+    ] {
+        let dir =
+            create_scratch_dir_in(fx.registry(), fx.root(), name, RootKind::CargoTarget).unwrap();
+        fs::write(
+            dir.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("release")).unwrap();
+        fs::write(dir.join("release/tool"), b"installed executable").unwrap();
+        if name.ends_with("-bin") {
+            // Relative link through another link, with no running consumer.
+            std::os::unix::fs::symlink(&dir, install.path().join("target")).unwrap();
+            std::os::unix::fs::symlink("../target/release/tool", cfg.install_dirs[0].join("tool"))
+                .unwrap();
+        } else if name.ends_with("-install") {
+            std::os::unix::fs::symlink(dir.join("release/tool"), cfg.install_dirs[1].join("tool"))
+                .unwrap();
+        } else {
+            cfg.deploy_roots.push(dir);
+        }
+    }
+    let report = run_pass(&cfg);
+    assert_eq!(report.kept_held, 4, "{report:?}");
+    for name in [
+        "shared-target",
+        "sat-target-deploy",
+        "review-target-bin",
+        "review-target-install",
+    ] {
+        assert_eq!(
+            fs::read(fx.root().join(name).join("release/tool")).unwrap(),
+            b"installed executable"
+        );
+    }
+    for dir in &cfg.install_dirs {
+        assert_eq!(fs::read(dir.join("tool")).unwrap(), b"installed executable");
+    }
+    // The production configuration protects the legacy laptop deploy roots.
+    let standard = ScratchConfig::standard();
+    let home = dirs::home_dir().unwrap();
+    assert!(
+        standard
+            .deploy_roots
+            .contains(&home.join(".cargo/shared-target"))
+    );
+    assert!(
+        standard
+            .deploy_roots
+            .contains(&home.join(".cargo/sat-target-deploy"))
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cargo_target_installed_during_rename_is_restored_and_retained() {
+    fn install_after_rename(aside: &Path) {
+        let root = aside.parent().unwrap();
+        std::os::unix::fs::symlink(
+            "../review-target-race/release/tool",
+            root.join("install/tool"),
+        )
+        .unwrap();
+    }
+    let fx = Fx::new();
+    let dir = create_scratch_dir_in(
+        fx.registry(),
+        fx.root(),
+        "review-target-race",
+        RootKind::CargoTarget,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    fs::create_dir(dir.join("release")).unwrap();
+    fs::write(dir.join("release/tool"), b"installed").unwrap();
+    let mut cfg = fx.config(RootKind::CargoTarget, OLD);
+    cfg.install_dirs = vec![fx.root().join("install")];
+    fs::create_dir(&cfg.install_dirs[0]).unwrap();
+    cfg.after_rename = Some(install_after_rename);
+    assert_eq!(run_pass(&cfg).kept_held, 1);
+    assert_eq!(
+        fs::read(cfg.install_dirs[0].join("tool")).unwrap(),
+        b"installed"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn manager_first_allocation_serializes_creation_and_record_publication() {
+    let fx = Fx::new();
+    let source = tempdir_keeping_btime();
+    let root = fsys::open_root(fx.root(), current_uid()).unwrap();
+    let lock = fsys::open_dir_lock(&root).unwrap();
+    assert!(fsys::try_flock(&lock, true).unwrap());
+    let barrier = std::sync::Barrier::new(9);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let send = send.clone();
+            let barrier = &barrier;
+            let fx = &fx;
+            let source = &source;
+            scope.spawn(move || {
+                barrier.wait();
+                send.send(cargo_targets::manager_target_in(
+                    fx.root(),
+                    fx.registry(),
+                    source.path(),
+                ))
+                .unwrap();
+            });
+        }
+        barrier.wait();
+        // The old mkdir-then-record implementation completes while the parent
+        // lock is held. Every allocation must instead wait for publication.
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read_dir(fx.root()).unwrap().count(), 0);
+        drop(lock);
+        let paths: Vec<_> = (0..8)
+            .map(|_| {
+                receive
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        let pinned = record::pin_dir(&paths[0]).unwrap();
+        let rec = record::read_record(&pinned).unwrap();
+        assert!(
+            Registry::open(fx.registry(), current_uid())
+                .unwrap()
+                .get(&rec.nonce)
+                .unwrap()
+                .binds(&pinned, &root, RootKind::CargoTarget.tag(), current_uid())
+        );
+    });
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn cargo_cache_proof_accepts_cross_compile_and_tool_layouts_and_requires_a_marker() {
+    let fx = Fx::new();
+    let source = tempdir_keeping_btime();
+    let dir = cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap();
+    for layout in [
+        "x86_64-apple-darwin/debug/deps",
+        "aarch64-unknown-linux-gnu/release",
+        "llvm-cov-target/debug",
+        "nextest",
+        "flycheck0",
+        "custom-profile/deps",
+    ] {
+        fs::create_dir_all(dir.join(layout)).unwrap();
+    }
+    assert_eq!(
+        cargo_targets::manager_target_in(fx.root(), fx.registry(), source.path()).unwrap(),
+        dir
+    );
+    let cfg = fx.config(RootKind::CargoTarget, OLD);
+    fs::remove_file(dir.join("CACHEDIR.TAG")).unwrap();
+    assert_eq!(run_pass(&cfg).kept_unproven, 1);
+    fs::write(dir.join("CACHEDIR.TAG"), b"just a filename").unwrap();
+    assert_eq!(run_pass(&cfg).kept_unproven, 1);
+    fs::remove_file(dir.join("CACHEDIR.TAG")).unwrap();
+    fs::write(
+        dir.join(".rustc_info.json"),
+        br#"{"rustc_fingerprint":42,"outputs":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(run_pass(&cfg).reclaimed, 1);
+
+    let legacy = fx.root().join("review-target-no-marker");
+    fs::create_dir_all(legacy.join("release")).unwrap();
+    fs::write(legacy.join("release/operator-data"), b"retain").unwrap();
+    let result = adopt_legacy(&cfg, later(), &[legacy.clone()]);
+    assert!(!result[0].adopted, "{result:?}");
+    assert_eq!(
+        fs::read(legacy.join("release/operator-data")).unwrap(),
+        b"retain"
+    );
 }

@@ -406,6 +406,21 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Whether `ancestor` is a commit reachable from `descendant` in `repo` (#2651).
+/// A commit the repository does not have, or an unresolvable ref, is `false`.
+///
+/// # Errors
+/// Git could not be run.
+pub(crate) fn commit_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(repo)
+        .output()
+        .map_err(DaemonError::Io)?
+        .status;
+    Ok(status.success())
+}
+
 pub(crate) fn repository_root(path: &Path) -> Result<PathBuf> {
     let canonical = path
         .canonicalize()
@@ -458,6 +473,7 @@ pub(crate) async fn resolve_execution_base(
         .args([
             "fetch",
             "--no-tags",
+            "--no-write-fetch-head",
             "origin",
             "+refs/heads/rolling:refs/remotes/origin/rolling",
         ])
@@ -566,6 +582,38 @@ pub(crate) fn observe_sandbox(sandbox: &Path) -> Result<ObservedSandbox> {
     let dirty = !git(sandbox, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
     let head = git(sandbox, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     Ok(ObservedSandbox { head, dirty })
+}
+
+/// #2697: what a node worker has committed so far, for the wall-time notice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SandboxProgress {
+    /// Commits on the sandbox HEAD that the attempt base does not contain.
+    pub(crate) commits: u32,
+    /// Committer time of the newest of them; `None` when there are none.
+    pub(crate) last_commit_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Commits the worker added on top of `base_commit` in `sandbox` (#2697).
+///
+/// # Errors
+/// Git could not be run or the base or HEAD does not resolve.
+pub(crate) fn sandbox_progress(sandbox: &Path, base_commit: &str) -> Result<SandboxProgress> {
+    let range = format!("{base_commit}..HEAD");
+    let commits = git(sandbox, &["rev-list", "--count", &range])?
+        .parse::<u32>()
+        .map_err(|error| DaemonError::InvalidParam(format!("git rev-list count: {error}")))?;
+    let last_commit_at = if commits == 0 {
+        None
+    } else {
+        let stamp = git(sandbox, &["log", "-1", "--format=%cI", &range])?;
+        chrono::DateTime::parse_from_rfc3339(&stamp)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
+    };
+    Ok(SandboxProgress {
+        commits,
+        last_commit_at,
+    })
 }
 
 /// [`observe_sandbox`] ignoring daemon-owned scratch directories (the
@@ -1081,7 +1129,7 @@ mod tests {
         let db = TempDir::new().unwrap();
         let sandboxes = TempDir::new().unwrap();
         let allocator = SandboxAllocator::new(sandboxes.path().to_path_buf());
-        let mut store = crate::store::Store::open(&db.path().join("rsi.db")).unwrap();
+        let mut store = crate::store::Store::open_test_fixture(&db.path().join("rsi.db")).unwrap();
         let mut sessions = Vec::new();
         for node in ["A", "B"] {
             let id = Uuid::new_v4();

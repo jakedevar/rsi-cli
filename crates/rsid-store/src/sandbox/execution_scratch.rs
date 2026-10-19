@@ -23,6 +23,24 @@ const TEMP_NAME: &CStr = c".rsi-tmp";
 // every target.
 const PRIVATE_DIRECTORY_MODE: nix::libc::mode_t = 0o700;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
+/// The build settings a session's shell received, read back for its job
+/// units (`agent_jobs`). Kept at the authenticated sandbox root, outside
+/// disposable Cargo output. Only names in [`RECORDED_BUILD_ENV`] are honoured.
+pub const BUILD_ENV_RECORD: &str = ".rsi-build-env.json";
+/// Every variable [`SandboxExecutionScratch::stamp_build_env`] may set.
+pub const RECORDED_BUILD_ENV: &[&str] = &[
+    "CARGO_BUILD_JOBS",
+    "CARGO_PROFILE_DEV_DEBUG",
+    "CARGO_INCREMENTAL",
+    "RUSTC_WRAPPER",
+    "RSI_BUILD_SLOTS",
+    "RSI_BUILD_SLOT_ROOT",
+    "RSI_BUILD_SCCACHE",
+    "SCCACHE_CACHE_SIZE",
+    "SCCACHE_DIR",
+    "SCCACHE_SERVER_UDS",
+    "SCCACHE_CLIENT_SIDE",
+];
 const RAMFS_MAGIC: i64 = 0x8584_58f6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +52,9 @@ pub struct SandboxExecutionScratch {
     target_identity: FileIdentity,
     temp_identity: FileIdentity,
     build_env: Option<AgentBuildEnvironment>,
+    /// The custody-recorded Git common directory of the sandbox's repository
+    /// (#2746); the trusted anchor for the Git paths a provider may write.
+    git_common_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +66,85 @@ struct AgentBuildEnvironment {
     slots: u32,
     sccache: Option<PathBuf>,
     cache_gib: u32,
+    /// Operator setting `target_pool_keep`: warm pools `target-pool` keeps.
+    pool_keep: u64,
 }
+
+impl AgentBuildEnvironment {
+    fn from_runtime(runtime: &RuntimeConfig, worker: bool) -> Self {
+        let cache_enabled = runtime.agent_build_sccache_enabled.load(Ordering::Relaxed);
+        Self {
+            jobs: runtime.agent_build_jobs.load(Ordering::Relaxed),
+            line_tables_only: runtime.agent_build_line_tables_only.load(Ordering::Relaxed),
+            worker,
+            wrapper: installed_build_wrapper(),
+            slots: runtime.agent_build_slots.load(Ordering::Relaxed),
+            sccache: cache_enabled
+                .then(|| executable_on_path("sccache"))
+                .flatten(),
+            cache_gib: runtime
+                .agent_build_sccache_cache_gib
+                .load(Ordering::Relaxed),
+            pool_keep: runtime.target_pool_keep.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The daemon-owned build settings: `Some(value)` is set, `None` is removed from
+    /// an inherited environment.
+    fn env_values(&self) -> Vec<(&'static str, Option<String>)> {
+        let build = self;
+        let path = |path: &Path| Some(path.display().to_string());
+        let home = dirs::home_dir();
+        let mut values = vec![
+            ("CARGO_BUILD_JOBS", Some(build.jobs.to_string())),
+            (
+                "CARGO_PROFILE_DEV_DEBUG",
+                build
+                    .line_tables_only
+                    .then(|| "line-tables-only".to_string()),
+            ),
+            (
+                "CARGO_INCREMENTAL",
+                (build.worker || build.sccache.is_some()).then(|| "0".to_string()),
+            ),
+        ];
+        if let Some(wrapper) = &build.wrapper {
+            values.push(("RUSTC_WRAPPER", path(wrapper)));
+            values.push(("RSI_BUILD_SLOTS", Some(build.slots.to_string())));
+            if let Some(home) = &home {
+                values.push(("RSI_BUILD_SLOT_ROOT", path(&home.join(".rsi/build-slots"))));
+            }
+            values.push(("RSI_BUILD_SCCACHE", build.sccache.as_deref().and_then(path)));
+        } else {
+            values.push(("RUSTC_WRAPPER", build.sccache.as_deref().and_then(path)));
+        }
+        if build.sccache.is_some() {
+            values.push(("SCCACHE_CACHE_SIZE", Some(format!("{}G", build.cache_gib))));
+            if let Some(home) = &home {
+                // #2745: the server socket lives inside the cache directory, so
+                // the one directory a Codex `workspace-write` launch grants is
+                // enough for the server to create both its socket and its cache.
+                // A socket beside the directory under `~/.rsi` would stay on
+                // the read-only side of the sandbox.
+                let cache_dir = home.join(AGENT_SCCACHE_DIR);
+                values.push(("SCCACHE_DIR", path(&cache_dir)));
+                values.push((
+                    "SCCACHE_SERVER_UDS",
+                    path(&cache_dir.join(SCCACHE_SOCKET_NAME)),
+                ));
+            }
+            // Keep compilation in the wrapper-held client process; the cache
+            // daemon only serves artifacts and never consumes a build slot.
+            values.push(("SCCACHE_CLIENT_SIDE", Some("1".to_string())));
+        }
+        values
+    }
+}
+
+/// The shared worker compiler-cache directory, relative to the home directory.
+const AGENT_SCCACHE_DIR: &str = ".rsi/agent-sccache";
+/// The cache server's socket inside [`AGENT_SCCACHE_DIR`] (#2745).
+const SCCACHE_SOCKET_NAME: &str = "server.sock";
 
 fn executable_on_path(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -57,6 +156,142 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
                 .metadata()
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
         })
+}
+
+/// How long a launch waits for `target-pool seed` (a real seed takes ~10 s).
+const SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(any(test, feature = "test-seam"))]
+fn target_pool_scripts_for_test()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>> {
+    static SCRIPTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    SCRIPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Substitute one root's next seed command without changing process-global
+/// HOME/PATH or invoking the installed pool builder in a launch test.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn install_target_pool_script_for_test(root: PathBuf, script: PathBuf) {
+    target_pool_scripts_for_test()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root, script);
+}
+
+/// A target the seeder may fill: absent, or holding only the daemon's own
+/// scratch and records.
+fn target_is_unseeded(target: &Path) -> bool {
+    match std::fs::read_dir(target) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok()).all(|entry| {
+            matches!(
+                entry.file_name().to_str(),
+                Some(".rsi-tmp" | BUILD_ENV_RECORD | "CACHEDIR.TAG")
+            )
+        }),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// `~/.rsi/bin/target-pool`, installed by `make release-install`.
+fn installed_target_pool() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let candidate = dirs::home_dir()?.join(".rsi/bin/target-pool");
+    candidate
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .then_some(candidate)
+}
+
+/// The warm pools' disk and age, as `target-pool summary` reports them, for the
+/// operator's Sandbox Storage settings (#1882). Blocking; None when the script
+/// is not installed or fails.
+pub fn target_pool_summary() -> Option<serde_json::Value> {
+    let script = installed_target_pool()?;
+    let output = std::process::Command::new(script)
+        .arg("summary")
+        .stdin(std::process::Stdio::null())
+        .env_remove("RSI_SESSION_TOKEN")
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| serde_json::from_slice(&output.stdout).ok())
+        .flatten()
+}
+
+/// One pool garbage-collection pass: keep the newest `keep` pools, or only the
+/// newest one under disk `pressure`. A pool a seed is reading is skipped by the
+/// script, never waited on. Blocking; returns the script's JSON report
+/// (`removed`, `skipped_in_use`) or None when it did not run.
+pub fn run_target_pool_gc(keep: u64, pressure: bool) -> Option<serde_json::Value> {
+    let script = installed_target_pool()?;
+    let mut command = std::process::Command::new(script);
+    command
+        .arg("gc")
+        .arg("--keep")
+        .arg(keep.to_string())
+        .arg("--json")
+        .stdin(std::process::Stdio::null())
+        .env_remove("RSI_SESSION_TOKEN");
+    if pressure {
+        command.arg("--pressure");
+    }
+    let output = command.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| serde_json::from_slice(&output.stdout).ok())
+        .flatten()
+}
+
+/// One pool refresh pass (#2707): `target-pool refresh` starts a detached build at
+/// the `origin/rolling` tip when no pool is within half the seed distance of it. The
+/// script checks the free-space floor itself and the build runs in the build slice,
+/// so this never waits for a build. Blocking; returns the script's JSON report
+/// (`refresh`: one entry per pool directory) or None when it did not run.
+pub fn run_target_pool_refresh(runtime: &RuntimeConfig, keep: u64) -> Option<serde_json::Value> {
+    let script = installed_target_pool()?;
+    let output = target_pool_refresh_command(&script, runtime, keep)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| serde_json::from_slice(&output.stdout).ok())
+        .flatten()
+}
+
+/// The `target-pool refresh` command with the build settings a worker's seed gets.
+/// The pool key hashes `CARGO_INCREMENTAL` and the `CARGO_PROFILE_*` settings, and
+/// the build the refresh starts inherits what it is given, so a refresh in the
+/// daemon's own environment would build a pool no worker seed matches (#2716).
+fn target_pool_refresh_command(
+    script: &Path,
+    runtime: &RuntimeConfig,
+    keep: u64,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(script);
+    command
+        .arg("refresh")
+        .env("RSI_TARGET_POOL_KEEP", keep.to_string())
+        // A pool build must leave the workers the floor their cargo-slot admission holds
+        // (the operator's governor_min_free_disk_gb), whatever its own floor is (#2773).
+        .env(
+            "RSI_TARGET_POOL_WORKER_FLOOR_GIB",
+            runtime.governor_policy().min_free_disk_gb.to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .env_remove("RSI_SESSION_TOKEN");
+    for (name, value) in AgentBuildEnvironment::from_runtime(runtime, true).env_values() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    command
 }
 
 fn installed_build_wrapper() -> Option<PathBuf> {
@@ -106,6 +341,7 @@ impl SandboxExecutionScratch {
             target_identity,
             temp_identity,
             build_env: None,
+            git_common_dir: None,
         })
     }
 
@@ -127,7 +363,22 @@ impl SandboxExecutionScratch {
                 "ContextRead target does not match authenticated custody root",
             ));
         }
-        Self::prepare(permit.effective_cwd()).map(Some)
+        let mut scratch = Self::prepare(permit.effective_cwd())?;
+        scratch.git_common_dir = permit.git_common_dir().map(Path::to_path_buf);
+        Ok(Some(scratch))
+    }
+
+    /// The custody-recorded Git common directory, when the sandbox is a Git
+    /// worktree.
+    pub fn git_common_dir(&self) -> Option<&Path> {
+        self.git_common_dir.as_deref()
+    }
+
+    /// Record a Git common directory the way custody does (tests only).
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn with_git_common_dir_for_test(mut self, common: PathBuf) -> Self {
+        self.git_common_dir = Some(common);
+        self
     }
 
     #[cfg(any(test, feature = "test-seam"))]
@@ -145,62 +396,134 @@ impl SandboxExecutionScratch {
     /// Attach daemon-owned build defaults only after the custody permit has
     /// established this sandbox's scratch directory.
     pub fn with_build_env(mut self, runtime: &RuntimeConfig, worker: bool) -> Self {
-        let cache_enabled = runtime.agent_build_sccache_enabled.load(Ordering::Relaxed);
-        self.build_env = Some(AgentBuildEnvironment {
-            jobs: runtime.agent_build_jobs.load(Ordering::Relaxed),
-            line_tables_only: runtime.agent_build_line_tables_only.load(Ordering::Relaxed),
-            worker,
-            wrapper: installed_build_wrapper(),
-            slots: runtime.agent_build_slots.load(Ordering::Relaxed),
-            sccache: (worker && cache_enabled)
-                .then(|| executable_on_path("sccache"))
-                .flatten(),
-            cache_gib: runtime
-                .agent_build_sccache_cache_gib
-                .load(Ordering::Relaxed),
-        });
+        self.build_env = Some(AgentBuildEnvironment::from_runtime(runtime, worker));
         self
     }
 
+    /// The daemon-owned build settings for this sandbox: `Some(value)` is set,
+    /// `None` is removed from an inherited environment.
+    fn build_env_values(&self) -> Vec<(&'static str, Option<String>)> {
+        self.build_env
+            .as_ref()
+            .map(AgentBuildEnvironment::env_values)
+            .unwrap_or_default()
+    }
+
+    /// Stamp the build settings onto a provider command and record them in
+    /// `<sandbox>/.rsi-build-env.json`, so a job unit the session submits builds
+    /// exactly as its shell does, even after `cargo clean` (#1741, #2401).
     pub fn stamp_build_env(&self, cmd: &mut Command) {
-        let Some(build) = &self.build_env else { return };
-        cmd.env("CARGO_BUILD_JOBS", build.jobs.to_string());
-        if build.line_tables_only {
-            cmd.env("CARGO_PROFILE_DEV_DEBUG", "line-tables-only");
-        } else {
-            cmd.env_remove("CARGO_PROFILE_DEV_DEBUG");
+        let values = self.build_env_values();
+        for (name, value) in &values {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
         }
-        if build.worker {
-            cmd.env("CARGO_INCREMENTAL", "0");
-        } else {
-            cmd.env_remove("CARGO_INCREMENTAL");
-        }
-        if let Some(wrapper) = &build.wrapper {
-            cmd.env("RUSTC_WRAPPER", wrapper);
-            cmd.env("RSI_BUILD_SLOTS", build.slots.to_string());
-            if let Some(home) = dirs::home_dir() {
-                cmd.env("RSI_BUILD_SLOT_ROOT", home.join(".rsi/build-slots"));
+        if self.build_env.is_some() {
+            if let Err(error) = self.record_build_env(&values) {
+                tracing::warn!(
+                    target = %self.target.display(),
+                    %error,
+                    "cannot record the sandbox build environment for job units"
+                );
             }
-            if let Some(sccache) = &build.sccache {
-                cmd.env("RSI_BUILD_SCCACHE", sccache);
-            } else {
-                cmd.env_remove("RSI_BUILD_SCCACHE");
-            }
-        } else if let Some(sccache) = &build.sccache {
-            cmd.env("RUSTC_WRAPPER", sccache);
-        } else {
-            cmd.env_remove("RUSTC_WRAPPER");
         }
-        if build.sccache.is_some() {
-            cmd.env("SCCACHE_CACHE_SIZE", format!("{}G", build.cache_gib));
-            if let Some(home) = dirs::home_dir() {
-                cmd.env("SCCACHE_DIR", home.join(".rsi/agent-sccache"));
-                cmd.env("SCCACHE_SERVER_UDS", home.join(".rsi/agent-sccache.sock"));
-            }
-            // Keep compilation in the wrapper-held client process; the cache
-            // daemon only serves artifacts and never consumes a build slot.
-            cmd.env("SCCACHE_CLIENT_SIDE", "1");
+    }
+
+    fn record_build_env(&self, values: &[(&'static str, Option<String>)]) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let set: serde_json::Map<String, serde_json::Value> = values
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_ref()
+                    .map(|value| (name.to_string(), serde_json::Value::String(value.clone())))
+            })
+            .collect();
+        let body = serde_json::json!({ "version": 1, "env": set });
+        // Create a private, unique file without following an existing symlink.
+        // Both paths stay outside target, so cleaning it cannot interrupt a stamp.
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".rsi-build-env.")
+            .tempfile_in(&self.root)?;
+        temporary.write_all(&serde_json::to_vec_pretty(&body)?)?;
+        temporary
+            .persist(self.root.join(BUILD_ENV_RECORD))
+            .map(|_| ())
+            .map_err(|error| error.error)
+    }
+
+    /// The `target-pool seed` command with exactly the build settings the session
+    /// receives, so it picks (and, when none matches, builds) a pool keyed the same way.
+    fn target_pool_seed_command(&self, script: &Path, build: &AgentBuildEnvironment) -> Command {
+        let mut command = Command::new(script);
+        command
+            .arg("seed")
+            .arg("--sandbox")
+            .arg(&self.root)
+            .arg("--target")
+            .arg(&self.target)
+            .arg("--build-missing")
+            // The pool build this seed may start garbage-collects with the
+            // operator's keep count (#1882).
+            .env("RSI_TARGET_POOL_KEEP", build.pool_keep.to_string())
+            .env("CARGO_TARGET_DIR", &self.target)
+            .env("TMPDIR", &self.temp)
+            .env_remove("RSI_SESSION_TOKEN")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        for (name, value) in self.build_env_values() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
         }
+        command
+    }
+
+    /// Seed this worker's empty target from the warm target pool (#1741):
+    /// run the installed `target-pool seed` with exactly the build settings
+    /// the session receives, so it picks a pool built the same way, and let it
+    /// start a pool build for this commit when none matches. Best effort: a
+    /// missing script, a timeout or a failure leaves an empty target and the
+    /// session builds cold as before. Returns the seeder's one-line summary.
+    pub async fn seed_target_from_pool(&self) -> Option<String> {
+        let build = self.build_env.as_ref()?;
+        if !build.worker
+            || !self.root.join("Cargo.toml").is_file()
+            || !target_is_unseeded(&self.target)
+        {
+            return None;
+        }
+        #[cfg(any(test, feature = "test-seam"))]
+        let script = target_pool_scripts_for_test()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.root)
+            .or_else(installed_target_pool)?;
+        #[cfg(not(any(test, feature = "test-seam")))]
+        let script = installed_target_pool()?;
+        let mut command = self.target_pool_seed_command(&script, build);
+        let outcome = tokio::time::timeout(SEED_TIMEOUT, command.output()).await;
+        let summary = match outcome {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            Ok(Ok(output)) => format!(
+                "target-pool seed exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(Err(error)) => format!("target-pool seed could not start: {error}"),
+            Err(_) => format!(
+                "target-pool seed timed out after {}s",
+                SEED_TIMEOUT.as_secs()
+            ),
+        };
+        tracing::info!(root = %self.root.display(), %summary, "warm target pool seed");
+        Some(summary)
     }
 
     /// Reopen all fixed names below the pinned root and compare their exact
@@ -372,6 +695,25 @@ mod tests {
             })
         };
 
+        // #1883: sccache is off by default; a worker still gets the wrapper
+        // and the other build settings, but no cache client or cache paths.
+        let default_worker = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, true);
+        let mut default_cmd = Command::new("true");
+        default_worker.stamp_build_env(&mut default_cmd);
+        assert_eq!(env_value(&default_cmd, "RSI_BUILD_SCCACHE"), None);
+        assert_eq!(env_value(&default_cmd, "SCCACHE_DIR"), None);
+        assert_eq!(env_value(&default_cmd, "SCCACHE_CACHE_SIZE"), None);
+        assert_eq!(
+            env_value(&default_cmd, "RUSTC_WRAPPER").is_some(),
+            installed_build_wrapper().is_some()
+        );
+
+        // The operator setting still turns the cache on for new workers.
+        runtime
+            .update_field("agent_build_sccache_enabled", &serde_json::json!(true))
+            .unwrap();
         let worker = SandboxExecutionScratch::prepare(fixture.path())
             .unwrap()
             .with_build_env(&runtime, true);
@@ -404,6 +746,30 @@ mod tests {
             );
         }
 
+        // #1741: the same values are recorded for the session's job units,
+        // and only names the job launcher honours are written.
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.path().join(BUILD_ENV_RECORD)).unwrap())
+                .unwrap();
+        let recorded = record["env"].as_object().unwrap();
+        assert_eq!(recorded["CARGO_INCREMENTAL"], "0");
+        assert_eq!(recorded["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only");
+        for (name, value) in recorded {
+            assert!(RECORDED_BUILD_ENV.contains(&name.as_str()), "{name}");
+            assert_eq!(env_value(&worker_cmd, name).as_deref(), value.as_str());
+        }
+        let stamped_unset = worker_cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned());
+        for name in stamped_unset {
+            assert!(
+                !recorded.contains_key(&name),
+                "{name} is removed, not recorded"
+            );
+        }
+
         let lead = SandboxExecutionScratch::prepare(fixture.path())
             .unwrap()
             .with_build_env(&runtime, false);
@@ -413,11 +779,161 @@ mod tests {
             env_value(&lead_cmd, "CARGO_BUILD_JOBS").as_deref(),
             Some("4")
         );
-        assert_eq!(env_value(&lead_cmd, "CARGO_INCREMENTAL"), None);
+        assert_eq!(
+            env_value(&lead_cmd, "CARGO_INCREMENTAL"),
+            executable_on_path("sccache").map(|_| "0".to_string())
+        );
         assert_eq!(
             env_value(&lead_cmd, "RUSTC_WRAPPER").is_some(),
-            installed_build_wrapper().is_some()
+            installed_build_wrapper().is_some() || executable_on_path("sccache").is_some()
         );
+    }
+
+    /// #2745: the cache server socket sits inside the cache directory, the one
+    /// directory a Codex `workspace-write` launch grants, so a cold start can
+    /// create both.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn sccache_socket_is_inside_the_cache_directory() {
+        let build = AgentBuildEnvironment {
+            jobs: 4,
+            line_tables_only: true,
+            worker: true,
+            wrapper: Some(PathBuf::from("/w/rsi-build-rustc")),
+            slots: 16,
+            sccache: Some(PathBuf::from("/usr/bin/sccache")),
+            cache_gib: 10,
+            pool_keep: 1,
+        };
+        let values = build.env_values();
+        let get = |name: &str| {
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| value.clone()).flatten())
+        };
+        let cache = PathBuf::from(get("SCCACHE_DIR").expect("cache dir stamped"));
+        let socket = PathBuf::from(get("SCCACHE_SERVER_UDS").expect("socket stamped"));
+        assert_eq!(socket.parent(), Some(cache.as_path()));
+    }
+
+    /// #2716: the pool a reclaim-triggered refresh builds must carry the build key the
+    /// worker seeds look for. The key hashes `CARGO_INCREMENTAL` and `CARGO_PROFILE_*`,
+    /// so a daemon environment without the worker overrides yields a different one.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn target_pool_refresh_and_worker_seed_commands_yield_the_same_build_key() {
+        use crate::config::Config;
+        use std::collections::BTreeMap;
+
+        let fixture = disk_backed_fixture();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let worker = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, true);
+        let build = worker.build_env.clone().unwrap();
+        let script = Path::new("target-pool");
+        let seed = worker.target_pool_seed_command(script, &build);
+        let refresh = target_pool_refresh_command(script, &runtime, 3);
+
+        // A daemon environment that lacks the worker overrides and carries others.
+        let mut daemon: BTreeMap<String, String> = std::env::vars()
+            .filter(|(name, _)| name != "CARGO_INCREMENTAL" && !name.starts_with("CARGO_PROFILE_"))
+            .collect();
+        daemon.insert("CARGO_INCREMENTAL".into(), "1".into());
+
+        let effective = |overrides: Vec<(String, Option<String>)>| {
+            let mut env = daemon.clone();
+            for (name, value) in overrides {
+                match value {
+                    Some(value) => env.insert(name, value),
+                    None => env.remove(&name),
+                };
+            }
+            env
+        };
+        let overrides_of = |envs: std::process::CommandEnvs<'_>| {
+            envs.map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+        let pool_script = Path::new(rsi_common::manifest_dir!()).join("../../scripts/target-pool");
+        let key_under = |env: BTreeMap<String, String>| {
+            let output = std::process::Command::new("python3")
+                .arg(&pool_script)
+                .arg("key")
+                .arg("--repo")
+                .arg(fixture.path())
+                .env_clear()
+                .envs(&env)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+
+        let seed_key = key_under(effective(overrides_of(seed.as_std().get_envs())));
+        let refresh_key = key_under(effective(overrides_of(refresh.get_envs())));
+        assert_eq!(refresh_key, seed_key);
+        assert_ne!(
+            key_under(daemon.clone()),
+            seed_key,
+            "the daemon environment alone must not already match, or the test proves nothing"
+        );
+        let refresh_env: BTreeMap<_, _> = overrides_of(refresh.get_envs()).into_iter().collect();
+        assert_eq!(
+            refresh_env.get("RSI_TARGET_POOL_KEEP"),
+            Some(&Some("3".to_string()))
+        );
+        assert_eq!(
+            refresh_env.get("CARGO_INCREMENTAL"),
+            Some(&Some("0".to_string()))
+        );
+        // #2773: the pool build is told the floor the workers' cargo-slot holds.
+        assert_eq!(
+            refresh_env.get("RSI_TARGET_POOL_WORKER_FLOOR_GIB"),
+            Some(&Some(
+                runtime.governor_policy().min_free_disk_gb.to_string()
+            ))
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn only_a_target_holding_daemon_scratch_is_seeded_from_the_pool() {
+        // #1741: the warm target pool fills a fresh worker target only; a
+        // target with any build output is the session's own and stays.
+        let fixture = disk_backed_fixture();
+        let scratch = SandboxExecutionScratch::prepare(fixture.path()).unwrap();
+        std::fs::write(scratch.target().join(BUILD_ENV_RECORD), b"{}").unwrap();
+        assert!(target_is_unseeded(scratch.target()));
+        assert!(target_is_unseeded(&fixture.path().join("absent")));
+        std::fs::create_dir(scratch.target().join("debug")).unwrap();
+        assert!(!target_is_unseeded(scratch.target()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn lead_sessions_and_non_cargo_roots_are_never_seeded() {
+        use crate::config::Config;
+        let fixture = disk_backed_fixture();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let lead = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, false);
+        assert_eq!(lead.seed_target_from_pool().await, None);
+        // No Cargo.toml at the root: nothing to seed, no pool build requested.
+        let worker = SandboxExecutionScratch::prepare(fixture.path())
+            .unwrap()
+            .with_build_env(&runtime, true);
+        assert_eq!(worker.seed_target_from_pool().await, None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

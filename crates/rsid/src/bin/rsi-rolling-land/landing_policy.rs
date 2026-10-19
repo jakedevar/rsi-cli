@@ -10,12 +10,11 @@
 //!   run of migrations starting at exactly the rolling tip's version + 1, each
 //!   version carrying its `if version < N` block. The refusal names the number
 //!   the source needs.
-//! - The Work binding is still reported (`source_binding=`) when the ledger is
-//!   readable; it never refuses a landing.
+//! - No ledger lookup: the lander never calls `AgentManagerInspect`, a manager
+//!   verb a worker's token is refused (#1927).
 
-use super::{AcceptedPair, git_output};
-use chrono::{DateTime, Duration, Utc};
-use serde_json::{Value, json};
+use super::git_output;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
@@ -30,8 +29,15 @@ const PRE_SPLIT_MIGRATION_DIR: &str = "crates/rsid/src/store/migrations";
 const STORES: [&str; 2] = [STORE, PRE_SPLIT_STORE];
 const MIGRATION_DIRS: [&str; 2] = [MIGRATION_DIR, PRE_SPLIT_MIGRATION_DIR];
 const MAX_CHANGED_PATHS: usize = 1024;
-const MAX_WORK_PAGES: usize = 16;
 const RELEASED_MANIFEST: &str = "tools/released-migrations.json";
+/// The store directories whose sources the pin file describes: a change under
+/// one can add a migration block or a marked protected section (#1949).
+const STORE_ROOTS: [&str; 2] = ["crates/rsid-store/src/store/", "crates/rsid/src/store/"];
+/// Identity and subject of the commit that records a derived pin (#1949). The
+/// stale retry recognises it by these to merge the source without it.
+const PIN_COMMIT_NAME: &str = "rsi rolling landing";
+const PIN_COMMIT_EMAIL: &str = "rsi-rolling-land@rsi.invalid";
+const PIN_COMMIT_SUBJECT: &str = "rsi rolling landing: derive released-migration pin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyFence {
@@ -56,12 +62,6 @@ impl PolicyFence {
 pub struct PolicyRefusal {
     pub fence: PolicyFence,
     pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceBinding {
-    pub source: String,
-    pub state: &'static str,
 }
 
 impl PolicyRefusal {
@@ -356,6 +356,120 @@ fn check_migration_number(
     Ok(appended)
 }
 
+fn is_store_path(path: &str) -> bool {
+    STORE_ROOTS.iter().any(|root| path.starts_with(root))
+}
+
+/// #1949: the released-migrations pin is derived where the lander publishes, so
+/// no worker edits the shared manifest and concurrent migrations never conflict
+/// on it. `worktree` is the candidate's detached worktree at `candidate`. When
+/// the diff `target..candidate` can change a pin and `--refresh` against
+/// `target` rewrites the manifest, the new manifest is committed on top of the
+/// candidate and its oid returned; `None` leaves the candidate as it is.
+///
+/// Best effort by design: a refresh that fails (a changed released block, a
+/// missing altered-objects entry, ...) derives nothing, and the released
+/// migration guard that follows refuses the candidate with the same reason.
+pub(super) fn derive_released_pin(
+    repo: &Path,
+    worktree: &Path,
+    target: &str,
+    candidate: &str,
+) -> Result<Option<String>, String> {
+    let script = repo.join("tools/check-released-migrations.py");
+    if !script.is_file() {
+        return Ok(None);
+    }
+    let paths = changed_paths(repo, target, candidate)?;
+    let protected = protected_migration_paths(repo, target)
+        .and_then(|mut paths| {
+            paths.extend(protected_migration_paths(repo, candidate)?);
+            Ok(paths)
+        })
+        // A tree with no readable pin file has nothing to derive on.
+        .unwrap_or_default();
+    if !paths
+        .iter()
+        .any(|path| is_protected(&protected, path) || is_store_path(path))
+    {
+        return Ok(None);
+    }
+    // A source that edited the pin file owns its pin (an older worker's
+    // `--refresh`): rewriting that text would read as lost hunks.
+    let manifest_blob = |revision: &str| {
+        super::git_text(
+            repo,
+            &["rev-parse", &format!("{revision}:{RELEASED_MANIFEST}")],
+        )
+    };
+    if manifest_blob(target).ok() != manifest_blob(candidate).ok() {
+        return Ok(None);
+    }
+    if super::git_text(worktree, &["rev-parse", "HEAD"])? != candidate
+        || !super::git_text(worktree, &["status", "--porcelain=v1"])?.is_empty()
+    {
+        return Err("pin derivation needs a clean worktree at the candidate".into());
+    }
+    let refreshed = Command::new("python3")
+        .arg(&script)
+        .arg("--refresh")
+        .arg(target)
+        .current_dir(worktree)
+        .output()
+        .map_err(|error| format!("cannot start released-migration refresh: {error}"))?;
+    if !refreshed.status.success() {
+        // `--refresh` writes only after every check passed, so the worktree is
+        // untouched; the guard that follows refuses with the reason.
+        println!(
+            "released_pin_derive=skipped reason={}",
+            String::from_utf8_lossy(&refreshed.stderr).trim()
+        );
+        return Ok(None);
+    }
+    super::git_ok(worktree, &["add", "--", RELEASED_MANIFEST])?;
+    if super::git_output(worktree, &["diff", "--cached", "--quiet"])?
+        .status
+        .success()
+    {
+        return Ok(None);
+    }
+    let name = format!("user.name={PIN_COMMIT_NAME}");
+    let email = format!("user.email={PIN_COMMIT_EMAIL}");
+    super::git_ok(
+        worktree,
+        &[
+            "-c",
+            &name,
+            "-c",
+            &email,
+            "commit",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-q",
+            "-m",
+            PIN_COMMIT_SUBJECT,
+        ],
+    )?;
+    if !super::git_text(worktree, &["status", "--porcelain=v1"])?.is_empty() {
+        return Err("pin derivation left the candidate worktree dirty".into());
+    }
+    let derived = super::git_text(worktree, &["rev-parse", "HEAD"])?;
+    println!("released_pin_derived={derived} parent={candidate}");
+    Ok(Some(derived))
+}
+
+/// The candidate a pin commit from [`derive_released_pin`] sits on, `None` for
+/// any other commit. A stale retry merges that parent onto the advanced tip and
+/// derives the pin again, so the manifest never conflicts with a sibling's pin.
+pub(super) fn pin_commit_parent(repo: &Path, oid: &str) -> Result<Option<String>, String> {
+    let identity = super::git_text(repo, &["log", "-1", "--format=%ce%n%s", oid])?;
+    if identity != format!("{PIN_COMMIT_EMAIL}\n{PIN_COMMIT_SUBJECT}") {
+        return Ok(None);
+    }
+    let parent = super::git_text(repo, &["rev-parse", &format!("{oid}^")])?;
+    Ok(Some(parent))
+}
+
 pub(super) fn check_released_migrations(
     repo: &Path,
     source_repo: &Path,
@@ -382,160 +496,13 @@ pub(super) fn check_released_migrations(
     Ok(())
 }
 
-// Unit tests inherit the worker's transport credentials. Never let their
-// informational binding lookup reach the live daemon (#1559).
-#[cfg(test)]
-fn inspect_work() -> Result<Vec<Value>, String> {
-    let path = std::env::var_os("RSI_LANDER_TEST_WORK_ROWS")
-        .ok_or_else(|| "test ownership ledger fixture not configured".to_owned())?;
-    let data = std::fs::read(path).map_err(|error| error.to_string())?;
-    serde_json::from_slice(&data).map_err(|error| error.to_string())
-}
-
-#[cfg(not(test))]
-fn inspect_work() -> Result<Vec<Value>, String> {
-    if std::env::var_os("RSI_SESSION_TOKEN").is_none() {
-        return Err("protected landing requires an rsi-managed Epic lead".into());
-    }
-    inspect_work_with_page(|cursor| {
-        let response = rsi_common::agent_rpc_client::dispatch_from_env(
-            "AgentManagerInspect",
-            json!({"section":"work","cursor":cursor,"limit":64}),
-        )
-        .map_err(|error| format!("cannot read landing ownership ledger: {error}"))?;
-        if let Some(error) = response.error {
-            return Err(format!(
-                "landing ownership ledger refused: {}",
-                error.message
-            ));
-        }
-        response
-            .result
-            .ok_or_else(|| "landing ownership ledger returned no result".into())
-    })
-}
-
-fn inspect_work_with_page(
-    mut page_source: impl FnMut(Value) -> Result<Value, String>,
-) -> Result<Vec<Value>, String> {
-    let mut cursor = Value::Null;
-    let mut seen = HashSet::new();
-    let mut rows = Vec::new();
-    for _ in 0..MAX_WORK_PAGES {
-        let result = page_source(cursor.clone())?;
-        if result["section"] != "work" {
-            return Err("landing ownership ledger returned the wrong section".into());
-        }
-        let page = result["rows"]
-            .as_array()
-            .ok_or("landing ownership ledger returned invalid work rows")?;
-        if page.len() > 64 {
-            return Err("landing ownership ledger exceeded its page bound".into());
-        }
-        rows.extend(page.iter().cloned());
-        cursor = result["next_cursor"].clone();
-        if cursor.is_null() {
-            if result["complete"] != true {
-                return Err("landing ownership ledger traversal is incomplete".into());
-            }
-            return Ok(rows);
-        }
-        let serialized = cursor.to_string();
-        if !seen.insert(serialized) {
-            return Err("landing ownership ledger repeated a page cursor".into());
-        }
-    }
-    Err("landing ownership ledger exceeded its traversal bound".into())
-}
-
-fn live_unintegrated(work: &Value) -> bool {
-    if work["integrated"] == true || work["archived"] == true {
-        return false;
-    }
-    let Some(updated_at) = work["updated_at"].as_str() else {
-        return true;
-    };
-    let Ok(updated_at) = DateTime::parse_from_rfc3339(updated_at) else {
-        return true;
-    };
-    updated_at.with_timezone(&Utc) >= Utc::now() - Duration::hours(24)
-}
-
-fn source_bindings(
-    accepted: &[AcceptedPair],
-    rows: &[Value],
-    lookup_unknown: bool,
-) -> Vec<SourceBinding> {
-    accepted
-        .iter()
-        .map(|pair| {
-            let bound = rows.iter().any(|row| {
-                row["source_commit"] == pair.source
-                    && row["source_accepted"] == true
-                    && live_unintegrated(row)
-            });
-            SourceBinding {
-                source: pair.source.clone(),
-                state: if bound {
-                    "bound"
-                } else if lookup_unknown {
-                    "unknown"
-                } else {
-                    "unbound"
-                },
-            }
-        })
-        .collect()
-}
-
 pub fn check_with_proof(
     repo: &Path,
     source_repo: &Path,
     target: &str,
     candidate: &str,
-    accepted: &[AcceptedPair],
     proved_versions: &[u32],
-) -> Result<Vec<SourceBinding>, PolicyRefusal> {
-    check_with_work_and_proof(
-        repo,
-        source_repo,
-        target,
-        candidate,
-        accepted,
-        proved_versions,
-        inspect_work,
-    )
-}
-
-#[cfg(test)]
-pub fn check_with_work(
-    repo: &Path,
-    source_repo: &Path,
-    target: &str,
-    candidate: &str,
-    accepted: &[AcceptedPair],
-    work_rows: impl FnOnce() -> Result<Vec<Value>, String>,
-) -> Result<Vec<SourceBinding>, PolicyRefusal> {
-    check_with_work_and_proof(
-        repo,
-        source_repo,
-        target,
-        candidate,
-        accepted,
-        &[],
-        work_rows,
-    )
-}
-
-pub fn check_with_work_and_proof(
-    repo: &Path,
-    source_repo: &Path,
-    target: &str,
-    candidate: &str,
-    accepted: &[AcceptedPair],
-    proved_versions: &[u32],
-    work_rows: impl FnOnce() -> Result<Vec<Value>, String>,
-) -> Result<Vec<SourceBinding>, PolicyRefusal> {
+) -> Result<(), PolicyRefusal> {
     let paths = changed_paths(repo, target, candidate)
         .map_err(|message| PolicyRefusal::new(PolicyFence::PathInspection, message))?;
     check_migration_layout(repo, target, candidate)?;
@@ -563,125 +530,5 @@ pub fn check_with_work_and_proof(
             "provisional proof version is outside the candidate's appended migration range",
         ));
     }
-    Ok(report_bindings(accepted, work_rows))
-}
-
-/// Report each source's Work binding. The lookup is informational: an
-/// unreadable ledger (no lead token, daemon down) reports `unknown` and never
-/// refuses the landing.
-fn report_bindings(
-    accepted: &[AcceptedPair],
-    work_rows: impl FnOnce() -> Result<Vec<Value>, String>,
-) -> Vec<SourceBinding> {
-    work_rows().map_or_else(
-        |_| source_bindings(accepted, &[], true),
-        |rows| source_bindings(accepted, &rows, false),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SOURCE: &str = "1111111111111111111111111111111111111111";
-
-    fn pair() -> AcceptedPair {
-        AcceptedPair {
-            base: "0".repeat(40),
-            source: SOURCE.into(),
-        }
-    }
-
-    fn row(integrated: bool) -> Value {
-        json!({
-            "key":"landing-work", "epic_id":"epic-j", "source_commit":SOURCE,
-            "source_accepted":true, "integrated":integrated, "archived":false,
-            "updated_at":Utc::now().to_rfc3339(),
-        })
-    }
-
-    #[test]
-    fn binding_report_is_bound_unbound_or_unknown_and_never_refuses() {
-        let bound = report_bindings(&[pair()], || Ok(vec![row(false)]));
-        assert_eq!(bound[0].source, SOURCE);
-        assert_eq!(bound[0].state, "bound");
-        let unbound = report_bindings(&[pair()], || Ok(vec![]));
-        assert_eq!(unbound[0].state, "unbound");
-        let integrated = report_bindings(&[pair()], || Ok(vec![row(true)]));
-        assert_eq!(integrated[0].state, "unbound");
-        let unknown = report_bindings(&[pair()], || Err("no lead token".into()));
-        assert_eq!(unknown[0].state, "unknown");
-    }
-
-    #[test]
-    fn test_binding_lookup_uses_only_the_local_fixture() {
-        let _env = super::super::tests::env_lock();
-        let previous = std::env::var_os("RSI_LANDER_TEST_WORK_ROWS");
-        unsafe { std::env::remove_var("RSI_LANDER_TEST_WORK_ROWS") };
-        let missing = inspect_work();
-        let unknown = report_bindings(&[pair()], inspect_work);
-
-        let fixture = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(fixture.path(), json!([row(false)]).to_string()).unwrap();
-        unsafe { std::env::set_var("RSI_LANDER_TEST_WORK_ROWS", fixture.path()) };
-        let bound = report_bindings(&[pair()], inspect_work);
-        std::fs::write(fixture.path(), "invalid fixture").unwrap();
-        let invalid = report_bindings(&[pair()], inspect_work);
-        unsafe {
-            match previous {
-                Some(path) => std::env::set_var("RSI_LANDER_TEST_WORK_ROWS", path),
-                None => std::env::remove_var("RSI_LANDER_TEST_WORK_ROWS"),
-            }
-        }
-
-        assert_eq!(
-            missing.unwrap_err(),
-            "test ownership ledger fixture not configured"
-        );
-        assert_eq!(unknown[0].state, "unknown");
-        assert_eq!(bound[0].state, "bound");
-        assert_eq!(invalid[0].state, "unknown");
-    }
-
-    #[test]
-    fn work_traversal_requires_complete_distinct_bounded_pages() {
-        let mut calls = Vec::new();
-        let rows = inspect_work_with_page(|cursor| {
-            calls.push(cursor.clone());
-            if cursor.is_null() {
-                Ok(json!({"section":"work","rows":[{"key":"first"}],"next_cursor":"next","complete":false}))
-            } else {
-                Ok(json!({"section":"work","rows":[{"key":"second"}],"next_cursor":null,"complete":true}))
-            }
-        })
-        .unwrap();
-        assert_eq!(calls, [Value::Null, json!("next")]);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0]["key"], "first");
-        assert_eq!(rows[1]["key"], "second");
-
-        assert!(
-            inspect_work_with_page(|_| Ok(
-                json!({"section":"work","rows":[],"next_cursor":null,"complete":false})
-            ))
-            .unwrap_err()
-            .contains("incomplete")
-        );
-        assert!(
-            inspect_work_with_page(|_| Ok(
-                json!({"section":"work","rows":[],"next_cursor":"repeat","complete":false})
-            ))
-            .unwrap_err()
-            .contains("repeated")
-        );
-        let mut page = 0;
-        assert!(
-            inspect_work_with_page(|_| {
-                page += 1;
-                Ok(json!({"section":"work","rows":[],"next_cursor":page,"complete":false}))
-            })
-            .unwrap_err()
-            .contains("traversal bound")
-        );
-    }
+    Ok(())
 }

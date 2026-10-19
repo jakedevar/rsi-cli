@@ -59,10 +59,16 @@ const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const MAX_TARGET_OPTIONS = 8;
 const TARGET_KINDS = new Set(['question', 'approval']);
 
-function statusError(status) {
+// A 503 is a busy (or slow) host, not a missing daemon: the polling backoff
+// retries it, so the wording is calm. Only a 502 (the gateway could not reach
+// rsid) says rsid may not be running. A 500 is a reply the gateway could not
+// use; its body code (malformed, oversize, daemon_error) is shown for the log.
+function statusError(status, code = '') {
   if (status === 401) return new ApiError('Your session has expired. Reload the page to sign in again.', 401);
   if (status === 403) return new ApiError('The gateway denied this request. Check that this phone is allowed and the gateway is ready, then reload.', 403);
   if (status === 502) return new ApiError('The RSI daemon is unavailable. Check that rsid is running on the host.', 502);
+  if (status === 503) return new ApiError('The host is busy; retrying…', 503);
+  if (status === 500 && code !== '') return new ApiError(`The RSI host sent a reply the gateway could not use (${code}). Retrying; check the rsi-remote log if it persists.`, 500);
   return new ApiError(`The RSI host returned ${status}. Retry when it is available.`, status);
 }
 
@@ -392,7 +398,7 @@ export function createApi(fetchImpl = globalThis.fetch.bind(globalThis)) {
       response = await send(fetchImpl, path, { ...GET_INIT });
       if (response.status === 401) throw statusError(401);
     }
-    if (!response.ok) throw statusError(response.status);
+    if (!response.ok) throw statusError(response.status, response.status === 500 ? await readErrorCode(response) : '');
     return readBody(response);
   }
 

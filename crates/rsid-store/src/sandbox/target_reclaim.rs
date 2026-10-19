@@ -4,13 +4,51 @@
 //! custody mutation. Its only mutating authority is an already authenticated
 //! `target` directory opened beneath `base/<allocation UUID>`.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
+//!
+//! Linux proves containment with the kernel's `openat2(2)` and
+//! `renameat2(2)`. macOS uses the same names from [`beneath`], a
+//! descriptor-relative walk with the same guarantees (#89, hub #3055).
 
+/// This platform reclaims sandbox build caches (hub #3055 part 2). The
+/// fail-closed shim sets it false, and the daemon raises the
+/// `reclaim_unsupported` health condition and reports
+/// `build_cache_reclaim: unsupported` from it.
+pub const RECLAIM_SUPPORTED: bool = true;
+
+// Linux uses the kernel calls; it compiles the portable walk only for its tests.
+#[cfg(any(target_os = "macos", test))]
+mod beneath;
+#[cfg(target_os = "macos")]
+mod process_scan_macos;
+
+/// Linux stand-in for the macOS-only scan module (#102). A change to
+/// `process_scan_macos.rs` makes `scripts/scoped-test` derive the filter
+/// `sandbox::target_reclaim::process_scan_macos`, which matches no test where
+/// the real module is not compiled and fails the run as `no_tests_selected`.
+/// This module keeps that path present on Linux and pins that the macOS scan
+/// is not what Linux uses.
+#[cfg(all(test, target_os = "linux"))]
+mod process_scan_macos {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn the_macos_scan_is_not_compiled_into_the_linux_reclaim_check() {
+        assert!(cfg!(target_os = "linux") && !cfg!(target_os = "macos"));
+    }
+}
+
+#[cfg(target_os = "macos")]
+use beneath::{OpenHow, RenameFlags, ResolveFlag, openat2, renameat2};
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag, open, openat2, renameat2};
+use nix::fcntl::{AtFlags, OFlag, open};
+#[cfg(target_os = "linux")]
+use nix::fcntl::{OpenHow, RenameFlags, ResolveFlag, openat2, renameat2};
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, dup, fsync, unlinkat};
+#[cfg(target_os = "macos")]
+use process_scan_macos::ensure_no_target_process;
+use rsi_common::sandbox_storage::E2E_ARTIFACTS_DIR_NAME;
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as SkipReason;
 use rsi_common::sandbox_storage::SandboxReclaimCheck;
 use sha2::{Digest, Sha256};
@@ -33,7 +71,7 @@ const CURSOR_DIR: &str = ".recovery-cursor-v2";
 const BACKOFF_DIR: &str = ".entry-backoff-v2";
 const BUCKET_COUNT: u16 = 256;
 const LEGACY_MIGRATION_ENTRIES_PER_PASS: u64 = 64;
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 const LEGACY_REJECTED_QUEUE_NAME: &str = ".rsi-target-reclaim-rejected-v1";
 // Fixed safety ceilings, not operator policy. These deliberately stay out of
 // daemon_settings: they bound hostile filesystem work rather than tune normal
@@ -43,10 +81,31 @@ const MAX_FILESYSTEM_ENTRIES_PER_PASS: u64 = 500_000;
 const MAX_ALLOCATED_BYTES_PER_PASS: u64 = 128 * 1024 * 1024 * 1024;
 const MAX_RECLAIM_PASS_DURATION: Duration = Duration::from_secs(30);
 const MAX_RECLAIM_DEPTH: u32 = 128;
+/// Longest directory entry name. Linux `NAME_MAX`; macOS has no libc
+/// constant but the same 255-byte limit (`<sys/syslimits.h>`).
+#[cfg(target_os = "linux")]
+const NAME_MAX: usize = nix::libc::NAME_MAX as usize;
+#[cfg(target_os = "macos")]
+const NAME_MAX: usize = 255;
 const RESOLVE_FLAGS: ResolveFlag = ResolveFlag::RESOLVE_BENEATH
     .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
     .union(ResolveFlag::RESOLVE_NO_MAGICLINKS)
     .union(ResolveFlag::RESOLVE_NO_XDEV);
+
+/// File-type test on `st_mode`. `SFlag::contains` is a bit test, and
+/// `S_IFSOCK` (0o140000) and `S_IFBLK` (0o060000) contain the `S_IFDIR` bit
+/// (0o040000), so it would classify a socket as a directory (#1933).
+fn mode_file_type(mode: nix::libc::mode_t) -> nix::libc::mode_t {
+    mode & nix::libc::S_IFMT
+}
+
+fn is_dir_mode(mode: nix::libc::mode_t) -> bool {
+    mode_file_type(mode) == nix::libc::S_IFDIR
+}
+
+fn is_symlink_mode(mode: nix::libc::mode_t) -> bool {
+    mode_file_type(mode) == nix::libc::S_IFLNK
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReclaimWorkLimits {
@@ -180,7 +239,7 @@ impl TargetFootprint {
         let bytes = allocated_stat_bytes(stat);
         self.scanned_entries = self.scanned_entries.saturating_add(1);
         self.scanned_allocated_bytes = self.scanned_allocated_bytes.saturating_add(bytes);
-        let is_dir = SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR);
+        let is_dir = is_dir_mode(stat.st_mode);
         let entry = self.entries.entry(key).or_insert_with(|| {
             self.bytes = self.bytes.saturating_add(bytes);
             InodeObservation {
@@ -453,6 +512,7 @@ pub fn directory_birth_time_for_test(
 
 /// The statx birth time of an open directory, or `None` when the kernel or
 /// filesystem does not report one.
+#[cfg(target_os = "linux")]
 fn directory_birth_time(fd: RawFd) -> Option<chrono::DateTime<chrono::Utc>> {
     let mut buf = std::mem::MaybeUninit::<nix::libc::statx>::zeroed();
     // SAFETY: `fd` is a live descriptor, the empty path with AT_EMPTY_PATH
@@ -475,6 +535,20 @@ fn directory_birth_time(fd: RawFd) -> Option<chrono::DateTime<chrono::Utc>> {
         return None;
     }
     chrono::DateTime::from_timestamp(buf.stx_btime.tv_sec, buf.stx_btime.tv_nsec)
+}
+
+/// The `st_birthtime` of an open directory (macOS reports it for every local
+/// filesystem), or `None` when it is unreadable or unset.
+#[cfg(target_os = "macos")]
+fn directory_birth_time(fd: RawFd) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stat = fstat(fd).ok()?;
+    if stat.st_birthtime <= 0 {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(
+        stat.st_birthtime,
+        u32::try_from(stat.st_birthtime_nsec).ok()?,
+    )
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -670,7 +744,12 @@ impl PinnedSandboxRoot {
             if !is_reclaimable_target_entry(name.to_bytes(), kind)
                 && !(kind == SFlag::S_IFDIR
                     && is_cargo_target_triple_name(name.to_bytes())
-                    && target_triple_dir_holds_only_profile_dirs(fd, name))
+                    && target_triple_dir_has_cargo_layout(fd, name))
+                // A triple-named directory must pass its own stricter layout
+                // check above (an empty one refuses, #1684).
+                && !(kind == SFlag::S_IFDIR
+                    && !is_cargo_target_triple_name(name.to_bytes())
+                    && dir_is_nested_target_tree(fd, name, 0))
             {
                 return Err((
                     SkipReason::TargetUnrecognizedContent,
@@ -688,10 +767,10 @@ impl PinnedSandboxRoot {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
             Err(Errno::ENOENT) => return Err(SkipReason::TargetAbsent),
-            Ok(stat) if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFLNK) => {
+            Ok(stat) if is_symlink_mode(stat.st_mode) => {
                 return Err(SkipReason::TargetSymlink);
             }
-            Ok(stat) if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) => {
+            Ok(stat) if !is_dir_mode(stat.st_mode) => {
                 return Err(SkipReason::TargetNotDirectory);
             }
             Ok(stat) => stat,
@@ -987,11 +1066,7 @@ impl PinnedSandboxRoot {
                         AtFlags::AT_SYMLINK_NOFOLLOW,
                     ) {
                         Err(Errno::ENOENT) => SkipReason::TargetAbsent,
-                        Ok(stat)
-                            if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFLNK) =>
-                        {
-                            SkipReason::TargetSymlink
-                        }
+                        Ok(stat) if is_symlink_mode(stat.st_mode) => SkipReason::TargetSymlink,
                         Ok(_) => SkipReason::TargetNotDirectory,
                         Err(_) => SkipReason::TargetIdentityChanged,
                     },
@@ -1092,10 +1167,13 @@ fn is_cargo_target_triple_name(name: &[u8]) -> bool {
         })
 }
 
-/// A Cargo target-triple directory holds only profile directories
-/// (`debug/`, `release/`, custom profiles). Any file, link or special entry
-/// may be someone's state, so the whole target is retained (#1684).
-fn target_triple_dir_holds_only_profile_dirs(target_fd: RawFd, name: &CStr) -> bool {
+/// A Cargo target-triple directory has Cargo's own layout: Cargo's
+/// `CACHEDIR.TAG` marker file, profile directories, and at least one of
+/// `debug/` or `release/` holding `deps/`, `.fingerprint/` or `build/`. Any
+/// other file, link or special entry may be someone's state, and a triple-named
+/// directory without a Cargo profile is not Cargo output, so the whole target
+/// is retained (#1684, #1847).
+fn target_triple_dir_has_cargo_layout(target_fd: RawFd, name: &CStr) -> bool {
     let Ok(raw) = nix::fcntl::openat(
         Some(target_fd),
         name,
@@ -1109,6 +1187,7 @@ fn target_triple_dir_holds_only_profile_dirs(target_fd: RawFd, name: &CStr) -> b
         return false;
     };
     let dir_fd = raw;
+    let mut profile_dirs: Vec<std::ffi::CString> = Vec::new();
     for entry in dir.iter() {
         let Ok(entry) = entry else {
             return false;
@@ -1123,11 +1202,143 @@ fn target_triple_dir_holds_only_profile_dirs(target_fd: RawFd, name: &CStr) -> b
         let Ok(stat) = fstatat(Some(dir_fd), child, AtFlags::AT_SYMLINK_NOFOLLOW) else {
             return false;
         };
-        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR {
-            return false;
+        match SFlag::from_bits_truncate(stat.st_mode) {
+            SFlag::S_IFDIR => {
+                if matches!(child.to_bytes(), b"debug" | b"release") {
+                    profile_dirs.push(child.to_owned());
+                }
+            }
+            SFlag::S_IFREG if child.to_bytes() == b"CACHEDIR.TAG" => {}
+            _ => return false,
         }
     }
-    true
+    profile_dirs
+        .iter()
+        .any(|profile| profile_dir_has_cargo_markers(dir_fd, profile))
+}
+
+/// Whether the profile directory `name` under `parent_fd` holds one of Cargo's
+/// build subdirectories (a real directory, never a link).
+fn profile_dir_has_cargo_markers(parent_fd: RawFd, name: &CStr) -> bool {
+    let Ok(raw) = nix::fcntl::openat(
+        Some(parent_fd),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    // Closed on drop.
+    let profile = unsafe { OwnedFd::from_raw_fd(raw) };
+    [c"deps", c".fingerprint", c"build"]
+        .into_iter()
+        .any(|marker| {
+            fstatat(
+                Some(profile.as_raw_fd()),
+                marker,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_ok_and(|stat| SFlag::from_bits_truncate(stat.st_mode) == SFlag::S_IFDIR)
+        })
+}
+
+/// How deep a nested cargo target may sit below `target/` (`scoped-baselines/
+/// run-*` is two levels, #2053).
+const NESTED_TARGET_MAX_DEPTH: usize = 3;
+
+/// Whether the directory `name` under `parent_fd` is recognized target content
+/// by structure instead of by name: a Cargo target directory of its own
+/// (`CACHEDIR.TAG`, or a `debug/`/`release/` profile with Cargo subdirectories,
+/// or a target-triple directory), or a container whose children are all such
+/// trees (`scoped-baselines/run-*`, #2053). Tools that build a second target
+/// under `target/` then stay reclaimable without a new name each time (#1838,
+/// #1847). A directory with no entries at all holds nothing and also counts.
+///
+/// Conservative: only directories and the exact known Cargo/RSI scratch files
+/// are allowed anywhere inside, every open is `O_NOFOLLOW` (a link, special
+/// file or unreadable entry refuses), depth is bounded and each entry is charged
+/// to the reclaim pass budget. A tree without target evidence, such as a source
+/// checkout, refuses.
+fn dir_is_nested_target_tree(parent_fd: RawFd, name: &CStr, depth: usize) -> bool {
+    if depth >= NESTED_TARGET_MAX_DEPTH {
+        return false;
+    }
+    let Ok(raw) = nix::fcntl::openat(
+        Some(parent_fd),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    // `Dir` takes ownership of `raw` and closes it on drop.
+    let Ok(mut dir) = Dir::from_fd(raw) else {
+        return false;
+    };
+    let mut any_entry = false;
+    let mut evidence = false;
+    for entry in dir.iter() {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let child = entry.file_name();
+        if matches!(child.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if current_pass_state().charge_filesystem_entry(0).is_err() {
+            return false;
+        }
+        any_entry = true;
+        let Ok(stat) = fstatat(Some(raw), child, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return false;
+        };
+        let kind = SFlag::from_bits_truncate(stat.st_mode);
+        match kind {
+            SFlag::S_IFREG => {
+                if !is_reclaimable_target_entry(child.to_bytes(), kind) {
+                    return false;
+                }
+                evidence |= child.to_bytes() == b"CACHEDIR.TAG";
+            }
+            SFlag::S_IFDIR => {
+                let bytes = child.to_bytes();
+                if matches!(bytes, b"debug" | b"release") {
+                    evidence |= profile_dir_has_cargo_markers(raw, child);
+                } else if is_reclaimable_target_entry(bytes, kind) {
+                    // Cargo or RSI scratch directory: no evidence, no refusal.
+                } else if is_cargo_target_triple_name(bytes)
+                    && target_triple_dir_has_cargo_layout(raw, child)
+                {
+                    evidence = true;
+                } else if dir_is_nested_target_tree(raw, child, depth + 1) {
+                    // A literally empty child adds no evidence, but a tree
+                    // with content does; the child already proved its own.
+                    evidence |= !dir_is_empty(raw, child);
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    !any_entry || evidence
+}
+
+/// Whether the real directory `name` under `parent_fd` has no entries.
+fn dir_is_empty(parent_fd: RawFd, name: &CStr) -> bool {
+    let Ok(raw) = nix::fcntl::openat(
+        Some(parent_fd),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(mut dir) = Dir::from_fd(raw) else {
+        return false;
+    };
+    dir.iter()
+        .all(|entry| entry.is_ok_and(|e| matches!(e.file_name().to_bytes(), b"." | b"..")))
 }
 
 fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
@@ -1145,18 +1356,98 @@ fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
                 | b"dhat"
                 | b".rsi-tmp"
                 | b"rsid-test-shards"
-        ) || (name.len() > FIXTURE_SUFFIX.len() && name.ends_with(FIXTURE_SUFFIX))
+        ) || name == E2E_ARTIFACTS_DIR_NAME.as_bytes()
+            || (name.len() > FIXTURE_SUFFIX.len() && name.ends_with(FIXTURE_SUFFIX))
     } else if kind == SFlag::S_IFREG {
-        matches!(
-            name,
-            b".rustc_info.json"
+        is_idle_cost_scratch(name)
+            || is_python_discover_scratch(name)
+            || matches!(
+                name,
+                b".rustc_info.json"
                 | b"CACHEDIR.TAG"
                 | b".cargo-lock"
                 | b".future-incompat-report.json"
                 | b".rsid-test-shards.lock"
-        )
+                | b".rsi-job-admission.lock"
+                // The daemon's build-settings record and the warm target
+                // pool's seed marker (#1741), both rewritten on demand.
+                | b".rsi-build-env.json"
+                | b".rsi-target-pool.json"
+            )
     } else {
         false
+    }
+}
+
+/// `python-discover.{start,head,log}`: the small marker and log files a Python
+/// test-discovery run leaves at the target root (a start/head commit stamp and
+/// its log, hub #3026, compare #243). Exact names only; they are regular
+/// files, never a directory, and the whole `target/` is deleted wholesale.
+fn is_python_discover_scratch(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"python-discover.start" | b"python-discover.head" | b"python-discover.log"
+    )
+}
+
+/// `issue211-idle-costs-<pid>.jsonl`: cost observations an older idle-cost test
+/// wrote at the target root (#2535). Exact pattern: a decimal pid only.
+fn is_idle_cost_scratch(name: &[u8]) -> bool {
+    let Some(pid) = name
+        .strip_prefix(b"issue211-idle-costs-")
+        .and_then(|rest| rest.strip_suffix(b".jsonl"))
+    else {
+        return false;
+    };
+    !pid.is_empty() && pid.iter().all(u8::is_ascii_digit)
+}
+
+/// How often a `/proc/<pid>` entry that cannot be read is re-read before the
+/// scan fails closed on it (#2163).
+const PROCESS_SCAN_RETRIES: u32 = 3;
+/// Pause between those re-reads. A transient state (a process between
+/// `unshare(2)` and `execve(2)` is briefly non-dumpable, one being torn down
+/// answers `EACCES`/`EIO` rather than `ENOENT`) clears within microseconds to
+/// milliseconds. A process that stays unreadable costs a candidate at most
+/// `PROCESS_SCAN_RETRIES * PROCESS_SCAN_RETRY_DELAY` before it refuses.
+const PROCESS_SCAN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// What one `/proc/<pid>` examination concluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessProbe {
+    /// Another owner's process, or one that exited before it could matter.
+    Unrelated,
+    /// Its cwd, executable, `CARGO_TARGET_DIR` or a descriptor names the
+    /// sandbox.
+    InUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessProbeFailure {
+    /// An RSI-unit process whose entry could not be read.
+    Unreadable,
+    /// The reclaim pass budget ended mid-scan.
+    Budget(SkipReason),
+}
+
+/// Re-run `probe` while it reports an unreadable entry, at most
+/// [`PROCESS_SCAN_RETRIES`] more times, calling `pause` between attempts.
+/// Only an entry that stays unreadable is returned as unreadable, so the scan
+/// still fails closed on a process it can never prove unrelated, but no longer
+/// on a glimpse of one mid-`exec` (#2163).
+fn settle_process_probe(
+    mut probe: impl FnMut() -> Result<ProcessProbe, ProcessProbeFailure>,
+    mut pause: impl FnMut() -> Result<(), SkipReason>,
+) -> Result<ProcessProbe, ProcessProbeFailure> {
+    let mut retries = 0;
+    loop {
+        match probe() {
+            Err(ProcessProbeFailure::Unreadable) if retries < PROCESS_SCAN_RETRIES => {
+                retries += 1;
+                pause().map_err(ProcessProbeFailure::Budget)?;
+            }
+            settled => return settled,
+        }
     }
 }
 
@@ -1165,30 +1456,21 @@ fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
 /// observations are bounded by the reclaim pass budget and never logged.
 /// Nondumpable unrelated services (e.g. credential agents) are outside RSI's
 /// process tree. Unreadable RSI units fail closed instead of disabling all
-/// reclamation whenever such an unrelated service is running.
+/// reclamation whenever such an unrelated service is running. An entry is
+/// re-read a few times before it counts as unreadable: the scan covers every
+/// process of this user, and one caught mid-`exec` must not refuse a reclaim
+/// that no consumer blocks (#2163).
+#[cfg(target_os = "linux")]
 fn ensure_no_target_process(
     root: &Path,
     target: &Path,
 ) -> Result<(), (SkipReason, SandboxReclaimCheck)> {
-    use std::os::unix::fs::MetadataExt;
     let by_reason = |reason: SkipReason| (reason, check(reason.as_str()));
-    let unreadable = |pid: u32| {
-        (
-            SkipReason::UnreadableEntry,
-            SandboxReclaimCheck::with_subject("process_scan_unreadable", pid.to_string()),
-        )
-    };
-    let in_use = |pid: u32| {
-        (
-            SkipReason::ActiveOwner,
-            SandboxReclaimCheck::with_subject("process_uses_sandbox", pid.to_string()),
-        )
-    };
-    let processes = std::fs::read_dir("/proc").map_err(|_| unreadable(0))?;
+    let processes = std::fs::read_dir("/proc").map_err(|_| unreadable_process(0))?;
     let uid = nix::unistd::getuid().as_raw();
     for process in processes {
         current_pass_state().checkpoint(0).map_err(by_reason)?;
-        let process = process.map_err(|_| unreadable(0))?;
+        let process = process.map_err(|_| unreadable_process(0))?;
         let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
@@ -1197,81 +1479,120 @@ fn ensure_no_target_process(
             continue;
         }
         let path = process.path();
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if process_has_exited(&error) => continue,
-            Err(_) => return Err(unreadable(pid)),
-        };
-        if metadata.uid() != uid {
-            continue;
-        }
-        let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
-            Ok(cgroup) => cgroup,
-            Err(error) if process_has_exited(&error) => continue,
-            Err(_) => return Err(unreadable(pid)),
-        };
-        let owned_unit = cgroup
-            .split('/')
-            .any(|component| component.starts_with("rsi-"));
-        for link in ["cwd", "exe"] {
-            match std::fs::read_link(path.join(link)) {
-                Ok(value) if value.starts_with(root) => return Err(in_use(pid)),
-                Ok(_) => {}
-                // A zombie or a process exiting during the scan has no cwd.
-                Err(error) if process_has_exited(&error) => {}
-                Err(error)
-                    if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
-                Err(_) => return Err(unreadable(pid)),
+        let probed = settle_process_probe(
+            || probe_process(&path, uid, root, target),
+            || {
+                std::thread::sleep(PROCESS_SCAN_RETRY_DELAY);
+                current_pass_state().checkpoint(0)
+            },
+        );
+        match probed {
+            Ok(ProcessProbe::Unrelated) => {}
+            Ok(ProcessProbe::InUse) => {
+                return Err((
+                    SkipReason::ActiveOwner,
+                    SandboxReclaimCheck::with_subject("process_uses_sandbox", pid.to_string()),
+                ));
             }
-        }
-        // A gate clone or a shell waiting between cargo commands may have no
-        // cwd/fd beneath the cache yet. Inspect only the Cargo target setting;
-        // environment values are never persisted or included in diagnostics.
-        match std::fs::read(path.join("environ")) {
-            Ok(environment) => {
-                for variable in environment.split(|byte| *byte == 0) {
-                    if let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") {
-                        let configured = Path::new(OsStr::from_bytes(value));
-                        let configured = if configured.is_absolute() {
-                            configured.to_path_buf()
-                        } else {
-                            std::fs::read_link(path.join("cwd"))
-                                .map_err(|_| unreadable(pid))?
-                                .join(configured)
-                        };
-                        let configured = normalize_lexically(&configured);
-                        if configured.starts_with(target) {
-                            return Err(in_use(pid));
-                        }
-                    }
-                }
-            }
-            Err(error) if process_has_exited(&error) => continue,
-            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(_) => return Err(unreadable(pid)),
-        }
-        let descriptors = match std::fs::read_dir(path.join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(error) if process_has_exited(&error) => continue,
-            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {
-                continue;
-            }
-            Err(_) => return Err(unreadable(pid)),
-        };
-        for descriptor in descriptors {
-            current_pass_state().checkpoint(0).map_err(by_reason)?;
-            let descriptor = descriptor.map_err(|_| unreadable(pid))?;
-            match std::fs::read_link(descriptor.path()) {
-                Ok(value) if value.starts_with(target) => return Err(in_use(pid)),
-                Ok(_) => {}
-                Err(error) if process_has_exited(&error) => {}
-                Err(error)
-                    if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
-                Err(_) => return Err(unreadable(pid)),
-            }
+            Err(ProcessProbeFailure::Unreadable) => return Err(unreadable_process(pid)),
+            Err(ProcessProbeFailure::Budget(reason)) => return Err(by_reason(reason)),
         }
     }
     Ok(())
+}
+
+fn unreadable_process(pid: u32) -> (SkipReason, SandboxReclaimCheck) {
+    (
+        SkipReason::UnreadableEntry,
+        SandboxReclaimCheck::with_subject("process_scan_unreadable", pid.to_string()),
+    )
+}
+
+/// One pass over a single `/proc/<pid>`: does this process use the sandbox
+/// root or the target, by cwd, executable, `CARGO_TARGET_DIR` or descriptor?
+#[cfg(target_os = "linux")]
+fn probe_process(
+    path: &Path,
+    uid: u32,
+    root: &Path,
+    target: &Path,
+) -> Result<ProcessProbe, ProcessProbeFailure> {
+    use std::os::unix::fs::MetadataExt;
+    let unreadable = ProcessProbeFailure::Unreadable;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if process_has_exited(&error) => return Ok(ProcessProbe::Unrelated),
+        Err(_) => return Err(unreadable),
+    };
+    if metadata.uid() != uid {
+        return Ok(ProcessProbe::Unrelated);
+    }
+    let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
+        Ok(cgroup) => cgroup,
+        Err(error) if process_has_exited(&error) => return Ok(ProcessProbe::Unrelated),
+        Err(_) => return Err(unreadable),
+    };
+    let owned_unit = cgroup
+        .split('/')
+        .any(|component| component.starts_with("rsi-"));
+    for link in ["cwd", "exe"] {
+        match std::fs::read_link(path.join(link)) {
+            Ok(value) if value.starts_with(root) => return Ok(ProcessProbe::InUse),
+            Ok(_) => {}
+            // A zombie or a process exiting during the scan has no cwd.
+            Err(error) if process_has_exited(&error) => {}
+            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(_) => return Err(unreadable),
+        }
+    }
+    // A gate clone or a shell waiting between cargo commands may have no
+    // cwd/fd beneath the cache yet. Inspect only the Cargo target setting;
+    // environment values are never persisted or included in diagnostics.
+    match std::fs::read(path.join("environ")) {
+        Ok(environment) => {
+            for variable in environment.split(|byte| *byte == 0) {
+                if let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") {
+                    let configured = Path::new(OsStr::from_bytes(value));
+                    let configured = if configured.is_absolute() {
+                        configured.to_path_buf()
+                    } else {
+                        std::fs::read_link(path.join("cwd"))
+                            .map_err(|_| unreadable)?
+                            .join(configured)
+                    };
+                    let configured = normalize_lexically(&configured);
+                    if configured.starts_with(target) {
+                        return Ok(ProcessProbe::InUse);
+                    }
+                }
+            }
+        }
+        Err(error) if process_has_exited(&error) => return Ok(ProcessProbe::Unrelated),
+        Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(_) => return Err(unreadable),
+    }
+    let descriptors = match std::fs::read_dir(path.join("fd")) {
+        Ok(descriptors) => descriptors,
+        Err(error) if process_has_exited(&error) => return Ok(ProcessProbe::Unrelated),
+        Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(ProcessProbe::Unrelated);
+        }
+        Err(_) => return Err(unreadable),
+    };
+    for descriptor in descriptors {
+        current_pass_state()
+            .checkpoint(0)
+            .map_err(ProcessProbeFailure::Budget)?;
+        let descriptor = descriptor.map_err(|_| unreadable)?;
+        match std::fs::read_link(descriptor.path()) {
+            Ok(value) if value.starts_with(target) => return Ok(ProcessProbe::InUse),
+            Ok(_) => {}
+            Err(error) if process_has_exited(&error) => {}
+            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(_) => return Err(unreadable),
+        }
+    }
+    Ok(ProcessProbe::Unrelated)
 }
 
 /// Collapse `.` and `..` components without touching the filesystem so a
@@ -1294,6 +1615,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(target_os = "linux")]
 fn process_has_exited(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(nix::libc::ESRCH)
 }
@@ -1386,7 +1708,7 @@ fn optional_private_child_directory(
             SkipReason::UnreadableEntry,
         )),
         Ok(stat) => {
-            if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+            if !is_dir_mode(stat.st_mode) {
                 return Err(RegisteredNamespaceState::Different);
             }
             let fd =
@@ -1438,7 +1760,7 @@ fn probe_registered_source(
     ) {
         Err(Errno::ENOENT) => return RegisteredNamespaceState::Absent,
         Err(_) => return RegisteredNamespaceState::Refused(SkipReason::UnreadableEntry),
-        Ok(stat) if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) => {
+        Ok(stat) if !is_dir_mode(stat.st_mode) => {
             return RegisteredNamespaceState::Different;
         }
         Ok(_) => match open_beneath_dir(base_fd, OsStr::new(&allocation)) {
@@ -1508,7 +1830,7 @@ fn probe_expected_directory(
         Err(_) => return RegisteredNamespaceState::Refused(SkipReason::UnreadableEntry),
         Ok(stat) => stat,
     };
-    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR)
+    if !is_dir_mode(stat.st_mode)
         || stat.st_dev as u64 != expected_device
         || stat.st_ino as u64 != expected_inode
     {
@@ -1710,7 +2032,7 @@ fn sync_registered_source_parent(
             };
         }
         Err(_) => return Err(SkipReason::UnreadableEntry),
-        Ok(stat) if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) => {
+        Ok(stat) if !is_dir_mode(stat.st_mode) => {
             return Err(SkipReason::TargetIdentityChanged);
         }
         Ok(stat) => stat,
@@ -1977,7 +2299,7 @@ fn recover_staged_targets_inner(base: &Path, dry_run: bool) -> TargetRecoveryRun
         Err(Errno::ENOENT) => return TargetRecoveryRun::default(),
         Err(_) => return recovery_failure(SkipReason::RejectedRecoveryEntry),
     };
-    if !SFlag::from_bits_truncate(queue_lstat.st_mode).contains(SFlag::S_IFDIR) {
+    if !is_dir_mode(queue_lstat.st_mode) {
         return recovery_failure(SkipReason::RejectedRecoveryEntry);
     }
     let queue_fd = match open_beneath_dir(base_fd.as_raw_fd(), OsStr::new(QUEUE_NAME)) {
@@ -2362,10 +2684,10 @@ fn rotation_faults() -> &'static Mutex<HashMap<String, RotationFaultPoint>> {
     FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct RotationFaultReset(String);
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl Drop for RotationFaultReset {
     fn drop(&mut self) {
         rotation_faults()
@@ -2375,7 +2697,7 @@ impl Drop for RotationFaultReset {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn set_rotation_fault_for_test(entry_name: &str, point: RotationFaultPoint) -> RotationFaultReset {
     rotation_faults()
         .lock()
@@ -2824,7 +3146,7 @@ fn rejected_stage_name(entry_name: &str) -> Option<RejectedStageName> {
     let (custody_id, generation, expected_dev, expected_ino) = parse_stage_name(entry_name)?;
     let canonical = stage_name(custody_id, generation, expected_dev, expected_ino);
     let basename = format!("{REJECTED_STAGE_PREFIX}{canonical}");
-    if basename.len() > nix::libc::NAME_MAX as usize {
+    if basename.len() > NAME_MAX {
         return None;
     }
     Some(RejectedStageName {
@@ -3005,6 +3327,7 @@ fn open_beneath_dir(dirfd: RawFd, path: &OsStr) -> Result<OwnedFd, SkipReason> {
 
 #[cfg(any(test, feature = "test-seam"))]
 enum PostAuthenticationHook {
+    #[cfg(test)]
     Barrier {
         reached: std::sync::Arc<std::sync::Barrier>,
         release: std::sync::Arc<std::sync::Barrier>,
@@ -3031,7 +3354,7 @@ fn post_authentication_hooks() -> &'static Mutex<HashMap<Uuid, PostAuthenticatio
     HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn set_post_authentication_barrier_for_test(
     custody_id: Uuid,
     reached: Arc<std::sync::Barrier>,
@@ -3068,6 +3391,7 @@ fn post_authentication_barrier_for_test(custody_id: Uuid) {
         .expect("post-authentication hook lock")
         .remove(&custody_id);
     match hook {
+        #[cfg(test)]
         Some(PostAuthenticationHook::Barrier { reached, release }) => {
             reached.wait();
             release.wait();
@@ -3142,7 +3466,7 @@ fn pause_target_deletion_signal_for_test(_custody_id: Uuid) {}
 #[cfg(not(any(test, feature = "test-seam")))]
 fn pause_staged_deletion_for_test(_entry_name: &str, _recovered: bool) {}
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Clone)]
 struct RejectionTransitionHook {
     seam: &'static str,
@@ -3150,19 +3474,19 @@ struct RejectionTransitionHook {
     release: Arc<std::sync::Barrier>,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn rejection_transition_hooks() -> &'static Mutex<HashMap<String, RejectionTransitionHook>> {
     static HOOKS: std::sync::OnceLock<Mutex<HashMap<String, RejectionTransitionHook>>> =
         std::sync::OnceLock::new();
     HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct RejectionTestReset {
     entry_name: String,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl Drop for RejectionTestReset {
     fn drop(&mut self) {
         rejection_transition_hooks()
@@ -3176,7 +3500,7 @@ impl Drop for RejectionTestReset {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn set_rejection_transition_barrier_for_test(
     entry_name: &str,
     seam: &'static str,
@@ -3199,7 +3523,7 @@ fn set_rejection_transition_barrier_for_test(
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn pause_rejection_transition_for_test(entry_name: &str, seam: &'static str) {
     let hook = {
         let mut hooks = rejection_transition_hooks()
@@ -3217,10 +3541,10 @@ fn pause_rejection_transition_for_test(entry_name: &str, seam: &'static str) {
     }
 }
 
-#[cfg(not(any(test, feature = "test-seam")))]
+#[cfg(not(test))]
 fn pause_rejection_transition_for_test(_entry_name: &str, _seam: &'static str) {}
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum RejectionFault {
     RenameCrossDevice,
@@ -3231,14 +3555,14 @@ enum RejectionFault {
     },
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn rejection_faults() -> &'static Mutex<HashMap<String, RejectionFault>> {
     static FAULTS: std::sync::OnceLock<Mutex<HashMap<String, RejectionFault>>> =
         std::sync::OnceLock::new();
     FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn set_rejection_fault_for_test(entry_name: &str, fault: RejectionFault) -> RejectionTestReset {
     rejection_faults()
         .lock()
@@ -3249,7 +3573,7 @@ fn set_rejection_fault_for_test(entry_name: &str, fault: RejectionFault) -> Reje
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn forced_rejection_base_reason_for_test(entry_name: &str) -> Option<SkipReason> {
     let mut faults = rejection_faults()
         .lock()
@@ -3263,12 +3587,12 @@ fn forced_rejection_base_reason_for_test(entry_name: &str) -> Option<SkipReason>
     }
 }
 
-#[cfg(not(any(test, feature = "test-seam")))]
+#[cfg(not(test))]
 fn forced_rejection_base_reason_for_test(_entry_name: &str) -> Option<SkipReason> {
     None
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn force_rejection_rename_exdev_for_test(entry_name: &str) -> bool {
     let mut faults = rejection_faults()
         .lock()
@@ -3284,12 +3608,12 @@ fn force_rejection_rename_exdev_for_test(entry_name: &str) -> bool {
     }
 }
 
-#[cfg(not(any(test, feature = "test-seam")))]
+#[cfg(not(test))]
 fn force_rejection_rename_exdev_for_test(_entry_name: &str) -> bool {
     false
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn maybe_fail_rejection_sync_for_test(
     entry_name: &str,
     phase: &'static str,
@@ -3310,7 +3634,7 @@ fn maybe_fail_rejection_sync_for_test(
     }
 }
 
-#[cfg(not(any(test, feature = "test-seam")))]
+#[cfg(not(test))]
 fn maybe_fail_rejection_sync_for_test(
     _entry_name: &str,
     _phase: &'static str,
@@ -3325,10 +3649,10 @@ fn forced_exdev_entries() -> &'static Mutex<HashSet<Vec<u8>>> {
     ENTRIES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 struct ExdevTestReset(Vec<u8>);
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl Drop for ExdevTestReset {
     fn drop(&mut self) {
         forced_exdev_entries()
@@ -3338,7 +3662,7 @@ impl Drop for ExdevTestReset {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn force_exdev_entry_for_test(path: &OsStr) -> ExdevTestReset {
     let name = path.as_bytes().to_vec();
     forced_exdev_entries()
@@ -3376,14 +3700,14 @@ fn base_fsync_test_states() -> &'static Mutex<HashMap<InodeKey, BaseFsyncTestSta
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn base_fsync_test_key(path: &Path) -> InodeKey {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path).expect("base fsync test path");
     (metadata.dev(), metadata.ino())
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn install_base_fsync_fault_for_test(path: &Path) {
     base_fsync_test_states()
         .lock()
@@ -3397,7 +3721,7 @@ fn install_base_fsync_fault_for_test(path: &Path) {
         );
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn base_fsync_counts_for_test(path: &Path) -> (usize, usize) {
     let state = base_fsync_test_states()
         .lock()
@@ -3439,7 +3763,7 @@ fn cursor_fsync_faults() -> &'static Mutex<HashSet<InodeKey>> {
     FAULTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn install_cursor_fsync_fault_for_test(queue: &Path) {
     cursor_fsync_faults()
         .lock()
@@ -3546,7 +3870,7 @@ fn revalidation_footprint_at_depth(
         if stat.st_dev as u64 != base_dev {
             return Err(SkipReason::MountOrDeviceCrossing);
         }
-        if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+        if is_dir_mode(stat.st_mode) {
             let child = open_nested_dir(fd, OsStr::from_bytes(name.to_bytes()))?;
             let child_footprint = revalidation_footprint_at_depth(
                 child.as_raw_fd(),
@@ -3636,7 +3960,7 @@ fn allocated_tree_children_footprint(
         }
         pass.charge_allocated_bytes(&stat)?;
         footprint.observe(&stat);
-        if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+        if is_dir_mode(stat.st_mode) {
             let child = open_nested_dir(fd, OsStr::from_bytes(name.to_bytes()))?;
             allocated_tree_children_footprint(
                 child.as_raw_fd(),
@@ -3651,10 +3975,263 @@ fn allocated_tree_children_footprint(
 }
 
 fn open_nested_dir(dirfd: RawFd, path: &OsStr) -> Result<OwnedFd, SkipReason> {
-    open_beneath_dir(dirfd, path).map_err(|reason| match reason {
+    open_beneath_dir(dirfd, path).map_err(nested_open_reason)
+}
+
+fn nested_open_reason(reason: SkipReason) -> SkipReason {
+    match reason {
         SkipReason::Openat2Unavailable | SkipReason::MountOrDeviceCrossing => reason,
         _ => SkipReason::UnreadableEntry,
+    }
+}
+
+fn openat2_beneath_dir_errno(dirfd: RawFd, path: &OsStr, mode: OFlag) -> Result<OwnedFd, Errno> {
+    let how = OpenHow::new()
+        .flags(mode | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW)
+        .resolve(RESOLVE_FLAGS);
+    let raw = openat2(dirfd, path.as_bytes(), how)?;
+    // SAFETY: `openat2` returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Open a child directory of authenticated staged content for deletion (#252).
+///
+/// A directory without owner read/search (a test fixture's mode-000 `denied`
+/// or fake `/proc` `fd` directory) refuses the open with EACCES, which left
+/// its registered intent `Deleting` forever. Only on that EACCES, and only for
+/// a directory this uid owns, unchanged since the walker's no-follow `fstatat`,
+/// restore owner `rwx` through an identity-verified `O_PATH` descriptor opened
+/// beneath the retained parent (no symlink, no magic link, no mount crossing)
+/// and open it once more. Anything else stays fail-closed.
+fn open_staged_child_dir(
+    parent: RawFd,
+    name: &CStr,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+    rel: &[u8],
+) -> Result<OwnedFd, SkipReason> {
+    let path = OsStr::from_bytes(name.to_bytes());
+    if force_exdev_for_test(path) {
+        return Err(SkipReason::MountOrDeviceCrossing);
+    }
+    let error = match openat2_beneath_dir_errno(parent, path, OFlag::O_RDONLY) {
+        Ok(child) => return Ok(child),
+        Err(error) => error,
+    };
+    if error != Errno::EACCES {
+        return Err(nested_open_reason(map_open_error(error)));
+    }
+    if let Err(reason) = restore_staged_owner_search(parent, path, expected, depth, pass) {
+        warn_staged_recovery_incomplete("openat2", error, expected, depth, rel, reason);
+        return Err(reason);
+    }
+    pass.checkpoint(depth)?;
+    openat2_beneath_dir_errno(parent, path, OFlag::O_RDONLY).map_err(|retry| {
+        let reason = nested_open_reason(map_open_error(retry));
+        warn_staged_recovery_incomplete("openat2", retry, expected, depth, rel, reason);
+        reason
     })
+}
+
+/// Longest namespace-relative path a recovery diagnostic carries.
+const RECOVERY_DIAGNOSTIC_PATH_BYTES: usize = 256;
+
+/// One bounded diagnostic at the directory a staged-deletion repair could not
+/// get past (#2781): the failing errno, the operation, and the path relative
+/// to the staged payload root (never an absolute or operator path). A repeated
+/// sweep that stays `Deleting` is diagnosable from this line alone. The path
+/// comes from directory entry bytes, so it is logged with Debug formatting
+/// (#2797): a newline, carriage return, ESC or other control character is
+/// escaped and cannot split the line or forge fields.
+fn warn_staged_recovery_incomplete(
+    operation: &'static str,
+    errno: Errno,
+    expected: &nix::libc::stat,
+    depth: u32,
+    rel: &[u8],
+    reason: SkipReason,
+) {
+    let end = rel.len().min(RECOVERY_DIAGNOSTIC_PATH_BYTES);
+    let path = String::from_utf8_lossy(&rel[..end]);
+    tracing::warn!(
+        operation,
+        errno = errno as i32,
+        errno_name = errno.desc(),
+        path = ?path,
+        path_truncated = rel.len() > end,
+        device = expected.st_dev,
+        inode = expected.st_ino,
+        owner = expected.st_uid,
+        mode = expected.st_mode & 0o7777,
+        depth,
+        ?reason,
+        "staged cache deletion repair incomplete"
+    );
+}
+
+/// `fstatat` on a child of the directory being emptied. A directory this uid
+/// owns that opened for reading but lacks owner search (mode 0400/0600) opens
+/// and enumerates, then refuses every child lookup with EACCES (#2780): repair
+/// owner search once through the authenticated descriptor at that actual
+/// denial, then retry. The ownership/identity fences are `staged_owner_search_mode`'s.
+fn stat_staged_child(
+    fd: RawFd,
+    name: &CStr,
+    root: &mut nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+    rel: &[u8],
+) -> Result<nix::libc::stat, SkipReason> {
+    let error = match fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => return Ok(stat),
+        Err(error) => error,
+    };
+    let reason = if error != Errno::EACCES {
+        SkipReason::StagedDeletionIncomplete
+    } else {
+        match restore_staged_owner_search_fd(fd, root, depth, pass) {
+            Ok(()) => {
+                match fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+                    Ok(stat) => {
+                        // The repaired mode is the directory's expected state
+                        // from here on (the owner-write fence compares it).
+                        if let Ok(current) = fstat(fd) {
+                            *root = current;
+                        }
+                        return Ok(stat);
+                    }
+                    Err(retry) => {
+                        warn_staged_recovery_incomplete(
+                            "fstatat",
+                            retry,
+                            root,
+                            depth,
+                            rel,
+                            SkipReason::StagedDeletionIncomplete,
+                        );
+                        return Err(SkipReason::StagedDeletionIncomplete);
+                    }
+                }
+            }
+            Err(reason) => reason,
+        }
+    };
+    warn_staged_recovery_incomplete("fstatat", error, root, depth, rel, reason);
+    Err(reason)
+}
+
+/// Owner-search repair of an already-open authenticated directory descriptor
+/// (a regular read open, so `fchmod` applies; no name is re-resolved).
+fn restore_staged_owner_search_fd(
+    fd: RawFd,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+) -> Result<(), SkipReason> {
+    pass.checkpoint(depth)?;
+    let current = fstat(fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    // SAFETY: geteuid has no preconditions. Ownership is never caller-supplied.
+    let mode = staged_owner_search_mode(&current, expected, unsafe { nix::libc::geteuid() })?;
+    fchmod(fd, mode).map_err(|_| SkipReason::StagedDeletionIncomplete)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_staged_owner_search(
+    parent: RawFd,
+    path: &OsStr,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+) -> Result<(), SkipReason> {
+    pass.checkpoint(depth)?;
+    // O_PATH needs no permission on the directory itself, so it pins the exact
+    // inode the walker observed; the mode change then goes to that descriptor,
+    // never to a name that could be swapped in between.
+    let pinned = openat2_beneath_dir_errno(parent, path, OFlag::O_PATH)
+        .map_err(|error| nested_open_reason(map_open_error(error)))?;
+    let current = fstat(pinned.as_raw_fd()).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    // SAFETY: geteuid has no preconditions. Ownership is never caller-supplied.
+    let mode = staged_owner_search_mode(&current, expected, unsafe { nix::libc::geteuid() })?;
+    chmod_pinned_descriptor(pinned.as_raw_fd(), mode)
+}
+
+/// macOS has no `O_PATH`, and a directory missing owner read and search
+/// cannot be opened to pin it. The repair instead verifies the entry's
+/// identity with a no-follow `fstatat` beneath the retained parent, changes
+/// the mode with `fchmodat(AT_SYMLINK_NOFOLLOW)` (never through a symlink),
+/// and verifies the identity again. A swap between the checks can at most add
+/// owner `rwx` to a directory this uid owns beneath the same parent; the
+/// reopen that follows still authenticates the walker's expected inode.
+#[cfg(target_os = "macos")]
+fn restore_staged_owner_search(
+    parent: RawFd,
+    path: &OsStr,
+    expected: &nix::libc::stat,
+    depth: u32,
+    pass: &ReclaimPassState,
+) -> Result<(), SkipReason> {
+    pass.checkpoint(depth)?;
+    let current = fstatat(Some(parent), path, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    let parent_dev = fstat(parent)
+        .map_err(|_| SkipReason::StagedDeletionIncomplete)?
+        .st_dev;
+    if current.st_dev != parent_dev {
+        return Err(SkipReason::MountOrDeviceCrossing);
+    }
+    // SAFETY: geteuid has no preconditions. Ownership is never caller-supplied.
+    let mode = staged_owner_search_mode(&current, expected, unsafe { nix::libc::geteuid() })?;
+    nix::sys::stat::fchmodat(
+        Some(parent),
+        path,
+        mode,
+        nix::sys::stat::FchmodatFlags::NoFollowSymlink,
+    )
+    .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    let after = fstatat(Some(parent), path, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    if after.st_dev != expected.st_dev || after.st_ino != expected.st_ino {
+        return Err(SkipReason::TargetIdentityChanged);
+    }
+    Ok(())
+}
+
+/// `fchmod` refuses an `O_PATH` descriptor (EBADF); its `/proc/self/fd` magic
+/// link names exactly that inode, which is how the C library implements
+/// `fchmodat(AT_SYMLINK_NOFOLLOW)` itself. No `/proc` means no repair.
+#[cfg(target_os = "linux")]
+fn chmod_pinned_descriptor(fd: RawFd, mode: Mode) -> Result<(), SkipReason> {
+    nix::sys::stat::fchmodat(
+        None,
+        format!("/proc/self/fd/{fd}").as_str(),
+        mode,
+        nix::sys::stat::FchmodatFlags::FollowSymlink,
+    )
+    .map_err(|_| SkipReason::StagedDeletionIncomplete)
+}
+
+fn staged_owner_search_mode(
+    current: &nix::libc::stat,
+    expected: &nix::libc::stat,
+    owner: nix::libc::uid_t,
+) -> Result<Mode, SkipReason> {
+    if current.st_dev != expected.st_dev || current.st_ino != expected.st_ino {
+        return Err(SkipReason::TargetIdentityChanged);
+    }
+    if !is_dir_mode(current.st_mode)
+        || current.st_uid != owner
+        || expected.st_uid != owner
+        || current.st_gid != expected.st_gid
+        || current.st_mode != expected.st_mode
+        // Only a missing owner read or search bit is repaired. An owner who
+        // already has both was denied for another reason (an ACL, an LSM):
+        // never broaden permissions on a guess.
+        || current.st_mode & 0o500 == 0o500
+    {
+        return Err(SkipReason::RejectedRecoveryEntry);
+    }
+    Ok(Mode::from_bits_truncate((current.st_mode & 0o7777) | 0o700))
 }
 
 fn allocated_stat_bytes(stat: &nix::libc::stat) -> u64 {
@@ -3670,12 +4247,14 @@ fn delete_dir_contents(
     observed_inodes: &mut HashSet<InodeKey>,
 ) -> Result<(), SkipReason> {
     let pass = current_pass_state();
+    let mut rel = Vec::new();
     delete_dir_contents_at_depth(
         fd,
         base_dev,
         entry_name,
         0,
         &pass,
+        &mut rel,
         credits,
         observed_bytes,
         observed_inodes,
@@ -3689,13 +4268,14 @@ fn delete_dir_contents_at_depth(
     entry_name: &str,
     depth: u32,
     pass: &ReclaimPassState,
+    rel: &mut Vec<u8>,
     credits: &mut DeletionCredits,
     observed_bytes: &mut u64,
     observed_inodes: &mut HashSet<InodeKey>,
     charge_root: bool,
 ) -> Result<(), SkipReason> {
     pass.checkpoint(depth)?;
-    let root = fstat(fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+    let mut root = fstat(fd).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
     if root.st_dev as u64 != base_dev {
         return Err(SkipReason::MountOrDeviceCrossing);
     }
@@ -3718,12 +4298,16 @@ fn delete_dir_contents_at_depth(
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        let stat = fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW)
-            .map_err(|_| SkipReason::StagedDeletionIncomplete)?;
+        let mark = rel.len();
+        if mark > 0 {
+            rel.push(b'/');
+        }
+        rel.extend_from_slice(name.to_bytes());
+        let stat = stat_staged_child(fd, name, &mut root, depth, pass, rel)?;
         if stat.st_dev as u64 != base_dev {
             return Err(SkipReason::MountOrDeviceCrossing);
         }
-        let is_dir = SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR);
+        let is_dir = is_dir_mode(stat.st_mode);
         charge_deletion_observation(
             &stat,
             depth.saturating_add(1),
@@ -3734,7 +4318,7 @@ fn delete_dir_contents_at_depth(
             !is_dir,
         )?;
         if is_dir {
-            let child = open_nested_dir(fd, OsStr::from_bytes(name.to_bytes()))?;
+            let child = open_staged_child_dir(fd, name, &stat, depth.saturating_add(1), pass, rel)?;
             let opened =
                 fstat(child.as_raw_fd()).map_err(|_| SkipReason::StagedDeletionIncomplete)?;
             if opened.st_dev != stat.st_dev || opened.st_ino != stat.st_ino {
@@ -3746,6 +4330,7 @@ fn delete_dir_contents_at_depth(
                 entry_name,
                 depth.saturating_add(1),
                 pass,
+                rel,
                 credits,
                 observed_bytes,
                 observed_inodes,
@@ -3753,13 +4338,22 @@ fn delete_dir_contents_at_depth(
             )?;
             drop(child);
             maybe_fail_delete_for_test(entry_name)?;
-            unlink_staged_entry(fd, name, UnlinkatFlags::RemoveDir, &root, depth, pass)?;
+            unlink_staged_entry(fd, name, UnlinkatFlags::RemoveDir, &root, depth, pass, rel)?;
             pass.record_entry_deleted();
         } else {
             maybe_fail_delete_for_test(entry_name)?;
-            unlink_staged_entry(fd, name, UnlinkatFlags::NoRemoveDir, &root, depth, pass)?;
+            unlink_staged_entry(
+                fd,
+                name,
+                UnlinkatFlags::NoRemoveDir,
+                &root,
+                depth,
+                pass,
+                rel,
+            )?;
             pass.record_entry_deleted();
         }
+        rel.truncate(mark);
     }
     Ok(())
 }
@@ -3775,6 +4369,7 @@ fn unlink_staged_entry(
     expected: &nix::libc::stat,
     depth: u32,
     pass: &ReclaimPassState,
+    rel: &[u8],
 ) -> Result<(), SkipReason> {
     match unlinkat(Some(fd), name, flags) {
         Ok(()) => Ok(()),
@@ -3790,18 +4385,9 @@ fn unlink_staged_entry(
                 unlinkat(Some(fd), name, flags).map_err(|_| SkipReason::StagedDeletionIncomplete)
             })();
             if let Err(reason) = &recovery {
-                // One fixed-size diagnostic at the failing directory, then
-                // unwind this stage. No descendant paths or per-entry retry loop.
-                tracing::warn!(
-                    device = expected.st_dev,
-                    inode = expected.st_ino,
-                    owner = expected.st_uid,
-                    mode = expected.st_mode & 0o7777,
-                    depth,
-                    unlink_errno = error as i32,
-                    ?reason,
-                    "staged cache owner-write recovery incomplete"
-                );
+                // One bounded diagnostic at the failing entry, then unwind
+                // this stage. No per-entry retry loop.
+                warn_staged_recovery_incomplete("unlinkat", error, expected, depth, rel, *reason);
             }
             recovery
         }
@@ -3831,7 +4417,7 @@ fn staged_owner_write_mode(
     if current.st_dev != expected.st_dev || current.st_ino != expected.st_ino {
         return Err(SkipReason::TargetIdentityChanged);
     }
-    if !SFlag::from_bits_truncate(current.st_mode).contains(SFlag::S_IFDIR)
+    if !is_dir_mode(current.st_mode)
         || current.st_uid != owner
         || expected.st_uid != owner
         || current.st_gid != expected.st_gid
@@ -4038,7 +4624,7 @@ pub fn fail_delete_after_for_test(custody_id: Uuid, generation: u64, after: isiz
         .insert((custody_id, generation), after);
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn set_elapsed_after_delete_for_test(custody_id: Uuid, generation: u64, elapsed: Duration) {
     elapsed_after_delete_for_test()
         .lock()
@@ -4085,7 +4671,7 @@ fn maybe_fail_delete_for_test(_entry_name: &str) -> Result<(), SkipReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
     use std::sync::{Arc, Barrier};
 
     fn registered_fixture(
@@ -4230,6 +4816,57 @@ mod tests {
             std::fs::read(slot.join("payload/replacement")).unwrap(),
             b"do-not-delete"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn registered_delete_removes_unix_sockets_and_nested_dirs() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let (root, pinned, intent) = registered_fixture(&base, 77);
+        let nested = root.join("target/.rsi-tmp/claude-1000/project/session/tasks");
+        std::fs::create_dir_all(&nested).unwrap();
+        // The fixture path exceeds SUN_LEN: bind through a directory descriptor.
+        #[cfg(target_os = "linux")]
+        let tmp_dir = std::fs::File::open(root.join("target/.rsi-tmp")).unwrap();
+        #[cfg(target_os = "linux")]
+        let _socket = std::os::unix::net::UnixListener::bind(format!(
+            "/proc/self/fd/{}/m.sock",
+            tmp_dir.as_raw_fd()
+        ))
+        .unwrap();
+        // macOS has no `/proc`: bind at a short path on the same APFS volume
+        // and rename the socket into place.
+        #[cfg(target_os = "macos")]
+        let _socket = {
+            let short = tempfile::Builder::new()
+                .prefix("rsi-sock")
+                .tempdir_in("/private/tmp")
+                .unwrap();
+            let socket =
+                std::os::unix::net::UnixListener::bind(short.path().join("m.sock")).unwrap();
+            std::fs::rename(
+                short.path().join("m.sock"),
+                root.join("target/.rsi-tmp/m.sock"),
+            )
+            .unwrap();
+            socket
+        };
+        assert!(
+            std::fs::symlink_metadata(root.join("target/.rsi-tmp/m.sock"))
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert_eq!(pinned.stage_registered_target(&intent).reason, None);
+        let outcome = delete_registered_target(&base, &intent, false);
+        assert_eq!(
+            outcome.kind,
+            TargetReclaimKind::RecoveredRemoved,
+            "{outcome:?}"
+        );
+        assert!(sync_registered_target_absence(&base, &intent).unwrap());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -4675,6 +5312,407 @@ mod tests {
         std::fs::set_permissions(&fixture.stage, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    /// #252: registered intent schedule 135 stayed `Deleting` because its
+    /// payload held a test fixture's mode-000 directories
+    /// (`.rsi-tmp/.tmpX/denied`, `.rsi-tmp/.tmpX/4003/task/4003/fd`) and the
+    /// walker could not open them. Deletion now restores owner `rwx` on such a
+    /// directory inside the authenticated payload and finishes; a symlink to a
+    /// mode-000 directory outside the namespace is unlinked, never followed,
+    /// and the outside directory keeps its mode and contents.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn registered_delete_restores_owner_search_on_mode_000_payload_directories_252() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let (root, pinned, intent) = registered_fixture(&base, 135);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        let fixture_tmp = root.join("target/.rsi-tmp/.tmpN7mVfP");
+        std::fs::create_dir_all(fixture_tmp.join("4003/task/4003/fd")).unwrap();
+        std::fs::create_dir_all(fixture_tmp.join("denied/nested")).unwrap();
+        std::fs::write(fixture_tmp.join("denied/target"), b"denied\n").unwrap();
+        std::fs::write(fixture_tmp.join("denied/nested/leaf"), b"leaf").unwrap();
+        symlink(&outside, fixture_tmp.join("denied/escape")).unwrap();
+        assert_eq!(pinned.stage_registered_target(&intent).reason, None);
+        let payload = base
+            .join(QUEUE_NAME)
+            .join(bucket_name(intent.bucket))
+            .join(&intent.slot_name)
+            .join("payload");
+        assert_stage_identity(&payload, intent.expected_device, intent.expected_inode);
+        let staged_tmp = payload.join(".rsi-tmp/.tmpN7mVfP");
+        for path in [
+            staged_tmp.join("denied/nested"),
+            staged_tmp.join("denied"),
+            staged_tmp.join("4003/task/4003/fd"),
+        ] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let outcome = delete_registered_target(&base, &intent, false);
+        assert_eq!(outcome.kind, TargetReclaimKind::RecoveredRemoved);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            probe_registered_target(&base, &intent).destination,
+            RegisteredNamespaceState::Absent
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&outside).unwrap().mode() & 0o7777,
+            0o000,
+            "the outside link target is never repaired"
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+    }
+
+    /// #2780: a nonempty directory with owner read but no owner search (mode
+    /// 0400 or 0600) opens and enumerates, then refuses every child lookup
+    /// with EACCES. The 000-only fixture of #252 cannot reach that path: the
+    /// repair must also run at the actual search denial.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn registered_delete_restores_owner_search_on_mode_0400_and_0600_payload_directories_2780() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let (root, pinned, intent) = registered_fixture(&base, 136);
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"outside").unwrap();
+        let fixture_tmp = root.join("target/.rsi-tmp/.tmpR4k2Q9");
+        for dir in ["ro400/inner/deep", "rw600/inner", "mixed/ro400"] {
+            std::fs::create_dir_all(fixture_tmp.join(dir)).unwrap();
+        }
+        for file in [
+            "ro400/leaf",
+            "ro400/inner/leaf",
+            "ro400/inner/deep/leaf",
+            "rw600/leaf",
+            "rw600/inner/leaf",
+            "mixed/ro400/leaf",
+        ] {
+            std::fs::write(fixture_tmp.join(file), b"leaf").unwrap();
+        }
+        symlink(&outside, fixture_tmp.join("ro400/escape")).unwrap();
+        assert_eq!(pinned.stage_registered_target(&intent).reason, None);
+        let payload = base
+            .join(QUEUE_NAME)
+            .join(bucket_name(intent.bucket))
+            .join(&intent.slot_name)
+            .join("payload");
+        assert_stage_identity(&payload, intent.expected_device, intent.expected_inode);
+        let staged_tmp = payload.join(".rsi-tmp/.tmpR4k2Q9");
+        // Deepest first so each chmod can still resolve its path.
+        for (path, mode) in [
+            ("ro400/inner/deep", 0o400),
+            ("ro400/inner", 0o600),
+            ("ro400", 0o400),
+            ("rw600/inner", 0o600),
+            ("rw600", 0o600),
+            ("mixed/ro400", 0o400),
+            ("mixed", 0o600),
+        ] {
+            std::fs::set_permissions(staged_tmp.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let outcome = delete_registered_target(&base, &intent, false);
+        assert_eq!(outcome.kind, TargetReclaimKind::RecoveredRemoved);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            probe_registered_target(&base, &intent).destination,
+            RegisteredNamespaceState::Absent
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&outside).unwrap().mode() & 0o7777,
+            0o400,
+            "the outside link target is never repaired"
+        );
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"outside");
+    }
+
+    /// #2781: the stuck-repair diagnostic keeps the failing errno, the
+    /// operation and the path relative to the staged payload root, bounded.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn staged_recovery_diagnostic_names_errno_operation_and_relative_path_2781() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let stat: nix::libc::stat = unsafe { std::mem::zeroed() };
+        tracing::subscriber::with_default(subscriber, || {
+            warn_staged_recovery_incomplete(
+                "fstatat",
+                Errno::EACCES,
+                &stat,
+                3,
+                b".rsi-tmp/.tmpX/denied/nested",
+                SkipReason::RejectedRecoveryEntry,
+            );
+            let long = vec![b'a'; RECOVERY_DIAGNOSTIC_PATH_BYTES * 4];
+            warn_staged_recovery_incomplete(
+                "unlinkat",
+                Errno::EPERM,
+                &stat,
+                1,
+                &long,
+                SkipReason::StagedDeletionIncomplete,
+            );
+        });
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let mut lines = logged.lines();
+        let first = lines.next().unwrap();
+        assert!(first.contains("operation=\"fstatat\""), "{first}");
+        assert!(
+            first.contains(&format!("errno={}", Errno::EACCES as i32)),
+            "{first}"
+        );
+        assert!(
+            first.contains("path=\".rsi-tmp/.tmpX/denied/nested\""),
+            "{first}"
+        );
+        assert!(first.contains("path_truncated=false"), "{first}");
+        let second = lines.next().unwrap();
+        assert!(second.contains("operation=\"unlinkat\""), "{second}");
+        assert!(
+            second.contains(&format!("errno={}", Errno::EPERM as i32)),
+            "{second}"
+        );
+        assert!(second.contains("path_truncated=true"), "{second}");
+        assert!(
+            !second.contains(&"a".repeat(RECOVERY_DIAGNOSTIC_PATH_BYTES + 1)),
+            "{second}"
+        );
+    }
+
+    /// #2797: a payload entry name is attacker-shaped bytes; the diagnostic
+    /// escapes control characters so it stays one line with no forged fields,
+    /// and the bound and `path_truncated` still hold.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn staged_recovery_diagnostic_escapes_control_bytes_in_path_2797() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let stat: nix::libc::stat = unsafe { std::mem::zeroed() };
+        let hostile: &[u8] = b"dir\nWARN forged=1\rx\x1b[31m/\xff\xfe/\x07end";
+        let mut long = hostile.to_vec();
+        long.extend(std::iter::repeat_n(
+            b'\n',
+            RECOVERY_DIAGNOSTIC_PATH_BYTES * 2,
+        ));
+        tracing::subscriber::with_default(subscriber, || {
+            warn_staged_recovery_incomplete(
+                "fstatat",
+                Errno::EACCES,
+                &stat,
+                2,
+                hostile,
+                SkipReason::RejectedRecoveryEntry,
+            );
+            warn_staged_recovery_incomplete(
+                "unlinkat",
+                Errno::EPERM,
+                &stat,
+                1,
+                &long,
+                SkipReason::StagedDeletionIncomplete,
+            );
+        });
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.lines().count(), 2, "{logged:?}");
+        assert!(logged.ends_with('\n'), "{logged:?}");
+        assert!(
+            logged
+                .lines()
+                .all(|line| !line.chars().any(char::is_control)),
+            "raw control character in {logged:?}"
+        );
+        let mut lines = logged.lines();
+        let first = lines.next().unwrap();
+        assert!(first.contains("\\n"), "{first}");
+        assert!(first.contains("\\r"), "{first}");
+        assert!(first.contains("\\u{1b}"), "{first}");
+        assert!(first.contains("path_truncated=false"), "{first}");
+        let second = lines.next().unwrap();
+        assert!(second.contains("path_truncated=true"), "{second}");
+        let kept_newlines = long[..RECOVERY_DIAGNOSTIC_PATH_BYTES]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        assert_eq!(second.matches("\\n").count(), kept_newlines, "{second}");
+    }
+
+    /// #252: the owner-search repair policy. Only a same-owner directory whose
+    /// owner read or search bit is missing, unchanged since the walk observed
+    /// it, gains owner `rwx`; everything else is refused with a typed reason,
+    /// and the repair goes to the pinned inode beneath the parent, never
+    /// through a symlink or to a directory swapped in under the same name.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn owner_search_repair_adds_only_owner_bits_and_refuses_drift_252() {
+        let fixture = staged_depth_fixture();
+        let (base_fd, _) = open_reclaim_base(&fixture.base).unwrap();
+        let relative = fixture.stage.strip_prefix(&fixture.base).unwrap();
+        let pinned = open_beneath_dir(base_fd.as_raw_fd(), relative.as_os_str()).unwrap();
+        let observed = fstat(pinned.as_raw_fd()).unwrap();
+        let owner = observed.st_uid;
+        let with_mode = |mode: u32| {
+            let mut stat = observed;
+            stat.st_mode = (stat.st_mode & !0o7777) | mode as nix::libc::mode_t;
+            stat
+        };
+        for (before, after) in [
+            (0o000, 0o700),
+            (0o055, 0o755),
+            (0o300, 0o700),
+            (0o600, 0o700),
+        ] {
+            let stat = with_mode(before);
+            assert_eq!(
+                staged_owner_search_mode(&stat, &stat, owner).map(|mode| mode.bits() & 0o7777),
+                Ok(after),
+                "{before:o}"
+            );
+        }
+        // Owner read and search already present: the denial is not ours to fix.
+        for mode in [0o500, 0o700, 0o555] {
+            let stat = with_mode(mode);
+            assert_eq!(
+                staged_owner_search_mode(&stat, &stat, owner),
+                Err(SkipReason::RejectedRecoveryEntry)
+            );
+        }
+        let denied = with_mode(0o000);
+        assert_eq!(
+            staged_owner_search_mode(&denied, &denied, owner.wrapping_add(1)),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+        let mut moved = denied;
+        moved.st_ino = moved.st_ino.wrapping_add(1);
+        assert_eq!(
+            staged_owner_search_mode(&moved, &denied, owner),
+            Err(SkipReason::TargetIdentityChanged)
+        );
+        assert_eq!(
+            staged_owner_search_mode(&with_mode(0o050), &denied, owner),
+            Err(SkipReason::RejectedRecoveryEntry),
+            "a mode that changed since the walk observed it"
+        );
+        let mut file = denied;
+        file.st_mode = SFlag::S_IFREG.bits();
+        assert_eq!(
+            staged_owner_search_mode(&file, &file, owner),
+            Err(SkipReason::RejectedRecoveryEntry)
+        );
+
+        let parent = fixture.stage.join("one/two");
+        let parent_fd = open_beneath_dir(
+            base_fd.as_raw_fd(),
+            parent.strip_prefix(&fixture.base).unwrap().as_os_str(),
+        )
+        .unwrap();
+        let outside = fixture._temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::rename(parent.join("three"), parent.join("held")).unwrap();
+        let held_stat = fstatat(
+            Some(parent_fd.as_raw_fd()),
+            "held",
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let repair = |expected: &nix::libc::stat| {
+            restore_staged_owner_search(
+                parent_fd.as_raw_fd(),
+                OsStr::new("three"),
+                expected,
+                0,
+                &ReclaimPassState::new(),
+            )
+        };
+        let mode_of = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+
+        // A symlink at the child's name is never followed.
+        symlink(&outside, parent.join("three")).unwrap();
+        let link_stat = fstatat(
+            Some(parent_fd.as_raw_fd()),
+            "three",
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        assert!(repair(&link_stat).is_err());
+        assert_eq!(mode_of(&outside), 0o000);
+
+        // A same-name directory swapped in after the walk observed another.
+        std::fs::remove_file(parent.join("three")).unwrap();
+        std::fs::create_dir(parent.join("three")).unwrap();
+        std::fs::set_permissions(parent.join("three"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        assert_eq!(repair(&held_stat), Err(SkipReason::TargetIdentityChanged));
+        assert_eq!(mode_of(&parent.join("three")), 0o000);
+
+        // The observed directory itself is repaired through its descriptor.
+        let current = fstatat(
+            Some(parent_fd.as_raw_fd()),
+            "three",
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        repair(&current).unwrap();
+        assert_eq!(mode_of(&parent.join("three")), 0o700);
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn readonly_permission_repair_respects_duration_and_depth_before_chmod() {
@@ -4879,7 +5917,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
-    fn cargo_target_guard_accepts_cross_target_triple_dirs_of_profile_dirs_only() {
+    fn cargo_target_guard_accepts_cross_target_triple_dirs_with_cargo_layout_only() {
         for name in [
             &b"wasm32-unknown-unknown"[..],
             b"x86_64-unknown-linux-gnu",
@@ -4894,7 +5932,22 @@ mod tests {
         let (_temp, base, root, id) = fixture();
         let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
-        std::fs::create_dir_all(root.join("target/wasm32-unknown-unknown/release")).unwrap();
+        std::fs::create_dir_all(root.join("target/wasm32-unknown-unknown/release/deps")).unwrap();
+        std::fs::create_dir_all(root.join("target/wasm32-unknown-unknown/debug/.fingerprint"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("target/x86_64-unknown-linux-gnu/release/build"))
+            .unwrap();
+        // Cargo writes its marker file beside the profile dirs (#1847).
+        std::fs::write(
+            root.join("target/wasm32-unknown-unknown/CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("target/x86_64-unknown-linux-gnu/CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
         assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
         // A file beside the profile dirs may be someone's state: retain all.
         std::fs::write(root.join("target/wasm32-unknown-unknown/notes"), b"keep").unwrap();
@@ -4906,6 +5959,40 @@ mod tests {
             std::fs::read(root.join("target/wasm32-unknown-unknown/notes")).unwrap(),
             b"keep"
         );
+        std::fs::remove_file(root.join("target/wasm32-unknown-unknown/notes")).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A triple-named directory without Cargo's layout refuses (#1429):
+        // empty, profile dir without Cargo subdirectories, or no profile dir.
+        for (case, layout) in [
+            ("empty", &[][..]),
+            ("bare-profile", &["release"][..]),
+            ("not-a-profile", &["src/deps"][..]),
+        ] {
+            let triple = root.join("target/aarch64-unknown-linux-gnu");
+            for sub in layout {
+                std::fs::create_dir_all(triple.join(sub)).unwrap();
+            }
+            std::fs::create_dir_all(&triple).unwrap();
+            let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+            assert_eq!(reason, SkipReason::TargetUnrecognizedContent, "{case}");
+            assert_eq!(
+                check.token(),
+                "target_entry_unrecognized:aarch64-unknown-linux-gnu",
+                "{case}"
+            );
+            std::fs::remove_dir_all(&triple).unwrap();
+        }
+        // A symlinked marker directory is not Cargo output either.
+        let triple = root.join("target/aarch64-unknown-linux-gnu");
+        std::fs::create_dir_all(triple.join("release")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), triple.join("release/deps")).unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert!(root.join("elsewhere").is_dir());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -4969,6 +6056,7 @@ mod tests {
             b"tmp",
             b".rsi-tmp",
             b"rsid-test-shards",
+            E2E_ARTIFACTS_DIR_NAME.as_bytes(),
             b"rsid-test-fixtures",
             b"rsid-d00-fixtures",
             b"slice8-harness-shell-fixtures",
@@ -4981,19 +6069,28 @@ mod tests {
             b"CACHEDIR.TAG",
             b".cargo-lock",
             b".rsid-test-shards.lock",
+            b".rsi-job-admission.lock",
+            b".rsi-build-env.json",
+            b".rsi-target-pool.json",
+            b"issue211-idle-costs-1234.jsonl",
         ] {
             assert!(is_reclaimable_target_entry(name, file), "{name:?}");
             assert!(!is_reclaimable_target_entry(name, dir), "{name:?} as dir");
         }
         // Anything else may be someone's state: a manager's lander, a log, an
-        // artifact left beside the build output. Links and special files never
+        // artifact left beside the build output, a hand-made `baseline-<pid>`
+        // checkout (a full repo copy, not harness scratch, #1838). Links and special files never
         // count, whatever their name.
         for name in [
             &b"lander"[..],
+            b"baseline-1632",
             b"artifact",
             b"fixtures",
             b"-fixtures",
             b"x.bin",
+            b"issue211-idle-costs-.jsonl",
+            b"issue211-idle-costs-12a.jsonl",
+            b"issue211-idle-costs-12.jsonl.bak",
         ] {
             assert!(!is_reclaimable_target_entry(name, dir), "{name:?}");
             assert!(!is_reclaimable_target_entry(name, file), "{name:?}");
@@ -5015,17 +6112,48 @@ mod tests {
             "debug",
             "tmp",
             ".rsi-tmp",
+            E2E_ARTIFACTS_DIR_NAME,
             "rsid-test-fixtures",
             "rsid-d00-fixtures",
         ] {
             std::fs::create_dir_all(target.join(dir).join("nested")).unwrap();
             std::fs::write(target.join(dir).join("nested").join("blob"), b"scratch").unwrap();
         }
-        for file in [".rustc_info.json", "CACHEDIR.TAG", ".rsid-test-shards.lock"] {
+        for file in [
+            ".rustc_info.json",
+            "CACHEDIR.TAG",
+            ".rsid-test-shards.lock",
+            ".rsi-build-env.json",
+            ".rsi-target-pool.json",
+            "issue211-idle-costs-4242.jsonl",
+            "python-discover.start",
+            "python-discover.head",
+            "python-discover.log",
+        ] {
             std::fs::write(target.join(file), b"{}").unwrap();
         }
         assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
         assert!(pinned.ensure_idle_cargo_target_checked().is_ok());
+
+        // Only the exact regular-file names are scratch (hub #3026): another
+        // suffix, and a directory of that name, still refuse.
+        std::fs::write(target.join("python-discover.other"), b"x").unwrap();
+        let (_, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(
+            check.token(),
+            "target_entry_unrecognized:python-discover.other"
+        );
+        std::fs::remove_file(target.join("python-discover.other")).unwrap();
+        std::fs::remove_file(target.join("python-discover.head")).unwrap();
+        std::fs::create_dir(target.join("python-discover.head")).unwrap();
+        std::fs::write(target.join("python-discover.head").join("x"), b"x").unwrap();
+        let (_, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(
+            check.token(),
+            "target_entry_unrecognized:python-discover.head"
+        );
+        std::fs::remove_dir_all(target.join("python-discover.head")).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
 
         std::fs::write(target.join("lander"), b"manager state").unwrap();
         let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
@@ -5039,6 +6167,271 @@ mod tests {
         assert_eq!(
             std::fs::read(target.join("lander")).unwrap(),
             b"manager state"
+        );
+
+        // An unknown top-level directory still refuses beside the known ones
+        // (#1429), including a hand-made `baseline-<pid>` checkout (#1838).
+        std::fs::remove_file(target.join("lander")).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+        std::fs::create_dir_all(target.join("baseline-1632").join("src")).unwrap();
+        let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(reason, SkipReason::TargetUnrecognizedContent);
+        assert_eq!(check.token(), "target_entry_unrecognized:baseline-1632");
+        assert!(target.join("baseline-1632").join("src").is_dir());
+    }
+
+    /// A `/proc/<pid>` entry caught mid-`exec` reads as unreadable for a moment;
+    /// the scan re-reads it instead of refusing the reclaim (#2163).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn process_probe_settles_after_a_transient_unreadable_entry() {
+        let mut probes = 0;
+        let mut pauses = 0;
+        let settled = settle_process_probe(
+            || {
+                probes += 1;
+                if probes <= PROCESS_SCAN_RETRIES {
+                    Err(ProcessProbeFailure::Unreadable)
+                } else {
+                    Ok(ProcessProbe::Unrelated)
+                }
+            },
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(settled, Ok(ProcessProbe::Unrelated));
+        assert_eq!(
+            (probes, pauses),
+            (PROCESS_SCAN_RETRIES + 1, PROCESS_SCAN_RETRIES)
+        );
+    }
+
+    /// An RSI-unit process that never becomes readable still fails closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn process_probe_fails_closed_on_an_entry_that_stays_unreadable() {
+        let mut probes = 0;
+        let mut pauses = 0;
+        let settled = settle_process_probe(
+            || {
+                probes += 1;
+                Err(ProcessProbeFailure::Unreadable)
+            },
+            || {
+                pauses += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(settled, Err(ProcessProbeFailure::Unreadable));
+        assert_eq!(
+            (probes, pauses),
+            (PROCESS_SCAN_RETRIES + 1, PROCESS_SCAN_RETRIES)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn process_probe_does_not_retry_a_settled_verdict_and_honors_the_pass_budget() {
+        for verdict in [ProcessProbe::InUse, ProcessProbe::Unrelated] {
+            let mut pauses = 0;
+            let settled = settle_process_probe(
+                || Ok(verdict),
+                || {
+                    pauses += 1;
+                    Ok(())
+                },
+            );
+            assert_eq!(settled, Ok(verdict));
+            assert_eq!(pauses, 0);
+        }
+
+        let mut probes = 0;
+        let settled = settle_process_probe(
+            || {
+                probes += 1;
+                Err(ProcessProbeFailure::Unreadable)
+            },
+            || Err(SkipReason::DurationBudget),
+        );
+        assert_eq!(
+            settled,
+            Err(ProcessProbeFailure::Budget(SkipReason::DurationBudget))
+        );
+        assert_eq!(probes, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReapedChild(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl ReapedChild {
+        fn proc_path(&self) -> PathBuf {
+            PathBuf::from(format!("/proc/{}", self.0.id()))
+        }
+
+        /// `spawn` returns once the kernel has switched the child to its new
+        /// program, but `execve` publishes the child's environment area a
+        /// little later: a `/proc/<pid>/environ` read in between is empty, and a
+        /// `CARGO_TARGET_DIR` consumer probed that early reads as unrelated.
+        /// Wait until the environment is visible so the probe judges the
+        /// settled process.
+        fn wait_until_exec_settled(&self) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match std::fs::read(self.proc_path().join("environ")) {
+                    Ok(environment) if !environment.is_empty() => return,
+                    Ok(_) => {}
+                    Err(error) => panic!("child {} environ unreadable: {error}", self.0.id()),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "child {} never published its environment",
+                    self.0.id()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn idle_child(configure: impl FnOnce(&mut std::process::Command)) -> ReapedChild {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("120").current_dir("/");
+        configure(&mut command);
+        let child = ReapedChild(command.spawn().unwrap());
+        child.wait_until_exec_settled();
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn process_probe_names_a_consumer_of_the_sandbox_and_ignores_the_rest() {
+        let (_temp, _base, root, _id) = fixture();
+        let root = std::fs::canonicalize(root).unwrap();
+        let target = root.join("target");
+        let held = target.join("held");
+        std::fs::write(&held, b"cache").unwrap();
+        let uid = nix::unistd::getuid().as_raw();
+        let probe = |child: &ReapedChild| probe_process(&child.proc_path(), uid, &root, &target);
+
+        let unrelated = idle_child(|_| {});
+        assert_eq!(probe(&unrelated), Ok(ProcessProbe::Unrelated));
+        let by_cwd = idle_child(|command| {
+            command.current_dir(&root);
+        });
+        assert_eq!(probe(&by_cwd), Ok(ProcessProbe::InUse));
+        let by_cargo_target_dir = idle_child(|command| {
+            command.env("CARGO_TARGET_DIR", target.join("nested"));
+        });
+        assert_eq!(probe(&by_cargo_target_dir), Ok(ProcessProbe::InUse));
+        let by_descriptor = idle_child(|command| {
+            command.stdin(std::fs::File::open(&held).unwrap());
+        });
+        assert_eq!(probe(&by_descriptor), Ok(ProcessProbe::InUse));
+
+        // A process gone by the time it is read cannot hold the sandbox.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone_path = PathBuf::from(format!("/proc/{}", gone.id()));
+        gone.wait().unwrap();
+        assert_eq!(
+            probe_process(&gone_path, uid, &root, &target),
+            Ok(ProcessProbe::Unrelated)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn idle_cargo_target_accepts_nested_cargo_targets_by_structure_only() {
+        let (_temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let baselines = target.join("scoped-baselines");
+
+        // The settled state scoped-test leaves: an empty container (#2053).
+        std::fs::create_dir_all(&baselines).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A leftover base-build target under `run-*`.
+        let run = baselines.join("run-x");
+        std::fs::create_dir_all(run.join("debug/.fingerprint/foo-1")).unwrap();
+        std::fs::create_dir_all(run.join("debug/deps")).unwrap();
+        std::fs::write(run.join("CACHEDIR.TAG"), b"Signature: x\n").unwrap();
+        std::fs::write(run.join(".rustc_info.json"), b"{}").unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // Profile markers alone are evidence too, and so is a nested triple.
+        let bare = baselines.join("run-y");
+        std::fs::create_dir_all(bare.join("release/build")).unwrap();
+        std::fs::create_dir_all(baselines.join("run-z/wasm32-unknown-unknown/debug/deps")).unwrap();
+        std::fs::write(
+            baselines.join("run-z/wasm32-unknown-unknown/CACHEDIR.TAG"),
+            b"Signature: x\n",
+        )
+        .unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A symlink inside is never followed: it refuses and its target stays.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, run.join("link")).unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        std::fs::remove_file(run.join("link")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, baselines.join("run-w")).unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        std::fs::remove_file(baselines.join("run-w")).unwrap();
+        assert_eq!(
+            std::fs::read(elsewhere.join("keep")).unwrap(),
+            b"keep",
+            "the symlink target is untouched"
+        );
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A nested directory without target markers refuses, as does an
+        // unknown file inside a real nested target.
+        let source = baselines.join("run-src");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::write(source.join("Cargo.toml"), b"[package]").unwrap();
+        let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(reason, SkipReason::TargetUnrecognizedContent);
+        assert_eq!(check.token(), "target_entry_unrecognized:scoped-baselines");
+        std::fs::remove_dir_all(&source).unwrap();
+        std::fs::write(run.join("notes.txt"), b"keep").unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        std::fs::remove_file(run.join("notes.txt")).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A hand-made source checkout beside the build output (`review-<n>-
+        // source`) has no target evidence and keeps the whole target.
+        let checkout = target.join("review-1885-source");
+        std::fs::create_dir_all(checkout.join("crates")).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), b"[workspace]").unwrap();
+        let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(reason, SkipReason::TargetUnrecognizedContent);
+        assert_eq!(
+            check.token(),
+            "target_entry_unrecognized:review-1885-source"
         );
     }
 
@@ -5323,7 +6716,7 @@ mod tests {
             rejected.basename.len(),
             REJECTED_STAGE_PREFIX.len() + active.len()
         );
-        assert!(rejected.basename.len() <= nix::libc::NAME_MAX as usize);
+        assert!(rejected.basename.len() <= NAME_MAX);
         assert_eq!(
             parse_stage_name(
                 rejected

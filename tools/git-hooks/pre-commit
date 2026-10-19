@@ -173,6 +173,19 @@ if [ -n "$staged_rs" ] && [ -f tools/check_identity_assertions.py ]; then
   fi
 fi
 
+# ── Portable-shell guard (local #322) ───────────────────────────────────────
+# Rejects a staged scripts/ file that adds a BSD-only or GNU-only shell form
+# above tools/portable-shell-baseline.json, and a staged baseline that raises a
+# count over HEAD's (see scripts/check-portable-shell.sh).
+staged_shell="$(git diff --cached --name-only --diff-filter=d -- 'scripts/*' tools/portable-shell-baseline.json)"
+if [ -n "$staged_shell" ] && [ -f tools/check_portable_shell.py ]; then
+  # shellcheck disable=SC2086
+  if ! python3 tools/check_portable_shell.py --base HEAD $staged_shell; then
+    echo "pre-commit: portable-shell guard failed (see above)." >&2
+    exit 1
+  fi
+fi
+
 # Theme reads in tests must hold the shared pin across rendering/assertions.
 staged_theme_rs="$(git diff --cached --name-only --diff-filter=d -- 'crates/rsi/src/*.rs')"
 if [ -n "$staged_theme_rs" ] && [ -f tools/check_theme_test_guards.py ]; then
@@ -206,12 +219,32 @@ if [ -f tools/check_operator_identifiers.py ]; then
   fi
 fi
 
+# True iff $1 (a thoughts/shared/research/*.json file) is a structured research
+# sidecar that rsi-research-validate --strict must check (#2948). Raw
+# measurement/evidence JSON shares the directory and must not be validated as
+# one. A file is a sidecar when ANY holds:
+#   - its name ends in `.research.json`;
+#   - a same-stem `.md` research doc sits beside it (`<doc>.md` + `<doc>.json`);
+#   - it carries the sidecar's `"research_question"` key (the explicit schema
+#     marker), so a malformed sidecar is still rejected, never skipped.
+# A name ending in `.evidence.json` or `.measurements.json` is always raw
+# evidence. Everything else is raw evidence too. See docs/research-validation.md.
+is_research_sidecar() {
+  case "$1" in
+    *.evidence.json|*.measurements.json) return 1 ;;
+    *.research.json) return 0 ;;
+  esac
+  [ -f "${1%.json}.md" ] && return 0
+  grep -q '"research_question"' "$1" 2>/dev/null
+}
+
 art_fail=0
 for f in $(git diff --cached --name-only --diff-filter=d); do
   [ -f "$f" ] || continue
   vbin=""; label=""; set -- ""
   case "$f" in
     thoughts/shared/research/*.json)
+      is_research_sidecar "$f" || continue
       vbin="$(find_validator rsi-research-validate)"; label="research sidecar"; set -- "$f" --strict ;;
     thoughts/shared/handoffs/*.md)
       vbin="$(find_validator rsi-handoff-validate)"; label="handoff"; set -- --strict "$f" ;;

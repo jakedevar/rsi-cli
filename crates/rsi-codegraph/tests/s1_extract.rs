@@ -1,9 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)] // Exact-source fixtures.
 
 use rsi_codegraph::{
-    CodegraphStore, ExtractionContract, ExtractionMode, ExtractorIdentity, FileDiagnostic,
-    NodeKind, PublishFault, RelationKind, SourceFile, SourceVersion, StagedExtraction,
-    WorkspaceInstanceKey, extract::extract_file, invalidate::ExtractionCache,
+    CodegraphStore, ExtractionContract, ExtractionMode, ExtractorIdentity, FactProvenance,
+    FileDiagnostic, NodeKind, PublishFault, RelationKind, SourceFile, SourceVersion,
+    StagedExtraction, WorkspaceInstanceKey, extract::extract_file, invalidate::ExtractionCache,
     resolve::resolve_unique,
 };
 use uuid::Uuid;
@@ -334,13 +334,18 @@ fn resolver_promotes_only_unique_explicit_crate_paths() {
         extract_file(source("src/other.rs", "pub fn target() {}\n")),
     ];
     resolve_unique(&mut files);
-    assert_eq!(
-        files[0]
-            .relations
+    // The crate-path call and the bare call through `use crate::other::target`
+    // both name the one declaration, so both are proven.
+    let calls = files[0]
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
             .iter()
-            .filter(|relation| relation.kind == RelationKind::Calls)
-            .count(),
-        1
+            .all(|relation| relation.provenance == FactProvenance::Extracted)
     );
     assert_eq!(
         files[0]
@@ -354,7 +359,7 @@ fn resolver_promotes_only_unique_explicit_crate_paths() {
         files[0]
             .unresolved_references
             .iter()
-            .any(|reference| reference.raw_target == "target")
+            .all(|reference| reference.kind != rsi_codegraph::UnresolvedReferenceKind::Call)
     );
 
     let temp = tempfile::tempdir().unwrap();
@@ -387,19 +392,24 @@ fn resolver_promotes_only_unique_explicit_crate_paths() {
         extract_file(source("src/other.rs", "fn target() {} fn target() {}")),
     ];
     resolve_unique(&mut ambiguous);
+    // Two declarations of one path are never proven: the site stays listed as
+    // unresolved and only bounded `Inferred` candidates are recorded.
     assert!(
         ambiguous[0]
             .unresolved_references
             .iter()
             .any(|reference| reference.raw_target == "crate::other::target")
     );
-    assert_eq!(
-        ambiguous[0]
-            .relations
+    let ambiguous_calls = ambiguous[0]
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == RelationKind::Calls)
+        .collect::<Vec<_>>();
+    assert_eq!(ambiguous_calls.len(), 2);
+    assert!(
+        ambiguous_calls
             .iter()
-            .filter(|relation| relation.kind == RelationKind::Calls)
-            .count(),
-        0
+            .all(|relation| relation.provenance == FactProvenance::Inferred)
     );
 }
 

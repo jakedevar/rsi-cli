@@ -5,8 +5,10 @@ pub mod browser;
 pub mod claude_config;
 pub mod client;
 pub mod clipboard;
+pub mod cold_storage;
 pub mod commands;
 pub mod daemon_resources;
+pub mod draw_stats;
 pub mod editing_mode_prompt;
 pub mod efficiency_stats;
 pub mod event;
@@ -19,6 +21,7 @@ pub mod input_bar;
 pub mod input_surface;
 pub mod key_tables;
 pub mod keybindings;
+pub mod land;
 pub mod manual;
 pub mod mcp_server_rows;
 pub mod modalkit_types;
@@ -37,6 +40,7 @@ pub mod provider_profile_view;
 pub mod settings;
 pub mod settings_keys;
 pub mod settings_registry;
+pub mod settings_staging;
 #[cfg(test)]
 mod standard_inputs_3b_tests;
 #[cfg(test)]
@@ -47,6 +51,7 @@ pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod text_objects;
+pub mod todo_panel;
 pub mod types;
 pub mod ui;
 pub mod vim_textarea;

@@ -24,6 +24,8 @@ pub(crate) struct DaemonHealthRead {
     pub(crate) resources: crate::daemon_resources::DaemonResourceSample,
     /// #1122: the pending operator restart line, when one is waiting.
     pub(crate) restart_pending: Option<String>,
+    /// Outer None preserves the last warning across a transient failed read.
+    pub(crate) local_build_warning: Option<Option<String>>,
 }
 
 async fn fetch_worker_pressure(
@@ -42,10 +44,20 @@ async fn fetch_worker_pressure(
             .await
             .ok()
             .and_then(|restart| restart.summary());
+        let local_build_warning = match client.get_daemon_info().await {
+            Ok(info) => Some(info.local_build_warning()),
+            Err(crate::client::ClientError::Rpc { code, .. })
+                if code == rsi_common::rpc::METHOD_NOT_FOUND =>
+            {
+                Some(None)
+            }
+            Err(_) => None,
+        };
         Ok(DaemonHealthRead {
             resources: crate::daemon_resources::DaemonResourceSample::from_health(&status, pid),
             pressure: status.worker_slice_memory_pressure,
             restart_pending,
+            local_build_warning,
         })
     })
     .await
@@ -178,17 +190,28 @@ impl App {
             .is_some_and(tokio::task::JoinHandle::is_finished)
             && let Some(handle) = self.worker_pressure_refresh_handle.take()
         {
-            let (pressure, resources, restart_pending) = match handle.await {
-                Ok(Ok(read)) => (read.pressure, Some(read.resources), read.restart_pending),
+            let (pressure, resources, restart_pending, local_build_warning) = match handle.await {
+                Ok(Ok(read)) => (
+                    read.pressure,
+                    Some(read.resources),
+                    read.restart_pending,
+                    read.local_build_warning,
+                ),
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "worker pressure Health refresh unavailable");
-                    (None, None, None)
+                    (None, None, None, None)
                 }
                 Err(error) => {
                     tracing::debug!(%error, "worker pressure Health task failed");
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             };
+            if let Some(warning) = local_build_warning
+                && self.local_build_warning != warning
+            {
+                self.local_build_warning = warning;
+                self.mark_dirty();
+            }
             if self.worker_slice_memory_pressure != pressure {
                 self.worker_slice_memory_pressure = pressure;
                 self.mark_dirty();
@@ -475,28 +498,28 @@ impl App {
         }
     }
 
-    /// Get session IDs for actively running sessions that need conversation polling.
-    /// ENHANCED: Only includes sessions that are genuinely running and producing output.
-    /// Excludes sessions handled by navigation effects (focused, inflight, containers).
+    /// Session IDs for the bounded catch-up poll: every running/starting leaf
+    /// session, INCLUDING the focused detail session and the global manager
+    /// workspace's conversation session (#1234). Push is the primary path, but a
+    /// dropped push would otherwise leave an open transcript stale until the
+    /// next refocus. The fetch is incremental (`since_sequence`) and batched, so
+    /// the steady-state cost is one cheap empty read per cycle.
+    ///
+    /// Container kinds (Group/Epic) have no conversation events and are never
+    /// polled; their metadata arrives via push. Sessions with an inflight focus
+    /// fetch are skipped so the same transcript is not fetched twice.
     fn active_running_session_ids(&self) -> Vec<uuid::Uuid> {
         self.sessions
             .iter()
             .filter(|(id, state)| {
-                // Only actively running sessions that produce conversation events
                 let is_actively_running = matches!(
                     state.session.status,
                     rsi_common::types::SessionStatus::Running
                         | rsi_common::types::SessionStatus::Starting
                 );
-
-                // Skip if navigation effects already handle it
-                let handled_by_navigation = self.focus_fetch_inflight.contains(id)
-                    || self.focused_detail_session_id() == Some(**id);
-
-                // Skip containers (they never have conversation events)
+                let focus_fetch_owns_it = self.focus_fetch_inflight.contains(id);
                 let is_container = rsi_common::is_container_kind(state.session.session_kind);
-
-                is_actively_running && !handled_by_navigation && !is_container
+                is_actively_running && !focus_fetch_owns_it && !is_container
             })
             .map(|(id, _)| *id)
             .collect()
@@ -738,109 +761,6 @@ impl App {
         }
         self.dispatch_pending_conversation_poll();
         dirty
-    }
-
-    /// Determine which sessions need conversation event fetching.
-    ///
-    /// Container kinds (Group/Epic) are filtered out by design: they have no
-    /// `ConversationEvent`s, so the periodic `GetConversation` RPC for them
-    /// is pure waste. Container metadata is kept in sync via push events
-    /// (`session_metadata_changed`, `child_spawned`). Navigation onto a
-    /// container therefore performs zero extra RPCs — instantaneous view
-    /// switch with no redundant network request. Leaf navigation (Story,
-    /// Standard, Task, etc.) is covered by the event-driven focus-fetch
-    /// effect in `trigger_focus_fetch_if_needed` (see `app/navigation.rs`).
-    fn poll_conversation_ids(&self) -> Vec<Uuid> {
-        let visible = self.visible_detail_session_ids();
-        let focused = self.focused_detail_session_id();
-        let mut seen = HashSet::new();
-        self.sessions
-            .iter()
-            .filter(|(id, state)| {
-                // Skip containers — they have no conversation events to fetch.
-                if rsi_common::is_container_kind(state.session.session_kind) {
-                    return false;
-                }
-                // Skip sessions with inflight focus fetches to avoid redundant requests.
-                // The focus-fetch effect handles immediate updates on navigation changes.
-                if self.focus_fetch_inflight.contains(id) {
-                    return false;
-                }
-                // ENHANCED: Skip the currently focused session entirely — navigation
-                // effects provide instant, incremental updates that replace periodic polling.
-                // This ensures zero polling for navigation transitions while maintaining
-                // background freshness for non-focused sessions.
-                if focused == Some(**id) {
-                    return false;
-                }
-                let is_active = matches!(
-                    state.session.status,
-                    rsi_common::types::SessionStatus::Running
-                        | rsi_common::types::SessionStatus::Starting
-                );
-                let include = is_active || visible.contains(id);
-                include && seen.insert(**id)
-            })
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Determine which sessions need initial conversation loading (push mode).
-    /// Only returns sessions that have no events loaded yet — push handles
-    /// real-time updates for sessions that are already populated.
-    ///
-    /// Container kinds (Group/Epic) are filtered out — see
-    /// `poll_conversation_ids` for the rationale. The mirror filter here
-    /// keeps both the push-mode and pull-mode poll paths consistent with
-    /// the focus-fetch effect (which already short-circuits on
-    /// `!is_leaf_kind`).
-    fn poll_unloaded_conversation_ids(&self) -> Vec<Uuid> {
-        let visible = self.visible_detail_session_ids();
-        let focused = self.focused_detail_session_id();
-        let mut seen = HashSet::new();
-        self.sessions
-            .iter()
-            .filter(|(id, state)| {
-                // Skip containers — they have no conversation events to fetch.
-                if rsi_common::is_container_kind(state.session.session_kind) {
-                    return false;
-                }
-                // Skip sessions with inflight focus fetches to avoid redundant requests.
-                // The focus-fetch effect handles immediate updates on navigation changes.
-                if self.focus_fetch_inflight.contains(id) {
-                    return false;
-                }
-                // ENHANCED: Skip the currently focused session entirely — navigation
-                // effects provide instant, incremental updates even for unloaded sessions.
-                if focused == Some(**id) {
-                    return false;
-                }
-                let unloaded = state.events.is_empty() && state.last_sequence.is_none();
-                let is_active = matches!(
-                    state.session.status,
-                    rsi_common::types::SessionStatus::Running
-                        | rsi_common::types::SessionStatus::Starting
-                );
-                // In push mode, only detail-visible unloaded sessions are fetched
-                // by the fallback poll. Session-list hierarchy transitions use the
-                // navigation effect instead of broad filtered-list polling.
-                if !unloaded && !is_active {
-                    return false;
-                }
-                let include = is_active || visible.contains(id);
-                include && seen.insert(**id)
-            })
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
-    /// Get the currently focused session ID if it's a detail view.
-    /// Returns None for session lists, settings, or other panes.
-    fn focused_detail_session_id(&self) -> Option<Uuid> {
-        match self.focused_pane() {
-            Some(Pane::SessionDetail { session_id }) => Some(*session_id),
-            _ => None,
-        }
     }
 
     /// Collect session IDs visible in focused panes across all tabs.
@@ -1107,6 +1027,16 @@ impl App {
                         Option<rsi_common::provider_capabilities::ResolvedContextBudget>,
                 }
                 if let Ok(parsed) = serde_json::from_value::<MetaInner>(event.data) {
+                    if (parsed.model.is_some() || parsed.resolved_context_budget.is_some())
+                        && (self
+                            .coordinator_context_budgets
+                            .iter()
+                            .any(|s| s.session_id == parsed.session_id)
+                            || self.settings_state.section
+                                == crate::settings_registry::SettingsSection::ContextRotation)
+                    {
+                        self.request_daemon_config_refresh();
+                    }
                     // Invalidate cache for metadata changes
                     self.navigation_cache.process_push_invalidation(
                         "session_metadata_changed",
@@ -1215,6 +1145,14 @@ impl App {
                         Option<rsi_common::provider_capabilities::ResolvedContextBudget>,
                 }
                 if let Ok(parsed) = serde_json::from_value::<CtxInner>(event.data) {
+                    if parsed.context_window > 0
+                        && self.coordinator_context_budgets.iter().any(|seat| {
+                            seat.session_id == parsed.session_id
+                                && seat.budget.window.active_tokens != parsed.context_window
+                        })
+                    {
+                        self.request_daemon_config_refresh();
+                    }
                     if let Some(state) = self.sessions.get_mut(&parsed.session_id) {
                         let api_total = parsed.input_tokens;
                         let codex = matches!(
@@ -1574,30 +1512,6 @@ impl App {
         }
         changed
     }
-
-    /// Fetch model segments for the focused session detail pane.
-    /// Only fetches if segments have changed (comparison check).
-    async fn fetch_model_segments_for_visible(&mut self) -> bool {
-        // Only fetch for the focused session in detail view
-        let session_id = match self.focused_pane() {
-            Some(Pane::SessionDetail { session_id }) => *session_id,
-            _ => return false,
-        };
-
-        let segments = match self.client.get_model_segments(session_id).await {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        if let Some(state) = self.sessions.get_mut(&session_id) {
-            if state.model_segments != segments {
-                state.model_segments = segments;
-                state.events_generation += 1; // Invalidate height cache
-                return true;
-            }
-        }
-        false
-    }
 }
 
 /// Map a daemon `system_message` level to a notification treatment:
@@ -1623,6 +1537,82 @@ fn system_message_notification(
 mod worker_pressure_refresh_tests {
     use super::super::App;
     use crate::client::DaemonClient;
+
+    #[tokio::test]
+    async fn local_build_warning_refreshes_and_clears_through_background_rpc() {
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket_path = crate::test_support::short_socket_path("local-build");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            for step in 0..5 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                for method in ["GetHealthStatus", "GetOperatorRestart", "GetDaemonInfo"] {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["method"], method);
+                    let result = match method {
+                        "GetHealthStatus" => json!({
+                            "persistence_queue_depth": 0, "persistence_queue_capacity": 1,
+                            "last_command_duration_ms": 0, "project_cache_size": 0,
+                        }),
+                        "GetOperatorRestart" => json!({
+                            "pending": false, "forced": false, "blockers": [],
+                            "turns_in_flight": 0, "supervised": true,
+                        }),
+                        _ => json!({
+                            "build_sha": "a".repeat(40), "started_at": "2026-10-19T00:00:00.000000000Z",
+                            "uptime_secs": 1, "schema_version": 1, "disk_free": {},
+                            "local_build": {
+                                "sha": if step < 2 { "b".repeat(40) } else { "c".repeat(40) },
+                                "path": "/fixture/rsid", "built_at": "2026-10-19T01:00:00.000000000Z",
+                                "differs": step < 3,
+                            },
+                        }),
+                    };
+                    let response = if method == "GetDaemonInfo" && (step == 1 || step == 4) {
+                        json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+                            "code": if step == 1 { -32603 } else { -32601 }, "message": "fixture unavailable",
+                        }})
+                    } else {
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                    };
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let mut app = App::new(DaemonClient::new(socket_path.clone()));
+        for expected in [
+            Some("bbbbbbbbb"),
+            Some("bbbbbbbbb"),
+            Some("ccccccccc"),
+            None,
+            None,
+        ] {
+            let read = super::fetch_worker_pressure(socket_path.clone())
+                .await
+                .unwrap();
+            let task = tokio::spawn(async move { Ok(read) });
+            // Synchronize completion so the normal input-loop poll can consume it.
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            app.worker_pressure_refresh_handle = Some(task);
+            app.poll_worker_pressure_refresh().await;
+            match expected {
+                Some(sha) => assert!(app.local_build_warning.as_ref().unwrap().contains(sha)),
+                None => assert_eq!(app.local_build_warning, None),
+            }
+        }
+        server.await.unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+    }
 
     #[tokio::test]
     async fn held_health_read_keeps_one_background_refresh_and_returns_promptly() {
@@ -1700,7 +1690,7 @@ mod system_message_tests {
 #[cfg(test)]
 mod conversation_poll_filter_tests {
     //! Tests for the container-kind filter applied to
-    //! `poll_conversation_ids` / `poll_unloaded_conversation_ids`.
+    //! `active_running_session_ids` (the fallback catch-up poll list).
     //!
     //! The contract: Group/Epic containers MUST NOT appear in the
     //! conversation-fetch poll lists, regardless of their status (Running,
@@ -1870,7 +1860,7 @@ mod conversation_poll_filter_tests {
         );
         app.filtered_session_order.push(group_id);
 
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
             !ids.contains(&group_id),
             "Group containers must be filtered out of conversation polling"
@@ -2335,7 +2325,7 @@ mod conversation_poll_filter_tests {
         );
         app.filtered_session_order.push(epic_id);
 
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
             !ids.contains(&epic_id),
             "Epic containers must be filtered out of conversation polling"
@@ -2356,78 +2346,10 @@ mod conversation_poll_filter_tests {
         );
         app.filtered_session_order.push(story_id);
 
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
             ids.contains(&story_id),
             "Story leaves MUST remain included (they have conversation events)"
-        );
-    }
-
-    #[test]
-    fn poll_conversation_ids_excludes_completed_story_when_only_list_visible() {
-        let mut app = test_app();
-        let story_id = Uuid::new_v4();
-        app.sessions.insert(
-            story_id,
-            SessionState::new(mk_session(
-                story_id,
-                SessionKind::Story,
-                SessionStatus::Completed,
-            )),
-        );
-        app.filtered_session_order.push(story_id);
-
-        let ids = app.poll_conversation_ids();
-        assert!(
-            !ids.contains(&story_id),
-            "session-list visibility must not trigger periodic conversation polling"
-        );
-    }
-
-    #[test]
-    fn poll_unloaded_conversation_ids_excludes_containers() {
-        let mut app = test_app();
-        let group_id = Uuid::new_v4();
-        let epic_id = Uuid::new_v4();
-        let story_id = Uuid::new_v4();
-
-        app.sessions.insert(
-            group_id,
-            SessionState::new(mk_session(
-                group_id,
-                SessionKind::Group,
-                SessionStatus::Running,
-            )),
-        );
-        app.sessions.insert(
-            epic_id,
-            SessionState::new(mk_session(
-                epic_id,
-                SessionKind::Epic,
-                SessionStatus::Running,
-            )),
-        );
-        app.sessions.insert(
-            story_id,
-            SessionState::new(mk_session(
-                story_id,
-                SessionKind::Story,
-                SessionStatus::Running,
-            )),
-        );
-        app.filtered_session_order.push(group_id);
-        app.filtered_session_order.push(epic_id);
-        app.filtered_session_order.push(story_id);
-
-        let ids = app.poll_unloaded_conversation_ids();
-        assert!(
-            !ids.contains(&group_id),
-            "Group filtered from push-mode poll"
-        );
-        assert!(!ids.contains(&epic_id), "Epic filtered from push-mode poll");
-        assert!(
-            ids.contains(&story_id),
-            "Story leaf MUST appear in push-mode poll (unloaded + active)"
         );
     }
 
@@ -2448,7 +2370,7 @@ mod conversation_poll_filter_tests {
         // Deliberately don't add to filtered_session_order — only the
         // "is_active" predicate would otherwise pick it up. Container filter
         // must still win.
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
             !ids.contains(&group_id),
             "Container filter must beat the is_active inclusion rule"
@@ -2472,34 +2394,10 @@ mod conversation_poll_filter_tests {
         // Pre-mark as having inflight focus fetch
         app.focus_fetch_inflight.insert(story_id);
 
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
             !ids.contains(&story_id),
             "Sessions with inflight focus fetch must be excluded from polling to avoid redundant requests"
-        );
-    }
-
-    #[test]
-    fn poll_unloaded_conversation_ids_excludes_sessions_with_inflight_focus_fetch() {
-        let mut app = test_app();
-        let story_id = Uuid::new_v4();
-        app.sessions.insert(
-            story_id,
-            SessionState::new(mk_session(
-                story_id,
-                SessionKind::Story,
-                SessionStatus::Running,
-            )),
-        );
-        app.filtered_session_order.push(story_id);
-
-        // Pre-mark as having inflight focus fetch
-        app.focus_fetch_inflight.insert(story_id);
-
-        let ids = app.poll_unloaded_conversation_ids();
-        assert!(
-            !ids.contains(&story_id),
-            "Sessions with inflight focus fetch must be excluded from push-mode polling to avoid redundant requests"
         );
     }
 
@@ -2882,7 +2780,7 @@ mod conversation_poll_filter_tests {
     }
 
     #[test]
-    fn poll_conversation_ids_excludes_currently_focused_session() {
+    fn poll_conversation_ids_includes_currently_focused_running_session() {
         let mut app = test_app();
         let story_id = Uuid::new_v4();
         app.sessions.insert(
@@ -2902,15 +2800,15 @@ mod conversation_poll_filter_tests {
             };
         }
 
-        let ids = app.poll_conversation_ids();
+        let ids = app.active_running_session_ids();
         assert!(
-            !ids.contains(&story_id),
-            "Currently focused session must be excluded from polling as navigation effects handle all updates"
+            ids.contains(&story_id),
+            "a dropped push must not leave the open transcript stale: the focused running session is part of the bounded catch-up poll (#1234)"
         );
     }
 
     #[test]
-    fn poll_unloaded_conversation_ids_excludes_currently_focused_session() {
+    fn poll_conversation_ids_excludes_completed_session_even_when_focused() {
         let mut app = test_app();
         let story_id = Uuid::new_v4();
         app.sessions.insert(
@@ -2918,22 +2816,14 @@ mod conversation_poll_filter_tests {
             SessionState::new(mk_session(
                 story_id,
                 SessionKind::Story,
-                SessionStatus::Running,
+                SessionStatus::Completed,
             )),
         );
-        app.filtered_session_order.push(story_id);
-
-        // Set the session as focused in detail view
         if let Some(pane) = app.focused_pane_mut() {
             *pane = crate::types::Pane::SessionDetail {
                 session_id: story_id,
             };
         }
-
-        let ids = app.poll_unloaded_conversation_ids();
-        assert!(
-            !ids.contains(&story_id),
-            "Currently focused session must be excluded from push-mode polling as navigation effects handle all updates"
-        );
+        assert!(app.active_running_session_ids().is_empty());
     }
 }

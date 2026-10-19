@@ -34,6 +34,7 @@ fn settlement_app(mode: &str) -> App {
     let mut app = app_with(mode);
     app.overlay = OverlayState::SourceWorktreeSettlement(
         crate::types::SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -93,6 +94,7 @@ fn satellite_app(mode: &str, form: SatelliteRegistryForm) -> App {
             sessions: None,
             form: Some(form),
             last_probe: None,
+            scope_status: None,
             last_error: None,
         }));
     app

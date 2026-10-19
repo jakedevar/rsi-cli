@@ -1,17 +1,20 @@
 import os
 import shutil
 import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "rsi-stash"
 
 
 class RsiStashTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-stash-test-")
+        self.temp = scratch_tempdir("rsi-stash-test-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repository = self.root / "repository"
@@ -23,10 +26,7 @@ class RsiStashTest(unittest.TestCase):
         self.commit("base")
 
     def git(self, *args, worktree=None):
-        return subprocess.check_output(
-            ["git", "-C", str(worktree or self.repository), *args],
-            text=True,
-        ).strip()
+        return scratch_git(worktree or self.repository, *args).stdout.strip()
 
     def commit(self, message):
         self.git("add", ".")
@@ -63,6 +63,22 @@ class RsiStashTest(unittest.TestCase):
             self.git("ls-files", "-s", worktree=worktree),
             (worktree / "shared.txt").read_text(),
         )
+
+    def logical_index(self, worktree):
+        # Raw .git/index bytes also carry stat-cache and racy-git timestamps that git
+        # may refresh at any time; the staged entries and their diff are the contract.
+        return (
+            self.git("ls-files", "-s", worktree=worktree),
+            self.git("diff", "--cached", "--name-status", worktree=worktree),
+        )
+
+    def stage_file(self, worktree, filename, contents):
+        (worktree / filename).write_text(contents)
+        self.git("add", filename, worktree=worktree)
+        baseline = self.logical_index(worktree)
+        self.assertIn(filename, baseline[0])
+        self.assertIn(f"A\t{filename}", baseline[1])
+        return baseline
 
     def git_wrapper(self, body):
         wrapper_dir = self.root / "bin"
@@ -129,7 +145,7 @@ class RsiStashTest(unittest.TestCase):
     def test_save_captures_tracked_and_untracked_changes(self):
         worktree = self.linked_worktree("capture")
         (worktree / "shared.txt").write_text("modified\n")
-        subprocess.check_call(["git", "add", "shared.txt"], cwd=worktree)
+        self.git("add", "shared.txt", worktree=worktree)
         sha = self.stash(worktree, "untracked.txt", "new work\n")
 
         self.assert_worktree_contents(worktree, "base\n")
@@ -284,9 +300,8 @@ class RsiStashTest(unittest.TestCase):
         worktree = self.linked_worktree("ignored-save")
         target = self.ignored_build_tree(worktree)
         (worktree / "shared.txt").write_text("changed\n")
+        index_before = self.stage_file(worktree, "staged.txt", "staged\n")
         before = self.state(worktree)
-        index = Path(self.git("rev-parse", "--git-path", "index", worktree=worktree))
-        index_before = index.read_bytes()
         real_git = subprocess.check_output(["which", "git"], text=True).strip()
         env = self.git_wrapper(
             f'if [[ "$1" == restore ]]; then "{real_git}" "$@"; exit 72; fi\n'
@@ -297,7 +312,7 @@ class RsiStashTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("working tree and index restored", result.stderr)
         self.assertEqual(self.state(worktree), before)
-        self.assertEqual(index.read_bytes(), index_before)
+        self.assertEqual(self.logical_index(worktree), index_before)
         self.assertEqual((target / "large.bin").stat().st_size, 4 * 1024 * 1024)
         recovery_path = Path(result.stderr.split("recovery snapshot: ")[-1].splitlines()[0])
         self.assertEqual(list(recovery_path.rglob("large.bin")), [])
@@ -308,15 +323,14 @@ class RsiStashTest(unittest.TestCase):
         (worktree / "shared.txt").write_text("saved\n")
         sha = self.run_stash(worktree, "save", "ignored restore").stdout.strip()
         target = self.ignored_build_tree(worktree)
+        index_before = self.stage_file(worktree, "staged.txt", "staged\n")
         before = self.state(worktree)
-        index = Path(self.git("rev-parse", "--git-path", "index", worktree=worktree))
-        index_before = index.read_bytes()
         real_git = subprocess.check_output(["which", "git"], text=True).strip()
         probe = self.root / "preflight-probe"
         env = self.git_wrapper(
             'if [[ "$1" == -C && "$3" == stash && "$4" == apply ]]; then '
             '[[ ! -e "$2/target" ]] || exit 91; '
-            '[[ "$(stat -c %d "$2")" == "$EXPECTED_DEVICE" ]] || exit 92; '
+            '[[ "$(stat -c %d "$2" 2>/dev/null || stat -f %d "$2")" == "$EXPECTED_DEVICE" ]] || exit 92; '
             'printf checked > "$PROBE_FILE"; fi\n'
             f'if [[ "$1" == stash && "$2" == apply ]]; then "{real_git}" "$@" || exit $?; '
             'exit 73; fi\n'
@@ -329,7 +343,7 @@ class RsiStashTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(probe.read_text(), "checked")
         self.assertEqual(self.state(worktree), before)
-        self.assertEqual(index.read_bytes(), index_before)
+        self.assertEqual(self.logical_index(worktree), index_before)
         self.assertEqual((target / "large.bin").stat().st_size, 4 * 1024 * 1024)
         recovery_path = Path(result.stderr.split("recovery snapshot: ")[-1].splitlines()[0])
         self.assertEqual(list(recovery_path.rglob("large.bin")), [])
@@ -342,7 +356,8 @@ class RsiStashTest(unittest.TestCase):
         (original / "shared.txt").write_text("unstaged\n")
         (original / "new.txt").write_text("untracked\n")
         original_index = Path(self.git("rev-parse", "--git-path", "index", worktree=original))
-        index_before = original_index.read_bytes()
+        index_before = self.logical_index(original)
+        self.assertIn("M\tshared.txt", index_before[1])
         status_before = self.state(original)
         list_before = self.run_stash(original, "list").stdout
 
@@ -357,8 +372,8 @@ class RsiStashTest(unittest.TestCase):
         ]
         paths = set()
         for args in path_lists:
-            output = subprocess.check_output(["git", "-C", str(original), *args])
-            paths.update(os.fsdecode(path) for path in output.split(b"\0") if path)
+            output = scratch_git(original, *args).stdout
+            paths.update(path for path in output.split("\0") if path)
         for path in sorted(paths):
             source = original / path
             destination = detached / path
@@ -373,7 +388,7 @@ class RsiStashTest(unittest.TestCase):
         result = self.run_stash(detached, "save", "recovery copy")
         self.assertEqual(result.returncode, 0, result.stderr)
         detached_sha = result.stdout.strip()
-        self.assertEqual(original_index.read_bytes(), index_before)
+        self.assertEqual(self.logical_index(original), index_before)
         self.assertEqual(self.state(original), status_before)
         self.assertEqual(self.run_stash(original, "list").stdout, list_before)
         self.assertIn(existing_sha, list_before)

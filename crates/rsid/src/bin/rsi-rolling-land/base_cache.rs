@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,10 @@ pub(super) struct BaseShardEntry {
     pub fingerprint: String,
     pub failures: BTreeSet<String>,
     pub provenance: String,
+    /// `<package>:<target>` the base run proved absent, which is why an empty
+    /// `failures` is empty (#1812). Entries written before it carry none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub absent_targets: BTreeSet<String>,
 }
 
 impl BaseShardEntry {
@@ -37,7 +41,13 @@ impl BaseShardEntry {
             fingerprint: fingerprint.into(),
             failures,
             provenance: provenance.into(),
+            absent_targets: BTreeSet::new(),
         }
+    }
+
+    pub(super) fn with_absent_targets(mut self, absent_targets: BTreeSet<String>) -> Self {
+        self.absent_targets = absent_targets;
+        self
     }
 
     fn matches(&self, rolling_sha: &str, shard: &str, fingerprint: &str) -> bool {
@@ -52,7 +62,165 @@ impl BaseShardEntry {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
             })
+            && self.absent_targets.iter().all(|target| {
+                !target.is_empty()
+                    && target
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+            })
     }
+}
+
+/// Most test names one per-test outcome file holds (#2059). A gate that would
+/// grow it past the bound records nothing more; the file lives in the base
+/// SHA's directory, so a tip change starts a fresh, empty file.
+const TEST_OUTCOME_LIMIT: usize = 4096;
+
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+}
+
+/// What the base (the rolling tip) did to individual tests under one command
+/// class and environment class (#2059): the narrowed base run of a red
+/// candidate answers per test name, so a later gate on the same tip reads the
+/// answer instead of running the base again.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+struct BaseTestOutcomes {
+    schema_version: u8,
+    rolling_sha: String,
+    class: String,
+    red: BTreeSet<String>,
+    green: BTreeSet<String>,
+}
+
+impl BaseTestOutcomes {
+    fn valid(&self, rolling_sha: &str, class: &str) -> bool {
+        self.schema_version == SCHEMA_VERSION
+            && self.rolling_sha == rolling_sha
+            && self.class == class
+            && self
+                .red
+                .iter()
+                .chain(&self.green)
+                .all(|name| plain_name(name))
+            && self.red.is_disjoint(&self.green)
+    }
+}
+
+fn test_outcome_paths(
+    root: &Path,
+    rolling_sha: &str,
+    class: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let digest = class
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("invalid base test outcome class")?;
+    if rolling_sha.len() != 40 || !rolling_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid base test outcome key".into());
+    }
+    let directory = root.join(rolling_sha);
+    Ok((
+        directory.join(format!("tests-{digest}.json")),
+        directory.join(format!("tests-{digest}.lock")),
+    ))
+}
+
+/// The recorded outcome of each test name on `rolling_sha`: `true` is red on the
+/// base, `false` is green. An unreadable, mismatched or self-contradicting
+/// file answers nothing, so every test is run.
+pub(super) fn load_test_outcomes(
+    root: &Path,
+    rolling_sha: &str,
+    class: &str,
+) -> BTreeMap<String, bool> {
+    let Ok((path, _)) = test_outcome_paths(root, rolling_sha, class) else {
+        return BTreeMap::new();
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(file) = serde_json::from_slice::<BaseTestOutcomes>(&bytes) else {
+        return BTreeMap::new();
+    };
+    if !file.valid(rolling_sha, class) {
+        return BTreeMap::new();
+    }
+    file.red
+        .into_iter()
+        .map(|name| (name, true))
+        .chain(file.green.into_iter().map(|name| (name, false)))
+        .collect()
+}
+
+/// Merge one base run's per-test outcomes into the file for `rolling_sha`. A
+/// name the file already holds with the opposite outcome is flaky evidence: it
+/// is dropped from both sides, so the next gate measures it again.
+pub(super) fn record_test_outcomes(
+    root: &Path,
+    rolling_sha: &str,
+    class: &str,
+    red: &BTreeSet<String>,
+    green: &BTreeSet<String>,
+) -> Result<(), String> {
+    let (path, lock_path) = test_outcome_paths(root, rolling_sha, class)?;
+    let parent = path.parent().ok_or("outcome file has no parent")?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|error| format!("cannot create base test outcome cache: {error}"))?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open base test outcome lock: {error}"))?;
+    // Held for one read-merge-write of a small file.
+    lock.lock()
+        .map_err(|error| format!("cannot lock base test outcomes: {error}"))?;
+    let mut file = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BaseTestOutcomes>(&bytes).ok())
+        .filter(|file| file.valid(rolling_sha, class))
+        .unwrap_or_else(|| BaseTestOutcomes {
+            schema_version: SCHEMA_VERSION,
+            rolling_sha: rolling_sha.into(),
+            class: class.into(),
+            ..BaseTestOutcomes::default()
+        });
+    for name in red.iter().filter(|name| plain_name(name)) {
+        if file.green.remove(name) {
+            continue;
+        }
+        if file.red.len() + file.green.len() < TEST_OUTCOME_LIMIT {
+            file.red.insert(name.clone());
+        }
+    }
+    for name in green.iter().filter(|name| plain_name(name)) {
+        if file.red.remove(name) {
+            continue;
+        }
+        if file.red.len() + file.green.len() < TEST_OUTCOME_LIMIT {
+            file.green.insert(name.clone());
+        }
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("cannot create base test outcome temp: {error}"))?;
+    serde_json::to_writer(&mut temporary, &file)
+        .map_err(|error| format!("cannot serialize base test outcomes: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("cannot sync base test outcome temp: {error}"))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("cannot publish base test outcomes: {}", error.error))?;
+    Ok(())
 }
 
 pub(super) fn default_root() -> Result<PathBuf, String> {

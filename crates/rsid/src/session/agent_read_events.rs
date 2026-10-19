@@ -3,20 +3,31 @@
 //!
 //! Scope is exactly `AgentGetStatus`' (`authorize_agent_target`): the caller's
 //! own session, a direct child, a child of an Epic it leads, or a session in
-//! the current manager's live scope. An unknown target and an out-of-scope
+//! the current manager's live scope, or (#2531) an earlier seat of the
+//! caller's own project manager slot (its own succession lineage, or #118 a
+//! displaced earlier appointment's). An unknown target and an out-of-scope
 //! target produce the identical refusal, so a refusal never reveals whether a
 //! session exists. Read-only: no writes, no journal rows.
 
 use super::agent_verbs::AgentControlHandle;
 use crate::error::{DaemonError, Result};
 use rsi_common::agent_session_events::{
-    AGENT_READ_EVENT_FIELD_MAX_CHARS, AGENT_READ_EVENTS_SCOPE_DENIED, AgentFinalMessageV1,
-    AgentReadSessionEventsRequestV1, AgentReadSessionEventsResultV1, AgentSessionEventV1,
-    FINAL_MESSAGE_FULL_MAX_CHARS, FINAL_MESSAGE_MAX_CHARS, clip_chars,
+    AGENT_READ_EVENT_FIELD_MAX_CHARS, AGENT_READ_EVENTS_SCOPE_DENIED, AgentEventsStorageV1,
+    AgentFinalMessageV1, AgentReadSessionEventsRequestV1, AgentReadSessionEventsResultV1,
+    AgentSessionEventV1, FINAL_MESSAGE_FULL_MAX_CHARS, FINAL_MESSAGE_MAX_CHARS, clip_chars,
     is_provider_diagnostic_metadata,
 };
 use rsi_common::types::{ConversationEvent, SessionStatus};
 use uuid::Uuid;
+
+/// An unknown or out-of-scope target, as `authorize_agent_target` reports it.
+fn is_scope_denial(error: &DaemonError) -> bool {
+    match error {
+        DaemonError::SessionNotFound(_) => true,
+        DaemonError::InvalidParam(message) => message.starts_with(AGENT_READ_EVENTS_SCOPE_DENIED),
+        _ => false,
+    }
+}
 
 fn scope_denied(caller: Uuid, target: Uuid) -> DaemonError {
     DaemonError::InvalidParam(format!(
@@ -85,13 +96,21 @@ impl AgentControlHandle {
         let target = request.session_id;
         match self.authorize_agent_target(caller_session_id, target).await {
             Ok(_) => {}
-            Err(DaemonError::SessionNotFound(_)) => {
-                return Err(scope_denied(caller_session_id, target));
-            }
-            Err(DaemonError::InvalidParam(message))
-                if message.starts_with(AGENT_READ_EVENTS_SCOPE_DENIED) =>
-            {
-                return Err(scope_denied(caller_session_id, target));
+            Err(error) if is_scope_denial(&error) => {
+                // #2531: the live holder of a project manager slot reads the
+                // tail of the earlier seats of the same slot (read-only), so a
+                // context-cap successor can see what its predecessor said and
+                // reported last; #118 extends it to the seats of an earlier
+                // appointment an operator reappointment displaced. Any other
+                // denial stays the one refusal.
+                let predecessor = self
+                    .store
+                    .lock()
+                    .await
+                    .manager_seat_reads_predecessor(caller_session_id, target)?;
+                if !predecessor {
+                    return Err(scope_denied(caller_session_id, target));
+                }
             }
             Err(other) => return Err(other),
         }
@@ -103,6 +122,13 @@ impl AgentControlHandle {
         let tip = store
             .get_session(tip_id)?
             .ok_or_else(|| scope_denied(caller_session_id, target))?;
+        // #2384: a cold session reads through the archive merge; the page is the
+        // one the unmoved transcript gives, and `storage` says where it came from.
+        let storage = if store.cold_ref(&target.to_string())?.is_some() {
+            AgentEventsStorageV1::Cold
+        } else {
+            AgentEventsStorageV1::Live
+        };
         let (events, mut has_more, mut has_earlier) = store.read_session_events_page(
             target,
             request.after_sequence,
@@ -185,6 +211,7 @@ impl AgentControlHandle {
             has_earlier,
             truncated,
             final_message,
+            storage,
         })
     }
 }
@@ -302,6 +329,133 @@ mod tests {
             event(&store, child, seq, kind, role, &format!("event {seq}")).await;
         }
         (control, store, parent, child)
+    }
+
+    /// #2384: a cold session reads exactly like a hot one and says where it came
+    /// from. The rows are archived by the real stage pass and moved by the
+    /// test-only move seam.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn a_cold_session_reads_identically_and_reports_its_storage() {
+        use crate::store::cold_archive::{
+            ColdMode, ColdSettings, DirectStoreAccess, MoveOutcome, PassLimits, PassParams,
+            open_read_connection, run_stage_pass,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("rsi.db");
+        let (control, store) = super::super::agent_verbs::tests::control_handle_for_file_store(
+            Store::open_test_fixture(&database).unwrap(),
+        );
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        insert(&store, parent, SessionKind::Task, None, None).await;
+        insert(&store, child, SessionKind::Task, Some(parent), None).await;
+        let old = (Utc::now() - chrono::Duration::days(61))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        {
+            let guard = store.lock().await;
+            for (sequence, event_type, role) in [
+                (1, "Message", Some("User")),
+                (2, "ToolUse", Some("Assistant")),
+                (3, "ToolResult", None),
+                (4, "ToolUse", Some("Assistant")),
+                (5, "ToolResult", None),
+                (6, "Message", Some("Assistant")),
+            ] {
+                guard
+                    .conn
+                    .execute(
+                        "INSERT INTO conversation_events(session_id, sequence, event_type, role,
+                            content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            child.to_string(),
+                            sequence,
+                            event_type,
+                            role,
+                            format!("{event_type} {sequence}"),
+                            old
+                        ],
+                    )
+                    .unwrap();
+            }
+            guard
+                .update_session_status(child, SessionStatus::Archived)
+                .unwrap();
+        }
+        let pages = |after: Option<i32>, types: Option<Vec<EventType>>| {
+            let control = &control;
+            async move {
+                let mut request = req(child);
+                request.after_sequence = after;
+                request.limit = Some(3);
+                request.event_types = types;
+                control
+                    .agent_read_session_events(parent, request)
+                    .await
+                    .unwrap()
+            }
+        };
+        let mut before = Vec::new();
+        for (after, types) in [
+            (None, None),
+            (Some(1), None),
+            (Some(0), Some(vec![EventType::ToolResult])),
+            (None, Some(vec![EventType::ToolUse])),
+        ] {
+            before.push(pages(after, types).await);
+        }
+        assert!(
+            before
+                .iter()
+                .all(|page| page.storage == AgentEventsStorageV1::Live)
+        );
+
+        {
+            let guard = store.lock().await;
+            let read = open_read_connection(&database).unwrap();
+            let settings = ColdSettings {
+                enabled: true,
+                after_days: 14,
+                dir: directory.path().join("archive"),
+                forbidden_roots: Vec::new(),
+            };
+            let run_id = guard.cold_begin_run("run_now", ColdMode::Stage).unwrap();
+            let params = PassParams {
+                run_id,
+                settings: &settings,
+                limits: PassLimits {
+                    batch_max_sessions: 32,
+                    batch_max_raw_bytes: 64 * 1024 * 1024,
+                    wall_budget: std::time::Duration::from_secs(120),
+                    batch_sleep: std::time::Duration::ZERO,
+                    gate_poll: std::time::Duration::ZERO,
+                },
+                batch_gate: None,
+                cancel: None,
+            };
+            let report = run_stage_pass(&DirectStoreAccess(&guard), &read, &params).unwrap();
+            assert_eq!(report.sessions_staged, 1, "{report:?}");
+            assert!(matches!(
+                guard.cold_move_session_for_test(child).unwrap(),
+                MoveOutcome::Moved(_)
+            ));
+        }
+
+        let mut after = Vec::new();
+        for (after_sequence, types) in [
+            (None, None),
+            (Some(1), None),
+            (Some(0), Some(vec![EventType::ToolResult])),
+            (None, Some(vec![EventType::ToolUse])),
+        ] {
+            after.push(pages(after_sequence, types).await);
+        }
+        for (cold, hot) in after.into_iter().zip(before) {
+            assert_eq!(cold.storage, AgentEventsStorageV1::Cold);
+            let mut cold = cold;
+            cold.storage = AgentEventsStorageV1::Live;
+            assert_eq!(cold, hot, "the cold page equals the pre-move page");
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
@@ -580,5 +734,277 @@ mod tests {
         assert_eq!(page.terminal_reason.as_deref(), Some("provider_error:boom"));
         assert_eq!(page.final_message.unwrap().content, "tip result");
         assert_eq!(page.events.len(), 2, "events come from the named session");
+    }
+
+    /// #2531: a context-cap successor of a project manager reads the tail of
+    /// the seat it replaced (and the one before), while a stranger, a sibling
+    /// project's seat and a later seat stay refused with the one denial.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn a_pm_successor_reads_its_predecessors_tail_and_nobody_elses_2531() {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::types::Project;
+        let (control, store) = control_handle_with_store();
+        let (project, other_project) = (Uuid::new_v4(), Uuid::new_v4());
+        let (first, stranger, foreign) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        {
+            let guard = store.lock().await;
+            for id in [project, other_project] {
+                let now = Utc::now();
+                guard
+                    .insert_project(&Project {
+                        id,
+                        name: format!("P {id}"),
+                        path: None,
+                        description: None,
+                        color: Project::DEFAULT_COLOR.into(),
+                        context_files: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .unwrap();
+            }
+            for (id, project_id) in [
+                (first, project),
+                (stranger, project),
+                (foreign, other_project),
+            ] {
+                let mut row = test_session(id, std::path::PathBuf::from("/tmp"));
+                row.project_id = Some(project_id);
+                row.status = SessionStatus::Running;
+                guard.insert_session(&row).unwrap();
+            }
+            guard
+                .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: first,
+                    epic_ids: None,
+                    group_ids: vec![],
+                    expected_row_version: 0,
+                })
+                .unwrap();
+        }
+        event(
+            &store,
+            first,
+            1,
+            EventType::Message,
+            Some(Role::Assistant),
+            "first seat tail",
+        )
+        .await;
+        let mut previous = first;
+        let mut seats = vec![first];
+        for _ in 0..2 {
+            let next = Uuid::new_v4();
+            {
+                let guard = store.lock().await;
+                let mut row = test_session(next, std::path::PathBuf::from("/tmp"));
+                row.project_id = Some(project);
+                row.continued_from = Some(previous);
+                row.rotation_depth =
+                    guard.get_session(previous).unwrap().unwrap().rotation_depth + 1;
+                row.status = SessionStatus::Running;
+                guard.insert_session(&row).unwrap();
+                guard
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET status='Archived' WHERE id=?1",
+                        [previous.to_string()],
+                    )
+                    .unwrap();
+                assert!(
+                    guard
+                        .record_harness_manager_rotation(previous, next)
+                        .unwrap()
+                );
+            }
+            event(
+                &store,
+                next,
+                1,
+                EventType::Message,
+                Some(Role::Assistant),
+                "later seat tail",
+            )
+            .await;
+            seats.push(next);
+            previous = next;
+        }
+        let (retired_first, retired_second, live) = (seats[0], seats[1], seats[2]);
+
+        for predecessor in [retired_second, retired_first] {
+            let page = control
+                .agent_read_session_events(live, req(predecessor))
+                .await
+                .unwrap();
+            assert_eq!(page.session_id, predecessor);
+            assert!(!page.events.is_empty());
+        }
+        let page = control
+            .agent_read_session_events(live, req(retired_first))
+            .await
+            .unwrap();
+        assert_eq!(page.events[0].content, "first seat tail");
+
+        for (caller, target) in [
+            (retired_first, live),
+            (retired_second, live),
+            (stranger, retired_first),
+            (live, foreign),
+            (live, Uuid::new_v4()),
+        ] {
+            let error = control
+                .agent_read_session_events(caller, req(target))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(AGENT_READ_EVENTS_SCOPE_DENIED),
+                "{caller} -> {target}: {error}"
+            );
+        }
+    }
+
+    /// #118: the operator reappoints a fresh, parentless session to pick up
+    /// from the old manager (no `continued_from`, a new appointment anchor).
+    /// The new seat reads every seat of the displaced appointment's lineage,
+    /// proven by the durable appointment retirement record; a prior seat of
+    /// another project, a non-manager, the new seat's own worker and a
+    /// displaced seat stay refused with the one denial.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn a_reappointed_pm_reads_the_displaced_seats_of_its_own_project_only_118() {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::types::Project;
+        let (control, store) = control_handle_with_store();
+        let (project, other_project) = (Uuid::new_v4(), Uuid::new_v4());
+        let [old, old_next, seat, other_old, other_seat, stranger, worker] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        let appoint = |guard: &crate::store::Store, project_id: Uuid, session_id: Uuid| {
+            let expected_row_version = guard
+                .get_harness_manager(project_id)
+                .unwrap()
+                .map_or(0, |config| config.row_version);
+            guard
+                .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                    project_id,
+                    session_id,
+                    epic_ids: None,
+                    group_ids: vec![],
+                    expected_row_version,
+                })
+                .unwrap();
+        };
+        {
+            let guard = store.lock().await;
+            for id in [project, other_project] {
+                let now = Utc::now();
+                guard
+                    .insert_project(&Project {
+                        id,
+                        name: format!("P {id}"),
+                        path: None,
+                        description: None,
+                        color: Project::DEFAULT_COLOR.into(),
+                        context_files: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .unwrap();
+            }
+            for (id, project_id) in [
+                (old, project),
+                (other_old, other_project),
+                (stranger, project),
+            ] {
+                let mut row = test_session(id, std::path::PathBuf::from("/tmp"));
+                row.project_id = Some(project_id);
+                row.status = SessionStatus::Running;
+                guard.insert_session(&row).unwrap();
+            }
+            appoint(&guard, project, old);
+            appoint(&guard, other_project, other_old);
+            // The old appointment rotated once on its own (context cap).
+            let mut row = test_session(old_next, std::path::PathBuf::from("/tmp"));
+            row.project_id = Some(project);
+            row.continued_from = Some(old);
+            row.rotation_depth = 1;
+            row.status = SessionStatus::Running;
+            guard.insert_session(&row).unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE sessions SET status='Archived' WHERE id=?1",
+                    [old.to_string()],
+                )
+                .unwrap();
+            assert!(
+                guard
+                    .record_harness_manager_rotation(old, old_next)
+                    .unwrap()
+            );
+            // The operator seats fresh, parentless sessions in both projects.
+            for (id, project_id) in [(seat, project), (other_seat, other_project)] {
+                let mut row = test_session(id, std::path::PathBuf::from("/tmp"));
+                row.project_id = Some(project_id);
+                row.status = SessionStatus::Running;
+                guard.insert_session(&row).unwrap();
+                appoint(&guard, project_id, id);
+            }
+            let mut row = test_session(worker, std::path::PathBuf::from("/tmp"));
+            row.project_id = Some(project);
+            row.parent_id = Some(seat);
+            row.status = SessionStatus::Running;
+            guard.insert_session(&row).unwrap();
+        }
+        for (id, text) in [
+            (old, "old anchor tail"),
+            (old_next, "old seat tail"),
+            (other_old, "other project tail"),
+        ] {
+            event(
+                &store,
+                id,
+                1,
+                EventType::Message,
+                Some(Role::Assistant),
+                text,
+            )
+            .await;
+        }
+
+        for (predecessor, text) in [(old_next, "old seat tail"), (old, "old anchor tail")] {
+            let page = control
+                .agent_read_session_events(seat, req(predecessor))
+                .await
+                .unwrap();
+            assert_eq!(page.session_id, predecessor);
+            assert_eq!(page.events[0].content, text);
+        }
+        let page = control
+            .agent_read_session_events(other_seat, req(other_old))
+            .await
+            .unwrap();
+        assert_eq!(page.events[0].content, "other project tail");
+
+        for (caller, target) in [
+            (seat, other_old),
+            (other_seat, old_next),
+            (stranger, old_next),
+            (worker, old_next),
+            (worker, old),
+            (old_next, seat),
+        ] {
+            let error = control
+                .agent_read_session_events(caller, req(target))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(AGENT_READ_EVENTS_SCOPE_DENIED),
+                "{caller} -> {target}: {error}"
+            );
+        }
     }
 }

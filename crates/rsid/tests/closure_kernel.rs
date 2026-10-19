@@ -2,7 +2,7 @@ use std::path::Path;
 
 #[test]
 fn closure_review_command_contract_routes_through_executable_sealer_and_preserves_v1_lane() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = Path::new(rsi_common::manifest_dir!())
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");

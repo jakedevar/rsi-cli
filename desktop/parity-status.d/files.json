@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>e": {
+      "status": "done",
+      "location": "src/actions/files.ts, src/files.ts",
+      "note": "toggles the file explorer drawer over the detail pane, opened on the viewer's file (also View > File explorer, the palette)"
+    },
+    "key:<Space><Space>": {
+      "status": "done",
+      "location": "src/actions/files.ts, src/files.ts",
+      "note": "fuzzy file picker over rsid's ListProjectFiles feed (also View > Find file…, the palette)"
+    },
+    "overlay:file-explorer-overlay-space-e": {
+      "status": "done",
+      "location": "src/files.ts, src/files-ops.ts, src/files-ops-model.ts, src/files-model.ts, src-tauri/src/files.rs",
+      "note": "tree over rsid's ListProjectDirectory: lazy folder loads, dirs first, dotfiles hidden until . / H, git-ignored entries dimmed, the viewer's file highlighted; j/k, g/G, Ctrl-d/u, PageUp/Down, Enter/o, l/h, Tab, P, z, R, /, yy/yn/yr, i, </>/=/Ctrl-0 (width remembered), Ctrl-L, ?, Esc/q/Space, click and wheel; file operations (#113): a new file (a; a trailing / makes a folder), A new folder, r rename (caret before the extension), m move, c copy (an existing folder as the destination receives the entry), d delete to rsid's trash after a yes/no (Enter/y/Y/d confirm, Esc/n/N/q cancel), u undo; each is one rsid call (CreateProjectEntry, MoveProjectEntry, CopyProjectEntry, TrashProjectEntry, UndoProjectFileOperation), never overwrites, and a refusal shows in the TUI's words (\"<name> already exists\", \"Path must stay inside <root>\", \"Nothing to undo\", \"Undo failed: …\") or as the calm text for project_file_conflict / project_file_outside_root while the prompt stays open to correct; Tab completes the typed path from the tree or rsid, Ctrl-A/E/B/F/H/U/W edit it; unsaved-draft dots mark files with unsaved buffers; open viewers and drafts follow a rename or move; mouse and menu entry points: a toolbar under the drawer title, a right-click menu on a row, View menu and palette actions"
+    },
+    "overlay:telescope-file-picker-space-space": {
+      "status": "done",
+      "location": "src/files.ts, src/files-model.ts, src-tauri/src/files.rs",
+      "note": "fzy-style subsequence scorer (smart case, best 100, ties in feed order; ordering pinned in tests/files.test.mjs) over git ls-files (tracked plus untracked, not ignored); typing (j and k too), Backspace, Ctrl-u, Down/Up, Ctrl-j/k/n/p, Enter opens in the viewer, Esc closes"
+    },
+    "overlay:file-viewer-opened-from-file-explorer": {
+      "status": "done",
+      "location": "src/files.ts, src/files-edit-model.ts, src/files-editor-model.ts, src/files-model.ts, src/viewer-model.ts, src-tauri/src/files.rs",
+      "note": "Editor: the desktop editor edits and saves through rsid (#113, #134): i a A I o O and the vim editor keys, Ctrl-S, :w (also on an unedited file, which rewrites it as the TUI does), :wq, :x, :w! force-save, :e! reload, :q refused while unsaved and :q! discarding, the TUI's changed-on-disk refusal \"Save refused — file changed on disk: <path> (use :w! to overwrite or :e! to reload)\" with a re-read that reports \"Already up to date\" when the buffer equals the disk and re-creates a deleted file, drafts kept per file with a dot in the tree, a Save button, a beforeunload guard; while editing the viewer's own lines are drawn from the buffer, so syntax colours (re-lexed as you type), the automatic bracket-match highlight, the git-gutter signs (carried over unsaved edits and refreshed after a save), the line numbers, search (/ ? with every hit lit incrementally, n N * #, in normal mode) and folds (za zo zc zM zR, regions re-derived from the buffer, the caret opens a fold it types in and steps over a closed one) all work; bracket auto-pairing as the TUI does it (brackets { ( [ only: an opener types the pair, a closer types over its closer, Backspace between an empty pair removes both; :set autopair / :set noautopair, on by default); Ctrl-V pastes the system clipboard at the caret from any mode, which is what the TUI's Ctrl-V does (its viewer has no visual-block mode, so there is none to add; Cmd-V pastes natively); a file with mixed line endings or a lone CR is edited (each unchanged line keeps its own break, a new line takes the break of the line above it) and CRLF files keep CRLF. Not here: a mouse drag does not select text (a click puts the caret; v / V select), and IME composition text shows once it is committed. Read-mode viewer: source navigation with a character cursor: h/l, w/b/e, W/B/E, 0/^/$, {/}, % and counts; j/k, gg/G/NG, Ctrl-d/u/f/b/e/y, PageUp/Down; search / and ? (incremental, every hit highlighted, Enter keeps it, Esc clears), n/N, * and # (viewer-model.ts findMatches/matchFrom, as file_viewer.rs); folds za/zo/zc/zM/zR with the ▸/▾ gutter, a '··· N lines' summary, cursor moves skip closed folds and a search hit or :N opens the fold hiding it (regions: multi-line bracket pairs and block comments outside strings, indentation for Python/YAML, fences and heading sections for Markdown, in place of tree-sitter nodes); syntax highlighting for the TUI's tree-sitter languages (Rust, Python, JS, TS/TSX, shell, JSON, TOML, YAML, Go, C, C++, Markdown) with its role colours; automatic bracket-match highlight; Space m renders .md through the sanitizing Markdown backend with j/k/Ctrl-d/u/f/b/gg/G scrolling and / ? n N marking hits in the rendered text; line numbers, git gutter, binary and truncated states; q / Space q / :q, Space e, Space Space, Backspace, :N, :e!. yy/yn/yr in the explorer copy a path"
+    },
+    "overlay-ref:file-explorer": {
+      "status": "done",
+      "location": "src/files.ts, src/files-ops.ts, src/files-ops-model.ts, src/files-model.ts, src-tauri/src/files.rs",
+      "note": "every key of the table: the navigation keys over rsid's read methods and the file operations (#113): a new file (a; a trailing / makes a folder), A new folder, r rename (caret before the extension), m move, c copy (an existing folder as the destination receives the entry), d delete to rsid's trash after a yes/no (Enter/y/Y/d confirm, Esc/n/N/q cancel), u undo; each is one rsid call (CreateProjectEntry, MoveProjectEntry, CopyProjectEntry, TrashProjectEntry, UndoProjectFileOperation), never overwrites, and a refusal shows in the TUI's words (\"<name> already exists\", \"Path must stay inside <root>\", \"Nothing to undo\", \"Undo failed: …\") or as the calm text for project_file_conflict / project_file_outside_root while the prompt stays open to correct; Tab completes the typed path from the tree or rsid, Ctrl-A/E/B/F/H/U/W edit it; unsaved-draft dots mark files with unsaved buffers; open viewers and drafts follow a rename or move; mouse and menu entry points: a toolbar under the drawer title, a right-click menu on a row, View menu and palette actions"
+    },
+    "overlay-ref:file-explorer-finder": {
+      "status": "substitute",
+      "location": "src/files.ts, src/files-model.ts",
+      "note": "/ in the tree opens the picker popup instead of an inline finder: same keys (Ctrl-u, Ctrl-w, Down/Up, Ctrl-j/k), Enter opens the file and reveals it in the tree, Esc returns to the tree and a second Esc closes it"
+    },
+    "overlay-ref:file-explorer-viewer-focus": {
+      "status": "done",
+      "location": "src/files.ts, src/files-model.ts",
+      "note": "Ctrl-H focuses the tree, other keys go to the viewer, Space e closes the explorer; clicking a panel focuses it"
+    },
+    "overlay-ref:file-viewer": {
+      "status": "done",
+      "location": "src/files.ts, src/files-edit-model.ts, src/files-editor-model.ts, src/files-model.ts, src/viewer-model.ts",
+      "note": "Editor: the desktop editor edits and saves through rsid (#113, #134): i a A I o O and the vim editor keys, Ctrl-S, :w (also on an unedited file, which rewrites it as the TUI does), :wq, :x, :w! force-save, :e! reload, :q refused while unsaved and :q! discarding, the TUI's changed-on-disk refusal \"Save refused — file changed on disk: <path> (use :w! to overwrite or :e! to reload)\" with a re-read that reports \"Already up to date\" when the buffer equals the disk and re-creates a deleted file, drafts kept per file with a dot in the tree, a Save button, a beforeunload guard; while editing the viewer's own lines are drawn from the buffer, so syntax colours (re-lexed as you type), the automatic bracket-match highlight, the git-gutter signs (carried over unsaved edits and refreshed after a save), the line numbers, search (/ ? with every hit lit incrementally, n N * #, in normal mode) and folds (za zo zc zM zR, regions re-derived from the buffer, the caret opens a fold it types in and steps over a closed one) all work; bracket auto-pairing as the TUI does it (brackets { ( [ only: an opener types the pair, a closer types over its closer, Backspace between an empty pair removes both; :set autopair / :set noautopair, on by default); Ctrl-V pastes the system clipboard at the caret from any mode, which is what the TUI's Ctrl-V does (its viewer has no visual-block mode, so there is none to add; Cmd-V pastes natively); a file with mixed line endings or a lone CR is edited (each unchanged line keeps its own break, a new line takes the break of the line above it) and CRLF files keep CRLF. Not here: a mouse drag does not select text (a click puts the caret; v / V select), and IME composition text shows once it is committed. Read-mode viewer: every navigation key of the table: q / Space q, Space m, Space Space, Space e, :, / ?, n N, * #, za zo zc, zM zR, PageDown/Up, Backspace, h j k l w b. yy/yn/yr in the explorer copy a path"
+    },
+    "overlay-ref:telescope": {
+      "status": "done",
+      "location": "src/files.ts, src/files-model.ts, src/overlay-keys.ts",
+      "note": "typing, Backspace, Ctrl-U, Down/Up, Ctrl-J/K, Enter, Esc; Space N and Space ; while the query is empty (a leading space filters nothing)"
+    },
+    "module:ui/overlay/file_explorer.rs": {
+      "status": "done",
+      "location": "src/files.ts, src/files-ops.ts, src/files-ops-model.ts, src-tauri/src/files.rs",
+      "note": "the drawer and its prompt row: the tree, the add / mkdir / rename / move / copy / delete confirmation prompts with the TUI's labels, and undo, over rsid (#113); a trash older than 7 days is not pruned (rsid keeps the trash; pruning is a product choice)"
+    },
+    "module:ui/overlay/telescope.rs": {
+      "status": "done",
+      "location": "src/files.ts, src/files-model.ts, src-tauri/src/files.rs",
+      "note": "centered picker popup with matched characters highlighted"
+    },
+    "module:ui/file_renderer.rs": {
+      "status": "done",
+      "location": "src/files.ts, src/files-model.ts, src/viewer-model.ts",
+      "note": "virtualized lines with git, fold and number gutters, syntax colours, search and current-hit marks, the cursor cell, the matching bracket, fold summaries and the Markdown preview"
+    },
+    "module:ui/treesitter.rs": {
+      "status": "substitute",
+      "location": "src/viewer-model.ts",
+      "note": "tree-sitter is a native parser; the desktop lexes the same languages (the ui/treesitter.rs extension registry) with a small line lexer that carries block-comment, multi-line-string and fence state between lines, and derives fold regions from bracket pairs, block comments, indentation and Markdown sections in place of its foldable nodes (no new dependency)"
+    },
+    "module:ui/highlight.rs": {
+      "status": "substitute",
+      "location": "src/codeblocks.ts, src/viewer-model.ts, src/markdown.ts",
+      "note": "syntect colours fenced code blocks in the TUI transcript; the desktop colours ```lang blocks in rendered Markdown (transcript bodies and the viewer preview) with the viewer highlighter, writing text nodes only into the sanitized HTML"
+    }
+  }
+}

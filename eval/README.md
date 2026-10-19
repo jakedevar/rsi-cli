@@ -116,3 +116,5 @@ corpus during manual verification.
   - `impl-003-tui-keybinding` (Feature)
   - `impl-004-migration` (Feature)
   - `impl-005-ambiguous-spec` (Standard, expected_partial=true)
+
+Pinned external benchmarks (Terminal-Bench 2.0) live in `eval/bench/`; see `eval/bench/README.md`.

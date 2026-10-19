@@ -4,12 +4,18 @@
 //! part of a tool schema or caller-provided request payload.
 
 use crate::identity;
-use crate::rpc::{RpcRequest, RpcResponse};
+#[cfg(unix)]
+use crate::rpc::RpcRequest;
+use crate::rpc::RpcResponse;
 use serde_json::Value;
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 pub fn resolve_socket_path() -> PathBuf {
     std::env::var("RSI_DAEMON_SOCKET_PATH")
@@ -24,13 +30,108 @@ pub fn dispatch_from_env(method: &str, params: Value) -> std::io::Result<RpcResp
 }
 
 pub fn dispatch(socket: &Path, method: &str, params: Value) -> std::io::Result<RpcResponse> {
-    dispatch_with_timeout(socket, method, params, Duration::from_secs(30))
+    dispatch_with_timeout(socket, method, params, default_timeout(method))
+}
+
+// Settlement may prove and remove hundreds of roots. The daemon owns the run
+// through disconnects; this budget lets synchronous clients receive its receipt.
+// A landing enqueue with `derive_filters` runs the touched-shard derivation and
+// the source probe synchronously (a large diff took longer than 30 s, #2357),
+// so it gets a budget that covers them rather than a false transport failure.
+fn default_timeout(method: &str) -> Duration {
+    Duration::from_secs(match method {
+        "AgentApplySourceWorktreeCohort" => 1800,
+        "AgentEnqueueLandingSource" | "EnqueueRollingQueueSource" => 300,
+        _ => 30,
+    })
+}
+
+/// The request was fully written, but no complete response arrived within the
+/// timeout (#2357). Unlike a connect or write timeout, the daemon may already
+/// have processed the call, so the caller must replay it under the same
+/// `idempotency_key` rather than treat it as not-done or retry under a new key.
+/// Carried inside the returned [`std::io::Error`] (kind `TimedOut`); recover it
+/// with [`response_timeout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcResponseTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl RpcResponseTimeout {
+    /// Stable machine-readable code for the typed error.
+    pub const CODE: &'static str = "rpc_response_timeout";
+}
+
+/// An advertised read: an `Agent` Get/List/Audit/Query/Read verb whose schema
+/// has no `idempotency_key` (#2622). It changes nothing, so a response timeout
+/// is answered by asking again, not by replaying a key it does not have.
+fn is_keyless_agent_read(method: &str) -> bool {
+    const READ_PREFIXES: [&str; 5] = [
+        "AgentGet",
+        "AgentList",
+        "AgentAudit",
+        "AgentQuery",
+        "AgentRead",
+    ];
+    READ_PREFIXES
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+        && crate::agent_control_schema::agent_control_catalog_v1()
+            .iter()
+            .find(|descriptor| descriptor.method == method)
+            .is_some_and(|descriptor| !descriptor.parameters_json().contains("\"idempotency_key\""))
+}
+
+impl std::fmt::Display for RpcResponseTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if is_keyless_agent_read(&self.method) {
+            return write!(
+                f,
+                "{}: {} was sent but no response arrived within {}s. It is a read-only call \
+                 with no idempotency_key and changed nothing; ask again. A daemon that is \
+                 busy answers with a typed busy refusal rather than silence",
+                Self::CODE,
+                self.method,
+                self.timeout.as_secs()
+            );
+        }
+        write!(
+            f,
+            "{}: {} was sent but no response arrived within {}s; the call may have \
+             completed. Replay it with the same idempotency_key and identical params \
+             (an exact replay returns the original receipt), or read the state, before \
+             issuing a new decision",
+            Self::CODE,
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RpcResponseTimeout {}
+
+/// The typed response timeout inside a transport error, if that is what it is.
+pub fn response_timeout(error: &std::io::Error) -> Option<&RpcResponseTimeout> {
+    error.get_ref()?.downcast_ref::<RpcResponseTimeout>()
+}
+
+#[cfg(unix)]
+fn response_timeout_error(method: &str, timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        RpcResponseTimeout {
+            method: method.to_string(),
+            timeout,
+        },
+    )
 }
 
 /// Like [`dispatch`], with one timeout budget for connect, write and read
 /// (#1049: the tool-boundary hook must never wait long on the daemon).
 /// Missing/refused sockets are retried during a deploy gap. Once connected,
 /// requests are never replayed: a write/read failure may follow a committed RPC.
+/// Platforms without Unix sockets return [`std::io::ErrorKind::Unsupported`].
 pub fn dispatch_with_timeout(
     socket: &Path,
     method: &str,
@@ -43,6 +144,27 @@ pub fn dispatch_with_timeout(
             "daemon RPC timeout must be nonzero",
         ));
     }
+    #[cfg(unix)]
+    {
+        dispatch_unix(socket, method, params, timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, method, params);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "daemon RPC transport requires Unix sockets on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_unix(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> std::io::Result<RpcResponse> {
     let started = Instant::now();
     let mut stream = connect_with_retry(socket, started, timeout)?;
     let request = RpcRequest {
@@ -52,7 +174,8 @@ pub fn dispatch_with_timeout(
         params,
         session_token: std::env::var(identity::ENV_SESSION_TOKEN)
             .ok()
-            .filter(|value| !value.is_empty()),
+            .filter(|value| !value.is_empty())
+            .map(Into::into),
     };
     let mut request_json = serde_json::to_vec(&request)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -70,10 +193,22 @@ pub fn dispatch_with_timeout(
     let mut response = Vec::new();
     let mut buf = [0; 4096];
     loop {
-        stream.set_read_timeout(Some(remaining(started, timeout)?))?;
+        let left =
+            remaining(started, timeout).map_err(|_| response_timeout_error(method, timeout))?;
+        stream.set_read_timeout(Some(left))?;
         let read = match stream.read(&mut buf) {
             Ok(read) => read,
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // SO_RCVTIMEO expiry reads as EAGAIN ("Resource temporarily
+            // unavailable", os error 11), which looks like a busy socket.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(response_timeout_error(method, timeout));
+            }
             Err(err) => return Err(err),
         };
         if read == 0 {
@@ -95,6 +230,7 @@ pub fn dispatch_with_timeout(
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
+#[cfg(unix)]
 fn remaining(started: Instant, timeout: Duration) -> std::io::Result<Duration> {
     timeout
         .checked_sub(started.elapsed())
@@ -104,6 +240,7 @@ fn remaining(started: Instant, timeout: Duration) -> std::io::Result<Duration> {
         })
 }
 
+#[cfg(unix)]
 fn connect_with_retry(
     socket: &Path,
     started: Instant,
@@ -128,7 +265,7 @@ fn connect_with_retry(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -295,6 +432,69 @@ mod tests {
     }
 
     #[test]
+    fn slow_response_is_a_typed_replayable_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            assert_eq!(read_request(&stream)["method"], "AgentEnqueueLandingSource");
+            thread::sleep(Duration::from_millis(600));
+            drop(stream);
+        });
+        let err = dispatch_with_timeout(
+            &socket,
+            "AgentEnqueueLandingSource",
+            json!({}),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let typed = response_timeout(&err).expect("typed response timeout");
+        assert_eq!(typed.method, "AgentEnqueueLandingSource");
+        let text = err.to_string();
+        assert!(text.starts_with("rpc_response_timeout: AgentEnqueueLandingSource"));
+        assert!(text.contains("may have completed"));
+        assert!(text.contains("same idempotency_key"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn keyless_read_timeout_does_not_advise_an_idempotency_replay() {
+        for method in ["AgentAuditSourceWorktreeCohort", "AgentGetStatus"] {
+            let text = RpcResponseTimeout {
+                method: method.into(),
+                timeout: Duration::from_secs(30),
+            }
+            .to_string();
+            assert!(text.starts_with(&format!("rpc_response_timeout: {method}")));
+            assert!(!text.contains("idempotency_key and identical"), "{text}");
+            assert!(!text.contains("Replay it"), "{text}");
+            assert!(text.contains("read-only"), "{text}");
+        }
+        // A keyed mutation keeps the replay advice.
+        let apply = RpcResponseTimeout {
+            method: "AgentApplySourceWorktreeCohort".into(),
+            timeout: Duration::from_secs(1800),
+        }
+        .to_string();
+        assert!(apply.contains("same idempotency_key"), "{apply}");
+    }
+
+    #[test]
+    fn connect_timeout_is_not_a_response_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = dispatch_with_timeout(
+            &dir.path().join("missing.sock"),
+            "AgentGetStatus",
+            json!({}),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(response_timeout(&err).is_none());
+    }
+
+    #[test]
     fn request_is_not_replayed_after_server_closes_connection() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
@@ -319,5 +519,56 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn landing_enqueue_gets_a_derivation_sized_timeout() {
+        for method in ["AgentEnqueueLandingSource", "EnqueueRollingQueueSource"] {
+            assert_eq!(default_timeout(method), Duration::from_secs(300));
+        }
+    }
+
+    #[test]
+    fn settlement_apply_gets_a_cohort_sized_timeout_only() {
+        assert_eq!(
+            default_timeout("AgentApplySourceWorktreeCohort"),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            default_timeout("AgentAuditSourceWorktreeCohort"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(default_timeout("AgentGetStatus"), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn zero_timeout_is_invalid_on_every_platform() {
+        let err = dispatch_with_timeout(
+            Path::new("daemon.sock"),
+            "AgentGetStatus",
+            json!({}),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn rpc_entry_points_report_unsupported_transport() {
+        let socket = Path::new("daemon.sock");
+        for result in [
+            dispatch_from_env("AgentGetStatus", json!({})),
+            dispatch(socket, "AgentGetStatus", json!({})),
+            dispatch_with_timeout(socket, "AgentGetStatus", json!({}), Duration::from_secs(1)),
+        ] {
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        }
     }
 }

@@ -22,11 +22,12 @@ impl SessionManager {
     pub(super) async fn reconcile_remote_answers_once(&self) -> Result<usize> {
         let mut changed = 0;
         for _ in 0..4 {
-            let delivery = self
-                .store
-                .lock()
-                .await
-                .claim_remote_answer(self.program_run_boot_id)?;
+            let delivery = crate::store_lock::lock(
+                &self.store,
+                "remote_answers::reconcile_remote_answers_once",
+            )
+            .await
+            .claim_remote_answer(self.program_run_boot_id)?;
             let Some(delivery) = delivery else { break };
             let outcome = if delivery.target["kind"] == "appserver_approval" {
                 self.deliver_remote_appserver_approval(delivery.clone())
@@ -34,7 +35,11 @@ impl SessionManager {
             } else {
                 self.continue_remote_answer(delivery.clone()).await
             };
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "remote_answers::reconcile_remote_answers_once",
+            )
+            .await;
             let mut requeued = false;
             if let Some(current) = store.remote_answer_delivery(delivery.key())? {
                 if current.receipt.state == State::Running {
@@ -94,7 +99,9 @@ impl SessionManager {
     ) -> Result<()> {
         self.check_question_runtime(delivery.session_id(), &delivery.target)
             .await?;
-        self.store.lock().await.check_remote_answer_target(delivery)
+        crate::store_lock::lock(&self.store, "remote_answers::check_remote_answer_runtime")
+            .await
+            .check_remote_answer_target(delivery)
     }
 
     pub(super) async fn clear_delivered_remote_question(
@@ -102,10 +109,12 @@ impl SessionManager {
         delivery: &RemoteAnswerDelivery,
     ) -> Result<()> {
         self.check_remote_answer_runtime(delivery).await?;
-        self.store
-            .lock()
-            .await
-            .clear_pending_question_exact(delivery.session_id(), &delivery.target)
+        crate::store_lock::lock(
+            &self.store,
+            "remote_answers::clear_delivered_remote_question",
+        )
+        .await
+        .clear_pending_question_exact(delivery.session_id(), &delivery.target)
     }
 }
 

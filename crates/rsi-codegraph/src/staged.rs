@@ -7,21 +7,28 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    CodegraphError, CodegraphStore, ExtractionContract, ExtractionMode, FactKey, NodeFact,
-    PublishFault, ReadySnapshot, RelationFact, Result, SourceFactBundle, SourceFile,
-    UnresolvedReferenceFact, WorkspaceScope, evidence_order, insert_evidence, node_id, parse_uuid,
-    relation_id, unresolved_digest, validate_bundle_with_limits, validate_path,
+    CodegraphError, CodegraphStore, ExtractionContract, FactKey, NodeFact, PublishFault,
+    ReadySnapshot, RelationFact, Result, SourceFactBundle, SourceFile, UnresolvedReferenceFact,
+    WorkspaceScope, blocks, evidence_order, node_id, parse_extraction_mode,
+    validate_bundle_with_limits, validate_path,
 };
 
-pub const MAX_STAGED_FILES: usize = 10_000;
+/// Largest complete inventory one run may declare. The RSI workspace already
+/// declares about 9,000 owners, so this leaves room to grow (#2323).
+pub const MAX_STAGED_FILES: usize = 50_000;
 pub const MAX_STAGED_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STAGED_SOURCE_BYTES: usize = 512 * 1024 * 1024;
-pub const MAX_STAGED_FACTS: usize = 1_000_000;
 pub const MAX_STAGED_FACTS_PER_FILE: usize = 50_000;
 pub const MAX_STAGED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum charged source and encoded fact buffers for one adapter call.
 pub const MAX_STAGED_BUFFER_BYTES: usize = 24 * 1024 * 1024;
-pub const MAX_STAGED_TOTAL_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+/// Sanity valve on the encoded facts of one run, sized from the largest source
+/// set discovery admits: encoded facts are an expansion of source text, so
+/// eight times the source ceiling is far above any real workspace. It is not
+/// the disk bound (the physical write budget is). The total fact count has no
+/// ceiling at all: staging is disk-backed, `publish_staged` reads one file at a
+/// time, and the per-file fact and payload ceilings bound memory (#2323).
+pub const MAX_STAGED_TOTAL_PAYLOAD_BYTES: usize = 8 * MAX_STAGED_SOURCE_BYTES;
 pub const MAX_STAGED_SECONDS: i64 = 3_600;
 pub const PARSER_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_DIGEST_DOMAIN: &[u8] = b"blake3-hex-v1";
@@ -50,6 +57,8 @@ pub struct PerFileFacts {
     pub relations: Vec<RelationFact>,
     pub unresolved_references: Vec<UnresolvedReferenceFact>,
     pub diagnostic: FileDiagnostic,
+    /// Syntax-local Rust facts for the resolver; never staged or persisted.
+    pub scope: crate::scope::RustScope,
 }
 
 /// A discovered owner and its exact expected source version.
@@ -95,13 +104,11 @@ fn ensure_deadline(started: DateTime<Utc>) -> Result<()> {
         .signed_duration_since(started)
         .num_seconds()
         .max(0);
-    if elapsed > MAX_STAGED_SECONDS {
-        return Err(CodegraphError::LimitExceeded {
-            requested: checked_count(elapsed)?,
-            maximum: checked_count(MAX_STAGED_SECONDS)?,
-        });
-    }
-    Ok(())
+    limit(
+        "run seconds",
+        checked_count(elapsed)?,
+        checked_count(MAX_STAGED_SECONDS)?,
+    )
 }
 
 fn checked_version(value: &str, field: &str) -> Result<()> {
@@ -129,9 +136,12 @@ fn stage_run_started(transaction: &Transaction<'_>, run: &StageRun) -> Result<Da
         .map_err(|_| CodegraphError::InvalidInput("invalid stage start time".into()))
 }
 
-const fn limit(value: usize, maximum: usize) -> Result<()> {
+/// Check one staging ceiling. The quantity is named so a failed index run
+/// reports which ceiling it hit, not only the numbers (#2323).
+const fn limit(quantity: &'static str, value: usize, maximum: usize) -> Result<()> {
     if value > maximum {
-        return Err(CodegraphError::LimitExceeded {
+        return Err(CodegraphError::StageCeilingExceeded {
+            quantity,
             requested: value,
             maximum,
         });
@@ -149,14 +159,99 @@ fn decode(payload: &[u8]) -> Result<StoredFacts> {
         .map_err(|error| CodegraphError::InvalidInput(format!("invalid staged facts: {error}")))
 }
 
-fn row_facts(transaction: &Transaction<'_>, workspace: Uuid, path: &str) -> Result<StoredFacts> {
-    let payload: Vec<u8> = transaction.query_row(
-        "SELECT payload FROM cg_stage_files WHERE workspace_id=?1 AND path=?2",
+/// Marks a staged payload that points at stored blocks instead of holding the
+/// file's facts (#2351). Facts payloads are JSON objects and start with `{`.
+const REF_MAGIC: &[u8] = b"rsi-cg-ref1\n";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredRef {
+    payload_digest: String,
+    structure_block: i64,
+    resolution_block: Option<i64>,
+}
+
+fn encode_ref(reference: &blocks::PayloadRef) -> Result<Vec<u8>> {
+    let mut payload = REF_MAGIC.to_vec();
+    serde_json::to_writer(
+        &mut payload,
+        &StoredRef {
+            payload_digest: reference.payload_digest.clone(),
+            structure_block: reference.blocks.structure,
+            resolution_block: reference.blocks.resolution,
+        },
+    )
+    .map_err(|error| CodegraphError::InvalidInput(format!("cannot encode reference: {error}")))?;
+    Ok(payload)
+}
+
+fn decode_ref(path: &str, source_digest: &str, payload: &[u8]) -> Result<blocks::PayloadRef> {
+    let stored: StoredRef =
+        serde_json::from_slice(&payload[REF_MAGIC.len()..]).map_err(|error| {
+            CodegraphError::InvalidInput(format!("invalid staged reference: {error}"))
+        })?;
+    Ok(blocks::PayloadRef {
+        path: path.to_owned(),
+        source_digest: source_digest.to_owned(),
+        payload_digest: stored.payload_digest,
+        blocks: blocks::FileBlocks {
+            structure: stored.structure_block,
+            resolution: stored.resolution_block,
+        },
+    })
+}
+
+/// A staged file: its facts, or the stored blocks that already hold them.
+enum StagedRow {
+    Full {
+        facts: StoredFacts,
+        payload_digest: String,
+    },
+    Ref(blocks::PayloadRef),
+}
+
+/// Digest of a staged payload: the canonical facts' digest, whether the row
+/// holds them or points at the blocks that do.
+fn row_payload_digest(path: &str, payload: &[u8]) -> Result<String> {
+    if payload.starts_with(REF_MAGIC) {
+        Ok(decode_ref(path, "", payload)?.payload_digest)
+    } else {
+        Ok(blake3::hash(payload).to_hex().to_string())
+    }
+}
+
+/// One staged row with its recorded source digest.
+fn staged_row(
+    transaction: &Transaction<'_>,
+    workspace: Uuid,
+    path: &str,
+) -> Result<(String, StagedRow)> {
+    let (source_digest, payload): (String, Vec<u8>) = transaction.query_row(
+        "SELECT source_digest,payload FROM cg_stage_files WHERE workspace_id=?1 AND path=?2",
         params![workspace.to_string(), path],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    limit(payload.len(), MAX_STAGED_PAYLOAD_BYTES)?;
-    decode(&payload)
+    limit(
+        "file payload bytes",
+        payload.len(),
+        MAX_STAGED_PAYLOAD_BYTES,
+    )?;
+    let row = if payload.starts_with(REF_MAGIC) {
+        StagedRow::Ref(decode_ref(path, &source_digest, &payload)?)
+    } else {
+        StagedRow::Full {
+            facts: decode(&payload)?,
+            payload_digest: blake3::hash(&payload).to_hex().to_string(),
+        }
+    };
+    Ok((source_digest, row))
+}
+
+fn diagnostic_of(stored: Option<&str>) -> Result<FileDiagnostic> {
+    match stored {
+        Some(text) => serde_json::from_str(text)
+            .map_err(|error| CodegraphError::InvalidInput(error.to_string())),
+        None => Ok(FileDiagnostic::Parsed),
+    }
 }
 
 fn paths(transaction: &Transaction<'_>, workspace: Uuid) -> Result<Vec<String>> {
@@ -165,7 +260,7 @@ fn paths(transaction: &Transaction<'_>, workspace: Uuid) -> Result<Vec<String>> 
     let paths = statement
         .query_map([workspace.to_string()], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
-    limit(paths.len(), MAX_STAGED_FILES)?;
+    limit("files", paths.len(), MAX_STAGED_FILES)?;
     Ok(paths)
 }
 
@@ -214,7 +309,7 @@ fn canonical_facts(facts: &PerFileFacts) -> StoredFacts {
 
 fn validate_file(extraction: ExtractionContract, facts: &PerFileFacts) -> Result<()> {
     let count = fact_count(facts);
-    limit(count, MAX_STAGED_FACTS_PER_FILE)?;
+    limit("facts in one file", count, MAX_STAGED_FACTS_PER_FILE)?;
     if facts.file.bytes.len() > PARSER_MAX_FILE_BYTES
         && !matches!(facts.diagnostic, FileDiagnostic::Oversize { .. })
     {
@@ -319,9 +414,9 @@ impl CodegraphStore {
                 "workspace scope is not bound to this store".into(),
             ));
         }
-        if manifest.extraction.mode != ExtractionMode::ExtractedV1_0 {
+        if !manifest.extraction.mode.is_publishable() {
             return Err(CodegraphError::InvalidInput(
-                "staging requires EXTRACTED/1.0".into(),
+                "staging requires EXTRACTED/1.0 or EXTRACTED+INFERRED/1.1".into(),
             ));
         }
         for (name, value) in [
@@ -348,7 +443,7 @@ impl CodegraphStore {
                 "stage inventory has no source files".into(),
             ));
         }
-        limit(owners.len(), MAX_STAGED_FILES)?;
+        limit("files", owners.len(), MAX_STAGED_FILES)?;
         let mut unique_paths = std::collections::HashSet::with_capacity(owners.len());
         for owner in owners {
             validate_path(&owner.relative_path)?;
@@ -427,7 +522,11 @@ impl CodegraphStore {
     /// Returns a visible bound, validation, stale-run, or `SQLite` error.
     pub fn stage_file(&mut self, run: &StageRun, facts: &PerFileFacts) -> Result<()> {
         validate_path(&facts.file.relative_path)?;
-        limit(facts.file.bytes.len(), MAX_STAGED_FILE_BYTES)?;
+        limit(
+            "file source bytes",
+            facts.file.bytes.len(),
+            MAX_STAGED_FILE_BYTES,
+        )?;
         let transaction = self.connection.transaction()?;
         let started = stage_run_started(&transaction, run)?;
         ensure_deadline(started)?;
@@ -457,11 +556,29 @@ impl CodegraphStore {
         let payload = serde_json::to_vec(&stored).map_err(|error| {
             CodegraphError::InvalidInput(format!("cannot encode facts: {error}"))
         })?;
-        limit(payload.len(), MAX_STAGED_PAYLOAD_BYTES)?;
         limit(
+            "file payload bytes",
+            payload.len(),
+            MAX_STAGED_PAYLOAD_BYTES,
+        )?;
+        limit(
+            "file buffer bytes",
             facts.file.bytes.len().saturating_add(payload.len()),
             MAX_STAGED_BUFFER_BYTES,
         )?;
+        // A file whose canonical facts are already stored as blocks is staged
+        // as a reference to them (#2351): an unchanged corpus then writes a few
+        // dozen bytes per file instead of its whole fact payload.
+        let payload_digest = blake3::hash(&payload).to_hex().to_string();
+        let payload = match blocks::find_payload_ref(
+            &transaction,
+            &facts.file.relative_path,
+            &source_digest,
+            &payload_digest,
+        )? {
+            Some(reference) => encode_ref(&reference)?,
+            None => payload,
+        };
         let old: Option<(i64, i64, i64)> = transaction.query_row(
             "SELECT source_bytes,fact_count,length(payload) FROM cg_stage_files WHERE workspace_id=?1 AND path=?2",
             params![run.workspace_id.to_string(), facts.file.relative_path],
@@ -479,10 +596,13 @@ impl CodegraphStore {
             checked_count(source - previous.0)?.saturating_add(facts.file.bytes.len());
         let next_facts = checked_count(facts_total - previous.1)?.saturating_add(fact_count(facts));
         let next_payload = checked_count(payload_total - previous.2)?.saturating_add(payload.len());
-        limit(next_files, MAX_STAGED_FILES)?;
-        limit(next_source, MAX_STAGED_SOURCE_BYTES)?;
-        limit(next_facts, MAX_STAGED_FACTS)?;
-        limit(next_payload, MAX_STAGED_TOTAL_PAYLOAD_BYTES)?;
+        limit("files", next_files, MAX_STAGED_FILES)?;
+        limit("source bytes", next_source, MAX_STAGED_SOURCE_BYTES)?;
+        limit(
+            "total payload bytes",
+            next_payload,
+            MAX_STAGED_TOTAL_PAYLOAD_BYTES,
+        )?;
         transaction.execute(
             "INSERT INTO cg_stage_files VALUES (?1,?2,?3,?4,?5,?6)
              ON CONFLICT(workspace_id,path) DO UPDATE SET source_digest=excluded.source_digest,
@@ -562,6 +682,66 @@ impl CodegraphStore {
             &owner_paths,
             SOURCE_DIGEST_DOMAIN,
         )?;
+        // Pass 1 learns every node identity, so a relation in one file can name
+        // a node in another. Only the key and identity of each node are kept.
+        // A file staged as a reference contributes the nodes of its stored block.
+        let mut node_ids: std::collections::HashMap<String, Uuid> =
+            std::collections::HashMap::new();
+        let mut parsed = 0;
+        let mut references: Vec<blocks::PayloadRef> = Vec::new();
+        let mut stale: Vec<blocks::PayloadRef> = Vec::new();
+        for path in &owner_paths {
+            ensure_deadline(started)?;
+            let (_, row) = staged_row(&transaction, run.workspace_id, path)?;
+            let nodes: Vec<(String, Uuid)> = match row {
+                StagedRow::Full { facts: stored, .. } => {
+                    parsed += usize::from(stored.diagnostic.is_parsed());
+                    stored
+                        .nodes
+                        .iter()
+                        .map(|node| (node.key.0.clone(), node_id(repository, node)))
+                        .collect()
+                }
+                StagedRow::Ref(reference) => {
+                    if !blocks::payload_ref_blocks_exist(&transaction, &reference)? {
+                        stale.push(reference);
+                        continue;
+                    }
+                    let diagnostic = diagnostic_of(
+                        blocks::referenced_diagnostic(&transaction, &reference)?.as_deref(),
+                    )?;
+                    parsed += usize::from(diagnostic.is_parsed());
+                    let nodes = blocks::referenced_nodes(&transaction, &reference)?;
+                    references.push(reference);
+                    nodes
+                }
+            };
+            for (key, id) in nodes {
+                if node_ids.insert(key.clone(), id).is_some() {
+                    return Err(CodegraphError::InvalidInput(format!(
+                        "duplicate node_key {key}"
+                    )));
+                }
+            }
+        }
+        if stale.is_empty() {
+            let nodes: std::collections::HashSet<Uuid> = node_ids.values().copied().collect();
+            for reference in &references {
+                if !blocks::referenced_endpoints_resolve(&transaction, reference, &nodes)? {
+                    stale.push(reference.clone());
+                }
+            }
+        }
+        if !stale.is_empty() {
+            // The blocks a reference names were reclaimed, or a node they relate
+            // to is gone. Forget the references and have the caller stage the
+            // run again from facts; nothing else was written yet.
+            for reference in &stale {
+                blocks::drop_payload_ref(&transaction, reference)?;
+            }
+            transaction.commit()?;
+            return Err(CodegraphError::RetryableWriterConflict);
+        }
         let head: Option<i64> = transaction
             .query_row(
                 "SELECT generation FROM cg_workspace_heads WHERE workspace_id=?1",
@@ -577,52 +757,108 @@ impl CodegraphStore {
                 snapshot_digest, graph_digest, extraction.mode.as_str(), extraction.extractor.name,
                 extraction.extractor.version],
         )?;
-        let mut parsed = 0;
+        // Pass 2 turns each file into content-addressed blocks. A file whose
+        // facts match a stored block adds a manifest row and no fact rows.
+        let workspace_text = run.workspace_id.to_string();
+        let mut relation_keys = blocks::KeySet::default();
+        let mut site_keys = blocks::KeySet::default();
         for path in &owner_paths {
             ensure_deadline(started)?;
-            let (source_digest, _bytes): (String, i64) = transaction.query_row(
-                "SELECT source_digest,source_bytes FROM cg_stage_files WHERE workspace_id=?1 AND path=?2",
-                params![run.workspace_id.to_string(), path], |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let id = Uuid::new_v5(&super::FILE_NS, format!("{repository}\0{path}").as_bytes());
-            transaction.execute("INSERT INTO cg_files(workspace_id,generation,path,file_id,source_digest) VALUES (?1,?2,?3,?4,?5)",
-                params![run.workspace_id.to_string(), generation, path, id.to_string(), source_digest])?;
-            let diagnostic = row_facts(&transaction, run.workspace_id, path)?.diagnostic;
-            parsed += usize::from(diagnostic.is_parsed());
+            let (source_digest, row) = staged_row(&transaction, run.workspace_id, path)?;
+            match row {
+                StagedRow::Ref(reference) => {
+                    if let Some(repeated) = blocks::referenced_keys(
+                        &transaction,
+                        &reference,
+                        &mut relation_keys,
+                        &mut site_keys,
+                    )? {
+                        return Err(CodegraphError::InvalidInput(format!(
+                            "duplicate {repeated}"
+                        )));
+                    }
+                    blocks::attach_referenced(
+                        &transaction,
+                        &workspace_text,
+                        generation,
+                        &reference,
+                    )?;
+                }
+                StagedRow::Full {
+                    facts: stored,
+                    payload_digest,
+                } => {
+                    for relation in &stored.relations {
+                        if !relation_keys.insert(&relation.key.0) {
+                            return Err(CodegraphError::InvalidInput(format!(
+                                "duplicate relation_key {}",
+                                relation.key.0
+                            )));
+                        }
+                    }
+                    for reference in &stored.unresolved_references {
+                        if !site_keys.insert(&reference.key.0) {
+                            return Err(CodegraphError::InvalidInput(format!(
+                                "duplicate site_key {}",
+                                reference.key.0
+                            )));
+                        }
+                    }
+                    let diagnostic = serde_json::to_string(&stored.diagnostic)
+                        .map_err(|error| CodegraphError::InvalidInput(error.to_string()))?;
+                    let file = blocks::FileFacts {
+                        path: path.as_str(),
+                        source_digest: &source_digest,
+                        file_id: Uuid::new_v5(
+                            &super::FILE_NS,
+                            format!("{repository}\0{path}").as_bytes(),
+                        ),
+                        diagnostic: Some(diagnostic),
+                        nodes: &stored.nodes,
+                        relations: &stored.relations,
+                        unresolved: &stored.unresolved_references,
+                    };
+                    let resolve = |key: &FactKey| -> Result<Uuid> {
+                        node_ids
+                            .get(&key.0)
+                            .copied()
+                            .ok_or_else(|| CodegraphError::MissingNode(key.0.clone()))
+                    };
+                    let digest_of = |evidence_path: &str| -> Result<String> {
+                        if evidence_path == path {
+                            Ok(source_digest.clone())
+                        } else {
+                            Err(CodegraphError::InvalidInput(format!(
+                                "evidence for {path} names another file: {evidence_path}"
+                            )))
+                        }
+                    };
+                    let built = blocks::build_file_blocks(repository, &file, &resolve, &digest_of)?;
+                    let stored_blocks = blocks::store_file_blocks(
+                        &transaction,
+                        &workspace_text,
+                        generation,
+                        built,
+                    )?;
+                    blocks::record_payload_ref(
+                        &transaction,
+                        &blocks::PayloadRef {
+                            path: path.clone(),
+                            source_digest: source_digest.clone(),
+                            payload_digest,
+                            blocks: stored_blocks,
+                        },
+                    )?;
+                }
+            }
+            // The file's facts now live in shared blocks. Releasing the staged
+            // copy inside the publish transaction lets the pages be reused, so
+            // a large workspace never holds both copies at once; a failed or
+            // faulted publish rolls the delete back with everything else.
             transaction.execute(
-                "INSERT INTO cg_file_diagnostics VALUES (?1,?2,?3,?4)",
-                params![
-                    run.workspace_id.to_string(),
-                    generation,
-                    path,
-                    serde_json::to_string(&diagnostic)
-                        .map_err(|error| CodegraphError::InvalidInput(error.to_string()))?
-                ],
+                "DELETE FROM cg_stage_files WHERE workspace_id=?1 AND path=?2",
+                params![workspace_text, path],
             )?;
-        }
-        for path in &owner_paths {
-            ensure_deadline(started)?;
-            let stored = row_facts(&transaction, run.workspace_id, path)?;
-            for node in &stored.nodes {
-                insert_node(&transaction, run.workspace_id, generation, repository, node)?;
-            }
-        }
-        super::index_fts_generation(&transaction, run.workspace_id, generation)?;
-        for path in &owner_paths {
-            ensure_deadline(started)?;
-            let stored = row_facts(&transaction, run.workspace_id, path)?;
-            for relation in &stored.relations {
-                insert_relation(
-                    &transaction,
-                    run.workspace_id,
-                    generation,
-                    repository,
-                    relation,
-                )?;
-            }
-            for reference in &stored.unresolved_references {
-                insert_reference(&transaction, run.workspace_id, generation, reference)?;
-            }
         }
         transaction.execute(
             "INSERT INTO cg_snapshot_completeness
@@ -681,7 +917,8 @@ impl CodegraphStore {
             rollup
         } else {
             let count = self.connection.query_row(
-                "SELECT count(*) FROM cg_files WHERE workspace_id=?1 AND generation=?2",
+                "SELECT count(*) FROM cg_manifest m JOIN cg_blocks b ON b.block_id=m.block_id
+                 WHERE m.workspace_id=?1 AND m.generation=?2 AND b.kind='S'",
                 params![workspace_id.to_string(), ready.generation],
                 |row| row.get(0),
             )?;
@@ -705,27 +942,26 @@ impl CodegraphStore {
     ) -> Result<FileDiagnostic> {
         validate_path(path)?;
         let ready = self.current_ready(workspace_id)?;
-        let diagnostic: Option<String> = self.connection.query_row(
-            "SELECT diagnostic FROM cg_file_diagnostics WHERE workspace_id=?1 AND generation=?2 AND path=?3",
-            params![workspace_id.to_string(), ready.generation, path], |row| row.get(0),
-        ).optional()?;
-        if let Some(diagnostic) = diagnostic {
-            serde_json::from_str(&diagnostic)
-                .map_err(|error| CodegraphError::InvalidInput(error.to_string()))
-        } else {
-            let exists: Option<i64> = self
-                .connection
-                .query_row(
-                    "SELECT 1 FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
-                    params![workspace_id.to_string(), ready.generation, path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            exists.map(|_| FileDiagnostic::Parsed).ok_or_else(|| {
-                CodegraphError::InvalidInput(format!(
-                    "file {path:?} is not in current ready snapshot"
-                ))
-            })
+        // A file block always exists for a published file; its diagnostic is
+        // absent only for S0 bundles, whose files are all parsed by contract.
+        let stored: Option<Option<String>> = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT b.diagnostic FROM cg_blocks b WHERE b.kind='S' AND b.path=?3 AND {}",
+                    blocks::scope_sql("b")
+                ),
+                params![workspace_id.to_string(), ready.generation, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(Some(diagnostic)) => serde_json::from_str(&diagnostic)
+                .map_err(|error| CodegraphError::InvalidInput(error.to_string())),
+            Some(None) => Ok(FileDiagnostic::Parsed),
+            None => Err(CodegraphError::InvalidInput(format!(
+                "file {path:?} is not in current ready snapshot"
+            ))),
         }
     }
 }
@@ -763,19 +999,26 @@ fn verify_stage_counters(
             "stage counters disagree with staged file rows".into(),
         ));
     }
-    limit(checked_count(recorded.0)?, MAX_STAGED_FILES)?;
-    limit(checked_count(recorded.1)?, MAX_STAGED_SOURCE_BYTES)?;
-    limit(checked_count(recorded.2)?, MAX_STAGED_FACTS)?;
-    limit(checked_count(recorded.3)?, MAX_STAGED_TOTAL_PAYLOAD_BYTES)?;
+    limit("files", checked_count(recorded.0)?, MAX_STAGED_FILES)?;
+    limit(
+        "source bytes",
+        checked_count(recorded.1)?,
+        MAX_STAGED_SOURCE_BYTES,
+    )?;
+    limit(
+        "total payload bytes",
+        checked_count(recorded.3)?,
+        MAX_STAGED_TOTAL_PAYLOAD_BYTES,
+    )?;
     Ok(())
 }
 
 fn stage_extraction(transaction: &Transaction<'_>, run: &StageRun) -> Result<ExtractionContract> {
     transaction.query_row(
-        "SELECT extractor_name,extractor_version FROM cg_stage_runs WHERE workspace_id=?1 AND run_id=?2",
+        "SELECT extraction_mode,extractor_name,extractor_version FROM cg_stage_runs WHERE workspace_id=?1 AND run_id=?2",
         params![run.workspace_id.to_string(), run.run_id.to_string()],
-        |row| Ok(ExtractionContract { mode: ExtractionMode::ExtractedV1_0,
-            extractor: super::ExtractorIdentity { name: row.get(0)?, version: row.get(1)? } }),
+        |row| Ok(ExtractionContract { mode: parse_extraction_mode(&row.get::<_, String>(0)?)?,
+            extractor: super::ExtractorIdentity { name: row.get(1)?, version: row.get(2)? } }),
     ).map_err(Into::into)
 }
 
@@ -795,7 +1038,7 @@ fn staged_digests(
     let extraction = stage_extraction(transaction, run)?;
     let mut hasher = blake3::Hasher::new();
     for part in [
-        b"rsi-codegraph-staged-v1".as_slice(),
+        b"rsi-codegraph-staged-v2".as_slice(),
         source_digest_domain,
         project.as_bytes(),
         repository.as_bytes(),
@@ -817,14 +1060,20 @@ fn staged_digests(
             params![run.workspace_id.to_string(), path],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        limit(payload.len(), MAX_STAGED_PAYLOAD_BYTES)?;
+        limit(
+            "file payload bytes",
+            payload.len(),
+            MAX_STAGED_PAYLOAD_BYTES,
+        )?;
         hash_field(&mut hasher, path.as_bytes());
         hash_field(&mut hasher, source_digest.as_bytes());
-        hash_field(&mut hasher, &payload);
+        // The digest of the canonical facts stands for them, so a file staged
+        // as a reference to its stored blocks hashes like one staged in full.
+        hash_field(&mut hasher, row_payload_digest(path, &payload)?.as_bytes());
     }
     let base = hasher.finalize();
-    let snapshot = blake3::derive_key("rsi-codegraph-staged-snapshot-v1", base.as_bytes());
-    let graph = blake3::derive_key("rsi-codegraph-staged-graph-v1", base.as_bytes());
+    let snapshot = blake3::derive_key("rsi-codegraph-staged-snapshot-v2", base.as_bytes());
+    let graph = blake3::derive_key("rsi-codegraph-staged-graph-v2", base.as_bytes());
     Ok((
         blake3::Hash::from_bytes(snapshot).to_hex().to_string(),
         blake3::Hash::from_bytes(graph).to_hex().to_string(),
@@ -836,119 +1085,11 @@ fn hash_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn insert_node(
-    transaction: &Transaction<'_>,
-    workspace: Uuid,
-    generation: i64,
-    repository: Uuid,
-    node: &NodeFact,
-) -> Result<()> {
-    let id = node_id(repository, node);
-    let span = &node.span;
-    transaction.execute(
-        "INSERT INTO cg_nodes(workspace_id,generation,node_id,node_key,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![workspace.to_string(), generation, id.to_string(), node.key.0, node.kind.as_str(),
-            node.name, span.path, span.start_byte, span.end_byte, span.start_line, span.start_column,
-            span.end_line, span.end_column, node.provenance.as_str()],
-    )?;
-    for (ordinal, evidence) in node.evidence.iter().enumerate() {
-        insert_evidence(
-            transaction,
-            workspace,
-            generation,
-            id,
-            ordinal,
-            "node",
-            evidence,
-        )?;
-    }
-    Ok(())
-}
-
-fn lookup_node(
-    transaction: &Transaction<'_>,
-    workspace: Uuid,
-    generation: i64,
-    key: &FactKey,
-) -> Result<Uuid> {
-    let id: Option<String> = transaction
-        .query_row(
-            "SELECT node_id FROM cg_nodes WHERE workspace_id=?1 AND generation=?2 AND node_key=?3",
-            params![workspace.to_string(), generation, key.0],
-            |row| row.get(0),
-        )
-        .optional()?;
-    parse_uuid(&id.ok_or_else(|| CodegraphError::MissingNode(key.0.clone()))?).map_err(Into::into)
-}
-
-fn insert_relation(
-    transaction: &Transaction<'_>,
-    workspace: Uuid,
-    generation: i64,
-    repository: Uuid,
-    relation: &RelationFact,
-) -> Result<()> {
-    let source = lookup_node(transaction, workspace, generation, &relation.source)?;
-    let target = lookup_node(transaction, workspace, generation, &relation.target)?;
-    let id = relation_id(
-        repository,
-        relation.kind,
-        source,
-        target,
-        &relation.owner_file,
-        &relation.site_anchor,
-    );
-    transaction.execute(
-        "INSERT INTO cg_relations(workspace_id,generation,relation_id,relation_key,kind,source_id,target_id,provenance)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![workspace.to_string(), generation, id.to_string(), relation.key.0,
-            relation.kind.as_str(), source.to_string(), target.to_string(), relation.provenance.as_str()],
-    )?;
-    for (ordinal, evidence) in relation.evidence.iter().enumerate() {
-        insert_evidence(
-            transaction,
-            workspace,
-            generation,
-            id,
-            ordinal,
-            "relation",
-            evidence,
-        )?;
-    }
-    Ok(())
-}
-
-fn insert_reference(
-    transaction: &Transaction<'_>,
-    workspace: Uuid,
-    generation: i64,
-    reference: &UnresolvedReferenceFact,
-) -> Result<()> {
-    let owner = lookup_node(transaction, workspace, generation, &reference.owner)?;
-    let id = Uuid::new_v5(
-        &super::RELATION_NS,
-        format!("{workspace}\0unresolved\0{}", reference.key.0).as_bytes(),
-    );
-    let span = &reference.span;
-    let source_digest: String = transaction.query_row(
-        "SELECT source_digest FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
-        params![workspace.to_string(), generation, span.path],
-        |row| row.get(0),
-    )?;
-    let digest = unresolved_digest(&source_digest, reference);
-    transaction.execute("INSERT INTO cg_unresolved_references VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![workspace.to_string(), generation, id.to_string(), reference.key.0,
-            reference.kind.as_str(), owner.to_string(), reference.raw_target, span.path,
-            span.start_byte, span.end_byte, span.start_line, span.start_column, span.end_line,
-            span.end_column, source_digest, digest, reference.provenance.as_str()])?;
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Fixtures fail at their exact construction point.
 mod tests {
     use super::*;
+    use crate::ExtractionMode;
 
     #[test]
     fn every_staged_resource_ceiling_reports_overflow() {
@@ -956,15 +1097,14 @@ mod tests {
             MAX_STAGED_FILES,
             MAX_STAGED_FILE_BYTES,
             MAX_STAGED_SOURCE_BYTES,
-            MAX_STAGED_FACTS,
             MAX_STAGED_FACTS_PER_FILE,
             MAX_STAGED_PAYLOAD_BYTES,
             MAX_STAGED_BUFFER_BYTES,
             MAX_STAGED_TOTAL_PAYLOAD_BYTES,
         ] {
             assert!(matches!(
-                limit(maximum.saturating_add(1), maximum),
-                Err(CodegraphError::LimitExceeded { .. })
+                limit("ceiling", maximum.saturating_add(1), maximum),
+                Err(CodegraphError::StageCeilingExceeded { .. })
             ));
         }
     }
@@ -1006,6 +1146,7 @@ mod tests {
                     relations: vec![],
                     unresolved_references: vec![],
                     diagnostic: FileDiagnostic::Parsed,
+                    scope: crate::scope::RustScope::default(),
                 },
             )
             .unwrap();

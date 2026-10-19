@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::{Uuid, uuid};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 10;
 
+mod blocks;
 pub mod cargo_metadata;
 pub mod extract;
 pub mod impact;
@@ -19,7 +20,10 @@ pub mod invalidate;
 pub mod lifecycle;
 pub mod query;
 pub mod resolve;
+mod rust_resolve;
+pub mod scope;
 pub mod staged;
+pub use blocks::StorageSummary;
 pub use staged::{
     FileDiagnostic, PerFileFacts, SourceVersion, StageCompleteness, StageRun, StagedExtraction,
 };
@@ -30,6 +34,10 @@ const RELATION_NS: Uuid = uuid!("34bed330-f70b-5232-9431-82262e5833df");
 const FILE_NS: Uuid = uuid!("c707c51b-25ec-5ba4-92f9-ccf42b187194");
 
 pub const STRICT_EXTRACTION_MODE: &str = "EXTRACTED/1.0";
+/// Strict extraction whose relations may also be `Inferred`: a bounded set of
+/// candidates for a reference the resolver cannot prove. Nodes and unresolved
+/// sites stay `Extracted`, and strict queries ignore `Inferred` relations.
+pub const INFERRED_EXTRACTION_MODE: &str = "EXTRACTED+INFERRED/1.1";
 pub const MAX_FILES: usize = 128;
 pub const MAX_FACTS: usize = 10_000;
 pub const MAX_FILE_BYTES: usize = 1_048_576;
@@ -55,6 +63,14 @@ pub enum CodegraphError {
     InvalidInput(String),
     #[error("requested limit {requested} exceeds hard limit {maximum}")]
     LimitExceeded { requested: usize, maximum: usize },
+    /// A staging ceiling named for the quantity that reached it, so a failed
+    /// index run says which ceiling it hit (#2323).
+    #[error("staged {quantity} {requested} exceeds the {maximum} staging ceiling")]
+    StageCeilingExceeded {
+        quantity: &'static str,
+        requested: usize,
+        maximum: usize,
+    },
     #[error("node key is not present in this source-fact bundle: {0}")]
     MissingNode(String),
     #[error("current ready snapshot does not exist")]
@@ -67,6 +83,20 @@ pub enum CodegraphError {
     RetryableWriterConflict,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+}
+
+impl CodegraphError {
+    /// Whether `SQLite` refused a write because the database reached its page
+    /// limit or the disk is full. The daemon reports this as a typed disk
+    /// budget notice instead of the raw `SQLite` message (#2245).
+    #[must_use]
+    pub fn is_disk_full(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DiskFull
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CodegraphError>;
@@ -201,6 +231,8 @@ impl FactProvenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExtractionMode {
     ExtractedV1_0,
+    /// Extracted facts plus bounded `Inferred` relations.
+    ExtractedInferredV1_1,
     Exploratory,
 }
 
@@ -208,8 +240,15 @@ impl ExtractionMode {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ExtractedV1_0 => STRICT_EXTRACTION_MODE,
+            Self::ExtractedInferredV1_1 => INFERRED_EXTRACTION_MODE,
             Self::Exploratory => "EXPLORATORY/1.0",
         }
+    }
+
+    /// Whether a staged or published snapshot may carry this mode.
+    #[must_use]
+    pub const fn is_publishable(self) -> bool {
+        matches!(self, Self::ExtractedV1_0 | Self::ExtractedInferredV1_1)
     }
 }
 
@@ -844,10 +883,108 @@ impl CodegraphStore {
             )?;
             transaction.commit()?;
         }
+        if version < 7 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                "ALTER TABLE cg_index_state ADD COLUMN skipped_symlinks INTEGER NOT NULL DEFAULT 0 CHECK (skipped_symlinks >= 0);
+                 ALTER TABLE cg_index_state ADD COLUMN partial_reasons TEXT;
+                 PRAGMA user_version = 7;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 8 {
+            // V8: snapshots may carry `Inferred` relations (extraction mode
+            // EXTRACTED+INFERRED/1.1), which a V7 binary cannot parse, and
+            // "who calls X" reads incoming edges by target, which the
+            // (source, target) endpoint index cannot serve.
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(
+                "CREATE INDEX IF NOT EXISTS cg_relations_target
+                    ON cg_relations(workspace_id, generation, target_id, kind);
+                 PRAGMA user_version = 8;",
+            )?;
+            transaction.commit()?;
+        }
+        if version < 9 {
+            // V9 (#2245): facts are content-addressed per file and a generation
+            // is a manifest of blocks. Existing generations are converted in
+            // place; the v8 fact tables become read-only views. The converted
+            // rows are a small fraction of the v8 copies, so the freed pages
+            // are returned to the filesystem straight away.
+            let transaction = connection.unchecked_transaction()?;
+            let converted = blocks::migrate_v8_to_v9(&transaction)?;
+            transaction.execute_batch("PRAGMA user_version = 9;")?;
+            transaction.commit()?;
+            if converted {
+                Self::reclaim_converted_pages(&connection);
+            }
+        }
+        if version < 10 {
+            // V10 (#2351): the index manifest and the live identity ledger are
+            // read from the head's blocks instead of copied per workspace, and
+            // staging can point at blocks already stored.
+            let transaction = connection.unchecked_transaction()?;
+            let freed = blocks::migrate_v9_to_v10(&transaction)?;
+            transaction.execute_batch("PRAGMA user_version = 10;")?;
+            transaction.commit()?;
+            if freed {
+                Self::reclaim_converted_pages(&connection);
+            }
+        }
         Ok(Self {
             connection,
             project_id,
         })
+    }
+
+    /// Shrink the file after the v9 conversion freed the v8 copies. A reader
+    /// that pins the WAL blocks `VACUUM`; the failure is not an error because
+    /// the converted database is complete, and the daemon's retention pass
+    /// compacts again once the reader is gone.
+    fn reclaim_converted_pages(connection: &Connection) {
+        const RECLAIM_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
+        let free = |pragma: &str| -> u64 {
+            connection
+                .pragma_query_value(None, pragma, |row| row.get::<_, u64>(0))
+                .unwrap_or(0)
+        };
+        if free("freelist_count").saturating_mul(free("page_size")) >= RECLAIM_FLOOR_BYTES
+            && connection.execute_batch("VACUUM").is_ok()
+        {
+            let _ = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
+    }
+
+    /// Counters of the content-shared store.
+    ///
+    /// # Errors
+    /// Returns an error if `SQLite` cannot be read.
+    pub fn storage_summary(&self) -> Result<StorageSummary> {
+        blocks::summary(&self.connection)
+    }
+
+    /// Database bytes that hold data: every page except free pages.
+    ///
+    /// # Errors
+    /// Returns an error if `SQLite` cannot be read.
+    pub fn live_database_bytes(&self) -> Result<u64> {
+        let pragma = |name: &str| -> Result<u64> {
+            Ok(self
+                .connection
+                .pragma_query_value(None, name, |row| row.get::<_, u64>(0))?)
+        };
+        Ok(pragma("page_count")?
+            .saturating_sub(pragma("freelist_count")?)
+            .saturating_mul(pragma("page_size")?))
+    }
+
+    /// Check that every block's reference count equals the manifests that use
+    /// it and that no manifest names a missing block.
+    ///
+    /// # Errors
+    /// Returns an error naming the first inconsistent block.
+    pub fn verify_storage_integrity(&self) -> Result<()> {
+        blocks::verify_references(&self.connection)
     }
 
     #[must_use]
@@ -1040,7 +1177,10 @@ impl CodegraphStore {
         let snapshot = self.current_ready(workspace_id)?;
         self.connection
             .query_row(
-                "SELECT file_id FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
+                &format!(
+                    "SELECT b.file_id FROM cg_blocks b WHERE b.kind='S' AND b.path=?3 AND {}",
+                    blocks::scope_sql("b")
+                ),
                 params![workspace_id.to_string(), snapshot.generation, path],
                 |row| {
                     let id: String = row.get(0)?;
@@ -1074,10 +1214,12 @@ impl CodegraphStore {
         check_limit(limit, MAX_QUERY_LIMIT)?;
         let snapshot = self.current_ready(workspace_id)?;
         // Keep SQL parameter indices distinct from the name and requested bound.
-        let mut statement = self.connection.prepare(
-            "SELECT node_id,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance
-             FROM cg_nodes WHERE workspace_id=?1 AND generation=?2 AND name=?3 ORDER BY path,node_id LIMIT ?4",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT n.node_id,n.kind,n.name,b.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance
+             FROM cg_block_nodes n JOIN cg_blocks b ON b.block_id=n.block_id
+             WHERE n.name=?3 AND {} ORDER BY b.path,n.node_id LIMIT ?4",
+            blocks::scope_sql("n")
+        ))?;
         let rows = statement.query_map(
             params![
                 workspace_id.to_string(),
@@ -1122,10 +1264,12 @@ impl CodegraphStore {
         validate_path(path)?;
         check_limit(limit, MAX_QUERY_LIMIT)?;
         let snapshot = self.current_ready(workspace_id)?;
-        let mut statement = self.connection.prepare(
-            "SELECT node_id,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance
-             FROM cg_nodes WHERE workspace_id=?1 AND generation=?2 AND path=?3 ORDER BY start_byte,node_id LIMIT ?4",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT n.node_id,n.kind,n.name,b.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance
+             FROM cg_blocks b JOIN cg_block_nodes n ON n.block_id=b.block_id
+             WHERE b.path=?3 AND {} ORDER BY n.start_byte,n.node_id LIMIT ?4",
+            blocks::scope_sql("b")
+        ))?;
         let rows = statement.query_map(
             params![
                 workspace_id.to_string(),
@@ -1168,8 +1312,12 @@ impl CodegraphStore {
     pub fn explain(&self, workspace_id: Uuid, node_id: Uuid) -> Result<ExplainView> {
         let snapshot = self.current_ready(workspace_id)?;
         let mut node = self.connection.query_row(
-            "SELECT node_id,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance
-             FROM cg_nodes WHERE workspace_id=?1 AND generation=?2 AND node_id=?3",
+            &format!(
+                "SELECT n.node_id,n.kind,n.name,b.path,n.start_byte,n.end_byte,n.start_line,n.start_column,n.end_line,n.end_column,n.provenance
+                 FROM cg_block_nodes n JOIN cg_blocks b ON b.block_id=n.block_id
+                 WHERE n.node_id=?3 AND {}",
+                blocks::scope_sql("n")
+            ),
             params![workspace_id.to_string(), snapshot.generation, node_id.to_string()], node_from_row,
         ).optional()?.ok_or_else(|| CodegraphError::InvalidInput(format!("node {node_id} is not in the current ready snapshot")))?;
         node.evidence = load_evidence(
@@ -1179,11 +1327,12 @@ impl CodegraphStore {
             node_id,
             "node",
         )?;
-        let mut statement = self.connection.prepare(
-            "SELECT relation_id,kind,source_id,target_id,provenance FROM cg_relations
-             WHERE workspace_id=?1 AND generation=?2 AND (source_id=?3 OR target_id=?3)
-             ORDER BY kind,source_id,target_id,relation_id LIMIT ?4",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT r.relation_id,r.kind,r.source_id,r.target_id,r.provenance FROM cg_block_relations r
+             WHERE (r.source_id=?3 OR r.target_id=?3) AND {}
+             ORDER BY r.kind,r.source_id,r.target_id,r.relation_id LIMIT ?4",
+            blocks::scope_sql("r")
+        ))?;
         let rows = statement.query_map(
             params![
                 workspace_id.to_string(),
@@ -1633,7 +1782,7 @@ fn load_snapshot_bundle(
     for (node_id_text, key, kind, name, span) in node_rows {
         let id = parse_uuid(&node_id_text)?;
         node_keys.insert(id, key.clone());
-        let evidence = load_evidence(connection, workspace, generation, id, "node")?
+        let evidence = load_evidence_legacy(connection, workspace, generation, id, "node")?
             .into_iter()
             .map(|item| EvidenceFact {
                 label: item.label,
@@ -1684,7 +1833,7 @@ fn load_snapshot_bundle(
             CodegraphError::InvalidInput(format!("relation {key} has a missing target node"))
         })?;
         let evidence: Vec<EvidenceFact> =
-            load_evidence(connection, workspace, generation, id, "relation")?
+            load_evidence_legacy(connection, workspace, generation, id, "relation")?
                 .into_iter()
                 .map(|item| EvidenceFact {
                     label: item.label,
@@ -1823,7 +1972,7 @@ fn validate_bundle_with_limits(
     max_total_bytes: usize,
     require_local_endpoints: bool,
 ) -> Result<()> {
-    if bundle.extraction.mode != ExtractionMode::ExtractedV1_0
+    if !bundle.extraction.mode.is_publishable()
         || bundle.extraction.extractor.name.trim().is_empty()
         || bundle.extraction.extractor.name.len() > MAX_EXTRACTOR_NAME_BYTES
         || bundle.extraction.extractor.version.trim().is_empty()
@@ -1934,7 +2083,14 @@ fn validate_bundle_with_limits(
             )));
         }
         validate_path(&relation.owner_file)?;
-        if relation.provenance != FactProvenance::Extracted
+        let provenance_allowed = match relation.provenance {
+            FactProvenance::Extracted => true,
+            FactProvenance::Inferred => {
+                bundle.extraction.mode == ExtractionMode::ExtractedInferredV1_1
+            }
+            FactProvenance::Ambiguous => false,
+        };
+        if !provenance_allowed
             || !files.contains_key(relation.owner_file.as_str())
             || !valid_site_anchor(&relation.site_anchor)
             || relation.site_anchor.len() > MAX_SITE_ANCHOR_BYTES
@@ -2248,7 +2404,8 @@ fn legacy_relation_id(
     )
 }
 
-#[allow(clippy::too_many_lines)] // Installs one validated bundle within its atomic publish transaction.
+/// Install one validated bundle within its atomic publish transaction: group its
+/// facts by owner file and store each file as content-addressed blocks.
 fn insert_bundle(
     transaction: &Transaction<'_>,
     workspace: Uuid,
@@ -2261,137 +2418,73 @@ fn insert_bundle(
         |row| row.get(0),
     )?;
     let repository_id = parse_uuid(&repository_id)?;
-    for file in &bundle.files {
-        let digest = blake3::hash(&file.bytes).to_hex().to_string();
-        let id = Uuid::new_v5(
-            &FILE_NS,
-            format!("{repository_id}\0{}", file.relative_path).as_bytes(),
-        );
-        transaction.execute(
-            "INSERT INTO cg_files(workspace_id,generation,path,file_id,source_digest) VALUES (?1,?2,?3,?4,?5)",
-            params![
-                workspace.to_string(),
-                generation,
-                file.relative_path,
-                id.to_string(),
-                digest
-            ],
-        )?;
-    }
+    let digests = bundle
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.relative_path.as_str(),
+                blake3::hash(&file.bytes).to_hex().to_string(),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let ids = bundle
         .nodes
         .iter()
         .map(|node| (node.key.0.as_str(), node_id(repository_id, node)))
         .collect::<std::collections::HashMap<_, _>>();
+    let mut nodes: std::collections::HashMap<&str, Vec<NodeFact>> =
+        std::collections::HashMap::new();
+    let mut relations: std::collections::HashMap<&str, Vec<RelationFact>> =
+        std::collections::HashMap::new();
+    let mut unresolved: std::collections::HashMap<&str, Vec<UnresolvedReferenceFact>> =
+        std::collections::HashMap::new();
     for node in &bundle.nodes {
-        let id = ids[node.key.0.as_str()];
-        let span = &node.span;
-        transaction.execute(
-            "INSERT INTO cg_nodes(workspace_id,generation,node_id,node_key,kind,name,path,start_byte,end_byte,start_line,start_column,end_line,end_column,provenance) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            params![
-                workspace.to_string(),
-                generation,
-                id.to_string(),
-                node.key.0,
-                node.kind.as_str(),
-                node.name,
-                span.path,
-                span.start_byte,
-                span.end_byte,
-                span.start_line,
-                span.start_column,
-                span.end_line,
-                span.end_column,
-                node.provenance.as_str(),
-            ],
-        )?;
-        let mut evidence = node.evidence.iter().collect::<Vec<_>>();
-        evidence.sort_by(|a, b| evidence_order(a, b));
-        for (ordinal, evidence) in evidence.into_iter().enumerate() {
-            insert_evidence(
-                transaction,
-                workspace,
-                generation,
-                id,
-                ordinal,
-                "node",
-                evidence,
-            )?;
-        }
+        nodes
+            .entry(node.span.path.as_str())
+            .or_default()
+            .push(node.clone());
     }
-    index_fts_generation(transaction, workspace, generation)?;
     for relation in &bundle.relations {
-        let source_id = ids[relation.source.0.as_str()];
-        let target_id = ids[relation.target.0.as_str()];
-        let id = relation_id(
-            repository_id,
-            relation.kind,
-            source_id,
-            target_id,
-            &relation.owner_file,
-            &relation.site_anchor,
-        );
-        transaction.execute(
-            "INSERT INTO cg_relations(workspace_id,generation,relation_id,relation_key,kind,source_id,target_id,provenance) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                workspace.to_string(),
-                generation,
-                id.to_string(),
-                relation.key.0,
-                relation.kind.as_str(),
-                source_id.to_string(),
-                target_id.to_string(),
-                relation.provenance.as_str(),
-            ],
-        )?;
-        let mut evidence = relation.evidence.iter().collect::<Vec<_>>();
-        evidence.sort_by(|a, b| evidence_order(a, b));
-        for (ordinal, evidence) in evidence.into_iter().enumerate() {
-            insert_evidence(
-                transaction,
-                workspace,
-                generation,
-                id,
-                ordinal,
-                "relation",
-                evidence,
-            )?;
-        }
+        relations
+            .entry(relation.owner_file.as_str())
+            .or_default()
+            .push(relation.clone());
     }
     for reference in &bundle.unresolved_references {
-        let owner_id = ids[reference.owner.0.as_str()];
-        let id = Uuid::new_v5(
-            &RELATION_NS,
-            format!("{workspace}\0unresolved\0{}", reference.key.0).as_bytes(),
-        );
-        let source_digest: String = transaction.query_row(
-            "SELECT source_digest FROM cg_files WHERE workspace_id=?1 AND generation=?2 AND path=?3",
-            params![workspace.to_string(), generation, reference.span.path],
-            |row| row.get(0),
-        )?;
-        let digest = unresolved_digest(&source_digest, reference);
-        let span = &reference.span;
-        transaction.execute(
-            "INSERT INTO cg_unresolved_references VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![workspace.to_string(), generation, id.to_string(), reference.key.0, reference.kind.as_str(), owner_id.to_string(), reference.raw_target, span.path, span.start_byte, span.end_byte, span.start_line, span.start_column, span.end_line, span.end_column, source_digest, digest, reference.provenance.as_str()],
-        )?;
+        unresolved
+            .entry(reference.span.path.as_str())
+            .or_default()
+            .push(reference.clone());
     }
-    Ok(())
-}
-
-/// Materialize FTS rows from the exact source-owned node rows of one generation.
-/// Called before its ready-head flip by both publication paths.
-fn index_fts_generation(
-    transaction: &Transaction<'_>,
-    workspace: Uuid,
-    generation: i64,
-) -> Result<()> {
-    transaction.execute(
-        "INSERT INTO cg_fts_nodes(name,path,workspace_id,generation,node_id,owner_path)
-         SELECT name,path,workspace_id,generation,node_id,path FROM cg_nodes
-         WHERE workspace_id=?1 AND generation=?2 ORDER BY path,start_byte,node_id",
-        params![workspace.to_string(), generation],
-    )?;
+    let resolve = |key: &FactKey| -> Result<Uuid> {
+        ids.get(key.0.as_str())
+            .copied()
+            .ok_or_else(|| CodegraphError::MissingNode(key.0.clone()))
+    };
+    let digest_of = |path: &str| -> Result<String> {
+        digests.get(path).cloned().ok_or_else(|| {
+            CodegraphError::InvalidInput(format!(
+                "evidence names a file outside the bundle: {path}"
+            ))
+        })
+    };
+    for file in &bundle.files {
+        let path = file.relative_path.as_str();
+        let file_id = Uuid::new_v5(&FILE_NS, format!("{repository_id}\0{path}").as_bytes());
+        let source_digest = digest_of(path)?;
+        let facts = blocks::FileFacts {
+            path,
+            source_digest: &source_digest,
+            file_id,
+            diagnostic: None,
+            nodes: nodes.get(path).map_or(&[], Vec::as_slice),
+            relations: relations.get(path).map_or(&[], Vec::as_slice),
+            unresolved: unresolved.get(path).map_or(&[], Vec::as_slice),
+        };
+        let built = blocks::build_file_blocks(repository_id, &facts, &resolve, &digest_of)?;
+        blocks::store_file_blocks(transaction, &workspace.to_string(), generation, built)?;
+    }
     Ok(())
 }
 
@@ -2489,7 +2582,49 @@ fn load_evidence(
     fact: Uuid,
     fact_type: &str,
 ) -> Result<Vec<EvidenceView>> {
-    let mut statement = connection.prepare("SELECT label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest FROM cg_evidence WHERE workspace_id=?1 AND generation=?2 AND fact_id=?3 AND fact_type=?4 ORDER BY path,start_byte,end_byte,label,ordinal LIMIT ?5")?;
+    load_evidence_from(
+        connection,
+        &format!(
+            "SELECT label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest
+             FROM cg_block_evidence e WHERE e.fact_id=?3 AND e.fact_type=?4 AND {}
+             ORDER BY path,start_byte,end_byte,label,ordinal LIMIT ?5",
+            blocks::scope_sql("e")
+        ),
+        workspace,
+        generation,
+        fact,
+        fact_type,
+    )
+}
+
+/// Evidence read from the v1 physical table, for the v1-to-v2 migration only:
+/// the shared block tables do not exist yet when it runs.
+fn load_evidence_legacy(
+    connection: &Connection,
+    workspace: Uuid,
+    generation: i64,
+    fact: Uuid,
+    fact_type: &str,
+) -> Result<Vec<EvidenceView>> {
+    load_evidence_from(
+        connection,
+        "SELECT label,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,evidence_digest FROM cg_evidence WHERE workspace_id=?1 AND generation=?2 AND fact_id=?3 AND fact_type=?4 ORDER BY path,start_byte,end_byte,label,ordinal LIMIT ?5",
+        workspace,
+        generation,
+        fact,
+        fact_type,
+    )
+}
+
+fn load_evidence_from(
+    connection: &Connection,
+    sql: &str,
+    workspace: Uuid,
+    generation: i64,
+    fact: Uuid,
+    fact_type: &str,
+) -> Result<Vec<EvidenceView>> {
+    let mut statement = connection.prepare(sql)?;
     let rows = statement.query_map(
         params![
             workspace.to_string(),
@@ -2563,11 +2698,13 @@ fn load_unresolved(
     generation: i64,
     owner: Uuid,
 ) -> Result<Vec<UnresolvedReferenceView>> {
-    let mut statement = connection.prepare(
-        "SELECT kind,owner_id,raw_target,path,start_byte,end_byte,start_line,start_column,end_line,end_column,source_digest,reference_digest
-         FROM cg_unresolved_references WHERE workspace_id=?1 AND generation=?2 AND owner_id=?3
-         ORDER BY path,start_byte,unresolved_id LIMIT ?4",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT u.kind,u.owner_id,u.raw_target,b.path,u.start_byte,u.end_byte,u.start_line,u.start_column,u.end_line,u.end_column,u.source_digest,u.reference_digest
+         FROM cg_block_unresolved u JOIN cg_blocks b ON b.block_id=u.block_id
+         WHERE u.owner_id=?3 AND {}
+         ORDER BY b.path,u.start_byte,u.unresolved_id LIMIT ?4",
+        blocks::scope_sql("u")
+    ))?;
     let rows = statement.query_map(
         params![
             workspace.to_string(),
@@ -2654,6 +2791,7 @@ fn parse_provenance(text: &str) -> rusqlite::Result<FactProvenance> {
 fn parse_extraction_mode(text: &str) -> rusqlite::Result<ExtractionMode> {
     match text {
         STRICT_EXTRACTION_MODE => Ok(ExtractionMode::ExtractedV1_0),
+        INFERRED_EXTRACTION_MODE => Ok(ExtractionMode::ExtractedInferredV1_1),
         "EXPLORATORY/1.0" => Ok(ExtractionMode::Exploratory),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -3319,7 +3457,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_v5_migration_preserves_ready_status_and_v6_metrics_survive_restart() {
+    fn populated_v5_migration_preserves_ready_status_and_v7_metrics_survive_restart() {
         use crate::lifecycle::{IndexLifecyclePhase, IndexRunMetrics};
 
         let (directory, mut store, project, workspace) = store();
@@ -3341,10 +3479,6 @@ mod tests {
                 ],
             )
             .unwrap();
-        store.connection.execute(
-            "INSERT INTO cg_index_manifest(workspace_id,path,source_digest) VALUES (?1,'src/lib.rs',?2)",
-            params![workspace.to_string(), source_digest],
-        ).unwrap();
         let expected_counts = store.index_status(workspace).unwrap().unwrap().ready_counts;
         let expected_alpha = store.search_name(workspace, "alpha", 1).unwrap();
         let expected_manifest = store.index_manifest(workspace).unwrap();
@@ -3356,12 +3490,18 @@ mod tests {
         drop(store);
 
         let legacy = Connection::open(&path).unwrap();
+        // Restore a genuine populated v8 database from the shared block store.
+        legacy
+            .execute_batch(include_str!("../tests/fixtures/downgrade-to-v8.sql"))
+            .unwrap();
         legacy
             .execute_batch(
                 "ALTER TABLE cg_index_state DROP COLUMN files_hashed;
              ALTER TABLE cg_index_state DROP COLUMN files_reused;
              ALTER TABLE cg_index_state DROP COLUMN files_extracted;
              ALTER TABLE cg_index_state DROP COLUMN rescan_reason;
+             ALTER TABLE cg_index_state DROP COLUMN skipped_symlinks;
+             ALTER TABLE cg_index_state DROP COLUMN partial_reasons;
              PRAGMA user_version = 5;",
             )
             .unwrap();
@@ -3373,7 +3513,7 @@ mod tests {
 
         let mut migrated = CodegraphStore::open(&path, project).unwrap();
         let status = migrated.index_status(workspace).unwrap().unwrap();
-        assert_eq!(status.schema_version, 6);
+        assert_eq!(status.schema_version, 10);
         assert_eq!(status.phase, IndexLifecyclePhase::Ready);
         assert_eq!(status.ready, Some(ready.clone()));
         assert_eq!(status.ready_counts, expected_counts);
@@ -3383,6 +3523,8 @@ mod tests {
         assert_eq!(status.metrics.files_hashed, 0);
         assert_eq!(status.metrics.files_reused, 0);
         assert_eq!(status.metrics.files_extracted, 0);
+        assert_eq!(status.metrics.skipped_symlinks, 0);
+        assert!(status.metrics.partial_reasons.is_empty());
         assert_eq!(status.rescan_reason, None);
         assert_eq!(
             migrated.search_name(workspace, "alpha", 1).unwrap(),
@@ -3415,6 +3557,11 @@ mod tests {
             overflow_count: 2,
             pending_rescan: true,
             rescan_reason: Some("watcher_overflow".into()),
+            skipped_symlinks: 4,
+            partial_reasons: vec![
+                crate::lifecycle::IndexPartialReason::CargoMetadataNoDeps,
+                crate::lifecycle::IndexPartialReason::CargoMetadataUnavailable,
+            ],
         };
         migrated
             .finish_index_run(

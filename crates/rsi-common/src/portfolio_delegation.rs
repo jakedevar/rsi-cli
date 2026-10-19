@@ -57,7 +57,9 @@ pub enum AppointChildTargetV1 {
     /// `node_id: <id>` replaces the seat of that child (one the caller's node
     /// granted) and takes no other field: the child's grant, epoch, ledger
     /// and workers stay; the predecessor seat loses authority in the same
-    /// commit.
+    /// commit. `node_id` equal to the caller's own node is a self-handoff
+    /// (#2021): the seat passes to the session this call launches, whoever
+    /// granted the node, fenced on `expected_grant_version`.
     Portfolio {
         #[serde(default)]
         node_id: Option<Uuid>,
@@ -98,7 +100,14 @@ pub struct AgentManagerAppointChildRequestV1 {
     /// Launch the seat in its own git worktree sandbox (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
+    /// A seat replacement only: where the predecessor wrote its handoff (a
+    /// repo path or a commit), recorded with the seat change (#2021).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
 }
+
+/// The longest recorded handoff reference.
+pub const SEAT_HANDOFF_MAX_BYTES: usize = 512;
 
 impl From<&AgentGlobalAppointManagerRequestV1> for AgentManagerAppointChildRequestV1 {
     fn from(request: &AgentGlobalAppointManagerRequestV1) -> Self {
@@ -110,6 +119,7 @@ impl From<&AgentGlobalAppointManagerRequestV1> for AgentManagerAppointChildReque
             query: request.query.clone(),
             idempotency_key: request.idempotency_key.clone(),
             sandbox: request.sandbox,
+            handoff: None,
         }
     }
 }
@@ -130,6 +140,21 @@ impl AgentManagerAppointChildRequestV1 {
             || !valid_key(&self.idempotency_key)
             || self.launch.validate().is_err()
         {
+            return Err(PORTFOLIO_INVALID_REQUEST);
+        }
+        let seat_replacement = matches!(
+            self.target,
+            AppointChildTargetV1::Portfolio {
+                node_id: Some(_),
+                ..
+            }
+        );
+        if self.handoff.as_deref().is_some_and(|handoff| {
+            !seat_replacement
+                || handoff.trim().is_empty()
+                || handoff.len() > SEAT_HANDOFF_MAX_BYTES
+                || handoff.chars().any(char::is_control)
+        }) {
             return Err(PORTFOLIO_INVALID_REQUEST);
         }
         match &self.target {
@@ -298,6 +323,7 @@ mod tests {
             query: "You manage B and C.".into(),
             idempotency_key: "k".into(),
             sandbox: None,
+            handoff: None,
         }
     }
 
@@ -355,6 +381,31 @@ mod tests {
             project_ids.push(Uuid::new_v4());
         }
         assert_eq!(replace.validate(), Err(PORTFOLIO_INVALID_REQUEST));
+    }
+
+    #[test]
+    fn a_handoff_reference_rides_only_a_seat_replacement() {
+        let mut replace = create(Vec::new());
+        replace.target = AppointChildTargetV1::Portfolio {
+            node_id: Some(Uuid::new_v4()),
+            tier_label: None,
+            project_ids: Vec::new(),
+            allowed_launches: Vec::new(),
+            policy: None,
+            child_policy: None,
+            max_direct_reports: None,
+            launch_project_id: None,
+            expected_grant_version: Some(4),
+        };
+        replace.handoff = Some("thoughts/shared/handoffs/general/h.md".into());
+        assert_eq!(replace.validate(), Ok(()));
+        for bad in ["", "  ", "a\nb", &"x".repeat(SEAT_HANDOFF_MAX_BYTES + 1)] {
+            replace.handoff = Some(bad.into());
+            assert_eq!(replace.validate(), Err(PORTFOLIO_INVALID_REQUEST));
+        }
+        let mut create = create(vec![Uuid::new_v4()]);
+        create.handoff = Some("h.md".into());
+        assert_eq!(create.validate(), Err(PORTFOLIO_INVALID_REQUEST));
     }
 
     #[test]

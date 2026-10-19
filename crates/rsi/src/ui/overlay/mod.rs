@@ -7,12 +7,15 @@ mod card_editor;
 mod cohort_settlement;
 mod command_palette;
 mod create_entity_form;
+mod daemon_text_editor;
 mod diagnostics;
 mod dialectic;
 mod esp_square;
 mod file_explorer;
 mod fleet;
 mod global_manager_workspace;
+pub(crate) mod gm_budget;
+pub(crate) mod grant_editor;
 pub(crate) mod graph;
 pub(crate) mod graph_layout;
 mod harness_manager;
@@ -52,6 +55,7 @@ pub(crate) mod terminal;
 mod text_area_bg_editor;
 mod theme_picker;
 mod theme_role_editor;
+mod todo_popup;
 mod topology_preview;
 mod trash_browser;
 
@@ -658,6 +662,19 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         OverlayState::TextAreaBgEditor { input, error } => {
             text_area_bg_editor::render_text_area_bg_editor(frame, area, input, *error);
         }
+        OverlayState::DaemonTextEditor {
+            field,
+            input,
+            error,
+        } => {
+            daemon_text_editor::render_daemon_text_editor(
+                frame,
+                area,
+                field,
+                input,
+                error.as_deref(),
+            );
+        }
         OverlayState::Prompt {
             surface,
             working_dir,
@@ -984,6 +1001,9 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
             scroll_offset,
         } => {
             hook_form::render_skill_preview(frame, area, name, content, *scroll_offset);
+        }
+        OverlayState::TodoPopup(state) => {
+            todo_popup::render_todo_popup(frame, area, app, state);
         }
         OverlayState::Diagnostics => {
             diagnostics::render_diagnostics(frame, area, app);

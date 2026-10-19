@@ -591,6 +591,7 @@ async fn content_base_selection(
     Ok((base.to_owned(), None))
 }
 
+#[cfg(test)]
 pub(super) async fn content_base(
     root: &Path,
     base: &str,
@@ -1726,10 +1727,9 @@ pub(super) async fn migration(root: &Path, baseline: &str, digest: &str) -> Resu
         return Err(refused("manager_v2_inventory_digest"));
     }
     let inventory: Value = serde_json::from_slice(&raw)?;
-    let canonical: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tools/released-migrations.json"
-    )))?;
+    let canonical: Value = serde_json::from_str(include_str!(
+        "../../../../../tools/released-migrations.json"
+    ))?;
     // A digest supplied by an agent is only a correlation value. The complete
     // daemon-pinned catalog, including every old pin, is the admission authority.
     if inventory != canonical {

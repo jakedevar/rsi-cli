@@ -24,6 +24,89 @@ pub struct DiscoveredModels {
     pub models: Vec<(String, String)>,
     #[serde(default)]
     pub effort_capabilities: Vec<ModelEffortCapabilities>,
+    /// Where the list came from (#2752): `live` (this login's own list),
+    /// `bundled` (the CLI's shipped catalog) or `stale` (an older live list
+    /// kept after a failed refresh). `None` for providers with one source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// When a `live`/`stale` list was fetched (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    /// The live probe failed and the list fell back to the bundled catalog.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+    /// Stable reason code of the failed probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    /// Menu models a fresh live list omits: the login cannot use them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<ModelAvailability>,
+}
+
+impl DiscoveredModels {
+    /// The picker rows: `models` with every model the login's fresh live list
+    /// omits labelled `(unavailable)` (#2752). Ids are untouched.
+    #[must_use]
+    pub fn picker_models(&self) -> Vec<(String, String)> {
+        self.models
+            .iter()
+            .map(|(id, label)| {
+                if self
+                    .unavailable
+                    .iter()
+                    .any(|entry| !entry.available && entry.model.eq_ignore_ascii_case(id))
+                {
+                    (id.clone(), format!("{label} (unavailable)"))
+                } else {
+                    (id.clone(), label.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// One-line catalog provenance for the picker title: the source, its age
+    /// and, when degraded, why (`live 2m`, `bundled (probe_timeout)`).
+    /// `None` for providers that report no source.
+    #[must_use]
+    pub fn catalog_note(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let source = self.source.as_deref()?;
+        let mut note = source.to_string();
+        if let Some(fetched_at) = self
+            .fetched_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        {
+            let secs = now
+                .signed_duration_since(fetched_at.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0);
+            let age = if secs < 60 {
+                format!("{secs}s")
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{}h", secs / 3600)
+            };
+            note.push(' ');
+            note.push_str(&age);
+        }
+        if self.degraded {
+            note.push_str(&format!(
+                " (degraded: {})",
+                self.degraded_reason.as_deref().unwrap_or("probe_failed")
+            ));
+        }
+        Some(note)
+    }
+}
+
+/// A model's availability for the signed-in login (#2752).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelAvailability {
+    pub model: String,
+    pub available: bool,
+    /// `absent_from_live_catalog`.
+    pub reason: String,
 }
 
 /// The backend that produced a model's weights, used to keep review authors
@@ -431,6 +514,46 @@ fn uppercase_suffix_or_title(part: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_models_label_unavailable_rows_and_describe_the_catalog() {
+        let discovered = DiscoveredModels {
+            models: vec![
+                ("gpt-6-astra".into(), "GPT-6 Astra".into()),
+                ("gpt-6-sol".into(), "GPT-6 Sol".into()),
+            ],
+            source: Some("live".into()),
+            fetched_at: Some("2026-10-16T00:00:00Z".into()),
+            unavailable: vec![ModelAvailability {
+                model: "gpt-6-astra".into(),
+                available: false,
+                reason: "absent_from_live_catalog".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            discovered.picker_models(),
+            vec![
+                ("gpt-6-astra".into(), "GPT-6 Astra (unavailable)".into()),
+                ("gpt-6-sol".into(), "GPT-6 Sol".into()),
+            ]
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T00:02:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(discovered.catalog_note(now).as_deref(), Some("live 2m"));
+        let degraded = DiscoveredModels {
+            source: Some("bundled".into()),
+            degraded: true,
+            degraded_reason: Some("probe_timeout".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            degraded.catalog_note(now).as_deref(),
+            Some("bundled (degraded: probe_timeout)")
+        );
+        assert_eq!(DiscoveredModels::default().catalog_note(now), None);
+    }
 
     #[test]
     fn vendor_family_uses_model_for_routed_backends_and_fails_closed_on_unknowns() {

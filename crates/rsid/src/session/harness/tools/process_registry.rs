@@ -51,13 +51,13 @@ impl HarnessProcessRegistryManager {
         let sessions = {
             let guard = store.lock().await;
             guard
-                .load_all_session_ids()
+                .internal_process_wake_owners()
                 .map_err(|error| error.to_string())
         };
         let sessions = match sessions {
             Ok(session_ids) => session_ids,
             Err(error) => {
-                tracing::warn!(%error, "Failed to load sessions for background process wake cleanup");
+                tracing::warn!(%error, "Failed to load background process wake owners for cleanup");
                 return;
             }
         };
@@ -247,6 +247,58 @@ mod tests {
             .list_owned_scheduled_jobs(session.id, false, 64)
             .expect("scheduled jobs");
         assert!(remaining.is_empty());
+    }
+
+    /// #2375: startup withdraws exactly the internal process wakes (one read,
+    /// no per-session write transaction); every other wake stays armed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn startup_cleanup_withdraws_only_internal_process_wakes() {
+        let store = crate::store::Store::open_in_memory().expect("store");
+        let mut with_process_wake = make_test_session();
+        with_process_wake.status = rsi_common::types::SessionStatus::Running;
+        store.insert_session(&with_process_wake).expect("session");
+        let mut other = make_test_session();
+        other.status = rsi_common::types::SessionStatus::Running;
+        store.insert_session(&other).expect("session");
+        store
+            .insert_scheduled_job(&process_wake(with_process_wake.id))
+            .expect("process wake");
+        let mut ordinary = process_wake(other.id);
+        ordinary.name = "ordinary-owner-wake".to_string();
+        store
+            .insert_scheduled_job(&ordinary)
+            .expect("ordinary wake");
+        assert_eq!(
+            store.internal_process_wake_owners().expect("owners"),
+            vec![with_process_wake.id]
+        );
+
+        let manager = HarnessProcessRegistryManager::new();
+        manager.install_store(Arc::new(TokioMutex::new(store)));
+        manager.clear_stale_wakes().await;
+
+        let store = manager.runtime.store.get().expect("installed store");
+        let guard = store.lock().await;
+        assert!(
+            guard
+                .list_owned_scheduled_jobs(with_process_wake.id, false, 64)
+                .expect("jobs")
+                .is_empty()
+        );
+        assert_eq!(
+            guard
+                .list_owned_scheduled_jobs(other.id, false, 64)
+                .expect("jobs")
+                .len(),
+            1
+        );
+        assert!(
+            guard
+                .internal_process_wake_owners()
+                .expect("owners")
+                .is_empty()
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

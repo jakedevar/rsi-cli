@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 fn crates_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    Path::new(rsi_common::manifest_dir!()).join("..")
 }
 
 fn manifests() -> BTreeMap<String, Table> {

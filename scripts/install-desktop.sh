@@ -12,6 +12,11 @@
 #   ~/.local/bin/rsi-desktop        symlink to it (RSI_INSTALL_BIN_DIR overrides)
 #   ~/.local/share/applications/rsi-desktop.desktop
 #   ~/.local/share/icons/hicolor/<size>/apps/rsi-desktop.png
+# and on macOS, instead of the two freedesktop entries:
+#   ~/Applications/RSI Desktop.app  an unsigned app bundle around the same
+#                                   binary (RSI_DESKTOP_APP_DIR overrides the
+#                                   folder); `--build-only` leaves it at
+#                                   <target>/release/bundle/macos/
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,6 +25,7 @@ TAURI_DIR="$DESKTOP_DIR/src-tauri"
 BIN_DIR="${RSI_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 INSTALL_DIR="${RSI_DESKTOP_INSTALL_DIR:-$HOME/.rsi/install}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+APP_DIR="${RSI_DESKTOP_APP_DIR:-$HOME/Applications}"
 
 BUILD_ONLY=0
 REQUIRED=0
@@ -65,15 +71,73 @@ if [[ ! -d node_modules || package-lock.json -nt node_modules ]]; then
 fi
 npm run build
 
-# `build.rs` watches ../dist, so a plain cargo build re-embeds frontend changes.
-cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml"
+# The target cargo builds into: a global `build.target-dir` or CARGO_TARGET_DIR may be
+# shared with other worktrees. Cargo's freshness check for the workspace crate
+# (`rsi-desktop`) is mtime-based, so a tree whose sources are older than another
+# tree's last build there would link that tree's crate. The release-target guard
+# (#938, #2177) records which worktree built `release/` and removes this workspace's
+# members when a different one builds, under one lock per target.
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps --manifest-path "$TAURI_DIR/Cargo.toml" \
     | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+# shellcheck source=scripts/release-target-guard.sh
+source "$ROOT/scripts/release-target-guard.sh"
+RELEASE_GUARD_MARKER=".rsi-desktop-source"
+RELEASE_GUARD_LOCK=".rsi-desktop.lock"
+RELEASE_GUARD_MANIFEST="$TAURI_DIR/Cargo.toml"
+release_guard_lock "$TARGET_DIR"
+release_guard_prepare "$ROOT" "$TARGET_DIR"
+# `build.rs` watches ../dist, so a plain cargo build re-embeds frontend changes.
+# fd 8 holds the lock; a long-lived child (sccache server) must not inherit it.
+cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml" 8>&-
+release_guard_finish "$ROOT" "$TARGET_DIR"
 BUILT_BIN="$TARGET_DIR/release/rsi-desktop"
 [[ -x "$BUILT_BIN" ]] || { echo "error: $BUILT_BIN was not built" >&2; exit 1; }
 
+# macOS app bundle, assembled by hand so the install needs no tauri-cli: the
+# same layout `cargo tauri build --bundles app` writes (Contents/MacOS binary,
+# Info.plist, Resources/icon.icns). It is not signed or notarized; a locally
+# built bundle carries no quarantine flag, so it opens without Gatekeeper's
+# prompt. Signing for distribution is the operator's step (desktop/README.md).
+BUILT_APP=""
+if [[ "$PLATFORM" == Darwin ]]; then
+    IFS=$'\t' read -r APP_NAME APP_ID APP_VERSION < <(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(c["productName"], c["identifier"], c["version"], sep="\t")' "$TAURI_DIR/tauri.conf.json")
+    BUNDLE_DIR="$TARGET_DIR/release/bundle/macos"
+    BUILT_APP="$BUNDLE_DIR/$APP_NAME.app"
+    rm -rf "$BUILT_APP"
+    mkdir -p "$BUILT_APP/Contents/MacOS" "$BUILT_APP/Contents/Resources"
+    cp -p "$BUILT_BIN" "$BUILT_APP/Contents/MacOS/rsi-desktop"
+    cp -p "$TAURI_DIR/icons/icon.icns" "$BUILT_APP/Contents/Resources/icon.icns"
+    cat > "$BUILT_APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+  <key>CFBundleExecutable</key><string>rsi-desktop</string>
+  <key>CFBundleIconFile</key><string>icon.icns</string>
+  <key>CFBundleIdentifier</key><string>$APP_ID</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>$APP_NAME</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
+  <key>CFBundleVersion</key><string>$APP_VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>10.15</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -lint -s "$BUILT_APP/Contents/Info.plist"
+    fi
+fi
+
 if [[ "$BUILD_ONLY" -eq 1 ]]; then
     echo "built: $BUILT_BIN"
+    [[ -n "$BUILT_APP" ]] && echo "built: $BUILT_APP"
     exit 0
 fi
 
@@ -86,8 +150,16 @@ mv -f "$temp" "$INSTALL_DIR/rsi-desktop"
 ln -sfn "$INSTALL_DIR/rsi-desktop" "$BIN_DIR/rsi-desktop"
 
 if [[ "$PLATFORM" == Darwin ]]; then
+    # Replace the bundle by rename: a running copy keeps its open binary.
+    mkdir -p "$APP_DIR"
+    staged="$(mktemp -d "$APP_DIR/.rsi-desktop-app.XXXXXX")"
+    cp -Rp "$BUILT_APP" "$staged/"
+    rm -rf "$APP_DIR/$APP_NAME.app"
+    mv "$staged/$APP_NAME.app" "$APP_DIR/$APP_NAME.app"
+    rmdir "$staged"
     echo "Desktop UI installed:"
     echo "  $BIN_DIR/rsi-desktop -> $INSTALL_DIR/rsi-desktop"
+    echo "  $APP_DIR/$APP_NAME.app"
     exit 0
 fi
 

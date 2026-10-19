@@ -17,14 +17,28 @@ use rsi_common::agent_jobs::{
     AgentListJobsRequestV1, AgentListJobsResultV1, AgentSubmitJobReceiptV1,
     AgentSubmitJobRequestV1, JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_KIND_NOT_AUTHORIZED,
     JOB_NOT_FOUND, JOB_QA_LANE_SHA_MISMATCH, JOB_QA_LANE_TIMEOUT_MAX_MINS,
-    JOB_SANDBOX_SESSION_LIVE, JOB_TEST_TIMEOUT_DEFAULT_MINS, JOB_TIMEOUT_NOT_AUTHORIZED, JobKind,
-    JobParams,
+    JOB_SANDBOX_SESSION_LIVE, JOB_SCOPED_TEST_TIMEOUT_DEFAULT_MINS, JOB_TEST_TIMEOUT_DEFAULT_MINS,
+    JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMINGS_TIMEOUT_DEFAULT_MINS, JOB_TIMEOUT_NOT_AUTHORIZED,
+    JobKind, JobParams,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
 
 const DEFAULT_LIST: usize = 20;
 const MAX_LIST: usize = 100;
+
+fn validate_build_package(
+    package: &str,
+    workspace_members: &std::collections::HashSet<String>,
+) -> Result<()> {
+    if workspace_members.contains(package) {
+        Ok(())
+    } else {
+        Err(DaemonError::InvalidParam(
+            "invalid_input field=params.package".into(),
+        ))
+    }
+}
 
 // A QA SHA is a HEAD label only. Never inspect worktree bytes during admission.
 // Keep this policy separate from shared fork/terminal cleanliness observations.
@@ -61,6 +75,8 @@ async fn observe_qa_head(root: &std::path::Path) -> Result<String> {
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"]);
+        // The test probe mutates these limits; production does not need `mut`.
+        #[allow(unused_mut)]
         let mut limits = CaptureLimits::new(
             64 * 1024,
             64 * 1024,
@@ -132,6 +148,46 @@ pub(crate) fn job_kind_permitted(kind: JobKind, is_manager: bool, is_lead: bool)
     }
 }
 
+/// The policy refusals the owner's current in-scope manager sees typed on
+/// `AgentCancelJob` (#2233). They are raised only after the scope and the
+/// ancestor-ownership checks, so the caller is that manager.
+const MANAGER_CANCEL_POLICY_REFUSALS: [&str; 3] = [
+    "manager_v2_capability_denied",
+    "manager_v2_paused",
+    "manager_v2_human_or_recovery_owner",
+];
+
+/// #2232/#2233: whether `caller`, who does not own `job`, may stop it as the
+/// owner's manager. The daemon-owned check runs first and every other refusal
+/// but the policy ones above collapses to `job_not_found`, so a caller outside
+/// the owner's manager chain (a worker, a stale or foreign manager, an
+/// ancestor that owns the target's lifecycle) learns nothing about a foreign
+/// job: not that it exists, who owns it, or why it is protected.
+fn authorize_manager_cancel(
+    store: &crate::store::Store,
+    caller: Uuid,
+    job: &AgentJobV1,
+) -> Result<()> {
+    let not_found = || DaemonError::InvalidParam(JOB_NOT_FOUND.into());
+    if !crate::agent_jobs::manager_may_cancel(store, job)? {
+        return Err(not_found());
+    }
+    match store.manager_session_control_scope(caller, job.owner_session_id, true) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(not_found()),
+        Err(DaemonError::InvalidParam(code))
+            if MANAGER_CANCEL_POLICY_REFUSALS.contains(&code.as_str()) =>
+        {
+            Err(DaemonError::InvalidParam(code))
+        }
+        // Any other typed scope refusal (target owned by an ancestor, a
+        // container owner, a custody change) is about the caller's authority
+        // over a job it cannot see.
+        Err(DaemonError::InvalidParam(_)) => Err(not_found()),
+        Err(error) => Err(error),
+    }
+}
+
 /// [`job_kind_permitted`] plus #1099: a `test` job with `candidate_receipt`
 /// fetches and builds an arbitrary branch, so it is a manager/Epic-lead job
 /// like landing.
@@ -145,9 +201,30 @@ pub(crate) fn job_permitted(params: &JobParams, is_manager: bool, is_lead: bool)
 /// that names none (a `candidate_receipt` run keeps the unit cap), and report
 /// whether an explicit timeout raises the default. Admission checks the
 /// manager/Epic-lead role or the bounded QA Issue-worker binding.
+///
+/// #1979: a `scoped_test` job's default is the larger of `default_minutes` and
+/// `JOB_SCOPED_TEST_TIMEOUT_DEFAULT_MINS`, capped at the test maximum: the tool
+/// budgets each package separately, so a plan of several long packages cannot
+/// finish in the 20-minute test default. Only a timeout above that default
+/// needs authority.
+///
+/// #2089: the `test-timings` recipe (one nextest JUnit run over `rsid` and
+/// `rsid-store`) gets the same rule with `JOB_TEST_TIMINGS_TIMEOUT_DEFAULT_MINS`;
+/// the manifest declaration can only lower it (`recipe::fit_timeout`).
 pub(crate) fn stamp_test_timeout(mut params: JobParams, default_minutes: u32) -> (JobParams, bool) {
     let JobParams::Test(test) = &mut params else {
         return (params, false);
+    };
+    let default_minutes = if test.is_scoped_test() {
+        default_minutes
+            .max(JOB_SCOPED_TEST_TIMEOUT_DEFAULT_MINS)
+            .min(JOB_TEST_TIMEOUT_MAX_MINS)
+    } else if test.is_test_timings() {
+        default_minutes
+            .max(JOB_TEST_TIMINGS_TIMEOUT_DEFAULT_MINS)
+            .min(JOB_TEST_TIMEOUT_MAX_MINS)
+    } else {
+        default_minutes
     };
     let raises = match test.timeout_minutes {
         Some(minutes) => minutes > default_minutes,
@@ -169,18 +246,20 @@ pub(crate) fn stamp_test_timeout(mut params: JobParams, default_minutes: u32) ->
 /// `sandbox_session_id`, `AgentEnqueueLandingSource` `source_session_id`).
 /// The caller's manager scope (project manager, area node or global seat)
 /// must reach it, a named `project_id` must be its project, and the scope's
-/// policy must execute. Any other caller is refused `denied`.
+/// policy must execute. Any other caller is refused `denied`; a target
+/// outside the caller's scope is refused `out_of_scope`.
 pub(crate) fn manager_reached_sandbox(
     store: &crate::store::Store,
     caller: Uuid,
     target: Uuid,
     project: Option<Uuid>,
     denied: &'static str,
+    out_of_scope: &'static str,
 ) -> Result<rsi_common::types::Session> {
     use rsi_common::harness_manager_v2::ManagerOperatingModeV2;
     let scope = store
         .manager_session_control_scope(caller, target, false)?
-        .ok_or_else(|| DaemonError::PolicyDenied(denied.into()))?;
+        .ok_or_else(|| DaemonError::PolicyDenied(out_of_scope.into()))?;
     if project.is_some_and(|project| scope.target.project_id != Some(project)) {
         return Err(DaemonError::InvalidParam(
             rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE.into(),
@@ -277,6 +356,7 @@ fn admit_job(
                 target,
                 request.project_id,
                 JOB_KIND_NOT_AUTHORIZED,
+                JOB_KIND_NOT_AUTHORIZED,
             )?;
             if !target.status.is_terminal() {
                 return Err(DaemonError::InvalidParam(JOB_SANDBOX_SESSION_LIVE.into()));
@@ -312,7 +392,7 @@ fn admit_job(
     if (request.raises_timeout || qa)
         && !(projection.is_manager || projection.is_lead || qa_binding.is_some())
     {
-        return Err(DaemonError::PolicyDenied(JOB_TIMEOUT_NOT_AUTHORIZED.into()));
+        return Err(job_timeout_not_authorized_error(qa));
     }
     let needs_authority =
         sandbox.is_some() || !job_permitted(params, false, false) || request.raises_timeout || qa;
@@ -330,6 +410,33 @@ fn admit_job(
     })
 }
 
+/// The typed `job_timeout_not_authorized` refusal: it names the cause and the
+/// next step, and travels as an invalid-request refusal, never as an internal
+/// error (#1956).
+fn job_timeout_not_authorized_error(qa_lane: bool) -> DaemonError {
+    let (cause, next_action) = if qa_lane {
+        (
+            "qa_lane shard jobs need a live manager Issue-launch binding with qa_lane delegation, or the manager/Epic lead",
+            "submit the shard from the QA lane worker the manager launched with qa_lane delegation, or ask the manager to run it",
+        )
+    } else {
+        (
+            "timeout_minutes above the operator default needs the appointed manager or an Epic lead",
+            "resubmit without timeout_minutes (the default applies), or ask the manager to run the longer job",
+        )
+    };
+    DaemonError::StructuredRpc {
+        rpc_code: rsi_common::rpc::INVALID_PARAMS,
+        message: format!("{JOB_TIMEOUT_NOT_AUTHORIZED}: {cause}; next: {next_action}"),
+        data: serde_json::json!({
+            "kind": JOB_TIMEOUT_NOT_AUTHORIZED,
+            "code": JOB_TIMEOUT_NOT_AUTHORIZED,
+            "retryable": false,
+            "next_action": next_action,
+        }),
+    }
+}
+
 impl AgentControlHandle {
     /// # Errors
     /// A stable `job_*` refusal, or a persistence/launch error.
@@ -342,7 +449,7 @@ impl AgentControlHandle {
     ) -> Result<AgentSubmitJobReceiptV1> {
         let params = request
             .typed_params()
-            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+            .map_err(|code| DaemonError::InvalidParam(request.refusal_detail(code)))?;
         let default_timeout =
             self.runtime_config
                 .as_ref()
@@ -372,10 +479,18 @@ impl AgentControlHandle {
         // job loop launches it once the drain ends or the deploy has
         // restarted); landing, cloud-gate and cloud-sweep jobs keep the typed
         // retryable refusal. The deploy's caller and parentless sessions run.
+        // #2190: a staged `interrupt_workers` deploy holds every `test`/`build`
+        // job, those sessions included, until it settles: it would stop them.
         let mut hold = false;
+        let mut release_by = None;
         if let Some(drain) = &self.deploy_drain {
             if matches!(params.kind(), JobKind::Test | JobKind::Build) {
-                hold = drain.holds(Some(caller), session.parent_id.is_some());
+                hold = drain.holds_job_start(Some(caller), session.parent_id.is_some());
+                if hold {
+                    release_by = drain
+                        .job_release_by()
+                        .map(|end| end.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+                }
             } else {
                 drain.refuse_if_draining(Some(caller), session.parent_id.is_some())?;
             }
@@ -410,6 +525,22 @@ impl AgentControlHandle {
         })
         .await
         .map_err(|error| DaemonError::Process(format!("job directory probe: {error}")))??;
+        // #2823: a unit with the wrong compiler fails the warning gate on
+        // untouched code; name the mismatch before any row or build exists.
+        {
+            let (runtime, params, cwd) =
+                (std::sync::Arc::clone(&runtime), params.clone(), cwd.clone());
+            tokio::task::spawn_blocking(move || runtime.check_toolchain(&params, &cwd))
+                .await
+                .map_err(|error| DaemonError::Process(format!("toolchain probe: {error}")))?
+                .map_err(DaemonError::InvalidParam)?;
+        }
+        if let JobParams::Build(build) = &params
+            && let Some(package) = &build.package
+        {
+            let members = crate::topology::catalog::workspace_members(&cwd).await?;
+            validate_build_package(package, &members)?;
+        }
         if let Some(expected) = qa_sha {
             // QA admission forbids requested worktrees; resolve_cwd returned
             // the canonical owner sandbox, never a working_dir fallback.
@@ -461,14 +592,25 @@ impl AgentControlHandle {
         })
         .await
         .map_err(|error| DaemonError::Process(format!("job submit: {error}")))??;
+        // An idempotent replay may return a job that has since started.
+        let release_by =
+            release_by.filter(|_| row.job.state == rsi_common::agent_jobs::JobState::Queued);
         Ok(AgentSubmitJobReceiptV1 {
+            job_id: row.job.id,
             job: row.job,
             replayed,
+            release_by,
         })
     }
 
+    /// #2470: the current manager seat also reads the jobs its published
+    /// rotation predecessors owned in the project and the jobs of sessions in
+    /// its live scope (a worker's receipt); read only, ownership and the cancel
+    /// rule do not change.
+    ///
     /// # Errors
-    /// `job_not_found` for an unknown job or one owned by another session.
+    /// `job_not_found` for an unknown job or one owned by another session
+    /// outside the caller's seat lineage and manager scope.
     pub async fn agent_get_job(
         &self,
         caller: Uuid,
@@ -477,16 +619,28 @@ impl AgentControlHandle {
         self.store
             .lock()
             .await
-            .get_agent_job(request.job_id)?
+            .get_agent_job_for_reader(caller, request.job_id)?
             .map(|row| row.job)
-            .filter(|job| job.owner_session_id == caller)
             .ok_or_else(|| DaemonError::InvalidParam(JOB_NOT_FOUND.into()))
     }
 
-    /// `AgentCancelJob` (#1106): the owner stops a running job.
+    /// `AgentCancelJob` (#1106): the owner stops a running job. #2213: the
+    /// current appointed manager (or a portfolio seat inside its grant) may
+    /// also stop an ordinary worker `test`/`build` job owned by a session in
+    /// its live scope, under the same scope, capability, mode and pause checks
+    /// as its other session controls; the settled job and the response name
+    /// the canceller. #2232/#2233: a daemon-owned job (a lander, a release
+    /// build, an automatic QA run) is never cancelled by a manager, and every
+    /// refusal a non-owner can reach that does not come from the caller being
+    /// the owner's current in-scope manager is `job_not_found`, the same as an
+    /// unknown job, so the verb is no oracle for foreign jobs.
     ///
     /// # Errors
-    /// `job_not_found` for an unknown job or one owned by another session.
+    /// `job_not_found` for an unknown job, one owned by another session
+    /// outside the caller's manager scope or authority, or a daemon-owned
+    /// job. The owner's current in-scope manager alone sees the typed policy
+    /// refusals (`manager_v2_capability_denied`, `manager_v2_paused`,
+    /// `manager_v2_human_or_recovery_owner`).
     pub async fn agent_cancel_job(
         &self,
         caller: Uuid,
@@ -494,19 +648,39 @@ impl AgentControlHandle {
         runtime: std::sync::Arc<dyn JobRuntime>,
     ) -> Result<AgentCancelJobResultV1> {
         let store = std::sync::Arc::clone(&self.store);
-        let (job, cancelled) = tokio::task::spawn_blocking(move || {
+        let (job, cancelled, cancelled_by_manager) = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
-            let owned = store
-                .get_agent_job(request.job_id)?
-                .is_some_and(|row| row.job.owner_session_id == caller);
-            if !owned {
-                return Err(DaemonError::InvalidParam(JOB_NOT_FOUND.into()));
+            let not_found = || DaemonError::InvalidParam(JOB_NOT_FOUND.into());
+            let row = store.get_agent_job(request.job_id)?.ok_or_else(not_found)?;
+            let owner = row.job.owner_session_id;
+            let by_manager = owner != caller;
+            if by_manager {
+                authorize_manager_cancel(&store, caller, &row.job)?;
             }
-            crate::agent_jobs::cancel_job(&store, &*runtime, request.job_id, chrono::Utc::now())
+            let (job, cancelled) = crate::agent_jobs::cancel_job_as(
+                &store,
+                &*runtime,
+                request.job_id,
+                chrono::Utc::now(),
+                by_manager.then_some(caller),
+            )?;
+            if by_manager && cancelled {
+                tracing::info!(
+                    job_id = %request.job_id,
+                    canceller = %caller,
+                    owner = %owner,
+                    "job cancelled by the owner's manager"
+                );
+            }
+            Ok::<_, DaemonError>((job, cancelled, by_manager.then_some(caller)))
         })
         .await
         .map_err(|error| DaemonError::Process(format!("job cancel: {error}")))??;
-        Ok(AgentCancelJobResultV1 { job, cancelled })
+        Ok(AgentCancelJobResultV1 {
+            job,
+            cancelled,
+            cancelled_by_manager,
+        })
     }
 
     /// # Errors
@@ -523,7 +697,7 @@ impl AgentControlHandle {
             .store
             .lock()
             .await
-            .list_agent_jobs(caller, limit)?
+            .list_agent_jobs_for_reader(caller, limit)?
             .into_iter()
             .map(|row| row.job)
             .collect();
@@ -536,7 +710,49 @@ mod tests {
     use super::QA_HEAD_PROBES;
     use super::job_kind_permitted;
     use super::job_permitted;
+    use super::validate_build_package;
     use rsi_common::agent_jobs::{JobKind, JobParams};
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn timeout_refusal_is_typed_with_cause_and_next_step() {
+        for qa in [false, true] {
+            let error = super::job_timeout_not_authorized_error(qa);
+            assert_eq!(
+                crate::friction::agent_refusal_code(&error),
+                "job_timeout_not_authorized"
+            );
+            let crate::error::DaemonError::StructuredRpc {
+                rpc_code,
+                message,
+                data,
+            } = error
+            else {
+                panic!("structured refusal")
+            };
+            assert_eq!(rpc_code, rsi_common::rpc::INVALID_PARAMS);
+            assert!(message.contains("job_timeout_not_authorized"));
+            assert!(message.contains("next:"));
+            assert!(data["next_action"].as_str().is_some_and(|a| !a.is_empty()));
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn build_package_must_name_a_workspace_member() {
+        let members = ["rsid".to_owned(), "rsi-common".to_owned()]
+            .into_iter()
+            .collect();
+        assert!(validate_build_package("rsid", &members).is_ok());
+        for package in ["workspace", "missing-crate"] {
+            assert_eq!(
+                validate_build_package(package, &members)
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid parameter: invalid_input field=params.package"
+            );
+        }
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
@@ -902,12 +1118,21 @@ mod tests {
         // Malformed included config also proves global config is excluded.
         std::fs::write(&included, "invalid config without a section\n").unwrap();
         install_home();
-        f.submit().await.unwrap();
+        let queued = f.submit().await.unwrap();
         assert!(
             !marker.exists(),
             "HEAD-only probe must not execute the helper"
         );
-        assert_eq!(f.recorder.0.lock().unwrap().len(), 2);
+        assert_eq!(queued.job.state, rsi_common::agent_jobs::JobState::Queued);
+        assert_eq!(queued.job.held.as_deref(), Some("sandbox_job_queued"));
+        assert_eq!(f.recorder.0.lock().unwrap().len(), 1);
+        assert!(
+            f.submit()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("job_qa_lane_limit")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1083,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             recorder.0.lock().unwrap()[0].command.runtime_max_secs,
-            95 * 60
+            95 * 60 + crate::agent_jobs::admission_allowance_secs(&accepted.job.params)
         );
         assert!(
             recorder.0.lock().unwrap()[0]
@@ -1342,6 +1567,50 @@ mod tests {
             20,
         );
         assert_eq!((timeout(&receipt), raises), (None, false));
+        let scoped = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"scoped_test":{"base":"origin/rolling"}});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            params(JobKind::Test, value)
+        };
+        // #1979: a scoped_test default is 60 minutes (never below the operator
+        // default, capped at 180) and only a larger explicit timeout raises it.
+        for (default, expected) in [(20, 60), (90, 90), (180, 180)] {
+            let (stamped, raises) = stamp_test_timeout(scoped(serde_json::json!({})), default);
+            assert_eq!((timeout(&stamped), raises), (Some(expected), false));
+        }
+        let (stamped, raises) =
+            stamp_test_timeout(scoped(serde_json::json!({"timeout_minutes":60})), 20);
+        assert_eq!((timeout(&stamped), raises), (Some(60), false));
+        let (_, raises) = stamp_test_timeout(scoped(serde_json::json!({"timeout_minutes":61})), 20);
+        assert!(raises);
+        // #2089: the `test-timings` recipe defaults to 90 minutes (never below the
+        // operator default, capped at 180); another recipe keeps the operator default.
+        let timings = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({"recipe":"test-timings"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            params(JobKind::Test, value)
+        };
+        for (default, expected) in [(20, 90), (120, 120), (180, 180)] {
+            let (stamped, raises) = stamp_test_timeout(timings(serde_json::json!({})), default);
+            assert_eq!((timeout(&stamped), raises), (Some(expected), false));
+        }
+        let (stamped, raises) =
+            stamp_test_timeout(timings(serde_json::json!({"timeout_minutes":90})), 20);
+        assert_eq!((timeout(&stamped), raises), (Some(90), false));
+        let (_, raises) =
+            stamp_test_timeout(timings(serde_json::json!({"timeout_minutes":91})), 20);
+        assert!(raises);
+        let (other, raises) = stamp_test_timeout(
+            params(JobKind::Test, serde_json::json!({"recipe":"check-cpu"})),
+            20,
+        );
+        assert_eq!((timeout(&other), raises), (Some(20), false));
         let build = params(
             JobKind::Build,
             serde_json::json!({"command":"check","workspace":true}),

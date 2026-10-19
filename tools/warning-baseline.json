@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "about": "Accepted compiler warnings per Cargo package (#1897). scripts/scoped-test fails a run that builds a listed package with a warning key above its count here, or whose baseline is raised against the merge base. Lower the counts as warnings are fixed; never raise them. Regenerate with scripts/scoped-test --warning-baseline-from <job log>.",
+  "packages": {
+    "rsid-store": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "residual": "Both constants sit inside RSI-RELEASED-MIGRATION regions, which are byte-immutable (tools/check-released-migrations.py), and are read only by cfg(test) fixtures, so a cfg(test) gate cannot be added without editing a released region.",
+      "warnings": {
+        "crates/rsid-store/src/store/agent_deploys_operator.rs|dead_code|constant `COPY_COLUMNS` is never used": 1,
+        "crates/rsid-store/src/store/migrations/support.rs|dead_code|constant `V113_CONVERGED_FULL_CATALOG_FINGERPRINT` is never used": 1
+      }
+    },
+    "rsi": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsi-graph": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsid": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsid-core": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsid-remote-read": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsid-harness": {
+      "configs": [
+        "lib",
+        "lib test"
+      ],
+      "warnings": {}
+    },
+    "rsi-common": {
+      "configs": [
+        "lib",
+        "lib test",
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-turn-shim": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-socket-hold": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-signal": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-eval": {
+      "configs": [
+        "lib",
+        "lib test",
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-diag": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-baseline": {
+      "configs": [
+        "lib",
+        "lib test",
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-codegraph": {
+      "configs": [
+        "lib",
+        "lib test",
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-remote": {
+      "configs": [
+        "lib",
+        "lib test",
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "flywheel-imessage": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "flywheel-signal": {
+      "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    }
+  }
+}

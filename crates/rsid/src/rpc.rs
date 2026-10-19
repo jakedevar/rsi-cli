@@ -16,7 +16,7 @@ use crate::store::agent_coordination::AgentReadClass;
 use chrono::{DateTime, Utc};
 use rsi_common::agent_control_schema::{
     AgentCancelWakeParams, AgentControlVerbV1, AgentGetStatusParams, AgentHaltParams,
-    AgentListWakesParams, AgentScheduleWakeParams, LIST_WAKES_DEFAULT_LIMIT,
+    AgentListWakesParams, AgentScheduleWakeParams,
 };
 use rsi_common::agent_coordination::{
     AgentArchiveChildRequestV1, AgentContinueChildRequestV1, AgentGetProgressParamsV1,
@@ -35,8 +35,8 @@ use rsi_common::harness_manager::{
 use rsi_common::issue_workspace::{
     ArchiveIssueRequestV1, CreateIssueV2RequestV1, GetIssueInProjectRequestV1,
     IssueDependencyMutationRequestV1, IssueWorkspaceErrorCodeV1, ListIssueDependenciesRequestV1,
-    ListIssueEventsV2RequestV1, ListIssuesPageRequestV1, RestoreIssueRequestV1,
-    UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
+    ListIssueEventsV2RequestV1, ListIssueHandoffsRequestV1, ListIssuesPageRequestV1,
+    RestoreIssueRequestV1, UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
 };
 use rsi_common::model_control::ModelControlMode;
 use rsi_common::recursive_dag::{
@@ -97,17 +97,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
-mod agent_issues;
+pub(crate) mod agent_issues;
 mod agent_verbs;
 mod codegraph;
+mod cold_archive; // #2384: cold-storage archive status and run-now
 mod common;
 mod fleet;
+mod input_assets; // hub #3044: operator-only paste upload and slash-command listing
 mod issues;
 mod manager;
 mod memory;
 mod models;
 mod program_runs;
+mod project_files; // hub #3012/#3103: project-root-scoped file RPCs (reads, writes)
 mod projects;
+mod prompt_files; // hub #3040: operator prompt-file RPCs (~/.rsi/prompts)
 mod recursive_control;
 mod recursive_read;
 mod remote;
@@ -154,8 +158,11 @@ mod friction; // #1333: ListFrictionRollup and the agent-refusal andon point
 mod global_manager; // #872 Slice B: global manager v0
 mod manager_issue_worker; // #1100: AgentManagerLaunchIssueWorker handler
 mod operator_restart; // #1122: operator quiet-point restart
+mod operator_todos; // #1747: operator to-do list RPCs
 mod portable; // #1406: operator-only portable install bundle
 mod scratch_adopt; // #1147: operator adoption of legacy scratch
+mod standing_directives; // #2649: standing operator directive RPCs
+mod worker_roster; // #2311: AgentWorkerRoster handler
 mod agent_gate {
     use std::collections::HashSet;
     use std::sync::LazyLock;
@@ -244,12 +251,41 @@ pub struct RpcServer {
     dialectic_engine: Option<Arc<crate::dialectic::DialecticEngine>>,
     runtime_config: Arc<RuntimeConfig>,
     rsid_scope_settings_path: std::path::PathBuf,
+    /// hub #3044: where `UploadPasteImage` stores images (`~/.rsi/paste/rsid`;
+    /// a per-process temporary directory under `cfg(test)`).
+    paste_dir: std::path::PathBuf,
+    /// hub #3062: the home whose `.claude/skills` `ListSkills`/`GetSkill`
+    /// `user: true` read (the daemon user's home; a per-process temporary
+    /// directory under `cfg(test)`).
+    skill_home: std::path::PathBuf,
     /// #1036: directory holding the remote-gate spend ledger and the caps
     /// file the daemon mirrors for `scripts/cloud-spend.py`.
     cloud_dir: std::path::PathBuf,
+    /// hub #3040: the rsi data directory whose `prompts/` and
+    /// `trash/prompts/` the operator prompt-file RPCs own (tests point it at
+    /// a temp directory).
+    prompt_data_dir: std::path::PathBuf,
+    /// hub #3039: the host files `operator_config` edits (a throwaway
+    /// directory under unit tests, never the operator's own files).
+    operator_config_paths: crate::operator_config::OperatorConfigPaths,
     model_control_runtime: crate::model_control::ModelControlRuntime,
     compile_engine: Arc<crate::prompt_compile::CompileEngine>,
     ollama_http: reqwest::Client,
+    /// Cancelled when the connection drain starts (#2353): a connection idle
+    /// between requests, and every push stream, then closes at once instead
+    /// of holding the drain open until its deadline.
+    connection_drain: tokio_util::sync::CancellationToken,
+}
+
+/// The data directory the prompt-file RPCs own: the rsi data directory, or in
+/// a unit-test build a fresh path under the temp directory, so no test can
+/// reach the operator's real `~/.rsi/prompts`.
+fn default_prompt_data_dir() -> std::path::PathBuf {
+    if cfg!(test) {
+        std::env::temp_dir().join(format!("rsid-test-prompt-data-{}", Uuid::new_v4()))
+    } else {
+        rsi_common::identity::data_dir()
+    }
 }
 
 impl RpcServer {
@@ -291,20 +327,69 @@ impl RpcServer {
                 "rsid-scope.env",
                 "rsid-scope",
             ),
+            paste_dir: if cfg!(test) {
+                std::env::temp_dir().join(format!("rsid-test-paste-{}", std::process::id()))
+            } else {
+                input_assets::default_paste_dir()
+            },
+            skill_home: if cfg!(test) {
+                std::env::temp_dir().join(format!("rsid-test-skill-home-{}", std::process::id()))
+            } else {
+                dirs::home_dir().unwrap_or_default()
+            },
             cloud_dir: crate::cloud_spend::default_cloud_dir(),
+            prompt_data_dir: default_prompt_data_dir(),
+            operator_config_paths: crate::operator_config::OperatorConfigPaths::default_for_build(),
             model_control_runtime,
             compile_engine,
             ollama_http,
+            connection_drain: tokio_util::sync::CancellationToken::new(),
         }
     }
 
-    /// Replace the host effects behind the operator RSI Remote controls.
+    /// Start the connection drain: close every connection that is idle between
+    /// requests and end every push stream. A connection with a request begun
+    /// (any byte received) or being served keeps running until it settles or
+    /// the caller's drain deadline passes.
+    pub fn begin_connection_drain(&self) {
+        self.connection_drain.cancel();
+    }
+
+    /// hub #3039: fill an absent base URL and API key from the named custom
+    /// provider's row and vault key, so a frontend sends only the id.
+    async fn resolve_custom_provider(
+        &self,
+        id: Option<Uuid>,
+        base_url: &mut Option<String>,
+        api_key: &mut Option<String>,
+    ) -> Result<()> {
+        let Some(id) = id else {
+            return Ok(());
+        };
+        let (provider_base_url, secret) = {
+            let store = self.session_manager.store().lock().await;
+            crate::operator_config::custom_providers::resolve_for_request(
+                &store,
+                &crate::vault::global(),
+                id,
+            )?
+        };
+        if base_url.as_deref().is_none_or(str::is_empty) {
+            *base_url = Some(provider_base_url);
+        }
+        if api_key.as_deref().is_none_or(str::is_empty) {
+            *api_key = secret.map(|secret| secret.expose().to_owned());
+        }
+        Ok(())
+    }
+
+    /// Point the operator configuration RPCs at other host files (tests).
     #[cfg(test)]
-    pub(crate) fn set_remote_system(
+    pub fn set_operator_config_paths(
         &mut self,
-        system: Arc<dyn crate::remote_control::RemoteSystem>,
+        paths: crate::operator_config::OperatorConfigPaths,
     ) {
-        self.remote = Arc::new(crate::remote_control::RemoteController::new(system));
+        self.operator_config_paths = paths;
     }
 
     /// Set the dreamer handle for manual dream trigger via RPC.
@@ -338,9 +423,26 @@ impl RpcServer {
     /// Handle a single client connection.
     pub async fn handle_connection(&self, stream: UnixStream) -> Result<()> {
         let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
 
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            // Idle between requests: wait for the first byte of the next one,
+            // or for the connection drain. `fill_buf` is cancellation safe and
+            // consumes nothing, so a request already begun is read to its end
+            // and served; only a connection with nothing begun is closed.
+            let buffered = tokio::select! {
+                biased;
+                filled = reader.fill_buf() => Some(filled?.len()),
+                () = self.connection_drain.cancelled() => None,
+            };
+            if buffered.is_none_or(|len| len == 0) {
+                break;
+            }
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                break;
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -433,6 +535,25 @@ impl RpcServer {
         Ok(())
     }
 
+    /// Write one push line, racing the connection drain (#2383). A reader that
+    /// has stopped reading fills the socket buffer and parks `write_all`
+    /// forever, so the drain must cut the write, not only the wait for the
+    /// next event. Returns false when the stream has to end: the peer is gone,
+    /// or the drain began (a line cut short by it is never completed, the
+    /// connection closes).
+    async fn write_push_line(
+        &self,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        json: &str,
+    ) -> bool {
+        let line = format!("{json}\n");
+        tokio::select! {
+            biased;
+            () = self.connection_drain.cancelled() => false,
+            written = writer.write_all(line.as_bytes()) => written.is_ok(),
+        }
+    }
+
     /// Run the push notification stream after a Subscribe handshake.
     async fn run_subscribe_stream(
         &self,
@@ -443,7 +564,12 @@ impl RpcServer {
         let mut rx = event_bus.subscribe();
 
         loop {
-            match rx.recv().await {
+            let received = tokio::select! {
+                biased;
+                () = self.connection_drain.cancelled() => break,
+                received = rx.recv() => received,
+            };
+            match received {
                 Ok(daemon_event) => {
                     // Apply filters from SubscribeParams
                     if !params.event_types.is_empty() {
@@ -462,15 +588,12 @@ impl RpcServer {
                     let Ok(json) = serde_json::to_string(&bus_event) else {
                         continue;
                     };
-                    if writer
-                        .write_all(format!("{}\n", json).as_bytes())
-                        .await
-                        .is_err()
-                    {
+                    if !self.write_push_line(writer, &json).await {
                         break;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    event_bus.record_lagged(n);
                     tracing::warn!(missed = n, "Push subscriber lagged, sending reset");
                     let reset = BusEvent {
                         event_type: "subscription_reset".to_string(),
@@ -480,11 +603,7 @@ impl RpcServer {
                     let Ok(json) = serde_json::to_string(&reset) else {
                         break;
                     };
-                    if writer
-                        .write_all(format!("{}\n", json).as_bytes())
-                        .await
-                        .is_err()
-                    {
+                    if !self.write_push_line(writer, &json).await {
                         break;
                     }
                 }
@@ -502,7 +621,75 @@ impl RpcServer {
         // Heap-box its generated future so additive operator-only methods do
         // not increase every caller's stack frame (including RPC unit tests
         // that deliberately use the default test-thread stack budget).
-        Box::pin(self.handle_request_inner_unboxed(request)).await
+        use crate::session::rpc_admission::{RPC_ADMISSION, RpcAdmission, unknown_caller};
+        // Resolve once, copy the incarnation, then release A6 before dispatch.
+        // Default-denied methods keep the existing attribution refusal.
+        let admission = if let Some(token) = request.session_token.as_ref()
+            && agent_gate::is_allowed_for_attributed_caller(&request.method)
+            && !agent_gate::UNSCOPED_READ_VERBS.contains(&request.method.as_str())
+        {
+            let Some(caller) = self
+                .session_manager
+                .resolve_bound_agent_caller(token.expose_for_transport())
+                .await
+                .filter(|caller| caller.legacy_session_id().is_some())
+            else {
+                return HandleResult::Response(RpcResponse::error(
+                    request.id.clone(),
+                    transport_admission_error(&request.method, unknown_caller()),
+                ));
+            };
+            Some(RpcAdmission {
+                caller,
+                registry: Arc::clone(&self.session_manager.agent_tokens),
+            })
+        } else {
+            None
+        };
+        // The daemon is serving this admitted call until the handler returns
+        // (or is dropped): the DRAIN wait reads this registry (#2353).
+        let _in_flight = admission.as_ref().map(|admission| {
+            self.session_manager
+                .daemon_wait
+                .begin(admission.caller.session_id())
+        });
+        let mut result = RPC_ADMISSION
+            .scope(admission, async {
+                let result = Box::pin(self.handle_request_inner_unboxed(request)).await;
+                // Finite reads prepare privately outside A6. Admit the resulting
+                // snapshot before exposing it; no guard spans serialization/writes.
+                if (agent_gate::READ_VERBS.contains(&request.method.as_str())
+                    && !agent_gate::UNSCOPED_READ_VERBS.contains(&request.method.as_str()))
+                    || matches!(
+                        request.method.as_str(),
+                        "AgentGetStatus" | "AgentReadSessionEvents"
+                    )
+                {
+                    if let Some(admission) = crate::session::rpc_admission::current() {
+                        let _store = self.session_manager.store().lock().await;
+                        if let Err(error) = admission.admit(admission.caller.session_id()).await {
+                            return HandleResult::Response(RpcResponse::error(
+                                request.id.clone(),
+                                transport_admission_error(&request.method, error),
+                            ));
+                        }
+                    }
+                }
+                result
+            })
+            .await;
+        // Enrich refusals only: historical DTO defaults and authorization
+        // ordering remain the handlers' responsibility.
+        if let HandleResult::Response(response) = &mut result {
+            if let Some(error) = &mut response.error {
+                if let Some(diagnostic) = AgentControlVerbV1::from_method_name(&request.method)
+                    .and_then(|verb| verb.schema_error(&request.params))
+                {
+                    diagnostic.enrich(error.data.get_or_insert_with(|| serde_json::json!({})));
+                }
+            }
+        }
+        result
     }
 
     async fn handle_request_inner_unboxed(&self, request: &RpcRequest) -> HandleResult {
@@ -560,6 +747,9 @@ impl RpcServer {
             "AgentGetAuthorityCatalog" => self.handle_agent_get_authority_catalog(request).await,
             "ClaimBoundaryMail" => self.handle_claim_boundary_mail(request).await,
             "ConfirmBoundaryMail" => self.handle_confirm_boundary_mail(request).await,
+            "RecordProviderLifecycleEvent" => {
+                self.handle_record_provider_lifecycle_event(request).await
+            }
             "AgentGetStatus" => self.handle_agent_get_status(request).await,
             "AgentHalt" => self.handle_agent_halt(request).await,
             "AgentContinueChild" => self.handle_agent_continue_child(request).await,
@@ -612,6 +802,10 @@ impl RpcServer {
                 self.handle_agent_topology(request, AgentControlVerbV1::TopologyList)
                     .await
             }
+            "AgentTopologyGet" => {
+                self.handle_agent_topology(request, AgentControlVerbV1::TopologyGet)
+                    .await
+            }
             "AgentTopologyExecute" => {
                 self.handle_agent_topology(request, AgentControlVerbV1::TopologyExecute)
                     .await
@@ -629,10 +823,18 @@ impl RpcServer {
                     .await
             }
             "AgentEnqueueLandingSource" => self.handle_agent_enqueue_landing_source(request).await,
+            "AgentListRollingQueue" => self.handle_agent_list_rolling_queue(request).await,
+            "AgentCancelRollingQueueEntry" => {
+                self.handle_agent_cancel_rolling_queue_entry(request).await
+            }
+            "AgentCheckLandingCandidate" => {
+                self.handle_agent_check_landing_candidate(request).await
+            }
             "AgentReadSessionEvents" => self.handle_agent_read_session_events(request).await,
             "AgentQueryFailureSignatures" => {
                 self.handle_agent_query_failure_signatures(request).await
             }
+            "AgentWorkerRoster" => self.handle_agent_worker_roster(request).await,
             "AgentGetProviderStatus" => self.handle_agent_get_provider_status(request).await,
             "AgentSubmitJob" => self.handle_agent_submit_job(request).await,
             "AgentGetJob" => self.handle_agent_get_job(request).await,
@@ -641,11 +843,23 @@ impl RpcServer {
             "AgentSendSatelliteMessage" => self.handle_agent_send_satellite_message(request).await,
             "AgentReportToHub" => self.handle_agent_report_to_hub(request).await,
             "AgentGetDaemonInfo" => self.handle_agent_get_daemon_info(request).await,
+            "AgentPushSatelliteManagerPolicy" => {
+                self.handle_agent_push_satellite_manager_policy(request)
+                    .await
+            }
+            "AgentReseatSatelliteManager" => {
+                Box::pin(self.handle_agent_reseat_satellite_manager(request)).await
+            }
             "AgentRequestDeploy" => self.handle_agent_request_deploy(request).await,
             "AgentGlobalOverview" => self.handle_agent_global_overview(request).await,
             "AgentManagerOverview" => self.handle_agent_manager_overview(request).await,
             "AgentCreateProject" => self.handle_agent_create_project(request).await,
             "AgentUpdateProject" => self.handle_agent_update_project(request).await,
+            // #1747: any manager node seat writes the operator to-do list.
+            "AgentOperatorTodoUpsert" => self.handle_agent_operator_todo_upsert(request).await,
+            "AgentOperatorTodoClose" => self.handle_agent_operator_todo_close(request).await,
+            // #2649: standing operator directives on a manager scope.
+            "AgentStandingDirective" => self.handle_agent_standing_directive(request).await,
             "AgentGlobalSend" => self.handle_agent_global_send(request).await,
             "AgentGlobalAppointManager" => self.handle_agent_global_appoint_manager(request).await,
             "AgentManagerAppointChild" => self.handle_agent_manager_appoint_child(request).await,
@@ -663,17 +877,30 @@ impl RpcServer {
             "ConfigureGlobalManager" => self.handle_configure_global_manager(request).await,
             "GetGlobalManager" => self.handle_get_global_manager(request).await,
             "GetGlobalManagerWorkspace" => self.handle_get_global_manager_workspace(request).await,
+            "GetGlobalManagerBudget" => self.handle_get_global_manager_budget(request).await,
             "GetManagerNodeWorkspace" => self.handle_get_manager_node_workspace(request).await,
             "RevokeGlobalManager" => self.handle_revoke_global_manager(request).await,
             "ListPortfolioNodes" => self.handle_list_portfolio_nodes(request).await,
             "GetPortfolioNode" => self.handle_get_portfolio_node(request).await,
             "ConfigurePortfolioNode" => self.handle_configure_portfolio_node(request).await,
+            "ConfigurePortfolioNodeLaunches" => {
+                self.handle_configure_portfolio_node_launches(request).await
+            }
             "RevokePortfolioNode" => self.handle_revoke_portfolio_node(request).await,
             // #1238: the operator escalation queue and top-of-chain notices.
             "ListOperatorEscalations" => self.handle_list_operator_escalations(request).await,
             "RuleOperatorEscalation" => self.handle_rule_operator_escalation(request).await,
             "AcknowledgeOperatorNotice" => self.handle_acknowledge_operator_notice(request).await,
             // #1122: the operator's quiet-point restart; operator-only.
+            // #1747: the operator's own to-do list; operator-only, outside
+            // AGENT_VERBS, READ_VERBS, native tools and the agent CLI catalog.
+            "OperatorTodoList" => self.handle_operator_todo_list(request).await,
+            "OperatorTodoAdd" => self.handle_operator_todo_add(request).await,
+            "OperatorTodoClose" => self.handle_operator_todo_close(request).await,
+            "OperatorTodoReopen" => self.handle_operator_todo_reopen(request).await,
+            "StandingDirectiveSet" => self.handle_standing_directive_set(request).await,
+            "StandingDirectiveClear" => self.handle_standing_directive_clear(request).await,
+            "StandingDirectiveList" => self.handle_standing_directive_list(request).await,
             "RequestOperatorRestart" => self.handle_request_operator_restart(request).await,
             "GetOperatorRestart" => self.handle_get_operator_restart(request).await,
             "CancelOperatorRestart" => self.handle_cancel_operator_restart(request).await,
@@ -702,6 +929,13 @@ impl RpcServer {
             "ConfigureHarnessManagerPolicy" => {
                 self.handle_configure_harness_manager_policy(request).await
             }
+            "ConfigureHarnessManagerWithPolicy" => {
+                self.handle_configure_harness_manager_with_policy(request)
+                    .await
+            }
+            // #2750 operator-only: deliberately absent from AGENT_VERBS,
+            // READ_VERBS, native tools and the agent CLI catalog.
+            "ReseatHarnessManager" => Box::pin(self.handle_reseat_harness_manager(request)).await,
             "GetHarnessManagerState" => self.handle_get_harness_manager_state(request).await,
             "AnswerHarnessManagerDecision" => {
                 self.handle_answer_harness_manager_decision(request).await
@@ -731,9 +965,18 @@ impl RpcServer {
             "PutSatellitePeerScope" => self.handle_put_satellite_peer_scope(request).await,
             "GetSatelliteInboundPolicy" => self.handle_get_satellite_inbound_policy(request).await,
             "PutSatelliteInboundPolicy" => self.handle_put_satellite_inbound_policy(request).await,
+            // #1928. Operator-only: the declared inbound scope, resolved live.
+            "GetSatelliteScopeStatus" => self.handle_get_satellite_scope_status(request).await,
             "DeliverHubMessage" => self.handle_deliver_hub_message(request).await,
             "FetchHubReports" => self.handle_fetch_hub_reports(request).await,
+            "RequestHubManagerPolicy" => self.handle_request_hub_manager_policy(request).await,
+            // #2750: the hub's reseat of this satellite's failed manager seat.
+            "RequestHubManagerReseat" => {
+                Box::pin(self.handle_request_hub_manager_reseat(request)).await
+            }
             "RequestHubDeploy" => self.handle_request_hub_deploy(request).await,
+            // #2120: the hub's full-library QA on this satellite; operator-only.
+            "RequestHubQaRun" => self.handle_request_hub_qa_run(request).await,
             "ProbeSatelliteLink" => self.handle_probe_satellite_link(request).await,
             "ListHubSatelliteSessions" => self.handle_list_hub_satellite_sessions(request).await,
             "GetConversation" => self.handle_get_conversation(request).await,
@@ -908,6 +1151,9 @@ impl RpcServer {
             method if sessions::is_operator_method(method) => {
                 self.handle_answer_pending_decision(request).await
             }
+            // RSI Remote API v2 (#2962): operator-only message write to a
+            // manager seat; the reads are in `remote_read::rpc_owner`.
+            "RemoteSendManagerMessageV2" => self.handle_remote_send_manager_message(request).await,
             "AnswerQuestion" => self.handle_answer_question(request).await,
             // Project methods
             "CreateProject" => self.handle_create_project(request).await,
@@ -915,6 +1161,32 @@ impl RpcServer {
             "DeleteProject" => self.handle_delete_project(request).await,
             "GetProject" => self.handle_get_project(request).await,
             "ListProjects" => self.handle_list_projects(request).await,
+            // hub #3012: read-only, project-root-scoped file reads
+            // (operator-only; never on the rsi-remote gateway).
+            "ListProjectDirectory" => self.handle_list_project_directory(request).await,
+            "ListProjectFiles" => self.handle_list_project_files(request).await,
+            "ReadProjectFile" => self.handle_read_project_file(request).await,
+            "GetProjectFileGitGutter" => self.handle_get_project_file_git_gutter(request).await,
+            "WriteProjectFile" => self.handle_write_project_file(request).await,
+            "CreateProjectEntry" => self.handle_create_project_entry(request).await,
+            "MoveProjectEntry" => self.handle_move_project_entry(request).await,
+            "CopyProjectEntry" => self.handle_copy_project_entry(request).await,
+            "TrashProjectEntry" => self.handle_trash_project_entry(request).await,
+            "UndoProjectFileOperation" => self.handle_undo_project_file_operation(request).await,
+            // hub #3044: input-bar assets for the desktop (operator-only;
+            // never on the rsi-remote gateway).
+            "UploadPasteImage" => self.handle_upload_paste_image(request).await,
+            "ListSlashCommands" => self.handle_list_slash_commands(request).await,
+            // hub #3062: skills for the desktop (operator-only); #97 adds the
+            // Settings > Skills enable/disable and delete writes.
+            "ListSkills" => self.handle_list_skills(request).await,
+            "GetSkill" => self.handle_get_skill(request).await,
+            "SetSkillEnabled" => self.handle_set_skill_enabled(request).await,
+            "DeleteSkill" => self.handle_delete_skill(request).await,
+            "ListPromptFiles" => self.handle_list_prompt_files(request).await,
+            "GetPromptFile" => self.handle_get_prompt_file(request).await,
+            "PutPromptFile" => self.handle_put_prompt_file(request).await,
+            "DeletePromptFile" => self.handle_delete_prompt_file(request).await,
             // Label methods
             "CreateLabel" => self.handle_create_label(request).await,
             "UpdateLabel" => self.handle_update_label(request).await,
@@ -955,8 +1227,12 @@ impl RpcServer {
             // deliberately NOT added to READ_VERBS (F-010).
             "GetFleetOverview" => self.handle_get_fleet_overview(request).await,
             "GetUsageStats" => self.handle_get_usage_stats(request).await,
+            // #2757: plan-window utilization per provider, Codex's polled
+            // beside Claude's streamed. Operator-only (not in READ_VERBS).
+            "GetProviderRateLimits" => self.handle_get_provider_rate_limits(request).await,
             "GetEfficiencyMetrics" => self.handle_get_efficiency_metrics(request).await,
             "GetRollingQueue" => self.handle_get_rolling_queue(request).await,
+            "EnqueueRollingQueueSource" => self.handle_enqueue_rolling_queue_source(request).await,
             // Resource governor (#1014). Deliberately absent from
             // AGENT_VERBS/READ_VERBS: the wrapper client calls these
             // without a session token, and a lease grants a slot only.
@@ -969,6 +1245,8 @@ impl RpcServer {
             "CancelModelInvocation" => self.handle_cancel_model_invocation(request).await,
             "DiscoverModels" => self.handle_discover_models(request).await,
             "GetHealthStatus" => self.handle_get_health_status(request).await,
+            // Operator-only identity read; detection uses the startup/interval cache.
+            "GetDaemonInfo" => self.handle_get_daemon_info(request).await,
             "GetDaemonCapabilities" => self.handle_get_daemon_capabilities(request).await,
             // Workflow methods
             "ListWorkflows" => self.handle_list_workflows(request).await,
@@ -1029,6 +1307,7 @@ impl RpcServer {
             "AddIssueDependency" => self.handle_add_issue_dependency(request).await,
             "RemoveIssueDependency" => self.handle_remove_issue_dependency(request).await,
             "ListIssueEventsV2" => self.handle_list_issue_events_v2(request).await,
+            "ListIssueHandoffs" => self.handle_list_issue_handoffs(request).await,
             "ArchiveIssue" => self.handle_archive_issue_v2(request).await,
             "RestoreIssue" => self.handle_restore_issue_v2(request).await,
             "LinkIssueToIdea" => self.handle_link_issue_to_idea(request).await,
@@ -1096,17 +1375,41 @@ impl RpcServer {
             // Issue #69 storage lifecycle. Both methods are operator-only by
             // default-deny and remain absent from AGENT_VERBS/READ_VERBS.
             "GetSandboxStorageStatus" => self.handle_get_sandbox_storage_status(request).await,
+            // Issue #1882: warm target pool state for Settings → Sandbox Storage.
+            "GetTargetPoolStatus" => self.handle_get_target_pool_status(request).await,
             "RunSandboxBuildCacheReclaim" => {
                 self.handle_run_sandbox_build_cache_reclaim(request).await
             }
             "RunSandboxWorktreeReclaim" => self.handle_run_sandbox_worktree_reclaim(request).await,
             // Issue #955: operator-only by default-deny, like the reclaim pair.
             "RunArchivedSandboxPurge" => self.handle_run_archived_sandbox_purge(request).await,
-            // V94 source-worktree settlement. All four methods are operator-only
+            // Issue #2384: cold-storage archive status and run-now. Operator-only by
+            // default-deny, like the storage family.
+            "GetColdArchiveStatus" => self.handle_get_cold_archive_status(request).await,
+            "RunColdArchiveNow" => self.handle_run_cold_archive_now(request).await,
+            "GetColdSessionStorage" => self.handle_get_cold_session_storage(request).await,
+            "RestoreColdSession" => self.handle_restore_cold_session(request).await,
+            // Source-worktree settlement reads and manual apply are operator-only
             // by omission from both attributed-caller allowlists.
+            "AgentListSourceWorktreeCohorts" => {
+                self.handle_agent_list_source_worktree_cohorts(request)
+                    .await
+            }
+            "AgentAuditSourceWorktreeCohort" => {
+                self.handle_agent_audit_source_worktree_cohort(request)
+                    .await
+            }
+            "AgentApplySourceWorktreeCohort" => {
+                self.handle_agent_apply_source_worktree_cohort(request)
+                    .await
+            }
             "ListSourceWorktreeCohorts" => self.handle_list_source_worktree_cohorts(request).await,
             "AuditSourceWorktreeCohort" => self.handle_audit_source_worktree_cohort(request).await,
             "ApplySourceWorktreeCohort" => self.handle_apply_source_worktree_cohort(request).await,
+            "ListSourceWorktreeSettlementRuns" => {
+                self.handle_list_source_worktree_settlement_runs(request)
+                    .await
+            }
             "GetSourceWorktreeSettlementRun" => {
                 self.handle_get_source_worktree_settlement_run(request)
                     .await
@@ -1123,6 +1426,32 @@ impl RpcServer {
             method if crate::vault::operator::is_operator_method(method) => {
                 crate::vault::operator::handle(
                     &crate::vault::global(),
+                    method,
+                    request.session_token.is_some(),
+                    &request.params,
+                )
+                .await
+            }
+            // #2753 provider CLI login state. Operator-only: absent from
+            // AGENT_VERBS/READ_VERBS/native tools/agent CLI catalog; agents
+            // read the same state through AgentGetProviderStatus.
+            method if crate::provider_login::is_operator_method(method) => {
+                crate::provider_login::handle_operator_method(
+                    self.session_manager.provider_login(),
+                    method,
+                    request.session_token.is_some(),
+                    &request.params,
+                )
+                .await
+            }
+            // #2755 provider CLI contract canary state. Operator-only: absent
+            // from AGENT_VERBS/READ_VERBS/native tools/agent CLI catalog; agents
+            // read the same state through AgentGetProviderStatus.
+            method if crate::provider_contract::is_operator_method(method) => {
+                crate::provider_contract::handle_operator_method(
+                    self.session_manager.provider_contract(),
+                    self.session_manager.provider_login(),
+                    &self.runtime_config,
                     method,
                     request.session_token.is_some(),
                     &request.params,
@@ -1155,6 +1484,25 @@ impl RpcServer {
                     &request.params,
                 )
             }
+            // hub #3039: hooks, custom providers (key in the vault) and
+            // message bridges, shared by the TUI and the desktop.
+            // Operator-only: absent from AGENT_VERBS/READ_VERBS/native
+            // tools/agent CLI catalog/rsi-remote; the handler refuses tokened
+            // callers again before parsing.
+            method if crate::operator_config::is_operator_method(method) => {
+                let store = self.session_manager.store().lock().await;
+                crate::operator_config::handle(
+                    &crate::operator_config::OperatorConfigContext {
+                        store: &store,
+                        vault: &crate::vault::global(),
+                        runtime_config: &self.runtime_config,
+                        paths: &self.operator_config_paths,
+                    },
+                    method,
+                    request.session_token.is_some(),
+                    &request.params,
+                )
+            }
             _ => {
                 return HandleResult::Response(RpcResponse::error(
                     request.id.clone(),
@@ -1182,6 +1530,27 @@ impl RpcServer {
                 };
                 let data = match &e {
                     DaemonError::StructuredRpc { data, .. } => Some(data.clone()),
+                    // #2502: a creation refusal's typed detail (node, cap,
+                    // used/limit, where to raise it).
+                    DaemonError::InvalidParam(message) => {
+                        rsi_common::manager_budget::CreationCapRefusalV1::parse(message)
+                            .and_then(|detail| serde_json::to_value(detail).ok())
+                    }
+                    // #565: a scratch write refused for quota or space is a
+                    // typed disk condition, not an opaque internal error.
+                    DaemonError::Io(io_err) => common::scratch_pressure_data(io_err),
+                    // #3141: a refused OpenRouter Harness preflight names its
+                    // cause in a stable code, never an opaque internal error.
+                    DaemonError::OpenRouterRoutePreflight { cause } => {
+                        serde_json::to_value(RpcErrorData {
+                            code: crate::error::openrouter_preflight_code(cause),
+                            resource_type: Some("provider".to_string()),
+                            resource_id: Some("openrouter".to_string()),
+                            retryable: false,
+                            details: None,
+                        })
+                        .ok()
+                    }
                     _ => None,
                 };
                 // Surface IO and Process errors to the daemon log before
@@ -1213,7 +1582,7 @@ impl RpcServer {
                     request.id.clone(),
                     RpcError {
                         code,
-                        message: e.to_string(),
+                        message: common::rpc_error_message(&e),
                         data,
                     },
                 )
@@ -1462,6 +1831,8 @@ pub(crate) fn rpc_production_source() -> String {
         include_str!("rpc/memory.rs"),
         include_str!("rpc/models.rs"),
         include_str!("rpc/program_runs.rs"),
+        include_str!("rpc/project_files.rs"),
+        include_str!("rpc/prompt_files.rs"),
         include_str!("rpc/projects.rs"),
         include_str!("rpc/recursive_control.rs"),
         include_str!("rpc/recursive_read.rs"),

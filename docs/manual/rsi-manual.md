@@ -167,7 +167,7 @@ The harness manager coordinates Epic leads under an operator-owned scope and pol
 |  | `:manager global [arg]` | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 |  | `:manager global appoint [arg]` | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 |  | `:manager global revoke` | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
-|  | `:manager portfolio [arg]` | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
+|  | `:manager portfolio [arg]` | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `launch add\|remove <node> <Provider/model[/effort]>...` (adds or removes launches on the node's current grant), `configure <JSON>` and `revoke <node>` inspect or change one. |
 |  | `:manager escalations [arg]` | Manager escalations | Lists escalations that reached the top of their manager chain and top-of-chain reports; `:manager escalations rule <hop> <text>` rules one (the ruling returns down the chain to the source seat and never answers a human approval), `ack <notice>` marks a report read, `all` includes closed rows, failed or uncertain tier mail is listed with its reason and `undelivered [<cursor>]` pages it. |
 |  | `:manager friction [arg]` | Manager friction | Shows the friction rollup (the andon): refusals, deploy timeouts, superseded handoffs and lander refusals the daemon recorded, by signature, with the kaizen Issue filed for each repeating one; `:manager friction <hours>` widens the window (default 24, at most 720). The board's Inspect · Friction section shows one project's rows. |
 |  | `:manager tree` | Open manager tree | Opens the manager hierarchy tree: the global grant, project seats, area nodes and led Epics. |
@@ -212,6 +212,12 @@ The Issues workspace tracks project issues; the scheduled-jobs browser runs recu
 | Issues: `[` |  | Previous Issues tab | Switches to the previous Issues tab. |
 | Issues: `]` |  | Next Issues tab | Switches to the next Issues tab. |
 | Issues: `/` |  | Search local issues | Searches the locally loaded issues. |
+| Issues: `#` |  | Go to issue number | Prompts for an issue number and opens that issue, including closed and archived ones. |
+| Issues: `O` |  | Show only operator requests and decisions | Toggles a filter that keeps only Issues labelled operator-request or operator-decision; press again to show every Issue. |
+| Issues: `}` |  | Next detail item | Moves the inspector cursor to the next folding handoff or review section or related Issue. |
+| Issues: `{` |  | Previous detail item | Moves the inspector cursor to the previous folding section or related Issue. |
+| Issues: `o` |  | Open or fold detail item | Folds or unfolds the section under the inspector cursor, or opens the related Issue under it. |
+| Issues: `B` |  | Back to the previous Issue | Returns to the Issue you followed a related link from. |
 | Issues: `f` |  | Edit filters and saved views | Edits the issue filters and saved views. |
 | Issues: `s` |  | Cycle issue sort | Cycles the issue sort order. |
 | Issues: `g` |  | Start first-page command | First `g` of `gg`: starts the first-page jump. |
@@ -254,6 +260,8 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | `DD` | `:delete` `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `R` | `:rotate` `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
 |  | `:rotation-abandon [arg]` | Abandon blocked rotation | Moves the selected session's blocked rotation to a fresh replacement session that takes the sandbox and the seat; `:rotation-abandon <provider>[/<model>]` picks its launch. Run twice to confirm. |
+|  | `:manager-reseat [arg]` | Reseat failed manager | Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm. |
+|  | `:cold-restore` | Restore from cold storage | Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way. |
 |  | `:model [arg]` `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `Ctrl-N` `<Space>N` | `:blank [arg]` `:bl [arg]` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `<Space>X` | `:stopall` `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
@@ -292,15 +300,28 @@ Operator views: diagnostics, memory search, graph review, the recursive DAG brow
 | Keys | Command | Action | What it does |
 | --- | --- | --- | --- |
 | `<Space>i` | `:issues` | Open or focus Issues workspace | Opens the Issues workspace pane for the current project, or focuses it if already open. |
+|  | `:issue [arg]` | Open an issue by number | Opens the Issues workspace on the issue with the given number (`:issue 2377` or `:issue #2377`), including closed and archived issues; without a number it opens the go-to-number prompt. |
+|  | `:cold-archive [arg]` | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
 |  | `:diagnostics` `:diag` | Open diagnostics | Opens the diagnostics overlay. |
 | `<Space>v` | `:graph` | Open graph review | Opens the visual workflow graph review editor. |
 |  | `:topology-resolve [arg]` | Resolve preserved topology work | Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: `:topology-resolve [<execution_id>] inspect\|accept\|retry\|discard [<commit>]` (the id may be omitted when exactly one is blocked; discard needs the full preserved commit). |
 |  | `:topology [arg]` | Run a topology on the focused Issue | Starts a stored topology on the focused Issue in the Issues workspace: `:topology run <name> [<epic>]`. The Epic defaults to the focused or only live Epic of the Issue's project; the run view opens on the started execution. |
 |  | `:dag` | Open recursive DAG | Opens the recursive DAG browser. |
 |  | `:ask [arg]` | Ask a question | Opens the dialectic question overlay; `:ask <question>` asks directly. |
+| `<Space>dt` | `:todo` | Operator to-do panel | Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count. |
+| `<Space>dj` |  | To-do: next item | Moves the operator to-do cursor to the next item (opens the panel first when it is hidden). |
+| `<Space>dk` |  | To-do: previous item | Moves the operator to-do cursor to the previous item. |
+| `<Space>do` |  | To-do: open link | Opens the selected to-do item's linked Issue, session or URL. |
+| `<Space>dd` |  | To-do: mark done | Marks the selected operator to-do item done after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dx` |  | To-do: dismiss | Dismisses the selected operator to-do item without doing it after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dy` `<Space>dc` |  | To-do: copy command | Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open. |
+| `<Space>dv` |  | To-do: open pop-up | Opens the selected operator to-do item in a pop-up with its full title, priority, link and the complete command text, and the yank, done, dismiss and open-link actions. |
+| `<Space>du` |  | To-do: undo close | Reopens the operator to-do item you just marked done or dismissed, within 60 seconds of the close. |
+| `<Space>da` |  | To-do: caught up | Clears the new and closed-since-last-visit highlights in the operator to-do panel. |
 | `<Space>gq` |  | Answer waiting question | Opens the question modal for a session waiting on your answer. |
 | `<Space>M` |  | Memory search | Opens memory search over the daemon's stored memories. |
 | `<Space>gc` |  | ESP Square game | Opens the ESP Square guessing game. |
+| `<Space>gl` | `:land` | Land session branch | Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it. |
 
 ## 10. Theming
 
@@ -355,6 +376,9 @@ Every settings row by group and section: what it does, what kind of value it is,
 | Settings: `e` |  | Enable or disable skill | Enables or disables the selected Claude skill. |
 | Settings: `K` |  | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
 | Settings: `J` |  | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
+| Settings: `+` |  | Step setting up | Moves the selected setting to its next value (switches on): numeric rows stop at their maximum, choices wrap. The value is staged until you apply with w. |
+| Settings: `-` |  | Step setting down | Moves the selected setting to its previous value (switches off): numeric rows stop at their minimum, choices wrap. The value is staged until you apply with w. |
+| Settings: `w` |  | Apply pending settings | Applies every staged setting at once: ONE atomic daemon update carries every changed field with its final value (all of them take effect or none do), plus the local preferences. Esc or q discards them instead. |
 | Settings: `R` |  | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | Settings: `s` |  | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | Settings: `r` |  | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -377,7 +401,7 @@ The built-in theme and per-role overrides.
 | --- | --- | --- | --- | --- |
 | Built-in theme | Selects the active built-in color theme; the preview applies immediately. | choice | TUI (state.json) | immediately |
 | Theme roles | Overrides individual semantic color roles of the active theme with a live contrast check. Each role opens the theme role editor: type a hex color, Enter previews then commits, Delete resets the role. | list | TUI (state.json) | immediately |
-| Reset active theme | Clears every semantic role override while keeping the selected theme. **Destructive.** | action | TUI (state.json) | immediately |
+| Reset active theme | Clears every semantic role override while keeping the selected theme. **Destructive.** | action | TUI (state.json) | when activated |
 
 #### Screen
 
@@ -385,12 +409,12 @@ Text-area background, animation styles and detail column placement.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Text area background | Paints the configured background color behind text-entry surfaces. | toggle | TUI (state.json) | immediately |
+| Text area background | Paints the configured background color behind text-entry surfaces. | toggle | TUI (state.json) | when applied (w) |
 | Background color | Sets the hex color used when the text area background is on. | edit | TUI (state.json) | immediately |
-| Formulation animation | Reveals each new live message with a top-to-bottom wipe. Off by default. | toggle | TUI (state.json) | immediately |
-| Formulation speed | Sets how long the formulation reveal runs when the animation is on. | choice | TUI (state.json) | immediately |
-| Activity indicator | Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight; rainbow colours are tuned to each theme. | choice | TUI (state.json) | immediately |
-| Detail column | Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned. | choice | TUI (state.json) | immediately |
+| Formulation animation | Reveals each new live message with a top-to-bottom wipe. Off by default. | toggle | TUI (state.json) | when applied (w) |
+| Formulation speed | Sets how long the formulation reveal runs when the animation is on. | choice | TUI (state.json) | when applied (w) |
+| Activity indicator | Cycles Semantic and five rainbow styles, including Sonic Speed Up and Rainbow Starlight; rainbow colours are tuned to each theme. | choice | TUI (state.json) | when applied (w) |
+| Detail column | Places the session-detail transcript column: Dynamic, Left Aligned or Center Aligned. Ctrl-Left / Ctrl-Right in a focused session detail move the column and switch to Dynamic; moving it to the left edge snaps to Left Aligned. | choice | TUI (state.json) | when applied (w) |
 
 ### WORKSPACE — What do I see in the list and a new transcript?
 
@@ -400,11 +424,11 @@ What the session navigator and cards show.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Navigator preset | Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it. | choice | TUI (state.json) | immediately |
-| Navigator optional columns | Turns optional navigator columns on or off; J/K move the selected column, saved per preset. Optional columns: Navigator age, Navigator model, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden. | list | TUI (state.json) | immediately |
-| Card fields | Chooses which facts render on session-list cards. Card fields: Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date. | list | TUI (state.json) | immediately |
-| Automatic session archive | Archives delivered or issue-filed terminal sessions after an idle window. | toggle | daemon field `session_retention_enabled` | immediately |
-| Archive idle hours | Idle hours before an eligible terminal session is archived. | choice | daemon field `session_retention_window_hours` | immediately |
+| Navigator preset | Cycles the session navigator column preset: Dense, Operations or Cost. Presets: Dense (default), Operations, Cost. Each preset sets which columns the navigator shows; the optional columns below add to it. | choice | TUI (state.json) | when applied (w) |
+| Navigator optional columns | Turns optional navigator columns on or off; J/K move the selected column, saved per preset. Optional columns: Navigator age, Navigator model, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden. | list | TUI (state.json) | when applied (w) |
+| Card fields | Chooses which facts render on session-list cards. Card fields: Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date. | list | TUI (state.json) | when applied (w) |
+| Automatic session archive | Archives delivered or issue-filed terminal sessions after an idle window. | toggle | daemon field `session_retention_enabled` | when applied · no restart |
+| Archive idle hours | Idle hours before an eligible terminal session is archived. | choice | daemon field `session_retention_window_hours` | when applied · no restart |
 
 #### Transcript Defaults
 
@@ -412,9 +436,9 @@ What a newly opened transcript shows.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Show system events | Default visibility of system events in newly opened transcripts (zs toggles one transcript). | toggle | TUI (state.json) | immediately |
-| Show thinking events | Default visibility of model thinking events in newly opened transcripts (zt toggles one transcript). | toggle | TUI (state.json) | immediately |
-| Hide tool results | Hides tool-result events in newly opened transcripts. | toggle | TUI (state.json) | immediately |
+| Show system events | Default visibility of system events in newly opened transcripts (zs toggles one transcript). | toggle | TUI (state.json) | when applied (w) |
+| Show thinking events | Default visibility of model thinking events in newly opened transcripts (zt toggles one transcript). | toggle | TUI (state.json) | when applied (w) |
+| Hide tool results | Hides tool-result events in newly opened transcripts. | toggle | TUI (state.json) | when applied (w) |
 
 #### Input & Prompts
 
@@ -422,9 +446,9 @@ How typing and submitting behave.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Submit on Enter | Plain Enter submits in submit-capable inputs; Shift-Enter inserts a newline. Document editors always insert a newline. | toggle | TUI (state.json) | immediately |
-| Auto-open question panel | Opens a waiting session's question panel automatically when nothing else is open. | toggle | TUI (state.json) | immediately |
-| Prompt compiler | Enables prompt compilation (Ctrl-Y in the input bar); off, compile requests return nothing. | toggle | TUI (state.json) | immediately |
+| Submit on Enter | Plain Enter submits in submit-capable inputs; Shift-Enter inserts a newline. Document editors always insert a newline. | toggle | TUI (state.json) | when applied (w) |
+| Auto-open question panel | Opens a waiting session's question panel automatically when nothing else is open. | toggle | TUI (state.json) | when applied (w) |
+| Prompt compiler | Enables prompt compilation (Ctrl-Y in the input bar); off, compile requests return nothing. | toggle | TUI (state.json) | when applied (w) |
 
 #### Editing Mode
 
@@ -432,7 +456,7 @@ Standard or Vim text editing in every input.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Editing mode | Standard edits like a normal text field (typing inserts, arrows move); Vim is the modal editing RSI was built around. Applies live; `unset` asks again at the next start. | choice | daemon field `editing_mode` | immediately |
+| Editing mode | Standard edits like a normal text field (typing inserts, arrows move); Vim is the modal editing RSI was built around. Applies when you apply the page (w), with no restart; `unset` asks again at the next start. | choice | daemon field `editing_mode` | when applied · no restart |
 
 ### MODELS — Which model does which job?
 
@@ -443,11 +467,11 @@ Which model does which job.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Default model | Provider and model used for newly launched sessions. | choice | TUI (state.json) | immediately |
-| Title model | Provider and model that generate session titles (with a fallback model). | edit | daemon fields `title_model_local`, `title_model_provider`, `title_model_base_url`, `title_model_fallback` | immediately |
-| Prompt compiler model | Provider and model that compile and refine prompts. | edit | daemon fields `prompt_compile_model_local`, `prompt_compile_model_provider`, `prompt_compile_model_base_url` | immediately |
-| Memory model | Local and fallback models for observation extraction and summarization. | edit | daemon fields `memory_model_local`, `memory_model_fallback`, `memory_model_fallback_provider`, `memory_model_fallback_base_url` | immediately |
-| Dream model | Provider and model that run memory consolidation and deduction. | edit | daemon fields `dream_model`, `dream_model_provider`, `dream_model_base_url` | immediately |
-| Stall classifier model | Model the stall classifier calls to judge a stalled session. The next classification uses the saved model; an in-flight classification keeps its model. The classifier's thresholds live in AGENT AUTOMATION ▸ Stall Detection. | edit | daemon field `stall_classifier_model` | immediately |
+| Title model | Provider and model that generate session titles (with a fallback model). | edit | daemon fields `title_model_local`, `title_model_provider`, `title_model_base_url`, `title_model_fallback` | when applied · no restart |
+| Prompt compiler model | Provider and model that compile and refine prompts. | edit | daemon fields `prompt_compile_model_local`, `prompt_compile_model_provider`, `prompt_compile_model_base_url` | when applied · no restart |
+| Memory model | Local and fallback models for observation extraction and summarization. | edit | daemon fields `memory_model_local`, `memory_model_fallback`, `memory_model_fallback_provider`, `memory_model_fallback_base_url` | when applied · no restart |
+| Dream model | Provider and model that run memory consolidation and deduction. | edit | daemon fields `dream_model`, `dream_model_provider`, `dream_model_base_url` | when applied · no restart |
+| Stall classifier model | Model the stall classifier calls to judge a stalled session. The next classification uses the saved model; an in-flight classification keeps its model. The classifier's thresholds live in AGENT AUTOMATION ▸ Stall Detection. | edit | daemon field `stall_classifier_model` | when applied · no restart |
 
 #### API Providers
 
@@ -473,9 +497,9 @@ Stop or limit model spend daemon-wide.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Model control mode | Daemon-wide model control: normal, pause-background, deny-paid, local-only or stop-all. | choice | daemon (model control) | immediately |
-| Emergency stop | Immediately denies new paid work and cancels every live model invocation. **Destructive.** | action | daemon (model control) | immediately |
-| Orchestration max child effort | Ceiling on the reasoning effort a spawned child agent may request at admission. | choice | daemon field `orchestration_max_child_effort` | immediately |
+| Model control mode | Daemon-wide model control: normal, pause-background, deny-paid, local-only or stop-all. | choice | daemon (model control) | when applied · no restart |
+| Emergency stop | Immediately denies new paid work and cancels every live model invocation. **Destructive.** | action | daemon (model control) | when activated |
+| Orchestration max child effort | Ceiling on the reasoning effort a spawned child agent may request at admission. | choice | daemon field `orchestration_max_child_effort` | when applied · no restart |
 
 #### Budgets
 
@@ -483,7 +507,7 @@ Model budget policies.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Budget policies | Daemon model budget policies; a adds, Enter edits, d deletes (an empty list shows the add hint). | list | daemon (model budgets) | immediately |
+| Budget policies | Daemon model budget policies; a adds, Enter edits, d deletes (an empty list shows the add hint). | list | daemon (model budgets) | when applied · no restart |
 
 #### Usage
 
@@ -491,8 +515,8 @@ Usage telemetry and stop/cancel actions.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Usage and telemetry | Read-only daemon usage and model-control telemetry. | read-only | daemon (usage statistics) | immediately |
-| Stop-all and cancel | Destructive actions from the stats view: emergency stop-all and cancel a live invocation. **Destructive.** | action | daemon (model control) | immediately |
+| Usage and telemetry | Read-only daemon usage and model-control telemetry. | read-only | daemon (usage statistics) | when applied · no restart |
+| Stop-all and cancel | Destructive actions from the stats view: emergency stop-all and cancel a live invocation. **Destructive.** | action | daemon (model control) | when activated |
 
 #### Provider Keys
 
@@ -500,27 +524,44 @@ Manage provider credentials stored in the key vault.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Provider credential slots | Twenty-three masked vault slots; s sets, r rotates, c checks, d clears after confirmation, and i imports from environment. | list | daemon (key vault) | immediately |
+| Provider credential slots | Twenty-three masked vault slots; s sets, r rotates, c checks, d clears after confirmation, and i imports from environment. | list | daemon (key vault) | when applied · no restart |
+
+#### Cloud Spend
+
+Daily cap and stop line for remote (cloud) gate spend.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Cloud spend | Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC. | read-only | daemon (cloud spend) | when applied · no restart |
+| Cloud spend stop line (USD) | Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes. | choice | daemon field `cloud_spend_stop_line_usd` | when applied · no restart |
+| Cloud spend daily cap (USD) | Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop. | choice | daemon field `cloud_spend_daily_cap_usd` | when applied · no restart |
 
 ### AGENT AUTOMATION — What does the daemon do on its own when agents fail?
 
 #### Retries & Recovery
 
-What the daemon does when a session fails.
+What the daemon does when a session fails or stalls.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Retry on failure | Kill-switch for durable automatic retry of failed sessions. | toggle | daemon field `retry_enabled` | immediately |
-| Max retries | Persisted daemon retry cap (`retry_max_default`); it is not applied to default launches. rsid gives every session kind zero automatic retries unless the launch carries an explicit retry policy (fail-closed; rsid session/retry_policy.rs:14-18). Changing this value does not give default launches retries. | read-only | daemon field `retry_max_default` | stored, not applied (see summary) |
-| Retry max backoff | Upper bound, in milliseconds, on the delay between automatic retries. | choice | daemon field `retry_max_backoff_ms` | immediately |
-| Retry on stall | Runs the stall-retry handler that relaunches stalled sessions. | toggle | daemon field `retry_on_stall` | immediately |
-| Reconciliation loop | Runs the background loop that reconciles session liveness and consistency. | toggle | daemon field `reconciliation_enabled` | immediately |
+| Retry on failure | Kill-switch for durable automatic retry of failed sessions. | toggle | daemon field `retry_enabled` | when applied · no restart |
+| Retry max backoff | Upper bound, in milliseconds, on the delay between automatic retries. | choice | daemon field `retry_max_backoff_ms` | when applied · no restart |
+| Retry on stall | Runs the stall-retry handler that relaunches stalled sessions. | toggle | daemon field `retry_on_stall` | when applied · no restart |
+| Reconciliation loop | Runs the background loop that reconciles session liveness and consistency. | toggle | daemon field `reconciliation_enabled` | when applied · no restart |
+
+#### Context Rotation
+
+When a session rotates to a fresh context, and the manager and worker context caps.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
 | Context rotation | Near its limit, asks a manager or Epic lead to pass its seat at the next idle boundary; workers keep going on native compaction. Manual rotation still works for any session. | toggle | daemon field `context_rotation_enabled` | new launches now · resumed sessions after restart |
-| Context rotation threshold (global) | Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%. | choice | daemon field `context_rotation_global_pct` | immediately |
-| Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | immediately |
-| Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | immediately |
-| Coordinator context cap (0 off) | Live-context tokens at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff; workers are never capped. Read or set a provider or model override with :context-cap <Provider[/model]> [tokens\|default]. Default 0 (off until #1156); 200000 is the suggested value. Needs context rotation on. | choice | daemon field `coordinator_context_cap_tokens` | immediately |
-| Worker context cap (0 off, 1-100 = % of window) | Live context at which a worker with a launching manager or Epic lead is told to pass the baton (commit, append a handoff to its Issue, end its turn) and its launcher gets a worker_context_cap notice. Read or set a provider or model override with :worker-context-cap <Provider[/model]> [pct\|tokens\|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. Managers may propose it within operator bounds. | choice | daemon field `worker_context_cap_tokens` | immediately |
+| Context rotation threshold (global) | Overrides Claude Code and Codex rotation thresholds when set. Default clears the override; choose 1–99%. | choice | daemon field `context_rotation_global_pct` | when applied · no restart |
+| Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | when applied · no restart |
+| Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | when applied · no restart |
+| Coordinator context cap (0 off, 1-100 = % of window) | Live context at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff. Read or set a provider or model override with :context-cap <Provider[/model]> [pct\|tokens\|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. An unknown window disables percentage caps. Needs context rotation on. | choice | daemon field `coordinator_context_cap_tokens` | when applied · no restart |
+| Worker context cap (0 off, 1-100 = % of window) | Live context at which a worker with a launching manager or Epic lead is told to pass the baton (commit, append a handoff to its Issue, end its turn) and its launcher gets a worker_context_cap notice. Read or set a provider or model override with :worker-context-cap <Provider[/model]> [pct\|tokens\|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. Managers may propose it within operator bounds. | choice | daemon field `worker_context_cap_tokens` | when applied · no restart |
+| Provider lifecycle hooks | Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart. StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, when it fits the provider's 10,000-character hook-context cap; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks. | choice | daemon field `provider_lifecycle_hooks` | next spawn |
 
 #### Stall Detection
 
@@ -528,13 +569,13 @@ How stalled sessions are detected and nudged.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Stall detection | Runs the stall detector that flags sessions which stop making progress. | toggle | daemon field `stall_detection_enabled` | immediately |
-| Stall classifier | Asks a model whether a flagged session is really stalled before nudging it. Turning it on or off applies to the next detector tick and received signal. The classifier model is edited in MODELS ▸ Model Roles. | toggle | daemon field `stall_classifier_enabled` | immediately |
-| Classifier idle threshold (Claude) | Idle seconds before the classifier considers a Claude session stalled. | edit | daemon field `stall_classifier_idle_secs` | immediately |
-| Classifier idle threshold (Codex) | Idle seconds before the classifier considers a Codex session stalled. | edit | daemon field `stall_classifier_idle_secs_codex` | immediately |
-| Classifier cooldown | Minimum seconds between classifier nudges to one session. | edit | daemon field `stall_classifier_cooldown_secs` | immediately |
-| Classifier max per session | Cap on classifier nudges over one session's lifetime. | edit | daemon field `stall_classifier_max_per_session` | immediately |
-| Classifier confidence floor | Minimum classifier confidence before a nudge is sent. | edit | daemon field `stall_classifier_confidence_floor` | immediately |
+| Stall detection | Runs the stall detector that flags sessions which stop making progress. | toggle | daemon field `stall_detection_enabled` | when applied · no restart |
+| Stall classifier | Asks a model whether a flagged session is really stalled before nudging it. Turning it on or off applies to the next detector tick and received signal. The classifier model is edited in MODELS ▸ Model Roles. | toggle | daemon field `stall_classifier_enabled` | when applied · no restart |
+| Classifier idle threshold (Claude) | Idle seconds before the classifier considers a Claude session stalled. | edit | daemon field `stall_classifier_idle_secs` | when applied · no restart |
+| Classifier idle threshold (Codex) | Idle seconds before the classifier considers a Codex session stalled. | edit | daemon field `stall_classifier_idle_secs_codex` | when applied · no restart |
+| Classifier cooldown | Minimum seconds between classifier nudges to one session. | edit | daemon field `stall_classifier_cooldown_secs` | when applied · no restart |
+| Classifier max per session | Cap on classifier nudges over one session's lifetime. | edit | daemon field `stall_classifier_max_per_session` | when applied · no restart |
+| Classifier confidence floor | Minimum classifier confidence before a nudge is sent. | edit | daemon field `stall_classifier_confidence_floor` | when applied · no restart |
 
 #### Memory & Dreaming
 
@@ -543,72 +584,45 @@ Memory extraction and consolidation.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Memory system | OFF stops new memory work live; ON may require a daemon restart. OFF stops automatic indexing and new observation extraction while retaining existing index search, status and file reads. ON requires a daemon restart if no memory worker was started. An existing worker can resume on its next sync. | toggle | daemon field `memory_enabled` | off now · on after restart |
-| Dream consolidation | Enables periodic memory consolidation (dreaming). | toggle | daemon field `dream_enabled` | immediately |
-| Observation threshold | Number of new observations that triggers a consolidation cycle. | edit | daemon field `dream_observation_threshold` | immediately |
-| Dream cooldown | Cooldown used by the next consolidation cycle; an existing cooldown keeps its deadline. | edit | daemon field `dream_cooldown_secs` | immediately |
-| Dream idle wait | Idle seconds the daemon waits for before starting a consolidation cycle. | choice | daemon field `dream_idle_secs` | immediately |
+| Dream consolidation | Enables periodic memory consolidation (dreaming). | toggle | daemon field `dream_enabled` | when applied · no restart |
+| Observation threshold | Number of new observations that triggers a consolidation cycle. | edit | daemon field `dream_observation_threshold` | when applied · no restart |
+| Dream cooldown | Cooldown used by the next consolidation cycle; an existing cooldown keeps its deadline. | edit | daemon field `dream_cooldown_secs` | when applied · no restart |
+| Dream idle wait | Idle seconds the daemon waits for before starting a consolidation cycle. | choice | daemon field `dream_idle_secs` | when applied · no restart |
 | Dialectic engine | Enables the dialectic question engine behind :ask. | toggle | daemon field `dialectic_enabled` | after daemon restart |
 
-#### Orchestration
+#### Scheduling
 
-Background queue and recursive DAG controls.
+The background queue, the topology executor, how child sessions are kept running and the manager health-alert thresholds.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Background queue | Enables the daemon's background work queue. | toggle | daemon field `queue_enabled` | after daemon restart |
-| Recursive DAG recovery controls | Allows recovery controls on recursive DAG runs. | toggle | daemon field `recursive_dag_recovery_controls_enabled` | immediately |
-| Recursive DAG scheduler controls | Allows scheduler controls on recursive DAG runs. | toggle | daemon field `recursive_dag_scheduler_controls_enabled` | immediately |
-| Recursive DAG cancellation controls | Allows cancelling recursive DAG runs. | toggle | daemon field `recursive_dag_cancellation_controls_enabled` | immediately |
-| Recursive DAG live scheduler | Allows the live scheduler to drive recursive DAG runs. | toggle | daemon field `recursive_dag_live_scheduler_control_enabled` | immediately |
-| Recursive DAG run lease TTL | Lease lifetime, in milliseconds, for a recursive DAG run. | choice | daemon field `recursive_dag_run_lease_ttl_ms` | immediately |
-| Recursive DAG max concurrent graphs | Maximum recursive DAG graphs running at once. | choice | daemon field `recursive_dag_max_concurrent_graphs` | immediately |
-| Graph overlay: render recursive origin | Draws each node's recursive-spawn origin edge in the graph overlay (:dag). | toggle | daemon field `gv_render_recursive_origin` | immediately |
-| Graph overlay: info dashboard | Shows the info dashboard panel in the graph overlay (:dag). | toggle | daemon field `gv_info_dashboard` | immediately |
-| Follow agent-created projects | Switches to the new project's tab when an agent creates a project (AgentCreateProject). On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is. | toggle | daemon field `follow_agent_created_projects` | immediately |
-| Durable topology executor | Kill switch for the durable topology executor (#634); off, no durable execution advances or recovers and live topology runs use the legacy in-memory runner. | toggle | daemon field `topology_executor_enabled` | immediately |
-| Topology build nodes | Most topology build nodes the durable executor runs at once (1-16; the page cycles 1-4). | choice | daemon field `topology_max_concurrent_build_nodes` | immediately |
-| Topology bulk fan-out on OpenRouter (0 off) | Minimum leaf count for OpenRouter topology bulk fan-out; 0 disables it. | choice | daemon field `topology_bulk_fanout_min_openrouter` | immediately |
-| Completed transcript cache (bytes) | Daemon RAM limit for completed transcript reads; 0 disables retention. | choice | daemon field `completed_transcript_cache_max_bytes` | immediately |
-| rsid MemoryHigh (MiB) | Systemd memory pressure threshold for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_high_mib` | after daemon restart |
-| rsid MemoryMax (MiB) | Hard systemd memory ceiling for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_max_mib` | after daemon restart |
-| rsid MemorySwapMax (MiB) | Swap ceiling for the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_swap_max_mib` | after daemon restart |
-| rsid CPUWeight | Relative CPU weight of the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_cpu_weight` | after daemon restart |
-| Worker slice MemoryHigh (MiB) | Aggregate worker MemoryHigh, initially 55% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_high_mib` | after daemon restart |
-| Worker slice MemoryMax (MiB) | Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_max_mib` | after daemon restart |
-| Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
-| Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
-| Rolling merge queue | Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish. | toggle | daemon field `rolling_queue_enabled` | immediately |
-| Detach Claude turns | Run new Claude CLI turns through the durable turn shim (default off). Applies to the next Claude turn. Turning it off reads provider output directly from a pipe. Experimental: enabling is unsafe until transport authority across daemon boots (#1711) lands. Sessions that ran a detached turn are kept in the trash and cannot be purged. | toggle | daemon field `turn_detach_enabled` | immediately |
-| Hold new work while a deploy waits | While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs. Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything. | toggle | daemon field `deploy_drain_enabled` | immediately |
-| Deploy hold limit (s) | How long an agent-requested deploy may hold new launches while it waits for its quiet point (0-3600 seconds, default 600; 0 never holds). A worker turn can run for an hour, so a deploy that held new launches until its max wait starved the manager. Past this limit the deploy keeps waiting for a quiet point (no lander, job or scoped worker mid-turn) without holding anything, then holds again only from its first quiet poll until the restart. An operator restart is not limited. The manager can also cancel its own waiting deploy (AgentRequestDeploy cancel: true). | choice | daemon field `deploy_drain_hold_secs` | immediately |
-| Host load limit for new launches | Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds). Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything. | choice | daemon field `host_load_admission_threshold` | immediately |
-| Merge queue batch size | Maximum ready sources merged into one candidate and gated once (1-8); the current runner gates one source at a time. | choice | daemon field `rolling_queue_batch_size` | immediately |
-| Merge queue speculation depth | How many candidates are prepared on top of the batch being gated (0-2). | choice | daemon field `rolling_queue_speculation_depth` | immediately |
-| Merge queue gate timeout (min) | Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 360). When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch. | choice | daemon field `rolling_queue_gate_timeout_mins` | immediately |
-| Agent test job timeout (min) | Default wall-clock timeout of an agent's AgentSubmitJob test job (5-180 minutes, default 20); a manager may raise one job. Counted from unit launch, not submit. Past it the daemon stops the job's unit and settles it failed with job_timed_out, which wakes its owner. A job held before launch by a deploy drain is failed job_admission_timed_out after the drain hold cap plus 5 minutes. Candidate-receipt runs keep the unit's own cap unless they name a timeout. | choice | daemon field `job_test_timeout_mins` | immediately |
-| CPU andon: CPU-minutes per tree | One agent process tree (a session's provider scope or a job unit) past this many CPU-minutes is a runaway (0 off, default 240). The daemon samples cgroup CPU time once a minute (Linux; unsupported elsewhere), records a runaway_process friction event and tells the owning manager the session and a suggested halt. It never stops the tree itself. | choice | daemon field `cpu_andon_cpu_minutes` | immediately |
-| CPU andon: host load | At or above this 1-minute host load, one agent process tree using a dominant share of it is a runaway (0 off, default 40). Same andon as the CPU-minutes trigger: a runaway_process friction event and one manager notice per tree, never an automatic stop. | choice | daemon field `cpu_andon_host_load` | immediately |
-| Hold program wakes while children run | Program-mode masters' due resume wakes wait while their spawned children run, then deliver once per keep-alive window; the wake stays armed meanwhile. The held wake stays enabled and exact, so the no-idle invariant is unchanged. It delivers when the last child settles (the child watch wakes the master) or once when the window elapses; an operator trigger-now bypasses the hold. Non-program wakes are never held. | toggle | daemon field `program_hold_while_children_run` | immediately |
-| Child keep-alive valve | Off by default. When on, an idle parent whose children keep running gets one same-session resume per window so it can unblock hung children. The valve inserts at most one daemon-owned one-shot Resume row per window, only for a Completed parent with no other enabled resume wake, pending question, approval, pause or capacity incident, and retires it undelivered if every child settled first. It never launches a Fresh session. | toggle | daemon field `child_keepalive_enabled` | immediately |
-| Child keep-alive window (s) | Length of the keep-alive and hold window (300-21600 seconds, default 1500). | choice | daemon field `child_keepalive_window_secs` | immediately |
-| Build slots | Concurrent cargo build/test runs the resource governor admits (1-16); default 4. | choice | daemon field `governor_build_slots` | immediately |
-| Lander slots | Concurrent rsi-rolling-land runs the resource governor admits (1-16); default 5. | choice | daemon field `governor_lander_slots` | immediately |
-| Governor max load (0 auto) | 1-minute load at or above which no new build or lander starts; 0 means 1.25 x cores. | choice | daemon field `governor_max_load` | immediately |
-| Governor min free disk (GB) | Free space on / below which no new build or lander starts; default 30. | choice | daemon field `governor_min_free_disk_gb` | immediately |
-| Governor min available memory (GB) | MemAvailable below which no new build or lander starts; default 16. | choice | daemon field `governor_min_avail_mem_gb` | immediately |
-| Governor max workers-slice memory (GB) | Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30. | choice | daemon field `governor_max_workers_slice_gb` | immediately |
-| Harness web access | Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it. | choice | daemon field `harness_web_access` | next spawn |
-| Harness network egress | Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. No Harness network tool exists yet (#748), so the fetch guard has no production caller until one lands. A session's own tool policy overrides it. | choice | daemon field `harness_egress_mode` | next spawn |
-| Harness context editing | Default for Harness context editing: when on, direct-Anthropic Claude Harness sessions let the provider clear stale tool results server-side to save context. A session's own tool policy (context_editing) overrides it. Read at launch, so running sessions keep the value they started with (#1111). | toggle | daemon field `harness_context_editing` | next spawn |
-| Harness search call cap | Default cap on hosted web searches per Harness session; 0 is unlimited. Exhaustion returns a typed tool error and the session continues. | choice | daemon field `harness_max_search_calls` | next spawn |
-| Harness fetch call cap | Default cap on hosted web fetches per Harness session; 0 is unlimited. | choice | daemon field `harness_max_fetch_calls` | next spawn |
-| Harness completion gates | Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794). | toggle | daemon field `completion_gates_enabled` | next spawn |
-| Harness tool output cap (bytes) | Default cap on total tool output bytes per Harness session; 0 is unlimited. Once used up, further tool calls return a typed error. | choice | daemon field `harness_max_result_bytes` | next spawn |
-| Harness web cost cap (micro-USD) | Default cap on estimated hosted web cost per Harness session (1000000 = 1 USD, searches estimated at 0.01 USD); 0 is unlimited. | choice | daemon field `harness_max_web_cost_usd_micros` | next spawn |
-| MCP deferred tool threshold | Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable. Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap. | choice | daemon field `mcp.deferred_tool_threshold` | next spawn |
-| Cloud spend | Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC. | read-only | daemon (cloud spend) | immediately |
-| Cloud spend stop line (USD) | Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes. | choice | daemon field `cloud_spend_stop_line_usd` | immediately |
-| Cloud spend daily cap (USD) | Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop. | choice | daemon field `cloud_spend_daily_cap_usd` | immediately |
+| Durable topology executor | Kill switch for the durable topology executor (#634); off, no durable execution advances or recovers and live topology runs use the legacy in-memory runner. | toggle | daemon field `topology_executor_enabled` | when applied · no restart |
+| Topology build nodes | Most topology build nodes the durable executor runs at once (1-16; the page cycles 1-4). | choice | daemon field `topology_max_concurrent_build_nodes` | when applied · no restart |
+| Topology bulk fan-out on OpenRouter (0 off) | Minimum leaf count for OpenRouter topology bulk fan-out; 0 disables it. | choice | daemon field `topology_bulk_fanout_min_openrouter` | when applied · no restart |
+| Hold program wakes while children run | Program-mode masters' due resume wakes wait while their spawned children run, then deliver once per keep-alive window; the wake stays armed meanwhile. The held wake stays enabled and exact, so the no-idle invariant is unchanged. It delivers when the last child settles (the child watch wakes the master) or once when the window elapses; an operator trigger-now bypasses the hold. Non-program wakes are never held. | toggle | daemon field `program_hold_while_children_run` | when applied · no restart |
+| Child keep-alive valve | Off by default. When on, an idle parent whose children keep running gets one same-session resume per window so it can unblock hung children. The valve inserts at most one daemon-owned one-shot Resume row per window, only for a Completed parent with no other enabled resume wake, pending question, approval, pause or capacity incident, and retires it undelivered if every child settled first. It never launches a Fresh session. | toggle | daemon field `child_keepalive_enabled` | when applied · no restart |
+| Child keep-alive window (s) | Length of the keep-alive and hold window (300-21600 seconds, default 1500). | choice | daemon field `child_keepalive_window_secs` | when applied · no restart |
+| Follow agent-created projects | Switches to the new project's tab when an agent creates a project (AgentCreateProject). On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is. | toggle | daemon field `follow_agent_created_projects` | when applied · no restart |
+| Health alert: hub disk used (%) | Hub root filesystem use at or above which a manager's armed health_anomaly wake fires (0 off, else 50-99 %, default 90). A manager (project manager or portfolio seat) arms one `health_anomaly` wake instead of an hourly check-in turn. The daemon evaluates it every minute with no model call and resumes the manager once, naming each condition, when one holds: this one, a PM seat stuck behind a refused succession or over its rotation threshold, blocked or overrun topology work, a hot CPU, a satellite below its disk floor, a provider fault, or a red rolling QA no Issue tracks. Takes effect at the next evaluation. | choice | daemon field `health_disk_used_pct` | when applied · no restart |
+| Health alert: CPU hot (C) | CPU temperature that, held for three minutes, fires a manager's armed health_anomaly wake (0 off, else 60-110 C, default 80). Read from the hub's hottest CPU sensor (Linux hwmon). A host with no readable sensor never fires. This is separate from the job thermal hold, which stops new jobs at a higher temperature. Takes effect at the next evaluation. | choice | daemon field `health_thermal_c` | when applied · no restart |
+| Health alert: work stuck (min) | Minutes a topology execution may stay blocked, a node attempt may run past its wall limit, or a red rolling QA may go untracked before health_anomaly fires (0 off, else 5-720, default 30). Counted from the moment the execution blocked, the attempt's execution deadline passed, or the red full-library QA run finished with no open Issue tracking it. Takes effect at the next evaluation. | choice | daemon field `health_stuck_minutes` | when applied · no restart |
+
+#### Recursive DAG
+
+Recursive DAG control gates, run leases and the graph views.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Recursive DAG recovery controls | Allows recovery controls on recursive DAG runs. | toggle | daemon field `recursive_dag_recovery_controls_enabled` | when applied · no restart |
+| Recursive DAG scheduler controls | Allows scheduler controls on recursive DAG runs. | toggle | daemon field `recursive_dag_scheduler_controls_enabled` | when applied · no restart |
+| Recursive DAG cancellation controls | Allows cancelling recursive DAG runs. | toggle | daemon field `recursive_dag_cancellation_controls_enabled` | when applied · no restart |
+| Recursive DAG live scheduler | Allows the live scheduler to drive recursive DAG runs. | toggle | daemon field `recursive_dag_live_scheduler_control_enabled` | when applied · no restart |
+| Recursive DAG run lease TTL | Lease lifetime, in milliseconds, for a recursive DAG run. | choice | daemon field `recursive_dag_run_lease_ttl_ms` | when applied · no restart |
+| Recursive DAG max concurrent graphs | Maximum recursive DAG graphs running at once. | choice | daemon field `recursive_dag_max_concurrent_graphs` | when applied · no restart |
+| Graph overlay: render recursive origin | Draws each node's recursive-spawn origin edge in the graph overlay (:dag). | toggle | daemon field `gv_render_recursive_origin` | when applied · no restart |
+| Graph overlay: info dashboard | Shows the info dashboard panel in the graph overlay (:dag). | toggle | daemon field `gv_info_dashboard` | when applied · no restart |
+| Schema-validated topology handoffs | Makes every topology session node ask the harness to validate its repeated handoff's shape, as if marked structured_handoff (default off). When a topology node's handoff is refused (handoff_invalid), the daemon continues the same session once to repeat it. With this on (or on a node marked structured_handoff) that turn carries the handoff JSON Schema: Claude gets --json-schema, Codex gets --output-schema and -o, so the harness checks the shape before RSI parses it. The parser accepts the structured payload as the handoff and still accepts a free-text one. Off launches every turn exactly as before. The effect shows in the handoff_invalid_total and handoff_observed_total counters of AgentGetDaemonInfo, by provider and structured. | toggle | daemon field `structured_handoff_default` | when applied · no restart |
 
 #### Code Intelligence
 
@@ -616,7 +630,7 @@ Code-graph indexing of project source.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Codegraph indexing | Indexes project source into the code graph used by code-intelligence views. | toggle | daemon field `codegraph_indexing_enabled` | immediately |
+| Codegraph indexing | Indexes project source into the code graph used by code-intelligence views. | toggle | daemon field `codegraph_indexing_enabled` | when applied · no restart |
 
 ### PROVIDERS & SANDBOXES — Where and how do agents run?
 
@@ -627,41 +641,68 @@ How provider processes are sandboxed and isolated.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Codex sandbox | Sandbox policy for new Codex processes: read-only, workspace-write or danger-full-access. | choice | daemon field `codex_sandbox_mode` | next spawn |
+| Codex live model catalog TTL (s) | Seconds the per-login Codex model list is cached before it is read again (0 = bundled catalog only, default 300). The Codex model picker, the manager preflight and launch admission use the models this login can actually use, read from the Codex app-server (model/list) and falling back to non-bundled `codex debug models`. A failed read falls back to the bundled catalog, marked degraded, and never refuses a launch by itself. A model absent from a fresh live list is refused model_unavailable before any session or sandbox is created, and admitted again as soon as a later list contains it. 0 reads only the bundled catalog. | choice | daemon field `codex_live_catalog_ttl_secs` | when applied · no restart |
+| Codex plan-window poll (s) | Seconds between reads of the Codex plan windows (0 = off, default 300). The daemon asks the Codex app-server (account/rateLimits/read, no model turn) how much of the signed-in plan's windows is used and stores them beside Claude's, so launch admission, the manager capacity view and the status bar treat both providers alike. A failed read keeps the last windows and marks them stale; a logged-out login stores nothing. 0 turns the poll off (Claude windows are unaffected). | choice | daemon field `codex_rate_limit_poll_secs` | when applied · no restart |
+| Provider CLI contract canary | Checks, at daemon start and when a CLI's version changes, that the installed Claude Code and Codex still honour what RSI relies on (default on). A bounded, non-billing check per CLI: Codex hook trust and the app-server handshake (hooks/list with RSI's real hook overrides: both session-flag hooks must be trusted with RSI's hash), and Claude's initialize control request plus every flag RSI passes (help text, then an unknown-option probe for hidden flags) and the non-bare ambient login. A failed check marks the provider degraded with a reason code in the provider status and the Provider Keys list, and notifies the manager. Off skips the check and reports the provider unchecked. | toggle | daemon field `provider_contract_canary` | when applied · no restart |
+| Refuse Codex launch when custody hook is untrusted | Refuses a Codex launch when the canary finds the installed codex-cli does not trust RSI's sandbox custody hook (default on). The custody hook stops a Codex session from switching the sandbox branch, stashing, or force-pushing. If a codex-cli update changes how it hashes hooks, the hook is silently not run. With this on, a Codex launch that needs the hook is refused with codex_hook_untrusted, codex_hook_hash_mismatch or codex_hook_missing until RSI's hash is updated; off launches Codex without custody and only reports the provider degraded. Only a definite untrusted result refuses: an unchecked or failed canary never does. | toggle | daemon field `codex_refuse_untrusted_custody_hook` | when applied · no restart |
 | Claude project config isolation | Isolation of Claude project config for new Claude processes: off, settings or strict. | choice | daemon field `claude_config_isolation` | next spawn |
-| Vault: legacy env fallback | Allow provider keys from legacy environment variables when no vault credential exists. | toggle | daemon field `vault.env_compat` | immediately |
-| Vault: check TTL | Cache provider key check results for this many seconds. | choice | daemon field `vault.check_ttl_secs` | immediately |
-| OpenRouter engine | Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route <model> [codex_cli\|harness\|default]. | choice | daemon field `api_route.openrouter` | next spawn |
-| Bedrock engine | Choose the engine for new Bedrock sessions: codex_cli runs GPT in Codex and Claude in Claude Code; harness runs both in RSI's Harness. | choice | daemon field `api_route.bedrock` | next spawn |
-| Provider profile | all launches every provider as before; aws_only allows only Claude Code on Amazon Bedrock (a Bedrock Claude model id), refuses every other launch with provider_profile_refused, and filters the model pickers. Set the AWS region and Bedrock key with :aws-setup. Checked at every launch, continuation, rotation and spawn. Under aws_only a Claude launch that names no model runs us.anthropic.claude-sonnet-5-v1:0. | choice | daemon field `provider_profile` | immediately |
-| API route fallback | Allow a failed Harness preflight to launch OpenRouter through Codex CLI. | toggle | daemon field `api_route.fallback` | next spawn |
-| OpenRouter context budget (0 off) | Live-context tokens at which an OpenRouter session compacts; 0 keeps the model's own limit. | choice | daemon field `openrouter_context_budget_tokens` | next spawn |
-| Harness iterations per turn | Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000). | choice | daemon field `harness_max_iterations_per_turn` | next spawn |
+| Codex user config isolation | Isolation of the operator's Codex config for new Codex processes: off, user (ignore config.toml), rules (ignore execpolicy rules) or all. user passes --ignore-user-config so $CODEX_HOME/config.toml (model, profile, mcp_servers, hooks, approval_policy) is not loaded; rules passes --ignore-rules so user and project execpolicy .rules files are not loaded; all passes both. Auth still uses CODEX_HOME and every override RSI passes still applies. off adds no flag. | choice | daemon field `codex_config_isolation` | next spawn |
+| Provider launch overrides | Extra Claude Code / Codex CLI launch options, from an allowlist (default none). Enter opens a JSON editor; the daemon checks each option and the editor shows its reason when it refuses. A JSON object of per-provider lists, e.g. {"codex":["model_reasoning_summary=concise"],"claude":["--append-system-prompt=Be terse."]}. Claude takes the flags --append-system-prompt and --betas (passed as --flag=value; the fallback chain and spend cap have their own settings); Codex takes the config keys model_reasoning_summary, model_verbosity, service_tier, web_search, hide_agent_reasoning, show_raw_agent_reasoning and agents.enabled (passed as -c key=value). Anything that widens privilege (--dangerously-skip-permissions, --permission-mode, --add-dir, permissions.*, sandbox.*, hooks.*, approval_policy, sandbox_mode, mcp_servers.*) or that RSI sets itself (model, effort, resume, --fallback-model, --max-budget-usd, and the Codex subagent model and concurrency cap, which have their own settings) is refused with provider_launch_override_denied; any other key with provider_launch_override_unknown_key, as is a Claude flag the installed CLI does not know. Applied at the next CLI launch (each Claude turn) and recorded on the session as a launch-overrides row. Empty clears. | action | daemon field `provider_launch_overrides` | when activated |
+| Claude fallback models | Ordered models a Claude session falls back to when its model is overloaded or unavailable, comma-separated, at most three. Default is empty (no fallback). Enter opens a text editor. Passed as --fallback-model=a,b to each new Claude CLI session (#2762); the CLI tries them in order per turn and retries the primary at the start of each turn. It does not apply to auth, billing or rate-limit errors, and is not passed to Bedrock-routed models or when the list names only the session's own model. A result that shows a chain member served part of the run adds a model_fallback_used row (from, to) to the session transcript. Running sessions keep the value they started with. | action | daemon field `claude_fallback_models` | when activated |
+| Claude spend cap per session (USD) | Estimated spend, in USD, at which a new Claude CLI session stops. 0 (the default) is off. Enter opens a text editor. Passed as --max-budget-usd=<n> to each new Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Meant for API- or Bedrock-billed sessions; a subscription login is not billed per token, so leave it 0 there. Running sessions keep the value they started with. | action | daemon field `claude_max_budget_usd` | when activated |
+| Vault: legacy env fallback | Allow provider keys from legacy environment variables when no vault credential exists. | toggle | daemon field `vault.env_compat` | when applied · no restart |
+| Vault: check TTL | Cache provider key check results for this many seconds. | choice | daemon field `vault.check_ttl_secs` | when applied · no restart |
 
-#### Sandbox Storage
+#### Subagent Governance
 
-Sandbox disk use, cache reclamation and settlement.
+Which model Claude and Codex subagents run on and how many may run at once.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Sandbox storage | Shows sandbox storage usage; R refreshes it. | read-only | daemon (sandbox storage) | immediately |
-| Sandbox cache reclaim | Enables periodic reclamation of sandbox build caches. | toggle | daemon field `sandbox_build_cache_reclaim_enabled` | immediately |
-| Cache reclaim TTL | Seconds a build cache may live before it can be reclaimed. | edit | daemon field `sandbox_build_cache_reclaim_ttl_secs` | immediately |
-| Cache reclaim interval | Seconds between periodic reclaim passes. | edit | daemon field `sandbox_build_cache_reclaim_interval_secs` | immediately |
-| Cache pressure high | Disk-use percent that arms reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_high_watermark_pct` | immediately |
-| Cache pressure low | Disk-use percent that clears reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_low_watermark_pct` | immediately |
-| Cache reclaim pass limit | Maximum caches deleted in one reclaim pass. | edit | daemon field `sandbox_build_cache_reclaim_max_candidates` | immediately |
-| Agent build jobs | Cargo jobs per build in a sandboxed session. | edit | daemon field `agent_build_jobs` | next spawn |
-| Agent line tables | Use line-tables-only debuginfo for sandbox builds. | toggle | daemon field `agent_build_line_tables_only` | next spawn |
-| Worker sccache | Use sccache and disable incremental builds for fresh workers. | toggle | daemon field `agent_build_sccache_enabled` | next spawn |
-| sccache cap (GiB) | Machine local sccache disk cap for new worker processes. | edit | daemon field `agent_build_sccache_cache_gib` | next spawn |
-| Machine build slots | Maximum concurrent compiler processes across agent sandboxes. | edit | daemon field `agent_build_slots` | next spawn |
-| Preview cache reclaim | Runs a dry-run reclaim pass and reports what it would free. | action | daemon (sandbox storage) | immediately |
-| Reclaim sandbox caches now | Runs a real reclaim pass now and reports the result. **Destructive.** | action | daemon (sandbox storage) | immediately |
-| Source-worktree settlement | Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. **Destructive.** | action | daemon (source-worktree settlement) | immediately |
-| Legacy scratch adoption | Lists unrecorded scratch directories (worker TMPDIRs, /var/tmp/rsi-*, lander workspaces) and records chosen ones so scratch reclaim, which is enabled, deletes them automatically once old and unheld. Adopting asks you to confirm every full path first. Each adoption re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and refuses what fails it. **Destructive.** | action | daemon (legacy scratch adoption) | immediately |
-| Maximum sandbox roots | Maximum direct source roots under the sandbox base before a new allocation is refused. | choice | daemon field `sandbox_max_source_roots` | immediately |
-| Minimum free space (GiB) | Free filesystem space required before a new sandbox is allocated. | choice | daemon field `sandbox_min_free_gib` | immediately |
-| Purge archived sandboxes | Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. **Destructive.** | toggle | daemon field `archived_sandbox_purge_enabled` | immediately |
+| Claude subagent model | Model every Claude subagent runs on (empty = inherit the parent's model, today's behaviour). Enter opens a text editor. Sets CLAUDE_CODE_SUBAGENT_MODEL for new Claude processes, so subagents run on a cheaper model than the expensive parent. Use a Claude alias (haiku, sonnet, opus) or a full model id; the daemon refuses anything else. Empty sets nothing. A running session keeps the value it started with, and the session shows the effective setting once it starts. | action | daemon field `claude_subagent_model` | when activated |
+| Claude max concurrent subagents | Cap on Claude subagents running at once, per session (0 = Claude Code's default of 20). Sets CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS for new Claude processes (1 to 100). 0 sets nothing. A running session keeps the value it started with, and the session shows the effective cap once it starts. | choice | daemon field `claude_max_concurrent_subagents` | next spawn |
+| Codex subagent model | Model every Codex subagent runs on (empty = Codex's own default). Enter opens a text editor. Passes -c agents.default_subagent_model=MODEL on every codex exec and exec resume turn, so subagents run on a cheaper model than the parent. The daemon refuses anything that is not a plain model identifier. Empty passes nothing. The session shows the effective setting once it starts. | action | daemon field `codex_subagent_model` | when activated |
+| Codex max concurrent subagents | Cap on Codex subagent threads running at once, per session (0 = Codex's default). Passes -c agents.max_concurrent_threads_per_session=N on every codex exec and exec resume turn (1 to 100). 0 passes nothing. The session shows the effective cap once it starts. | choice | daemon field `codex_max_concurrent_subagents` | next spawn |
+
+#### Provider Skills
+
+How new provider sessions get the repository's agent skills.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Provider skill delivery | How a new Claude or Codex session gets the repository's agent skills: ambient (the CLI discovers them, default) or explicit (the launch names them). ambient leaves the launch argv exactly as before: the CLI finds skills from the session's working directory and the operator's home. explicit delivers the repository's skills with the launch itself and suppresses every other source, so the loaded set is exactly the delivered one whatever the working directory or the operator's home hold: Claude gets one --plugin-dir (a content-addressed plugin named rsi-skills built from .claude/skills, its skills namespaced rsi-skills:<skill>; a symlinked .claude or .claude/skills is never read) and an empty --setting-sources, which stops ~/.claude/skills, the working directory's skills and settings-enabled plugins from loading (the user and project settings files then no longer apply either); Codex gets -c skills.bundled.enabled=false and one -c skills.config override that enables the repository's .agents/skills and disables every other skill it finds (nested, symlinked, project .codex/skills, user and admin roots). A Claude plugin that cannot be built delivers no skills (never ambient ones). A Codex launch is refused with a typed skill_delivery_* reason when the skill scan cannot prove it named every skill. Claude's init plugins and plugin_errors show whether it loaded. | choice | daemon field `provider_skill_delivery` | next spawn |
+
+#### API Routes
+
+Provider profile, OpenRouter and Bedrock routes and their budgets.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Provider profile | all launches every provider as before; aws_only allows only Claude Code on Amazon Bedrock (a Bedrock Claude model id), refuses every other launch with provider_profile_refused, and filters the model pickers. Set the AWS region and Bedrock key with :aws-setup. Checked at every launch, continuation, rotation and spawn. Under aws_only a Claude launch that names no model runs us.anthropic.claude-sonnet-5-v1:0. | choice | daemon field `provider_profile` | when applied · no restart |
+| OpenRouter engine | Choose the engine for new OpenRouter sessions. Read or set a model override with :openrouter-route <model> [codex_cli\|harness\|default]. | choice | daemon field `api_route.openrouter` | next spawn |
+| Bedrock engine | Choose the engine for new Bedrock sessions: codex_cli runs GPT in Codex and Claude in Claude Code; harness runs both in RSI's Harness. | choice | daemon field `api_route.bedrock` | next spawn |
+| OpenRouter Codex fallback | Allow a failed Harness preflight to launch OpenRouter through Codex CLI. Off (default): the launch fails loudly and never runs on Codex. | toggle | daemon field `api_route.fallback.openrouter` | next spawn |
+| Bedrock Codex fallback | Allow a failed Harness preflight to launch Bedrock through Codex CLI. The legacy api_route.fallback key is an alias of this setting. | toggle | daemon field `api_route.fallback.bedrock` | next spawn |
+| OpenRouter context budget (0 off) | Live-context tokens at which an OpenRouter session compacts; 0 keeps the model's own limit. | choice | daemon field `openrouter_context_budget_tokens` | next spawn |
+
+#### Harness Tools
+
+Web access, egress, tool budgets and completion gates for Harness sessions.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Harness web access | Default web_access for Harness sessions: enabled, hosted_only (provider-hosted tools only) or disabled (no web tool advertised or run). A session's own tool policy overrides it. | choice | daemon field `harness_web_access` | next spawn |
+| Harness network egress | Default network egress for Harness sessions: deny_private (network tools reach public addresses only; loopback, link-local, cloud metadata and private ranges are refused, after DNS and every redirect) or offline (no network tools; the shell runs in an empty network namespace). In deny_private the shell tool's network is NOT restricted: only offline isolates it. The native web_fetch tool is guarded by it (and web_search refuses offline before any request). A session's own tool policy overrides it. | choice | daemon field `harness_egress_mode` | next spawn |
+| Harness web search backend | Which search vendor backs the native web_search tool on Harness routes without a provider-hosted search: auto (the first backend whose key is set under Provider Keys, else the SearXNG instance when its URL is set), serper, exa, searxng (a self-hosted, keyless instance) or disabled. The tool is advertised only when the chosen backend is configured; otherwise the session emits a web_search_unavailable notice. Read at launch, so running sessions keep the value they started with (#2251). Auto tries Serper first, then Exa (#2252), then SearXNG (#2315). | choice | daemon field `harness_web_search_backend` | next spawn |
+| Harness SearXNG URL | Base URL of the SearXNG instance behind the keyless web_search backend. Default is unset. Enter opens a text editor: type an http(s) URL (scripts/searxng-local.sh prints the local one, http://127.0.0.1:8888); the daemon checks it and the editor shows its reason when it refuses. Run scripts/searxng-local.sh once to start a loopback-only instance with the JSON API enabled (#2315). Public SearXNG instances usually block automated JSON queries, so the local instance is the supported path. Read at launch, so running sessions keep the value they started with. | action | daemon field `harness_searxng_url` | when activated |
+| Harness context editing | Default for Harness context editing: when on, direct-Anthropic Claude Harness sessions let the provider clear stale tool results server-side to save context. A session's own tool policy (context_editing) overrides it. Read at launch, so running sessions keep the value they started with (#1111). | toggle | daemon field `harness_context_editing` | next spawn |
+| Harness search call cap | Default cap on web_search calls per Harness session, native or provider-hosted; 0 is unlimited. Exhaustion returns a typed tool error and the session continues. | choice | daemon field `harness_max_search_calls` | next spawn |
+| Harness fetch call cap | Default cap on web_fetch calls per Harness session, native or provider-hosted; 0 is unlimited. | choice | daemon field `harness_max_fetch_calls` | next spawn |
+| Harness completion gates | Kill switch for Harness completion gates. When off, Harness sessions launched afterwards skip their configured gate commands and record a visible disabled-gate event instead. Read at launch, so running sessions keep the value they started with (#794). | toggle | daemon field `completion_gates_enabled` | next spawn |
+| Harness tool output cap (bytes) | Default cap on total tool output bytes per Harness session; 0 is unlimited. Once used up, further tool calls return a typed error. | choice | daemon field `harness_max_result_bytes` | next spawn |
+| Harness web cost cap (micro-USD) | Default cap on estimated web cost per Harness session, native or provider-hosted (1000000 = 1 USD, searches estimated at 0.01 USD); 0 is unlimited. | choice | daemon field `harness_max_web_cost_usd_micros` | next spawn |
+| MCP deferred tool threshold | Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable. Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap. | choice | daemon field `mcp.deferred_tool_threshold` | next spawn |
+| Harness iterations per turn | Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000). | choice | daemon field `harness_max_iterations_per_turn` | next spawn |
 
 #### Claude Hooks
 
@@ -678,6 +719,120 @@ Claude user skills.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Claude skills | Claude user skills; Enter previews, e enables or disables. | list | file `~/.claude/skills/` | immediately |
+
+### HOST & BUILD — What do agents, builds and the merge queue use of this machine?
+
+#### Resource Limits
+
+Memory and CPU limits for the daemon, workers and build slice.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| rsid MemoryHigh (MiB) | Systemd memory pressure threshold for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_high_mib` | after daemon restart |
+| rsid MemoryMax (MiB) | Hard systemd memory ceiling for the rsid daemon scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_max_mib` | after daemon restart |
+| rsid MemorySwapMax (MiB) | Swap ceiling for the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_memory_swap_max_mib` | after daemon restart |
+| rsid CPUWeight | Relative CPU weight of the rsid daemon systemd scope; applies after restarting rsid. | choice | daemon field `rsid_scope_cpu_weight` | after daemon restart |
+| Worker slice MemoryHigh (MiB) | Aggregate worker MemoryHigh, initially 55% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_high_mib` | after daemon restart |
+| Worker slice MemoryMax (MiB) | Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_max_mib` | after daemon restart |
+| Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
+| Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
+| Worker CPU quota | CPU cap of each worker, as a percentage of one CPU (400 = four cores, default 400; 0 disables the cap). Each worker session runs in its own systemd scope; this sets that scope's CPUQuota, so one worker's builds, tests or runaway loops cannot take more than this share of the host. A halted worker's whole scope is killed, so no descendant outlives it. Applies to workers started after the change; running workers keep their quota. Linux only: other platforms have no scope and ignore it. | choice | daemon field `worker_cpu_quota_percent` | when applied · no restart |
+| Hub build CPU budget | Share of the host's CPUs that all cargo builds and tests RSI starts may use together, as a percentage of its logical CPUs (default 50, range 10-100). Every cargo build and test unit RSI starts (job units, scoped-test, merge-queue gates, the library QA run) runs in one systemd user slice, rsi-build.slice, whose CPUQuota is this share of the host's logical CPUs (50% of 32 threads is 16 cores) at a low CPUWeight, so concurrent jobs share one budget and the desktop stays responsive. Each job also sizes its own thread count from the budget. Applying a change rewrites the slice at once, including for units already running; read it back with systemctl --user show rsi-build.slice -p CPUQuotaPerSecUSec. Linux only: other platforms have no slice and report that no budget is available. | choice | daemon field `hub_build_cpu_percent` | when applied · no restart |
+| Completed transcript cache (bytes) | Daemon RAM limit for completed transcript reads; 0 disables retention. | choice | daemon field `completed_transcript_cache_max_bytes` | when applied · no restart |
+
+#### Build Governor
+
+Host-load admission, CPU andon and the build governor's slots and floors.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Host load limit for new launches | Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds). Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything. | choice | daemon field `host_load_admission_threshold` | when applied · no restart |
+| CPU andon: CPU-minutes per tree | One agent process tree (a session's provider scope or a job unit) past this many CPU-minutes is a runaway (0 off, default 240). The daemon samples cgroup CPU time once a minute (Linux; unsupported elsewhere), records a runaway_process friction event and tells the owning manager the session and a suggested halt. It never stops the tree itself. | choice | daemon field `cpu_andon_cpu_minutes` | when applied · no restart |
+| CPU andon: host load | At or above this 1-minute host load, one agent process tree using a dominant share of it is a runaway (0 off, default 40). Same andon as the CPU-minutes trigger: a runaway_process friction event and one manager notice per tree, never an automatic stop. | choice | daemon field `cpu_andon_host_load` | when applied · no restart |
+| Build slots | Concurrent cargo build/test runs the resource governor admits (1-16); default 4. | choice | daemon field `governor_build_slots` | when applied · no restart |
+| Lander slots | Concurrent rsi-rolling-land runs the resource governor admits (1-16); default 5. | choice | daemon field `governor_lander_slots` | when applied · no restart |
+| Check slots | Concurrent cargo check runs of the fast compile-feedback lane, a pool of its own that full builds never fill (1-16); default 2. | choice | daemon field `governor_check_slots` | when applied · no restart |
+| Governor max load (0 auto) | 1-minute load at or above which no new build or lander starts; 0 means 1.25 x cores. | choice | daemon field `governor_max_load` | when applied · no restart |
+| Governor min free disk (GB) | Free space on / below which no new build or lander starts; default 30. | choice | daemon field `governor_min_free_disk_gb` | when applied · no restart |
+| Governor min available memory (GB) | MemAvailable below which no new build or lander starts; default 16. | choice | daemon field `governor_min_avail_mem_gb` | when applied · no restart |
+| Governor max workers-slice memory (GB) | Anonymous + shmem memory of the workers slice at or above which no new build or lander starts (page cache is not counted); default 30. | choice | daemon field `governor_max_workers_slice_gb` | when applied · no restart |
+
+#### Queue & Deploys
+
+Merge queue batching and gates, test-job timeouts and deploy drain limits.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Rolling merge queue | Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish. | toggle | daemon field `rolling_queue_enabled` | when applied · no restart |
+| Merge queue batch size | Maximum ready sources merged into one candidate and gated together (1-8). | choice | daemon field `rolling_queue_batch_size` | when applied · no restart |
+| Merge queue gate timeout (min) | Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 60). When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch. | choice | daemon field `rolling_queue_gate_timeout_mins` | when applied · no restart |
+| Merge queue full-QA interval (min) | Minimum time between two starts of the merge queue's async full-library QA run (0-240 minutes, default 60). A landing gated on queue-derived filters or a bounded selection owes one full rsid and rsid-store library, bin and integration test run; landings published in between coalesce into the next run, which runs at a lower CPU weight than gates. 0 starts it as soon as the previous run ends. | choice | daemon field `rolling_queue_full_qa_interval_mins` | when applied · no restart |
+| QA target size cap (GiB) | Size above which the shared full-library QA build target is emptied before the next run (0 off, else 10-500 GiB, default 30). Each QA run removes the build artifacts a newer run superseded, so the target stays near one commit's footprint (about 15-20 GiB). This cap is the backstop: a target still over it is emptied before the next run starts, which then rebuilds cold. It applies on the hub and on a satellite running a QA run for the hub, and takes effect at the next QA start. | choice | daemon field `qa_target_max_gib` | when applied · no restart |
+| Job thermal hold (C) | CPU temperature at or above which no new build or test job starts (0 off, else 60-110 C, default 85). A job submitted while the host's hottest CPU sensor (Linux hwmon: k10temp Tctl/Tdie, coretemp) is at or above this temperature is held, shown as held_for_thermal, with no unit and no timeout clock; it starts, in submission order, once the host is below the ceiling. It applies on the hub and on a satellite alike. Running jobs are not stopped. Hosts without a readable CPU sensor, and other platforms, never hold. Takes effect at the next job start. | choice | daemon field `job_thermal_ceiling_c` | when applied · no restart |
+| Agent test job timeout (min) | Default wall-clock timeout of an agent's AgentSubmitJob test job (5-180 minutes, default 20); a manager may raise one job. Counted from the command start, excluding build-slot and sandbox/artifact-lock waits. Unit start has a separate ten-minute cap; build admission (waiting for a governor build slot) lasts the job's own timeout for a test job (at least ten minutes) and one hour for a build job, not counted against execution. Past it the daemon stops the job's unit and settles it failed with job_timed_out, which wakes its owner. A job held before launch by a deploy drain is failed job_admission_timed_out after the drain hold cap plus 5 minutes. Candidate-receipt runs keep the unit's own cap unless they name a timeout. | choice | daemon field `job_test_timeout_mins` | when applied · no restart |
+| Detach Claude turns | Run new Claude CLI turns through the durable turn shim (default off). Applies to the next Claude turn. Turning it off reads provider output directly from a pipe. Experimental: enabling is unsafe until transport authority across daemon boots (#1711) lands. Sessions that ran a detached turn are kept in the trash and cannot be purged. | toggle | daemon field `turn_detach_enabled` | when applied · no restart |
+| Hold new work while a deploy waits | While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs. Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything. | toggle | daemon field `deploy_drain_enabled` | when applied · no restart |
+| Deploy hold limit (s) | How long an agent-requested deploy may hold new launches while it waits for its quiet point (0-3600 seconds, default 600; 0 never holds). A worker turn can run for an hour, so a deploy that held new launches until its max wait starved the manager. Past this limit the deploy keeps waiting for a quiet point (no lander, job or scoped worker mid-turn) without holding anything, then holds again only from its first quiet poll until the restart. An operator restart is not limited. The manager can also cancel its own waiting deploy (AgentRequestDeploy cancel: true). | choice | daemon field `deploy_drain_hold_secs` | when applied · no restart |
+| Deploy restarts per hour | Deploy restarts an agent may use in a rolling hour (1-12, default 2). The supervisor uses this persisted setting for its hourly restart budget and adds one restart for rollback or watchdog recovery, with a total ceiling of 13. Past the deploy limit AgentRequestDeploy is refused deploy_restart_budget with a retry_after time (RFC3339): the moment the oldest counted restart leaves the hour. Read at each request, so an applied change takes effect on the next request. | choice | daemon field `deploy_restarts_per_hour` | when applied · no restart |
+| Shutdown grace (s) | How long the supervisor lets a daemon shutdown run before it force-ends it and restarts the daemon (60-3600 seconds, default 120). Once the daemon begins to shut down (a deploy, SIGTERM, a DRAIN restart) the supervisor allows this long. After that it sends SIGTERM again, then SIGKILL to the daemon's process group, and follows the deploy-restart path (a restart, or a rollback to the previous binary when a failed deploy exits quickly). The forced end is recorded as a forced_shutdown friction event and a manager notice on the next daemon start; it is never silent. The supervisor re-reads the value when a shutdown begins. Linux and macOS only; Windows has no supervisor. | choice | daemon field `supervisor_shutdown_grace_secs` | when applied · no restart |
+
+#### Sandbox Storage
+
+Sandbox disk use, source-worktree settlement, archived sandbox purge and the stored tool-result cap.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Source-worktree settlement | Opens the source-worktree settlement audit, which can delete settled source worktrees after confirmation. **Destructive.** | action | daemon (source-worktree settlement) | when activated |
+| Legacy scratch adoption | Lists unrecorded scratch directories (worker TMPDIRs, /var/tmp/rsi-*, lander workspaces) and records chosen ones so scratch reclaim, which is enabled, deletes them automatically once old and unheld. Adopting asks you to confirm every full path first. Each adoption re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and refuses what fails it. **Destructive.** | action | daemon (legacy scratch adoption) | when activated |
+| Maximum sandbox roots | Maximum direct source roots under the sandbox base before a new allocation is refused. | choice | daemon field `sandbox_max_source_roots` | when applied · no restart |
+| Minimum free space (GiB) | Free filesystem space required before a new sandbox is allocated. | choice | daemon field `sandbox_min_free_gib` | when applied · no restart |
+| Automatic source settlement | Automatically removes clean, merged, terminal sandbox worktrees under disk pressure. Default on; every run has a durable receipt. Uses the same fresh Git and custody proof as manual settlement. Dirty, divergent, active or dependent work is retained. Disabling retains untouched roots, including after restart. Items already moved or removed retain exact recovery. **Destructive.** | toggle | daemon field `source_worktree_auto_settlement_enabled` | when applied · no restart |
+| Disk pressure free space (GB) | Free-space threshold for automatic source settlement; default 100 GB (1024³ bytes per GB), capped at 25% of disk size. Machine local setting, from 1 to 4096 GB. Uses the smaller of this value and 25% of the filesystem: a 192 GB disk has a 48 GB default threshold. Settlement retains untouched roots once free space reaches the effective threshold. Pool trimming has separate controls. | choice | daemon field `disk_pressure_min_free_gb` | when applied · no restart |
+| Purge archived sandboxes | Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. **Destructive.** | toggle | daemon field `archived_sandbox_purge_enabled` | when applied · no restart |
+| Stored tool-result cap (KiB) | Largest body of a tool result kept in the database, in KiB (0 or 4-1024, default 32); a longer one keeps its first and last half around a marker that records its original size. Tool output such as raw cargo logs is most of the database and grows it about 2 GB a month. The cap applies to every provider as a tool result is stored: only the stored copy is cut, so the live session and the TUI still see the whole output. It applies to results stored after the change; rows already stored are never rewritten. A resumed Harness session replays the stored body, marker included. 0 stores every result whole. | choice | daemon field `tool_result_storage_cap_kib` | when applied · no restart |
+
+#### Cold Storage
+
+The compressed archive of old session data: switch, age, directory, status and a run-now action.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Cold-storage archive | Moves the bulky rows of old Archived and Deleted sessions into verified, compressed archive files and out of rsi.db (default on). A background pass runs at most every 6 hours at the lowest CPU and I/O priority, outside startup. It writes each cold session's tool rows to an append-only archive file under the archive directory, fsyncs it and reads it back against its checksums; only then, and only while a backup of rsi.db younger than 24 hours exists in ~/.rsi/backups (the pass takes one itself when none does), it deletes those rows from the live database and returns the freed space in small steps. Transcripts still open whole; :cold-restore puts a session's rows back. Shrinking the file once happens at the next supervised restart (:cold-archive compact asks for it). A weekly pass re-reads every archived chunk, and every failure raises an operator to-do. The archive directory is the row below; back it up with the rest of ~/.rsi. The status rows below show what the archive holds and the last pass; the run row (or :cold-archive run) starts a copy-only pass now, :cold-archive move a full one. | toggle | daemon field `cold_archive_enabled` | when applied · no restart |
+| Cold-storage age (days) | A session is cold when its newest event is at least this many days old (3-3650, default 14). Age is measured by the newest conversation event, not the session's updated time, which sandbox maintenance bumps in bulk. Only Archived and Deleted sessions qualify, and a session that a live manager, worker, wake, job, queue entry or topology still references is never cold. Read at the start of each pass. | choice | daemon field `cold_archive_after_days` | when applied · no restart |
+| Cold-storage directory | Where archive files are written: an absolute path outside every sandbox root, or empty for <data dir>/archive. Enter opens a text editor. The daemon checks the path before saving it and again when a pass starts: a symlink or .. that leads into a sandbox root or a .git directory is refused, and the editor shows the reason and keeps your text. Existing archive files keep their recorded path, so a change only affects new files. Back the directory up with the rest of ~/.rsi. | action | daemon field `cold_archive_dir` | when activated |
+| Cold-storage status | Live database size, archive files and sizes, sessions staged, verified and cold, and whether a pass is running; R refreshes it. Read from GetColdArchiveStatus when you open this tab and on R. Open problems (a failed pass, an archive file that failed verification) are listed in the last-run row and by :cold-archive status. | read-only | daemon (cold archive) | when applied · no restart |
+| Cold-storage last run | The newest archive pass: its mode, outcome, how many sessions it staged and moved, the bytes written and any problem; R refreshes it. | read-only | daemon (cold archive) | when applied · no restart |
+| Run cold-storage pass | Starts a copy-only archive pass now (stage and verify) in the background; the archive must be switched on. :cold-archive move also moves the rows out, :cold-archive verify re-reads every archived chunk. | action | daemon (cold archive) | when activated |
+
+#### Build Cache
+
+Target-cache reclamation and the warm target pool.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Sandbox storage | Shows sandbox storage usage; R refreshes it. | read-only | daemon (sandbox storage) | when applied · no restart |
+| Sandbox cache reclaim | Enables periodic reclamation of sandbox build caches. | toggle | daemon field `sandbox_build_cache_reclaim_enabled` | when applied · no restart |
+| Cache reclaim TTL | Seconds a build cache may live before it can be reclaimed. | edit | daemon field `sandbox_build_cache_reclaim_ttl_secs` | when applied · no restart |
+| Cache reclaim interval | Seconds between periodic reclaim passes. | edit | daemon field `sandbox_build_cache_reclaim_interval_secs` | when applied · no restart |
+| Cache pressure high | Disk-use percent that arms reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_high_watermark_pct` | when applied · no restart |
+| Cache pressure low | Disk-use percent that clears reclaim pressure. | edit | daemon field `sandbox_build_cache_reclaim_low_watermark_pct` | when applied · no restart |
+| Cache reclaim pass limit | Maximum caches deleted in one reclaim pass. | edit | daemon field `sandbox_build_cache_reclaim_max_candidates` | when applied · no restart |
+| Preview cache reclaim | Runs a dry-run reclaim pass and reports what it would free. | action | daemon (sandbox storage) | when activated |
+| Reclaim sandbox caches now | Runs a real reclaim pass now and reports the result. **Destructive.** | action | daemon (sandbox storage) | when activated |
+| Warm build pools kept | Prebuilt Cargo target pools kept for seeding new workers; older ones are removed after each pool build, and only the newest survives disk pressure. | choice | daemon field `target_pool_keep` | when applied · no restart |
+| Warm build pools | Newest good pool, how many commits it trails rolling, and the pools' total size; R refreshes it. | read-only | daemon (target pool) | when applied · no restart |
+
+#### Agent Builds
+
+Build parallelism, line tables and sccache for agent cargo builds.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Agent build jobs | Cargo jobs per build in a sandboxed session. | edit | daemon field `agent_build_jobs` | next spawn |
+| Agent line tables | Use line-tables-only debuginfo for sandbox builds. | toggle | daemon field `agent_build_line_tables_only` | next spawn |
+| Worker sccache | Use sccache and disable incremental builds for fresh workers. | toggle | daemon field `agent_build_sccache_enabled` | next spawn |
+| sccache cap (GiB) | Machine local sccache disk cap for new worker processes. | edit | daemon field `agent_build_sccache_cache_gib` | next spawn |
+| Machine build slots | Maximum concurrent compiler processes across agent sandboxes. | edit | daemon field `agent_build_slots` | next spawn |
 
 ### INTEGRATIONS — How do I reach agents from elsewhere?
 
@@ -696,8 +851,8 @@ Registered peers, local links and cached remote sessions.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Satellite registry | Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads. | action | daemon (satellite_registry) | immediately |
-| Satellite polling | Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on. | toggle | daemon field `satellite_polling_enabled` | immediately |
+| Satellite registry | Manage paired peers and local socket links; browse cached remote sessions. Peer sockets carry full operator authority. Verify SSH trust and the peer installation ID before enabling reads. | action | daemon (satellite_registry) | when activated |
+| Satellite polling | Global switch for hub satellite polling; off keeps registry rows and cached observations. Turning this off stops every registry-driven probe and link inspection on the next tick; paired peers and cached observations are retained and polling resumes when it is turned back on. | toggle | daemon field `satellite_polling_enabled` | when applied · no restart |
 
 #### Remote
 
@@ -705,7 +860,7 @@ Read-only phone view over your tailnet: enable, devices, projects.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
-| Remote access | Enable the read-only phone view, pick allowed devices and exposed projects, and see the URL. Starts a managed gateway (systemd user unit) and a tailscale serve route; never Funnel. Needs one privilege step, `sudo tailscale set --operator=$USER`, shown here when pending. Disabling stops serving on the next request. | action | daemon (remote_access) | immediately |
+| Remote access | Enable the read-only phone view, pick allowed devices and exposed projects, and see the URL. Starts a managed gateway (systemd user unit) and a tailscale serve route; never Funnel. Needs one privilege step, `sudo tailscale set --operator=$USER`, shown here when pending. Disabling stops serving on the next request. | action | daemon (remote_access) | when activated |
 
 #### MCP Servers
 
@@ -721,6 +876,8 @@ These daemon settings are persisted and read by the daemon, but no TUI surface e
 
 | Daemon field | How it is set today | Tracking |
 | --- | --- | --- |
+| `retry_max_default` | `RSI_RETRY_MAX_DEFAULT` at daemon start, or `UpdateDaemonConfig`; stored, not applied to default launches (only seeds the retry kill-switch) | #2236 |
+| `api_route.fallback` | `UpdateDaemonConfig` (legacy alias of `api_route.fallback.bedrock`; never touches OpenRouter); the Bedrock fallback row is the editor | #3141 |
 
 ## 12. Ex-command reference
 
@@ -736,6 +893,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:refresh` |  | Refresh navigation | Re-fetches sessions, projects and labels from the daemon. |
 | `:theme [arg]` |  | Choose built-in theme | Opens the built-in theme picker; `:theme <name>` applies a theme directly. |
 | `:issues` |  | Open or focus Issues workspace | Opens the Issues workspace pane for the current project, or focuses it if already open. |
+| `:issue [arg]` |  | Open an issue by number | Opens the Issues workspace on the issue with the given number (`:issue 2377` or `:issue #2377`), including closed and archived issues; without a number it opens the go-to-number prompt. |
 | `:manager policy` |  | Edit manager policy | Opens the harness manager policy editor (operator-owned manager limits and choices). |
 | `:manager board` |  | Open manager board | Opens the harness manager work board. |
 | `:manager decisions` |  | Open manager decisions | Opens the harness manager decisions queue awaiting the operator. |
@@ -749,6 +907,9 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `:rotate` | `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
 | `:rotation-abandon [arg]` |  | Abandon blocked rotation | Moves the selected session's blocked rotation to a fresh replacement session that takes the sandbox and the seat; `:rotation-abandon <provider>[/<model>]` picks its launch. Run twice to confirm. |
+| `:manager-reseat [arg]` |  | Reseat failed manager | Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm. |
+| `:cold-restore` |  | Restore from cold storage | Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way. |
+| `:cold-archive [arg]` |  | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
 | `:archives` |  | Open archives | Switches the session list to the Archive zone. |
 | `:model [arg]` | `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `:sessions` | `:ls` | List sessions | Lists sessions in the session list. |
@@ -784,7 +945,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
-| `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
+| `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `launch add\|remove <node> <Provider/model[/effort]>...` (adds or removes launches on the node's current grant), `configure <JSON>` and `revoke <node>` inspect or change one. |
 | `:manager escalations [arg]` |  | Manager escalations | Lists escalations that reached the top of their manager chain and top-of-chain reports; `:manager escalations rule <hop> <text>` rules one (the ruling returns down the chain to the source seat and never answers a human approval), `ack <notice>` marks a report read, `all` includes closed rows, failed or uncertain tier mail is listed with its reason and `undelivered [<cursor>]` pages it. |
 | `:manager friction [arg]` |  | Manager friction | Shows the friction rollup (the andon): refusals, deploy timeouts, superseded handoffs and lander refusals the daemon recorded, by signature, with the kaizen Issue filed for each repeating one; `:manager friction <hours>` widens the window (default 24, at most 720). The board's Inspect · Friction section shows one project's rows. |
 | `:manager tree` |  | Open manager tree | Opens the manager hierarchy tree: the global grant, project seats, area nodes and led Epics. |
@@ -799,6 +960,8 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:tabclose` | `:tabc` | Close tab | Closes the current tab (handled by the pane's window commands). |
 | `:tabnext` | `:tabn` | Next tab | Switches to the next tab. |
 | `:tabprev` | `:tabp` `:tabprevious` | Previous tab | Switches to the previous tab. |
+| `:todo` |  | Operator to-do panel | Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count. |
+| `:land` |  | Land session branch | Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it. |
 
 ## 13. Key reference by context
 
@@ -898,6 +1061,17 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>C` | Change session project | Moves the selected session to another project. |
 | `<Space>r` | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` | Cancel pending retry | Cancels the selected session's pending automatic retry. |
+| `<Space>dt` | Operator to-do panel | Shows or hides the right-hand operator to-do panel in session detail; the choice is remembered. The status line always shows the open count. |
+| `<Space>dj` | To-do: next item | Moves the operator to-do cursor to the next item (opens the panel first when it is hidden). |
+| `<Space>dk` | To-do: previous item | Moves the operator to-do cursor to the previous item. |
+| `<Space>do` | To-do: open link | Opens the selected to-do item's linked Issue, session or URL. |
+| `<Space>dd` | To-do: mark done | Marks the selected operator to-do item done after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dx` | To-do: dismiss | Dismisses the selected operator to-do item without doing it after a y/n confirmation in the to-do pop-up; `<Space>du` undoes it for 60 seconds. |
+| `<Space>dy` | To-do: copy command | Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open. |
+| `<Space>dc` | To-do: copy command | Yanks (copies) the selected operator to-do item's command text to the clipboard; the item stays open. |
+| `<Space>dv` | To-do: open pop-up | Opens the selected operator to-do item in a pop-up with its full title, priority, link and the complete command text, and the yank, done, dismiss and open-link actions. |
+| `<Space>du` | To-do: undo close | Reopens the operator to-do item you just marked done or dismissed, within 60 seconds of the close. |
+| `<Space>da` | To-do: caught up | Clears the new and closed-since-last-visit highlights in the operator to-do panel. |
 | `<Space>x` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 | `<Space>T` | Open in new tab | Opens the selected session in a new tab. |
 | `<Space>gg` | Git panel (lazygit) | Suspends the TUI and runs lazygit in the session's working directory. |
@@ -920,6 +1094,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>K` | Scheduled jobs | Opens the scheduled jobs browser. |
 | `<Space>gc` | ESP Square game | Opens the ESP Square guessing game. |
 | `gR` | Run Epic topology | Runs the focused Epic's bound workflow topology. |
+| `<Space>gl` | Land session branch | Lands the focused session's branch through the merge queue: the first press shows the commit and its status, the second confirms and enqueues it. |
 | `<Space>G` | Create Group | Creates a top-level Group container. |
 | `<Space>E` | Create Epic | Creates an Epic container under the current Group. |
 | `<Space>gS` | Create Story | Creates a Story leaf under the current Epic. |
@@ -977,6 +1152,9 @@ Keys of the settings pane (category rail and items).
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
 | `K` | Move navigator column earlier | Moves the selected optional navigator column one place left; the order is saved per navigator preset. |
 | `J` | Move navigator column later | Moves the selected optional navigator column one place right; the order is saved per navigator preset. |
+| `+` | Step setting up | Moves the selected setting to its next value (switches on): numeric rows stop at their maximum, choices wrap. The value is staged until you apply with w. |
+| `-` | Step setting down | Moves the selected setting to its previous value (switches off): numeric rows stop at their minimum, choices wrap. The value is staged until you apply with w. |
+| `w` | Apply pending settings | Applies every staged setting at once: ONE atomic daemon update carries every changed field with its final value (all of them take effect or none do), plus the local preferences. Esc or q discards them instead. |
 | `R` | Refresh daemon-backed state | Re-reads daemon-backed settings state (config, hooks, skills, storage). |
 | `s` | Set provider key | Opens the masked Set form for the selected provider key slot. |
 | `r` | Rotate provider key | Opens the masked Rotate form for the selected provider key slot. |
@@ -1028,6 +1206,12 @@ Registry keys of the Issues workspace; some apply only in the tab or mode the ac
 | `[` | Previous Issues tab | Switches to the previous Issues tab. |
 | `]` | Next Issues tab | Switches to the next Issues tab. |
 | `/` | Search local issues | Searches the locally loaded issues. |
+| `#` | Go to issue number | Prompts for an issue number and opens that issue, including closed and archived ones. |
+| `O` | Show only operator requests and decisions | Toggles a filter that keeps only Issues labelled operator-request or operator-decision; press again to show every Issue. |
+| `}` | Next detail item | Moves the inspector cursor to the next folding handoff or review section or related Issue. |
+| `{` | Previous detail item | Moves the inspector cursor to the previous folding section or related Issue. |
+| `o` | Open or fold detail item | Folds or unfolds the section under the inspector cursor, or opens the related Issue under it. |
+| `B` | Back to the previous Issue | Returns to the Issue you followed a related link from. |
 | `f` | Edit filters and saved views | Edits the issue filters and saved views. |
 | `s` | Cycle issue sort | Cycles the issue sort order. |
 | `g` | Start first-page command | First `g` of `gg`: starts the first-page jump. |
@@ -1714,7 +1898,9 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `x` | Halt the selected seat session (soft stop) |
 | `X` | Halt the selected seat session now (press twice) |
 | `a` | Archive the selected earlier seat session |
-| `n` | Launch and appoint a manager (seat, launch, scope) |
+| `n` | Launch and appoint a manager (seat, launch, scope, grant) |
+| `b` | Budget panel: every cap of the global node and each PM as used / limit, binding cap marked |
+| `b: + / 0-9` | Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back |
 | `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
 | `Enter / l` | Open the seat's session in its project tab, or a child node's console |
 | `Backspace` | Open the parent node's console |
@@ -1801,6 +1987,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `j / k, Down / Up` | Move between settings |
 | `h / l, Left / Right` | Change the selected setting |
 | `Space / Enter` | Toggle or open the selected setting |
+| `p, Enter on Grant` | Open the manager's grant page: preset, mode, capabilities, allowances, launches |
+| `Grant page: j / k, h / l, Space, digits` | Move between rows, step or toggle a row, type a number; Esc returns to the launch rows |
 | `Ctrl-E / Ctrl-B` | Cycle effort / toggle sandbox |
 | `Ctrl-M` | Open model picker |
 | `Ctrl-Enter` | Launch the session |
@@ -1923,6 +2111,25 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 
+#### To-do Pop-up
+
+| Keys | Action |
+| --- | --- |
+| `y` | Yank the command (the item stays open) |
+| `d` | Mark done (asks y/n first) |
+| `x` | Dismiss (asks y/n first) |
+| `u` | Undo the last close (60 s) |
+| `o` | Open the item's link |
+| `n / p` | Show next / previous item |
+| `j / k, Down / Up` | Scroll |
+| `Ctrl-D / Ctrl-U` | Scroll ten rows down / up |
+| `g / Home` | Jump to top |
+| `y / Enter` | At the prompt: confirm the close |
+| `n / Esc` | At the prompt: cancel; otherwise close |
+| `q` | Close |
+| `Space N` | Close and open a blank session prompt |
+| `Space ;` | Open the command palette |
+
 #### Diagnostics
 
 | Keys | Action |
@@ -2034,6 +2241,15 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `Up / Down` | Cycle scope kind / model tier |
 | `Enter` | Save policy |
 | `Esc` | Close |
+
+#### Daemon Text Setting
+
+| Keys | Action |
+| --- | --- |
+| `Type, Backspace` | Edit text |
+| `Enter` | Save value |
+| `Delete` | Clear (use the default) |
+| `Esc` | Cancel |
 
 #### Skill Preview
 

@@ -25,6 +25,7 @@
 mod engine;
 mod git;
 mod guard;
+mod test_timings;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
@@ -42,7 +43,9 @@ pub use engine::{
 // Stage B2 replaces its caller; this remains crate-private so no external
 // integration path can bypass continuous custody.
 pub(crate) use engine::publish;
+pub use guard::scrubbed as guard_withholds_env;
 pub use guard::{GuardCommand, GuardCommandReport, GuardReport, GuardSpec, GuardStatus, run_guard};
+pub use test_timings::{TEST_TIMINGS_ENV, TEST_TIMINGS_HEADER, append_test_timings};
 
 /// RME-S2A-002: Resolve a Git ref to its commit OID using the hardened
 /// engine git helper. Returns `None` if the ref does not resolve.
@@ -54,6 +57,165 @@ pub async fn resolve_ref(
     git::stdout(config, repo, &["rev-parse", "--verify", ref_name])
         .await
         .ok()
+}
+
+/// One number a launch hint may search commit subjects for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IssueCommitQuery {
+    /// The `#N` token to find (it must end at a non-digit).
+    pub number: i64,
+    /// Only commits dated at or after this Unix second name the Issue. A
+    /// project-local number is reused by older, unrelated Issues (#2529), so
+    /// the bound Issue's own number carries its creation time as a floor.
+    pub since_unix: Option<i64>,
+}
+
+/// The hub Issue number a satellite mirror records as its origin (#2529).
+///
+/// A mirror says so in its title (`... (#211 / hub #2494)`, a `/ hub #N` segment) or on a body line
+/// that opens with `Hub origin`, `Mirrors hub` or `Mirror of hub`. Other body
+/// mentions of `hub #N` are references to different Issues and never count.
+pub fn mirror_hub_origin(title: &str, body: &str) -> Option<i64> {
+    fn after_hub(text: &str) -> Option<i64> {
+        let lower = text.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(at) = lower[from..].find("hub") {
+            let rest = &lower[from + at + 3..];
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("issue").map_or(rest, str::trim_start);
+            let rest = rest.strip_prefix("origin").map_or(rest, str::trim_start);
+            let rest = rest.strip_prefix(':').map_or(rest, str::trim_start);
+            if let Some(digits) = rest.strip_prefix('#') {
+                let digits: String = digits.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(number) = digits.parse::<i64>()
+                    && number >= 1
+                {
+                    return Some(number);
+                }
+            }
+            from += at + 3;
+        }
+        None
+    }
+    let titled = title.split('/').skip(1).find_map(|segment| {
+        let segment = segment.trim_start();
+        segment
+            .to_ascii_lowercase()
+            .starts_with("hub")
+            .then(|| after_hub(segment))
+            .flatten()
+    });
+    if titled.is_some() {
+        return titled;
+    }
+    body.lines().find_map(|line| {
+        let lower = line.trim_start().to_ascii_lowercase();
+        let lower = lower.trim_start_matches(['-', '*', '>', ' ']);
+        ["hub origin", "mirrors hub", "mirror of hub"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            .then(|| after_hub(lower))
+            .flatten()
+    })
+}
+
+/// The commit searches that belong to the bound Issue: a mirror's hub origin
+/// (any age, the hub's own history) plus its local number floored at the
+/// Issue's creation, so an older Issue that held the same number never leaks
+/// its commits in (#2529).
+pub fn issue_commit_queries(issue: &rsi_common::types::Issue) -> Vec<IssueCommitQuery> {
+    let mut queries = Vec::new();
+    if let Some(number) = mirror_hub_origin(&issue.title, &issue.body) {
+        queries.push(IssueCommitQuery {
+            number,
+            since_unix: None,
+        });
+    }
+    if queries.iter().all(|q| q.number != issue.display_number) {
+        queries.push(IssueCommitQuery {
+            number: issue.display_number,
+            since_unix: Some(issue.created_at.timestamp()),
+        });
+    }
+    queries
+}
+
+/// Whether a commit subject carries the `#N` token for `number`, ending at a
+/// non-digit (`#12` is not `#123`). A mention in the commit body is only an
+/// incidental reference and never counts (#212).
+fn subject_names_issue(subject: &str, number: i64) -> bool {
+    let token = format!("#{number}");
+    subject.match_indices(&token).any(|(at, _)| {
+        !subject[at + token.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// Find recent published commit subjects that name the queried Issue numbers.
+/// The history search is deliberately bounded to the last 500 commits per
+/// query and returns at most five matches. `git log --grep` reads the whole
+/// message, so each hit is re-checked against its subject: a body-only mention
+/// of the number is not returned. Discovery is advisory: Git errors produce an
+/// empty list.
+pub async fn issue_commits_on_rolling(
+    repo: &std::path::Path,
+    queries: &[IssueCommitQuery],
+) -> Vec<rsi_common::manager_issue_worker::RollingIssueCommitV1> {
+    let config = IntegrationConfig {
+        allowed_targets: Vec::new(),
+        identity: CommitIdentity {
+            name: "rsi integration".into(),
+            email: "integration@rsi.local".into(),
+        },
+        git_timeout: Duration::from_secs(10),
+    };
+    let mut commits: Vec<rsi_common::manager_issue_worker::RollingIssueCommitV1> = Vec::new();
+    for query in queries.iter().filter(|q| q.number >= 1) {
+        let grep = format!("--grep=#{}([^0-9]|$)", query.number);
+        let since = query.since_unix.map(|unix| format!("--since={unix}"));
+        let mut args = vec![
+            "log",
+            "--max-count=500",
+            "--extended-regexp",
+            &grep,
+            "--format=%H%x00%s",
+        ];
+        if let Some(since) = &since {
+            args.push(since);
+        }
+        args.push("origin/rolling");
+        let output = match git::stdout_raw(&config, repo, &args).await {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        for line in String::from_utf8_lossy(&output).lines() {
+            let Some((sha, subject)) = line.split_once('\0') else {
+                continue;
+            };
+            if sha.len() != 40
+                || !subject_names_issue(subject, query.number)
+                || commits.iter().any(|c| c.sha == sha)
+            {
+                continue;
+            }
+            let mut subject = subject.to_owned();
+            if subject.len() > 512 {
+                let mut end = 512;
+                while !subject.is_char_boundary(end) {
+                    end -= 1;
+                }
+                subject.truncate(end);
+            }
+            commits.push(rsi_common::manager_issue_worker::RollingIssueCommitV1 {
+                sha: sha.to_owned(),
+                subject,
+            });
+        }
+    }
+    commits.truncate(5);
+    commits
 }
 
 /// Branch names no caller allowlist can authorize as an integration target.

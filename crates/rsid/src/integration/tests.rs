@@ -1936,3 +1936,27 @@ async fn candidate_transition_preserves_add_delete_mode_and_symlink_tree_shape()
         .is_empty()
     );
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[test]
+fn mirror_hub_origin_reads_only_the_recorded_origin() {
+    assert_eq!(
+        super::mirror_hub_origin("Reuse intent (#211 / hub #2494)", ""),
+        Some(2494)
+    );
+    assert_eq!(
+        super::mirror_hub_origin("x", "intro\nMirrors hub Issue #2411 here\nmore"),
+        Some(2411)
+    );
+    assert_eq!(
+        super::mirror_hub_origin("x", "- Hub origin: #77\nsee also hub #9"),
+        Some(77)
+    );
+    // A title or body that merely mentions another hub Issue records no origin.
+    assert_eq!(super::mirror_hub_origin("fix after hub #2411", ""), None);
+    assert_eq!(
+        super::mirror_hub_origin("x", "Related: hub #2411 and hub Issue #5"),
+        None
+    );
+    assert_eq!(super::mirror_hub_origin("x", ""), None);
+}

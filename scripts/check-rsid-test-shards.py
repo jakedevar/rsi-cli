@@ -14,9 +14,11 @@ has tests in it; the gate runs the shard across those packages
 from __future__ import annotations
 
 import argparse
+import functools
 from collections import Counter
 import json
 from pathlib import Path
+import posixpath
 import re
 import sys
 import tomllib
@@ -117,12 +119,28 @@ SHARD_GATE = re.compile(
 )
 
 
+SHARD_GATE_FIX = (
+    "the shard gate must be its own line, exactly "
+    '`#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-X"))]`, '
+    "directly above `#[test]` (#1621); put `target_os` or any other condition in a "
+    "separate `#[cfg(...)]` line above the shard gate"
+)
+
+
 def fail(message: str) -> None:
     raise ValueError(message)
 
 
+# The only characters that can start a comment, raw/byte string, string or char.
+MASK_START = re.compile(r"[/rb\"']")
+
+
+@functools.lru_cache(maxsize=None)
 def mask_literals_and_comments(source: str, path: str) -> str:
-    """Keep positions/newlines while hiding non-code Rust text."""
+    """Keep positions/newlines while hiding non-code Rust text.
+
+    Cached: the shard-cfg check and the test extraction mask every file once each.
+    """
     masked = list(source)
     length = len(source)
 
@@ -195,11 +213,16 @@ def mask_literals_and_comments(source: str, path: str) -> str:
                 hide(position, match.end())
                 position = match.end()
                 continue
-        position += 1
+        following = MASK_START.search(source, position + 1)
+        position = following.start() if following else length
     return "".join(masked)
 
 
 CFG_ATTR = re.compile(r"#!?\[\s*(cfg_attr|cfg)\s*\(")
+# The one `cfg_attr` a shard feature may appear in (#2666): the crate-root inner attribute that
+# silences the two lints a shard build trips by construction (another shard's helpers and imports
+# look unused) for the shard-mode test unit only. It changes no `cfg`, so it hides no test.
+SHARD_LINT_ALLOW = 'all(test,feature="test-shard-mode"),allow(dead_code,unused_imports)'
 CFG_TOKEN = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|([A-Za-z_][A-Za-z_0-9]*)|(.))', re.S)
 
 
@@ -280,6 +303,10 @@ def check_shard_cfg_attributes(path: Path) -> None:
             continue
         line = source.count("\n", 0, match.start()) + 1
         if match.group(1) == "cfg_attr":
+            if code[match.start() : match.start() + 3] == "#![" and re.sub(
+                r"[\s,]*$", "", re.sub(r"\s+", "", inner)
+            ) == SHARD_LINT_ALLOW:
+                continue
             fail(f"{relative}:{line}: cfg_attr must not name a test shard feature")
         value, _ = parse_cfg(inner, 0)
         if not value:
@@ -287,6 +314,88 @@ def check_shard_cfg_attributes(path: Path) -> None:
                 f"{relative}:{line}: shard-only cfg hides code from the unfeatured test build; "
                 'use any(not(feature = "test-shard-mode"), feature = "test-shard-...")'
             )
+
+
+ITEM_START = re.compile(
+    r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern)\s+)*"
+    r"(fn|struct|enum|impl|trait|static|type|union|const|mod)\b"
+)
+USE_START = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\b")
+TEST_ATTR = re.compile(r"#\[\s*(?:test|tokio::test)\b")
+
+
+def attribute_block(raw_lines: list[str], index: int) -> str:
+    """The attribute and doc lines directly above line `index`, as one string."""
+    collected = []
+    cursor = index - 1
+    while cursor >= 0:
+        stripped = raw_lines[cursor].strip()
+        if not stripped or stripped.endswith((";", "{", "}")) and not stripped.startswith("#["):
+            break
+        collected.append(stripped)
+        cursor -= 1
+    return "\n".join(collected)
+
+
+def check_helpers_follow_shard_gate(path: Path) -> None:
+    """Reject an ungated item in a module whose `use` items are shard-gated (#2628).
+
+    A shard feature build (`--features test-shard-X --no-default-features`)
+    compiles out a gated `use`, so an ungated helper `fn`/`struct`/`impl`/`const`
+    that names the imported types fails to compile in every other shard. The
+    change that adds it must carry the file's shard gate. Tests are exempt: the
+    inventory checks their gates.
+    """
+    relative = path.relative_to(ROOT).as_posix()
+    source = path.read_text(encoding="utf-8")
+    code = mask_literals_and_comments(source, relative)
+    raw_lines = source.splitlines()
+    code_lines = code.splitlines()
+    if len(raw_lines) != len(code_lines):
+        fail(f"{relative}: scanner lost line alignment")
+    # One entry per open `{`: [gated by an enclosing shard-gated item, has a
+    # shard-gated use, ungated items as (line, kind)].
+    scopes: list[list] = [[False, False, []]]
+    pending_gated = False
+    for index, line in enumerate(code_lines):
+        item = ITEM_START.match(line)
+        if item or USE_START.match(line):
+            attributes = attribute_block(raw_lines, index)
+            gated = "test-shard-" in attributes
+            scope = scopes[-1]
+            if item is None:
+                scope[1] = scope[1] or gated
+            else:
+                pending_gated = gated
+                is_test = TEST_ATTR.search(attributes) is not None
+                if item.group(1) != "mod" and not gated and not is_test and not scope[0]:
+                    scope[2].append((index + 1, item.group(1)))
+        for char in line:
+            if char == "{":
+                scopes.append([pending_gated or scopes[-1][0], False, []])
+                pending_gated = False
+            elif char == "}":
+                if len(scopes) == 1:
+                    fail(f"{relative}:{index + 1}: unbalanced closing brace")
+                closed = scopes.pop()
+                if closed[1] and not closed[0]:
+                    line_no, kind = closed[2][0] if closed[2] else (None, None)
+                    if line_no:
+                        fail(_helper_message(relative, line_no, kind))
+        if not scopes:
+            fail(f"{relative}: unbalanced braces")
+    top = scopes[0]
+    if top[1] and top[2]:
+        fail(_helper_message(relative, *top[2][0]))
+
+
+def _helper_message(relative: str, line: int, kind: str) -> str:
+    return (
+        f"{relative}:{line}: ungated {kind} in a module whose `use` items are shard-gated; "
+        "helpers follow their file's shard gate, so a shard build without the gated imports "
+        'cannot compile it (add the file\'s `#[cfg(any(not(feature = "test-shard-mode"), '
+        'feature = "test-shard-..."))]` above it)'
+    )
 
 
 def extract_tests(path: Path) -> list[tuple[str, int, bool]]:
@@ -381,6 +490,8 @@ def source_inventory(
         package = package_of(relative)
         is_bin = relative == "crates/rsid/src/main.rs" or relative.startswith("crates/rsid/src/bin/")
         check_shard_cfg_attributes(path)
+        if not is_bin:
+            check_helpers_follow_shard_gate(path)
         raw_lines = path.read_text(encoding="utf-8").splitlines()
         excluded_ranges = host_excluded_line_ranges(raw_lines)
         for name, line, has_gate in extract_tests(path):
@@ -414,8 +525,8 @@ def source_inventory(
                 file_shards[relative] = shard
                 manifest[identity] = shard
                 gated += 1
-            elif "test-shard-" in previous:
-                fail(f"{relative}:{line}: incorrect shard gate")
+            elif "test-shard-" in attribute_block(raw_lines, line - 1):
+                fail(f"{relative}:{line}: incorrect shard gate; {SHARD_GATE_FIX}")
             elif require_gates:
                 fail(f"{relative}:{line}: ungated test blocks a bounded lib harness")
             else:
@@ -426,6 +537,116 @@ def source_inventory(
             fail(f"{relative}:{line}: ungated test has no declared file shard")
         manifest[(relative, name)] = shard
     return manifest, gated
+
+
+PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
+INCLUDE = re.compile(r'^\s*include!\(\s*"([^"]+)"\s*\)\s*;')
+ATTR_LINE = re.compile(r"^\s*#\[")
+MOD_ITEM = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*(;|\{)")
+
+
+def mount_declarations(text: str) -> list[tuple[str | None, str | None, list[str]]]:
+    """[(name, #[path] or None, enclosing inline mods)] of the `mod x;` lines of a source.
+
+    An `include!("x.rs");` line yields (None, "x.rs", enclosing inline mods). The line
+    scan mirrors `mod_declarations` in `check-touched-shards` (a parity test holds them
+    together); this checker stays a standalone script because fixtures copy it alone.
+    """
+    found: list[tuple[str | None, str | None, list[str]]] = []
+    stack: list[tuple[str, str]] = []
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if stack and line.startswith(stack[-1][0] + "}") and line.rstrip() in (stack[-1][0] + "}", stack[-1][0] + "};"):
+            stack.pop()
+            continue
+        include = INCLUDE.match(line) if "include!" in line else None
+        if include:
+            found.append((None, include.group(1), [name for _, name in stack]))
+            continue
+        if "mod " not in line:
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        rest, attr = line, None
+        while rest.lstrip().startswith("#[") and "]" in rest:
+            attr = PATH_ATTR.search(rest) or attr
+            rest = rest.split("]", 1)[1]
+        declared = MOD_ITEM.match(indent + rest.lstrip())
+        if not declared:
+            continue
+        _, name, terminator = declared.groups()
+        if terminator == "{":
+            stack.append((indent, name))
+            continue
+        back = index - 1
+        while attr is None and back >= 0 and ATTR_LINE.match(lines[back]):
+            attr = PATH_ATTR.search(lines[back])
+            back -= 1
+        found.append((name, attr.group(1) if attr else None, [n for _, n in stack]))
+    return found
+
+
+def mounted_sources(files: dict[str, str], root: str) -> set[str]:
+    """Sources a target rooted at `root` compiles, following `mod`, `#[path]` and `include!`.
+
+    A `mod x;` in a root, `mod.rs`, `lib.rs` or `main.rs` file loads beside it; in any other
+    file it loads under `<stem>/`. A file a `#[path]` attribute mounted is a module root
+    for its own `mod x;` lines: rustc resolves them beside that file (#1697).
+    """
+    mounted, queue, path_mounted = {root}, [root], set()
+    while queue:
+        parent = queue.pop(0)
+        directory, _, base = parent.rpartition("/")
+        owns_directory = parent == root or parent in path_mounted or base in ("mod.rs", "lib.rs", "main.rs")
+        own = directory if owns_directory else f"{directory}/{base[:-3]}"
+        for name, attr, inline in mount_declarations(files[parent]):
+            if name is None:
+                candidates = [posixpath.normpath(posixpath.join(directory, attr))]
+            elif attr is not None:
+                anchor = posixpath.join(directory if not inline else posixpath.join(own, *inline), attr)
+                candidates = [posixpath.normpath(anchor)]
+            else:
+                anchor = posixpath.join(own, *inline)
+                candidates = [f"{anchor}/{name}.rs", f"{anchor}/{name}/mod.rs"]
+            target = next((c for c in candidates if c in files), None)
+            if target is None or target in mounted:
+                continue
+            mounted.add(target)
+            if attr is not None and name is not None:
+                path_mounted.add(target)
+            queue.append(target)
+    return mounted
+
+
+def target_roots(relative_files: set[str]) -> list[str]:
+    """Crate and target roots Cargo discovers under each `src/`: lib.rs, main.rs, bin/NAME.rs, bin/NAME/main.rs."""
+    return sorted(
+        path
+        for path in relative_files
+        if re.fullmatch(r"crates/[^/]+/src/(?:lib\.rs|main\.rs|bin/[^/]+\.rs|bin/[^/]+/main\.rs)", path)
+    )
+
+
+def unmounted_test_sources() -> list[str]:
+    """Source files holding tests that no crate or target root mounts through `mod`, `#[path]` or `include!`.
+
+    Rust compiles a file only when a declaration reaches it. A `#[path]`-mounted file is a
+    module root: its own `mod tests;` loads `tests.rs` beside it, not `<stem>/tests.rs`. The
+    path-based inventory would still count the unreached file's tests as shard members and
+    pass the gate while the shard never runs them (#1697).
+    """
+    files = {
+        path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for source in SOURCES
+        for path in source.rglob("*.rs")
+    }
+    mounted: set[str] = set()
+    for root in target_roots(set(files)):
+        mounted |= mounted_sources(files, root)
+    return sorted(
+        relative
+        for relative, text in files.items()
+        if relative not in mounted and ATTR.search(mask_literals_and_comments(text, relative))
+    )
 
 
 def check_runtime(
@@ -499,6 +720,11 @@ def main() -> int:
         action="store_true",
         help="print `shard package...` lines: the packages whose tests a shard run must select",
     )
+    parser.add_argument(
+        "--shards-only",
+        action="store_true",
+        help="with --list-shards/--list-shard-packages, read the shard names from the manifests only and skip the source inventory (#1853)",
+    )
     parser.add_argument("--runtime-dir", type=Path, help="check one Nextest JSON list per shard")
     parser.add_argument("--runtime-shard", help="check one selected shard")
     args = parser.parse_args()
@@ -509,7 +735,19 @@ def main() -> int:
         shards = list(shard_packages)
         if args.runtime_shard and args.runtime_shard not in shards:
             fail(f"unknown runtime shard {args.runtime_shard}")
+        if args.shards_only and (args.list_shard_packages or args.list_shards) and args.runtime_dir is None:
+            print("\n".join(f"{shard} {' '.join(packages)}" for shard, packages in shard_packages.items())
+                  if args.list_shard_packages else "\n".join(shards))
+            return 0
         manifest, gated = source_inventory(shard_packages, args.require_gates or args.runtime_dir is not None)
+        unmounted = unmounted_test_sources()
+        if unmounted:
+            fail(
+                "tests in files no `mod`, `#[path]` or `include!` declaration reaches (rustc never compiles them): "
+                + ", ".join(unmounted)
+                + "; a `#[path]`-mounted file's `mod tests;` loads `tests.rs` beside it, so mount the test file "
+                'with an explicit `#[path = "<stem>/tests.rs"]`'
+            )
         populated = {(package_of(source), assigned) for (source, _), assigned in manifest.items()}
         for shard, packages in shard_packages.items():
             for package in packages:

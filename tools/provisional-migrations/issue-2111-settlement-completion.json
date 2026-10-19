@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "version": 172,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v172.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:a1adf44c6f7d98136d5dc17ef82483ef3d23eb63e4ad917090c2ed4ae225fb1f",
+      "sites": [
+        {
+          "anchor": "fn migrate_v172(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 172 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 172)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/cohort_settlement/completion_retry.rs",
+      "path_template": "crates/rsid-store/src/store/cohort_settlement/completion_retry.rs",
+      "source_blob": "sha256:883334e7277b97051f4e6a50cbe2a6eec137ce75d21491018dd3544a7c4407ea",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v172-settlement-completion-retry",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-completion-retry",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v172-settlement-completion-retry",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-completion-retry",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:25f26e00079f00ab36abb352e969ee83426c508af664e48aba8d9279638311cd",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v172-settlement-completion-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-completion-altered-objects",
+          "scope": "unit"
+        },
+        {
+          "anchor": "(172, &[\"source_worktree_settlement_items_forward_phase\", \"source_worktree_settlement_items_terminal\", \"source_worktree_settlement_current_runs\"]),",
+          "replacement": "(${VERSION}, &[\"source_worktree_settlement_items_forward_phase\", \"source_worktree_settlement_items_terminal\", \"source_worktree_settlement_current_runs\"]),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v172-settlement-completion-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-completion-altered-objects",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:4a959b9d2db9ae42c599f6b88389211fa07093bfc7e822bf97f8c7dfc40378cb",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 172;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 172 && target < 172 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 172 - 1).unwrap();",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION} - 1).unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 172,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

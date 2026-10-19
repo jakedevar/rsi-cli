@@ -9,6 +9,25 @@
 use super::*;
 use rsi_common::types::{Session, SessionKind};
 
+// Alias `s`; the page supplies pending/delivered scoped-work identities and a
+// fixed seven-day cutoff. Explicit durable obligations do not expire.
+const ACTIONABLE_WORKER: &str = "(
+    s.status IN ('Starting','Running','WaitingApproval')
+    OR s.id IN (SELECT value FROM json_each(:pending))
+    OR EXISTS(SELECT 1 FROM agent_jobs j WHERE j.owner_session_id=s.id AND j.state IN ('queued','running'))
+    OR s.id IN (SELECT source_session_id FROM rolling_queue_entries
+                WHERE state IN ('queued','admitted','gating'))
+    OR (s.status NOT IN ('Archived','Deleted') AND (
+        s.pending_question_json IS NOT NULL
+        OR (s.updated_at>=:recent AND s.status IN ('Failed','Interrupted'))
+        OR (s.updated_at>=:recent AND s.status='Completed'
+            AND (s.pipeline_artifact IS NOT NULL OR s.sandbox_branch IS NOT NULL)
+            AND s.id NOT IN (SELECT value FROM json_each(:delivered))
+            AND NOT EXISTS(SELECT 1 FROM rolling_queue_entries q
+                WHERE q.source_session_id=s.id AND q.state='published'
+                    AND q.finished_at>=s.updated_at))))
+)";
+
 pub(super) struct LeafScope {
     pub stamp: String,
     epics: Vec<Uuid>,
@@ -37,6 +56,8 @@ struct Position {
     root: usize,
     #[serde(rename = "x")]
     partial: bool,
+    #[serde(rename = "t")]
+    recent_since: i64,
 }
 
 impl Store {
@@ -99,6 +120,7 @@ impl Store {
         after: &str,
     ) -> Result<LeafPage> {
         let topology = query.section == ManagerInspectSectionV2::Topology;
+        let actionable = !topology && !query.include_history;
         let limit = usize::from(query.limit);
         let mut p: Position = if after.is_empty() {
             Position {
@@ -124,6 +146,7 @@ impl Store {
                 at: [0, 0, 0],
                 root: 0,
                 partial: !scope.complete,
+                recent_since: (Utc::now() - chrono::Duration::days(7)).timestamp(),
             }
         } else {
             serde_json::from_str(after).map_err(|_| refused("manager_v2_invalid_cursor"))?
@@ -206,18 +229,57 @@ impl Store {
         } else {
             self.manager_v2_work_rows(config, query.epic_id)?
         };
+        let pending_sources = serde_json::to_string(
+            &work
+                .iter()
+                .filter(|w| w["integrated"] != true && w["archived"] != true)
+                .filter_map(|w| w["source_session_id"].as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let delivered_sources = serde_json::to_string(
+            &work
+                .iter()
+                .filter(|w| w["integrated"] == true)
+                .filter_map(|w| w["source_session_id"].as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        let recent = DateTime::from_timestamp(p.recent_since, 0)
+            .ok_or_else(|| refused("manager_v2_invalid_cursor"))?
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         if p.phase == 1 && rows.len() < limit {
             let take = limit - rows.len();
             let mut candidates = Vec::new();
             // idx_sessions_parent_id includes rowid as its implicit suffix.
-            // One indexed seek per scoped Epic, visiting at most one page. Do not
-            // sort UUIDs with this index: that sorts the entire remaining Epic.
+            // One indexed seek per scoped Epic, returning at most one page.
+            // The default filters before LIMIT so history cannot fill the page;
+            // a history-only Epic can still require scanning its retained rows.
+            // Seek from the last row rather than sorting the remaining Epic.
             for epic in &scope.epics {
-                let mut stmt = self.conn.prepare(
-                    "SELECT rowid,id FROM sessions WHERE parent_id=?1 AND rowid>?2 AND rowid<=?3 ORDER BY rowid LIMIT ?4"
-                )?;
+                let position = if actionable {
+                    "s.rowid<=:after"
+                } else {
+                    "s.rowid>:after"
+                };
+                let order = if actionable { "DESC" } else { "ASC" };
+                let sql = format!(
+                    "SELECT s.rowid,s.id FROM sessions s WHERE s.parent_id=:epic
+                    AND {position} AND s.rowid<=:horizon AND (:actionable=0 OR {ACTIONABLE_WORKER})
+                    ORDER BY s.rowid {order} LIMIT :limit"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
                 for row in stmt.query_map(
-                    params![epic.to_string(), p.at[0], p.hi[0], take as i64],
+                    rusqlite::named_params! {
+                        ":epic": epic.to_string(),
+                        ":after": if actionable {
+                            if p.at[0] == 0 { p.hi[0] } else { p.at[0] - 1 }
+                        } else { p.at[0] },
+                        ":horizon": p.hi[0],
+                        ":limit": take as i64,
+                        ":pending": pending_sources,
+                        ":recent": recent,
+                        ":delivered": delivered_sources,
+                        ":actionable": actionable,
+                    },
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )? {
                     let (position, id) = row?;
@@ -225,6 +287,9 @@ impl Store {
                 }
             }
             candidates.sort_by_key(|r| r.0);
+            if actionable {
+                candidates.reverse();
+            }
             let exhausted = candidates.len() < take;
             for (position, id, epic) in candidates.into_iter().take(take) {
                 p.at[0] = position;
@@ -270,26 +335,39 @@ impl Store {
             // rowid window once, advancing even on an empty scoped page, instead
             // of filtering then LIMIT-ing an unbounded scan or adding a migration.
             const SCAN: usize = 128;
-            let mut stmt = self.conn.prepare(
-                "SELECT rowid,child_session_id,owner_session_id,epic_id,state,updated_at,substr(json_extract(request_json,'$.query'),1,2048),safe_error_class,kind FROM agent_spawn_requests WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3"
-            )?;
+            let position = if actionable { "rowid<=?1" } else { "rowid>?1" };
+            let order = if actionable { "DESC" } else { "ASC" };
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT rowid,child_session_id,owner_session_id,epic_id,state,updated_at,substr(json_extract(request_json,'$.query'),1,2048),safe_error_class,kind FROM agent_spawn_requests WHERE {position} AND rowid<=?2 ORDER BY rowid {order} LIMIT ?3"
+            ))?;
             let pending = stmt
-                .query_map(params![p.at[1], p.hi[1], SCAN as i64], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, String>(6)?,
-                        r.get::<_, Option<String>>(7)?,
-                        r.get::<_, String>(8)?,
-                    ))
-                })?
+                .query_map(
+                    params![
+                        if actionable {
+                            if p.at[1] == 0 { p.hi[1] } else { p.at[1] - 1 }
+                        } else {
+                            p.at[1]
+                        },
+                        p.hi[1],
+                        SCAN as i64
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, String>(8)?,
+                        ))
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let end = pending.last().map_or(p.at[1], |r| r.0);
-            let exhausted = pending.len() < SCAN || end == p.hi[1];
+            let exhausted = pending.len() < SCAN || (!actionable && end == p.hi[1]);
             for (position, id, owner, epic, state, updated, task, error, kind) in pending {
                 if rows.len() == limit {
                     break;
@@ -327,7 +405,22 @@ impl Store {
                             .get_session(id)?
                             .filter(|s| legal_member(s, config.project_id, epic))
                         {
-                            rows.push(self.manager_v2_worker(config, &s, epic, &work)?);
+                            let visible = !actionable
+                                || self.conn.query_row(
+                                    &format!(
+                                        "SELECT {ACTIONABLE_WORKER} FROM sessions s WHERE s.id=:id"
+                                    ),
+                                    rusqlite::named_params! {
+                                        ":id": id.to_string(),
+                                        ":pending": pending_sources,
+                                        ":recent": recent,
+                                        ":delivered": delivered_sources,
+                                    },
+                                    |r| r.get::<_, bool>(0),
+                                )?;
+                            if visible {
+                                rows.push(self.manager_v2_worker(config, &s, epic, &work)?);
+                            }
                         } else {
                             p.partial = true;
                         }
@@ -336,6 +429,9 @@ impl Store {
                 }
                 if state == "launched" {
                     p.partial = true;
+                    continue;
+                }
+                if actionable && state == "failed" && updated < recent {
                     continue;
                 }
                 let kind: SessionKind = serde_json::from_value(json!(kind))?;

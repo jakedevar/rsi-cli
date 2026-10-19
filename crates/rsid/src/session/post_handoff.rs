@@ -118,7 +118,10 @@ const READ_ONLY_RSI_CONTROLS: &[&str] = &[
     "manager_get_action",
     "global_overview",
     "query_failure_signatures",
+    "worker_roster",
+    "list_wakes",
     "topology_list",
+    "topology_get",
     "topology_get_execution",
 ];
 
@@ -411,9 +414,35 @@ pub(crate) fn tree_clean_at_handoff(root: &Path, handoff: &str) -> bool {
         Ok((true, head)) => {
             let head = head.trim().to_ascii_lowercase();
             shas.iter().any(|sha| head.starts_with(sha.as_str()))
+                || landed_work_proof(root, &head, &shas)
         }
         _ => false,
     }
+}
+
+fn git_succeeds(root: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// #1960: the tree is clean and HEAD has already landed on `origin/rolling`
+/// (so there are no unreported commits), and a commit the handoff names is
+/// on `origin/rolling` too. The worker's HEAD then differs from the named
+/// commit only because the work landed through the merge queue.
+fn landed_work_proof(root: &Path, head: &str, shas: &[String]) -> bool {
+    const ROLLING: &str = "refs/remotes/origin/rolling";
+    git_succeeds(root, &["merge-base", "--is-ancestor", head, ROLLING])
+        && shas.iter().any(|sha| {
+            let commit = format!("{sha}^{{commit}}");
+            git_succeeds(root, &["merge-base", "--is-ancestor", &commit, ROLLING])
+        })
 }
 
 type ActiveMap =
@@ -646,6 +675,24 @@ mod tests {
             root,
             "PIPELINE HANDOFF — IMPLEMENTATION:\nno sha"
         ));
+
+        // #1960: HEAD moved past the named commit but both sit on
+        // origin/rolling: the work landed, so the handoff stands. A new
+        // unlanded commit after the handoff does not.
+        git(root, &["update-ref", "refs/remotes/origin/rolling", &head]);
+        std::fs::write(root.join("a.txt"), "a2\n").unwrap();
+        git(root, &["commit", "-q", "-am", "landed"]);
+        let landed = git(root, &["rev-parse", "HEAD"]);
+        assert!(!tree_clean_at_handoff(root, &first_line));
+        git(
+            root,
+            &["update-ref", "refs/remotes/origin/rolling", &landed],
+        );
+        assert!(tree_clean_at_handoff(root, &first_line));
+        std::fs::write(root.join("a.txt"), "a3\n").unwrap();
+        git(root, &["commit", "-q", "-am", "unreported"]);
+        assert!(!tree_clean_at_handoff(root, &first_line));
+        git(root, &["reset", "-q", "--hard", &landed]);
 
         // A later call left the tree dirty: no proof.
         std::fs::write(root.join("b.txt"), "b\n").unwrap();

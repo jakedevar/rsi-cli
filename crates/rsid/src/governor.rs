@@ -21,7 +21,7 @@
 
 pub use crate::store_support::config_types::GovernorPolicy;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -34,13 +34,18 @@ const GIB: f64 = 1_073_741_824.0;
 /// dropped: its client is gone or wedged.
 pub const WAITER_STALE: Duration = Duration::from_secs(120);
 
-/// Admission class. Landers (`rsi-rolling-land` runs) and builds (everything
-/// else) draw on separate slot pools so landers cannot starve builds.
+/// Admission class. Landers (`rsi-rolling-land` runs), builds (everything
+/// else) and checks (`cargo check` jobs, #2430) draw on separate slot pools so
+/// landers cannot starve builds and a worker's compile-feedback run is never
+/// queued behind full builds and test runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionClass {
     Build,
     Lander,
+    /// The fast compile-feedback lane (#2430): `cargo check` only, its own
+    /// pool and FIFO, and exempt from the load gate (disk and memory still apply).
+    Check,
 }
 
 impl AdmissionClass {
@@ -49,6 +54,7 @@ impl AdmissionClass {
         match self {
             Self::Build => "build",
             Self::Lander => "lander",
+            Self::Check => "check",
         }
     }
 }
@@ -128,7 +134,8 @@ impl BlockReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Holder {
     pub pid: u32,
-    /// `/proc/<pid>/stat` field 22, guarding against pid reuse.
+    /// `/proc/<pid>/stat` field 22 (macOS: process start time in microseconds),
+    /// guarding against pid reuse.
     pub start_ticks: u64,
 }
 
@@ -204,6 +211,9 @@ pub struct GovernorSnapshot {
     pub margins: Vec<GateMargin>,
     pub build_in_use: u32,
     pub lander_in_use: u32,
+    /// Leases of the fast `cargo check` lane (#2430).
+    #[serde(default)]
+    pub check_in_use: u32,
     pub leases: Vec<LeaseView>,
     pub queue: Vec<QueueEntryView>,
 }
@@ -237,6 +247,7 @@ type HolderFn = Box<dyn Fn(u32) -> Option<Holder> + Send + Sync>;
 pub struct Governor {
     state: Mutex<State>,
     sample: SampleFn,
+    sample_last_updated: Option<Arc<Mutex<Option<Instant>>>>,
     /// Current identity of a pid, or `None` when it is gone. A lease is live
     /// only while this equals the identity recorded at acquire time.
     resolve_holder: HolderFn,
@@ -250,6 +261,7 @@ impl Governor {
         Self {
             state: Mutex::new(State::default()),
             sample,
+            sample_last_updated: None,
             resolve_holder,
             disk_warned: std::sync::atomic::AtomicBool::new(false),
         }
@@ -259,8 +271,76 @@ impl Governor {
     #[must_use]
     pub fn global() -> &'static Self {
         static GLOBAL: LazyLock<Governor> =
-            LazyLock::new(|| Governor::new(Box::new(sample_host), Box::new(resolve_proc_holder)));
+            LazyLock::new(|| Governor::new_cached_host(Box::new(resolve_proc_holder)));
         &GLOBAL
+    }
+
+    fn new_cached_host(resolve_holder: HolderFn) -> Self {
+        Self::new_cached(
+            Box::new(sample_host),
+            resolve_holder,
+            Duration::from_millis(500),
+        )
+    }
+
+    fn new_cached(
+        sample_fn: SampleFn,
+        resolve_holder: HolderFn,
+        sample_interval: Duration,
+    ) -> Self {
+        let sample = Arc::new(Mutex::new(ResourceSample {
+            load1: f64::MAX,
+            cores: 1,
+            disk_free_gb: 0.0,
+            mem_available_gb: 0.0,
+            workers_slice_anon_gb: None,
+        }));
+        let refresh_sample = Arc::clone(&sample);
+        let sample_last_updated = Arc::new(Mutex::new(None));
+        let refresh_last_updated = Arc::clone(&sample_last_updated);
+        if let Err(error) = std::thread::Builder::new()
+            .name("rsid-resource-sampler".into())
+            .spawn(move || {
+                loop {
+                    // Host probes can block on filesystem or cgroup I/O under
+                    // pressure. Keep them off Tokio RPC workers; callers read the
+                    // last completed sample while this thread is stalled.
+                    let current = sample_fn();
+                    *refresh_sample
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = current;
+                    *refresh_last_updated
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+                    std::thread::sleep(sample_interval);
+                }
+            })
+        {
+            tracing::error!(error = %error, "Failed to start resource sampler thread");
+        }
+
+        let mut governor = Self::new(
+            Box::new(move || {
+                sample
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }),
+            resolve_holder,
+        );
+        governor.sample_last_updated = Some(sample_last_updated);
+        governor
+    }
+
+    fn sample_is_fresh(&self) -> bool {
+        const MAX_SAMPLE_AGE: Duration = Duration::from_secs(5);
+        let Some(last_updated) = &self.sample_last_updated else {
+            return true;
+        };
+        last_updated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|sampled_at| sampled_at.elapsed() <= MAX_SAMPLE_AGE)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -274,6 +354,7 @@ impl Governor {
         params: &AcquireParams,
     ) -> Result<AcquireOutcome, String> {
         let sample = (self.sample)();
+        let sample_is_fresh = self.sample_is_fresh();
         if sample.disk_free_gb >= policy.min_free_disk_gb as f64 {
             self.disk_warned
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -310,7 +391,7 @@ impl Governor {
                 .back()
                 .map_or_else(Uuid::nil, |waiter| waiter.ticket)
         });
-        Self::admit(&mut state, policy, &sample);
+        Self::admit(&mut state, policy, &sample, sample_is_fresh);
         if let Some(lease) = state.leases.get(&ticket) {
             return Ok(AcquireOutcome::Granted {
                 lease_id: lease.id,
@@ -319,7 +400,7 @@ impl Governor {
         }
         let (class, position) = Self::position_of(&state, ticket)
             .ok_or_else(|| "ticket vanished during admission".to_string())?;
-        let reason = Self::reason_for(&state, policy, &sample, class, position);
+        let reason = Self::reason_for(&state, policy, &sample, class, position, sample_is_fresh);
         self.note_disk_stall(policy, &sample, &reason);
         Ok(AcquireOutcome::Queued {
             ticket_id: ticket,
@@ -365,22 +446,24 @@ impl Governor {
     /// Release a lease or cancel a queued ticket. Returns whether it existed.
     pub fn release(&self, policy: &GovernorPolicy, lease_id: Uuid) -> bool {
         let sample = (self.sample)();
+        let sample_is_fresh = self.sample_is_fresh();
         let mut state = self.state();
         let mut existed = state.leases.remove(&lease_id).is_some();
         let before = state.queue.len();
         state.queue.retain(|w| w.ticket != lease_id);
         existed |= state.queue.len() != before;
         self.reap(&mut state);
-        Self::admit(&mut state, policy, &sample);
+        Self::admit(&mut state, policy, &sample, sample_is_fresh);
         existed
     }
 
     /// Current policy margins, leases and queue.
     pub fn snapshot(&self, policy: &GovernorPolicy) -> GovernorSnapshot {
         let sample = (self.sample)();
+        let sample_is_fresh = self.sample_is_fresh();
         let mut state = self.state();
         self.reap(&mut state);
-        Self::admit(&mut state, policy, &sample);
+        Self::admit(&mut state, policy, &sample, sample_is_fresh);
         let count = |class| {
             u32::try_from(state.leases.values().filter(|l| l.class == class).count())
                 .unwrap_or(u32::MAX)
@@ -421,6 +504,7 @@ impl Governor {
             sample,
             build_in_use: count(AdmissionClass::Build),
             lander_in_use: count(AdmissionClass::Lander),
+            check_in_use: count(AdmissionClass::Check),
             leases,
             queue,
         }
@@ -436,15 +520,22 @@ impl Governor {
     }
 
     /// Grant slots to queue heads, FIFO within each class.
-    fn admit(state: &mut State, policy: &GovernorPolicy, sample: &ResourceSample) {
-        if global_block(policy, sample).is_some() {
-            return;
-        }
+    fn admit(
+        state: &mut State,
+        policy: &GovernorPolicy,
+        sample: &ResourceSample,
+        sample_is_fresh: bool,
+    ) {
         let mut blocked: Vec<AdmissionClass> = Vec::new();
         let mut index = 0;
         while index < state.queue.len() {
             let class = state.queue[index].class;
             if blocked.contains(&class) {
+                index += 1;
+                continue;
+            }
+            if sample_is_fresh && global_block(policy, sample, class).is_some() {
+                blocked.push(class);
                 index += 1;
                 continue;
             }
@@ -486,8 +577,9 @@ impl Governor {
         sample: &ResourceSample,
         class: AdmissionClass,
         position: u32,
+        sample_is_fresh: bool,
     ) -> BlockReason {
-        if let Some(reason) = global_block(policy, sample) {
+        if sample_is_fresh && let Some(reason) = global_block(policy, sample, class) {
             return reason;
         }
         if position > 0 {
@@ -554,6 +646,7 @@ fn class_cap(policy: &GovernorPolicy, class: AdmissionClass) -> u32 {
     match class {
         AdmissionClass::Build => policy.build_slots,
         AdmissionClass::Lander => policy.lander_slots,
+        AdmissionClass::Check => policy.check_slots,
     }
 }
 
@@ -567,16 +660,23 @@ pub fn effective_max_load(policy: &GovernorPolicy, cores: u32) -> u32 {
     }
 }
 
-/// First closed host gate, in cargo-slot order: disk, load, memory, slice.
-fn global_block(policy: &GovernorPolicy, sample: &ResourceSample) -> Option<BlockReason> {
-    if sample.disk_free_gb < policy.min_free_disk_gb as f64 {
+/// First closed host gate for `class`, in cargo-slot order: disk, load, memory,
+/// slice. The check lane (#2430) skips the load gate: its whole purpose is
+/// feedback while full builds saturate the host, and the build slice's CPU cap
+/// still bounds it; disk and memory floors apply to every class.
+fn global_block(
+    policy: &GovernorPolicy,
+    sample: &ResourceSample,
+    class: AdmissionClass,
+) -> Option<BlockReason> {
+    if crate::host_pressure::disk_below_floor(sample.disk_free_gb, policy.min_free_disk_gb) {
         return Some(BlockReason::Disk {
             free_gb: sample.disk_free_gb,
             min_gb: policy.min_free_disk_gb,
         });
     }
     let max_load = effective_max_load(policy, sample.cores);
-    if sample.load1 >= f64::from(max_load) {
+    if class != AdmissionClass::Check && sample.load1 >= f64::from(max_load) {
         return Some(BlockReason::Load {
             load1: sample.load1,
             max: max_load,
@@ -633,10 +733,43 @@ fn margins(policy: &GovernorPolicy, sample: &ResourceSample) -> Vec<GateMargin> 
 }
 
 /// Identity of `pid` from `/proc/<pid>/stat`, or `None` when it is gone.
+#[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn resolve_proc_holder(pid: u32) -> Option<Holder> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let start_ticks = parse_start_ticks(&stat)?;
+    Some(Holder { pid, start_ticks })
+}
+
+/// Identity of `pid` from `proc_pidinfo(PROC_PIDTBSDINFO)`, or `None` when it
+/// is gone. macOS has no `/proc`; the process start time (microseconds since
+/// the epoch) plays the role of the Linux start ticks and guards against pid
+/// reuse the same way.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn resolve_proc_holder(pid: u32) -> Option<Holder> {
+    let mut info = std::mem::MaybeUninit::<nix::libc::proc_bsdinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<nix::libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is a properly sized and aligned `proc_bsdinfo` that
+    // outlives the call; proc_pidinfo writes at most `size` bytes into it.
+    let written = unsafe {
+        nix::libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            nix::libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct (checked above).
+    let info = unsafe { info.assume_init() };
+    let start_ticks = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)?;
     Some(Holder { pid, start_ticks })
 }
 
@@ -663,6 +796,7 @@ pub fn anon_shmem_bytes(memory_stat: &str) -> u64 {
         .sum()
 }
 
+#[cfg(target_os = "linux")]
 fn mem_available_kib(meminfo: &str) -> Option<u64> {
     meminfo
         .lines()
@@ -679,21 +813,43 @@ fn workers_slice_stat_path() -> std::path::PathBuf {
     .into()
 }
 
-fn sample_host() -> ResourceSample {
-    let load1 = std::fs::read_to_string("/proc/loadavg")
+/// The 1-minute load: `/proc/loadavg` on Linux, `getloadavg(3)` elsewhere
+/// (#2937). Unreadable counts as idle, as cargo-slot did.
+#[cfg(target_os = "linux")]
+fn read_load1() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
         .ok()
         .and_then(|body| body.split_whitespace().next()?.parse().ok())
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_load1() -> f64 {
+    crate::daemon_info::load_average().map_or(0.0, |load| load.one)
+}
+
+/// Available memory in GiB; `f64::MAX` (the gate passes) when unreadable.
+#[cfg(target_os = "linux")]
+fn read_mem_available_gb() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|body| mem_available_kib(&body))
+        .map_or(f64::MAX, |kib| kib as f64 * 1024.0 / GIB)
+}
+
+/// macOS: `vm_stat` free + inactive + speculative pages (#2937).
+#[cfg(not(target_os = "linux"))]
+fn read_mem_available_gb() -> f64 {
+    crate::host_memory::read_available_bytes().map_or(f64::MAX, |bytes| bytes as f64 / GIB)
+}
+
+fn sample_host() -> ResourceSample {
+    let load1 = read_load1();
     let cores = std::thread::available_parallelism()
         .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
         .unwrap_or(1);
-    let disk_free_gb = nix::sys::statvfs::statvfs("/").map_or(f64::MAX, |stats| {
-        stats.blocks_available() as f64 * stats.fragment_size() as f64 / GIB
-    });
-    let mem_available_gb = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|body| mem_available_kib(&body))
-        .map_or(f64::MAX, |kib| kib as f64 * 1024.0 / GIB);
+    let disk_free_gb = crate::host_pressure::disk_free_gb();
+    let mem_available_gb = read_mem_available_gb();
     let workers_slice_anon_gb = std::fs::read_to_string(workers_slice_stat_path())
         .ok()
         .map(|body| anon_shmem_bytes(&body) as f64 / GIB);
@@ -756,6 +912,37 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn governor_snapshot_does_not_wait_for_host_resource_probe() {
+        let governor = Governor::new_cached(
+            Box::new(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                healthy()
+            }),
+            Box::new(|pid| {
+                Some(Holder {
+                    pid,
+                    start_ticks: 7,
+                })
+            }),
+            Duration::from_millis(10),
+        );
+
+        let started = Instant::now();
+        let outcome = governor
+            .acquire(
+                &GovernorPolicy::LINUX_DEFAULT,
+                &req(AdmissionClass::Build, 7),
+            )
+            .expect("acquire while first host probe is in progress");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "governor admission waited for the host resource probe"
+        );
+        assert!(matches!(outcome, AcquireOutcome::Granted { .. }));
+    }
+
     fn req(class: AdmissionClass, pid: u32) -> AcquireParams {
         AcquireParams {
             class,
@@ -805,7 +992,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn default_policy_equals_cargo_slot_values() {
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         assert_eq!((p.build_slots, p.lander_slots, p.max_load), (4, 5, 0));
         assert_eq!(
             (
@@ -824,7 +1011,7 @@ mod tests {
         let (_w, g) = World::new();
         let p = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         let mut holder = req(AdmissionClass::Build, 1);
         holder.label = Some("make scoped-test".into());
@@ -846,7 +1033,7 @@ mod tests {
         let (_w, g) = World::new();
         let p = GovernorPolicy {
             build_slots: 2,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         let a = granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         let _b = granted(&g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap());
@@ -891,7 +1078,7 @@ mod tests {
         let p = GovernorPolicy {
             build_slots: 1,
             lander_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         // A full build pool does not block a lander.
@@ -899,11 +1086,66 @@ mod tests {
         queued(&g.acquire(&p, &req(AdmissionClass::Build, 3)).unwrap());
     }
 
+    /// #2430: a worker's `cargo check` is granted while every build slot is
+    /// held, and a closed load gate (what saturated builds produce) does not
+    /// hold it; the disk and memory floors still do.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn check_lane_is_granted_while_build_slots_and_load_gate_are_closed() {
+        let (w, g) = World::new();
+        let p = GovernorPolicy {
+            build_slots: 1,
+            check_slots: 1,
+            ..GovernorPolicy::LINUX_DEFAULT
+        };
+        granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
+        queued(&g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap());
+        w.set(|s| s.load1 = 1000.0);
+        let check = granted(&g.acquire(&p, &req(AdmissionClass::Check, 3)).unwrap());
+        // The lane has its own cap and FIFO: a second check waits for the first.
+        let (waiting, pos, why) = queued(&g.acquire(&p, &req(AdmissionClass::Check, 4)).unwrap());
+        assert_eq!(pos, 0);
+        assert!(matches!(
+            why,
+            BlockReason::Slots {
+                class: AdmissionClass::Check,
+                in_use: 1,
+                cap: 1
+            }
+        ));
+        assert!(g.release(&p, check));
+        granted(&poll(&g, &p, waiting, AdmissionClass::Check));
+        let snap = g.snapshot(&p);
+        assert_eq!((snap.check_in_use, snap.build_in_use), (1, 1));
+        // The memory floor applies to the check lane too.
+        w.set(|s| s.mem_available_gb = 1.0);
+        let (_t, _, why) = queued(&g.acquire(&p, &req(AdmissionClass::Check, 5)).unwrap());
+        assert_eq!(
+            serde_json::to_value(&why).unwrap()["gate"],
+            "memory_available"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn load_gate_still_blocks_build_and_lander_classes() {
+        let p = GovernorPolicy::LINUX_DEFAULT;
+        let mut s = healthy();
+        s.load1 = 1000.0;
+        for class in [AdmissionClass::Build, AdmissionClass::Lander] {
+            assert!(matches!(
+                global_block(&p, &s, class),
+                Some(BlockReason::Load { .. })
+            ));
+        }
+        assert!(global_block(&p, &s, AdmissionClass::Check).is_none());
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn disk_floor_stall_latches_one_warning_until_the_gate_reopens() {
         let (w, g) = World::new();
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         assert!(!g.disk_warning_latched());
         w.set(|s| s.disk_free_gb = 29.0);
         let (ticket, _, _) = queued(&g.acquire(&p, &req(AdmissionClass::Lander, 1)).unwrap());
@@ -919,7 +1161,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn each_host_gate_blocks_with_its_reason() {
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         let cases: Vec<(Box<dyn Fn(&mut ResourceSample)>, &str)> = vec![
             (Box::new(|s| s.disk_free_gb = 29.0), "disk"),
             (Box::new(|s| s.load1 = 40.0), "load"),
@@ -946,17 +1188,17 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn gate_thresholds_are_the_cargo_slot_boundaries() {
-        let p = GovernorPolicy::default();
-        assert!(global_block(&p, &healthy()).is_none());
+        let p = GovernorPolicy::LINUX_DEFAULT;
+        assert!(global_block(&p, &healthy(), AdmissionClass::Build).is_none());
         let mut s = healthy();
         s.disk_free_gb = 30.0;
         s.load1 = 39.9;
         s.mem_available_gb = 16.0;
         s.workers_slice_anon_gb = Some(29.9);
-        assert!(global_block(&p, &s).is_none());
+        assert!(global_block(&p, &s, AdmissionClass::Build).is_none());
         s.load1 = 40.0;
         assert!(matches!(
-            global_block(&p, &s),
+            global_block(&p, &s, AdmissionClass::Build),
             Some(BlockReason::Load { .. })
         ));
     }
@@ -967,8 +1209,11 @@ mod tests {
         let (w, g) = World::new();
         w.set(|s| s.workers_slice_anon_gb = None);
         granted(
-            &g.acquire(&GovernorPolicy::default(), &req(AdmissionClass::Build, 1))
-                .unwrap(),
+            &g.acquire(
+                &GovernorPolicy::LINUX_DEFAULT,
+                &req(AdmissionClass::Build, 1),
+            )
+            .unwrap(),
         );
     }
 
@@ -987,7 +1232,7 @@ mod tests {
         let (w, g) = World::new();
         let p = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         let (ticket, _, _) = queued(&g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap());
@@ -1006,7 +1251,7 @@ mod tests {
         let (w, g) = World::new();
         let p = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         queued(&g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap());
@@ -1034,7 +1279,7 @@ mod tests {
                 })
             }),
         );
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         granted(&g.acquire(&p, &req(AdmissionClass::Build, 5)).unwrap());
         *start.lock().unwrap() = 8; // same pid, new process
         assert_eq!(g.snapshot(&p).build_in_use, 0);
@@ -1046,7 +1291,7 @@ mod tests {
         let (_w, g) = World::new();
         let p = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         let a = granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         let (t, _, _) = queued(&g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap());
@@ -1060,7 +1305,7 @@ mod tests {
     #[test]
     fn granted_ticket_is_idempotent_and_unknown_ticket_errors() {
         let (_w, g) = World::new();
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         let a = granted(&g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap());
         assert_eq!(granted(&poll(&g, &p, a, AdmissionClass::Build)), a);
         let bad = g.acquire(
@@ -1082,13 +1327,13 @@ mod tests {
         let (_w, g) = World::new();
         let one = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         granted(&g.acquire(&one, &req(AdmissionClass::Build, 1)).unwrap());
         let (t, _, _) = queued(&g.acquire(&one, &req(AdmissionClass::Build, 2)).unwrap());
         granted(&poll(
             &g,
-            &GovernorPolicy::default(),
+            &GovernorPolicy::LINUX_DEFAULT,
             t,
             AdmissionClass::Build,
         ));
@@ -1098,7 +1343,7 @@ mod tests {
     #[test]
     fn snapshot_reports_margins_and_queue() {
         let (w, g) = World::new();
-        let p = GovernorPolicy::default();
+        let p = GovernorPolicy::LINUX_DEFAULT;
         w.set(|s| s.load1 = 55.0);
         queued(&g.acquire(&p, &req(AdmissionClass::Lander, 3)).unwrap());
         let snap = g.snapshot(&p);
@@ -1126,7 +1371,7 @@ mod tests {
     use std::process::{Command, Stdio};
 
     fn script_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/cargo-slot")
+        std::path::Path::new(rsi_common::manifest_dir!()).join("../../scripts/cargo-slot")
     }
 
     fn tools_available() -> bool {
@@ -1228,7 +1473,7 @@ mod tests {
         ));
         let policy = GovernorPolicy {
             build_slots: 1,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         serve(&socket, governor.clone(), policy);
         let wait_for = |what: &str, ok: &dyn Fn(&GovernorSnapshot) -> bool| {

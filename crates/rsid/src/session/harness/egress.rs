@@ -105,11 +105,6 @@ fn blocked_message(what: &str, class: BlockedClass) -> String {
 
 impl EgressFetcher {
     #[must_use]
-    pub fn new(policy: EgressPolicy) -> Self {
-        Self::with_resolver(policy, Arc::new(SystemResolver))
-    }
-
-    #[must_use]
     pub fn with_resolver(policy: EgressPolicy, resolver: Arc<dyn EgressResolver>) -> Self {
         Self {
             policy,
@@ -120,7 +115,7 @@ impl EgressFetcher {
     }
 
     #[cfg(test)]
-    fn with_connect_override(mut self, addr: SocketAddr) -> Self {
+    pub(crate) fn with_connect_override(mut self, addr: SocketAddr) -> Self {
         self.connect_override = Some(addr);
         self
     }

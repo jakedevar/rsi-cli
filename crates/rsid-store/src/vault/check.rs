@@ -30,6 +30,9 @@ pub enum ProbeOutcome {
     Failed,
     /// No check endpoint is defined for this slot.
     Unsupported,
+    /// The daemon is offline (#130): no request was made; the key is
+    /// unchecked.
+    Offline,
 }
 
 /// HTTP behind a trait so tests use a mock (no live network in tests).
@@ -47,6 +50,9 @@ pub struct HttpCredentialProbe {
     pub openai_base: String,
     /// `None` = derive `https://bedrock-runtime.<region>.amazonaws.com`.
     pub bedrock_base: Option<String>,
+    /// Offline daemon (#130): every probe returns [`ProbeOutcome::Offline`]
+    /// without building a client or resolving a host.
+    pub offline: bool,
 }
 
 impl Default for HttpCredentialProbe {
@@ -56,6 +62,7 @@ impl Default for HttpCredentialProbe {
             anthropic_base: "https://api.anthropic.com".into(),
             openai_base: "https://api.openai.com".into(),
             bedrock_base: None,
+            offline: rsid_core::offline::is_offline(),
         }
     }
 }
@@ -63,6 +70,9 @@ impl Default for HttpCredentialProbe {
 #[async_trait::async_trait]
 impl CredentialProbe for HttpCredentialProbe {
     async fn probe(&self, slot: Slot, secret: &SecretString) -> ProbeOutcome {
+        if self.offline {
+            return ProbeOutcome::Offline;
+        }
         let Some(http) = probe_client() else {
             return ProbeOutcome::Failed;
         };
@@ -191,6 +201,12 @@ pub fn classify(
         ProbeOutcome::Timeout => record(Unknown, None, None, "timeout"),
         ProbeOutcome::Connect => record(Unknown, None, None, "connect_error"),
         ProbeOutcome::Failed => record(Unknown, None, None, "request_failed"),
+        ProbeOutcome::Offline => record(
+            Unknown,
+            None,
+            None,
+            rsid_core::offline::REASON_OFFLINE_UNCHECKED,
+        ),
         ProbeOutcome::Http { status, body } => {
             let status = *status;
             let text = String::from_utf8_lossy(body);
@@ -398,5 +414,40 @@ pub mod tests {
             classify(Slot::Openrouter, &outcome, Utc::now(), None).class,
             CredentialCheckClass::Exhausted
         );
+    }
+
+    /// #130: an offline probe sends no request for any slot (every base URL
+    /// aims at a local server that expects none) and classifies the key as
+    /// unchecked offline: `unknown`, never an authoritative refusal.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[tokio::test]
+    async fn an_offline_probe_sends_no_request_and_reads_unchecked_offline() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let probe = HttpCredentialProbe {
+            openrouter_base: server.uri(),
+            anthropic_base: server.uri(),
+            openai_base: server.uri(),
+            bedrock_base: Some(server.uri()),
+            offline: true,
+        };
+        for slot in Slot::ALL {
+            let outcome = probe
+                .probe(slot, &SecretString::new("sk-test-offline".into()))
+                .await;
+            assert_eq!(outcome, ProbeOutcome::Offline, "{slot:?}");
+            let record = classify(slot, &outcome, Utc::now(), None);
+            assert_eq!(record.class, CredentialCheckClass::Unknown);
+            assert!(!record.class.is_authoritative_refusal());
+            assert_eq!(
+                record.detail_code,
+                rsid_core::offline::REASON_OFFLINE_UNCHECKED
+            );
+        }
+        server.verify().await;
     }
 }

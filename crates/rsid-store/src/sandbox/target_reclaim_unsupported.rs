@@ -13,6 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Reclaim is unavailable on this platform: every candidate is refused
+/// `Openat2Unavailable`. The daemon raises the persistent `reclaim_unsupported`
+/// health condition and reports `build_cache_reclaim: unsupported` from this,
+/// so a host never fills silently (hub #3055 part 2).
+pub const RECLAIM_SUPPORTED: bool = false;
+
 /// Mirrors the Linux `MAX_RECLAIM_PASS_DURATION`.
 const UNSUPPORTED_PASS_STORE_WAIT: Duration = Duration::from_secs(30);
 
@@ -61,6 +67,8 @@ impl ReclaimPassState {
         (0, 0)
     }
 
+    /// Mirrors the Linux API surface; no caller on this platform.
+    #[allow(dead_code)]
     pub(crate) fn entries_deleted(&self) -> u64 {
         0
     }
@@ -71,6 +79,7 @@ impl ReclaimPassState {
     }
 
     #[cfg(any(test, feature = "test-seam"))]
+    #[allow(dead_code)]
     pub(crate) fn set_elapsed_for_test(&self, _elapsed: Duration) {}
 }
 
@@ -283,14 +292,6 @@ pub fn reclaim_test_isolation_for_test() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(any(test, feature = "test-seam"))]
-pub(crate) fn set_post_authentication_barrier_for_test(
-    _custody_id: Uuid,
-    _reached: Arc<std::sync::Barrier>,
-    _release: Arc<std::sync::Barrier>,
-) {
 }
 
 #[cfg(any(test, feature = "test-seam"))]

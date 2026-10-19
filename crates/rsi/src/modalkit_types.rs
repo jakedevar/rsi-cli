@@ -132,6 +132,36 @@ pub enum LcAction {
     /// Cancel a pending automatic retry on the focused session.
     CancelRetry,
 
+    /// Show or hide the operator to-do panel (remembered).
+    ToggleTodoPanel,
+
+    /// Move the operator to-do cursor down.
+    TodoNext,
+
+    /// Move the operator to-do cursor up.
+    TodoPrev,
+
+    /// Open the selected to-do item's linked Issue, session or URL.
+    TodoOpenLink,
+
+    /// Mark the selected to-do item done.
+    TodoDone,
+
+    /// Dismiss the selected to-do item.
+    TodoDismiss,
+
+    /// Copy the selected to-do item's command (`how`) to the clipboard.
+    TodoCopy,
+
+    /// Mark the to-do list as caught up (clear the new and closed highlights).
+    TodoAcknowledge,
+
+    /// Open the selected to-do item in a pop-up (full title, `how` and actions).
+    TodoPopup,
+
+    /// Undo the operator's last to-do close within the undo window.
+    TodoUndo,
+
     /// Open the session-rating overlay for the focused session.
     OpenRatingOverlay,
 
@@ -152,6 +182,17 @@ pub enum LcAction {
     /// #1176: abandon the focused session's blocked rotation to a fresh
     /// replacement (`:rotation-abandon [provider[/model]]`).
     AbandonRotation(Option<String>),
+
+    /// #2750: replace the focused session's project manager seat, whose
+    /// provider is down, with a successor on another provider
+    /// (`:manager-reseat <provider>[/<model>] <reason>`).
+    ReseatManager(Option<String>),
+
+    /// #2384: put the focused session's rows back from cold storage into the
+    /// live database (`:cold-restore`).
+    ColdRestoreSession,
+    /// #2384: the cold-storage archive (`:cold-archive [status|run|move|verify|compact]`).
+    ColdArchive(Option<String>),
 
     /// Open the sort order picker overlay.
     OpenSortPicker,
@@ -396,6 +437,8 @@ pub enum LcAction {
     // --- Issue Tracker ---
     /// Open or focus the first-class Issue workspace pane.
     OpenIssuesWorkspace,
+    /// #2381: `:issue [N]` opens the Issue with that number (blank: the go-to prompt).
+    OpenIssueNumber(String),
 
     // --- Dialectic Query ---
     /// Open the dialectic query overlay (natural-language Q&A).
@@ -407,6 +450,11 @@ pub enum LcAction {
     // --- Daemon Config ---
     /// Toggle the daemon feature at the given index in `App::daemon_features`.
     ToggleDaemonFeature(usize),
+
+    /// Apply every pending (staged) Settings edit: ONE atomic
+    /// `UpdateDaemonConfig` carrying every changed daemon field with its final
+    /// value, plus the staged local preferences (#2241, #2236).
+    ApplyPendingSettings,
 
     /// Trigger a global model-control emergency stop.
     EmergencyStopAll,
@@ -483,6 +531,9 @@ pub enum LcAction {
     /// Set the focused leaf session as the lead of its parent Epic.
     /// No-op if the focused session has no parent or the parent is not an Epic.
     SetEpicLead,
+    /// #2055: land the focused session's branch through the merge queue. The
+    /// first press shows the commit and arms; the same action again confirms.
+    LandSessionBranch,
     /// Open the project's appointed manager conversation.
     OpenHarnessManager,
     /// Appoint the focused ordinary leaf and choose its Epic scope.
@@ -568,6 +619,20 @@ pub enum LcAction {
     /// (`ListProviderCredentials`). Queued on every entry to Settings ->
     /// Provider Keys (1:1 clone of `RefreshDaemonFeatures`).
     RefreshProviderCredentials,
+    /// Refresh `App::cached_provider_login` (#2753) for the Provider Keys login
+    /// rows: `GetProviderLoginState` (the daemon's cache, probing only a stale
+    /// result), or with `probe` `RefreshProviderLoginState` (probe both CLIs
+    /// now).
+    RefreshProviderLogin {
+        probe: bool,
+    },
+    /// Refresh `App::cached_provider_contract` (#2755) for the Provider Keys
+    /// contract rows: `GetProviderContractState` (the daemon's cached canary
+    /// result), or with `probe` `RefreshProviderContractState` (run the canary
+    /// for both CLIs now).
+    RefreshProviderContract {
+        probe: bool,
+    },
 
     /// Set the credential for `slot` to `secret` (`SetProviderCredential`).
     /// Built from the `ProviderCredentialForm` overlay's masked buffer at
@@ -616,6 +681,34 @@ pub enum LcAction {
     ClearMcpServerSecret {
         id: String,
     },
+    /// hub #3039: load the daemon's custom providers (`ListCustomProviders`)
+    /// and point each daemon model role at its selected provider.
+    RefreshCustomProviders,
+    /// Create or replace a custom provider (`PutCustomProvider`). A key in
+    /// `params` goes to the daemon vault; its `Debug` is redacted.
+    PutCustomProvider {
+        params: rsi_common::operator_config::PutCustomProviderParams,
+    },
+    /// Remove a custom provider and its vault key (`DeleteCustomProvider`).
+    DeleteCustomProvider {
+        id: uuid::Uuid,
+    },
+    /// Load the daemon's view of `~/.claude/settings.json` hooks.
+    RefreshClaudeHooks,
+    /// Write `hooks` if the file is still at `expected_revision`; on a
+    /// conflict replay `edit` on the current hooks and open the prompt.
+    SaveClaudeHooks {
+        expected_revision: String,
+        hooks: rsi_common::claude_hooks::ClaudeHooks,
+        edit: crate::claude_config::HookEdit,
+    },
+    /// Read a bridge config through the daemon and open its form.
+    OpenMessageBridgeForm(crate::settings::MessageBridgeKind),
+    /// Write a bridge config through the daemon (`PutMessageBridge`).
+    PutMessageBridge {
+        bridge: crate::settings::MessageBridgeKind,
+        settings: crate::settings::MessageBridgeSettings,
+    },
 }
 
 #[cfg(test)]
@@ -661,6 +754,16 @@ impl LcAction {
             LcAction::ToggleTestingNeeded => "ToggleTestingNeeded",
             LcAction::ToggleRotationDisabled => "ToggleRotationDisabled",
             LcAction::CancelRetry => "CancelRetry",
+            LcAction::ToggleTodoPanel => "ToggleTodoPanel",
+            LcAction::TodoNext => "TodoNext",
+            LcAction::TodoPrev => "TodoPrev",
+            LcAction::TodoOpenLink => "TodoOpenLink",
+            LcAction::TodoDone => "TodoDone",
+            LcAction::TodoDismiss => "TodoDismiss",
+            LcAction::TodoCopy => "TodoCopy",
+            LcAction::TodoAcknowledge => "TodoAcknowledge",
+            LcAction::TodoPopup => "TodoPopup",
+            LcAction::TodoUndo => "TodoUndo",
             LcAction::OpenRatingOverlay => "OpenRatingOverlay",
             LcAction::OpenSessionInfoPanel => "OpenSessionInfoPanel",
             LcAction::OpenModelSwitchPicker => "OpenModelSwitchPicker",
@@ -668,6 +771,9 @@ impl LcAction {
             LcAction::ReassignSessionProject => "ReassignSessionProject",
             LcAction::RotateSession => "RotateSession",
             LcAction::AbandonRotation(..) => "AbandonRotation",
+            LcAction::ReseatManager(..) => "ReseatManager",
+            LcAction::ColdRestoreSession => "ColdRestoreSession",
+            LcAction::ColdArchive(..) => "ColdArchive",
             LcAction::OpenSortPicker => "OpenSortPicker",
             LcAction::OpenDiagnostics => "OpenDiagnostics",
             LcAction::OpenRecursiveDagBrowser => "OpenRecursiveDagBrowser",
@@ -737,9 +843,11 @@ impl LcAction {
             LcAction::AddProjectCardFact(..) => "AddProjectCardFact",
             LcAction::AddUserCardFact(..) => "AddUserCardFact",
             LcAction::OpenIssuesWorkspace => "OpenIssuesWorkspace",
+            LcAction::OpenIssueNumber(..) => "OpenIssueNumber",
             LcAction::OpenDialectic => "OpenDialectic",
             LcAction::AskQuery(..) => "AskQuery",
             LcAction::ToggleDaemonFeature(..) => "ToggleDaemonFeature",
+            LcAction::ApplyPendingSettings => "ApplyPendingSettings",
             LcAction::EmergencyStopAll => "EmergencyStopAll",
             LcAction::CancelModelInvocation(..) => "CancelModelInvocation",
             LcAction::RefreshDaemonFeatures => "RefreshDaemonFeatures",
@@ -763,6 +871,7 @@ impl LcAction {
             LcAction::MoveToParent => "MoveToParent",
             LcAction::MoveToRoot => "MoveToRoot",
             LcAction::SetEpicLead => "SetEpicLead",
+            LcAction::LandSessionBranch => "LandSessionBranch",
             LcAction::OpenHarnessManager => "OpenHarnessManager",
             LcAction::AppointHarnessManager => "AppointHarnessManager",
             LcAction::EditHarnessManagerScope => "EditHarnessManagerScope",
@@ -792,6 +901,8 @@ impl LcAction {
             LcAction::DeleteBudgetPolicy(..) => "DeleteBudgetPolicy",
             LcAction::SubmitBudgetPolicy { .. } => "SubmitBudgetPolicy",
             Self::RefreshProviderCredentials => "RefreshProviderCredentials",
+            Self::RefreshProviderLogin { .. } => "RefreshProviderLogin",
+            Self::RefreshProviderContract { .. } => "RefreshProviderContract",
             Self::SetProviderCredentialSecret { .. } => "SetProviderCredentialSecret",
             Self::RotateProviderCredentialSecret { .. } => "RotateProviderCredentialSecret",
             Self::ClearProviderCredentialSlot(..) => "ClearProviderCredentialSlot",
@@ -803,6 +914,13 @@ impl LcAction {
             Self::SetMcpServerSecret { .. } => "SetMcpServerSecret",
             Self::RotateMcpServerSecret { .. } => "RotateMcpServerSecret",
             Self::ClearMcpServerSecret { .. } => "ClearMcpServerSecret",
+            Self::RefreshCustomProviders => "RefreshCustomProviders",
+            Self::PutCustomProvider { .. } => "PutCustomProvider",
+            Self::DeleteCustomProvider { .. } => "DeleteCustomProvider",
+            Self::RefreshClaudeHooks => "RefreshClaudeHooks",
+            Self::SaveClaudeHooks { .. } => "SaveClaudeHooks",
+            Self::OpenMessageBridgeForm(..) => "OpenMessageBridgeForm",
+            Self::PutMessageBridge { .. } => "PutMessageBridge",
         }
     }
 }
@@ -970,6 +1088,9 @@ mod tests {
             LcAction::ReassignSessionProject,
             LcAction::RotateSession,
             LcAction::AbandonRotation(None),
+            LcAction::ReseatManager(None),
+            LcAction::ColdRestoreSession,
+            LcAction::ColdArchive(None),
             LcAction::OpenSortPicker,
             LcAction::OpenDiagnostics,
             LcAction::OpenRecursiveDagBrowser,
@@ -1042,9 +1163,11 @@ mod tests {
             LcAction::AddProjectCardFact("fact".into()),
             LcAction::AddUserCardFact("fact".into()),
             LcAction::OpenIssuesWorkspace,
+            LcAction::OpenIssueNumber(String::new()),
             LcAction::OpenDialectic,
             LcAction::AskQuery("test".into()),
             LcAction::ToggleDaemonFeature(0),
+            LcAction::ApplyPendingSettings,
             LcAction::EmergencyStopAll,
             LcAction::CancelModelInvocation(uuid::Uuid::nil()),
             LcAction::RefreshDaemonFeatures,
@@ -1068,6 +1191,7 @@ mod tests {
             LcAction::MoveToParent,
             LcAction::MoveToRoot,
             LcAction::SetEpicLead,
+            LcAction::LandSessionBranch,
             LcAction::RunEpicTopology,
             // --- Event-driven refresh actions ---
             LcAction::RefreshNavigation,
@@ -1105,6 +1229,16 @@ mod tests {
             // missing from this vector, so `test_all_variants_exist` was not
             // actually exhaustive. ---
             LcAction::CancelRetry,
+            LcAction::ToggleTodoPanel,
+            LcAction::TodoNext,
+            LcAction::TodoPrev,
+            LcAction::TodoOpenLink,
+            LcAction::TodoDone,
+            LcAction::TodoDismiss,
+            LcAction::TodoCopy,
+            LcAction::TodoAcknowledge,
+            LcAction::TodoPopup,
+            LcAction::TodoUndo,
             LcAction::OpenSourceWorktreeSettlement,
             LcAction::OpenLegacyScratch,
             LcAction::SyncTitleModelConfig,
@@ -1129,6 +1263,8 @@ mod tests {
             LcAction::OpenRecentFileN(1),
             // --- Provider Keys / key vault (#694 K1b) ---
             LcAction::RefreshProviderCredentials,
+            LcAction::RefreshProviderLogin { probe: true },
+            LcAction::RefreshProviderContract { probe: true },
             LcAction::SetProviderCredentialSecret {
                 slot: rsi_common::provider_credentials::ProviderCredentialSlot::Openrouter,
                 secret: "sk-test".to_string(),
@@ -1169,6 +1305,36 @@ mod tests {
             },
             LcAction::ClearMcpServerSecret {
                 id: "fixture".to_string(),
+            },
+            LcAction::RefreshCustomProviders,
+            LcAction::PutCustomProvider {
+                params: rsi_common::operator_config::PutCustomProviderParams {
+                    id: None,
+                    name: "fixture".to_string(),
+                    base_url: "http://127.0.0.1:1/v1".to_string(),
+                    default_model: String::new(),
+                    api_key: rsi_common::operator_config::CustomProviderKeyChange::Keep,
+                },
+            },
+            LcAction::DeleteCustomProvider {
+                id: uuid::Uuid::nil(),
+            },
+            LcAction::RefreshClaudeHooks,
+            LcAction::SaveClaudeHooks {
+                expected_revision: "absent".to_string(),
+                hooks: rsi_common::claude_hooks::ClaudeHooks::new(),
+                edit: crate::claude_config::HookEdit::Delete {
+                    event: crate::claude_config::HookEvent::Known(
+                        crate::claude_config::KnownHookEvent::Stop,
+                    ),
+                    entry_index: 0,
+                    hook_index: 0,
+                },
+            },
+            LcAction::OpenMessageBridgeForm(crate::settings::MessageBridgeKind::Signal),
+            LcAction::PutMessageBridge {
+                bridge: crate::settings::MessageBridgeKind::Imessage,
+                settings: crate::settings::MessageBridgeSettings::default(),
             },
         ];
 
@@ -1216,10 +1382,7 @@ mod tests {
     /// top-level commas (tracking nested `()`, `{}`, `<>`) and takes each
     /// chunk's leading identifier as the variant name.
     fn scan_lc_action_variant_names() -> std::collections::BTreeSet<String> {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/modalkit_types.rs"
-        ));
+        let source = include_str!("modalkit_types.rs");
 
         let marker = "pub enum LcAction {";
         let marker_at = source

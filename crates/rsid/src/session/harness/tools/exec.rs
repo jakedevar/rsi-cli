@@ -4,7 +4,7 @@
 //! `write_stdin` call can either send input or poll the same scoped process.
 
 use super::{
-    HarnessTool, ToolContext,
+    HarnessTool, ToolContext, custody_guard,
     process_registry::ProcessWakeController,
     shell::{ShellLaunchIdentity, scoped_shell_command},
 };
@@ -71,6 +71,7 @@ fn error_json(message: impl Into<String>, code: &str) -> ToolResult {
     )
 }
 
+#[cfg(test)]
 fn result_text(result: &ToolResult) -> String {
     crate::session::harness::types::ChatMessage::tool_result("test-result", result.output.clone())
         .visible_tool_text()
@@ -299,7 +300,6 @@ struct ProcessSnapshot {
 
 #[derive(Debug)]
 struct ProcessHandle {
-    id: u32,
     terminate: CancellationToken,
     state: Arc<ProcessState>,
     monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -519,7 +519,6 @@ impl ProcessRegistry {
             .await;
         });
         let handle = Arc::new(ProcessHandle {
-            id: session_id,
             terminate,
             state,
             monitor: Mutex::new(Some(monitor)),
@@ -735,6 +734,7 @@ async fn observe_leader_exit(child: &mut Child, state: &ProcessState) -> LeaderO
 /// Turn an observation into the leader's exit status, killing the group only
 /// when the leader is proven to still pin it, and always disarming before the
 /// reap.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 async fn settle_observed_exit(
     observation: LeaderObservation,
     state: &ProcessState,
@@ -945,12 +945,23 @@ impl HarnessTool for ExecCommandTool {
         if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
             return error_json(refusal, "broad_kill_refused");
         }
+        let working_dir = requested_workdir(&args, &context.working_dir);
+        // S6 (#2256): refuse git commands that break AGENTS.md hard rules 1, 2
+        // and 9 before anything in the command runs.
+        let probe = custody_guard::Probe {
+            session_id: self.identity.session_id,
+            invocation_id: self.identity.invocation_id,
+            working_dir: &working_dir,
+            cancel: &context.cancel,
+        };
+        if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
+            return error_json(refusal.message(), custody_guard::ERROR_CODE);
+        }
         let yield_ms = clamped_yield_ms(
             args.get("yield_time_ms").and_then(Value::as_u64),
             DEFAULT_EXEC_YIELD_MS,
         );
         let max_output_bytes = output_limit(&args, context);
-        let working_dir = requested_workdir(&args, &context.working_dir);
         let identity = ShellLaunchIdentity {
             egress: context.policy.egress.mode,
             ..self.identity.clone()
@@ -1429,6 +1440,95 @@ mod tests {
         unsafe { std::env::remove_var("RSI_EXEC_TEST_SECRET") };
         assert!(result.success, "{:?}", result.error_msg);
         assert_eq!(json_value(&result)["output"].as_str().unwrap(), "EMPTY");
+    }
+
+    /// S6 (#2256): a custody refusal is a typed error naming the hard rule, and
+    /// nothing in the command starts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn exec_command_refuses_custody_git_commands_with_a_typed_error() {
+        use super::super::custody_guard::test_support::{git, repo};
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let head = git(dir, &["rev-parse", "HEAD"]);
+        let registry = default_process_registry();
+        let exec = ExecCommandTool::new(Arc::clone(&registry), None, None, None);
+        for (cmd, rule) in [
+            ("touch ran.txt && git stash", "hard rule 9"),
+            ("git stash pop", "hard rule 9"),
+            ("sh -c \"git stash push -u\"", "hard rule 9"),
+            ("git checkout main; touch ran.txt", "hard rule 2"),
+            ("git switch -c other", "hard rule 2"),
+            ("git reset --hard HEAD~1", "hard rule 2"),
+            ("git push -f origin main", "hard rule 1"),
+            ("touch ran.txt; git restore .", "hard rules 8 and 9"),
+            // #2290: b.txt is clean, but the probe runs before the shell starts.
+            ("sleep 0.2; git restore b.txt", "hard rules 8 and 9"),
+            // #2289: `env -C` moves the child, not the probe.
+            ("env -C . git restore b.txt", "hard rules 8 and 9"),
+            // #2287: aliases are refused.
+            ("git -c 'alias.x=!git stash' x", "hard rules 1, 2 and 9"),
+            // #2288: substitutions inside double quotes run too.
+            ("printf '%s' \"$(git stash)\"", "hard rule 9"),
+        ] {
+            let result = exec
+                .execute_with_context(
+                    json!({"cmd": cmd, "workdir": dir, "yield_time_ms": 250}),
+                    &context(CancellationToken::new(), 4096),
+                )
+                .await;
+            assert!(!result.success, "{cmd}");
+            let value = json_value(&result);
+            assert_eq!(value["error_code"], "custody_git_refused", "{cmd}");
+            let message = value["error"].as_str().unwrap_or_default();
+            assert!(message.contains(rule), "{cmd}: {message}");
+        }
+        assert!(!dir.join("ran.txt").exists());
+        assert_eq!(git(dir, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(dir, &["stash", "list"]), "");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn exec_command_still_runs_allowed_git_commands() {
+        use super::super::custody_guard::test_support::repo;
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let registry = default_process_registry();
+        let exec = ExecCommandTool::new(Arc::clone(&registry), None, None, None);
+        let result = exec
+            .execute_with_context(
+                json!({
+                    "cmd": "git status --short && echo 'git stash is only text'",
+                    "workdir": dir,
+                    "yield_time_ms": 30000
+                }),
+                &context(CancellationToken::new(), 4096),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error_msg);
+        let output = json_value(&result)["output"].as_str().unwrap().to_owned();
+        assert!(output.contains("a.txt"), "{output}");
+        assert!(output.contains("git stash is only text"), "{output}");
+
+        // The clean path b.txt may be discarded as the only command in the line.
+        let result = exec
+            .execute_with_context(
+                json!({
+                    "cmd": "git checkout -- b.txt",
+                    "workdir": dir,
+                    "yield_time_ms": 30000
+                }),
+                &context(CancellationToken::new(), 4096),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error_msg);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

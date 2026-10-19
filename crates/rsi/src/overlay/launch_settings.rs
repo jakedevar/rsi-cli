@@ -7,9 +7,11 @@
 //! showing, so the modal itself carries no key hints.
 //!
 //! The manager appointment is performed after the daemon accepts the launch,
-//! on the same task, through the operator RPCs the `:manager appoint` and
-//! `:manager policy` editors use (`ConfigureHarnessManager`, then
-//! `ConfigureHarnessManagerPolicy`).
+//! on the same task, through one operator RPC that saves the appointment and
+//! its policy atomically (`ConfigureHarnessManagerWithPolicy`, #2237). With a
+//! manager planned the settings side has a second page (`p`, or Enter on the
+//! Grant row) that edits that policy: preset, mode, capabilities, allowances
+//! and launches (`overlay::grant_editor`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -18,15 +20,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::harness_manager::{ConfigureHarnessManagerRequestV1, HarnessManagerScopeModeV1};
 use rsi_common::harness_manager_presets::{
     ManagerPolicyOrigin, ManagerPolicyPreset, ManagerPresetContext, apply_manager_policy_preset,
+    classify_manager_policy,
 };
-use rsi_common::harness_manager_v2::{ConfigureHarnessManagerPolicyRequestV2, ManagerPolicyV2};
+use rsi_common::harness_manager_v2::{ConfigureHarnessManagerWithPolicyRequestV2, ManagerPolicyV2};
 use rsi_common::types::{Session, SessionKind, SessionStatus};
 use uuid::Uuid;
 
 use crate::app::App;
+use crate::overlay::grant_editor::{GrantEditor, GrantKey};
 use crate::types::{
-    ManagerLaunchPlan, ManagerLaunchScope, OverlayState, PopupMode, PromptLaunchSettings,
-    PromptPurpose,
+    ManagerAppointment, ManagerLaunchPlan, ManagerLaunchScope, OverlayState, PopupMode,
+    PromptLaunchSettings, PromptPurpose,
 };
 
 /// Policy presets offered at launch, in cycle order. `Custom` policies stay
@@ -49,6 +53,8 @@ pub(crate) enum LaunchSettingRow {
     Manager,
     ManagerScope,
     ManagerPolicy,
+    /// #2237: opens the grant page (the editor behind the preset).
+    ManagerGrant,
 }
 
 impl LaunchSettingRow {
@@ -60,6 +66,7 @@ impl LaunchSettingRow {
             Self::Manager => "Manager",
             Self::ManagerScope => "Scope",
             Self::ManagerPolicy => "Policy",
+            Self::ManagerGrant => "Grant",
         }
     }
 
@@ -72,6 +79,9 @@ impl LaunchSettingRow {
             Self::Manager => "Appoint this session as the project manager at launch.",
             Self::ManagerScope => "What the manager supervises: project, Group or Epic.",
             Self::ManagerPolicy => "Observe watches; Execute runs work; Full grants all.",
+            Self::ManagerGrant => {
+                "Edit the grant: mode, capabilities, caps and launches. Enter or p opens it."
+            }
         }
     }
 
@@ -143,6 +153,7 @@ pub(crate) fn setting_rows(
         if launch.manager.is_some() {
             rows.push(LaunchSettingRow::ManagerScope);
             rows.push(LaunchSettingRow::ManagerPolicy);
+            rows.push(LaunchSettingRow::ManagerGrant);
         }
     }
     rows
@@ -335,7 +346,15 @@ pub(crate) fn handle_prompt_launch_keys(app: &mut App, slot: PromptSlot, key: Ke
     if passes_through_settings_side(key) {
         return false;
     }
+    if launch.grant_open {
+        handle_grant_page_key(app, slot, key);
+        app.mark_dirty();
+        return true;
+    }
     match key.code {
+        KeyCode::Char('p') if planned_manager(app, slot).is_some() => {
+            open_grant_page(app, slot, true);
+        }
         KeyCode::Esc => set_settings_side(app, slot, false),
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, slot, Move::Next),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, slot, Move::Previous),
@@ -364,6 +383,8 @@ pub(crate) fn set_settings_side(app: &mut App, slot: PromptSlot, open: bool) {
             return;
         }
         launch.open = open;
+        // Flipping away always lands on the launch rows next time.
+        launch.grant_open = false;
         let rows = setting_rows(purpose, launch).len();
         launch.selected = launch.selected.min(rows.saturating_sub(1));
         surface.suggestions_visible = false;
@@ -421,6 +442,7 @@ fn change_selected(app: &mut App, slot: PromptSlot, step: Step) {
         Some(LaunchSettingRow::Manager) => toggle_manager(app, slot),
         Some(LaunchSettingRow::ManagerScope) => step_scope(app, slot, step != Step::Back),
         Some(LaunchSettingRow::ManagerPolicy) => step_preset(app, slot, step != Step::Back),
+        Some(LaunchSettingRow::ManagerGrant) => open_grant_page(app, slot, true),
         None => {}
     }
 }
@@ -488,6 +510,11 @@ fn toggle_manager(app: &mut App, slot: PromptSlot) {
             }),
             _ => None,
         };
+        // A grant edited for one appointment never outlives it.
+        if launch.manager.is_none() {
+            launch.grant = None;
+            launch.grant_open = false;
+        }
         let rows = setting_rows(purpose, launch).len();
         launch.selected = launch.selected.min(rows.saturating_sub(1));
     }
@@ -511,7 +538,13 @@ fn step_scope(app: &mut App, slot: PromptSlot, forward: bool) {
         .position(|scope| *scope == plan.scope)
         .unwrap_or(0);
     let scope = choices[wrapped(current, choices.len(), forward)];
-    set_plan(app, slot, ManagerLaunchPlan { scope, ..plan });
+    let next = ManagerLaunchPlan { scope, ..plan };
+    if let Some(OverlayState::Prompt { launch, .. }) = slot.get_mut(app)
+        && let Some(editor) = launch.grant.as_mut()
+    {
+        editor.set_scope_mode(next.scope_mode());
+    }
+    set_plan(app, slot, next);
 }
 
 fn step_preset(app: &mut App, slot: PromptSlot, forward: bool) {
@@ -523,7 +556,51 @@ fn step_preset(app: &mut App, slot: PromptSlot, forward: bool) {
         .position(|preset| *preset == plan.preset)
         .unwrap_or(0);
     let preset = MANAGER_LAUNCH_PRESETS[wrapped(current, MANAGER_LAUNCH_PRESETS.len(), forward)];
+    // Choosing a preset resets the edited grant to it.
+    if let Some(OverlayState::Prompt { launch, .. }) = slot.get_mut(app)
+        && let Some(editor) = launch.grant.as_mut()
+    {
+        editor.apply_preset(preset);
+    }
     set_plan(app, slot, ManagerLaunchPlan { preset, ..plan });
+}
+
+/// Show (`open`) or hide the grant page. The editor is created from the
+/// planned preset the first time it opens, so an operator who never opens the
+/// page grants exactly the preset.
+fn open_grant_page(app: &mut App, slot: PromptSlot, open: bool) {
+    let Some(plan) = planned_manager(app, slot) else {
+        return;
+    };
+    if let Some(OverlayState::Prompt { launch, .. }) = slot.get_mut(app) {
+        if open && launch.grant.is_none() {
+            launch.grant = Some(GrantEditor::for_manager(
+                plan.policy(),
+                plan.scope_mode(),
+                crate::overlay::global_manager_command::default_allowed_launches(),
+            ));
+        }
+        launch.grant_open = open;
+    }
+}
+
+/// Keys while the grant page shows: the editor takes them; `Esc` (or `p`)
+/// returns to the launch rows.
+fn handle_grant_page_key(app: &mut App, slot: PromptSlot, key: KeyEvent) {
+    let outcome = match slot.get_mut(app) {
+        Some(OverlayState::Prompt { launch, .. }) => launch
+            .grant
+            .as_mut()
+            .map_or(GrantKey::Leave, |editor| editor.handle_key(key)),
+        _ => return,
+    };
+    let back = outcome == GrantKey::Leave
+        || (outcome == GrantKey::Ignored
+            && key.code == KeyCode::Char('p')
+            && key.modifiers.is_empty());
+    if back {
+        open_grant_page(app, slot, false);
+    }
 }
 
 fn planned_manager(app: &App, slot: PromptSlot) -> Option<ManagerLaunchPlan> {
@@ -540,17 +617,21 @@ fn set_plan(app: &mut App, slot: PromptSlot, plan: ManagerLaunchPlan) {
 }
 
 /// Appoint the accepted `session_id` as its project's manager with the
-/// planned scope, then grant the planned policy preset. Runs on the launch
-/// task right after `LaunchSession` returns, so the operator sees one result.
+/// planned scope and grant the planned policy (the preset's, or the grant the
+/// operator edited), in one atomic operator RPC
+/// (`ConfigureHarnessManagerWithPolicy`, #2237): the appointment and its
+/// policy land together or not at all. Runs on the launch task right after
+/// `LaunchSession` returns, so the operator sees one result.
 ///
 /// # Errors
-/// A sentence for the operator naming which step was refused; the session
-/// itself is launched either way.
+/// A sentence for the operator naming the refusal; the session itself is
+/// launched either way.
 pub(crate) async fn appoint_launched_manager(
     socket_path: PathBuf,
     session_id: Uuid,
-    plan: ManagerLaunchPlan,
+    appointment: ManagerAppointment,
 ) -> Result<String, String> {
+    let ManagerAppointment { plan, grant } = appointment;
     let not_appointed = |error: String| {
         format!(
             "Session launched but not appointed manager: {error}. Retry with :manager appoint on it."
@@ -572,32 +653,28 @@ pub(crate) async fn appoint_launched_manager(
                 .unwrap_or(config.manager_session_id)
                 != session_id
     });
-    let config = client
-        .configure_harness_manager(
-            plan.scope_request(session_id, previous.as_ref().map_or(0, |c| c.row_version)),
-        )
-        .await
-        .map_err(|error| not_appointed(error.to_string()))?;
-    let preset = plan.preset.label();
-    let not_granted = |error: String| {
-        format!(
-            "Manager appointed, but the {preset} policy was not granted: {error}. Set it with :manager policy."
-        )
-    };
     let stored = client
         .get_harness_manager_policy(plan.project_id)
         .await
-        .map_err(|error| not_granted(error.to_string()))?;
-    client
-        .configure_harness_manager_policy(ConfigureHarnessManagerPolicyRequestV2 {
-            project_id: plan.project_id,
-            expected_scope_version: config.row_version,
+        .map_err(|error| not_appointed(error.to_string()))?;
+    let policy = grant.unwrap_or_else(|| plan.policy());
+    let label = if policy == plan.policy() {
+        plan.preset.label()
+    } else {
+        classify_manager_policy(&policy, plan.scope_mode())
+            .preset
+            .label()
+    };
+    let result = client
+        .configure_harness_manager_with_policy(ConfigureHarnessManagerWithPolicyRequestV2 {
+            scope: plan.scope_request(session_id, previous.as_ref().map_or(0, |c| c.row_version)),
             expected_policy_version: stored.map_or(0, |policy| policy.row_version),
             idempotency_key: Uuid::new_v4().to_string(),
-            policy: plan.policy(),
+            policy,
         })
         .await
-        .map_err(|error| not_granted(error.to_string()))?;
+        .map_err(|error| not_appointed(error.to_string()))?;
+    let config = result.config;
     let scope = if config.scope_mode == HarnessManagerScopeModeV1::Project {
         "the whole project".to_string()
     } else {
@@ -608,7 +685,7 @@ pub(crate) async fn appoint_launched_manager(
         )
     };
     Ok(format!(
-        "Manager appointed for {scope} with the {preset} policy{}",
+        "Manager appointed for {scope} with the {label} policy{}",
         if replaced {
             "; it replaces the previous manager"
         } else {

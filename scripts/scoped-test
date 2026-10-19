@@ -13,27 +13,148 @@ An ATOM is a substring, =exact::name, or /regex/.
 --runtime-max-sec and the time left, and a package with none left is not run
 (`scoped_test_timeout: total budget exhausted`, exit 1). The durable recipes
 use it so their sequential package budgets fit the job's own cap (#1584).
+Daemon scoped_test jobs also pass --job-max-sec: slot/lock waits spend that
+wall budget and admission leaves a 120s runtime reserve (#2025). One admission
+is held across the selected packages (#2216); each keeps its own bounded unit.
 RSI_SCOPED_TEST_FILTERS (newline-separated PACKAGE=FILTER, set by the daemon's
 recipe `filters` param) acts as --filter when no --filter is given.
 Use --reclaim-incremental to remove Cargo incremental caches after each successful
 package when another selected package remains; compiled dependencies and test
 binaries stay available.
-Linux uses a foreground systemd service; other platforms use a plain process
-timeout (no CPU quota). Logs and the derived plan live in /tmp/rsi-scoped-test-*.
+Linux uses a foreground systemd service in the hub's shared build slice
+`rsi-build.slice` (#2119): its CPUQuota is the operator's `hub_build_cpu_percent` of the host's
+threads, so concurrent runs share one budget (RSI_BUILD_SLICE overrides the name, empty runs
+outside it). Other platforms use a plain process timeout and print that no slice or CPU cap is
+available. Logs and the derived plan live in /tmp/rsi-scoped-test-*.
 Static guards run even for dry runs, declined plans, and explicit filters.
-Use --tmpfs for the merge-queue lander's tmpfs parity (#1182, #1577): the selected
-test binaries run with a private TMPDIR under /dev/shm (override the parent with
+A package whose selected tests passed retains its passing verdict and count even when another
+filter is empty. `unmatched_filters` names those filters separately and still makes the run red.
+`baseline_reds` requires a named candidate failure observed again in a failing base run;
+a failed build or harness alone never establishes one. `baseline_failure_records` separately
+annotates active known-failure records by name (not a verified signature match), and
+`baseline_reds_without_record` names successful lookups with no record. Durable jobs use the
+shared classifier snapshot without agent credentials; a missing/stale snapshot or failed lookup
+is `unavailable`, never evidence that no record exists. Lookup time is bounded to ten seconds.
+Execution order is fixed (#2647): the selected Python tests (stdlib `python3 -m unittest`
+for the repo suites) run first, fail-fast, and Cargo starts only after they all pass. The run prints the order
+(`execution order: ...`) and records it as the receipt's `phase_order`. `--dry-run` selects the Python
+tests with the same code and prints each `python test:` command and the Cargo plan, fills `python` with
+`planned` entries (a missing runner is the typed `runner_unavailable` entry, not a pass), and executes no
+test and no Cargo, so a worker can run exactly those Python commands in the foreground before it submits.
+The `desktop` lane (hub #3001, `scripts/desktop-test-gate.py`) fails closed (#355): a candidate whose diff touches
+the script (a delete or rename) or a lane input while the script is missing is refused, never an empty lane.
+It is selected by the same rule the merge queue
+uses: a diff that touches `desktop/`, `docs/keybindings.md`, `crates/rsi/src` or a path dependency of
+`desktop/src-tauri/Cargo.toml` (`trigger_inputs` in the gate script) runs `npm ci` + `npm test` and `cargo test` in `desktop/src-tauri` on a
+private copy of the tree (npm cache and Cargo target under the job's TMPDIR/target, never the committed
+tree); a diff elsewhere selects nothing. It runs after the Python tests and before Cargo. Desktop failures
+keep the run red while Cargo and the warning gate still run; timeouts stop immediately. Its
+receipt entries are the `desktop` list (`status` passed/failed/runner_unavailable/no_tests_executed/planned,
+`npm_tests`, `cargo_tests`, `executed_tests`). A missing node, npm, cargo or (Linux) webkit2gtk-4.1 is the
+typed `runner_unavailable` with zero tests, never green; `--dry-run` previews the lane and runs nothing.
+Planning starts no cargo (#2564): derivation is `check-touched-shards --filters-only` and a
+dry run only prints the build it would run. The receipt's `compile` object records
+`planning` (source, `cargo_invoked: false`), `execution` (`pending`, `skipped_dry_run`,
+`executed`, `none_scheduled`) and each package's build as `executed`/`failed`/`incomplete`.
+By default the selected tests run with the merge-queue lander's tmpfs parity
+(#1182, #1910): a private TMPDIR under /dev/shm (override the parent with
 CHECK_TOUCHED_SHARDS_TMPDIR); the build still uses the host TMPDIR and the same
-Cargo target, so an earlier scoped-test run's binaries are reused, not rebuilt.
-Where no tmpfs exists (non-Linux, no usable /dev/shm) it prints `TMPFS_PARITY
-unavailable: ...` and exits 0 without running anything.
+Cargo target. This is one test pass, not a second verification job.
+The selected Python fixture tests run under the same kind of private TMPDIR and
+print `TMPFS_PARITY python tests=N tmpfs=<dir>` (also `python_tmpfs` in the
+receipt), so a script-only change is never silently unchecked (#1799).
+Where no tmpfs exists (non-Linux, no usable /dev/shm, or one that leaves this
+user under RSI_SCOPED_TEST_TMPFS_MIN_GB, default 12, counting the user's block
+quota and not only df's free space, #2177) the default prints
+`TMPFS_PARITY unavailable: ...` and runs the same selected tests with the host
+TMPDIR. The receipt records scratch_mode and completed tests. Explicit --tmpfs
+remains a parity-only request: it reports unavailable and skips when no tmpfs
+exists, for compatibility with existing callers.
+Tests run with cargo-nextest when it is installed (receipt `runner: "nextest"`): one
+`cargo nextest run -E 'test(=a) | ...'` per batch of exact names at N test threads, hangs named
+through the repo profile's slow-timeout/terminate-after (`.config/nextest.toml`). Without it
+(laptop, macOS) they run in N concurrent single-threaded libtest processes per package, names
+interleaved across the shards, each with its own start/end tracking so a timeout names every
+running test (#2046, `runner: "libtest"`). `--runner` or RSI_SCOPED_TEST_RUNNER forces one.
+N is load-adaptive (#2084): clamp((host threads - 1-minute load) / 2, 2, 12), never above the
+job's `--cpu-quota` in cores; the worker unit's CPUQuota is N*100%. `--test-shards` overrides N.
+The receipt records runner, test_threads, cpu_quota, host_threads, load1 and adaptive_threads.
+A plan of more than --filter-budget (default 12) distinct filters is never broadened to
+whole packages (#2084 replaces #2047's `PKG=*`): it runs as named, most specific filters first,
+inside a test-time box (--test-time-box-sec, default 600; 0 = no box). Packages and tiers not
+started when the box is spent are skipped, not failed: the receipt says `plan:
+"targeted_subset"` with selected_filters/run_filters, selected_tests/run_tests, box_expired,
+filters_partial and filters_not_run, and the merge-queue gate covers the rest. Filter coverage derives
+from the executed selected test identities (#216): a filter whose every selected test ran is `run`
+even when the box expired afterwards, a part-run one is `filters_partial` with its selected/executed
+counts, a filter with no executed test is `filters_not_run`; a failed test that ran counts as
+executed and never changes the verdict; `unlisted_packages` names packages that never listed.
+The tests of a module whose own source changed run right after the added/changed ones and before
+any unrelated observer, smallest module first (#2182, check-touched-shards `changed_modules`); a
+module that selects more than CHANGED_MODULE_TEST_LIMIT tests is a broad filter and keeps its
+specificity tier. The receipt names `changed_modules` and, in a targeted subset,
+`changed_module_tests_selected`/`changed_module_tests_run`. Exit is green when the run subset
+passes. A BROAD observer fallback from check-touched-shards (#2105: a trace over 150 functions
+or 24 tests keeps the module filter) is never refused: it runs boxed the same way and the
+receipt carries `uncertain: "broad_observers"` with `broad_filter_count`, `broad_tests` and
+`broad_filters` (filter, tests, reason); the merge-queue gate and the full-library QA cover the
+rest. The same expression under several shard labels (the label only routes it, #1698) is one
+selection: `broad_filter_count` and `broad_tests` count each expression once, and
+`broad_filter_entries` keeps the labelled count. A trace that stops at a high-fan-in hub (a type more than 150 functions mention) or at the
+function, test or identity bound still names the tests it proved observe the change
+(`direct_observers`, `broad_filters[].direct_tests`/`hubs`/`trace_stopped`): they run nearest first
+right after the added/changed and changed-module tests and ahead of every unranked far test, whatever
+specificity tier the far test is in (an exact filter's unrelated test included), in every binary of the
+package, and the packages holding them run first after the changed-module packages (#2588). Where an
+ambiguity or an untraceable diff keeps the broad filter, every selected test stays selected: far tests are
+ordered last, never dropped. The hint only orders tests the plan already selects, so filter counts and
+executed identities are the plan's own (`direct_observer_tests_selected`/`_run`). The tiers of all of a
+package's binaries run in one rank order, so the box cannot be spent in an earlier binary first.
+A trace that stopped at a CAP (a hub, the function bound or the test bound, every identity placed; the
+broad entry's `worker_bounded`) is never widened for the worker (#2592). Its module filter stays in
+`suggested_filters`, which is the merge-queue gate's selection, but the worker plan keeps only that module's
+changed-module tests (up to CHANGED_MODULE_TEST_LIMIT per module) and the proven direct observers, nearest
+first inside the box. Every direct observer is selected in its own right (`direct_only`, built with its
+package), also one that sits outside every plan filter; these are not filters of the plan and have no coverage
+entry. The named filters the module filter had absorbed (`merged_filters`) return to the plan. Everything else the filter matches is DEFERRED: never selected, run or counted passed. The receipt
+carries `worker_policy: "bounded_deferred"`, `worker_broad_filters` (broad worker filters left: 0 when every
+broad entry was a cap), `filters_bounded` (per filter kept/executed/deferred, apart from run/partial/not_run)
+and `deferred`: the filters and why they stopped, `scope_tests_at_most` from the derivation (before the kept
+tests are subtracted; the dry run's number), `tests` (exact deferred test identities counted from the package
+listings once a run lists them; `tests_basis` says if a package never listed), `routes`
+(`merge_queue_gate`, `pinned_full_qa`), `candidate` (the pinned SHA) and `status: "pending"`: the receipt
+never says that gate or QA ran, only the queue entry and the `qa_green` field of `AgentListRollingQueue` show that.
+A non-zero derivation exit names its cause in `derive_failure` (for example a candidate
+that no longer merges cleanly with the base). An ordinary plan reports `plan: "precise"`. `--filter-budget 0` keeps the precise plan
+and runs everything it names.
+
+Compiler warnings (#1897): when the repository checks in `tools/warning-baseline.json`, the build this run already
+supervises is also the evidence for that file. The compiler diagnostics of the JSON stream are attributed to their
+Cargo package and counted once per file, lint code and message (a line number only tells two reports of one warning
+apart, so the lib and lib-test units do not double a count). A baselined package built in the run may not have a
+warning key above its baseline count (`warning_gate_failed: new_warnings`), the candidate's baseline may not be above
+the merge base's or drop a package it has (`baseline_raised`), and diagnostics that cannot be trusted (flags that allow
+warnings, a diagnostic outside the JSON stream, a warning with no package) fail the run as `unavailable` rather than
+count as clean. A package the run did not build is `not_measured`, never clean. The receipt's `warnings` object
+carries the verdict. `--warning-baseline-from LOG` prints the `packages` document a finished job log measured, to
+seed or lower the baseline.
+
+Trial merge (#348): at the end of a run that resolved its head, a fetch-free
+`git merge-tree --write-tree origin/rolling <head>` is recorded as the receipt's
+`merges_cleanly_onto_rolling` (true, false, or null with `merge_check_reason`) and, when false,
+`conflict_paths` (first 32; `conflict_paths_total` is the full count). It is informational: it
+never changes the exit code or verdict. A worker whose receipt says false merges origin/rolling
+(no rebase), resolves, pushes and reruns one scoped_test.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import math
+import platform
 import os
 from pathlib import Path
 import queue
@@ -53,10 +174,39 @@ SCRIPT = Path(__file__).resolve()
 _python_spec = importlib.util.spec_from_file_location("python_test_gate", SCRIPT.with_name("python-test-gate.py"))
 PYTHON_GATE = importlib.util.module_from_spec(_python_spec)
 _python_spec.loader.exec_module(PYTHON_GATE)
+_desktop_spec = importlib.util.spec_from_file_location("desktop_test_gate", SCRIPT.with_name("desktop-test-gate.py"))
+DESKTOP_GATE = importlib.util.module_from_spec(_desktop_spec)
+_desktop_spec.loader.exec_module(DESKTOP_GATE)
 
 
 def command_text(command):
     return shlex.join(map(str, command))
+
+
+def signal_group(process, sig):
+    """Signal the process group we created; a group with nobody left to signal is already stopped.
+
+    macOS answers killpg(2) with EPERM, not ESRCH, when the group's only members are
+    zombies or exiting (the leader exited but is not reaped yet). That is the same
+    "already gone" outcome as ProcessLookupError, so it must not replace the
+    TimeoutExpired that brought us here. Fall back to the leader alone; if even that
+    is refused for a live process, name the step and the errno.
+    """
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        if process.poll() is not None:
+            return  # the leader is reaped and no member can be signalled
+        try:
+            process.send_signal(sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            raise PermissionError(error.errno,
+                                  f"cannot signal process group {process.pid} with {sig.name} "
+                                  f"({error.strerror})") from error
 
 
 def stop_process(process, own_tree=True):
@@ -64,22 +214,63 @@ def stop_process(process, own_tree=True):
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
     elif own_tree:
+        signal_group(process, signal.SIGTERM)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             pass
+        signal_group(process, signal.SIGKILL)
     else:
         process.terminate()
     process.wait()
 
 
-def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=None):
-    """Tee output live; a timeout covers silent commands as well as noisy ones."""
+class Budget:
+    """A run budget whose clock starts when the governor grants the build slot (#1756).
+
+    Time queued behind other cargo work never counts: `scripts/cargo-slot` prints
+    `rsi-phase <epoch> slot-granted: ...` when the slot is granted, and `grant()`
+    starts the clock then. A budget with no slot to wait for starts at once.
+    `wait_cap` bounds the queue; an optional job deadline includes queue time.
+    `waited` is the seconds spent queued.
+    """
+
+    GRANT = re.compile(r"rsi-phase \d+ slot-granted:")
+
+    def __init__(self, seconds, queued=False, wait_cap=600, grace=0, deadline=None):
+        self.seconds, self.wait_cap, self.grace = seconds, wait_cap, grace
+        self.deadline = deadline
+        self.created = time.monotonic()
+        self.started = None if queued else self.created
+
+    def observe(self, line):
+        if self.started is None and self.GRANT.match(line):
+            self.started = time.monotonic()
+
+    @property
+    def waited(self):
+        return (self.started if self.started is not None else time.monotonic()) - self.created
+
+    def remaining(self):
+        """Seconds left; the wait cap while still queued."""
+        if self.started is None:
+            left = self.created + self.wait_cap - time.monotonic()
+        else:
+            left = self.started + self.seconds + self.grace - time.monotonic()
+        if self.deadline is not None:
+            left = min(left, self.deadline - time.monotonic())
+        return max(0, left)
+
+    def ran_out(self):
+        """The run (not the queue) used its whole budget."""
+        return self.started is not None and time.monotonic() - self.started >= self.seconds
+
+
+def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=None, budget=None):
+    """Tee output live; a timeout covers silent commands as well as noisy ones.
+
+    `budget` (a Budget) replaces `timeout` and re-reads the deadline as output arrives.
+    """
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, errors="replace", start_new_session=own_tree and os.name != "nt", cwd=cwd, env=env)
     lines = queue.Queue()
@@ -95,16 +286,23 @@ def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def left():
+        if budget is not None:
+            return budget.remaining()
+        return None if deadline is None else max(0, deadline - time.monotonic())
+
     try:
         while True:
-            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            remaining = left()
             try:
                 line = lines.get(timeout=remaining)
             except queue.Empty:
                 raise subprocess.TimeoutExpired(command, timeout)
             if line is None:
-                remaining = None if deadline is None else max(0, deadline - time.monotonic())
-                return process.wait(timeout=remaining)
+                return process.wait(timeout=left())
+            if budget is not None:
+                budget.observe(line)
             emit(line)
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         try:
@@ -115,19 +313,68 @@ def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=
         raise
 
 
+def user_free_bytes(path):
+    """Bytes this user can still write under `path`: the filesystem's free space capped by the
+    user's block quota there (#2177, mirrors `user_free_gb` in scripts/cargo-slot, #938).
+    systemd gives each user a quota of 80% of the /tmp and /dev/shm tmpfs mounts and statvfs
+    reports the whole filesystem, so a statvfs-sized scratch dir fails with "Disk quota exceeded".
+    quotactl_fd(2) is Linux 5.14+ (tmpfs quotas 6.6+); no quota, or no way to read one, leaves
+    the free space uncapped. An unreadable `path` has 0 bytes."""
+    try:
+        stats = os.statvfs(path)
+    except OSError:
+        return 0
+    free = stats.f_bavail * stats.f_frsize
+    # quotactl_fd is syscall 443 on every Linux ABI except the offset mips/alpha ones.
+    if sys.platform.startswith("linux") and not platform.machine().startswith(("mips", "alpha")):
+        try:
+            import ctypes
+            import struct
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                dqblk = ctypes.create_string_buffer(72)  # struct if_dqblk
+                command = (0x800007 << 8) | 0  # QCMD(Q_GETQUOTA, USRQUOTA)
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.syscall(443, fd, ctypes.c_uint(command), ctypes.c_uint(os.geteuid()), dqblk) == 0:
+                    hard_kib, _soft, used = struct.unpack_from("=QQQ", dqblk.raw)
+                    valid = struct.unpack_from("=I", dqblk.raw, 64)[0]
+                    if hard_kib and (valid & 5) == 5:  # QIF_BLIMITS | QIF_SPACE
+                        free = min(free, max(0, hard_kib * 1024 - used))
+            finally:
+                os.close(fd)
+        except (OSError, AttributeError, ImportError):
+            pass
+    return free
+
+
+def tmpfs_min_free_gb():
+    """The floor, in GiB, the user's room under the tmpfs parent must reach (the lander's own
+    --tmpfs-min-free-gb default, 12); RSI_SCOPED_TEST_TMPFS_MIN_GB overrides it."""
+    value = os.environ.get("RSI_SCOPED_TEST_TMPFS_MIN_GB", "")
+    return int(value) if value.isdigit() else 12
+
+
 def tmpfs_parent():
-    """The tmpfs directory the lander gates on, or (None, reason) when unavailable."""
+    """The tmpfs directory the lander gates on, or (None, reason) when unavailable.
+
+    A parent that leaves this user less than the floor (free space or block quota,
+    whichever is smaller) is unavailable too: the run uses the host TMPDIR instead of
+    failing with "Disk quota exceeded" (#2177, #565)."""
     if not sys.platform.startswith("linux"):
         return None, "no tmpfs on " + sys.platform
     parent = os.environ.get("CHECK_TOUCHED_SHARDS_TMPDIR", "/dev/shm")
     if not (os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)):
         return None, f"{parent} is not a writable directory"
+    floor_gb = tmpfs_min_free_gb()
+    room_gb = user_free_bytes(parent) // (1 << 30)
+    if room_gb < floor_gb:
+        return None, f"{parent} leaves this user {room_gb} GiB (quota included), below {floor_gb} GiB"
     return parent, ""
 
 
-def selection_plan(filters, shard_packages):
+def selection_plan(filters, shard_packages, priority_filters=()):
     plan = {}
-    for value in filters:
+    for value in dict.fromkeys([*filters, *priority_filters]):
         package, sep, expression = value.partition("=")
         if not sep or not re.fullmatch(r"[\w-]+", package) or not expression:
             raise ValueError(f"refusing unscoped filter: {value}")
@@ -164,8 +411,79 @@ def selection_plan(filters, shard_packages):
         for owner in packages:
             plan.setdefault(owner, []).append({"filter": value, "kind": kind,
                                                "target": target, "substring": substring,
-                                               "exact": exact, "regex": regex})
+                                               "exact": exact, "regex": regex,
+                                               "priority": value in priority_filters})
     return plan
+
+
+# A plan with more filters than this is a targeted subset (#2084): it runs as named, most
+# specific first, inside a test-time box, and the merge-queue gate covers the rest. Matches
+# the derivation's GATE_FILTER_LIMIT; `--filter-budget 0` keeps the precise plan unboxed.
+FILTER_BUDGET = 12
+TEST_TIME_BOX_SEC = 600
+THREADS_MIN, THREADS_MAX = 2, 12
+
+
+def plan_filter_count(plan):
+    return len({s["filter"] for selections in plan.values() for s in selections if not s.get("direct_only")})
+
+
+def package_order(plan, changed_packages=(), direct_packages=()):
+    """Added/changed tests first, then packages that own a changed module (#2182), then packages
+    holding a proven direct observer of a bounded broad trace (#2588), then the most specific:
+    fewest broad (non-exact, non-regex) filters, then fewest filters."""
+    def key(item):
+        package, selections = item
+        broad = sum(1 for s in selections if not (s.get("exact") or s.get("regex")))
+        return (not any(s.get("priority") for s in selections), package not in changed_packages,
+                package not in direct_packages, broad, len(selections), package)
+    return sorted(plan.items(), key=key)
+
+
+def host_capacity():
+    """(logical threads, 1-minute load or None), read at run time."""
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        load = None
+    return os.cpu_count() or 2, load
+
+
+def adaptive_threads(host_threads, load1):
+    """clamp((host threads - 1-minute load) / 2, 2, 12): a busy host gets fewer test threads."""
+    free = host_threads - (load1 or 0.0)
+    return int(max(THREADS_MIN, min(THREADS_MAX, free / 2)))
+
+
+def nextest_required(repo):
+    """The minimum cargo-nextest version the repo's config demands, as a tuple (or ())."""
+    try:
+        text = (Path(repo) / ".config" / "nextest.toml").read_text()
+    except OSError:
+        return ()
+    found = re.search(r'nextest-version\s*=\s*\{[^}]*required\s*=\s*"([\d.]+)"', text)
+    return tuple(int(part) for part in found[1].split(".")) if found else ()
+
+
+def detect_runner(repo, requested="auto"):
+    """(runner, nextest version or None): nextest when installed and new enough, else libtest."""
+    requested = os.environ.get("RSI_SCOPED_TEST_RUNNER") or requested
+    if requested == "libtest":
+        return "libtest", None
+    binary = shutil.which("cargo-nextest")
+    version = None
+    if binary:
+        try:
+            done = subprocess.run([binary, "nextest", "--version"], text=True, capture_output=True, timeout=30)
+            found = re.match(r"cargo-nextest (\d+\.\d+\.\d+)", done.stdout) if done.returncode == 0 else None
+            version = found[1] if found else None
+        except (OSError, subprocess.TimeoutExpired):
+            version = None
+    if version and tuple(int(p) for p in version.split(".")) >= nextest_required(repo):
+        return "nextest", version
+    if requested == "nextest":
+        raise ValueError("--runner nextest: cargo-nextest is missing or older than .config/nextest.toml requires")
+    return "libtest", None
 
 
 # The integration target whose tests return Ok at once unless RSI_E2E=1 and that spawn a
@@ -219,32 +537,57 @@ def execute_package(plan):
     os.chdir(plan["repo"])
     os.environ.pop("RSI_PROCESS_OWNERSHIP_NAMESPACE", None)
     artifacts = {}
+    diagnosed = []
+    warnings = WarningCollector(plan["repo"])
+
+    def diagnose(text):
+        """The first actionable compiler line, once, bounded (#1913)."""
+        text = " ".join(str(text).split())[:400]
+        if text and not diagnosed:
+            diagnosed.append(text)
+            print("SCOPED_DIAG " + json.dumps(text), flush=True)
 
     def build_line(line):
         try:
             message = json.loads(line)
         except ValueError:
             print(line, end="", flush=True)
+            warnings.text(line)
+            if line.startswith(("error", "Error")):
+                diagnose(line)
             return
+        if message.get("reason") == "compiler-artifact":
+            warnings.artifact(message)
+        elif message.get("reason") == "compiler-message":
+            warnings.diagnostic(message)
         if message.get("reason") == "compiler-artifact" and message.get("executable") and message.get("profile", {}).get("test"):
             artifacts[message["executable"]] = (
                 message["target"], str(Path(message.get("manifest_path", Path(plan["repo"]) / "Cargo.toml")).parent))
         elif message.get("reason") == "compiler-message":
-            print(message["message"].get("rendered", line), end="", flush=True)
+            detail = message["message"]
+            print(detail.get("rendered", line), end="", flush=True)
+            if detail.get("level") == "error":
+                spans = [span for span in detail.get("spans") or [] if span.get("is_primary")]
+                where = f" ({spans[0]['file_name']}:{spans[0]['line_start']})" if spans else ""
+                diagnose(str(detail.get("message", "")) + where)
         elif message.get("reason") != "compiler-artifact":
             print(line, end="", flush=True)
 
     result = stream(plan["build"], build_line, own_tree=False)
     if result:
+        print("SCOPED_PHASE build_failed", flush=True)
         return result
+    print("SCOPED_WARNINGS " + json.dumps(warnings.payload(), separators=(",", ":")), flush=True)
     if plan.get("e2e"):
         os.environ["RSI_E2E"] = "1"
         print("scoped-test: e2e_tui selected; RSI_E2E=1 and building rsid for the harness", flush=True)
         result = stream(plan["e2e"]["prebuild"], lambda line: print(line, end="", flush=True), own_tree=False)
         if result:
+            print("SCOPED_PHASE build_failed", flush=True)
             return result
     if not artifacts:
         print("scoped-test: build produced no test binaries", flush=True)
+        print("SCOPED_PHASE build_failed", flush=True)
         return 1
     test_env, scratch = None, None
     if plan.get("tmpfs"):
@@ -252,14 +595,405 @@ def execute_package(plan):
         test_env = {**os.environ, "TMPDIR": scratch, "TMP": scratch, "TEMP": scratch}
         print(f"TMPFS_PARITY tmpfs={scratch}", flush=True)
     try:
-        return run_selected(plan, artifacts, test_env)
+        return run_selected(plan, artifacts, test_env, plan.get("exact_tests"))
     finally:
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)
 
 
-def run_selected(plan, artifacts, test_env):
+BATCH_MAX_TESTS = 256
+BATCH_MAX_BYTES = 64 * 1024
+
+
+# A test selected by a filter that names few tests runs before the tests only a broad
+# filter selects, so a budget that stops the run leaves the targeted evidence (#1732).
+SPECIFICITY_TIERS = (24, 60)
+
+
+def ranked_tiers(selected, selection_sizes, priority_tests=(), changed_ranks=None, direct_ranks=None):
+    """[(rank key, sorted names)] of `selected`, first to run first.
+
+    The key is (not added/changed, not in a changed module, that module's size, direct distance,
+    specificity tier). Added/changed tests run first; then the tests of a changed module, smallest
+    module first (`changed_ranks`, #2182); then every proven direct observer of a bounded broad
+    trace, nearest first (`direct_ranks`, #2588), whatever filter selects it, so an unrelated exact
+    observer can never spend a box before one; the unranked far tests follow by specificity: the
+    size of the narrowest filter selecting each, tightest first (#1732). Each tier is sorted,
+    because libtest runs a batch in name order. The keys compare across binaries."""
+    changed_ranks, direct_ranks = changed_ranks or {}, direct_ranks or {}
+    tiers = {}
+    for name in sorted(selected):
+        size = selection_sizes[name]
+        tier = (name not in priority_tests, name not in changed_ranks, changed_ranks.get(name, 0),
+                direct_ranks.get(name, FAR_RANK), sum(size > limit for limit in SPECIFICITY_TIERS))
+        tiers.setdefault(tier, []).append(name)
+    return [(tier, tiers[tier]) for tier in sorted(tiers)]
+
+
+def specificity_tiers(selected, selection_sizes, priority_tests=(), changed_ranks=None, direct_ranks=None):
+    """The names of `ranked_tiers`, first to run first."""
+    return [names for _, names in ranked_tiers(selected, selection_sizes, priority_tests, changed_ranks, direct_ranks)]
+
+
+# A selected test no bounded trace proved to observe the change ranks after every one that did.
+FAR_RANK = 1 << 30
+
+
+def direct_observer_ranks(names, selections):
+    """{test name: nearest distance} of the `names` of one binary that a direct-observer selection matches.
+
+    check-touched-shards names, for a broad filter whose trace had to stop (a high-fan-in hub, the
+    function or test bound, an unresolved identity), the tests it proved observe the change, with
+    the number of caller hops to each. They only order tests the plan already selects; a name no
+    plan filter selects is never added here (#2588)."""
+    ranks = {}
+    for selection in selections:
+        if selection.get("regex"):
+            members = [n for n in names if re.search(selection["regex"], n)]
+        elif selection.get("exact"):
+            members = [n for n in names if n == selection["exact"]]
+        else:
+            members = [n for n in names if selection["substring"] in n]
+        for name in members:
+            ranks[name] = min(ranks.get(name, selection["distance"]), selection["distance"])
+    return ranks
+
+
+# A changed module whose own tests number more than this is itself a broad filter: ranking it
+# ahead of every narrower observer would let it spend the whole time box, so its tests keep
+# their specificity tier. The 155-test `session::rotation` of #1186 is well inside it.
+CHANGED_MODULE_TEST_LIMIT = 300
+
+
+def changed_module_ranks(names, records, target, limit=CHANGED_MODULE_TEST_LIMIT):
+    """{test name: size of the smallest changed module or target holding it} for the `names` of one binary (#2182).
+
+    A record from check-touched-shards' `changed_modules` holds the tests named `<module>::..`
+    other than those of a descendant source it `excluded`, or every test of the changed bin or
+    integration-test target. Only a record holding at most `limit` of the selected names ranks:
+    a module that selects thousands is the broad fallback, not a changed module's own tests."""
+    ranks = {}
+    for record in records:
+        if "module" in record:
+            if "lib" not in target["kind"]:
+                continue
+            prefix, excluded = record["module"] + "::", tuple(x + "::" for x in record.get("excluded", ()))
+            members = {n for n in names if n.startswith(prefix) and not n.startswith(excluded)}
+        elif record.get("target") == target["name"] and record.get("kind") in target["kind"]:
+            members = set(names)
+        else:
+            continue
+        if not members or len(members) > limit:
+            continue
+        for name in members:
+            ranks[name] = min(ranks.get(name, len(members)), len(members))
+    return ranks
+
+
+def test_batches(names, max_tests=BATCH_MAX_TESTS, max_bytes=BATCH_MAX_BYTES):
+    """Split sorted test names into few libtest invocations (#1756).
+
+    One process per test costs a start-up each (about 2.5 s for the lifecycle
+    tests), which timed a broad same-module selection out. Batches are bounded by
+    count and by argv bytes so one invocation stays well under ARG_MAX.
+    """
+    batch, size = [], 0
+    for name in names:
+        if batch and (len(batch) >= max_tests or size + len(name) + 1 > max_bytes):
+            yield batch
+            batch, size = [], 0
+        batch.append(name)
+        size += len(name) + 1
+    if batch:
+        yield batch
+
+
+class BatchProgress:
+    """Turn libtest's single-threaded `test NAME ... ` start lines into SCOPED_START/END.
+
+    With --test-threads=1 libtest prints `test NAME ... ` before it runs the test, so a
+    start line is a reliable boundary even when the test's own output precedes `ok`.
+    """
+
+    START = re.compile(r"test (\S+) \.\.\. ")
+
+    def __init__(self, names, emit):
+        self.names, self.emit, self.active, self.seen = set(names), emit, None, set()
+        # Completion is the set of selected names seen to finish (#2079), never a raw line
+        # count: a nested libtest child (an #[ignore]d fixture re-run by its parent test)
+        # echoes `test X ... ok` for a name the batch also lists, and X's own line follows.
+        self.done = set()
+        self.extra = set()
+        self.failures = set()
+        self.failure_summary = False
+
+    @property
+    def ran(self):
+        return len(self.done)
+
+    def missing(self):
+        return sorted(self.names - self.done)
+
+    def note_extra(self, name):
+        """Log a libtest-style line for a name this batch did not select, once."""
+        if name not in self.extra:
+            self.extra.add(name)
+            self.emit(f"scoped-test: ignoring nested libtest line for unselected test {name}\n")
+
+    def finish_active(self):
+        if self.active is not None:
+            self.emit("SCOPED_END " + self.active + "\n")
+            self.done.add(self.active)
+            self.active = None
+
+    def begin(self, name):
+        self.active = name
+        self.seen.add(name)
+        self.emit("SCOPED_START " + name + "\n")
+
+    def line(self, text):
+        found = self.START.match(text)
+        if found and found[1] in self.names:
+            self.failure_summary = False
+            if found[1] != self.active and found[1] in self.done:
+                # Already finished: a repeat from a nested child or the real line after
+                # the child's echo. It is not a new test start.
+                pass
+            elif found[1] != self.active:
+                self.finish_active()
+                self.begin(found[1])
+            if text.rstrip().endswith("FAILED"):
+                self.failures.add(found[1])
+        elif found:
+            # A nested libtest child (or other process) printed a test line for a name
+            # this batch did not select. Ignore it for completeness, but a FAILED
+            # verdict is still a failure.
+            self.note_extra(found[1])
+            if text.rstrip().endswith("FAILED"):
+                self.failures.add(found[1])
+        elif self.active is not None and text.strip() == "FAILED":
+            # --nocapture puts panic/output between the start and verdict.
+            # Keep the active test's verdict even if a later test aborts the
+            # process before libtest can print its failure summary (#1931).
+            self.failures.add(self.active)
+        elif text.strip() == "failures:":
+            self.failure_summary = True
+        elif self.failure_summary and text.startswith("    ") and text.strip() in self.names:
+            # --nocapture often separates `test NAME ...` from `FAILED` with
+            # panic or tracing output. The final libtest summary names it.
+            self.failures.add(text.strip())
+        elif text.startswith("test result: "):
+            self.failure_summary = False
+            self.finish_active()
+        self.emit(text)
+
+
+PRINT_LOCK = threading.Lock()
+
+
+def emit_line(line):
+    """One whole line at a time, so concurrent shards never split each other's lines."""
+    with PRINT_LOCK:
+        print(line, end="", flush=True)
+
+
+def run_batch(binary, names, directory, test_env):
+    """Run `names` exactly once in one libtest process; returns (tests run, exit code)."""
+    progress = BatchProgress(names, emit_line)
+    # libtest runs a sorted selection in order, so the first name is live at once: a hang
+    # before any output still names its test.
+    progress.begin(names[0])
+    result = stream([binary, *names, "--exact", "--nocapture", "--test-threads=1"], progress.line,
+                    own_tree=False, cwd=directory, env=test_env)
+    progress.finish_active()
+    if result == 0:
+        # A successful binary may itself print failure-looking diagnostics.
+        progress.failures.clear()
+        # A clean exit ran every listed name; account for any whose start line the
+        # test's own output hid.
+        for name in names:
+            if name not in progress.seen:
+                progress.line(f"test {name} ... ok\n")
+                progress.finish_active()
+    return progress.ran, result, sorted(progress.failures), set(progress.done)
+
+
+class NextestProgress:
+    """Turn cargo-nextest status lines into the SCOPED_START/END protocol.
+
+    nextest prints no start line, so a test is announced when it is SLOW (the repo profile's
+    slow-timeout period) or when its verdict arrives; a hang is therefore named by its SLOW
+    line and a terminate-after TIMEOUT fails it. Same surface as BatchProgress.
+    """
+
+    STATUS = re.compile(r"^\s*([A-Z][A-Z-]+)\s+\[\s*>?\s*[\d.]+s\]\s+\([^)]*\)\s+(\S+)\s+(\S.*?)\s*$")
+    NOT_FINAL = {"SLOW", "TERMINATING", "DELAY", "RETRY", "START", "SKIP", "CANCEL", "CANCELLING"}
+    PASSED = {"PASS", "LEAK"}
+
+    def __init__(self, names, emit):
+        self.names, self.emit = set(names), emit
+        self.started, self.done, self.failures, self.extra = set(), set(), set(), set()
+
+    @property
+    def ran(self):
+        return len(self.done)
+
+    def missing(self):
+        return sorted(self.names - self.done)
+
+    def start(self, name):
+        if name not in self.started:
+            self.started.add(name)
+            self.emit("SCOPED_START " + name + "\n")
+
+    def line(self, text):
+        found = self.STATUS.match(text)
+        if found:
+            status, name = found[1], found[3]
+            if name not in self.names:
+                if name not in self.extra and status not in self.NOT_FINAL:
+                    self.extra.add(name)
+                    self.emit(f"scoped-test: ignoring nextest line for unselected test {name}\n")
+            elif status == "SLOW":
+                self.start(name)
+            elif status not in self.NOT_FINAL and name not in self.done:
+                self.start(name)
+                if status not in self.PASSED:
+                    self.failures.add(name)
+                self.done.add(name)
+                self.emit("SCOPED_END " + name + "\n")
+        self.emit(text)
+
+
+def nextest_filterset(names):
+    return " | ".join(f"test(={name})" for name in names)
+
+
+def nextest_target_args(target):
+    kinds = target["kind"]
+    return ["--lib"] if "lib" in kinds else ["--bin", target["name"]] if "bin" in kinds else ["--test", target["name"]]
+
+
+def run_nextest_batch(nextest, package, target, names, directory, test_env, threads):
+    """Run exact `names` in one cargo-nextest invocation; returns run_batch's tuple.
+
+    `--ignore-default-filter`: the names are explicit and the slow tier (#2270) was already
+    decided by `run_selected`, so the profile's default-filter must not drop a named test
+    (which `result == 0` below would then report as a pass)."""
+    progress = NextestProgress(names, emit_line)
+    command = [*nextest, "run", "-p", package, *nextest_target_args(target), "--no-fail-fast",
+               "--color", "never", "--status-level", "pass", "--final-status-level", "none",
+               "--test-threads", str(max(1, threads)), "--ignore-default-filter", "-E", nextest_filterset(names)]
+    result = stream(command, progress.line, own_tree=False, cwd=directory, env=test_env)
+    if result == 0:
+        # A clean exit ran every listed name; account for any whose verdict line was hidden.
+        for name in names:
+            if name not in progress.done:
+                progress.line(f"        PASS [   0.000s] (---/---) {package} {name}\n")
+    return progress.ran, result, sorted(progress.failures), set(progress.done)
+
+
+def interleave(names, shards):
+    """Deal sorted `names` round-robin into at most `shards` lists; each stays sorted."""
+    shards = max(1, min(shards, len(names)))
+    return [names[index::shards] for index in range(shards)]
+
+
+NEXTEST_BATCH_MAX_TESTS = 500
+NEXTEST_BATCH_MAX_BYTES = 96 * 1024
+# Under a time box a batch is the granularity at which the box is checked, so batches shrink.
+BOXED_LIBTEST_BATCH, BOXED_NEXTEST_BATCH = 32, 120
+NEXTEST_SAFE_NAME = re.compile(r"[\w:]+")
+
+
+def run_tier(binary, tier, directory, test_env, target, shards, runner=None, deadline=None, ran_names=None):
+    """Run one specificity tier; returns (tests run, whether any batch failed, box expired).
+
+    libtest: `shards` concurrent single-threaded processes, each a thread running its own
+    batches one process at a time, so every process keeps a single live test and its own
+    BatchProgress. nextest (`runner` = (argv prefix, package, threads)): sequential batches,
+    each one nextest run at `threads` test threads; a name nextest's filterset cannot carry
+    falls back to libtest. A batch is not started once `deadline` (monotonic) has passed."""
+    lock, total, failed, expired = threading.Lock(), [0], [False], [False]
+
+    def settle(batch, outcome):
+        ran, result, batch_failures, *rest = outcome
+        with lock:
+            total[0] += ran
+            if ran_names is not None and rest:
+                ran_names.update(rest[0])
+            # Print as each batch settles so a later batch or package that times
+            # out cannot lose them (#1895).
+            for name in batch_failures:
+                emit_line(f"SCOPED_FAILURE {target['kind'][0]}:{target['name']} {name}\n")
+            failed[0] |= result != 0 or ran < len(batch)
+
+    def out_of_time():
+        if deadline is not None and time.monotonic() >= deadline:
+            expired[0] = True
+        return expired[0]
+
+    def shard(names):
+        if runner is None:
+            for batch in (test_batches(names) if deadline is None else test_batches(names, BOXED_LIBTEST_BATCH)):
+                if out_of_time():
+                    return
+                settle(batch, run_batch(binary, batch, directory, test_env))
+            return
+        nextest, package, threads = runner
+        safe = [name for name in names if NEXTEST_SAFE_NAME.fullmatch(name)]
+        for batch in test_batches(
+                safe, BOXED_NEXTEST_BATCH if deadline is not None else NEXTEST_BATCH_MAX_TESTS,
+                NEXTEST_BATCH_MAX_BYTES):
+            if out_of_time():
+                return
+            settle(batch, run_nextest_batch(nextest, package, target, batch, directory, test_env, threads))
+        safe_set = set(safe)
+        for batch in test_batches([name for name in names if name not in safe_set]):
+            if out_of_time():
+                return
+            settle(batch, run_batch(binary, batch, directory, test_env))
+
+    lists = interleave(tier, 1 if runner else shards)
+    if len(lists) == 1:
+        shard(lists[0])
+    else:
+        errors = []
+
+        def guarded(names):
+            try:
+                shard(names)
+            except BaseException as error:  # a shard crash must fail the run, not vanish
+                errors.append(error)
+                failed[0] = True
+
+        threads = [threading.Thread(target=guarded, args=(names,), daemon=True) for names in lists]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+    return total[0], failed[0], expired[0]
+
+
+def run_selected(plan, artifacts, test_env, exact_tests=None):
     failed, count = False, 0
+    # #2270: the released-migration tests the diff does not need (check-touched-shards decided).
+    slow_names, slow_skipped = set(plan.get("slow_tier_excluded") or ()), set()
+    ignored_only = set()  # #2273: filters whose every match is #[ignore]d
+    box = plan.get("time_box_sec")
+    started = time.monotonic()
+    deadline = started + box if box else None
+    selected_tests, run_tests, expired = 0, 0, False
+    changed_selected, changed_run = 0, 0  # tests of a changed module (#2182)
+    direct_selected, direct_run = 0, 0  # proven direct observers of a stopped broad trace (#2588)
+    coverage = {}  # filter -> [selected test identities, executed ones] in this package (#216)
+    bounded, deferred_tests = {}, 0  # cap-overflow filter -> [kept, executed, deferred]; deferred identities (#2592)
+    # Every binary is listed and ranked first; the tiers of all of them then run in one rank order,
+    # so a binary listed earlier cannot spend the box before another binary's changed-module or
+    # direct-observer tests (#2588).
+    records = []
     for binary, (target, directory) in artifacts.items():
         selections = [s for s in plan["selections"]
                       if s["kind"] in target["kind"] and (s["kind"] == "lib" or s["target"] == target["name"])]
@@ -269,9 +1003,21 @@ def run_selected(plan, artifacts, test_env):
         result = stream([binary, "--list", "--format=terse"], listing.append, own_tree=False, cwd=directory)
         if result:
             print("".join(listing), end="", flush=True)
+            print("SCOPED_PHASE list_failed", flush=True)
             return result
         names = [line[:-len(": test\n")] for line in listing if line.endswith(": test\n")]
-        selected = set()
+        # #2273: `--list` also names #[ignore]d tests, which nextest then skips ("no tests to
+        # run"). Like the lander (rsi-rolling-land `listed_selected_tests`: matching and not
+        # ignored), leave them out; `--list --ignored` is the libtest way to name that set.
+        ignored = []
+        if names and stream([binary, "--list", "--ignored", "--format=terse"], ignored.append,
+                            own_tree=False, cwd=directory) == 0:
+            ignored = {line[:-len(": test\n")] for line in ignored if line.endswith(": test\n")}
+        else:
+            ignored = set()
+        selected, selection_sizes, by_filter, priority_tests = set(), {}, {}, set()
+        bounded_matches = {}  # a cap-overflow module filter's matches, restricted below (#2592)
+        direct_only = set()  # proven direct observers a bounded plan selects in their own right (#2592)
         for selection in selections:
             if selection.get("regex"):
                 matches = {name for name in names if re.search(selection["regex"], name)}
@@ -279,19 +1025,119 @@ def run_selected(plan, artifacts, test_env):
                 matches = {name for name in names if name == selection["exact"]}
             else:
                 matches = {name for name in names if selection["substring"] in name}
+            if exact_tests is not None:
+                matches &= set(exact_tests)
+            if selection.get("direct_only"):
+                # Not a filter of the plan: no coverage, no required match, no ignored-only note.
+                direct_only |= matches - ignored - (slow_names if selection["kind"] == "lib" else set())
+                continue
+            if matches and matches <= ignored:
+                # Matched, but only ignored tests: nothing to run, and not an unmatched filter.
+                ignored_only.add(selection["filter"])
+                print("SCOPED_MATCH " + selection["filter"], flush=True)
+                continue
+            matches -= ignored
+            skipped = matches & slow_names if selection["kind"] == "lib" else set()
+            if skipped:
+                slow_skipped |= skipped
+                matches -= skipped
+                if not matches:
+                    # The filter selects tests, all in the slow tier: matched, nothing to run.
+                    print("SCOPED_MATCH " + selection["filter"], flush=True)
+                    continue
+            if matches and selection.get("bounded"):
+                print("SCOPED_MATCH " + selection["filter"], flush=True)
+                bounded_matches.setdefault(selection["filter"], set()).update(matches)
+                continue
             if matches:
                 print("SCOPED_MATCH " + selection["filter"], flush=True)
                 selected.update(matches)
-        for name in sorted(selected):
-            print("SCOPED_START " + name, flush=True)
-            result = stream([binary, name, "--exact", "--nocapture", "--test-threads=1"],
-                            lambda line: print(line, end="", flush=True), own_tree=False, cwd=directory,
-                            env=test_env)
-            count += 1
-            print("SCOPED_END " + name, flush=True)
-            failed |= result != 0
+                if selection.get("priority"):
+                    priority_tests.update(matches)
+                by_filter.setdefault(selection["filter"], set()).update(matches)
+                for name in matches:
+                    selection_sizes[name] = min(selection_sizes.get(name, len(matches)), len(matches))
+        runner = None
+        if plan.get("runner") == "nextest" and plan.get("nextest"):
+            runner = (plan["nextest"], plan["package"], plan.get("test_threads") or plan.get("test_shards", 1))
+        # Ranks are judged over everything the plan's filters match, bounded matches included, so a
+        # restriction can never make a module that selects more than the limit look small (#2592).
+        selected |= direct_only
+        for test in direct_only:
+            selection_sizes.setdefault(test, 1)
+        universe = selected.union(*bounded_matches.values()) if bounded_matches else selected
+        changed_ranks = changed_module_ranks(universe, plan.get("changed_modules") or (), target)
+        direct_ranks = direct_observer_ranks(universe, [s for s in plan.get("direct_selections") or ()
+                                                        if s["kind"] in target["kind"]
+                                                        and (s["kind"] == "lib" or s["target"] == target["name"])])
+        kept_by_bounded = {}
+        for name, matches in bounded_matches.items():
+            # Only the changed module's own tests and the proven direct observers run; nothing else the
+            # module filter matches is selected, whatever the box would still admit (#2592).
+            kept = {test for test in matches if test in changed_ranks or test in direct_ranks}
+            kept_by_bounded[name] = kept
+            selected |= kept
+            for test in kept:
+                selection_sizes[test] = min(selection_sizes.get(test, len(matches)), len(matches))
+        deferred = set().union(*bounded_matches.values()) - selected if bounded_matches else set()
+        changed_ranks = {test: rank for test, rank in changed_ranks.items() if test in selected}
+        direct_ranks = {test: rank for test, rank in direct_ranks.items() if test in selected}
+        changed_selected += len(changed_ranks)
+        direct_selected += len(direct_ranks)
+        records.append({"binary": binary, "target": target, "directory": directory, "runner": runner,
+                        "selected": selected, "by_filter": by_filter, "changed": set(changed_ranks),
+                        "bounded": {name: (kept_by_bounded[name], matches - selected)
+                                    for name, matches in bounded_matches.items()},
+                        "deferred": deferred,
+                        "direct": set(direct_ranks), "ran": set(),
+                        "tiers": ranked_tiers(selected, selection_sizes, priority_tests, changed_ranks, direct_ranks)})
+    queue = sorted(((key, index, tier) for index, record in enumerate(records) for key, tier in record["tiers"]),
+                   key=lambda item: item[:2])
+    for _key, index, tier in queue:
+        record = records[index]
+        ran, tier_failed, tier_expired = run_tier(
+            record["binary"], tier, record["directory"], test_env, record["target"], plan.get("test_shards", 1),
+            runner=record["runner"], deadline=deadline, ran_names=record["ran"])
+        count += ran
+        failed |= tier_failed
+        if tier_expired:
+            expired = True
+            break
+    for record in records:
+        ran_names, selected = record["ran"], record["selected"]
+        selected_tests += len(selected)
+        run_tests += len(ran_names & selected) if ran_names else 0
+        changed_run += len(ran_names & record["changed"])
+        direct_run += len(ran_names & record["direct"])
+        for name, matches in record["by_filter"].items():
+            seen = coverage.setdefault(name, [0, 0])
+            seen[0] += len(matches)
+            seen[1] += len(matches & ran_names)
+        deferred_tests += len(record["deferred"])
+        for name, (kept, left) in record["bounded"].items():
+            seen = bounded.setdefault(name, [0, 0, 0])
+            seen[0] += len(kept)
+            seen[1] += len(kept & ran_names)
+            seen[2] += len(left)
     print(f"scoped-test: {plan['package']} executed {count} tests", flush=True)
+    for name in sorted(ignored_only):
+        print("SCOPED_IGNORED_ONLY " + name, flush=True)
+    if slow_skipped:
+        print(f"SCOPED_SLOW_TIER_SKIPPED {len(slow_skipped)}", flush=True)
+    if box or bounded or any(s.get("bounded") for s in plan["selections"]):
+        # Per filter, the selected and executed test identities: a failed test that ran is
+        # executed (the verdict stays the exit code), a test the box never started is not. A
+        # cap-overflow filter reports kept/executed/deferred apart: deferred is neither run nor passed.
+        print("SCOPED_SUBSET " + json.dumps({
+            "package": plan["package"], "selected_tests": selected_tests, "run_tests": run_tests,
+            "changed_module_tests": [changed_selected, changed_run],
+            "direct_observer_tests": [direct_selected, direct_run], "box_expired": expired, "filters": {name: seen for name, seen in sorted(coverage.items())},
+            "bounded": {name: seen for name, seen in sorted(bounded.items())}, "deferred_tests": deferred_tests,
+            "test_sec": round(time.monotonic() - started, 1)}), flush=True)
+    # Every binary built and listed: only now may a missing filter mean "no tests".
+    print("SCOPED_PHASE listed", flush=True)
     if failed:
+        print("SCOPED_PHASE test_failed", flush=True)
         return 1
     # A shared filter may match only in another package. The parent checks
     # that every filter selects something across the complete package union.
@@ -299,22 +1145,183 @@ def run_selected(plan, artifacts, test_env):
     return 0
 
 
-def bounded_command(plan, plan_path, seconds, cpu_quota, linux):
+BUILD_ENV_NAMES = (
+    "PATH", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTUP_TOOLCHAIN",
+    "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RSI_CARGO_SLOT_HELD", "TMPDIR", "TMP", "TEMP", "RUST_BACKTRACE",
+    "CHECK_TOUCHED_SHARDS_TMPDIR",
+    "CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG", "RUSTC_WRAPPER", "RSI_BUILD_SLOTS",
+    "RSI_BUILD_SLOT_ROOT", "RSI_BUILD_SCCACHE", "SCCACHE_CACHE_SIZE", "SCCACHE_DIR",
+    "SCCACHE_SERVER_UDS", "SCCACHE_CLIENT_SIDE",
+    # cargo-slot sets these for its child; the slot is held outside the unit now (#1756).
+    "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS",
+)
+
+
+class BuildAdmission:
+    """Hold one cargo-slot lease while the parent runs bounded package units.
+
+    The holder waits for EOF on its stdin. Normal exit, exceptions and signals
+    close that pipe, so cargo-slot releases its lease (or its local flock). Only
+    build knobs cross back from the holder; authority never crosses into units.
+    """
+
+    PREFIX = "SCOPED_SLOT_ENV "
+
+    def __init__(self):
+        self.process = None
+        self.environment = {}
+        self.previous = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def close(self):
+        if self.process is not None:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                stop_process(self.process)
+            self.reader.join(timeout=5)
+            self.process = None
+        for name, value in self.previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self.previous.clear()
+
+    def acquire(self, slot, emit, budget, wait_cap, job_deadline):
+        if self.process is not None:
+            if self.process.poll() is not None:
+                raise OSError("shared build-slot holder exited before the package run finished")
+            return 0
+        command = [*slot, sys.executable, "-u", str(SCRIPT), "--hold-admission"]
+        env = dict(os.environ)
+        if job_deadline is not None:
+            env["RSI_CARGO_ADMISSION_MAX_SEC"] = str(max(1, math.ceil(wait_cap)))
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True, errors="replace",
+                                        start_new_session=os.name != "nt", env=env)
+        lines = queue.Queue()
+
+        def read():
+            try:
+                for line in self.process.stdout:
+                    lines.put(line)
+            finally:
+                self.process.stdout.close()
+                lines.put(None)
+
+        self.reader = threading.Thread(target=read, daemon=True)
+        self.reader.start()
+        try:
+            while True:
+                try:
+                    line = lines.get(timeout=budget.remaining())
+                except queue.Empty:
+                    raise subprocess.TimeoutExpired(command, wait_cap)
+                if line is None:
+                    return self.process.wait(timeout=budget.remaining()) or 1
+                if line.startswith(self.PREFIX):
+                    environment = json.loads(line[len(self.PREFIX):])
+                    if environment.get("RSI_CARGO_SLOT_HELD") != "1":
+                        raise OSError("build-slot holder did not attest a held admission")
+                    self.environment = {name: value for name, value in environment.items()
+                                        if name in BUILD_ENV_NAMES}
+                    self.previous = {name: os.environ.get(name) for name in self.environment}
+                    os.environ.update(self.environment)
+                    return 0
+                budget.observe(line)
+                emit(line)
+        except BaseException:
+            self.close()
+            raise
+
+
+def hold_admission():
+    # cargo-slot owns the policy and lease; this child only keeps it alive.
+    print(BuildAdmission.PREFIX + json.dumps({name: os.environ[name] for name in BUILD_ENV_NAMES
+                                             if name in os.environ}), flush=True)
+    sys.stdin.read()
+    return 0
+
+
+# #2119: every cargo build and test unit RSI starts runs in this user slice, whose CPUQuota is the
+# hub-wide build budget; the daemon configures it (operator setting hub_build_cpu_percent).
+BUILD_SLICE = "rsi-build.slice"
+
+
+def build_slice():
+    """The slice name for bounded units; `RSI_BUILD_SLICE=` (empty) opts out."""
+    return os.environ.get("RSI_BUILD_SLICE", BUILD_SLICE)
+
+
+def bounded_command(plan, plan_path, seconds, cpu_quota, linux, env=None):
+    """`env` overrides build settings for the unit (the baseline's own target)."""
+    env = env or {}
     worker = [sys.executable, "-u", str(SCRIPT), "--execute-plan", str(plan_path)]
     if not linux:
         return worker, None
-    unit = "rsi-scoped-test-" + uuid.uuid4().hex
+    # The daemon's job id (RSI_JOB_ID, a UUID) goes in the name so the CPU
+    # andon attributes this separate cgroup to its job (#2127).
+    job_id = os.environ.get("RSI_JOB_ID", "")
+    job_tag = job_id + "-" if re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", job_id) else ""
+    unit = "rsi-scoped-test-" + job_tag + uuid.uuid4().hex
     # Copy only build/runtime knobs; never transport authority or credentials.
-    environment = ["--setenv=" + name for name in (
-        "PATH", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTUP_TOOLCHAIN",
-        "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RSI_CARGO_SLOT_HELD", "TMPDIR", "TMP", "TEMP", "RUST_BACKTRACE",
-        "CHECK_TOUCHED_SHARDS_TMPDIR",
-    ) if name in os.environ]
+    # The unit builds with the worker shell's build settings (#1741): a
+    # different profile, incremental mode or compiler wrapper would build a
+    # second copy of every artifact in the same target, and a target seeded
+    # from the warm pool (scripts/target-pool) needs RUSTC_WRAPPER.
+    environment = ["--setenv=" + (f"{name}={env[name]}" if name in env else name)
+                   for name in BUILD_ENV_NAMES if name in os.environ or name in env]
+    slice_name = build_slice()
     return ["systemd-run", "--user", "--collect", "--wait", "--pipe", "--service-type=exec",
+            *(["--slice=" + slice_name] if slice_name else []),
             "--unit=" + unit, "--working-directory=" + plan["repo"],
             "-p", f"RuntimeMaxSec={seconds:g}", "-p", f"CPUQuota={cpu_quota:g}%",
             "-p", "TimeoutStopSec=2", "-p", "KillMode=control-group",
             *environment, *worker], unit
+
+
+def slice_budget_percent(linux, run=subprocess.run):
+    """The build slice's live `CPUQuota` in percent of one CPU, or None (#2524).
+
+    The job's own `--cpu-quota` is the daemon's ceiling; the host's build budget
+    is the slice's quota. Nested units run in that slice, so they never ask for
+    more than it grants, even when the job was started with a larger ceiling or
+    the budget was lowered while it ran. Unknown (no systemd, no slice, no
+    quota) means no extra bound.
+    """
+    name = build_slice()
+    if not linux or not name:
+        return None
+    try:
+        shown = run(["systemctl", "--user", "show", name, "-p", "CPUQuotaPerSecUSec", "--value"],
+                    capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (shown.stdout or "").strip() if shown.returncode == 0 else ""
+    found = re.fullmatch(r"(\d+(?:\.\d+)?)(s|ms|us|min)?", text)
+    if not found:
+        return None  # "infinity" or empty: the slice carries no quota
+    unit = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, None: 1.0}[found[2]]
+    return float(found[1]) * unit * 100
+
+
+def split_slot(cargo):
+    """Separate a leading `cargo-slot` from the cargo command (#1756).
+
+    The slot is acquired once, around all bounded package units, so the time spent
+    queued for it is outside the run budget and the unit's RuntimeMaxSec. The held
+    slot marks its child (RSI_CARGO_SLOT_HELD), so the build inside takes no second.
+    """
+    if cargo and Path(cargo[0]).name == "cargo-slot":
+        return [cargo[0]], list(cargo[1:])
+    return [], list(cargo)
 
 
 def positive(value):
@@ -339,16 +1346,30 @@ def reclaim_incremental(repo):
 
 def static_guards(repo, base, head, audits):
     """Reuse completed derivation audits; narrowing a plan must not skip guards."""
+    guards = RECEIPT["static_guards"] = {}
     commands = {
+        # The lander's first guard (`git diff --check <target> <candidate>`); a stack that is
+        # green here must not be refused for whitespace before any test runs (#3060).
+        "whitespace": ["git", "diff", "--check", base, head],
         "shard_gates": [sys.executable, "scripts/check-rsid-test-shards.py", "--require-gates"],
         "released_migrations": [sys.executable, "tools/check-released-migrations.py", base, head],
+        # A starter JSON change moves its digest fixture and SHIPPED_BEFORE together (#3070).
+        "starter_pins": [sys.executable, "tools/check_starter_pins.py", base, head],
         "identity_assertions": [sys.executable, "tools/check_identity_assertions.py"],
+        "portable_shell": [sys.executable, "tools/check_portable_shell.py", "--base", base],
     }
     failed = False
     for name, command in commands.items():
         audit = audits.get(name, {})
         if audit.get("verdict") in ("ok", "fail"):
             status, detail = audit["verdict"], audit.get("detail", "")
+        elif command[0] == sys.executable and not (Path(repo) / command[1]).is_file():
+            # The tool copy comes from rolling but a guard script comes from the candidate tree. A
+            # guard newer than the candidate's merge base is absent there, and failing it would end
+            # the run before any test with no evidence (#3126). The merge queue runs every guard on
+            # the merged tree, which does carry it.
+            status = "skipped"
+            detail = f"{command[1]} not in candidate; merge queue runs it on the merged tree"
         else:
             print("static guard: " + command_text(command), flush=True)
             try:
@@ -357,9 +1378,253 @@ def static_guards(repo, base, head, audits):
                 detail = (result.stdout + result.stderr).strip()
             except OSError as error:
                 status, detail = "fail", str(error)
+        guards[name] = {"status": status, "detail": detail}
         print(f"scoped-test: static guard {name}={status}" + (f": {detail}" if detail else ""), flush=True)
-        failed |= status != "ok"
+        failed |= status not in ("ok", "skipped")
     return failed
+
+
+# The compiler-warning gate: a crate with a checked-in baseline may not gain warnings (#1897).
+WARNING_BASELINE = "tools/warning-baseline.json"
+WARNING_NOISE = re.compile(r"(?:\d+ warnings? emitted|aborting due to .*)")
+WARNING_SUPPRESSION = re.compile(
+    r"(?:^|\s)(?:-A|--allow)[\s=]?(?:warnings|unused[a-z_]*|dead_code)(?=\s|$)|(?:^|\s)--cap-lints\b")
+WARNING_LIST_CAP = 20
+
+
+def warning_package_name(package_id):
+    """The Cargo package name in a package id, or None: `path+file:///x/crates/NAME#VERSION`,
+    `path+file:///x/crates/DIR#NAME@VERSION` and the old `NAME VERSION (SOURCE)` forms."""
+    text = str(package_id or "")
+    if "#" in text:
+        source, _, spec = text.rpartition("#")
+        name = spec.partition("@")[0]
+        if name and not name[0].isdigit():
+            return name
+        return source.rstrip("/").rsplit("/", 1)[-1] or None
+    return text.split(" ", 1)[0] or None
+
+
+def warning_suppression(env):
+    """Why this build cannot show every warning (flags that allow them), else None."""
+    flags = " ".join(str(env.get(name, "")).replace("\x1f", " ")
+                     for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS"))
+    hit = WARNING_SUPPRESSION.search(flags)
+    return f"compiler flags suppress warnings ({hit.group(0).strip()})" if hit else None
+
+
+class WarningCollector:
+    """Compiler warnings of one supervised build, from the JSON diagnostics Cargo already streams.
+
+    A warning is attributed to its Cargo package (`package_id`) and keyed by file, lint code and
+    message, never by line: a position only tells two reports of the same warning apart, so the
+    lib and lib-test units that both report one warning count it once. `measured` names, per
+    package, the units Cargo built (artifacts), so a package this run did not build is never
+    read as clean. Anything that makes the diagnostics untrustworthy lands in `degraded`."""
+
+    def __init__(self, root, env=None):
+        self.root = str(root).replace("\\", "/").rstrip("/") + "/"
+        self.measured, self.positions, self.unattributed, self.degraded = {}, {}, 0, []
+        reason = warning_suppression(os.environ if env is None else env)
+        if reason:
+            self.degraded.append(reason)
+
+    def artifact(self, message):
+        package = warning_package_name(message.get("package_id"))
+        kinds = (message.get("target") or {}).get("kind") or ["?"]
+        label = str(kinds[0]) + (" test" if (message.get("profile") or {}).get("test") else "")
+        if package:
+            self.measured.setdefault(package, set()).add(label)
+
+    def diagnostic(self, message):
+        detail = message.get("message") or {}
+        text = str(detail.get("message", ""))
+        if detail.get("level") != "warning" or WARNING_NOISE.fullmatch(text):
+            return
+        package = warning_package_name(message.get("package_id"))
+        if not package:
+            self.unattributed += 1
+            return
+        spans = detail.get("spans") or []
+        span = next((item for item in spans if item.get("is_primary")), spans[0] if spans else {})
+        name = str(span.get("file_name", "")).replace("\\", "/")
+        name = name[len(self.root):] if name.startswith(self.root) else name
+        code = (detail.get("code") or {}).get("code") or ""
+        position = f"{span.get('line_start', 0)}:{span.get('column_start', 0)}"
+        self.positions.setdefault(package, {}).setdefault(f"{name}|{code}|{text}", set()).add(position)
+
+    def text(self, line):
+        """A line that is not JSON. Cargo's own notes are fine; a rendered rustc location
+        (` --> file:line:col`) is a diagnostic that bypassed the JSON stream, so it is not evidence."""
+        if re.match(r"\s*--> \S+:\d+:\d+", line) and "rendered diagnostic" not in " ".join(self.degraded):
+            self.degraded.append("a rendered diagnostic arrived outside the JSON stream")
+
+    def payload(self):
+        return {"measured": {name: sorted(labels) for name, labels in sorted(self.measured.items())},
+                "warnings": {name: {key: sorted(places) for key, places in sorted(keys.items())}
+                             for name, keys in sorted(self.positions.items())},
+                "unattributed": self.unattributed, "degraded": self.degraded}
+
+
+def merge_warning_payloads(payloads):
+    """One view over every package build of a run: positions and configs are unions, so a unit
+    several `cargo test -p` builds report again is counted once."""
+    merged = {"measured": {}, "warnings": {}, "unattributed": 0, "degraded": []}
+    for payload in payloads:
+        for name, labels in (payload.get("measured") or {}).items():
+            merged["measured"][name] = sorted(set(merged["measured"].get(name, [])) | set(labels))
+        for name, keys in (payload.get("warnings") or {}).items():
+            into = merged["warnings"].setdefault(name, {})
+            for key, places in keys.items():
+                into[key] = sorted(set(into.get(key, [])) | set(places))
+        merged["unattributed"] += int(payload.get("unattributed") or 0)
+        merged["degraded"] += [item for item in payload.get("degraded") or [] if item not in merged["degraded"]]
+    return merged
+
+
+def read_warning_baseline(text):
+    """Parse the checked-in baseline; a ValueError names the defect (a broken file never disables the gate)."""
+    document = json.loads(text)
+    packages = document.get("packages") if isinstance(document, dict) else None
+    if not isinstance(packages, dict) or document.get("schema") != 1:
+        raise ValueError('expected {"schema": 1, "packages": {NAME: {"configs": [...], "warnings": {KEY: COUNT}}}}')
+    for name, entry in packages.items():
+        warnings = entry.get("warnings") if isinstance(entry, dict) else None
+        configs = entry.get("configs") if isinstance(entry, dict) else None
+        if (not isinstance(warnings, dict) or not isinstance(configs, list) or not configs or
+                any(not isinstance(key, str) or isinstance(count, bool) or not isinstance(count, int) or count < 1
+                    for key, count in warnings.items())):
+            raise ValueError(f"package {name}: needs a non-empty `configs` list and `warnings` counts of 1 or more")
+    return document
+
+
+def base_warning_baseline(repo, base, run=subprocess.run):
+    """The baseline at `base`: (document, state), state present | absent | unresolved | unreadable."""
+    def git(*args):
+        return run(["git", "-C", str(repo), *args], text=True, capture_output=True)
+    try:
+        if git("rev-parse", "--verify", "--quiet", base + "^{commit}").returncode:
+            return None, "unresolved"
+        shown = git("show", f"{base}:{WARNING_BASELINE}")
+    except OSError:
+        return None, "unresolved"
+    if shown.returncode:
+        return None, "absent"
+    try:
+        return read_warning_baseline(shown.stdout), "present"
+    except ValueError:
+        return None, "unreadable"
+
+
+def evaluate_warning_gate(observed, candidate, base, base_state):
+    """The verdict for one run. Pure: observed payload, the candidate's baseline, the base's (or None).
+
+    ok               every measured baselined package is at or under its baseline
+    new_warnings     a measured package has a warning key above its baseline count
+    baseline_raised  the candidate's baseline is above the base's, or drops a package the base has
+    unavailable      the diagnostics cannot be trusted (suppressed, unparsed or unattributed)
+    not_measured     no baselined package was built in this run (nothing to compare)
+    """
+    packages, refusals = {}, []
+    for name, entry in sorted(candidate["packages"].items()):
+        before = ((base or {}).get("packages") or {}).get(name)
+        if before is not None:
+            for key, count in sorted(entry["warnings"].items()):
+                if count > before["warnings"].get(key, 0):
+                    refusals.append(f"{name}: baseline raised for {key!r}: "
+                                    f"{before['warnings'].get(key, 0)} -> {count}")
+    if base is not None:
+        for name in sorted(set(base["packages"]) - set(candidate["packages"])):
+            refusals.append(f"{name}: its baseline was removed; lower the counts instead")
+    unavailable = list(observed.get("degraded") or [])
+    if observed.get("unattributed"):
+        unavailable.append(f"{observed['unattributed']} warning(s) carried no package id")
+    for name, entry in sorted(candidate["packages"].items()):
+        configs = observed["measured"].get(name)
+        if configs is None:
+            packages[name] = {"status": "not_measured", "baseline": sum(entry["warnings"].values())}
+            continue
+        counts = {key: len(places) for key, places in (observed["warnings"].get(name) or {}).items()}
+        new = [(key, counts[key] - entry["warnings"].get(key, 0)) for key in sorted(counts)
+               if counts[key] > entry["warnings"].get(key, 0)]
+        complete = set(entry["configs"]) <= set(configs)
+        fixed = ([(key, count - counts.get(key, 0)) for key, count in sorted(entry["warnings"].items())
+                  if counts.get(key, 0) < count] if complete else [])
+        packages[name] = {"status": "new_warnings" if new else "ok", "observed": sum(counts.values()),
+                          "baseline": sum(entry["warnings"].values()), "configs": configs, "complete": complete,
+                          "new": [{"key": key, "count": count} for key, count in new[:WARNING_LIST_CAP]],
+                          "new_total": sum(count for _, count in new),
+                          "fixed": [{"key": key, "count": count} for key, count in fixed[:WARNING_LIST_CAP]],
+                          "fixed_total": sum(count for _, count in fixed)}
+    measured = [item for item in packages.values() if item["status"] != "not_measured"]
+    if refusals:
+        status = "baseline_raised"
+    elif measured and unavailable:
+        status = "unavailable"
+    elif any(item["status"] == "new_warnings" for item in measured):
+        status = "new_warnings"
+    else:
+        status = "ok" if measured else "not_measured"
+    summary = {"status": status, "packages": packages, "base_baseline": base_state}
+    if refusals:
+        summary["refusals"] = refusals
+    if unavailable and measured:
+        summary["unavailable"] = unavailable
+    return summary
+
+
+def warning_gate(repo, base, payloads, run=subprocess.run):
+    """Judge a run's diagnostics against `tools/warning-baseline.json`, or None when the repository has none."""
+    path = Path(repo) / WARNING_BASELINE
+    if not path.is_file():
+        return None
+    try:
+        candidate = read_warning_baseline(path.read_text())
+    except (OSError, ValueError) as error:
+        return {"status": "unavailable", "unavailable": [f"{WARNING_BASELINE} is unreadable: {error}"],
+                "packages": {}}
+    document, state = base_warning_baseline(repo, base, run)
+    return evaluate_warning_gate(merge_warning_payloads(payloads), candidate, document, state)
+
+
+def report_warning_gate(gate):
+    """Print the verdict; True when it fails the run."""
+    for name, item in sorted(gate["packages"].items()):
+        if item["status"] == "not_measured":
+            print(f"scoped-test: warnings {name}: not built in this run (baseline {item['baseline']})", flush=True)
+            continue
+        print(f"scoped-test: warnings {name}: {item['observed']} observed, baseline {item['baseline']}, "
+              f"{item['new_total']} new (units: {', '.join(item['configs'])})", flush=True)
+        for entry in item["new"]:
+            print(f"scoped-test: new warning x{entry['count']}: {entry['key']}", flush=True)
+        if item["fixed"]:
+            print(f"scoped-test: warnings {name}: {item['fixed_total']} baseline warning(s) are gone; "
+                  f"lower {WARNING_BASELINE}", flush=True)
+        elif not item["complete"]:
+            print(f"scoped-test: warnings {name}: the baseline names units this run did not build; "
+                  "no baseline warning is reported as fixed", flush=True)
+    for text in gate.get("refusals", []):
+        print(f"scoped-test: warning_baseline_raised: {text}", flush=True)
+    for text in gate.get("unavailable", []):
+        print(f"scoped-test: warning_evidence_unavailable: {text}", flush=True)
+    failed = gate["status"] in ("new_warnings", "baseline_raised", "unavailable")
+    if failed:
+        print(f"scoped-test: warning_gate_failed: {gate['status']}", flush=True)
+    return failed
+
+
+def baseline_from_log(lines):
+    """A `packages` document for every package a job log measured (`SCOPED_WARNINGS` lines), to seed
+    or lower `tools/warning-baseline.json`: configs are the units seen, counts the distinct warnings."""
+    payloads = []
+    for line in lines:
+        if line.startswith("SCOPED_WARNINGS "):
+            payloads.append(json.loads(line.split(" ", 1)[1]))
+    merged = merge_warning_payloads(payloads)
+    return {"schema": 1, "packages": {
+        name: {"configs": configs,
+               "warnings": {key: len(places) for key, places in sorted((merged["warnings"].get(name) or {}).items())}}
+        for name, configs in sorted(merged["measured"].items())}}
 
 
 # The typed receipt the daemon's scoped-test job reads from the log tail (#1638).
@@ -367,16 +1632,895 @@ RECEIPT = {"schema": 1, "emit": False, "packages": []}
 RECEIPT_PREFIX = "SCOPED_TEST_RECEIPT "
 
 
+def planning_compile(explicit, dry_run):
+    """The truthful compile label of a plan (#2564): planning never starts cargo; the build and test
+    compile happen later, inside this admitted job, and the receipt says whether they did."""
+    return {"planning": {"source": "explicit_filters" if explicit else "filters_only", "cargo_invoked": False},
+            "execution": "skipped_dry_run" if dry_run else "pending", "packages": {}}
+
+
+def package_compile_status(phases):
+    """How one package's supervised build went, from its SCOPED_PHASE lines."""
+    if "build_failed" in phases:
+        return "failed"
+    if phases.intersection({"listed", "list_failed", "test_failed"}):
+        return "executed"
+    return "incomplete"
+
+
+def slow_tier_plan(checker, repo, head, derived, explicit):
+    """(receipt entry, excluded test names) for the slow tier of the released-migration tests (#2270).
+
+    Explicit filters run exactly what they name. A derived plan excludes the tier unless
+    check-touched-shards (the one place that reads the diff) decided `full`: a trigger path or a
+    line of a slow test's own source changed, no config, or an unreadable decision."""
+    decision = {"mode": "full", "reason": "explicit_filters"} if explicit else dict(
+        derived.get("slow_tier") or {"mode": "full", "reason": "no_decision"})
+    entry = {"mode": decision.get("mode", "full"), "reason": decision.get("reason"), "skipped_tests": 0,
+             "package": None}
+    for key in ("path", "line"):
+        if key in decision:
+            entry[key] = decision[key]
+    if entry["mode"] != "excluded":
+        return entry, []
+    try:
+        config = checker["load_slow_tier"](repo, head)
+    except (OSError, ValueError, KeyError) as error:
+        entry.update(mode="full", reason=f"config_unreadable: {error}")
+        return entry, []
+    if config is None:
+        entry.update(mode="full", reason="no_slow_tier_config")
+        return entry, []
+    entry.update(package=config["package"], tests=len(config["tests"]))
+    return entry, sorted(config["tests"])
+
+
+def slow_tier_summary(entry):
+    if entry["mode"] == "excluded":
+        return (f"slow tier excluded ({entry['reason']}): {entry.get('tests', 0)} released-migration tests are "
+                "left to the merge-queue full QA; a diff that touches a migration, the runner or such a test runs them")
+    where = f" at {entry['path']}" if entry.get("path") else ""
+    return f"slow tier runs in full ({entry['reason']}{where})"
+
+
+def direct_observer_plan(derived, shard_packages):
+    """{package: selections} of the proven direct observers of every stopped broad trace (#2588).
+
+    They are an ordering hint only and never part of `plan`: a test they name runs because a plan
+    filter selects it, so the receipt's filter counts and executed identities are those of the plan."""
+    items = [i for i in derived.get("direct_observer_filters") or () if isinstance(i, dict) and i.get("filter")]
+    if not items:
+        return {}
+    distances = {i["filter"]: int(i.get("distance") or 1) for i in items}
+    plan = selection_plan(list(distances), shard_packages)
+    for selections in plan.values():
+        for selection in selections:
+            selection["distance"] = distances[selection["filter"]]
+    summary = derived.get("direct_observers") or {}
+    RECEIPT["direct_observers"] = {"filters": len(items), "tests": summary.get("tests"),
+                                   "by_distance": summary.get("by_distance")}
+    print(f"scoped-test: direct observers of the stopped broad traces run nearest first, before the "
+          f"unranked far observers of any specificity tier: {summary.get('tests', '?')} tests, "
+          f"{len(items)} filters, by distance {summary.get('by_distance')}", flush=True)
+    return plan
+
+
+def note_broad_observers(derived):
+    """Record a broad observer fallback in the receipt instead of refusing (#2105).
+
+    check-touched-shards keeps a module filter when the observer trace is too wide to name
+    (more than 150 functions or 24 tests) and says so in `broad_filters`. The plan then runs
+    as a bounded targeted subset; the uncertainty stays visible for the manager.
+    """
+    items = [item for item in derived.get("broad_filters") or [] if isinstance(item, dict)]
+    if not (derived.get("broad") or items):
+        return
+    selections = distinct_expressions(items)
+    RECEIPT.update(uncertain="broad_observers", broad_filter_count=len(selections),
+                   broad_filter_entries=len(items), broad_tests=sum(selections.values()),
+                   broad_filters=[{key: item[key] for key in ("filter", "tests", "reason", "direct_tests", "trace_layers",
+                                                              "trace_stopped", "hubs") if key in item}
+                                  for item in items])
+    print(f"scoped-test: uncertain: broad_observers ({len(selections)} filters, "
+          f"{RECEIPT['broad_tests']} tests); the bounded subset below is not the whole observer "
+          "set, the merge-queue gate and the full-library QA cover the rest", flush=True)
+
+
+DEFERRED_ROUTES = ("merge_queue_gate", "pinned_full_qa")
+
+
+def distinct_expressions(entries):
+    """{filter expression: its tests}: one selection per expression, whatever shard labels carry it.
+
+    A shard label only routes a filter (#1698): the same expression under two labels selects the
+    same tests, so the derivation's per-label count (`/^store::/` under `other-01` and `store-01`,
+    2189 each) is one selection counted twice. Only an identical expression is merged; a different
+    expression, however similar its count, stays its own entry."""
+    expressions = {}
+    for item in entries:
+        expression = str(item.get("filter", "")).partition(":test(")[2]
+        expressions[expression] = max(expressions.get(expression, 0), int(item.get("tests") or 0))
+    return expressions
+
+
+def scope_tests_at_most(entries):
+    """The most tests the cap-overflow module filters can select, each identity counted once.
+
+    The derivation counts a filter's tests from the source inventory: the same expression under two
+    shard labels is one selection, and an anchored `^module::` filter inside another is covered by
+    it. Other filters add up, so this is an upper bound, not the deferred count: the changed-module
+    tests and the direct observers a run keeps are still inside it."""
+    expressions = distinct_expressions(entries)
+    anchored = {re.fullmatch(r"/\^([\w:]+)::/\)", expression)[1]: expression
+                for expression in expressions if re.fullmatch(r"/\^([\w:]+)::/\)", expression)}
+    covered = {expression for module, expression in anchored.items()
+               if any(module.startswith(other + "::") for other in anchored)}
+    return sum(tests for expression, tests in expressions.items() if expression not in covered)
+
+
+def bounded_worker_selection(derived):
+    """The worker's bounded view of a derivation whose traces stopped at a cap, or None (#2592).
+
+    check-touched-shards keeps the module filter in `suggested_filters` when a trace is too wide
+    to name: that list stays the merge-queue gate's selection. A broad entry it flagged
+    `worker_bounded` (a hub, the function bound or the test bound, with every identity placed) is
+    not widened for the worker: scoped-test selects only the module's changed-module tests and the
+    proven direct observers, and records the rest as deferred to the gate and the pinned full QA.
+    A filter any unbounded broad entry (an unresolved identity, an untraceable diff) also produced
+    stays a broad worker filter. Named filters the module filter had absorbed (`merged_filters`)
+    return to the plan, so a source scanner or catalog pin is never lost with its covering filter."""
+    broad = [item for item in derived.get("broad_filters") or () if isinstance(item, dict) and item.get("filter")]
+    unbounded = {item["filter"] for item in broad if not item.get("worker_bounded")}
+    bounded = {item["filter"] for item in broad if item.get("worker_bounded")} - unbounded
+    suggested = list(derived.get("suggested_filters") or ())
+    planned = [value for value in suggested if value in bounded]
+    if not planned:
+        return None
+    covered, restored = set(planned), []
+    merged = [item for item in derived.get("merged_filters") or () if isinstance(item, dict)]
+    settled = False
+    while not settled:
+        settled = True
+        for item in merged:
+            value, by = item.get("filter"), item.get("covered_by")
+            if not value or by not in covered or value in covered or value in restored:
+                continue
+            settled = False
+            if value in bounded or str(item.get("reason", "")).startswith("identical expression"):
+                covered.add(value)
+            else:
+                restored.append(value)
+    entries = [item for item in broad if item.get("filter") in bounded]
+    stays = sorted({value for value in unbounded if value in suggested})
+    return {"filters": list(dict.fromkeys([*[v for v in suggested if v not in bounded], *restored, *planned])),
+            "bounded": planned, "restored": restored, "entries": entries, "broad_filters_left": stays}
+
+
+def deferred_record(bounded, head, direct):
+    """The receipt's `deferred` block before any test ran: what is deferred, why and where it is proven."""
+    entries = bounded["entries"]
+    stops = sorted({str(item.get("stop")) for item in entries})
+    return {
+        "policy": "bounded_worker_selection",
+        "reason": "the observer trace stopped at a cap (" + ", ".join(stops) + "): the worker runs the changed "
+                  "modules' tests and the proven direct observers nearest first and does not widen to the module filters",
+        "filters": [{key: item[key] for key in ("filter", "tests", "stop", "reason", "path", "direct_tests", "hubs")
+                     if key in item} for item in entries],
+        "bounded_filters": list(bounded["bounded"]),
+        "restored_filters": list(bounded["restored"]),
+        "scope_tests_at_most": scope_tests_at_most(entries),
+        "scope_basis": "derived source inventory, before the kept changed-module and direct-observer tests are subtracted",
+        "direct_observers": dict(direct or {}),
+        "tests": None,
+        "tests_basis": "pending: counted from the package test listings when the run lists them",
+        "routes": list(DEFERRED_ROUTES),
+        "candidate": head,
+        "status": "pending",
+        "status_basis": "deferred coverage is not passed, run or fully verified here: the merge-queue gate runs "
+                        "suggested_filters, the full-library QA runs the whole candidate once it is landed",
+    }
+
+
+def record_deferred(coverage):
+    """Fold the executed listing counts into the deferred block (identities, never a pass)."""
+    deferred = RECEIPT.get("deferred")
+    if not deferred:
+        return
+    unlisted = coverage["unlisted_packages"]
+    deferred.update(tests=coverage["deferred_tests"],
+                    tests_basis=("listed test identities no plan filter, changed-module rank or direct-observer rank kept; "
+                                 + ("incomplete: " + ", ".join(unlisted) + " never listed" if unlisted
+                                    else "every selected package listed")),
+                    bounded_coverage=coverage["bounded"][:20], bounded_coverage_total=len(coverage["bounded"]))
+    RECEIPT.update(filters_bounded=coverage["bounded"][:20], filters_bounded_total=len(coverage["bounded"]),
+                   deferred_tests=coverage["deferred_tests"])
+
+
+def with_direct_observers(plan, direct_plan):
+    """Select the proven direct observers in a bounded plan, in whatever package and binary they sit.
+
+    Ordinarily the direct-observer hints only order tests the plan already selects. A bounded plan
+    no longer holds the module filter that selected most of them, and some sit outside every plan
+    filter (a scheduler or satellite test that calls the changed function), so each one is selected
+    itself and built with its package. These selections are not filters of the plan: they have no
+    coverage entry and no required match, and the executed identities count them (#2592)."""
+    for package, selections in direct_plan.items():
+        plan.setdefault(package, []).extend({**selection, "priority": False, "direct_only": True}
+                                            for selection in selections)
+
+
+def announce_bounded_plan(bounded, plan, head, derived, direct_plan):
+    """Mark the cap-overflow filters of `plan` bounded and publish the deferred block (#2592)."""
+    marked = set(bounded["bounded"])
+    for selections in plan.values():
+        for selection in selections:
+            if selection["filter"] in marked:
+                selection["bounded"] = True
+    with_direct_observers(plan, direct_plan)
+    deferred = deferred_record(bounded, head, derived.get("direct_observers"))
+    RECEIPT.update(worker_policy="bounded_deferred", deferred=deferred,
+                   worker_broad_filters=len(bounded["broad_filters_left"]))
+    print(f"scoped-test: worker policy: {len(marked)} cap-overflow module filters "
+          f"(stopped at {', '.join(sorted({str(i.get('stop')) for i in bounded['entries']}))}) are NOT widened; "
+          f"the worker selects their changed-module tests and the {deferred['direct_observers'].get('tests', 0)} proven "
+          f"direct observers nearest first, {len(bounded['restored'])} absorbed named filters return to the plan, and "
+          f"{len(bounded['broad_filters_left'])} broad worker filters remain", flush=True)
+    print(f"scoped-test: deferred (status {deferred['status']}, not run, not passed): up to "
+          f"{deferred['scope_tests_at_most']} tests of {len(deferred['filters'])} derived module filters minus the kept "
+          f"ones; routed to the {' and the '.join(r.replace('_', ' ') for r in deferred['routes'])} of candidate "
+          f"{str(head)[:12]}; the exact deferred count is listed when the run lists the tests", flush=True)
+
+
+def derive_failure_reasons(derived, code):
+    """Why check-touched-shards exited non-zero, from its own receipt, so a red is never silent."""
+    reasons = []
+    if derived.get("merge_clean") is False:
+        reasons.append("candidate does not merge cleanly with the base: merge origin/rolling and retry")
+    migrations = derived.get("migrations") or {}
+    if migrations.get("numbering_conflict"):
+        reasons.append("new migration numbering conflicts with the base head")
+    if migrations.get("stray_pre_split"):
+        reasons.append("stray pre-split migration file")
+    reasons += [f"audit {name} failed: {audit.get('detail')}" for name, audit in
+                sorted((derived.get("audits") or {}).items()) if audit.get("verdict") == "fail"]
+    runs = derived.get("shards") or {}
+    if runs.get("compiled_failed"):
+        reasons.append("shard compile failed: " + ", ".join(runs["compiled_failed"]))
+    return reasons or [f"check-touched-shards exited {code}"]
+
+
+def tool_copy():
+    """Which copy of this script ran (#1938): path, git blob SHA and where it came from.
+
+    The daemon runs the origin/rolling tip's copy (`rolling`, with its rev) unless the
+    candidate edits the tool (`candidate`); a manual run or a fallback is `worktree`.
+    """
+    data = SCRIPT.read_bytes()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    copy = {"path": str(SCRIPT), "blob": blob,
+            "source": os.environ.get("RSI_SCOPED_TEST_TOOL_SOURCE") or "worktree",
+            "rev": os.environ.get("RSI_SCOPED_TEST_TOOL_REV") or None}
+    files = tool_files_beside_script(os.environ.get("RSI_SCOPED_TEST_TOOL_FILES"))
+    if files is not None:
+        copy["files"] = files
+    return copy
+
+
+def tool_files_beside_script(names):
+    """The helpers the daemon named (comma-separated file names under scripts/), each with its
+    git blob SHA as found beside this script, or `null` when the file is absent there.
+
+    The daemon derives the list from what the tool scripts load beside themselves, so a helper
+    a candidate adds shows up in the receipt by name; a missing one is `null`, never skipped
+    (hub #3024). `None` when the daemon named no list (a manual run or an older daemon).
+    """
+    if not names:
+        return None
+    files = {}
+    for name in sorted({item.strip() for item in names.split(",") if item.strip()}):
+        path = SCRIPT.parent / name
+        if "/" in name or not path.is_file():
+            files[name] = None
+            continue
+        data = path.read_bytes()
+        files[name] = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    return files
+
+
+MERGE_CONFLICT_PATH_LIMIT = 32
+
+
+def merge_onto_rolling(repo, head, rolling="origin/rolling"):
+    """Informational trial merge of `head` onto the already-resolved `rolling` ref (fetch-free).
+
+    Returns the receipt fields `merges_cleanly_onto_rolling` (true/false/null), `conflict_paths`
+    (first 32, sorted) and, only when null, `merge_check_reason`. Never raises and never
+    changes the run's verdict: a green run on a commit that no longer merges stays green."""
+    unknown = {"merges_cleanly_onto_rolling": None, "conflict_paths": []}
+    try:
+        def git(*a):
+            return subprocess.run(["git", "-C", str(repo), *a], text=True, capture_output=True, timeout=120)
+        for ref in (rolling, head):
+            if git("rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode:
+                return {**unknown, "merge_check_reason": f"{ref} does not resolve to a commit"}
+        proc = git("merge-tree", "--write-tree", "--name-only", "--no-messages", rolling, head)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {**unknown, "merge_check_reason": f"git merge-tree could not run: {error}"}
+    if proc.returncode == 0:
+        return {"merges_cleanly_onto_rolling": True, "conflict_paths": []}
+    if proc.returncode != 1:
+        detail = (proc.stderr.strip().splitlines() or ["unknown error"])[0]
+        return {**unknown, "merge_check_reason": f"git merge-tree exited {proc.returncode}: {detail}"[:200]}
+    # Output: the merged tree id, then the conflicted paths, a blank line and (without --no-messages) messages.
+    lines = proc.stdout.splitlines()[1:]
+    paths = sorted(set(lines[:lines.index("")] if "" in lines else lines))
+    return {"merges_cleanly_onto_rolling": False, "conflict_paths": paths[:MERGE_CONFLICT_PATH_LIMIT],
+            "conflict_paths_total": len(paths)}
+
+
+def record_merge_onto_rolling():
+    """Fill the receipt's trial-merge fields at the end of a run that resolved a candidate head."""
+    head, repo = RECEIPT.get("head"), RECEIPT.get("candidate_repo")
+    RECEIPT.pop("candidate_repo", None)
+    if not head or not repo or RECEIPT.get("dry_run"):
+        return
+    RECEIPT.update(merge_onto_rolling(repo, head))
+
+
 def emit_receipt(exit_code):
     """Print the one-line JSON receipt last, whatever way the run ended."""
     if not RECEIPT["emit"]:
         return
-    receipt = {k: v for k, v in RECEIPT.items() if k != "emit"}
+    receipt = {k: v for k, v in RECEIPT.items() if k not in ("emit", "candidate_repo")}
     receipt.update(exit_code=exit_code, ok=exit_code == 0)
     print(RECEIPT_PREFIX + json.dumps(receipt, separators=(",", ":")), flush=True)
 
 
+def snapshot_package(entry):
+    """Keep the latest package progress in receipts that survive interruption."""
+    packages = [item for item in RECEIPT["packages"] if item.get("package") != entry["package"]]
+    packages.append(entry)
+    RECEIPT["packages"] = packages
+    emit_receipt(1)
+
+
+def baseline_target_dir(repo, log_dir):
+    """A Cargo target the baseline comparison owns, never the candidate's (#1898).
+
+    Cargo fingerprints key on the workspace path and package id, so one target
+    reused across the candidate and a base checkout leaves dependency artifacts
+    built from the other revision's source (a library with a field the candidate
+    fixtures lack). Keep the baseline under the assigned target tree (#1963),
+    with its own fingerprints and dependencies. A warm-pool seed can hard-link
+    into it, and it is removed when the comparison settles.
+    """
+    candidate = Path(os.environ.get("CARGO_TARGET_DIR", Path(repo) / "target"))
+    if not candidate.is_absolute():
+        candidate = Path(repo) / candidate
+    # Also reclaim abandoned sibling targets from the older layout (#1934).
+    sweep_stale_baseline_targets(candidate.parent, f"{candidate.name}-baseline-")
+    parent = candidate / "scoped-baselines"
+    parent.mkdir(parents=True, exist_ok=True)
+    sweep_stale_baseline_targets(parent, "run-")
+    return Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+
+
+# A run removes its baseline target when it settles; a killed or timed-out run
+# cannot, so the next one sweeps the leftovers beyond any live run's budget.
+STALE_BASELINE_SECONDS = 6 * 3600
+
+
+def sweep_stale_baseline_targets(parent, prefix, max_age=STALE_BASELINE_SECONDS):
+    """Remove abandoned baseline targets so disk use stays bounded (#1934)."""
+    now = time.time()
+    for path in Path(parent).glob(prefix + "*"):
+        try:
+            if path.is_dir() and not path.is_symlink() and now - path.stat().st_mtime > max_age:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def seed_baseline_target(worktree, target, log_dir):
+    """Best effort: start the baseline target from the warm pool, never fail on it."""
+    pool = SCRIPT.parent / "target-pool"
+    if not pool.is_file():
+        return
+    try:
+        seeded = subprocess.run([sys.executable, str(pool), "seed", "--sandbox", str(worktree),
+                                 "--target", str(target)], cwd=worktree, text=True,
+                                capture_output=True, timeout=300)
+        detail = (seeded.stdout + seeded.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        detail = f"{type(error).__name__}: {error}"
+    (Path(log_dir) / "baseline-seed.log").write_text(detail + "\n")
+
+
+def failure_records(candidate_failures):
+    return [{"package": package, "kind": kind, "target": target, "test": test}
+            for package, entries in sorted(candidate_failures.items())
+            for kind, target, test in sorted({(x["kind"], x["target"], x["test"]) for x in entries})]
+
+
+def query_failure_records(repo, test_id, timeout):
+    """Look up active records by exact name; a lookup error never means no record exists.
+
+    This is annotation only: a name record does not prove this run matched its signature,
+    and neither a record nor its absence establishes that a test failed on the base.
+    """
+    try:
+        if not os.environ.get("RSI_SESSION_TOKEN"):
+            # Durable jobs intentionally carry no agent authority. Use the shared
+            # classifier's exported snapshot there, as the rolling QA tools do.
+            binary = os.environ.get("RSI_KNOWN_FAILURE_BIN") or shutil.which("rsi-known-failure")
+            if not binary:
+                target = Path(os.environ.get("CARGO_TARGET_DIR", str(Path.home() / ".cargo/shared-target")))
+                binary = str(target / "debug/rsi-known-failure")
+            result = subprocess.run([binary, "query", test_id], cwd=repo, text=True,
+                                    capture_output=True, timeout=timeout)
+            # The CLI warns for a stale snapshot. It cannot attest to current absence.
+            if result.returncode or result.stderr.strip():
+                return {"status": "unavailable", "source": "snapshot",
+                        "reason": "known-failure snapshot missing, invalid or stale"}
+            records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+            if any(not isinstance(record, dict) or record.get("test_id") != test_id for record in records):
+                return {"status": "unavailable", "source": "snapshot",
+                        "reason": "known-failure snapshot query returned invalid records"}
+            return {"status": "recorded" if records else "unknown", "source": "snapshot", "records": records}
+        result = subprocess.run(
+            ["rsi-rpc", "AgentQueryFailureSignatures", "--params", json.dumps({"test_id": test_id})],
+            cwd=repo, text=True, capture_output=True, timeout=timeout)
+        payload = json.loads(result.stdout).get("result") if result.returncode == 0 else None
+        if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+            return {"status": "unavailable", "reason": "known-failure query did not return records"}
+        records = payload["records"]
+        # An invalid signature block can hide a record: do not claim absence in that case.
+        if not records and payload.get("malformed_issues"):
+            return {"status": "unavailable", "reason": "known-failure query found malformed Issues"}
+        return {"status": "recorded" if records else "unknown", "records": records}
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return {"status": "unavailable", "reason": "known-failure query unavailable"}
+
+
+def annotate_baseline_reds(repo, reds):
+    """Keep observed base failures and known-failure record availability separate (#397)."""
+    annotations, without_record, cache = [], [], {}
+    deadline = time.monotonic() + 10
+    for failure in reds:
+        name = failure["test"]
+        if name not in cache:
+            left = deadline - time.monotonic()
+            cache[name] = (query_failure_records(repo, name, min(5, left)) if left > 0 else
+                           {"status": "unavailable", "reason": "known-failure lookup budget exhausted"})
+        record = cache[name]
+        annotations.append({**failure, **record})
+        if record["status"] == "unknown":
+            without_record.append(failure)
+            print(f"scoped-test: baseline red without known-failure record: {failure['package']} {name}", flush=True)
+        elif record["status"] == "unavailable":
+            print(f"scoped-test: baseline red known-failure lookup unavailable: {failure['package']} {name}", flush=True)
+    return {"baseline_failure_records": annotations, "baseline_reds_without_record": without_record}
+
+
+def compare_failures_with_base(repo, base, packages, log_dir, seconds, cpu_quota, linux, cargo, tmpfs=None):
+    """Rerun only candidate failures on the base, in a detached worktree."""
+    failures = {package: names for package, names in packages.items() if names}
+    if not failures:
+        return {"status": "not_needed", "base": base, "baseline_reds": []}
+    if seconds <= 0:
+        return {"status": "incomplete", "base": base, "detail": "no comparison budget remained",
+                "baseline_reds": []}
+    root = Path(repo)
+    worktree = Path(log_dir) / "baseline-worktree"
+    added = subprocess.run(["git", "worktree", "add", "--detach", "--quiet", str(worktree), base],
+                          cwd=root, text=True, capture_output=True)
+    if added.returncode:
+        detail = (added.stdout + added.stderr).strip()
+        print(f"scoped-test: base comparison unavailable: {detail}", flush=True)
+        return {"status": "unavailable", "base": base, "detail": detail, "baseline_reds": []}
+    if not worktree.is_dir():
+        detail = "git worktree did not create the requested directory"
+        print(f"scoped-test: base comparison unavailable: {detail}", flush=True)
+        return {"status": "unavailable", "base": base, "detail": detail, "baseline_reds": []}
+    baseline_reds, checked = [], []
+    baseline_target = baseline_target_dir(root, log_dir)
+    build_env = {"CARGO_TARGET_DIR": str(baseline_target)}
+    print(f"scoped-test: base comparison builds in its own target {baseline_target}", flush=True)
+    try:
+        seed_baseline_target(worktree, baseline_target, log_dir)
+        for index, (package, failed_tests) in enumerate(sorted(failures.items())):
+            if index and seconds <= 0:
+                break
+            selections = []
+            for kind, target in sorted({(entry["kind"], entry["target"]) for entry in failed_tests}):
+                selections.append({"filter": f"baseline exact failures {kind}:{target}", "kind": kind,
+                                   "target": target if kind != "lib" else "", "substring": "",
+                                   "exact": None, "regex": None})
+            names = sorted({entry["test"] for entry in failed_tests})
+            plan = {"repo": str(worktree), "package": package, "selections": selections,
+                    "exact_tests": names, "test_shards": max(1, int(cpu_quota // 100)),
+                    "build": build_command(package, selections, cargo)}
+            if tmpfs:
+                plan["tmpfs"] = tmpfs
+            plan_path = Path(log_dir) / f"baseline-{package}.json"
+            plan_path.write_text(json.dumps(plan) + "\n")
+            command, unit = bounded_command(plan, plan_path, max(1, seconds), cpu_quota, linux,
+                                            env=build_env)
+            started = time.monotonic()
+            output_lines = []
+            try:
+                def stop_unit():
+                    if linux and unit:
+                        subprocess.run(["systemctl", "--user", "stop", unit], check=False, timeout=30)
+
+                code = stream(command, output_lines.append, timeout=max(1, seconds),
+                              stop=stop_unit if linux else None, cwd=worktree,
+                              env={**os.environ, **build_env})
+                output = "".join(output_lines)
+                result = subprocess.CompletedProcess(command, code)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                output = "".join(output_lines)
+                output += f"\nscoped-test: base comparison {type(error).__name__}: {error}\n"
+                result = None
+            (Path(log_dir) / f"baseline-{package}.log").write_text(output)
+            expected = {(entry["kind"], entry["target"], entry["test"]) for entry in failed_tests}
+            observed = set()
+            for line in output.splitlines():
+                match = re.fullmatch(r"SCOPED_FAILURE ([^ :]+):([^ ]+) (.+)", line)
+                if match and result is not None and result.returncode != 0:
+                    identity = tuple(match.groups())
+                    if identity in expected:
+                        observed.add(identity)
+            # A nonzero exit alone is a build/harness failure, not an observed test failure.
+            # A successful run can echo failure-looking output; it is never baseline-red.
+            baseline_reds.extend({"package": package, "kind": kind, "target": target, "test": name}
+                                 for kind, target, name in sorted(observed))
+            finished = any(line.startswith(f"scoped-test: {package} executed ")
+                           for line in output.splitlines())
+            if finished and result is not None:
+                checked.extend({"package": package, **entry} for entry in failed_tests)
+            print(f"scoped-test: base {package}: " +
+                  ("baseline reds found" if any(x["package"] == package for x in baseline_reds)
+                   else "no baseline reds found" if result and result.returncode == 0
+                   else "comparison incomplete"), flush=True)
+            seconds -= time.monotonic() - started
+    finally:
+        shutil.rmtree(baseline_target, ignore_errors=True)
+        subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["git", "worktree", "prune"], cwd=root, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+        complete = len(checked) == sum(map(len, failures.values()))
+    return {"status": "complete" if complete else "incomplete", "base": base,
+            "checked": checked, "baseline_reds": baseline_reds}
+
+
+def fork_point(repo, head, base):
+    """The commit the candidate forked from `base`, or None when it is the tip itself or unknown (#2170)."""
+    def rev(*a):
+        proc = subprocess.run(["git", "-C", str(repo), *a], text=True, capture_output=True)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    mb, tip = rev("merge-base", head, base), rev("rev-parse", "--verify", base + "^{commit}")
+    return mb if mb and tip and mb != tip else None
+
+
+def split_stale_base_failures(repo, head, base, base_failures, comparison, log_dir, seconds,
+                              cpu_quota, linux, cargo, tmpfs=None):
+    """Failures the tip does not reproduce may be inherited from the candidate's fork point and fixed
+    on `base` since. Re-run just those at the fork point (#2170): the ones red there are not new.
+    Returns (stale_base_reds, extra) where `extra` is receipt detail."""
+    if comparison.get("status") != "complete":
+        return [], {}
+    tip_reds = {(r["package"], r["kind"], r["target"], r["test"]) for r in comparison["baseline_reds"]}
+    pending = {}
+    for package, names in base_failures.items():
+        rest = [n for n in names if (package, n["kind"], n["target"], n["test"]) not in tip_reds]
+        if rest:
+            pending[package] = rest
+    point = fork_point(repo, head, base) if pending else None
+    if not point:
+        return [], {}
+    sub = Path(log_dir) / "fork-point"
+    sub.mkdir(exist_ok=True)
+    check = compare_failures_with_base(repo, point, pending, sub, seconds, cpu_quota, linux, cargo, tmpfs)
+    stale = check.get("baseline_reds", []) if check.get("status") == "complete" else []
+    return stale, {"merge_base": point, "status": check.get("status"), "checked": check.get("checked", [])}
+
+
+def filter_coverage(plan, subsets):
+    """Per-filter coverage from the executed selected test identities each package reported (#216).
+
+    A package's SCOPED_SUBSET names, per filter, how many tests the filter selected there and how
+    many of them ran to a verdict (a failed test that ran counts as executed; the verdict is the
+    exit code, never this label). Across the packages that listed:
+      run      every selected test ran, even when the time box expired afterwards (a filter that
+               selects nothing runnable in every package that carries it is vacuously run);
+      partial  some selected tests ran and some did not;
+      not run  none ran, or no package carrying the filter listed its tests, so nothing is claimed.
+    A package that never reported (box spent, timeout, build failure) is named in
+    `unlisted_packages`; its tests are unknown, so they are neither counted nor assumed."""
+    carriers, bounded_carriers = {}, {}
+    for package, selections in plan.items():
+        for selection in selections:
+            # A cap-overflow filter is never "run": it keeps only some of its matches (#2592).
+            if selection.get("direct_only"):
+                continue
+            target = bounded_carriers if selection.get("bounded") else carriers
+            target.setdefault(selection["filter"], set()).add(package)
+    listed = {item["package"] for item in subsets if item.get("package")}
+    seen = {}
+    for item in subsets:
+        for name, counts in (item.get("filters") or {}).items():
+            total = seen.setdefault(name, [0, 0])
+            total[0] += counts[0]
+            total[1] += counts[1]
+    run, partial, not_run = [], [], []
+    for name in sorted(carriers):
+        selected, executed = seen.get(name, (0, 0))
+        if executed and executed == selected:
+            run.append(name)
+        elif executed:
+            partial.append({"filter": name, "selected": selected, "executed": executed})
+        elif not selected and carriers[name] <= listed:
+            run.append(name)
+        else:
+            not_run.append(name)
+    unlisted = sorted({package for package in plan if package not in listed})
+    kept = {}
+    for item in subsets:
+        for name, counts in (item.get("bounded") or {}).items():
+            total = kept.setdefault(name, [0, 0, 0])
+            for index, count in enumerate(counts):
+                total[index] += count
+    bounded = [{"filter": name, "kept": kept.get(name, (0, 0, 0))[0], "executed": kept.get(name, (0, 0, 0))[1],
+                "deferred": kept.get(name, (0, 0, 0))[2]} for name in sorted(bounded_carriers)]
+    return {"selected": len(carriers), "run": run, "partial": partial, "not_run": not_run,
+            "unlisted_packages": unlisted, "bounded": bounded,
+            "deferred_tests": sum(int(item.get("deferred_tests") or 0) for item in subsets)}
+
+
+def report_subset(plan, subsets, skipped_filters, dry_run):
+    """Fill the targeted-subset receipt fields and say what the merge-queue gate must still cover."""
+    if dry_run:
+        return
+    coverage = filter_coverage(plan, subsets)
+    tests = {"selected_tests": sum(item.get("selected_tests", 0) for item in subsets),
+             "run_tests": sum(item.get("run_tests", 0) for item in subsets)}
+    changed = [item.get("changed_module_tests") or [0, 0] for item in subsets]
+    direct = [item.get("direct_observer_tests") or [0, 0] for item in subsets]
+    if RECEIPT.get("direct_observers"):
+        tests.update(direct_observer_tests_selected=sum(c[0] for c in direct),
+                     direct_observer_tests_run=sum(c[1] for c in direct))
+    if RECEIPT.get("changed_modules"):
+        tests.update(changed_module_tests_selected=sum(c[0] for c in changed),
+                     changed_module_tests_run=sum(c[1] for c in changed))
+    partial, not_run = coverage["partial"], coverage["not_run"]
+    RECEIPT.update(selected_filters=coverage["selected"], run_filters=len(coverage["run"]), **tests,
+                   box_expired=bool(skipped_filters) or any(item.get("box_expired") for item in subsets),
+                   filters_partial=partial[:20], filters_partial_total=len(partial),
+                   filters_not_run=not_run[:20], filters_not_run_total=len(not_run),
+                   unlisted_packages=coverage["unlisted_packages"])
+    if coverage["bounded"]:
+        record_deferred(coverage)
+    print(f"scoped-test: targeted subset: ran {RECEIPT['run_filters']} of {coverage['selected']} filters "
+          f"completely ({len(partial)} partial, {len(not_run)} not run; "
+          f"{tests['run_tests']} of {tests['selected_tests']} listed tests)"
+          + (f"; unlisted packages: {', '.join(coverage['unlisted_packages'])}" if coverage["unlisted_packages"] else "")
+          + "; " + ("the time box ended the run and the merge-queue gate covers the rest" if partial or not_run
+                    else "the whole plan fit the time box"), flush=True)
+
+
+def desktop_lane_selected(repo, receipt_data, base, head):
+    """Whether the desktop lane runs: the derivation's own selection, else the gate's read of the diff.
+
+    Raises `DESKTOP_GATE.SelectorMissing` when the candidate lacks `scripts/desktop-test-gate.py` and its diff
+    touches it or one of the lane's inputs (#355)."""
+    derived = receipt_data.get("desktop")
+    if derived and derived.get("error"):
+        raise DESKTOP_GATE.SelectorMissing(derived["error"])
+    if derived:
+        return derived["selected"]
+    return DESKTOP_GATE.lane_selected(repo, base, head)
+
+
+def announce_execution_order(python_commands, packages, dry_run, desktop_commands=()):
+    """Say, and record in the receipt, which phases run in which order (#2647).
+
+    The order is fixed: every selected Python test file runs first, fail-fast, and Cargo starts only when
+    they all pass, so a red or unavailable Python runner is the whole result of the run. A dry run prints
+    the same selection the real run executes and starts neither phase."""
+    order = [name for name, count in (("python", len(python_commands)), ("desktop", len(desktop_commands)),
+                                      ("cargo", len(packages))) if count]
+    RECEIPT["phase_order"] = order
+    if not order:
+        return
+    python = (f"Python first ({len(python_commands)} test file(s), fail-fast: the first failure or "
+              "an unavailable runner stops the run before Cargo starts)" if python_commands else "")
+    desktop = ("the desktop lane (npm test, then cargo test in desktop/src-tauri; only timeouts stop before Cargo)"
+               if desktop_commands else "")
+    cargo = (f"Cargo second ({len(packages)} package(s): {' '.join(packages)})" if packages
+             else "no Cargo package scheduled")
+    print("scoped-test: execution order: " + ", then ".join(part for part in (python, desktop, cargo) if part)
+          + ("; this dry run executes no Python test, no desktop test and no Cargo" if dry_run else ""),
+          flush=True)
+
+
+def preview_python_test(command):
+    """Dry-run entry of one selected Python test: the receipt entry a real run would start from.
+
+    Same fields as a real run, planned instead of executed. Only the runner preflight runs (an in-process
+    module lookup for this interpreter), never the suite itself."""
+    unavailable = PYTHON_GATE.runner_status(command)
+    if unavailable:
+        RECEIPT["python"].append({**unavailable, "completed": False})
+        print(f"scoped-test: runner_unavailable runner={unavailable['runner']} executed_tests=0 "
+              f"test_file={command[-1]}: {unavailable['reason']} (a real run stops here, before Cargo)", flush=True)
+        return
+    RECEIPT["python"].append({"test_file": command[-1], "status": "planned", "completed": False,
+                              "runner": PYTHON_GATE.command_runner(command), "executed_tests": None})
+
+
+def run_python_tests(python_commands, args, log_dir, run_started, env):
+    """Run the selected Python tests; the exit code on failure, else None."""
+    for index, command in enumerate(python_commands):
+        print("python test: " + command_text(command), flush=True)
+        if args.dry_run:
+            preview_python_test(command)
+            continue
+        # 300s, not 120s: test_scoped_test.py alone takes ~80s on a loaded host and timed out the #2416 job.
+        budget = min(args.runtime_max_sec, 300)
+        if args.total_max_sec is not None:
+            budget = min(budget, args.total_max_sec - (time.monotonic() - run_started))
+        if budget <= 0:
+            print("scoped_test_timeout: total budget exhausted before Python tests", flush=True)
+            return 1
+        runner = PYTHON_GATE.command_runner(command)
+        unavailable = PYTHON_GATE.runner_status(command)
+        if unavailable:
+            # A missing runner is a typed prerequisite, never a test result: zero
+            # tests executed, no silent substitute runner, and the job is red.
+            RECEIPT["python"].append({**unavailable, "completed": False})
+            print(f"scoped-test: runner_unavailable runner={runner} executed_tests=0 "
+                  f"test_file={command[-1]}: {unavailable['reason']}", flush=True)
+            return 1
+        with (log_dir / f"python-{index}.log").open("w") as log:
+            result = {"test_file": command[-1], "status": "running", "completed": False,
+                      "runner": runner, "executed_tests": None}
+            RECEIPT["python"].append(result)
+            def emit_python(line):
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                ran = re.match(r"Ran (\d+) tests? in ", line)
+                if ran and runner == "unittest":
+                    result["executed_tests"] = int(ran.group(1))
+            try:
+                code = stream(command, emit_python, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
+            except subprocess.TimeoutExpired:
+                result["status"] = "timed out"
+                print("scoped_test_timeout: " + command_text(command), flush=True)
+                return 1
+        result.update(status="failed" if code else "passed", completed=True)
+        if not code and runner == "unittest" and not result["executed_tests"]:
+            # Exit 0 with zero executed tests (Python before 3.12 exits 0 here) is
+            # no evidence: a function-style suite that merely imports unittest.
+            result["status"] = "no_tests_executed"
+            print("scoped-test: Python suite executed 0 tests: " + command_text(command), flush=True)
+            return 1
+        if code:
+            print("scoped-test: Python test failed: " + command_text(command), flush=True)
+            return code
+    return None
+
+
+def run_desktop_lane(desktop_commands, args, log_dir, run_started, env=None):
+    """Run (or, on a dry run, preview) the selected desktop lane; the exit code on failure, else None.
+
+    One receipt entry per lane run, with the same fields either way. A missing runner (node, npm,
+    cargo, or on Linux pkg-config and webkit2gtk-4.1) is the typed `runner_unavailable` with zero
+    executed tests, the job is red, and nothing substitutes for it (hub #3001)."""
+    for index, command in enumerate(desktop_commands):
+        print("desktop lane: " + command_text(command), flush=True)
+        unavailable = DESKTOP_GATE.runner_status()
+        if unavailable:
+            RECEIPT["desktop"].append({**unavailable, "completed": False})
+            print(f"scoped-test: runner_unavailable runner={unavailable['runner']} executed_tests=0 "
+                  f"lane=desktop: {unavailable['reason']}" + (" (a real run records failure and continues to Cargo)"
+                                                              if args.dry_run else ""), flush=True)
+            if args.dry_run:
+                continue
+            return 1
+        if args.dry_run:
+            RECEIPT["desktop"].append({"lane": "desktop", "status": "planned", "completed": False,
+                                       "runner": "npm+cargo", "executed_tests": None})
+            continue
+        budget = args.runtime_max_sec
+        if args.total_max_sec is not None:
+            budget = min(budget, args.total_max_sec - (time.monotonic() - run_started))
+        if budget <= 0:
+            print("scoped_test_timeout: total budget exhausted before the desktop lane", flush=True)
+            return 1
+        result = {"lane": "desktop", "status": "running", "completed": False, "runner": "npm+cargo",
+                  "executed_tests": None}
+        RECEIPT["desktop"].append(result)
+        with (log_dir / f"desktop-{index}.log").open("w") as log:
+            def emit_desktop(line):
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                if line.startswith(DESKTOP_GATE.RESULT_MARK):
+                    try:
+                        reported = json.loads(line[len(DESKTOP_GATE.RESULT_MARK):])
+                    except ValueError:
+                        return
+                    result.update({key: reported[key] for key in
+                                   ("npm_tests", "cargo_tests", "executed_tests", "failed_step") if key in reported})
+                    result["lane_status"] = reported.get("status")
+            try:
+                code = stream(command, emit_desktop, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
+            except subprocess.TimeoutExpired:
+                result["status"] = "timed out"
+                print("scoped_test_timeout: " + command_text(command), flush=True)
+                return 1
+        result.update(completed=True, status="failed" if code else "passed")
+        if result.get("lane_status") in ("runner_unavailable", "no_tests_executed"):
+            result["status"] = result["lane_status"]
+        if not code and result.get("lane_status") != "passed":
+            # Exit 0 without the lane's own passed verdict (no result line, zero tests) is no evidence.
+            result["status"] = "no_tests_executed"
+            code = 1
+        if result.get("lane_status") == DESKTOP_GATE.TIMED_OUT:
+            print("scoped_test_timeout: " + command_text(command), flush=True)
+            return code or 1
+        if code:
+            print("scoped-test: desktop lane failed: " + command_text(command), flush=True)
+            return code
+    return None
+
+
+def integrated_base(repo, base, head, rolling="origin/rolling"):
+    """Base that excludes already-gated rolling work a launch-pin worker merged in (#2135).
+
+    A worker branched from an unlanded pin diffs against that pin, so the rolling tip it
+    was required to merge shows up as its own change. Return a synthetic commit whose tree
+    is the pin merged with the rolling commit `head` integrated; the diff from it to `head`
+    is the worker-owned delta. Any failure keeps `base`; landing gates still see the full candidate."""
+    def git(*a, **kw):
+        proc = subprocess.Popen(["git", "-C", str(repo), *a], text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, **kw)
+        out, err = proc.communicate()
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+    try:
+        if git("rev-parse", "--verify", "--quiet", rolling + "^{commit}").returncode:
+            return base
+        mb = git("merge-base", head, rolling)
+        if mb.returncode or not mb.stdout.strip():
+            return base
+        integrated = mb.stdout.strip()
+        base_sha = git("rev-parse", "--verify", base + "^{commit}").stdout.strip()
+        if not base_sha or integrated == base_sha:
+            return base
+        for a, b in ((base_sha, integrated), (integrated, base_sha)):
+            if git("merge-base", "--is-ancestor", a, b).returncode == 0:
+                return base  # pin already landed (or rolling is behind it): nothing extra to exclude
+        tree = git("merge-tree", "--write-tree", base_sha, integrated)
+        if tree.returncode:
+            return base
+        env = dict(os.environ, GIT_AUTHOR_NAME="scoped-test", GIT_AUTHOR_EMAIL="scoped-test@localhost",
+                   GIT_COMMITTER_NAME="scoped-test", GIT_COMMITTER_EMAIL="scoped-test@localhost")
+        commit = git("commit-tree", tree.stdout.split()[0], "-p", base_sha, "-p", integrated,
+                     "-m", "scoped-test integrated base", env=env)
+        return commit.stdout.strip() or base
+    except OSError:
+        return base
+
+
 def main():
+    with BuildAdmission() as admission:
+        return run(admission)
+
+
+def run(admission):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="origin/rolling")
     parser.add_argument("--head", default="HEAD")
@@ -387,38 +2531,90 @@ def main():
                         help="wall-clock cap per package, including build (default 1800)")
     parser.add_argument("--total-max-sec", type=positive, default=None,
                         help="wall-clock cap for the whole run; later packages get only the time left")
+    parser.add_argument("--slot-wait-max-sec", type=positive, default=600,
+                        help="longest to queue for a governor build slot; the wait never counts against "
+                             "--runtime-max-sec or --total-max-sec (default 600)")
+    parser.add_argument("--job-max-sec", type=positive, default=None,
+                        help="daemon job wall budget, including waits; reserve 120s for execution")
+    parser.add_argument("--filter-budget", type=int, default=FILTER_BUDGET, metavar="N",
+                        help="a plan with more than N distinct filters is a targeted subset: it runs as named, "
+                             "most specific first, inside --test-time-box-sec (receipt `plan: targeted_subset`); "
+                             f"0 keeps the precise plan unboxed (default {FILTER_BUDGET})")
+    parser.add_argument("--test-time-box-sec", type=float, default=TEST_TIME_BOX_SEC, metavar="SEC",
+                        help="test time (build excluded) a targeted subset may spend before the rest is left "
+                             f"to the merge-queue gate; 0 = no box (default {TEST_TIME_BOX_SEC})")
+    parser.add_argument("--runner", choices=("auto", "nextest", "libtest"), default="auto",
+                        help="test runner: cargo-nextest when installed (auto), else concurrent libtest "
+                             "processes; RSI_SCOPED_TEST_RUNNER overrides")
+    parser.add_argument("--cargo-slot", help=argparse.SUPPRESS)
     parser.add_argument("--cpu-quota", type=positive, default=200,
-                        help="Linux CPU quota in percent (default 200, two CPUs)")
+                        help="the job's Linux CPU quota in percent (default 200, two CPUs): the ceiling for "
+                             "load-adaptive test threads")
+    parser.add_argument("--test-shards", type=positive, default=None,
+                        help="test threads per package (nextest) or concurrent single-threaded libtest "
+                             "processes (default: clamp((host threads - 1-minute load) / 2, 2, 12), at most "
+                             "--cpu-quota in cores)")
     parser.add_argument("--reclaim-incremental", action="store_true",
                         help="remove Cargo incremental caches after a successful package before the next package")
     parser.add_argument("--tmpfs", action="store_true",
-                        help="run the selected test binaries under a private tmpfs TMPDIR, as the lander does")
+                        help="require tmpfs parity; report unavailable and skip if no tmpfs exists "
+                             "(the default uses tmpfs when available, otherwise runs normally)")
     parser.add_argument("--dry-run", action="store_true", help="derive and print the plan without cargo or systemd")
+    parser.add_argument("--warning-baseline-from", metavar="LOG",
+                        help="print the tools/warning-baseline.json packages a finished job LOG measured, then exit")
     parser.add_argument("--execute-plan", help=argparse.SUPPRESS)
+    parser.add_argument("--hold-admission", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.hold_admission:
+        return hold_admission()
+    if args.warning_baseline_from:
+        print(json.dumps(baseline_from_log(Path(args.warning_baseline_from).read_text().splitlines()),
+                         indent=2, sort_keys=True))
+        return 0
     if args.execute_plan:
         return execute_package(json.loads(Path(args.execute_plan).read_text()))
-    RECEIPT.update(emit=True, base=args.base, head=args.head, dry_run=args.dry_run)
+    RECEIPT.pop("admission", None)
+    RECEIPT.update(emit=True, base=args.base, head=args.head, dry_run=args.dry_run, python=[], desktop=[],
+                   tool=tool_copy())
+    print("scoped-test: tool copy " + json.dumps(RECEIPT["tool"], sort_keys=True), flush=True)
     repo = Path(args.repo).resolve()
     run_started = time.monotonic()
+    job_deadline = None
+    if args.job_max_sec is not None:
+        # The wrapper starts the wall clock before sandbox/artifact-lock waits.
+        elapsed = max(0, time.time() - float(os.environ.get("RSI_JOB_STARTED_AT", time.time())))
+        run_started -= elapsed
+        job_deadline = run_started + args.job_max_sec - 60
     if args.filters is None and os.environ.get("RSI_SCOPED_TEST_FILTERS"):
         args.filters = [line for line in os.environ["RSI_SCOPED_TEST_FILTERS"].split("\n") if line]
-    tmpfs = None
-    if args.tmpfs:
-        tmpfs, reason = tmpfs_parent()
-        if tmpfs is None:
-            print(f"TMPFS_PARITY unavailable: {reason}; lander tmpfs parity was not checked", flush=True)
+    tmpfs, reason = tmpfs_parent()
+    RECEIPT.update(scratch_mode="tmpfs" if tmpfs else "host", scratch_parent=tmpfs,
+                   parity_unavailable=reason or None)
+    if tmpfs is None:
+        print(f"TMPFS_PARITY unavailable: {reason}; " +
+              ("lander tmpfs parity was not checked" if args.tmpfs else
+               "running selected tests with the host TMPDIR"), flush=True)
+        if args.tmpfs:
+            RECEIPT["scratch_mode"] = "unavailable"
             return 0
+    else:
+        print(f"scoped-test: selected tests use tmpfs TMPDIR under {tmpfs}", flush=True)
     checker_path = SCRIPT.with_name("check-touched-shards")
     checker = runpy.run_path(str(checker_path))
     receipt_data, derive_code = {}, 0
+    bounded_plan = None
     if args.filters is not None:
         filters = args.filters
         head = checker["git_out"](repo, "rev-parse", "--verify", args.head + "^{commit}").strip()
         print(f"explicit filters: head={head} repo={repo}", flush=True)
     else:
-        derive = [sys.executable, str(checker_path), "--repo", str(repo), "--base", args.base,
-                  "--head", args.head, "--no-compile", "--json"]
+        derive_base = integrated_base(repo, args.base, args.head)
+        if derive_base != args.base:
+            RECEIPT["integrated_base"] = derive_base
+            print(f"scoped-test: launch pin {args.base} integrated with rolling; "
+                  f"deriving the worker-owned delta from {derive_base}", flush=True)
+        derive = [sys.executable, str(checker_path), "--repo", str(repo), "--base", derive_base,
+                  "--head", args.head, "--filters-only", "--json"]
         print("derive: " + command_text(derive), flush=True)
         receipt = subprocess.run(derive, text=True, capture_output=True)
         if receipt.stderr:
@@ -429,83 +2625,212 @@ def main():
         except ValueError:
             if not derive_code:
                 raise
+        note_broad_observers(receipt_data)
         if derive_code:
+            RECEIPT["derive_failure"] = derive_failure_reasons(receipt_data, derive_code)
+            print("scoped-test: derivation failed: " + "; ".join(RECEIPT["derive_failure"]), flush=True)
             print(receipt.stdout, end="")
         else:
             filters, head = receipt_data["suggested_filters"], receipt_data["head"]
+            if receipt_data.get("unfiltered_leaf_paths"):
+                filters = list(dict.fromkeys([
+                    *filters, *receipt_data.get("worker_filters", []),
+                    *receipt_data.get("scanned_token_filters", []),
+                ]))
+            bounded_plan = bounded_worker_selection(receipt_data)
+            if bounded_plan:
+                filters = list(dict.fromkeys([*bounded_plan["filters"], *filters]))
     guards_failed = static_guards(repo, receipt_data.get("merge_base", args.base),
                                   receipt_data.get("head", args.head), receipt_data.get("audits", {}))
     if derive_code or guards_failed:
         return derive_code or 1
     if not args.dry_run and checker["git_out"](repo, "rev-parse", "HEAD").strip() != head:
         raise ValueError("--head differs from this worktree's HEAD; use --dry-run to inspect another candidate")
-    RECEIPT.update(head=head, filters=list(filters))
-    plan = selection_plan(filters, checker["shard_packages"](repo))
+    RECEIPT.update(head=head, filters=list(filters), candidate_repo=str(repo))
+    slow_tier, slow_tests = slow_tier_plan(checker, repo, head, receipt_data, explicit=args.filters is not None)
+    RECEIPT["slow_tier"] = slow_tier
+    print("scoped-test: " + slow_tier_summary(slow_tier), flush=True)
+    priority_filters = receipt_data.get("priority_filters", [])
+    RECEIPT["priority_filters"] = priority_filters
+    changed_modules = [item for item in receipt_data.get("changed_modules") or () if isinstance(item, dict)]
+    changed_packages = {item["package"] for item in changed_modules if item.get("package")}
+    if changed_modules:
+        RECEIPT["changed_modules"] = [{key: item[key] for key in ("package", "module", "kind", "target", "path", "tests")
+                                       if key in item} for item in changed_modules]
+        print("scoped-test: tests of a changed module run before unrelated observers, smallest module first: "
+              + " ".join(item.get("module") or f"{item['kind']}:{item['target']}" for item in changed_modules),
+              flush=True)
+    plan = selection_plan(filters, checker["shard_packages"](repo), priority_filters)
+    direct_plan = direct_observer_plan(receipt_data, checker["shard_packages"](repo))
+    if bounded_plan:
+        announce_bounded_plan(bounded_plan, plan, head, receipt_data, direct_plan)
+    if priority_filters:
+        plan = dict(package_order(plan, changed_packages, set(direct_plan)))
+        print("scoped-test: added/changed tests run first: " + " ".join(priority_filters), flush=True)
+    RECEIPT["plan"] = "precise"
+    RECEIPT["compile"] = planning_compile(args.filters is not None, args.dry_run)
+    host_threads, load1 = host_capacity()
+    adaptive = adaptive_threads(host_threads, load1)
+    linux = sys.platform.startswith("linux")
+    # #2524: min(job ceiling, host build budget) bounds every nested unit.
+    budget = slice_budget_percent(linux)
+    if budget is not None and budget < args.cpu_quota:
+        print(f"scoped-test: --cpu-quota {args.cpu_quota:g}% exceeds the {build_slice()} budget "
+              f"{budget:g}%; using the budget", flush=True)
+        args.cpu_quota = min(args.cpu_quota, max(100.0, budget))
+    quota_cores = max(1, int(args.cpu_quota // 100))
+    test_shards = int(args.test_shards or min(adaptive, quota_cores))
+    # The unit's quota follows the thread count, never the job's own ceiling.
+    unit_quota = args.cpu_quota if args.test_shards else min(args.cpu_quota, test_shards * 100)
+    runner, nextest_version = detect_runner(repo, args.runner)
+    RECEIPT.update(runner=runner, nextest_version=nextest_version, test_threads=test_shards,
+                   test_shards=test_shards, cpu_quota=unit_quota, job_cpu_quota=args.cpu_quota,
+                   host_threads=host_threads, load1=load1, adaptive_threads=adaptive)
+    over_budget = bool(args.filter_budget and plan_filter_count(plan) > args.filter_budget)
+    # A broad observer fallback (#2105) keeps its module filters, which can name thousands of
+    # tests: run them boxed like an over-budget plan, never refuse and never widen.
+    boxed = over_budget or bool(args.filter_budget and RECEIPT.get("uncertain"))
+    time_box = args.test_time_box_sec if boxed and args.test_time_box_sec > 0 else None
+    if boxed:
+        RECEIPT.update(plan="targeted_subset", filter_budget=args.filter_budget, test_time_box_sec=time_box,
+                       selected_filters=plan_filter_count(plan), run_filters=None, gate_covers_rest=True)
+        plan = dict(package_order(plan, changed_packages, set(direct_plan)))
+        reason = (f"{plan_filter_count(plan)} filters exceed the budget of {args.filter_budget}" if over_budget
+                  else f"{len(bounded_plan['bounded'])} cap-overflow module filters are bounded to their changed-module "
+                       "tests and direct observers" if bounded_plan and not bounded_plan["broad_filters_left"]
+                  else f"{RECEIPT['broad_filter_count']} broad observer filters could not be narrowed")
+        print(f"scoped-test: targeted subset: {reason}; running them as named, most specific first, within "
+              + (f"a {time_box:g}s test time box" if time_box else "no time box")
+              + "; the merge-queue gate covers the rest", flush=True)
     python_tests = PYTHON_GATE.selected_tests(
         repo, PYTHON_GATE.changed_paths(repo, receipt_data.get("merge_base", args.base), head))
     python_commands = PYTHON_GATE.test_commands(repo, python_tests, sys.executable)
-    linux = sys.platform.startswith("linux")
+    # The derivation's own `desktop` selection when there is one (it diffs exactly as it selects every
+    # other test); explicit filters derive nothing, so they read the diff the way the Python tests do.
+    try:
+        desktop_selected = desktop_lane_selected(repo, receipt_data, receipt_data.get("merge_base", args.base), head)
+    except DESKTOP_GATE.SelectorMissing as error:
+        # #355: no selector script in the candidate is a refusal, never an empty lane.
+        print(f"scoped-test: desktop lane: {error}", flush=True)
+        return 1
+    desktop_commands = ([DESKTOP_GATE.lane_command(sys.executable, SCRIPT.with_name("desktop-test-gate.py"), repo)]
+                        if desktop_selected else [])
     if not linux:
-        print("scoped-test: systemd unavailable on this platform; plain wall-clock timeout, no CPU cap", flush=True)
+        print("scoped-test: systemd unavailable on this platform; no rsi-build.slice available, plain wall-clock timeout, no CPU cap", flush=True)
     log_dir = Path(tempfile.mkdtemp(prefix="rsi-scoped-test-", dir="/tmp" if Path("/tmp").is_dir() else None))
     print(f"logs: {log_dir}", flush=True)
     RECEIPT["log_dir"] = str(log_dir)
-    if not plan and not python_commands:
+    if not plan and not python_commands and not desktop_commands:
         print("scoped-test: no test filters derived; no tests run", flush=True)
-    matched, failed, summaries = set(), False, []
-    for index, command in enumerate(python_commands):
-        print("python test: " + command_text(command), flush=True)
-        if args.dry_run:
-            continue
-        budget = min(args.runtime_max_sec, 120)
-        if args.total_max_sec is not None:
-            budget = min(budget, args.total_max_sec - (time.monotonic() - run_started))
-        if budget <= 0:
-            print("scoped_test_timeout: total budget exhausted before Python tests", flush=True)
-            return 1
-        with (log_dir / f"python-{index}.log").open("w") as log:
-            def emit_python(line):
-                print(line, end="", flush=True)
-                log.write(line)
-                log.flush()
-            try:
-                code = stream(command, emit_python, timeout=budget, cwd=repo)
-            except subprocess.TimeoutExpired:
-                print("scoped_test_timeout: " + command_text(command), flush=True)
-                return 1
-        if code:
-            print("scoped-test: Python test failed: " + command_text(command), flush=True)
-            return code
+    matched, failed, summaries, candidate_failures = set(), False, [], {}
+    warning_payloads = []
+    subsets, skipped_filters, box_left = [], set(), time_box
+    python_scratch, python_env = None, None
+    if tmpfs and python_commands and not args.dry_run:
+        # The Python fixture tests honour TMPDIR, so the lander's tmpfs parity
+        # covers them too; the marker names them so a log is never silent (#1799).
+        python_scratch = tempfile.mkdtemp(prefix="rsi-scoped-test-tmpfs-python-", dir=tmpfs)
+        python_env = {**os.environ, "TMPDIR": python_scratch, "TMP": python_scratch, "TEMP": python_scratch}
+        print(f"TMPFS_PARITY python tests={len(python_commands)} tmpfs={python_scratch}", flush=True)
+        RECEIPT["python_tmpfs"] = len(python_commands)
+    announce_execution_order(python_commands, list(plan), args.dry_run, desktop_commands)
+    try:
+        python_code = run_python_tests(python_commands, args, log_dir, run_started, python_env)
+    finally:
+        if python_scratch:
+            shutil.rmtree(python_scratch, ignore_errors=True)
+    if python_code is not None:
+        return python_code
+    desktop_code = run_desktop_lane(desktop_commands, args, log_dir, run_started)
+    desktop_failures = []
+    if desktop_code is not None:
+        failed = True
+        # Desktop failures are never fed to the Rust-only baseline comparison.
+        desktop_failures = [{"package": "desktop", "kind": "desktop", "target": "desktop",
+                             "test": entry.get("failed_step") or entry.get("lane_status") or entry["status"]}
+                            for entry in RECEIPT["desktop"] if entry["status"] != "passed"]
+        RECEIPT["failures"] = desktop_failures
+    if any(entry["status"] == "timed out" or entry.get("lane_status") == DESKTOP_GATE.TIMED_OUT
+           for entry in RECEIPT["desktop"]):
+        return desktop_code or 1
+    if not args.dry_run and args.total_max_sec is not None and time.monotonic() - run_started >= args.total_max_sec:
+        print("scoped_test_timeout: total budget exhausted before Cargo", flush=True)
+        return 1
     packages = list(plan.items())
+    # Hold one governor admission across the package units (#2216). Foreground
+    # runs exclude the one queue wait; daemon jobs include it (#2025).
+    slot, cargo = split_slot(checker["cargo_prefix"]())
+    if args.cargo_slot and not os.environ.get("RSI_CARGO_SLOT_HELD"):
+        slot = [args.cargo_slot] if Path(args.cargo_slot).name == "cargo-slot" else []
+    admission_failed = False
+    slot_waited = 0.0
     for package_index, (package, selections) in enumerate(packages):
+        if box_left is not None and box_left <= 0 and not args.dry_run:
+            # The box is spent: a later package is left to the merge-queue gate, not failed.
+            print(f"scoped-test: targeted subset: test time box spent; {package} left to the merge-queue gate",
+                  flush=True)
+            skipped_filters.update(s["filter"] for s in selections)
+            matched.update(s["filter"] for s in selections)
+            continue
         package_plan = {"repo": str(repo), "package": package, "selections": selections,
-                        "build": build_command(package, selections, checker["cargo_prefix"]())}
+                        "build": build_command(package, selections, cargo), "test_shards": test_shards,
+                        "test_threads": test_shards, "runner": runner, "time_box_sec": box_left,
+                        "changed_modules": [item for item in changed_modules if item.get("package") == package],
+                        "direct_selections": direct_plan.get(package, [])}
+        if runner == "nextest":
+            package_plan["nextest"] = [*cargo, "nextest"]
+        if slow_tests and package == slow_tier["package"]:
+            package_plan["slow_tier_excluded"] = slow_tests
         if selects_e2e(selections):
-            package_plan["e2e"] = {"prebuild": e2e_prebuild_command(checker["cargo_prefix"]())}
+            package_plan["e2e"] = {"prebuild": e2e_prebuild_command(cargo)}
         if tmpfs:
             package_plan["tmpfs"] = tmpfs
         plan_path = log_dir / f"{package}.json"
         plan_path.write_text(json.dumps(package_plan, indent=2) + "\n")
         budget = args.runtime_max_sec
         if args.total_max_sec is not None:
-            left = args.total_max_sec - (time.monotonic() - run_started)
+            left = args.total_max_sec - (time.monotonic() - run_started - (slot_waited if job_deadline is None else 0))
             if left < 1 and not args.dry_run:
                 print(f"scoped_test_timeout: total budget exhausted before {package}: --total-max-sec "
                       f"{args.total_max_sec:g}; {package} was not run", flush=True)
                 failed = True
-                summaries.append((package, selections, True, 1, 0))
+                summaries.append((package, selections, True, 1, 0,
+                                  {"phases": set(), "diagnostic": None, "terminated": False, "incomplete": True}))
                 continue
             budget = min(budget, max(left, 1))
-        command, unit = bounded_command(package_plan, plan_path, budget, args.cpu_quota, linux)
-        print(f"{package} filters: " + " ".join(s["filter"] for s in selections), flush=True)
+        wait_cap = args.slot_wait_max_sec
+        if job_deadline is not None:
+            wait_cap = max(0, job_deadline - 60 - time.monotonic())
+            # A granted slot leaves only the job's remaining wall budget.
+            budget = min(budget, max(1, job_deadline - time.monotonic()))
+        needs_admission = bool(slot) and admission.process is None
+        if needs_admission and wait_cap <= 0 and not args.dry_run:
+            print(f"rsi-phase {int(time.time())} admission-timeout: no job budget left for {package}", flush=True)
+            admission_failed = True
+            break
+        command, unit = bounded_command(package_plan, plan_path, budget, unit_quota, linux)
+        run_budget = Budget(budget, queued=needs_admission, wait_cap=wait_cap,
+                            grace=5 if linux else 0, deadline=job_deadline)
+        print(f"{package} filters: " + " ".join(s["filter"] + (" (bounded)" if s.get("bounded") else "")
+                                                  for s in selections if not s.get("direct_only")), flush=True)
+        if any(s.get("direct_only") for s in selections):
+            print(f"{package} direct observers selected: {sum(1 for s in selections if s.get('direct_only'))} filters "
+                  "(listed in the package plan)", flush=True)
+        if needs_admission:
+            print(f"slot: {slot[0]} is held across packages before the budget starts; queue time " +
+                  ("counts against the job wall budget" if job_deadline is not None else "is not counted"), flush=True)
         print("build once: " + command_text(package_plan["build"]), flush=True)
+        print(f"tests: {runner} at {test_shards} thread(s) (host {host_threads} threads, load "
+              f"{'n/a' if load1 is None else f'{load1:.1f}'}, cpu quota {unit_quota:g}%)", flush=True)
         if "e2e" in package_plan:
             print("e2e prebuild (RSI_E2E=1): " + command_text(package_plan["e2e"]["prebuild"]), flush=True)
         print("budget: " + command_text(command), flush=True)
         if args.dry_run:
             continue
         active, timed_out, terminated = {}, False, False
+        subsets_before = len(subsets)
         completed, completion = 0, None
+        phases, diagnostics = set(), []
         with (log_dir / f"{package}.log").open("w") as log:
             def emit(line):
                 nonlocal timed_out, terminated, completed, completion
@@ -517,8 +2842,44 @@ def main():
                 elif line.startswith("SCOPED_END "):
                     if active.pop(line.strip().split(" ", 1)[1], None) is not None:
                         completed += 1
+                        if completed % 10 == 0:
+                            snapshot_package({"package": package, "status": "running",
+                                              "completed": completed, "phase": "incomplete",
+                                              "log": str(log_dir / f"{package}.log")})
+                elif line.startswith("SCOPED_PHASE "):
+                    phases.add(line.strip().split(" ", 1)[1])
+                elif line.startswith("SCOPED_DIAG "):
+                    try:
+                        diagnostics.append(json.loads(line.split(" ", 1)[1]))
+                    except ValueError:
+                        pass
+                elif line.startswith("SCOPED_WARNINGS "):
+                    try:
+                        warning_payloads.append(json.loads(line.split(" ", 1)[1]))
+                    except ValueError:
+                        warning_payloads.append({"degraded": ["a SCOPED_WARNINGS line was not valid JSON"]})
                 elif line.startswith("SCOPED_MATCH "):
                     matched.add(line.strip().split(" ", 1)[1])
+                elif line.startswith("SCOPED_SUBSET "):
+                    try:
+                        subsets.append(json.loads(line.split(" ", 1)[1]))
+                    except ValueError:
+                        pass
+                elif line.startswith("SCOPED_IGNORED_ONLY "):
+                    RECEIPT.setdefault("skipped_ignored_only", []).append(line.strip().split(" ", 1)[1])
+                elif line.startswith("SCOPED_SLOW_TIER_SKIPPED "):
+                    try:
+                        RECEIPT["slow_tier"]["skipped_tests"] += int(line.split()[1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("SCOPED_FAILURE "):
+                    target_name, test_name = line.strip().split(" ", 2)[1:]
+                    kind, target_name = target_name.split(":", 1)
+                    candidate_failures.setdefault(package, []).append(
+                        {"kind": kind, "target": target_name, "test": test_name})
+                    # Durable at once: a later package that times out, or a
+                    # run that dies before the comparison, keeps what failed (#1895).
+                    RECEIPT["failures"] = failure_records(candidate_failures) + desktop_failures
                 else:
                     receipt = re.fullmatch(r"SCOPED_COMPLETE " + re.escape(package) + r" ([0-9]+)\n?", line)
                     if receipt:
@@ -535,18 +2896,32 @@ def main():
                 # The unique unit name belongs to this invocation only.
                 subprocess.run(["systemctl", "--user", "stop", unit], check=False, timeout=30)
 
-            started = time.monotonic()
             try:
                 # systemd owns the primary deadline; this watchdog also bounds
                 # a stuck systemd client. Other platforms use the plain timeout.
-                code = stream(command, emit, budget + (5 if linux else 0),
-                              stop_unit if linux else None)
-                timed_out |= code != 0 and time.monotonic() - started >= budget
+                code = admission.acquire(slot, emit, run_budget, wait_cap, job_deadline) if slot else 0
+                if code == 0:
+                    # Admission supplies cargo-slot's build settings and HELD marker to
+                    # every unit, including baseline comparison units, without nesting slots.
+                    command, unit = bounded_command(package_plan, plan_path, budget, unit_quota, linux)
+                    if needs_admission:
+                        emit("admitted budget: " + command_text(command) + "\n")
+                    code = stream(command, emit, stop=stop_unit if linux else None, budget=run_budget)
+                    if slot and admission.process.poll() is not None:
+                        emit("scoped-test: shared build-slot holder exited during the package run\n")
+                        code = code or 1
+                timed_out |= code != 0 and run_budget.ran_out()
             except subprocess.TimeoutExpired:
-                code, timed_out = 124, True
+                code, timed_out = 124, run_budget.started is not None
+                if not timed_out:
+                    emit(f"scoped_test_slot_wait_timeout: no build slot after {wait_cap:g}s; "
+                         f"{package} was not run\n")
             except OSError as error:
-                emit(f"scoped-test: unable to start bounded run: {error}\n")
+                emit(f"scoped-test: unable to run bounded {package} command: {error}\n")
                 code = 1
+            if job_deadline is not None and code == 124 and run_budget.started is None:
+                admission_failed = True
+                emit(f"rsi-phase {int(time.time())} admission-timeout: no build slot within remaining job budget; {package} was not run\n")
             # systemd-run can exit zero after systemctl stop. Only the worker
             # can attest that every selected test finished successfully.
             if terminated or active or completion != completed:
@@ -557,28 +2932,143 @@ def main():
                 emit("scoped_test_timeout: slowest still-running tests: " +
                      (", ".join(f"{name} ({time.monotonic() - since:.1f}s)" for name, since in
                                 sorted(active.items(), key=lambda item: item[1])) or "none (build/list/startup)") + "\n")
-            summaries.append((package, selections, timed_out, code, completed))
+            package_waited = run_budget.waited if needs_admission else 0.0
+            slot_waited += package_waited
+            if slot:
+                RECEIPT["admission"] = {"count": 1, "waited_sec": round(slot_waited, 3)}
+            if box_left is not None:
+                box_left -= sum(item.get("test_sec", 0) for item in subsets[subsets_before:])
+            if slot:
+                emit(f"scoped-test: {package}: waited {package_waited:.0f}s for a build slot "
+                     f"({'counted against the job budget' if job_deadline is not None else 'not counted against the budget'})\n")
+            summaries.append((package, selections, timed_out, code, completed,
+                              {"phases": phases, "diagnostic": diagnostics[0] if diagnostics else None,
+                               "terminated": terminated, "incomplete": bool(active) or (completion != completed and "test_failed" not in phases)}))
             failed |= timed_out or code != 0
+            if not args.dry_run:
+                phase = next((name for name in ("build_failed", "list_failed") if name in phases), None)
+                status = "timed out" if timed_out else "failed" if code else "passed" if completed else "not applicable"
+                entry = {"package": package, "status": status, "completed": completed}
+                if slot:
+                    entry.update(slot_wait_sec=round(package_waited, 3),
+                                 run_sec=round(time.monotonic() - run_budget.started, 3)
+                                 if run_budget.started is not None else 0)
+                if phase:
+                    entry.update(phase=phase, log=str(log_dir / f"{package}.log"))
+                    if diagnostics:
+                        entry["diagnostic"] = diagnostics[0]
+                snapshot_package(entry)
+                # Keep the last finished package durable if the outer job unit
+                # is stopped before the final comparison and receipt.
+            if phases.intersection({"build_failed", "list_failed"}):
+                # A broken build/list makes later package results unavailable
+                # to the candidate. Keep their independent landing coverage in
+                # the merge queue instead of spending this job's budget there.
+                break
+            if admission_failed or (slot and (not admission.environment or
+                                              admission.process.poll() is not None)):
+                break
             if (args.reclaim_incremental and package_index + 1 < len(packages) and
                     code == 0 and not timed_out and completion == completed):
                 reclaimed = reclaim_incremental(repo)
                 print(f"scoped-test: reclaimed {reclaimed} bytes of Cargo incremental cache before next package",
                       flush=True)
+    if boxed or bounded_plan:
+        report_subset(plan, subsets, skipped_filters, args.dry_run)
     if not args.dry_run:
-        missing = set(filters) - matched
+        # Replace the incremental snapshots with the canonical final package
+        # verdicts (which can also include unmatched-filter results).
+        package_timings = {entry["package"]: {key: entry[key] for key in ("slot_wait_sec", "run_sec")
+                                             if key in entry} for entry in RECEIPT["packages"]}
+        RECEIPT["packages"] = []
+        RECEIPT["compile"]["execution"] = "executed" if summaries else "none_scheduled"
+        # "Selected no tests" is a claim about test listings: make it only when
+        # every package built and listed its binaries (#1913).
+        unlisted = [item[0] for item in summaries if "listed" not in item[5]["phases"]]
+        missing = set(filters) - matched if not unlisted else set()
+        if unlisted and set(filters) - matched:
+            print("scoped-test: filter matching not evaluated; no test listing from: " +
+                  ", ".join(unlisted), file=sys.stderr)
         if missing:
             print("scoped-test: filters selected no tests: " + ", ".join(sorted(missing)), file=sys.stderr)
+            RECEIPT["unmatched_filters"] = sorted(missing)
             failed = True
-        for package, selections, timed_out, code, completed in summaries:
-            unmatched = any(s["filter"] in missing for s in selections)
+        for package, selections, timed_out, code, completed, detail in summaries:
+            # Filter coverage is independent of a package's successful execution. A stale
+            # empty observer must not relabel 90 passing tests as no_tests_selected (#397).
+            unmatched = completed == 0 and any(s["filter"] in missing for s in selections)
             status = ("timed out" if timed_out else "failed" if code or unmatched else
                       "passed" if completed else "not applicable")
+            phase = next((name for name in ("build_failed", "list_failed") if name in detail["phases"]), None)
+            if phase is None and (timed_out or detail["terminated"] or detail["incomplete"]):
+                phase = "incomplete"
+            elif phase is None and "test_failed" in detail["phases"]:
+                phase = "test_failed"
+            elif phase is None and unmatched:
+                phase = "no_tests_selected"
+            elif phase is None and code:
+                phase = "incomplete"
             summary = f"scoped-test: {package}: {status} ({completed} completed tests)\n"
-            RECEIPT["packages"].append({"package": package, "status": status, "completed": completed})
+            entry = {"package": package, "status": status, "completed": completed}
+            RECEIPT["compile"]["packages"][package] = package_compile_status(detail["phases"])
+            if slot:
+                entry.update(package_timings.get(package, {}))
+            if phase:
+                entry.update(phase=phase, log=str(log_dir / f"{package}.log"))
+                if detail["diagnostic"]:
+                    entry["diagnostic"] = detail["diagnostic"]
+                summary += (f"scoped-test: {package}: {phase}" +
+                            (f": {detail['diagnostic']}" if detail["diagnostic"] else "") +
+                            f" (log {entry['log']})\n")
+            RECEIPT["packages"].append(entry)
             print(summary, end="", flush=True)
             with (log_dir / f"{package}.log").open("a") as log:
                 log.write(summary)
-    return 1 if failed else 0
+    if not args.dry_run and not any(detail["phases"].intersection({"build_failed", "list_failed"})
+                                    for _, _, _, _, _, detail in summaries):
+        # Only a build that finished can say which warnings the candidate carries (#1897).
+        gate = warning_gate(repo, receipt_data.get("merge_base", args.base), warning_payloads)
+        if gate is not None:
+            RECEIPT["warnings"] = gate
+            failed |= report_warning_gate(gate)
+    if not args.dry_run:
+        base = args.base
+        base_failures = {package: names for package, names in candidate_failures.items() if names}
+        remaining = (args.runtime_max_sec if args.total_max_sec is None else
+                     max(0.0, args.total_max_sec - (time.monotonic() - run_started)))
+        admission_lost = bool(slot and admission.process is not None and admission.process.poll() is not None)
+        stopped_on_build_or_list = any(
+            detail["phases"].intersection({"build_failed", "list_failed"})
+            for _, _, _, _, _, detail in summaries
+        )
+        comparison = ({"status": "not_needed", "base": base,
+                       "detail": "skipped after lost admission" if admission_lost else "skipped after build/list failure"}
+                      if stopped_on_build_or_list or admission_lost else
+                      compare_failures_with_base(repo, base, base_failures, log_dir,
+                                                 remaining, args.cpu_quota, linux, cargo, tmpfs))
+        RECEIPT["failures"] = failure_records(candidate_failures) + desktop_failures
+        RECEIPT["baseline_comparison"] = comparison
+        RECEIPT["baseline_reds"] = comparison.get("baseline_reds", [])
+        RECEIPT.update(annotate_baseline_reds(repo, RECEIPT["baseline_reds"]))
+        remaining = (args.runtime_max_sec if args.total_max_sec is None else
+                     max(0.0, args.total_max_sec - (time.monotonic() - run_started)))
+        stale_reds, stale_detail = split_stale_base_failures(
+            repo, head, base, base_failures, comparison, log_dir, remaining, args.cpu_quota, linux,
+            cargo, tmpfs)
+        if stale_detail:
+            comparison["fork_point_comparison"] = stale_detail
+        if stale_reds:
+            RECEIPT["stale_base_reds"] = stale_reds
+            RECEIPT["stale_base"] = (f"{len(stale_reds)} failing test(s) were already red at your branch "
+                                     f"point and pass on {base}: merge {base} and re-run")
+            print("scoped-test: stale_base: " + RECEIPT["stale_base"], flush=True)
+        baseline_keys = {(item.get("package"), item.get("kind"), item.get("target"), item.get("test"))
+                         for item in comparison.get("baseline_reds", []) + stale_reds}
+        RECEIPT["new_failures"] = ([item for item in RECEIPT["failures"]
+                                    if (item.get("package"), item.get("kind"), item.get("target"),
+                                        item.get("test")) not in baseline_keys]
+                                   if comparison.get("status") == "complete" else desktop_failures or None)
+    return 124 if admission_failed else 1 if failed else 0
 
 
 if __name__ == "__main__":
@@ -589,5 +3079,6 @@ if __name__ == "__main__":
         code = 1
     except KeyboardInterrupt:
         code = 130
+    record_merge_onto_rolling()
     emit_receipt(code)
     sys.exit(code)

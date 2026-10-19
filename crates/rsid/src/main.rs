@@ -110,11 +110,31 @@ where
 }
 
 fn main() -> Result<()> {
+    // #2594: read the supervisor's shutdown-marker path and remove it from the
+    // environment while the process is still single-threaded, so no worker,
+    // job unit, lander or test this daemon spawns can write the real marker.
+    rsid::supervisor_shutdown::capture_marker_path();
+    // #2384: the path a supervised restart's compaction helper is launched
+    // from; after a deploy swap it names the new build.
+    rsid::cold_compact::capture_executable();
+    // #130: the offline opt-in (`RSI_OFFLINE=1`, tests and isolated harness
+    // runs only) is fixed here, before any background task can probe, poll
+    // or check a provider.
+    if rsid::offline::init_from_env() {
+        eprintln!(
+            "rsid: offline mode (RSI_OFFLINE): no provider probe, poll, catalog fetch or credential check opens a network connection"
+        );
+    }
     // Informational flags exit here, before any daemon state exists. The
     // daemon starts after the match so no arm owns daemon startup: the
     // provider-capability scan reads a match arm's callees as one mapping.
     match cli_action(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
         CliAction::Run => {}
+        CliAction::ColdArchiveCompact(args) => {
+            // #2384 (plan §5): the isolated compaction helper. Hidden; never
+            // starts a daemon, runs no migration and no startup work.
+            std::process::exit(rsid::cold_compact::run_helper(&args));
+        }
         CliAction::Help => {
             println!(
                 "rsid {}\nUsage: rsid [--help | --version]\nRun the RSI daemon when no flag is given.",
@@ -147,10 +167,11 @@ fn main() -> Result<()> {
     // created after the call, and the runtime starts the worker threads
     // that would otherwise take their own arenas first (#997).
     rsid::process_memory::configure_allocator();
+    let startup = prepare_daemon()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    run_to_bounded_exit(runtime, Box::pin(run_daemon()))
+    run_to_bounded_exit(runtime, Box::pin(run_daemon(startup)))
 }
 
 /// Runs the daemon future, then tears the runtime down within
@@ -164,12 +185,32 @@ fn run_to_bounded_exit<F: std::future::Future<Output = Result<()>>>(
 ) -> Result<()> {
     let result = runtime.block_on(daemon);
     runtime.shutdown_timeout(RUNTIME_DROP_GRACE);
-    // #1045: a deploy restart exits 75 so `rsid-supervisor.sh` relaunches the
-    // new binary with its own environment.
-    if result.is_ok() && rsid::deploy::exit_75_requested() {
-        std::process::exit(rsid::watchdog::WATCHDOG_EXIT_CODE);
+    if let Some(code) = supervised_exit_code(
+        result.is_ok(),
+        rsid::deploy::exit_75_requested(),
+        rsid::cold_compact::compact_before_exit,
+    ) {
+        std::process::exit(code);
     }
     result
+}
+
+/// #1045: a deploy restart exits 75 so `rsid-supervisor.sh` relaunches the new
+/// binary with its own environment. #2384 (plan §5): first the compaction this
+/// restart scheduled runs in its helper, bounded by its deadline (killed and
+/// reaped past it); the exit code is 75 whatever the helper did.
+fn supervised_exit_code(
+    daemon_ok: bool,
+    exit_75: bool,
+    compact: impl FnOnce() -> Option<rsid::cold_compact::HelperOutcome>,
+) -> Option<i32> {
+    if !(daemon_ok && exit_75) {
+        return None;
+    }
+    if let Some(outcome) = compact() {
+        eprintln!("rsid: cold-archive compaction helper ended: {outcome:?}");
+    }
+    Some(rsid::watchdog::WATCHDOG_EXIT_CODE)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -179,12 +220,19 @@ enum CliAction {
     Version,
     BuildInfo,
     RestoreDatabase(std::path::PathBuf, std::path::PathBuf),
+    ColdArchiveCompact(rsid::cold_compact::HelperArgs),
     Invalid,
 }
 
 fn cli_action(args: &[std::ffi::OsString]) -> CliAction {
     match args {
         [] => CliAction::Run,
+        [mode, rest @ ..]
+            if mode.to_str() == Some(rsid::store::cold_archive::reclaim::COMPACT_HELPER_ARG) =>
+        {
+            rsid::cold_compact::parse_helper_args(rest)
+                .map_or(CliAction::Invalid, CliAction::ColdArchiveCompact)
+        }
         [flag] if flag == "--help" || flag == "-h" => CliAction::Help,
         [flag] if flag == "--version" || flag == "-V" => CliAction::Version,
         [flag] if flag == "--build-info" => CliAction::BuildInfo,
@@ -195,14 +243,22 @@ fn cli_action(args: &[std::ffi::OsString]) -> CliAction {
     }
 }
 
-async fn run_daemon() -> Result<()> {
-    // tokio-console subscriber — compile-time + runtime double opt-in; zero overhead when off.
-    #[cfg(feature = "tokio-console")]
-    {
-        if std::env::var("RSI_TOKIO_CONSOLE").as_deref() == Ok("1") {
-            console_subscriber::init();
-        }
-    }
+struct DaemonStartup {
+    started_at: std::time::Instant,
+    config: Config,
+    data_dir: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    instance_guard: DaemonInstanceGuard,
+    inherited_listener: Option<rsid::instance_guard::InheritedListener>,
+}
+
+/// Adopt activation and clear its environment before any threads or children.
+fn prepare_daemon() -> Result<DaemonStartup> {
+    // First action (#1852): nothing this process creates, including a daemon.log
+    // the launcher redirected into a still-0755 data directory, may be
+    // group/other-readable before the directory is hardened below.
+    let previous_umask = rsid_core::private_state::restrict_umask();
+    let started_at = std::time::Instant::now();
 
     // Migrate legacy ~/.flywheel/ data directory to ~/.rsi/
     if let Some(home) = dirs::home_dir() {
@@ -220,17 +276,45 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
+    // Load configuration
+    let config = Config::default();
+
+    // Daemon state is owner-only (#1844): 0700 directory, 0600 database, logs
+    // and spools on Unix; tightened when an older daemon left them looser. This
+    // runs before the first log line (#1852) so a log redirected into an old
+    // 0755 directory is tightened before anything is written; results are
+    // logged once tracing exists.
+    let hardened = config.socket_path.parent().map(|parent| {
+        (
+            parent,
+            rsid_core::private_state::harden_data_dir_top(parent),
+        )
+    });
+    let hardened = match hardened {
+        Some((parent, Err(error))) => {
+            let created = std::fs::create_dir_all(parent);
+            Some((parent, Err(error), created))
+        }
+        Some((parent, result)) => Some((parent, result, Ok(()))),
+        None => None,
+    };
+    // Children (providers, git worktrees) get the operator's umask back; the
+    // directory is private now and private files request 0600 explicitly.
+    previous_umask.restore();
+
     // Initialize tracing
     tracing_subscriber::fmt::init();
-    // Keep a redirected daemon.log bounded (#960); a no-op under journald.
-    rsid::log_rotation::spawn_bounded_log();
 
     // Route panics through tracing so they land in the same sink as everything
     // else instead of writing an unstructured line to raw stderr and vanishing
     // from whatever collects daemon logs.
     install_panic_hook();
 
-    info!("rsid starting...");
+    info!(
+        process_elapsed_ms = rsid::startup_clock::process_elapsed_ms(),
+        prepare_elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "rsid starting..."
+    );
 
     match load_daemon_dotenv() {
         DaemonDotenvStatus::Loaded(_) | DaemonDotenvStatus::Missing(_) => {}
@@ -239,8 +323,6 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
-    // Load configuration
-    let mut config = Config::default();
     rsi_common::identity::initialize_process_ownership_namespace(&config.socket_path)
         .map_err(rsid::error::DaemonError::Process)?;
     info!(
@@ -251,9 +333,22 @@ async fn run_daemon() -> Result<()> {
         "Configuration loaded"
     );
 
-    // Create data directory if needed
-    if let Some(parent) = config.socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    match hardened {
+        Some((parent, Ok(report), _)) => {
+            if !report.changed.is_empty() {
+                info!(
+                    count = report.changed.len(),
+                    dir = %parent.display(),
+                    "Tightened daemon state modes to owner-only"
+                );
+            }
+            report.log_failures();
+        }
+        Some((parent, Err(error), created)) => {
+            warn!(dir = %parent.display(), %error, "Could not secure daemon data directory");
+            created?;
+        }
+        None => {}
     }
 
     // The database is the singleton identity. Take its kernel lease before
@@ -275,7 +370,73 @@ async fn run_daemon() -> Result<()> {
     // Bridge the first guarded rollout: an already-running legacy binary does
     // not hold the new file lease. A connectable socket is positive incumbent
     // evidence and must never be unlinked. Missing/refused is the stale case.
-    let inherited_listener = inherited_daemon_listener(&config.socket_path)?;
+    // SAFETY: startup is single-threaded, before Tokio or any subprocess.
+    let inherited_listener = unsafe { inherited_daemon_listener(&config.socket_path)? };
+    Ok(DaemonStartup {
+        started_at,
+        config,
+        data_dir,
+        db_path,
+        instance_guard,
+        inherited_listener,
+    })
+}
+
+/// Tightens the contents of the daemon-private spools on a background thread
+/// (#2375); the directory, its private files and the spools' own modes were
+/// settled before the first log line.
+fn spawn_private_subtree_hardening(data_dir: std::path::PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("private-state-harden".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let report = rsid_core::private_state::harden_private_subtrees(&data_dir);
+            if !report.changed.is_empty() {
+                info!(
+                    count = report.changed.len(),
+                    dir = %data_dir.display(),
+                    "Tightened daemon state modes to owner-only"
+                );
+            }
+            report.log_failures();
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Daemon-private spool modes checked"
+            );
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "Could not start the daemon-private spool hardening pass");
+    }
+}
+
+async fn run_daemon(startup: DaemonStartup) -> Result<()> {
+    let DaemonStartup {
+        started_at,
+        mut config,
+        data_dir,
+        db_path,
+        instance_guard,
+        inherited_listener,
+    } = startup;
+    // tokio-console subscriber — compile-time + runtime double opt-in; zero overhead when off.
+    #[cfg(feature = "tokio-console")]
+    {
+        if std::env::var("RSI_TOKIO_CONSOLE").as_deref() == Ok("1") {
+            console_subscriber::init();
+        }
+    }
+
+    let mut spans = rsid::startup_clock::StartupSpans::new();
+    // #2375: daemon loops whose first pass walks the store start only after the
+    // `request_ready` milestone, so they never hold the store lock inside the
+    // authority-initialization window. Set once, right after the milestone.
+    let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
+    // #2375: the walk of the private spools' contents is not a startup gate.
+    // It starts here, not in `prepare_daemon`, which stays single-threaded
+    // until the inherited listener is taken.
+    spawn_private_subtree_hardening(data_dir.clone());
+    // Keep a redirected daemon.log bounded (#960); a no-op under journald.
+    rsid::log_rotation::spawn_bounded_log(rsid::log_rotation::configured_log_path(&data_dir));
     let socket_inherited = inherited_listener.is_some();
     if !socket_inherited {
         refuse_live_daemon_socket(&config.socket_path).await?;
@@ -292,6 +453,9 @@ async fn run_daemon() -> Result<()> {
         error!(db = %db_path.display(), error = %e, "Database open/migration failed; daemon cannot start");
     })?;
     info!(db = %db_path.display(), "Database opened");
+    spans.mark("store_open");
+    // #289: the store's successor-seat check reads the live Claude ladders.
+    rsid::claude::install_live_effort_ladder_source();
     match rsid::watchdog::import_pending_restart_records(&data_dir, |record| {
         store
             .persist_daemon_restart_record(record)
@@ -315,6 +479,7 @@ async fn run_daemon() -> Result<()> {
             "Reaped Store-owned provider/tool orphan(s) before provider probes"
         );
     }
+    spans.mark("process_ownership_reap");
 
     // Validate providers only after proving this process owns daemon custody.
     // The local probe can wait on network I/O; a duplicate must fail before
@@ -351,9 +516,15 @@ async fn run_daemon() -> Result<()> {
     } else {
         warn!("Antigravity binary not found; Antigravity provider unavailable");
     }
+    spans.mark("provider_probes");
 
+    let mut pending_client = None;
     let listener = if let Some(listener) = inherited_listener {
-        UnixListener::from_std(listener)?
+        pending_client = listener
+            .pending
+            .map(tokio::net::UnixStream::from_std)
+            .transpose()?;
+        UnixListener::from_std(listener.listener)?
     } else {
         // Only the daemon-owned path probes, unlinks, binds and sets mode.
         if config.socket_path.exists() {
@@ -366,12 +537,14 @@ async fn run_daemon() -> Result<()> {
         listener
     };
 
+    rsid::deploy::note_startup_milestone();
     info!(
         startup_milestone = "socket_bound",
         socket = %config.socket_path.display(),
         "Unix socket bound; RPC acceptance pending initialization"
     );
 
+    spans.mark("socket_bind");
     // C5 activation gates the durable pending journal before any manager can
     // restore or reconcile sessions. Historical Failed rows are never scanned.
     store.ensure_c5_autofile_activation()?;
@@ -397,6 +570,10 @@ async fn run_daemon() -> Result<()> {
         RuntimeConfig::from_config_with_system_prompt_preset(&config, system_prompt_preset_seed);
     let persisted_daemon_settings =
         rsid::store::daemon_settings::apply_persisted_runtime_config(&store, &runtime_config)?;
+    rsid::deploy::write_supervisor_restart_budget_snapshot(
+        &rsi_common::identity::data_path("deploy-restart-budget", "deploy-restart-budget"),
+        &runtime_config,
+    )?;
     // #1036: publish the operator's spend caps for scripts/cloud-spend.py.
     if let Err(error) = rsid::cloud_spend::write_caps_file(
         &rsid::cloud_spend::default_cloud_dir(),
@@ -411,6 +588,17 @@ async fn run_daemon() -> Result<()> {
             "Applied persisted daemon settings"
         );
     }
+    // #2119: the hub build/test CPU budget (`rsi-build.slice`) is in force
+    // before any job or gate starts in it. Every launch re-applies it, so a
+    // failure here is only logged. #2282: the value the store just loaded is
+    // published first, and only the user's own hub daemon writes the slices.
+    rsid::build_budget::apply_at_start(
+        &data_dir,
+        runtime_config
+            .hub_build_cpu_percent
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .await;
 
     // #694 K1: open the provider key vault after the persisted
     // `vault.*` settings are applied. A vault whose directory or file mode is
@@ -423,32 +611,54 @@ async fn run_daemon() -> Result<()> {
     }
     rsid::vault::log_provider_credential_health(&rsid::vault::global());
 
+    // hub #3039: copy the TUI's legacy custom providers (and their plaintext
+    // keys, into the vault) from state.json once, without touching the file,
+    // then reapply the stored model-role assignments whose keys live only in
+    // memory. Neither ever stops the daemon from starting.
+    {
+        let paths = rsid::operator_config::OperatorConfigPaths::production();
+        let vault = rsid::vault::global();
+        match rsid::operator_config::legacy_import::import_legacy_tui_state(&store, &vault, &paths)
+        {
+            Ok(report) if !report.already_imported => info!(
+                source_present = report.source_present,
+                providers_imported = report.providers_imported,
+                keys_imported = report.keys_imported,
+                providers_skipped = report.providers_skipped,
+                keys_skipped = report.keys_skipped,
+                "Imported legacy custom providers from state.json"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "Legacy custom provider import failed; it retries at the next start")
+            }
+        }
+        match rsid::operator_config::custom_providers::reapply_all_routes(
+            &store,
+            &vault,
+            &runtime_config,
+        ) {
+            Ok(0) => {}
+            Ok(applied) => info!(applied, "Applied custom provider model roles"),
+            Err(error) => warn!(%error, "Could not apply custom provider model roles"),
+        }
+    }
+
+    spans.mark("settings_and_vault");
     // Codegraph uses its own project-bound databases. An unavailable project
     // or index subsystem must not prevent the session daemon from starting.
     let index_root = db_path.with_file_name("codegraph");
-    let mut _codegraph_runtime = match IndexRuntime::start_from_store(
-        index_root.clone(),
-        &store,
-        &config.workspace_roots,
+    // The registry snapshot, the project index databases and the watches are
+    // installed by `attach_registry` after readiness (#2375).
+    let mut _codegraph_runtime = IndexRuntime::start_deferred(
+        index_root,
         Some(Arc::clone(&event_bus)),
         Arc::clone(&runtime_config.codegraph_indexing_enabled),
-    ) {
-        Ok(runtime) => Some(runtime),
-        Err(error) => {
-            warn!(%error, "Codegraph startup snapshot rejected; registry refresh will retry");
-            IndexRuntime::start_with_registrations_and_bus_and_gate(
-                index_root,
-                Vec::new(),
-                Vec::new(),
-                &config.workspace_roots,
-                Some(Arc::clone(&event_bus)),
-                Arc::clone(&runtime_config.codegraph_indexing_enabled),
-            )
-            .inspect_err(|error| warn!(%error, "Codegraph registry fallback failed"))
-            .ok()
-        }
-    };
+    )
+    .inspect_err(|error| warn!(%error, "Codegraph startup failed"))
+    .ok();
 
+    spans.mark("codegraph_start");
     // Initialize memory system (enabled by default; disable with RSI_MEMORY_ENABLED=false)
     let memory_manager = if let Some(memory_config) = config.memory_config() {
         // Ensure memory directory exists
@@ -489,19 +699,17 @@ async fn run_daemon() -> Result<()> {
         Arc::clone(&runtime_config),
         config.sandbox_base.clone(),
     )?;
-    if let Some(runtime) = &mut _codegraph_runtime {
-        runtime.attach_registry(
-            session_manager.store().clone(),
-            config.workspace_roots.clone(),
-        );
+    if let Some(runtime) = &_codegraph_runtime {
         session_manager.set_codegraph_handle(runtime.handle().clone());
     }
 
+    spans.mark("session_manager_new");
     if codex_available && let Err(error) = session_manager.refresh_codex_catalog_at_startup().await
     {
         warn!(%error, "Codex catalog startup refresh failed; using repository fallbacks");
     }
 
+    spans.mark("codex_catalog");
     // Initialize background task queue
     let queue_handle = if let Some(queue_config) = config.queue_config() {
         use rsid::queue::processor::NoOpProcessor;
@@ -541,6 +749,7 @@ async fn run_daemon() -> Result<()> {
 
     let session_manager = Arc::new(session_manager);
 
+    spans.mark("queue_and_receivers");
     // Settle the operator queue's crash boundary before restore can start a
     // monitor or the main loop can dispatch another provider turn.
     let (retryable, uncertain) = session_manager
@@ -553,6 +762,7 @@ async fn run_daemon() -> Result<()> {
         );
     }
 
+    spans.mark("operator_message_reconcile");
     // Restore sessions from previous daemon runs. A provider-inventory failure
     // is a daemon-wide startup fence: later best-effort reconciliation and
     // background services must not mutate away the durable candidate cohort.
@@ -573,14 +783,18 @@ async fn run_daemon() -> Result<()> {
             false
         }
     };
-    if session_restore_ready {
-        // The exact journal owns graceful interruptions. Claim it after
-        // invocation and custody restore, before schedulers or watch dispatch.
-        session_manager
-            .reconcile_restart_intents_at_startup()
-            .await?;
-    }
+    // The exact journal owns graceful interruptions. Claim it after
+    // invocation and custody restore, before schedulers or watch dispatch.
+    // Only the claim runs here: the claimed intents stay durable (journal-owned
+    // for every reader), and their provider continuations, about 400 ms per
+    // session, are dispatched in journal order after request_ready (#2375).
+    let restart_intents_to_continue = if session_restore_ready {
+        session_manager.claim_restart_intents_at_startup().await?
+    } else {
+        Vec::new()
+    };
 
+    spans.mark("restore_sessions");
     let program_run_dispatcher = match program_run_startup_sequence(
         || async { session_restore_ready },
         || async {
@@ -607,6 +821,7 @@ async fn run_daemon() -> Result<()> {
         }
     };
 
+    spans.mark("program_runs");
     // C-P2-15: the bounded AppServer control worker. Startup keyset
     // reconciliation runs inside this call and gates writer admission, so a
     // failure here must leave the worker unstarted rather than admitting a
@@ -625,6 +840,7 @@ async fn run_daemon() -> Result<()> {
         }
     };
 
+    spans.mark("app_server_seal");
     // Issue 21 P2-06c: the periodic agent-message reconciliation worker. This
     // is what finally WIRES crash recovery and expiry — the P2-06a/b writers
     // had no production caller until now.
@@ -652,57 +868,84 @@ async fn run_daemon() -> Result<()> {
     // store-guard scope. Nothing panic-related belongs at this spawn site.
     {
         let manager = Arc::clone(&session_manager);
-        tokio::spawn(manager.run_agent_message_reconciliation_loop());
-    }
-    {
-        let manager = Arc::clone(&session_manager);
-        tokio::spawn(manager.run_archived_sandbox_purge_loop());
-    }
-    // Issue #1007: the daemon-owned rolling merge queue. It reconciles
-    // interrupted runs once, then claims work only while the operator setting
-    // is on.
-    tokio::spawn(rsid::rolling_queue::run_rolling_queue_loop(
-        Arc::clone(session_manager.store()),
-        Arc::clone(&runtime_config),
-        rsid::rolling_queue::LanderLauncher::discover(),
-        session_manager.deploy_drain(),
-    ));
-
-    // Issue #1045: daemon-owned deploys. Verifies a `restarting` deploy once,
-    // then waits for a quiet point and restarts through the graceful drain.
-    {
-        let service = rsid::deploy::DeployService::init_global(config.sandbox_base.clone());
-        let manager = Arc::clone(&session_manager);
-        service.set_restart_trigger(Arc::new(move || {
-            rsid::deploy::request_exit_75();
-            manager.request_drain_restart();
-        }));
-        tokio::spawn(rsid::deploy::run_deploy_loop(
-            Arc::clone(session_manager.store()),
-            service,
-            session_manager.deploy_drain(),
-            Arc::clone(&runtime_config),
+        tokio::spawn(after_request_ready(
+            readiness_rx.clone(),
+            manager.run_agent_message_reconciliation_loop(),
         ));
     }
+    // #2201/#2202: admission starts only after the staged-deploy hold is
+    // restored from the durable live deploy row. `DeployDrain` starts empty and
+    // the deploy runner reloads the row only after startup verification, so a
+    // loop spawned before this would admit queued jobs and the next merge-queue
+    // batch while a staged deploy is still draining. A restore failure fails
+    // startup rather than admitting past an unread hold.
+    rsid::deploy::start_admission_after_restore(
+        session_manager.store(),
+        &session_manager.deploy_drain(),
+        &runtime_config,
+        || async {
+            // Issue #1007: the daemon-owned rolling merge queue. It reconciles
+            // interrupted runs once, then claims work only while the operator
+            // setting is on.
+            tokio::spawn(after_request_ready(
+                readiness_rx.clone(),
+                rsid::rolling_queue::run_rolling_queue_loop(
+                    Arc::clone(session_manager.store()),
+                    Arc::clone(&runtime_config),
+                    rsid::rolling_queue::LanderLauncher::discover().with_build_slice(),
+                    session_manager.deploy_drain(),
+                    session_manager.host_load(),
+                ),
+            ));
 
-    // Issue #1002: daemon-owned durable agent jobs. The first poll reconciles
-    // units that finished while rsid was down; each job settles and wakes its
-    // owner exactly once.
-    tokio::spawn(rsid::agent_jobs::run_agent_jobs_loop(
-        Arc::clone(session_manager.store()),
-        rsid::agent_jobs::platform_job_runtime(),
-        session_manager.deploy_drain(),
-    ));
+            // Issue #1045: daemon-owned deploys. Verifies a `restarting` deploy
+            // once, then waits for a quiet point and restarts through the
+            // graceful drain.
+            {
+                let service = rsid::deploy::DeployService::init_global(config.sandbox_base.clone());
+                let manager = Arc::clone(&session_manager);
+                service.set_restart_trigger(Arc::new(move || {
+                    rsid::deploy::request_exit_75();
+                    manager.request_drain_restart();
+                }));
+                tokio::spawn(after_request_ready(
+                    readiness_rx.clone(),
+                    rsid::deploy::run_deploy_loop(
+                        Arc::clone(session_manager.store()),
+                        service,
+                        session_manager.deploy_drain(),
+                        Arc::clone(&runtime_config),
+                    ),
+                ));
+            }
 
+            // Issue #1002: daemon-owned durable agent jobs. The first poll
+            // reconciles units that finished while rsid was down; each job
+            // settles and wakes its owner exactly once.
+            tokio::spawn(after_request_ready(
+                readiness_rx.clone(),
+                rsid::agent_jobs::run_agent_jobs_loop(
+                    Arc::clone(session_manager.store()),
+                    rsid::agent_jobs::platform_job_runtime(),
+                    session_manager.deploy_drain(),
+                ),
+            ));
+        },
+    )
+    .await?;
+
+    spans.mark("admission_restore");
     // Restore has armed all retry candidates; now perform the one bounded C5
     // pending-journal replay without delaying startup or scanning sessions.
     {
         let control = session_manager.agent_control();
-        tokio::spawn(async move {
+        let ready = readiness_rx.clone();
+        tokio::spawn(after_request_ready(ready, async move {
             control.replay_c5_autofile_pending().await;
-        });
+        }));
     }
 
+    spans.mark("c5_replay_spawn");
     let recursive_recovery_budget = recursive_startup_recovery_budget(&config);
     {
         let store = session_manager.store().lock().await;
@@ -750,6 +993,7 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
+    spans.mark("recursive_live_attempts");
     match session_manager
         .commit_recoverable_recursive_live_outputs_after_restart(recursive_recovery_budget.clone())
         .await
@@ -769,31 +1013,10 @@ async fn run_daemon() -> Result<()> {
         ),
     }
 
-    match session_manager
-        .reconcile_closure_outputs_after_restart()
-        .await
-    {
-        Ok(report)
-            if report.examined > 0
-                || report.committed > 0
-                || report.replayed > 0
-                || report.deferred > 0 =>
-        {
-            info!(
-                examined = report.examined,
-                committed = report.committed,
-                replayed = report.replayed,
-                deferred = report.deferred,
-                deadline_reached = report.deadline_reached,
-                "Closure terminal-output startup reconciliation pass complete"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            warn!(error = %error, "Closure terminal-output startup reconciliation deferred")
-        }
-    }
-    Arc::clone(&session_manager).run_closure_output_reconciliation_loop();
+    spans.mark("recursive_live_outputs");
+    // #2375: the Closure terminal-output startup pass (about 290 ms) runs in a
+    // task spawned after request_ready, followed by the five-second sweep loop;
+    // capture is idempotent and terminal sessions also capture at their own end.
 
     {
         let store = session_manager.store().lock().await;
@@ -831,16 +1054,20 @@ async fn run_daemon() -> Result<()> {
         }
     }
 
+    spans.mark("recursive_task_graphs");
     // #634: durable topology executions left in flight by a previous daemon
     // incarnation resume beside the recursive passes, gated by the kill
     // switch and bounded by the same startup recovery budget.
-    Arc::clone(&session_manager)
+    // Only the lease claim runs here; the claimed executions' drivers (whose
+    // first advance launches node sessions) start after request_ready (#2526).
+    let recovered_topology_executions = Arc::clone(&session_manager)
         .start_topology_executor(
             config.recursive_dag_startup_recovery_max_graphs as usize,
             std::time::Duration::from_millis(config.recursive_dag_startup_recovery_time_budget_ms),
         )
         .await;
 
+    spans.mark("topology_executor");
     match session_manager.reconcile_topology_workflows().await {
         Ok(count) => info!(
             topology_count = count,
@@ -849,6 +1076,7 @@ async fn run_daemon() -> Result<()> {
         Err(e) => warn!(error = %e, "Failed to reconcile topology workflow bridge"),
     }
 
+    spans.mark("topology_bridge");
     // Stall classifier signal channel — moved BEFORE stall_detector spawn
     // so the detector can receive a clone of the Sender. Channel is created
     // unconditionally; the classifier task and the detector's classifier
@@ -927,6 +1155,7 @@ async fn run_daemon() -> Result<()> {
         )
     };
 
+    spans.mark("stall_and_chain_setup");
     // Create exactly one runtime from durable policy before any model-capable
     // service is started.  It is shared by Dream and the RPC control surface.
     let model_control_runtime = {
@@ -1143,7 +1372,9 @@ async fn run_daemon() -> Result<()> {
     let scheduler_heartbeat = config
         .scheduler_enabled
         .then(rsid::watchdog::LoopHeartbeat::new);
+    spans.mark("issue_tracker_setup");
     session_manager.clear_stale_harness_process_wakes().await;
+    spans.mark("clear_stale_harness_process_wakes");
     let scheduler_handle = if config.scheduler_enabled {
         let launcher =
             Arc::clone(&session_manager) as Arc<dyn rsid::issue_tracker::poller::SessionLauncher>;
@@ -1181,6 +1412,7 @@ async fn run_daemon() -> Result<()> {
         info!("Terminal watch service enabled");
     }
 
+    spans.mark("scheduler_and_watch_services");
     // Shared HTTP client for Ollama — one pool, reused across compile + warmup
     // + ad-hoc GenerateText calls.
     let ollama_http = reqwest::Client::new();
@@ -1222,6 +1454,7 @@ async fn run_daemon() -> Result<()> {
         Arc::clone(&runtime_config),
     );
 
+    spans.mark("compile_engine_and_warmup");
     let mut rpc_server = RpcServer::new(
         Arc::clone(&session_manager),
         memory_manager.clone(),
@@ -1340,6 +1573,7 @@ async fn run_daemon() -> Result<()> {
                 .await;
         }
     });
+    spans.mark("rpc_server_setup");
     if let Err(error) = session_manager.reconcile_incomplete_agent_spawns().await {
         warn!(error = %error, "Incomplete durable agent spawn reconciliation deferred");
     }
@@ -1349,12 +1583,27 @@ async fn run_daemon() -> Result<()> {
     {
         warn!(error = %error, "Incomplete master successor reconciliation deferred");
     }
+    spans.mark("agent_spawn_successor_reconcile");
     let session_manager_for_successor_backstop = Arc::clone(&session_manager);
     tokio::spawn(rsid::session::retention::run_retention_loop(Arc::clone(
         &session_manager,
     )));
     // #1333: the andon files one kaizen Issue per repeating friction signature.
     tokio::spawn(rsid::friction::run_andon_loop(Arc::clone(&session_manager)));
+    // #2246: a project graph stuck Degraded or Failed for over 24 hours gets one Issue.
+    if let Some(runtime) = &_codegraph_runtime {
+        tokio::spawn(rsid::codegraph::run_codegraph_health_loop(
+            runtime.handle().clone(),
+            session_manager.store().clone(),
+        ));
+    }
+    // #2757: Codex plan windows into the same table Claude's rate_limit_event
+    // feeds (interval: the live setting `codex_rate_limit_poll_secs`, 0 = off).
+    tokio::spawn(rsid::codex_rate_limits::run_codex_rate_limit_poll_loop(
+        session_manager.store().clone(),
+        Arc::clone(session_manager.event_bus()),
+        Arc::clone(&runtime_config),
+    ));
     // #1337: the CPU-time andon per agent-owned process tree.
     tokio::spawn(rsid::cpu_andon::run_cpu_andon_loop(
         Arc::clone(&session_manager),
@@ -1439,21 +1688,20 @@ async fn run_daemon() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_scan = tokio::time::Instant::now();
             loop {
-                let due = tokio::select! {
-                    _=interval.tick()=>true,
+                // #2494: the tick always runs a pass; an event only brings
+                // the next one forward (see `rsid::manager_wake`).
+                let wake = tokio::select! {
+                    _=interval.tick()=>None,
                     event=manager_events.recv()=>match event {
-                        Ok(event)=>matches!(event.as_ref(),
-                            rsid::bus::DaemonEvent::SessionStatusChanged{..}
-                            |rsid::bus::DaemonEvent::SessionQuestionRaised{..}
-                            |rsid::bus::DaemonEvent::SessionCreated{..}
-                            |rsid::bus::DaemonEvent::SessionMetadataChanged{..}
-                            |rsid::bus::DaemonEvent::ProviderRateLimitUpdated{..})
-                            ||matches!(event.as_ref(),rsid::bus::DaemonEvent::SystemMessage{message,..} if message.starts_with("Harness manager decision")),
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>true,
+                        Ok(event)=>Some(rsid::manager_wake::ManagerWake::classify(event.as_ref())),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>Some(rsid::manager_wake::ManagerWake::Hint),
                         Err(tokio::sync::broadcast::error::RecvError::Closed)=>break,
                     }
                 };
-                if !due || last_scan.elapsed() < Duration::from_secs(1) {
+                let runs = wake
+                    .unwrap_or(rsid::manager_wake::ManagerWake::Ignore)
+                    .runs(wake.is_none(), last_scan.elapsed());
+                if !runs {
                     continue;
                 }
                 last_scan = tokio::time::Instant::now();
@@ -1527,7 +1775,9 @@ async fn run_daemon() -> Result<()> {
         info!("Stall-triggered retry handler ready (runtime gated)");
     }
 
+    spans.mark("authority_tail");
     let authority_initialized_at = std::time::Instant::now();
+    rsid::deploy::note_startup_milestone();
     info!(
         startup_milestone = "authority_initialized",
         "Daemon authority initialization complete"
@@ -1538,6 +1788,7 @@ async fn run_daemon() -> Result<()> {
     // receiver monitor keeps the lifecycle cancellation signal truthful while
     // request readiness advances independently of the pass result.
     let sandbox_cache_maintenance = session_manager.start_sandbox_build_cache_maintenance();
+    let source_worktree_settlement = session_manager.start_source_worktree_auto_settlement();
 
     // Journaled Prepared intents hold the custody gate until their rename
     // seam is resolved. Retry them independently of the ordinary policy
@@ -1579,8 +1830,15 @@ async fn run_daemon() -> Result<()> {
         }
     });
 
+    // local #120 (hub #3103): the project-file trash keeps the TUI's 7-day
+    // rule; one bounded pass at start, later passes follow trash writes.
+    tokio::task::spawn_blocking(rsid::prune_project_file_trash_at_start);
+
+    spans.mark("post_authority_services");
     info!(
         startup_milestone = "request_ready",
+        total_elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        process_elapsed_ms = rsid::startup_clock::process_elapsed_ms(),
         post_authority_elapsed_ms = authority_initialized_at
             .elapsed()
             .as_millis()
@@ -1588,12 +1846,137 @@ async fn run_daemon() -> Result<()> {
         "Daemon initialized, ready to accept connections"
     );
     rsid::process_memory::on_request_ready();
+    // #2375: release the loops that wait for readiness (agent-message
+    // reconciliation, merge queue, deploy, agent jobs, C5 replay).
+    let _ = readiness_tx.send(true);
+    // #2375: deploy-interrupted and other restart-journal sessions were
+    // claimed before readiness; their provider continuations start now, in
+    // journal order, ahead of the topology drivers below. They never gate RPC
+    // acceptance.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            session_manager
+                .continue_claimed_restart_intents(restart_intents_to_continue)
+                .await
+        }
+    });
+    // #2753: probe the provider CLI logins (`claude`, `codex`) once the daemon
+    // is up, so launch admission and the provider status know whether each is
+    // logged in before the first session is spent. Background, never gating.
+    session_manager.provider_login().spawn_refresh_all();
+    // #2755: the provider CLI contract canary (Codex hook trust and handshake,
+    // Claude flags and initialize) runs once now and again whenever a CLI's
+    // version changes. Background, never gating; a failed check only marks the
+    // provider degraded.
+    session_manager.spawn_provider_contract_check();
+    // #2375: the Closure terminal-output startup pass (a bounded store walk) and
+    // the five-second sweep loop that follows it start only now; neither may
+    // gate RPC acceptance. The pass is idempotent, so a reader that races it
+    // sees the same state the periodic sweep already allows.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            session_manager
+                .run_closure_output_recovery_after_readiness()
+                .await
+        }
+    });
+    // #2375: the codegraph registry snapshot, the project index databases and
+    // the inotify watches (about 470 ms) are installed by the registry task,
+    // which starts only now; they never gate RPC acceptance.
+    if let Some(runtime) = &mut _codegraph_runtime {
+        runtime.attach_registry(
+            session_manager.store().clone(),
+            config.workspace_roots.clone(),
+        );
+    }
+
+    // #2561: a shutdown the supervisor had to force-end is surfaced to the
+    // managers by this start. A store pass, so it follows readiness.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            let store = session_manager.store().lock().await;
+            let surfaced = rsid::supervisor_shutdown::surface_incidents(
+                &store,
+                &rsid::supervisor_shutdown::incident_path(),
+            );
+            if surfaced > 0 {
+                warn!(
+                    surfaced,
+                    "Recorded forced daemon shutdown incidents from the supervisor"
+                );
+            }
+        }
+    });
+    // #2375: starter topology seeding (a store pass) follows readiness; it
+    // must never gate RPC acceptance.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            session_manager
+                .seed_starter_topologies_after_restart()
+                .await
+        }
+    });
+    // Retained settlement journals already fence launch, archive and cleanup.
+    // Process-holder proofs can be expensive and must never gate RPC acceptance.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            if let Err(error) = session_manager
+                .recover_startup_source_worktree_settlements()
+                .await
+            {
+                warn!(error = %error, "Post-readiness settlement recovery deferred; durable fences remain");
+            }
+        }
+    });
+    // #2526: a recovered topology execution's first advance launches a node
+    // session (git-worktree sandbox allocation, target seed, provider spawn)
+    // and the archived sandbox purge runs git proofs; neither may sit on the
+    // readiness path, so both start only now.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            session_manager
+                .drive_recovered_topology_executions(recovered_topology_executions)
+                .await
+        }
+    });
+    {
+        let manager = Arc::clone(&session_manager);
+        tokio::spawn(manager.run_archived_sandbox_purge_loop());
+    }
+    // Topology pending discards and settlement cleanup release sandboxes via
+    // git proofs (~129 git subprocesses on a big retained set, #2375). They
+    // are durable and idempotent and the supervisor already runs them beside
+    // RPC traffic, so they must never gate RPC acceptance.
+    tokio::spawn({
+        let session_manager = Arc::clone(&session_manager);
+        async move {
+            session_manager
+                .recover_topology_settlements_after_restart()
+                .await
+        }
+    });
     // Sandbox diagnostics classify every retained sandbox; they run after
     // readiness so they never delay restarts (#961).
     tokio::spawn({
         let session_manager = Arc::clone(&session_manager);
         async move { session_manager.run_startup_sandbox_diagnostics().await }
     });
+    // #2384: the cold-storage archive loop is spawned only after readiness and
+    // waits a further 15 minutes before its first look at the setting, so an
+    // archive pass can never sit on the startup or readiness path. The manager's
+    // pass-thread lifecycle becomes the process-wide one here too (#205): the
+    // deploy loop and the exit path reach it through that slot, and no pass can
+    // exist before it (no connection is accepted until this block is past).
+    rsid::cold_archive_lifecycle::install_process(Arc::clone(
+        session_manager.cold_archive_lifecycle(),
+    ));
+    tokio::spawn(Arc::clone(&session_manager).run_cold_archive_loop());
 
     let mut watchdog = Some(rsid::watchdog::start_watchdog(
         config.socket_path.clone(),
@@ -1620,6 +2003,9 @@ async fn run_daemon() -> Result<()> {
     // the standard "stop the daemon" case. `Signal::recv` is cancel-safe, so
     // losing this branch to another `select!` arm cannot drop a signal.
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    // #2936: after the SIGTERM handler exists, so the watch's signal drains.
+    #[cfg(target_os = "macos")]
+    rsid::supervisor_shutdown::spawn_supervisor_parent_watch();
 
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     let mut operator_drain_started: Option<tokio::time::Instant> = None;
@@ -1641,18 +2027,36 @@ async fn run_daemon() -> Result<()> {
                 if session_manager.drain_restart_requested() {
                     let started = *operator_drain_started.get_or_insert_with(|| {
                         info!("Operator DRAIN restart requested; status reads remain available during the wait");
+                        rsid::supervisor_shutdown::mark_shutdown_begun("drain_restart");
                         tokio::time::Instant::now()
                     });
                     shutdown_deadline = started + OPERATOR_DRAIN_LIMIT + SHUTDOWN_LIMIT;
-                    let snapshot = session_manager.drain_restart_status().await;
-                    let active_count = snapshot["active_sessions"].as_array().map_or(0, Vec::len);
-                    if active_count == 0 || tokio::time::Instant::now() >= started + OPERATOR_DRAIN_LIMIT {
+                    // Complete when nothing is active, when every active session
+                    // waits only on a call the daemon is serving (a turn that
+                    // cannot finish while the daemon drains, #2353), or at the limit.
+                    let decision = session_manager
+                        .operator_drain_decision(started.elapsed(), OPERATOR_DRAIN_LIMIT)
+                        .await;
+                    if let rsid::session::OperatorDrainDecision::Complete {
+                        active_count,
+                        daemon_waiting,
+                        deploy_interrupted,
+                        limit_reached,
+                    } = decision
+                    {
+                        if daemon_waiting > 0 && !limit_reached {
+                            info!(daemon_waiting, "Operator DRAIN wait ends early: every remaining session waits only on the daemon");
+                        }
+                        if deploy_interrupted > 0 && !limit_reached {
+                            info!(deploy_interrupted, "Operator DRAIN wait ends early: the remaining workers are the ones the deploy interrupts");
+                        }
                         info!(active_count, "Operator DRAIN wait complete");
                         if let Some(watchdog) = watchdog.take() { watchdog.stop(); }
                         if let Some(handle) = &scheduler_handle {
                             let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
                         }
                         drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                        rpc_server.begin_connection_drain();
                     }
                 }
             }
@@ -1663,6 +2067,7 @@ async fn run_daemon() -> Result<()> {
             }
             _ = &mut ctrl_c, if drain_deadline.is_none() => {
                 info!("Received shutdown signal (Ctrl+C)");
+                rsid::supervisor_shutdown::mark_shutdown_begun("ctrl_c");
                 hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
@@ -1671,10 +2076,12 @@ async fn run_daemon() -> Result<()> {
                     let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
                 }
                 drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                rpc_server.begin_connection_drain();
                 info!(connections = connections.len(), "Connection drain started");
             }
             _ = sigterm.recv(), if drain_deadline.is_none() => {
                 info!("Received shutdown signal (SIGTERM)");
+                rsid::supervisor_shutdown::mark_shutdown_begun("sigterm");
                 hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
@@ -1683,6 +2090,7 @@ async fn run_daemon() -> Result<()> {
                     let _ = shutdown_stage("scheduler", shutdown_deadline, handle.shutdown()).await;
                 }
                 drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
+                rpc_server.begin_connection_drain();
                 info!(connections = connections.len(), "Connection drain started");
             }
             () = async {
@@ -1700,7 +2108,14 @@ async fn run_daemon() -> Result<()> {
                     warn!(%error, "Connection handler task failed during drain");
                 }
             }
-            result = listener.accept(), if drain_deadline.is_none() => {
+            result = async {
+                if let Some(stream) = pending_client.take() {
+                    let address = stream.peer_addr()?;
+                    Ok((stream, address))
+                } else {
+                    listener.accept().await
+                }
+            }, if drain_deadline.is_none() => {
                 match result {
                     Ok((stream, _)) => {
                         let server = Arc::clone(&rpc_server);
@@ -1729,6 +2144,7 @@ async fn run_daemon() -> Result<()> {
     // Stop pressure continuations before shutdown awaits other services.
     // Already accepted worker jobs retain their cancellation-safe settlement.
     sandbox_cache_maintenance.abort();
+    source_worktree_settlement.abort();
 
     // Graceful shutdown
     if let Some(watchdog) = watchdog.take() {
@@ -1842,6 +2258,17 @@ fn install_panic_hook() {
         tracing::error!(location = %location, message = %message, "panic in daemon");
         previous_hook(panic_info);
     }));
+}
+
+/// Runs `work` once the `request_ready` milestone has been signalled. A daemon
+/// that exits before readiness drops the sender; the work then starts so a
+/// shutdown path never leaves it parked.
+async fn after_request_ready<F: std::future::Future>(
+    mut ready: tokio::sync::watch::Receiver<bool>,
+    work: F,
+) -> F::Output {
+    let _ = ready.wait_for(|ready| *ready).await;
+    work.await
 }
 
 fn recursive_startup_recovery_budget(config: &Config) -> RecursiveRecoveryBudget {
@@ -1989,10 +2416,17 @@ mod tests {
     }
 
     fn health_rpc(socket_path: &std::path::Path) -> std::io::Result<String> {
+        health_rpc_with_read_timeout(socket_path, std::time::Duration::from_secs(1))
+    }
+
+    fn health_rpc_with_read_timeout(
+        socket_path: &std::path::Path,
+        read_timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
         use std::io::{BufRead, Write};
 
         let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+        stream.set_read_timeout(Some(read_timeout))?;
         stream.write_all(
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"GetHealthStatus\",\"params\":null}\n",
         )?;
@@ -2044,6 +2478,7 @@ mod tests {
     #[test]
     #[ignore = "fixture entry point for the isolated real-daemon startup test"]
     fn sr2_real_daemon_fixture_process() {
+        let startup = prepare_daemon().expect("single-threaded fixture startup");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -2052,7 +2487,7 @@ mod tests {
             // Stands in for a blocking read of a provider child's pipe.
             runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(600)));
         }
-        run_to_bounded_exit(runtime, run_daemon()).expect("isolated daemon fixture");
+        run_to_bounded_exit(runtime, run_daemon(startup)).expect("isolated daemon fixture");
     }
 
     fn assert_isolated_sigint_exit(
@@ -2369,7 +2804,9 @@ mod tests {
         let ready_log = wait_for_log(
             &log_path,
             "startup_milestone=\"request_ready\"",
-            std::time::Duration::from_secs(5),
+            // Generous: only a log poll, and the hold (30 s safety net)
+            // outlasts it plus the health deadline below.
+            std::time::Duration::from_secs(10),
         );
         let request_ready_line = ready_log
             .lines()
@@ -2383,9 +2820,19 @@ mod tests {
             "request readiness took {post_authority_elapsed_ms} ms after authority initialization"
         );
 
-        let health_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // The daemon holds reclaim until this test writes `reclaim_release`
+        // (its own safety timeout is 30 s, `pause_reclaim_after_single_flight_for_test`),
+        // so the deadline only has to be generous: a host under load may take
+        // seconds to answer, and a read that times out (EAGAIN/WouldBlock) is
+        // retried. The deadline plus one read timeout stays well inside the
+        // hold, and the checks below prove the hold was still in force when
+        // the answer arrived.
+        const REAL_DAEMON_HEALTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+        const REAL_DAEMON_HEALTH_ATTEMPT_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(5);
+        let health_deadline = std::time::Instant::now() + REAL_DAEMON_HEALTH_DEADLINE;
         let health_response = loop {
-            match health_rpc(&socket) {
+            match health_rpc_with_read_timeout(&socket, REAL_DAEMON_HEALTH_ATTEMPT_TIMEOUT) {
                 Ok(response) if response.contains("\"result\"") => break response,
                 _ if std::time::Instant::now() < health_deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2393,6 +2840,15 @@ mod tests {
                 other => panic!("health RPC did not complete during reclaim hold: {other:?}"),
             }
         };
+        // The hold is still in force when the answer arrives: the test has not
+        // released it, the daemon's own 30 s safety net cannot have expired, and
+        // the entered marker is still there (checked again via the log below).
+        assert!(
+            reclaim_entered.exists()
+                && !reclaim_release.exists()
+                && held_at.elapsed() < std::time::Duration::from_secs(28),
+            "health answered only after the reclaim hold could have ended"
+        );
         assert!(health_response.contains("\"jsonrpc\":\"2.0\""));
         assert!(
             !std::fs::read_to_string(&log_path)
@@ -2416,7 +2872,8 @@ mod tests {
         let terminal_log = wait_for_log(
             &log_path,
             "Sandbox build-cache reclaim pass completed",
-            std::time::Duration::from_secs(5),
+            // The hold is released; only a loaded host delays the log line.
+            std::time::Duration::from_secs(20),
         );
 
         let accepted = terminal_log
@@ -2535,9 +2992,231 @@ mod tests {
     }
 
     #[test]
+    fn settlement_process_proofs_are_dispatched_after_rpc_readiness() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").unwrap();
+        let main_end = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .unwrap()
+            + main_start;
+        let main_body = &source[main_start..main_end];
+        let ready = main_body
+            .find(r#"startup_milestone = "request_ready""#)
+            .unwrap();
+        let recovery = main_body
+            .find("recover_startup_source_worktree_settlements()")
+            .unwrap();
+        assert!(ready < recovery);
+        let launch = include_str!("session/launch.rs");
+        let restore = launch
+            .split_once("pub async fn restore_sessions(&self)")
+            .unwrap()
+            .1;
+        let restore = restore
+            .split_once(r#"startup_milestone = "authority_restore_complete""#)
+            .unwrap()
+            .0;
+        assert_eq!(
+            restore
+                .matches("reap_startup_settlement_orphans_checked")
+                .count(),
+            0
+        );
+        assert_eq!(
+            restore
+                .matches("recover_source_worktree_settlements")
+                .count(),
+            0
+        );
+    }
+
+    /// #2384 (plan §5, review #2398): a supervised restart exits 75 after the
+    /// compaction helper ran or was killed at its deadline; nothing else runs it.
+    #[test]
+    fn a_supervised_exit_runs_the_compaction_first_and_always_exits_75() {
+        use rsid::cold_compact::HelperOutcome;
+        for outcome in [
+            Some(HelperOutcome::Killed),
+            Some(HelperOutcome::Exited(Some(1))),
+            Some(HelperOutcome::SpawnFailed("gone".into())),
+            Some(HelperOutcome::Deferred(
+                "a pass thread was still running".into(),
+            )),
+            None,
+        ] {
+            let mut ran = false;
+            let code = supervised_exit_code(true, true, || {
+                ran = true;
+                outcome.clone()
+            });
+            assert_eq!(
+                code,
+                Some(rsid::watchdog::WATCHDOG_EXIT_CODE),
+                "{outcome:?}"
+            );
+            assert!(ran);
+        }
+        // No restart requested, or the daemon failed: no helper, no exit 75.
+        for (ok, exit_75) in [(true, false), (false, true), (false, false)] {
+            let code = supervised_exit_code(ok, exit_75, || panic!("no compaction here"));
+            assert_eq!(code, None);
+        }
+        // The real exit path calls the helper after the runtime teardown and
+        // before the exit.
+        let source = include_str!("main.rs");
+        let start = source.find("fn run_to_bounded_exit").unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let teardown = body
+            .find("runtime.shutdown_timeout(RUNTIME_DROP_GRACE)")
+            .unwrap();
+        let compact = body
+            .find("rsid::cold_compact::compact_before_exit")
+            .unwrap();
+        let exit = body.find("std::process::exit(code)").unwrap();
+        assert!(teardown < compact && compact < exit);
+    }
+
+    #[test]
+    fn the_compaction_helper_mode_parses_before_any_daemon_starts() {
+        let args: Vec<std::ffi::OsString> = [
+            "cold-archive-compact",
+            "--db",
+            "/d/rsi.db",
+            "--tmp-dir",
+            "/d/tmp/compact-1",
+            "--result",
+            "/d/tmp/compact-1.json",
+            "--run-id",
+            "00000000-0000-4000-8000-000000000001",
+        ]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+        assert!(matches!(
+            cli_action(&args),
+            CliAction::ColdArchiveCompact(_)
+        ));
+        assert_eq!(cli_action(&args[..3]), CliAction::Invalid);
+        let source = include_str!("main.rs");
+        let main_start = source.find("fn main() -> Result<()>").unwrap();
+        let helper = source[main_start..]
+            .find("CliAction::ColdArchiveCompact(args)")
+            .unwrap();
+        let daemon = source[main_start..].find("prepare_daemon()?").unwrap();
+        assert!(
+            helper < daemon,
+            "the helper mode exits before prepare_daemon"
+        );
+    }
+
+    /// #2384: the compaction decision lives at the deploy loop's quiet point
+    /// (before `mark_agent_deploy_restarting`) and its reconcile in the
+    /// cold-archive loop; neither is on the startup or readiness path.
+    #[test]
+    fn the_compaction_decision_and_reconcile_are_never_on_the_startup_path() {
+        let main = include_str!("main.rs");
+        let main_start = main.find("async fn run_daemon").unwrap();
+        let main_end = main[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .unwrap()
+            + main_start;
+        let daemon = &main[main_start..main_end];
+        for name in [
+            "decide_at_quiet_point",
+            "cold_claim_compaction",
+            "cold_reconcile_compactions",
+            "run_compaction",
+        ] {
+            assert!(!daemon.contains(name), "run_daemon names {name}");
+        }
+        let deploy = include_str!("deploy.rs");
+        let poll = deploy.find("async fn poll_step(").unwrap();
+        let poll_end = poll + deploy[poll..].find("\n}\n").unwrap();
+        let decide = deploy
+            .find("crate::cold_compact::decide_at_quiet_point(&store)")
+            .unwrap();
+        let restarting = deploy[poll..poll_end]
+            .find("store.mark_agent_deploy_restarting(row.id, now)")
+            .unwrap()
+            + poll;
+        assert!(
+            poll < decide && decide < restarting,
+            "decided at the quiet point, before the restart mark"
+        );
+        assert_eq!(deploy.matches("decide_at_quiet_point").count(), 1);
+        // The store reconcile has one caller, `reconcile_cold_compactions`, and
+        // that runs only first thing in the loop spawned after readiness.
+        let service = include_str!("session/cold_archive.rs");
+        assert_eq!(service.matches("cold_reconcile_compactions(").count(), 1);
+        assert_eq!(service.matches(".reconcile_cold_compactions()").count(), 1);
+        let loop_start = service.find("pub async fn run_cold_archive_loop").unwrap();
+        let call = service.find(".reconcile_cold_compactions()").unwrap();
+        let delay = service
+            .find("tokio::time::sleep(COLD_ARCHIVE_INITIAL_DELAY)")
+            .unwrap();
+        assert!(
+            loop_start < call && call < delay,
+            "reconciled first thing in the archive loop"
+        );
+    }
+
+    /// #2384 review (#205): the session manager's archive lifecycle becomes the
+    /// process-wide one after readiness (nothing on the startup path touches the
+    /// cold archive) and before the loop that can start a pass, so the deploy loop
+    /// and the exit path reach it.
+    #[test]
+    fn the_archive_lifecycle_is_installed_after_readiness_and_before_the_archive_loop() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").unwrap();
+        let main_end = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .unwrap()
+            + main_start;
+        let body = &source[main_start..main_end];
+        let ready = body.find(r#"startup_milestone = "request_ready""#).unwrap();
+        let install = body.find("install_process(").unwrap();
+        let spawn = body.find("run_cold_archive_loop()").unwrap();
+        assert!(ready < install, "never on the startup or readiness path");
+        assert!(install < spawn, "installed before the loop is spawned");
+        assert_eq!(body.matches("install_process(").count(), 1);
+    }
+
+    /// #2384: the cold-archive loop is spawned after `request_ready`, never on
+    /// the startup or readiness path, and nothing before readiness starts a pass.
+    #[test]
+    fn cold_archive_loop_is_spawned_after_request_ready() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").unwrap();
+        let main_end = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .unwrap()
+            + main_start;
+        let main_body = &source[main_start..main_end];
+        let ready = main_body
+            .find(r#"startup_milestone = "request_ready""#)
+            .unwrap();
+        let spawn = main_body.find("run_cold_archive_loop()").unwrap();
+        assert!(ready < spawn, "the archive loop must follow readiness");
+        assert_eq!(main_body.matches("run_cold_archive_loop").count(), 1);
+        assert!(
+            !main_body[..ready].contains("cold_archive"),
+            "nothing on the startup path may touch the cold archive"
+        );
+        let service = include_str!("session/cold_archive.rs");
+        let initial_delay = service
+            .find("tokio::time::sleep(COLD_ARCHIVE_INITIAL_DELAY)")
+            .unwrap();
+        let first_tick = service.find("interval.tick().await").unwrap();
+        assert!(
+            initial_delay < first_tick,
+            "the loop waits its initial delay before its first tick"
+        );
+    }
+
+    #[test]
     fn provider_inventory_fence_precedes_probes_workers_and_restore() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn run_daemon").expect("main function");
+        let main_start = source.find("fn prepare_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)
@@ -2686,10 +3365,398 @@ mod tests {
         assert!(producer < periodic);
     }
 
+    /// #2375: the topology settlement cleanup (about 129 git subprocesses)
+    /// must not sit between authority_restore_complete and request_ready.
+    /// Only the execution-resume pass is awaited before readiness; the
+    /// settlement recovery is a spawned task after the request_ready milestone.
+    #[test]
+    fn topology_settlement_recovery_runs_after_request_ready_in_a_spawned_task() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").expect("main function");
+        let helper_start = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .map(|offset| main_start + offset)
+            .expect("startup recovery helper follows main");
+        let main_body = &source[main_start..helper_start];
+
+        let executor_start = main_body
+            .find(".start_topology_executor(")
+            .expect("topology executor resume pass");
+        let request_ready = main_body
+            .find("startup_milestone = \"request_ready\"")
+            .expect("request-ready milestone");
+        let cleanup = main_body
+            .find(".recover_topology_settlements_after_restart()")
+            .expect("deferred settlement recovery");
+        let accept = main_body.find("listener.accept()").expect("accept loop");
+        assert!(executor_start < request_ready);
+        assert!(request_ready < cleanup, "cleanup must follow readiness");
+        assert!(cleanup < accept);
+        // It is detached: the closest preceding statement is a tokio::spawn,
+        // not an inline await in the readiness path.
+        let spawn = main_body[request_ready..cleanup]
+            .rfind("tokio::spawn(")
+            .expect("cleanup is spawned");
+        assert!(spawn < cleanup - request_ready);
+        assert!(
+            !main_body[..request_ready].contains("recover_topology_settlements_after_restart"),
+            "the cleanup is not referenced on the readiness path"
+        );
+
+        // The awaited pass owns no settlement work.
+        let graph = include_str!("session/graph_executions.rs");
+        let start = graph
+            .find("pub async fn start_topology_executor")
+            .expect("start_topology_executor");
+        let end = graph[start..]
+            .find("pub async fn recover_topology_settlements_after_restart")
+            .map(|offset| start + offset)
+            .expect("deferred recovery follows");
+        let pre_readiness = &graph[start..end];
+        assert!(pre_readiness.contains("claim_recovery_leases("));
+        assert!(!pre_readiness.contains("recover_executions("));
+        assert!(!pre_readiness.contains("recover_after_restart("));
+        assert!(!pre_readiness.contains("recover_settlements("));
+    }
+
+    /// #2375: starter topology seeding and codegraph watch installation are
+    /// off the readiness path, and the milestone logs the process clock.
+    #[test]
+    fn starter_seeding_and_codegraph_watches_follow_request_ready() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").expect("main function");
+        let helper_start = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .map(|offset| main_start + offset)
+            .expect("startup recovery helper follows main");
+        let main_body = &source[main_start..helper_start];
+        let request_ready = main_body
+            .find("startup_milestone = \"request_ready\"")
+            .expect("request-ready milestone");
+        let accept = main_body.find("listener.accept()").expect("accept loop");
+        let (before, after) = main_body.split_at(request_ready);
+
+        assert!(!before.contains("seed_starter_topologies_after_restart"));
+        let seed = after
+            .find(".seed_starter_topologies_after_restart()")
+            .expect("starter seeding follows readiness");
+        assert!(request_ready + seed < accept);
+        assert!(
+            after[..seed].rfind("tokio::spawn(").is_some(),
+            "starter seeding is detached from the readiness path"
+        );
+        assert!(
+            after[..after
+                .find("rsid::process_memory::on_request_ready()")
+                .unwrap()]
+                .contains("process_elapsed_ms ="),
+            "the milestone logs process_elapsed_ms beside total_elapsed_ms"
+        );
+
+        // The awaited executor pass no longer seeds starters.
+        let graph = include_str!("session/graph_executions.rs");
+        let start = graph
+            .find("pub async fn start_topology_executor")
+            .expect("start_topology_executor");
+        let end = graph[start..]
+            .find("pub async fn drive_recovered_topology_executions")
+            .map(|offset| start + offset)
+            .expect("post-readiness driver follows");
+        assert!(!graph[start..end].contains("starters::seed_all("));
+        assert!(graph.contains("pub async fn seed_starter_topologies_after_restart"));
+
+        // Codegraph startup registers nothing: the registry snapshot, the index
+        // databases and the watches are the registry task's first step, which
+        // starts only after the request_ready milestone.
+        assert!(!before.contains("IndexRuntime::start_from_store"));
+        assert!(!before.contains(".attach_registry("));
+        let attach = after
+            .find(".attach_registry(")
+            .expect("registry task starts after readiness");
+        assert!(request_ready + attach < accept);
+        let runtime = include_str!("codegraph/runtime.rs");
+        let deferred = runtime
+            .find("pub fn start_deferred")
+            .expect("start_deferred");
+        let deferred_end = runtime[deferred..]
+            .find("fn start_with_workspaces")
+            .map(|offset| deferred + offset)
+            .expect("start_with_workspaces");
+        assert!(runtime[deferred..deferred_end].contains("Vec::new()"));
+    }
+
+    /// #2375: the process-start-to-first-log window (~540 ms) was the walk of
+    /// the private spools' contents. Only the shallow pass precedes tracing;
+    /// the walk runs on its own thread once the runtime exists, and the
+    /// first log line carries the clock so the window stays visible.
+    #[test]
+    fn private_spool_walk_is_off_the_pre_tracing_path() {
+        let source = include_str!("main.rs");
+        let prepare = source.find("fn prepare_daemon").expect("prepare_daemon");
+        let run = source.find("async fn run_daemon").expect("run_daemon");
+        let prepare_end = source
+            .find("fn spawn_private_subtree_hardening")
+            .expect("hardening helper");
+        let prepare_body = &source[prepare..prepare_end];
+        assert!(prepare_body.contains("harden_data_dir_top("));
+        assert!(!prepare_body.contains("harden_data_dir("));
+        assert!(!prepare_body.contains("harden_private_subtrees("));
+        assert!(
+            !prepare_body.contains("thread::"),
+            "prepare stays single-threaded"
+        );
+        let tracing_init = prepare_body
+            .find("tracing_subscriber::fmt::init()")
+            .unwrap();
+        let first_line = prepare_body.find("\"rsid starting...\"").unwrap();
+        assert!(tracing_init < first_line);
+        assert!(
+            prepare_body[tracing_init..first_line].contains("process_elapsed_ms"),
+            "the first log line names the process clock"
+        );
+        let run_body = &source[run..];
+        let spawn = run_body
+            .find("spawn_private_subtree_hardening(data_dir.clone())")
+            .expect("walk starts in run_daemon");
+        let socket_bound = run_body
+            .find("startup_milestone = \"socket_bound\"")
+            .unwrap();
+        assert!(spawn < socket_bound);
+        assert!(source.contains("harden_private_subtrees(&data_dir)"));
+    }
+
+    /// #2375: every awaited gap before `request_ready` has a named span.
+    #[test]
+    fn startup_spans_tile_the_authority_gap() {
+        let source = include_str!("main.rs");
+        let run = source.find("async fn run_daemon").expect("run_daemon");
+        let body = &source[run..];
+        let restore = body.find("spans.mark(\"restore_sessions\")").unwrap();
+        let tail = body.find("spans.mark(\"authority_tail\")").unwrap();
+        let initialized = body
+            .find("startup_milestone = \"authority_initialized\"")
+            .unwrap();
+        let ready = body.find("startup_milestone = \"request_ready\"").unwrap();
+        assert!(restore < tail && tail < initialized && initialized < ready);
+        for name in [
+            "operator_message_reconcile",
+            "program_runs",
+            "admission_restore",
+            "topology_executor",
+            "topology_bridge",
+            "clear_stale_harness_process_wakes",
+            "post_authority_services",
+        ] {
+            assert!(body.contains(&format!("spans.mark(\"{name}\")")), "{name}");
+        }
+    }
+
+    /// #2375 slice 4: the Closure terminal-output startup pass is not awaited
+    /// between authority_restore_complete and request_ready. A task spawned
+    /// after the milestone runs the pass and then the sweep loop; the pass is
+    /// idempotent (capture-or-replay), so it still completes.
+    #[test]
+    fn closure_output_recovery_runs_after_request_ready_in_a_spawned_task() {
+        let source = include_str!("main.rs");
+        let run = source.find("async fn run_daemon").expect("run_daemon");
+        let tests = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("tests module");
+        let body = &source[run..tests];
+        let ready = body.find("startup_milestone = \"request_ready\"").unwrap();
+        let task = body
+            .find(".run_closure_output_recovery_after_readiness()")
+            .expect("closure recovery task");
+        let accept = body.find("// Main loop").unwrap();
+        assert!(ready < task && task < accept);
+        assert!(
+            body[ready..task].rfind("tokio::spawn(").is_some(),
+            "the closure pass is a detached task"
+        );
+        assert!(
+            !body[..ready].contains("reconcile_closure_outputs_after_restart")
+                && !body[..ready].contains("run_closure_output_reconciliation_loop"),
+            "no closure sweep runs on the readiness path"
+        );
+        assert!(!body.contains("spans.mark(\"closure_outputs\")"));
+
+        // The task runs the pass first, then the loop, so they never overlap.
+        let session = include_str!("session/mod.rs");
+        let start = session
+            .find("pub async fn run_closure_output_recovery_after_readiness")
+            .expect("recovery task body");
+        let pass = session[start..]
+            .find("self.reconcile_closure_outputs_after_restart()")
+            .expect("startup pass");
+        let sweep = session[start..]
+            .find("self.run_closure_output_reconciliation_loop()")
+            .expect("sweep loop");
+        assert!(pass < sweep);
+    }
+
+    /// #2375 slice 5: the daemon loops whose first pass walks the store
+    /// (agent-message reconciliation, merge queue, deploy, agent jobs, C5
+    /// replay) are spawned before readiness but wait for the `request_ready`
+    /// signal, so none holds the store lock inside the authority window. The
+    /// signal is sent right after the milestone, and each loop still runs.
+    #[test]
+    fn store_walking_loops_wait_for_the_request_ready_signal() {
+        let source = include_str!("main.rs");
+        let run = source.find("async fn run_daemon").expect("run_daemon");
+        let tests = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("tests module");
+        let body = &source[run..tests];
+        let ready = body.find("startup_milestone = \"request_ready\"").unwrap();
+        let signal = body.find("readiness_tx.send(true)").expect("signal");
+        assert!(ready < signal);
+        for spawn in [
+            "run_agent_message_reconciliation_loop()",
+            "run_rolling_queue_loop(",
+            "run_deploy_loop(",
+            "run_agent_jobs_loop(",
+            "replay_c5_autofile_pending()",
+        ] {
+            let at = body.find(spawn).unwrap_or_else(|| panic!("{spawn}"));
+            let gate = body[..at]
+                .rfind("after_request_ready(")
+                .unwrap_or_else(|| panic!("{spawn} is not gated"));
+            assert!(at - gate < 600, "{spawn} must sit inside its gate");
+            assert!(gate < ready, "{spawn} is spawned before the milestone");
+        }
+        assert!(
+            !body.contains("tokio::spawn(rsid::agent_jobs::run_agent_jobs_loop"),
+            "no ungated jobs loop"
+        );
+    }
+
+    /// The gate runs its work after the signal, and still runs it when the
+    /// sender is dropped without one.
+    #[tokio::test]
+    async fn after_request_ready_runs_work_after_the_signal_and_on_sender_drop() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let task = tokio::spawn(after_request_ready(rx.clone(), async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        tokio::task::yield_now().await;
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        tx.send(true).unwrap();
+        task.await.unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        assert_eq!(after_request_ready(rx, async { 7 }).await, 7);
+    }
+
+    /// #2375: restart-journal continuations (a provider spawn each, about 400 ms
+    /// per deploy-interrupted worker) are dispatched by a task spawned after
+    /// `request_ready`, ahead of the topology drivers; before readiness only
+    /// the claim runs, and the whole pass never runs inline.
+    #[test]
+    fn restart_journal_continuations_are_spawned_after_request_ready() {
+        let source = include_str!("main.rs");
+        let run = source.find("async fn run_daemon").expect("run_daemon");
+        let tests = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("tests module");
+        let body = &source[run..tests];
+        let restore = body.find("spans.mark(\"restore_sessions\")").unwrap();
+        let claim = body.find(".claim_restart_intents_at_startup()").unwrap();
+        let ready = body.find("startup_milestone = \"request_ready\"").unwrap();
+        let cont = body.find(".continue_claimed_restart_intents(").unwrap();
+        let drivers = body.find(".drive_recovered_topology_executions(").unwrap();
+        let accept = body.find("// Main loop").unwrap();
+        assert!(
+            claim < restore,
+            "the claim is authority work before readiness"
+        );
+        assert!(ready < cont, "the continuation follows readiness");
+        assert!(
+            cont < drivers,
+            "journal resumes start before the topology drivers"
+        );
+        assert!(cont < accept);
+        assert!(
+            body[ready..cont].rfind("tokio::spawn(").is_some(),
+            "the continuation is a detached task"
+        );
+        assert!(
+            !body[..ready].contains(".continue_claimed_restart_intents(")
+                && !body.contains(".reconcile_restart_intents_at_startup()"),
+            "the whole journal pass never runs inline on the startup path"
+        );
+    }
+
+    /// #2526: no topology node launch and no sandbox work (archived purge)
+    /// may happen before request_ready. Before it, restart recovery only
+    /// claims leases; the drivers (whose first advance launches node sessions)
+    /// and the purge loop are spawned after the milestone.
+    #[test]
+    fn topology_node_launch_and_sandbox_purge_start_after_request_ready() {
+        let source = include_str!("main.rs");
+        let main_start = source.find("async fn run_daemon").expect("main function");
+        let helper_start = source[main_start..]
+            .find("fn recursive_startup_recovery_budget")
+            .map(|offset| main_start + offset)
+            .expect("startup recovery helper follows main");
+        let main_body = &source[main_start..helper_start];
+        let request_ready = main_body
+            .find("startup_milestone = \"request_ready\"")
+            .expect("request-ready milestone");
+        let accept = main_body.find("listener.accept()").expect("accept loop");
+        let (before, after) = main_body.split_at(request_ready);
+
+        for call in [
+            "drive_recovered_topology_executions(",
+            "run_archived_sandbox_purge_loop()",
+        ] {
+            assert!(!before.contains(call), "{call} must follow request_ready");
+            let at = after.find(call).unwrap_or_else(|| panic!("{call} spawned"));
+            assert!(request_ready + at < accept);
+            assert!(
+                after[..at].rfind("tokio::spawn(").is_some(),
+                "{call} is detached from the readiness path"
+            );
+        }
+        // The awaited startup pass never advances an execution or drives one.
+        assert!(!before.contains("recover_topology_settlements_after_restart"));
+        let graph = include_str!("session/graph_executions.rs");
+        let start = graph
+            .find("pub async fn start_topology_executor")
+            .expect("start_topology_executor");
+        let end = graph[start..]
+            .find("pub async fn drive_recovered_topology_executions")
+            .map(|offset| start + offset)
+            .expect("post-readiness driver follows");
+        // The supervisor loop is a detached task that first sleeps a tick; the
+        // awaited part is everything before it.
+        let supervisor = graph[start..end]
+            .find("tokio::spawn(async move")
+            .expect("supervisor task");
+        let pre_readiness = &graph[start..start + supervisor];
+        assert!(!pre_readiness.contains(".advance("));
+        assert!(!pre_readiness.contains("drive_topology_execution("));
+        assert!(!pre_readiness.contains("spawn_driver("));
+        // The claim helper itself never advances.
+        let recovery = include_str!("topology/recovery.rs");
+        let claim_start = recovery
+            .find("pub(crate) async fn claim_recovery_leases")
+            .expect("claim helper");
+        let claim_end = recovery[claim_start..]
+            .find("pub(crate) async fn recover_after_restart")
+            .or_else(|| recovery[claim_start..].find("pub(crate) async fn recover_executions"))
+            .map(|offset| claim_start + offset)
+            .expect("claim helper end");
+        assert!(!recovery[claim_start..claim_end].contains(".advance("));
+    }
+
     #[test]
     fn daemon_instance_lease_precedes_store_open_and_socket_unlink() {
         let source = include_str!("main.rs");
-        let main_start = source.find("async fn run_daemon").expect("main function");
+        let main_start = source.find("fn prepare_daemon").expect("main function");
         let helper_start = source[main_start..]
             .find("fn recursive_startup_recovery_budget")
             .map(|offset| main_start + offset)
@@ -2716,11 +3783,11 @@ mod tests {
         assert!(lease < inherited_validation);
         assert!(inherited_validation < socket_probe);
         assert!(main_body.contains("if !socket_inherited {\n        refuse_live_daemon_socket"));
-        assert!(
-            main_body
-                .contains("if !socket_inherited {\n        if let Err(e) = tokio::fs::remove_file")
-        );
-        assert!(main_body.contains("UnixListener::from_std(listener)?\n    } else {"));
+        let ordinary_socket_branch = main_body
+            .find("UnixListener::from_std(listener.listener)?\n    } else {")
+            .expect("only an ordinary daemon owns socket cleanup");
+        assert!(ordinary_socket_branch < socket_unlink);
+        assert!(main_body.contains("UnixListener::from_std(listener.listener)?\n    } else {"));
         let ownership_fence = main_body
             .find("reap_startup_process_ownership_checked")
             .expect("process ownership fence");

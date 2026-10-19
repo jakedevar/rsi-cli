@@ -577,6 +577,8 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             app.open_or_focus_issues();
         }
 
+        LcAction::OpenIssueNumber(argument) => app.open_issue_command(&argument),
+
         LcAction::OpenDialectic => {
             if matches!(&app.overlay, OverlayState::Dialectic { .. }) {
                 app.overlay = OverlayState::None;

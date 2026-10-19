@@ -23,8 +23,56 @@ Set `NEXTEST_JOBS` to change the worker bound for a constrained machine:
 make test-fast NEXTEST_JOBS=4
 ```
 
-The profiles in `.config/nextest.toml` contain no default filters or quarantine
-expressions. A failing test therefore remains part of both applicable lanes.
+## Slow tier
+
+The `rsid` + `rsid-store` library suite spent half its time re-proving released,
+immutable historical migrations (failpoint, rewind, replay and hostile-classifier
+matrices, `store::tests` `h1_*`, `d04`/`d05`, `v95`, `v97`, `v112`/`v113`, ...). Those
+tests matter when a migration or the migration runner changes; they do not need to run
+on every landing gate, every `scoped_test` and every QA sweep (#2270). They form a
+**slow tier**, and it is the only quarantine the profiles carry. It is an exact list,
+never a wildcard, and it is mechanical:
+
+- `.config/slow-tier.toml` names the tests (`tests`) and the paths that make a diff run
+  them (`trigger_paths`: the `store/migrations/` tree, `tools/released-migrations.json`,
+  the migration runner and its helpers, `build.rs`, the tier's own config).
+- `.config/nextest.toml` `[profile.default] default-filter` leaves exactly those tests
+  out, so `rsid-fast` (the merge-queue gate), `test-timings` and the default profile skip
+  them. The line is generated: `python3 scripts/check-touched-shards
+  --write-slow-tier-filter`; `scripts/tests/test_slow_tier.py` fails on drift or on a name
+  no source defines.
+- `ci-full` and `rsid-qa` set `default-filter = "all()"`: `make test-full`, the satellite
+  `make rolling-library-qa`, the QA sweep (`scripts/run-rolling-qa.py`, which passes
+  `--slow-tier` to `scripts/run-rsid-test-shards.sh`) and the cloud sweep run the tier.
+  `--ignore-default-filter` runs the full suite from any profile.
+- `scripts/check-touched-shards` decides per candidate diff (`slow_tier` in its receipt;
+  `--slow-tier-only` prints just the decision): `full` when a changed path is in
+  `trigger_paths` or a changed line of a file that declares a slow test lies outside a fast
+  `#[test]` body (a slow test, a shared helper, a `use`); `excluded` otherwise. The lander
+  (`rsi-rolling-land`, gate line `slow_tier=...`) and `scripts/scoped-test` (receipt
+  `slow_tier`, `skipped_tests`) follow it: on `full` they run the tier, on `excluded` they
+  do not. Explicit `--filter`s always run exactly what they name.
+- `make test-slow-tier` runs only the tier. After editing a migration, run it.
+
+Add a test to the tier by name when `make test-timings` shows a released-migration test
+over about two seconds. A test that is not named runs everywhere, as before.
+
+Membership is decided by the test's subject (#2298), not its name: a test belongs only if
+it rewinds, upgrades or replays a historical schema (a rewound or copied database, a
+historical fixture, a migration failpoint). A test that opens the current schema and
+asserts current behaviour (a request replaying by idempotency key, a CAS winner, an event
+round-trip, a trigger or CHECK predicate, a column default) stays in the default tier even
+when a version number or the word "replay" appears in its name, because a diff that changes
+what it observes touches no trigger path and would otherwise never run it.
+
+A tree with no `.config/slow-tier.toml` runs the tier in full, as the selector decides, and
+the lander follows it unless the tree's `.config/nextest.toml` provably excludes no test
+(no file, or only `default-filter = "all()"`): a leftover exclusion is never run unrecorded
+(#2299).
+
+The other profiles contain no default filters or quarantine expressions beyond this one.
+A failing test therefore remains part of both applicable lanes; the slow tier is covered
+by the full QA and by every diff that can change what it proves.
 
 ## Store fixture cache
 

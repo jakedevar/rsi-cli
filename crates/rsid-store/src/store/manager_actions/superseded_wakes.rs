@@ -10,12 +10,13 @@
 //! watches and the wakes of an open capacity incident keep their own owners.
 
 use super::super::Store;
-use super::super::harness_manager_v2::{now, refused};
+use super::super::harness_manager_v2::now;
 use super::{ManagerActionClaimV2, ManagerActionOriginV2, action_epic, parse_id};
 use crate::error::Result;
 use rsi_common::harness_manager::HarnessManagerConfigV1;
+use rsi_common::harness_manager_v2::ManagerCancelledWakesV1;
 use rsi_common::types::SessionStatus;
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -27,6 +28,14 @@ const ANCESTRY_CAP: usize = 256;
 /// Manager event recording the resume wakes a lead handover retired. Keyed
 /// by the action id, readable through the manager's event inspection.
 const LEAD_WAKES_RETIRED_EVENT: &str = "lead_wakes_retired";
+
+/// Manager event recording how a `succeed_manager` publication settled the
+/// displaced seat's resume wakes: the ids handed to the successor, the ids
+/// retired with the displaced seat, and the reason. Keyed by the operation id.
+pub(crate) const SUCCESSION_WAKES_EVENT: &str = "succession_wakes_settled";
+
+/// Reason recorded for a resume wake a succession retires.
+pub(crate) const SUCCESSION_WAKES_REASON: &str = "manager_succession_displaced_seat";
 
 /// Enabled resume wakes whose own owner is not the ordinary scheduler.
 const RETIRABLE_RESUME_WAKE: &str = "j.enabled=1 AND j.wake_mode='resume'
@@ -80,6 +89,118 @@ impl Store {
             "lead handover retired superseded-lineage resume wakes"
         );
         Ok(retired)
+    }
+
+    /// Enabled wakes of `predecessor` that a seat change could hand to its
+    /// successor. Read before the publication, inside its transaction.
+    pub(crate) fn succession_carried_wake_ids_on(&self, predecessor: Uuid) -> Result<Vec<Uuid>> {
+        super::super::manager_obligations::carried_wake_ids_on(&self.conn, predecessor)
+    }
+
+    /// A succeeded `succeed_manager` settles the displaced seat's resume wakes
+    /// inside its publication transaction (#2652). The publication hands the
+    /// seat's durable obligations (job and deploy outcome wakes, predicate waits,
+    /// watches) to the successor without its generic backstops (the transfer
+    /// skips them while this succession's root row is `established`, unlike an
+    /// automatic rotation, #2511); every
+    /// resume wake still targeting the displaced lineage is then cancelled: its
+    /// generic or safety-net wakes, a `keepalive-*`/`background-process-*` row
+    /// created after admission, an earlier rotation hop. Rows are disabled, never
+    /// deleted; protected rows (manager watches, wakes of an open capacity
+    /// incident) keep their owners. `candidates` are the pre-publication wakes;
+    /// only those the successor now owns are recorded as transferred. Returns the cancelled job ids, sorted, and
+    /// records both lists with the reason in a [`SUCCESSION_WAKES_EVENT`]
+    /// manager event keyed by the operation id, from which the final receipt's
+    /// `cancelled_wakes` is read.
+    pub(crate) fn settle_succession_displaced_wakes_on(
+        &self,
+        claim: &ManagerActionClaimV2,
+        predecessor: Uuid,
+        successor: Uuid,
+        candidates: &[Uuid],
+    ) -> Result<Vec<Uuid>> {
+        let mut handed = Vec::new();
+        for id in candidates {
+            let owner: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT wake_session_id FROM scheduled_jobs WHERE id=?1 AND enabled=1 AND wake_mode='resume'",
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if matches!(owner, Some(Some(ref owner)) if *owner == successor.to_string()) {
+                handed.push(*id);
+            }
+        }
+        handed.sort();
+        let retired = self.retire_superseded_lineage_resume_wakes_on(predecessor)?;
+        if handed.is_empty() && retired.is_empty() {
+            return Ok(retired);
+        }
+        let op = &claim.operation;
+        let actor = match op.context.origin {
+            ManagerActionOriginV2::Agent { caller } => Some(caller.to_string()),
+            ManagerActionOriginV2::OperatingIntent { .. } => None,
+        };
+        let payload = json!({
+            "operation_id": claim.id(),
+            "reason": SUCCESSION_WAKES_REASON,
+            "predecessor_session_id": predecessor,
+            "successor_session_id": successor,
+            "transferred_wake_job_ids": handed,
+            "retired_wake_job_ids": retired,
+        });
+        self.conn.execute(
+            "INSERT INTO harness_manager_v2_events(project_id,manager_session_id,scope_version,actor_session_id,kind,record_key,row_version,payload_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                op.project_id.to_string(),
+                op.manager_session_id.to_string(),
+                op.scope_version,
+                actor,
+                SUCCESSION_WAKES_EVENT,
+                claim.id().to_string(),
+                op.receipt.row_version + 1,
+                serde_json::to_string(&payload)?,
+                now()
+            ],
+        )?;
+        tracing::info!(
+            operation_id = %claim.id(),
+            predecessor = %predecessor,
+            carried = ?handed,
+            retired = ?retired,
+            "manager succession settled the displaced seat's resume wakes"
+        );
+        Ok(retired)
+    }
+
+    /// The wakes the publication of succession `operation` cancelled, for its
+    /// succeeded receipt; `None` when it cancelled none.
+    pub(crate) fn succession_cancelled_wakes(
+        &self,
+        operation: Uuid,
+    ) -> Result<Option<ManagerCancelledWakesV1>> {
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM harness_manager_v2_events WHERE kind=?1 AND record_key=?2",
+                params![SUCCESSION_WAKES_EVENT, operation.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        let job_ids: Vec<Uuid> = serde_json::from_value(payload["retired_wake_job_ids"].clone())?;
+        if job_ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ManagerCancelledWakesV1 {
+            reason: SUCCESSION_WAKES_REASON.to_string(),
+            job_ids,
+        }))
     }
 
     /// Disable every retirable resume wake that targets `predecessor` or an
@@ -175,7 +296,8 @@ impl Store {
     /// - a deploy outcome wake already written but not yet fired moves to
     ///   `new_seat`;
     /// - non-terminal daemon jobs and their pending batch waits move to
-    ///   `new_seat` (#1587);
+    ///   `new_seat` (#1587); so do the outcome wakes of settled jobs and every
+    ///   predicate wait (`when`), whether or not a job is still live (#2471);
     /// - unsettled rolling-queue outcomes and their unfired wakes move to
     ///   `new_seat` while enqueue/replay identity stays fixed (#1604).
     ///
@@ -194,72 +316,50 @@ impl Store {
             displaced.project_id,
         );
         lineage.retain(|session| *session != new_seat);
-        let stamp = now();
         let (mut watches, mut deploys, mut wakes) = (0, 0, 0);
         for old in lineage {
-            super::super::agent_jobs::transfer_manager_jobs_on(&self.conn, old, new_seat)?;
-            let old = old.to_string();
-            let target = new_seat.to_string();
-            // Deploy replay/cancel identity is (owner, key). A historical
-            // deployment of the new owner can occupy that key. Refuse the
-            // entire appointment rather than publish a seat with an orphaned
-            // live deploy or make cancel address a different deployment.
-            let conflicting_deploy: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_deploys live
-                 JOIN agent_deploys prior ON prior.owner_session_id=?2
-                   AND prior.idempotency_digest=live.idempotency_digest AND prior.id<>live.id
-                 WHERE live.owner_session_id=?1 AND live.state IN ('staged','restarting'))",
-                params![old, target],
-                |row| row.get(0),
-            )?;
-            if conflicting_deploy {
-                return Err(refused("manager_deploy_transfer_key_conflict"));
-            }
-            let owned: Vec<(String, String)> = {
-                let mut statement = self.conn.prepare(
-                    "SELECT j.id, j.wake_mode FROM scheduled_jobs j
-                     WHERE j.enabled=1 AND j.wake_session_id=?1 AND j.wake_mode LIKE 'on_terminal:%'
-                       AND NOT EXISTS(SELECT 1 FROM harness_manager_watches w WHERE w.job_id=j.id)
-                     ORDER BY j.id",
-                )?;
-                statement
-                    .query_map([&old], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<std::result::Result<_, _>>()?
-            };
-            for (job, mode) in owned {
-                let held: bool = self.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
-                     WHERE enabled=1 AND wake_session_id=?1 AND wake_mode=?2)",
-                    params![target, mode],
-                    |r| r.get(0),
-                )?;
-                let changed = if held {
-                    self.conn.execute(
-                        "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1 AND enabled=1",
-                        params![job, stamp],
-                    )?
-                } else {
-                    self.conn.execute(
-                        "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
-                         WHERE id=?1 AND enabled=1 AND wake_session_id=?4",
-                        params![job, target, stamp, old],
-                    )?
-                };
-                watches += usize::from(changed == 1 && !held);
-            }
-            deploys += self.conn.execute(
-                "UPDATE agent_deploys SET owner_session_id=?2
-                 WHERE owner_session_id=?1 AND state IN ('staged','restarting')",
-                params![old, target],
-            )?;
-            wakes += self.conn.execute(
-                "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
-                 WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1
-                   AND id IN (SELECT wake_job_id FROM agent_deploys WHERE wake_job_id IS NOT NULL)",
-                params![old, target, stamp],
-            )?;
+            let (w, d, k) = self.transfer_hop_pending_on(old, new_seat, false)?;
+            watches += w;
+            deploys += d;
+            wakes += k;
         }
         Ok((watches, deploys, wakes))
+    }
+
+    /// #2021: a portfolio node's seat hands its seat to `new_seat`. Everything
+    /// [`Self::transfer_displaced_seat_wakes_on`] hands a displaced project
+    /// seat (terminal watches, daemon jobs and their batch waits, deploys and
+    /// their outcome wakes, queue outcomes) moves from `old`, and so do the
+    /// seat's own pending resume wakes (#2511): the node's next check-ins and its
+    /// backstop belong to the seat that now runs it. Protected wakes (manager watches, open
+    /// capacity incidents) keep their owners. Returns `(terminal watches,
+    /// deploys, wakes)` retargeted, resume wakes included in the last.
+    pub(crate) fn transfer_seat_pending_on(
+        &self,
+        old: Uuid,
+        new_seat: Uuid,
+    ) -> Result<(usize, usize, usize)> {
+        if old == new_seat {
+            return Ok((0, 0, 0));
+        }
+        self.transfer_hop_pending_on(old, new_seat, true)
+    }
+
+    /// What one superseded hop owns that its seat's successor takes over: the
+    /// durable obligations of `manager_obligations` (#2471).
+    fn transfer_hop_pending_on(
+        &self,
+        old: Uuid,
+        new_seat: Uuid,
+        backstop_follows: bool,
+    ) -> Result<(usize, usize, usize)> {
+        let moved = super::super::manager_obligations::transfer_manager_obligations_on(
+            &self.conn,
+            old,
+            new_seat,
+            backstop_follows,
+        )?;
+        Ok((moved.watches, moved.deploys, moved.wakes))
     }
 
     fn retirable_resume_wakes_for(&self, session: Uuid) -> Result<Vec<Uuid>> {
@@ -341,6 +441,200 @@ mod tests {
     fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
         ids.sort();
         ids
+    }
+
+    /// #2021: a portfolio seat that hands its seat on takes its terminal
+    /// watches and its own pending resume wakes with it; a protected manager
+    /// watch and another session's wakes stay put.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_seat_handoff_moves_the_pending_watches_and_resume_wakes() {
+        let store = Store::open_in_memory().unwrap();
+        let old = session(&store, SessionStatus::Running, None);
+        let new = session(&store, SessionStatus::Running, None);
+        let other = session(&store, SessionStatus::Running, None);
+        let resume = wake(&store, old, "resume");
+        let watch = wake(&store, old, "on_terminal");
+        let unrelated = wake(&store, other, "resume");
+        let tx = rusqlite::Transaction::new_unchecked(
+            &store.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let (watches, deploys, wakes) = store.transfer_seat_pending_on(old, new).unwrap();
+        tx.commit().unwrap();
+        assert_eq!((watches, deploys, wakes), (1, 0, 1));
+        let owner = |job: Uuid| {
+            store
+                .get_scheduled_job(&job)
+                .unwrap()
+                .unwrap()
+                .wake_session_id
+        };
+        assert_eq!(owner(resume), Some(new));
+        assert_eq!(owner(watch), Some(new));
+        assert_eq!(owner(unrelated), Some(other));
+        assert!(enabled(&store, resume) && enabled(&store, watch));
+        // Nothing moves from a seat to itself.
+        assert_eq!(store.transfer_seat_pending_on(new, new).unwrap(), (0, 0, 0));
+    }
+
+    /// #2389: after a portfolio self-handoff the successor lists the wakes
+    /// that carried over (mode, predicate, deadline, a report waiting inside a
+    /// wake) with the owner-scoped read, and nobody else's wakes appear.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn the_successor_seat_lists_the_wakes_that_carried_over() {
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+
+        let store = Store::open_in_memory().unwrap();
+        let old = session(&store, SessionStatus::Running, None);
+        let new = session(&store, SessionStatus::Running, None);
+        let other = session(&store, SessionStatus::Running, None);
+        let build = |owner: Uuid, mode: &str, name: &str, message: &str| {
+            build_agent_scheduled_job(ScheduleWakeRequest {
+                message: message.into(),
+                in_seconds: Some(600),
+                at: None,
+                name: Some(name.into()),
+                every_seconds: (mode == "resume").then_some(600),
+                mode: Some(mode.into()),
+                working_dir: std::path::PathBuf::from("/tmp/issue-2389"),
+                provider: None,
+                model: None,
+                project_id: None,
+                origin_session_id: Some(owner),
+                watch_session_id: (mode == "on_terminal").then(Uuid::new_v4),
+            })
+            .unwrap()
+        };
+        let add = |job: &rsi_common::types::ScheduledJob| store.insert_scheduled_job(job).unwrap();
+
+        let safety = build(old, "resume", "gm-safety-net", "check in");
+        add(&safety);
+        let watch = build(old, "on_terminal", "gm-watch-pm", "pm ended");
+        add(&watch);
+        let predicate = build(old, "resume", "gm-wait-landing", "landed?");
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        let sha = "0123456789abcdef0123456789abcdef01234567".to_string();
+        store
+            .insert_wake_when(
+                &predicate,
+                &WakeWhenState {
+                    predicate: WakePredicate {
+                        sha_on_rolling: Some(sha.clone()),
+                        ..WakePredicate::default()
+                    },
+                    armed_at: chrono::Utc::now(),
+                    deadline: Some(deadline),
+                    repo_dir: None,
+                },
+                false,
+            )
+            .unwrap();
+        let long_report = "r".repeat(1000);
+        let report = build(old, "resume", "Manager report", &long_report);
+        add(&report);
+        let delivered = build(old, "resume", "Manager notice", "already taken");
+        add(&delivered);
+        let message_row = |job: &rsi_common::types::ScheduledJob, state: &str, key: &str| {
+            let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store
+                .conn
+                .execute(
+                    "INSERT INTO manager_tier_messages(id,direction,kind,source_ref,target_ref,
+                        project_id,source_session_id,target_session_id,source_grant_version,
+                        target_grant_version,body,body_digest,idempotency_key,state,
+                        created_at,updated_at)
+                     VALUES(?1,'up','report',?2,?3,NULL,?4,?5,NULL,NULL,'report',?6,?7,?8,?9,?9)",
+                    rusqlite::params![
+                        job.id.to_string(),
+                        format!("project:{}", Uuid::new_v4()),
+                        format!("portfolio:{}", Uuid::new_v4()),
+                        Uuid::new_v4().to_string(),
+                        old.to_string(),
+                        "d".repeat(64),
+                        key,
+                        state,
+                        stamp,
+                    ],
+                )
+                .unwrap();
+        };
+        message_row(&report, "queued", "report-key");
+        message_row(&delivered, "delivered", "notice-key");
+        let foreign = build(other, "resume", "gm-safety-net", "not yours");
+        add(&foreign);
+
+        let tx = rusqlite::Transaction::new_unchecked(
+            &store.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        store.transfer_seat_pending_on(old, new).unwrap();
+        tx.commit().unwrap();
+
+        let listed = store.list_owned_wake_views(new, false, 64).unwrap();
+        let by_name = |name: &str| {
+            listed
+                .iter()
+                .find(|wake| wake.name == name)
+                .unwrap_or_else(|| panic!("{name} carried over: {listed:?}"))
+        };
+        assert_eq!(listed.len(), 5, "{listed:?}");
+        assert!(listed.iter().all(|wake| wake.enabled && !wake.protected));
+        assert_eq!(by_name("gm-safety-net").job_id, safety.id);
+        assert_eq!(by_name("gm-safety-net").mode, "resume");
+        assert!(by_name("gm-safety-net").pending_message.is_none());
+        assert_eq!(by_name("gm-watch-pm").job_id, watch.id);
+        assert_eq!(by_name("gm-watch-pm").mode, "on_terminal");
+        assert!(by_name("gm-watch-pm").watch_session_id.is_some());
+        let when = by_name("gm-wait-landing");
+        assert_eq!(when.mode, "when");
+        assert_eq!(when.job_id, predicate.id);
+        assert_eq!(when.when.as_ref().unwrap().sha_on_rolling, Some(sha));
+        assert_eq!(when.deadline, Some(deadline));
+        let waiting = by_name("Manager report").pending_message.as_ref().unwrap();
+        assert_eq!(
+            (waiting.kind.as_str(), waiting.state.as_str()),
+            ("report", "queued")
+        );
+        assert_eq!(waiting.message_id, report.id);
+        assert!(waiting.from.starts_with("project:"));
+        assert_eq!(waiting.preview, "r".repeat(400));
+        assert!(
+            by_name("Manager notice").pending_message.is_none(),
+            "a delivered message is not waiting"
+        );
+
+        // The handing seat keeps nothing; the foreign session's wake is its own.
+        assert!(
+            store
+                .list_owned_wake_views(old, false, 64)
+                .unwrap()
+                .is_empty()
+        );
+        let others = store.list_owned_wake_views(other, false, 64).unwrap();
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].job_id, foreign.id);
+        assert!(listed.iter().all(|wake| wake.job_id != foreign.id));
+
+        // A cancelled wake leaves the default list and returns with history.
+        store
+            .cancel_owned_scheduled_jobs(new, Some(safety.id), None)
+            .unwrap();
+        assert_eq!(
+            store.list_owned_wake_views(new, false, 64).unwrap().len(),
+            4
+        );
+        let all = store.list_owned_wake_views(new, true, 64).unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(
+            all.iter()
+                .any(|wake| wake.job_id == safety.id && !wake.enabled)
+        );
+        // The bound is honoured.
+        assert_eq!(store.list_owned_wake_views(new, true, 2).unwrap().len(), 2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -458,6 +752,14 @@ mod tests {
         let displaced_duplicate = watch_on(old, shared);
         let kept_duplicate = watch_on(successor.id, shared);
         let own_continuation = wake(&store, old, "resume");
+        let named_moved = watch_on(old, Uuid::new_v4());
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET name='inherited-watch' WHERE id=?1",
+                [named_moved.to_string()],
+            )
+            .unwrap();
 
         fn new_deploy(owner: Uuid, key: &str) -> NewDeploy<'_> {
             NewDeploy {
@@ -529,6 +831,54 @@ mod tests {
                 .owner_session_id,
             Some(old)
         );
+
+        // #1632: the seat that lists a transferred watch can cancel it, by id
+        // and by name; a repeat is a named refusal, never a silent zero.
+        let listed: Vec<Uuid> = store
+            .list_owned_scheduled_jobs(successor.id, false, 64)
+            .unwrap()
+            .into_iter()
+            .map(|(job, _)| job.id)
+            .collect();
+        assert!(listed.contains(&moved) && listed.contains(&named_moved));
+        assert!(!listed.contains(&own_continuation));
+        assert_eq!(
+            store
+                .cancel_owned_scheduled_jobs(successor.id, Some(moved), None)
+                .unwrap(),
+            vec![moved]
+        );
+        assert_eq!(
+            store
+                .cancel_owned_scheduled_jobs(successor.id, None, Some("inherited-watch"))
+                .unwrap(),
+            vec![named_moved]
+        );
+        assert!(!enabled(&store, moved) && !enabled(&store, named_moved));
+        for error in [
+            store
+                .cancel_owned_scheduled_jobs(successor.id, Some(moved), None)
+                .unwrap_err(),
+            store
+                .cancel_owned_scheduled_jobs(successor.id, None, Some("inherited-watch"))
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, crate::error::DaemonError::InvalidParam(code)
+                    if code.starts_with("wake_already_disabled")),
+                "{error:?}"
+            );
+        }
+        // The displaced holder's own continuation stays out of the successor's reach.
+        let foreign = store
+            .cancel_owned_scheduled_jobs(successor.id, Some(own_continuation), None)
+            .unwrap_err();
+        assert!(
+            matches!(&foreign, crate::error::DaemonError::InvalidParam(code)
+                if code.starts_with("wake_not_found")),
+            "{foreign:?}"
+        );
+        assert!(enabled(&store, own_continuation));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -634,7 +984,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
-    fn deploy_key_collision_rolls_back_the_seat_and_all_wake_transfers() {
+    fn a_successors_used_deploy_key_does_not_block_the_live_deploy_handover_1572() {
         use crate::store::agent_deploys::{NewDeploy, deploy_fingerprint_with};
         use crate::store::manager_coordinator::tests::fixture;
         use rsi_common::agent_deploy::DeployState;
@@ -676,7 +1026,7 @@ mod tests {
             .unwrap();
         let live = stage(old);
         let watch = wake(&store, old, "on_terminal");
-        let error = store
+        store
             .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
                 project_id: config.project_id,
                 session_id: successor.id,
@@ -684,38 +1034,143 @@ mod tests {
                 group_ids: Vec::new(),
                 expected_row_version: config.row_version,
             })
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("manager_deploy_transfer_key_conflict"),
-            "{error}"
-        );
+            .unwrap();
         let held = store
             .get_harness_manager(config.project_id)
             .unwrap()
             .unwrap();
-        assert_eq!(held.manager_session_id, old);
-        assert_eq!(held.row_version, config.row_version);
+        assert_eq!(held.manager_session_id, successor.id);
         let watch = store.get_scheduled_job(&watch).unwrap().unwrap();
-        assert_eq!(watch.wake_session_id, Some(old));
-        assert!(watch.enabled);
-        assert_eq!(
-            store
-                .get_agent_deploy(live.id)
-                .unwrap()
-                .unwrap()
-                .owner_session_id,
-            Some(old)
-        );
+        assert_eq!(watch.wake_session_id, Some(successor.id));
+        // Both durable records survive: the live deploy settles under the new
+        // seat, and the successor's earlier terminal record is untouched.
+        let moved = store.get_agent_deploy(live.id).unwrap().unwrap();
+        assert_eq!(moved.owner_session_id, Some(successor.id));
+        assert_eq!(moved.state, DeployState::Staged);
         assert!(store.agent_deploy_interrupt(live.id).unwrap().requested);
-        // The retained seat can still cancel its own live deployment.
+        let terminal = store.get_agent_deploy(prior.id).unwrap().unwrap();
+        assert_eq!(terminal.owner_session_id, Some(successor.id));
+        assert_eq!(terminal.state, DeployState::Failed);
+        // The key addresses each request in its own namespace: the new seat's
+        // replay is its own settled record; a cancel by key reaches the live
+        // deployment it inherited.
+        let fingerprint = deploy_fingerprint_with(SHA, "x", 60, true);
         assert_eq!(
             store
-                .cancel_agent_deploy(old, "reused-key", SHA, chrono::Utc::now())
+                .replay_agent_deploy(successor.id, "reused-key", &fingerprint)
+                .unwrap()
+                .unwrap()
+                .id,
+            prior.id
+        );
+        assert_eq!(
+            store
+                .cancel_agent_deploy(successor.id, "reused-key", SHA, chrono::Utc::now())
                 .unwrap()
                 .id,
             live.id
         );
+        assert_eq!(
+            store.get_agent_deploy(live.id).unwrap().unwrap().state,
+            DeployState::Failed
+        );
+        // The predecessor still replays the deployment it requested.
+        assert_eq!(
+            store
+                .replay_agent_deploy(old, "reused-key", &fingerprint)
+                .unwrap()
+                .unwrap()
+                .id,
+            live.id
+        );
+    }
+    /// #2471: a project manager's rotation hands every durable result and
+    /// predicate obligation to the rotated seat in the rotation transaction,
+    /// so maintenance finds nothing of them and each reaches the successor once.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_manager_rotation_carries_results_and_predicates_to_the_rotated_seat() {
+        use crate::store::manager_coordinator::tests::fixture;
+        use crate::store::manager_obligations::test_support as ob;
+        use rsi_common::harness_manager_v2::ManagerPolicyV2;
+
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+        let old = config.manager_session_id;
+        let armed = ob::arm(
+            &store,
+            old,
+            Some((config.project_id, lead.parent_id.unwrap())),
+        );
+        let mut rotated = store.get_session(old).unwrap().unwrap();
+        rotated.id = Uuid::new_v4();
+        rotated.continued_from = Some(old);
+        rotated.rotation_depth += 1;
+        store.insert_session(&rotated).unwrap();
+        store
+            .update_session_status(old, SessionStatus::Archived)
+            .unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(old, rotated.id)
+                .unwrap()
+        );
+
+        ob::assert_carried(&store, &armed, old, rotated.id, true);
+        // Maintenance runs before delivery: the backstop followed the seat.
+        let retired = store.sweep_superseded_resume_wakes().unwrap();
+        assert!(!retired.contains(&armed.keepalive));
+        ob::assert_maintenance_keeps_obligations(&store, &armed);
+        ob::assert_second_transfer_is_empty(&store, old, rotated.id);
+    }
+
+    /// #2471: replacing the project manager carries the same obligations
+    /// (the pre-existing watch, deploy and job transfer, plus outcome wakes
+    /// and predicate waits) while the displaced holder keeps its own continuation.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_manager_replacement_carries_results_and_predicates_to_the_new_seat() {
+        use crate::store::manager_coordinator::tests::fixture;
+        use crate::store::manager_obligations::test_support as ob;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::ManagerPolicyV2;
+        use rsi_common::types::SessionKind;
+
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+        let old = config.manager_session_id;
+        let armed = ob::arm(
+            &store,
+            old,
+            Some((config.project_id, lead.parent_id.unwrap())),
+        );
+        let mut successor = crate::test_support::test_session(
+            Uuid::new_v4(),
+            std::path::PathBuf::from("/tmp/issue-2471"),
+        );
+        successor.session_kind = SessionKind::Standard;
+        successor.project_id = Some(config.project_id);
+        successor.status = SessionStatus::Completed;
+        store.insert_session(&successor).unwrap();
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: config.project_id,
+                session_id: successor.id,
+                epic_ids: Some(vec![lead.parent_id.unwrap()]),
+                group_ids: Vec::new(),
+                expected_row_version: config.row_version,
+            })
+            .unwrap();
+
+        ob::assert_carried(&store, &armed, old, successor.id, false);
+        let retired = store.sweep_superseded_resume_wakes().unwrap();
+        assert!(!retired.iter().any(|id| {
+            armed
+                .obligations
+                .iter()
+                .any(|(_, obligation)| obligation == id)
+        }));
+        ob::assert_maintenance_keeps_obligations(&store, &armed);
+        ob::assert_second_transfer_is_empty(&store, old, successor.id);
     }
 }

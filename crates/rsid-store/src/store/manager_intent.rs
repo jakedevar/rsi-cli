@@ -15,9 +15,33 @@ use super::manager_actions::{
     MANAGER_ACTION_HOLD_KIND, ManagerActionHoldReasonV2, ManagerActionOriginV2,
     ManagerActionRuntimeHoldV2, UNCERTAINTY_CURRENT_AUTHORITY, manager_action_hold_key,
 };
-use crate::error::Result;
+use super::worker_no_result::ResultWakeBound;
+use crate::error::{DaemonError, Result};
 
 const LEAD_PAUSE_KIND: &str = "manager_lead_pause";
+
+/// #3209: a Completed lead's wake that has no deadline (a `when` predicate
+/// without `timeout_seconds`, an `on_terminal` watch) still reads as parked for
+/// this long after it was armed; past it the lead is reported as blocked on an
+/// unbounded wake, so a wake that never fires cannot hide a stranded Epic.
+const PARKED_WAKE_HORIZON_SECS: i64 = 3600;
+
+pub(crate) mod idle;
+pub use idle::{IntentInputPin, IntentInputVersion};
+
+/// #2939: the read-only part of one intent pass, computed on another
+/// connection ([`Store::observe_manager_intent`]). Valid only while the
+/// daemon Store's inputs still equal `pin`.
+pub struct ManagerIntentObservation {
+    project: Uuid,
+    manager_session_id: Uuid,
+    scope_version: i64,
+    pin: IntentInputPin,
+    cohort: Vec<super::manager_coordinator::ManagerCohortMemberV2>,
+    work: Vec<Value>,
+    requests: Vec<Value>,
+    resources: Value,
+}
 
 // Issue #669: daemon-owned manager seat recovery lives beside lead intent.
 #[path = "manager_seat.rs"]
@@ -35,12 +59,16 @@ struct ManagerLeadPauseV2 {
     cleared_by: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ManagerIntentReconciliationV2 {
     pub changed: usize,
     pub unfinished: usize,
     pub blocked: usize,
     pub queued: usize,
+    /// #3021: the pass read its work, requests and resources under the caller's
+    /// Store guard (no usable off-lock observation, no memo hit). The
+    /// coordinator logs it with the hold time of a slow pass.
+    pub read_under_lock: bool,
 }
 
 /// Operator spend cap hold: unknown spend or known spend at/above the cap
@@ -56,6 +84,57 @@ pub(crate) fn manager_v2_spend_blocked(policy: &ManagerPolicyV2, resources: &Val
 
 fn work_finished(work: &Value) -> bool {
     work["integrated"] == true || (work["kind"] == "program" && work["source_accepted"] == true)
+}
+
+/// #2607: a topology execution owns the review Work rows it creates and settles
+/// them itself (`topology_settle_review_work`), so a lead has nothing to do for
+/// them: they never count as unfinished work for operating-intent recovery.
+fn topology_owned(work: &Value) -> bool {
+    work["key"]
+        .as_str()
+        .is_some_and(|key| key.starts_with("topology:"))
+}
+
+fn work_open(work: &Value) -> bool {
+    !work_finished(work) && !topology_owned(work)
+}
+
+fn with_overdue_requests(reason: &str, state: &Value) -> String {
+    let ids = state["overdue_requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|request| request["request_id"].as_str())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{reason}; overdue requests: {}", ids.join(", "))
+    }
+}
+
+/// Interpret the recovery gate for intent reporting only; its refusal and
+/// the authority it protects stay unchanged.
+fn intent_refusal_reason(
+    error: &DaemonError,
+    state: &Value,
+    lead: Option<&rsi_common::types::Session>,
+) -> String {
+    let reason = match error {
+        DaemonError::InvalidParam(code) if code == "manager_v2_human_or_recovery_owner" => {
+            match lead {
+                Some(lead) if lead.pending_question.is_some() => "lead awaiting operator answer",
+                Some(lead) if lead.pending_archive => "lead awaiting archive",
+                Some(lead) if lead.status == SessionStatus::WaitingApproval => {
+                    "lead awaiting approval"
+                }
+                _ => "lead held by a human or daemon recovery owner",
+            }
+            .to_owned()
+        }
+        _ => error.to_string(),
+    };
+    with_overdue_requests(&reason, state)
 }
 
 impl Store {
@@ -280,7 +359,7 @@ impl Store {
         if !self
             .manager_v2_work_rows(config, Some(epic))?
             .iter()
-            .any(|work| !work_finished(work) && work["ready"] == true)
+            .any(|work| work_open(work) && work["ready"] == true)
         {
             return Err(refused("manager_v2_no_ready_work"));
         }
@@ -295,13 +374,31 @@ impl Store {
         config: &HarnessManagerConfigV1,
         epic: Uuid,
     ) -> Result<()> {
-        let pending:bool=self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM harness_manager_v2_records WHERE project_id=?1
+        let mut statement = self.conn.prepare(
+            "SELECT record_key,payload_json FROM harness_manager_v2_records WHERE project_id=?1
              AND manager_session_id=?2 AND scope_version=?3 AND epic_id=?4 AND kind='decision'
-             AND archived=0 AND json_extract(payload_json,'$.status') IN ('pending','answer_queued'))",
-            params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,epic.to_string()],|r|r.get(0))?;
-        if pending {
-            return Err(refused("manager_v2_pending_operator_decision"));
+             AND archived=0 AND json_extract(payload_json,'$.status') IN ('pending','answer_queued')",
+        )?;
+        let pending = statement.query_map(
+            params![
+                config.project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                epic.to_string()
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for row in pending {
+            let (key, payload) = row?;
+            let payload: Value = serde_json::from_str(&payload)?;
+            // The executor holds the asking run while it waits. This must
+            // not hold unrelated work under the same Epic, even for a real
+            // operator gate: only the operator can release that run's wait.
+            if super::manager_decision_rulings::topology_decision_execution(&key, &payload)
+                .is_none()
+            {
+                return Err(refused("manager_v2_pending_operator_decision"));
+            }
         }
         Ok(())
     }
@@ -340,8 +437,71 @@ impl Store {
     pub fn reconcile_manager_intent(
         &self,
         project: Uuid,
-        _retry_enabled: bool,
+        retry_enabled: bool,
     ) -> Result<ManagerIntentReconciliationV2> {
+        self.reconcile_manager_intent_observed(project, retry_enabled, None)
+    }
+
+    /// #2939: whether `project`'s last write-free pass can be reused as is
+    /// (its inputs are unchanged). The coordinator asks under the daemon Store
+    /// lock before it computes an observation off the lock.
+    pub fn manager_intent_memoized(&self, project: Uuid) -> Result<bool> {
+        Ok(self
+            .manager_intent_memo(project, chrono::Utc::now())?
+            .is_some())
+    }
+
+    /// #2939: the read-only half of [`Self::reconcile_manager_intent`] (cohort,
+    /// work, requests, resources: nearly all of a pass's SQL), in one read
+    /// snapshot. Meant for a [`Store::open_read_only_observer`] connection, so
+    /// the daemon's Store lock is not held while it runs. It decides nothing:
+    /// [`Self::reconcile_manager_intent_observed`] uses it only while every
+    /// input is unchanged since `pin`, which the caller took on the daemon's
+    /// Store before this snapshot began.
+    pub fn observe_manager_intent(
+        &self,
+        project: Uuid,
+        pin: IntentInputPin,
+    ) -> Result<Option<ManagerIntentObservation>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let Some(config) = self.get_harness_manager(project)? else {
+            return Ok(None);
+        };
+        let cohort = self.manager_v2_cohort(&config)?;
+        let work = self.manager_v2_work_rows(&config, None)?;
+        let requests = self.manager_v2_request_rows(&config, None, "", 129, true)?;
+        let resources = self.manager_v2_resource_snapshot_in(&config, Some(&cohort))?;
+        tx.commit()?;
+        Ok(Some(ManagerIntentObservation {
+            project,
+            manager_session_id: config.manager_session_id,
+            scope_version: config.row_version,
+            pin,
+            cohort,
+            work,
+            requests,
+            resources,
+        }))
+    }
+
+    /// [`Self::reconcile_manager_intent`], reusing `observed` (taken on
+    /// another connection) only for this exact appointment and only while no
+    /// input changed since its pin; otherwise the reads run here. Every
+    /// write, hold, admission and fence below is unchanged.
+    pub fn reconcile_manager_intent_observed(
+        &self,
+        project: Uuid,
+        _retry_enabled: bool,
+        observed: Option<ManagerIntentObservation>,
+    ) -> Result<ManagerIntentReconciliationV2> {
+        // This is an observation cache, never an authority or admission cache.
+        // Only a pass that performed no writes can be reused. Effects, seat
+        // recovery, action claims and their live fences still run separately.
+        let observed_at = chrono::Utc::now();
+        if let Some(result) = self.manager_intent_memo(project, observed_at)? {
+            return Ok(result);
+        }
+        let pin = self.manager_intent_input_pin()?;
         let mut result = ManagerIntentReconciliationV2::default();
         let Some(config) = self.get_harness_manager(project)? else {
             return Ok(result);
@@ -352,12 +512,48 @@ impl Store {
         if grant.revoked {
             return Ok(result);
         };
-        result.changed += self.manager_v2_refresh_question_decisions(&config)?;
+        let mut observed = match observed {
+            Some(observation)
+                if observation.project == project
+                    && observation.manager_session_id == config.manager_session_id
+                    && observation.scope_version == config.row_version
+                    && self.manager_intent_inputs_unchanged(&observation.pin, &[])? =>
+            {
+                Some(observation)
+            }
+            _ => None,
+        };
+        // #2494: one cohort read serves the question refresh, the epic
+        // loop and the resource snapshot of this pass.
+        let cohort = match observed.as_mut() {
+            Some(observation) => std::mem::take(&mut observation.cohort),
+            None => self.manager_v2_cohort(&config)?,
+        };
+        result.changed += self.manager_v2_refresh_question_decisions_in(&config, &cohort)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let cohort = self.manager_v2_cohort(&config)?;
-        let work = self.manager_v2_work_rows(&config, None)?;
-        let requests = self.manager_v2_request_rows(&config, None, "", 129, true)?;
-        let resources = self.manager_v2_resource_snapshot(&config)?;
+        // The refresh may have written an input: then read again, as before.
+        let observed = match observed {
+            Some(observation) if self.manager_intent_inputs_unchanged(&observation.pin, &[])? => {
+                Some(observation)
+            }
+            _ => None,
+        };
+        let (work, requests, resources) = match observed {
+            Some(observation) => (
+                observation.work,
+                observation.requests,
+                observation.resources,
+            ),
+            None => {
+                result.read_under_lock = true;
+                (
+                    self.manager_v2_work_rows(&config, None)?,
+                    self.manager_v2_request_rows(&config, None, "", 129, true)?,
+                    self.manager_v2_resource_snapshot_in(&config, Some(&cohort))?,
+                )
+            }
+        };
+        let valid_until = idle::next_observation_at(observed_at, &requests, &resources);
         let spend_blocked = manager_v2_spend_blocked(&grant.policy, &resources);
         self.manager_v2_intent_hold(
             &config,
@@ -372,7 +568,7 @@ impl Store {
         epics.sort_by_key(|epic| {
             (
                 work.iter()
-                    .filter(|w| w["epic_id"] == epic.to_string() && !work_finished(w))
+                    .filter(|w| w["epic_id"] == epic.to_string() && work_open(w))
                     .filter_map(|w| w["priority"].as_u64())
                     .min()
                     .unwrap_or(255),
@@ -380,6 +576,7 @@ impl Store {
             )
         });
         let mut candidates = Vec::new();
+        let mut stale_leads = Vec::new();
         for epic in epics {
             self.manager_v2_inherit_lead_pause(&config, epic)?;
             let members: Vec<_> = cohort.iter().filter(|m| m.epic_id == Some(epic)).collect();
@@ -387,11 +584,7 @@ impl Store {
                 .iter()
                 .filter(|w| w["epic_id"] == epic.to_string())
                 .collect();
-            let remaining: Vec<_> = items
-                .iter()
-                .filter(|w| !work_finished(w))
-                .copied()
-                .collect();
+            let remaining: Vec<_> = items.iter().filter(|w| work_open(w)).copied().collect();
             result.unfinished += remaining.len();
             let ready: Vec<_> = remaining
                 .iter()
@@ -489,6 +682,55 @@ impl Store {
                     }
                 );
                 state["actions"] = json!(pending_actions);
+            } else if let Some(lead) = lead.as_ref().filter(|lead| {
+                // #3209 / #1443: a lead idle since before the seat appointment
+                // is `stale_lead` whatever old wake it still owns.
+                lead.status == SessionStatus::Completed
+                    && !self.manager_v2_lead_stale(&config, lead).unwrap_or(false)
+            }) && let Some(bound) = self.owner_result_wake_bound(
+                lead.id,
+                chrono::Duration::seconds(PARKED_WAKE_HORIZON_SECS),
+                observed_at,
+            )? {
+                // A completed provider turn with a bounded own wake is parked,
+                // not idle work requiring another recovery owner. Preserve
+                // genuine operator/daemon holds even while a wake is armed.
+                // #3209: a wake nothing bounds (a predicate without a deadline,
+                // past the horizon) may never fire, so it is not "parked": the
+                // manager is told, naming the wake.
+                match self.manager_action_operator_gate(lead.id) {
+                    Ok(()) => match bound {
+                        ResultWakeBound::Bounded(_) => {
+                            state["state"] = json!("parked");
+                            state["reason"] = json!(with_overdue_requests(
+                                "lead parked on its own wakes; it will see pending requests on its next wake",
+                                &state,
+                            ));
+                        }
+                        ResultWakeBound::Unbounded {
+                            wake_id,
+                            predicate,
+                            armed_at,
+                        } => {
+                            state["state"] = json!("blocked");
+                            state["reason"] = json!(with_overdue_requests(
+                                "lead_parked_on_unbounded_wake",
+                                &state,
+                            ));
+                            state["wake_id"] = json!(wake_id);
+                            state["wake_predicate"] = json!(predicate);
+                            state["wake_armed_at"] = json!(armed_at.to_rfc3339());
+                            state["next_action"] = json!(format!(
+                                "The lead's wake {wake_id} ({predicate}, armed {}) has no deadline and may never fire. Check its predicate, then resume or replace the lead explicitly with AgentManagerControl.",
+                                armed_at.to_rfc3339()
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        state["state"] = json!("blocked");
+                        state["reason"] = json!(intent_refusal_reason(&error, &state, Some(lead)));
+                    }
+                }
             } else if ready.is_empty() {
                 state["state"] = json!("dependency_wait");
                 state["dependencies"] = json!(
@@ -504,6 +746,9 @@ impl Store {
                 .as_ref()
                 .filter(|lead| self.manager_v2_lead_stale(&config, lead).unwrap_or(false))
             {
+                // #2939: a new event of this lead ends staleness; the memo
+                // watches it (other events cannot change this observation).
+                stale_leads.push(lead.id);
                 // #1443: a seat change never wakes a lead that has been idle
                 // since before the appointment. Only the manager's explicit
                 // resume continues it; list it for the manager instead.
@@ -526,7 +771,7 @@ impl Store {
                     }
                     Err(error) => {
                         state["state"] = json!("blocked");
-                        state["reason"] = json!(error.to_string());
+                        state["reason"] = json!(intent_refusal_reason(&error, &state, Some(&lead)));
                     }
                 }
             } else {
@@ -602,7 +847,11 @@ impl Store {
                 }
                 Err(error) => {
                     state["state"] = json!("blocked");
-                    state["reason"] = json!(error.to_string());
+                    state["reason"] = json!(intent_refusal_reason(
+                        &error,
+                        &state,
+                        self.manager_lead(project, epic).ok().as_ref(),
+                    ));
                     result.blocked += 1;
                 }
             }
@@ -614,6 +863,24 @@ impl Store {
                 &state,
             )?);
             tx.commit()?;
+        }
+        // Do not publish a memo after writes (including our own projections
+        // and admissions), concurrent commits, errors, or an outer transaction
+        // that could roll back. The next pass must observe those effects.
+        if let Some(pin) = pin
+            && result.changed == 0
+            && result.queued == 0
+            && self.conn.is_autocommit()
+            && self.manager_intent_inputs_unchanged(&pin, &stale_leads)?
+        {
+            self.manager_intent_idle.borrow_mut().remember(
+                project,
+                pin,
+                stale_leads,
+                observed_at,
+                valid_until,
+                result.clone(),
+            );
         }
         Ok(result)
     }
@@ -804,14 +1071,13 @@ impl Store {
             "work":ready.iter().map(|w|json!([w["key"],w["row_version"]])).collect::<Vec<_>>()}),
         )?;
         let key = Uuid::new_v5(&Uuid::NAMESPACE_OID, fingerprint.as_bytes());
-        Ok(AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
+        Ok(AgentManagerControlRequestV2::new(
+            ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: grant.row_version,
             },
-            idempotency_key: format!("intent:{key}"),
+            format!("intent:{key}"),
             operation,
-        })
+        ))
     }
 }

@@ -1,8 +1,27 @@
 # Topology → Workflow Bridge (P1.10/P1.11)
 
+> **Historical (P1 era), plus the legacy runner.** Live executions no longer
+> run through `graph_runner::run_loop_region`. Since #634 the daemon accepts
+> them into the durable, step-at-a-time executor
+> (`crates/rsid/src/topology/executor.rs`), which reads durable attempt rows,
+> reserves effects in one store transaction and is idempotent across restarts.
+> It also runs the typed steps (`session`, `command`, `gate`, `review`, `land`),
+> edge `when` routing and per-node custody; see
+> [topology-validation.md](topology-validation.md) for the rules and
+> [rpc-reference.md](rpc-reference.md) "Typed steps" for the schema.
+>
+> What this page still describes accurately: the bridge itself
+> (`session/topology_bridge.rs`: topology → `WorkflowDefinition`, the
+> workflows-table mirror, the v5 workflow id, cascade delete), which feeds the
+> durable executor too. The sections "Loop Edge Metadata" and
+> "P1.11 Runtime Behavior" (including `FailurePolicy`) describe the **legacy in-memory runner**, which
+> runs only when the operator sets `topology_executor_enabled=false` (the
+> rollback kill switch; `session/graph_executions.rs` chooses the path at
+> accept time). That runner cannot run command, gate, review or land nodes.
+> Validation moved to `crates/rsid-store/src/store_support/topology_validation.rs`.
+
 `topology_bridge.rs` converts stored `Topology` rows into `WorkflowDefinition`
-form for the `graph_runner.rs` async executor. The `ExecuteTopology` RPC is the
-caller-facing entry point.
+form. The `ExecuteTopology` RPC is the caller-facing entry point.
 
 ---
 

@@ -15,8 +15,13 @@ Call `AgentGetAuthorityCatalog` (native `rsi_control_authority_catalog`; Claude:
 AgentGetAuthorityCatalog`).
 
 - With `{}` it returns your current roles, the daemon-shipped operating rules
-  for exactly those roles, and the controls you may call now (plus, for a
-  manager, the update variants and actions your grant allows).
+  for exactly those roles, and the controls you may call now, each with a
+  one-line description (`view: "summary"`; plus, for a manager, the update
+  variants and actions your grant allows). It is small enough to read inline
+  (a manager's answer was 73 KB before #308 and exceeded Claude's tool-result
+  limit). `{"fields": "full"}` returns every control's complete description,
+  for tooling only; read a control's shape with `{"verb": "<name>"}`, never by
+  slicing the full form.
 - With `{"verb": "<name>"}` it returns only the compact envelope
   (`schema_version`, `session_id`, `authority_revision`, `roles`, `pending`) and
   that one control's detail: whether you may call it (`permitted`), its
@@ -71,7 +76,11 @@ token; the recipe is promote, then rotate.
   content.
 - **Uncertain is not failed.** A timeout or transport error on a write may have
   committed. Retry with the same key and identical content, or read the state,
-  before issuing a new decision or a new launch.
+  before issuing a new decision or a new launch. `rsi-rpc` names the case
+  `rpc_response_timeout: <method> ... the call may have completed` and exits 3
+  (1 is a plain transport failure, 2 a daemon refusal): replay with the same key
+  and params, never a new key (#2357). An `os error 11` seen before that fix was
+  this same client read timeout, not a busy socket.
 - **Stale is not retryable as-is.** `stale_*` and fence refusals mean the state
   moved: re-read (`AgentGetProgress`, the Issue, the manager inspect page), adopt
   the observed cursor or version, re-decide whether the action still applies,
@@ -81,7 +90,7 @@ token; the recipe is promote, then rotate.
   effect.
 - **Do not poll.** Dispatch the work (child, job, review, landing) and end the
   turn; rely on the event wakes (terminal watches, job and lander completion,
-  manager mail, `AgentScheduleWake`). A self-wake is always `mode:"resume"`.
+  manager mail, `AgentScheduleWake`). A self-wake is always `mode:"resume"`. Every `AgentScheduleWake` call needs `message` (the prompt run on resume), including `mode:"when"` (`{"mode":"when","message":"jobs finished: read the receipts","when":{"jobs_terminal":["<job id>"]}}`); without it the call is refused `invalid_input`.
 - **Automatic session retries are fail-closed.** The daemon applies no default
   retry budget to any session kind: a positive budget comes only from an explicit
   session retry policy or launch `max_retries`, and `retry_enabled=false` is a

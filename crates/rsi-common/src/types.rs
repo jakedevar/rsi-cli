@@ -1137,7 +1137,25 @@ pub struct ConversationEvent {
 /// message the daemon delivered to a running session at a tool boundary (#1062).
 pub const OPERATOR_EVENT_SOURCE: &str = "operator";
 
+/// Metadata key of a `System` row that reports provider-session health (#2756):
+/// a worker without its `rsi-agent` tools, a failed plugin or MCP server, or a
+/// `system/api_retry` category. The value is an object whose `kind` names the
+/// class.
+pub const PROVIDER_HEALTH_METADATA_KEY: &str = "provider_health";
+
 impl ConversationEvent {
+    /// True for a `System` row that reports provider-session health (#2756).
+    /// The TUI shows it even when ordinary system rows are hidden: it is the
+    /// operator's evidence that a worker looks healthy but has no tools.
+    #[must_use]
+    pub fn is_provider_health_notice(&self) -> bool {
+        self.event_type == EventType::System
+            && self
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.get(PROVIDER_HEALTH_METADATA_KEY).is_some())
+    }
+
     /// True for a user-role event that carries an operator message delivered
     /// at a tool boundary; the TUI labels it "Operator" instead of "You".
     #[must_use]
@@ -1463,6 +1481,23 @@ pub enum TopologyStep {
         /// Render upstream nodes' full last message into this node's prompt.
         #[serde(default)]
         pass_content: bool,
+        /// #2249: settle `succeeded` only when the daemon finds a terminal
+        /// `scoped_test` job owned by this node's session whose receipt
+        /// `head` is the result commit and whose failures, if any, are all
+        /// known failure signatures. Needs `expects_commit`. Absent when
+        /// false, so stored definitions keep their canonical text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        require_verified: bool,
+        /// #2759: ask the harness to validate the handoff's shape before RSI
+        /// parses it. On the turn the daemon opens to obtain a repeated
+        /// handoff (the #2584 format continuation), Claude gets
+        /// `--json-schema` and Codex `--output-schema` + `-o`; the parser
+        /// accepts that payload as the handoff and still accepts free text.
+        /// Absent when false, so stored definitions keep their canonical text
+        /// and digests; the daemon setting `structured_handoff_default` makes
+        /// every session node opt in.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        structured_handoff: bool,
     },
     /// One closed, daemon-owned catalog operation.
     Command { op: CatalogOp },
@@ -1487,16 +1522,28 @@ pub enum TopologyStep {
     /// The daemon enqueues on behalf of the execution's owning manager or
     /// Epic lead, waits on the queue entry without any agent turn, and
     /// branches on published versus refused. It is never an author command:
-    /// the only inputs are the accepted review node and optional
-    /// `PACKAGE=FILTER` gate filters.
+    /// the only inputs are the accepted node and optional `PACKAGE=FILTER`
+    /// gate filters.
     Land {
-        /// The review node whose accepted commit is landed. The land node's
-        /// only forward input is its `verdict_accepted` edge.
+        /// The node whose accepted commit is landed: a review node (the land
+        /// node's only forward input is its `verdict_accepted` edge), or a
+        /// `require_verified` session node (#2249; its `success` edge). The
+        /// latter is admitted by the node's own verification receipt and never
+        /// lands a source that carries a migration.
         accepted: String,
         /// `PACKAGE=FILTER` test filters for the queue entry; empty lets the
         /// lander derive the observing tests.
         #[serde(default)]
         test_filters: Vec<String>,
+        /// #2260: when the queue entry publishes, close the execution's input
+        /// Issue (`inputs.issue`) as the execution's owner and note the
+        /// landing on the execution. The execution is refused at accept
+        /// (`issue_input_required`) without that input. A refused authority is
+        /// an output field of the land (`issue_close`), never a failed land.
+        /// Absent when false, so stored definitions keep their canonical text
+        /// and digests.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        close_issue: bool,
     },
 }
 
@@ -1802,6 +1849,11 @@ pub enum EdgeWhen {
     GateFalse,
     VerdictAccepted,
     VerdictChangesRequested,
+    /// #2688: leaves a land node the daemon refused with
+    /// `land_requires_review` (a migration or another change that needs a
+    /// pre-land review): taken only for that refusal, so the execution
+    /// routes to its own review node of the exact head instead of blocking.
+    ReviewRequired,
 }
 
 impl TopologyNode {
@@ -1895,6 +1947,79 @@ mod topology_step_tests {
         assert!(bad_filter.validate().is_err());
         let when = node(serde_json::json!({"when": {"g": "gate_false"}}));
         assert_eq!(when.incoming_when().unwrap()["g"], EdgeWhen::GateFalse);
+    }
+
+    /// #2249: stored definitions keep their canonical text. A session step
+    /// that does not ask for verification serializes exactly as before the
+    /// field existed, and one that does round-trips it.
+    #[test]
+    fn require_verified_is_omitted_when_false_and_round_trips_when_true() {
+        let plain: TopologyStep = serde_json::from_value(serde_json::json!({
+            "kind": "session", "expects_commit": true, "pass_content": false
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"kind": "session", "expects_commit": true, "pass_content": false})
+        );
+        let bare: TopologyStep =
+            serde_json::from_value(serde_json::json!({"kind": "session"})).unwrap();
+        assert!(matches!(
+            bare,
+            TopologyStep::Session {
+                expects_commit: false,
+                pass_content: false,
+                require_verified: false,
+                structured_handoff: false
+            }
+        ));
+
+        let verified_json = serde_json::json!({
+            "kind": "session", "expects_commit": true, "pass_content": false,
+            "require_verified": true
+        });
+        let verified: TopologyStep = serde_json::from_value(verified_json.clone()).unwrap();
+        assert!(matches!(
+            verified,
+            TopologyStep::Session {
+                require_verified: true,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&verified).unwrap(), verified_json);
+        // The strict decode still refuses unknown fields beside it.
+        assert!(
+            serde_json::from_value::<TopologyStep>(
+                serde_json::json!({"kind": "session", "require_verified": true, "env": {}})
+            )
+            .is_err()
+        );
+    }
+
+    /// #2759: `structured_handoff` is omitted when false (canonical text and
+    /// digests of stored definitions are unchanged) and round-trips when true.
+    #[test]
+    fn structured_handoff_is_omitted_when_false_and_round_trips_when_true() {
+        let plain: TopologyStep =
+            serde_json::from_value(serde_json::json!({"kind": "session", "expects_commit": true}))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"kind": "session", "expects_commit": true, "pass_content": false})
+        );
+        let json = serde_json::json!({
+            "kind": "session", "expects_commit": true, "pass_content": false,
+            "structured_handoff": true
+        });
+        let structured: TopologyStep = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(
+            structured,
+            TopologyStep::Session {
+                structured_handoff: true,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&structured).unwrap(), json);
     }
 
     #[test]
@@ -2148,6 +2273,21 @@ pub struct WorkflowExecutionSnapshot {
     /// answer text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rulings: Vec<TopologyRulingView>,
+    /// #1753: each node's latest attempt as the daemon recorded it (nodes that
+    /// never launched are absent), sorted by node id. The run view reads
+    /// attempt and round from here instead of inferring them from `updates`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_attempts: Vec<TopologyNodeAttemptView>,
+}
+
+/// A node's latest attempt in a durable run (#1753).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyNodeAttemptView {
+    pub node_id: String,
+    /// Loop iteration of the attempt (0 for the first pass).
+    pub iteration: u32,
+    /// Attempt number within the iteration (1 for the first launch).
+    pub attempt_no: u32,
 }
 
 /// Rulings a snapshot lists (the newest are kept).
@@ -4003,6 +4143,22 @@ pub enum IdeaControllerControlOperationV1 {
         controller_epoch: i64,
         reason: ControllerReleaseReasonV1,
     },
+    /// #1186: a rotation publication moved the assigned controller from the
+    /// rotated-away holder to the exact published successor, in the
+    /// publication's own transaction (the same commit as the Epic lead
+    /// pointer and the global grant). No reservation or launch confirmation
+    /// exists for this move: the published rotation lineage
+    /// (`successor.continued_from` chain, settled by `rotation_id`) is the
+    /// evidence, and system attribution is the only permitted actor.
+    TransferToRotationSuccessor {
+        transfer_intent_key: String,
+        expected_row_version: i64,
+        observed_controller_epoch: i64,
+        former_controller_session_id: Uuid,
+        successor_session_id: Uuid,
+        rotation_id: String,
+        proposed_epoch: i64,
+    },
 }
 
 impl IdeaControllerControlOperationV1 {
@@ -4011,7 +4167,9 @@ impl IdeaControllerControlOperationV1 {
     pub const fn event_type(&self) -> IdeaEventType {
         match self {
             Self::Reserve { .. } => IdeaEventType::ControllerReserved,
-            Self::Assign { .. } => IdeaEventType::ControllerAssigned,
+            Self::Assign { .. } | Self::TransferToRotationSuccessor { .. } => {
+                IdeaEventType::ControllerAssigned
+            }
             Self::ReleaseReservation { .. } | Self::ReleaseAssigned { .. } => {
                 IdeaEventType::ControllerReleased
             }
@@ -4035,6 +4193,10 @@ impl IdeaControllerControlOperationV1 {
             | Self::ReleaseAssigned {
                 expected_row_version,
                 ..
+            }
+            | Self::TransferToRotationSuccessor {
+                expected_row_version,
+                ..
             } => Ok(*expected_row_version),
             Self::Assign { reservation, .. } => reservation
                 .base_row_version
@@ -4047,7 +4209,8 @@ impl IdeaControllerControlOperationV1 {
     #[must_use]
     pub const fn controller_epoch(&self) -> i64 {
         match self {
-            Self::Reserve { proposed_epoch, .. } => *proposed_epoch,
+            Self::Reserve { proposed_epoch, .. }
+            | Self::TransferToRotationSuccessor { proposed_epoch, .. } => *proposed_epoch,
             Self::Assign { reservation, .. } | Self::ReleaseReservation { reservation, .. } => {
                 reservation.proposed_epoch
             }
@@ -4068,6 +4231,10 @@ impl IdeaControllerControlOperationV1 {
                 controller_session_id,
                 ..
             } => Some(*controller_session_id),
+            Self::TransferToRotationSuccessor {
+                successor_session_id,
+                ..
+            } => Some(*successor_session_id),
             Self::Reserve { .. } | Self::ReleaseReservation { .. } => None,
         }
     }
@@ -4108,6 +4275,9 @@ impl IdeaControllerControlRequestV1 {
             }
             IdeaControllerControlOperationV1::ReleaseAssigned { .. } => {
                 self.validate_assigned_release()
+            }
+            IdeaControllerControlOperationV1::TransferToRotationSuccessor { .. } => {
+                self.validate_rotation_transfer()
             }
         }
     }
@@ -4238,6 +4408,39 @@ impl IdeaControllerControlRequestV1 {
         Ok(())
     }
 
+    fn validate_rotation_transfer(&self) -> Result<(), String> {
+        let IdeaControllerControlOperationV1::TransferToRotationSuccessor {
+            transfer_intent_key,
+            expected_row_version,
+            observed_controller_epoch,
+            former_controller_session_id,
+            successor_session_id,
+            rotation_id,
+            proposed_epoch,
+        } = &self.operation
+        else {
+            return Err("rotation controller transfer operation mismatch".to_string());
+        };
+        validate_idea_idempotency_key(transfer_intent_key)?;
+        if self.actor_kind != IdeaActorKind::System
+            || *expected_row_version < 1
+            || *observed_controller_epoch < 0
+            || former_controller_session_id.is_nil()
+            || successor_session_id.is_nil()
+            || former_controller_session_id == successor_session_id
+            || rotation_id.trim().is_empty()
+            || rotation_id.len() > 512
+            || rotation_id.contains('\0')
+            || *proposed_epoch
+                != observed_controller_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| "rotation controller transfer epoch overflow".to_string())?
+        {
+            return Err("invalid rotation controller transfer semantics".to_string());
+        }
+        Ok(())
+    }
+
     /// Deterministic canonical JSON used for durable semantic equality.
     ///
     /// # Errors
@@ -4324,7 +4527,11 @@ impl IdeaControllerEventPayloadV1 {
                     return Err("terminal outcome contains a different reservation".to_string());
                 }
             }
-            (IdeaControllerControlOperationV1::ReleaseAssigned { .. }, None) => {}
+            (
+                IdeaControllerControlOperationV1::ReleaseAssigned { .. }
+                | IdeaControllerControlOperationV1::TransferToRotationSuccessor { .. },
+                None,
+            ) => {}
             _ => return Err("controller event reservation outcome mismatch".to_string()),
         }
         Ok(())
@@ -4721,6 +4928,20 @@ pub fn idea_controller_assigned_release_stage_key(
         format!("rsi.idea.controller-assigned-release/v1/{release_intent_key}").as_bytes(),
     );
     format!("controller-release-assigned:v1:{operation_id}")
+}
+
+/// Durable rotation-transfer-stage key derived from the Idea and the transfer
+/// intent (#1186).
+#[must_use]
+pub fn idea_controller_rotation_transfer_stage_key(
+    idea_id: Uuid,
+    transfer_intent_key: &str,
+) -> String {
+    let operation_id = Uuid::new_v5(
+        &idea_id,
+        format!("rsi.idea.controller-rotation-transfer/v1/{transfer_intent_key}").as_bytes(),
+    );
+    format!("controller-transfer-rotation:v1:{operation_id}")
 }
 
 /// Strict bounded history request.
@@ -5263,6 +5484,23 @@ pub enum IssueEventOperationV1 {
     LegacyCreateAdopted,
 }
 
+/// Largest status-change note (#2329).
+pub const ISSUE_STATUS_NOTE_MAX_BYTES_V1: usize = 2_048;
+
+/// A status-change note is nonblank, NUL-free and at most
+/// [`ISSUE_STATUS_NOTE_MAX_BYTES_V1`] bytes.
+pub fn validate_issue_status_note(note: &str) -> Result<(), String> {
+    if note.trim().is_empty()
+        || note.len() > ISSUE_STATUS_NOTE_MAX_BYTES_V1
+        || note.as_bytes().contains(&0)
+    {
+        return Err(format!(
+            "Issue status note must be nonblank, NUL-free, and at most {ISSUE_STATUS_NOTE_MAX_BYTES_V1} bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// Canonical audit-domain marker for every V97 Issue semantic request.
 pub const ISSUE_SEMANTIC_REQUEST_DOMAIN_V1: &str = "rsi.issue.request/v1";
 
@@ -5306,7 +5544,7 @@ impl IssueContentPatchV1 {
         if let Some(body) = &self.body
             && (body.len() > 65_536 || body.as_bytes().contains(&0))
         {
-            return Err("Issue body must be NUL-free and at most 65536 bytes".into());
+            return Err("Issue body must be NUL-free and at most 65536 bytes; a bound worker whose body is full publishes its handoff with AgentUpdateIssue {handoff} alone (its own append-only record, no body copy)".into());
         }
         if let Some(labels) = &self.labels {
             if labels.len() > 64 {
@@ -5372,6 +5610,11 @@ pub enum IssueSemanticOperationV1 {
         issue_id: Uuid,
         expected_row_version: i64,
         status: IssueStatus,
+        /// #2329: why the status changed (closed as covered-by, duplicate,
+        /// moot, landed; a reopen reason). Part of the request fingerprint, so
+        /// replay with a different note conflicts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Archived {
         issue_id: Uuid,
@@ -5462,9 +5705,19 @@ impl IssueSemanticOperationV1 {
             Self::StatusUpdated {
                 issue_id,
                 expected_row_version,
+                note,
                 ..
+            } => {
+                validate_id("issue_id", *issue_id)?;
+                if *expected_row_version < 1 {
+                    return Err("expected_row_version must be positive".to_string());
+                }
+                if let Some(note) = note {
+                    validate_issue_status_note(note)?;
+                }
+                Ok(())
             }
-            | Self::Archived {
+            Self::Archived {
                 issue_id,
                 expected_row_version,
             }
@@ -5645,6 +5898,47 @@ pub struct IssuePageV1 {
     pub next_cursor: Option<IssueListCursorV1>,
 }
 
+/// Issue metadata available to live Issue-bound workers for deduplication.
+/// Keep this projection explicit so full records cannot leak through transports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIssueSummaryV1 {
+    pub display_number: i64,
+    /// #2052: lets a caller follow up with `AgentGetIssue {issue_id}`.
+    pub id: Uuid,
+    pub title: String,
+    pub labels: Vec<String>,
+    pub status: IssueStatus,
+    pub priority: Option<u8>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIssueSummaryPageV1 {
+    pub issues: Vec<AgentIssueSummaryV1>,
+    #[serde(default)]
+    pub next_cursor: Option<IssueListCursorV1>,
+}
+
+/// Role-dependent list projection, shared by RPC and native tools. Untagged
+/// serialization preserves the full-record page shape for leads and managers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AgentIssuePageV1 {
+    Full(IssuePageV1),
+    Summary(AgentIssueSummaryPageV1),
+}
+
+impl AgentIssuePageV1 {
+    pub fn into_full(self) -> Option<IssuePageV1> {
+        match self {
+            Self::Full(page) => Some(page),
+            Self::Summary(_) => None,
+        }
+    }
+}
+
 /// Compact related-Issue projection returned by the guarded agent lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIssueDependencyRefV1 {
@@ -5663,6 +5957,47 @@ pub struct AgentGetIssueResultV1 {
     pub blocked_by_truncated: bool,
     pub blocks: Vec<AgentIssueDependencyRefV1>,
     pub blocks_truncated: bool,
+    /// #1750: the latest [`ISSUE_HANDOFF_PAGE_V1`] stored handoff records in
+    /// full, oldest first. A handoff record never counts against the body cap.
+    #[serde(default)]
+    pub handoffs: Vec<IssueHandoffV1>,
+    /// Every handoff record the Issue holds (the page above is the newest).
+    #[serde(default)]
+    pub handoffs_total: i64,
+    /// #2329: the note on the Issue's latest status change, when it carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_note: Option<String>,
+    /// Bytes the body can still grow before the 65536-byte ceiling; at zero a
+    /// bound worker publishes with `AgentUpdateIssue {handoff}`.
+    #[serde(default)]
+    pub body_bytes_remaining: i64,
+}
+
+/// The largest stored Issue handoff record, equal to the body ceiling.
+pub const ISSUE_HANDOFF_MAX_BYTES_V1: usize = 65_536;
+/// How many of the newest handoff records `AgentGetIssue` returns in full.
+pub const ISSUE_HANDOFF_PAGE_V1: i64 = 3;
+
+/// One append-only handoff published by an Issue-bound worker (#1750). It lives
+/// beside the Issue body so a full body never blocks a complete handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueHandoffV1 {
+    /// Per-Issue, starting at 1.
+    pub sequence: i64,
+    pub author_session_id: Uuid,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Receipt for `AgentUpdateIssue {handoff}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIssueHandoffReceiptV1 {
+    pub issue_id: Uuid,
+    pub display_number: i64,
+    pub row_version: i64,
+    pub handoff_sequence: i64,
+    pub handoff_bytes: i64,
+    pub deduplicated: bool,
 }
 
 /// Bounded immutable Issue-history page request. Scope is injected by Store
@@ -6283,6 +6618,7 @@ mod tests {
             current_nodes: Vec::new(),
             on_call: None,
             rulings: Vec::new(),
+            node_attempts: Vec::new(),
             updates: vec![GraphExecutionUpdate {
                 execution_id,
                 workflow_id,
@@ -6361,6 +6697,7 @@ mod tests {
                 current_nodes: Vec::new(),
                 on_call: None,
                 rulings: Vec::new(),
+                node_attempts: Vec::new(),
                 updates: Vec::new(),
             },
         };
@@ -8337,6 +8674,7 @@ mod v99_rate_limit_rpc_tests {
                     resets_at_epoch: None,
                 },
             ],
+            stale_reason: None,
         };
         let peak = snapshot.peak_window().expect("a peak exists");
         assert_eq!(peak.window_key, "five_hour");
@@ -8353,6 +8691,7 @@ mod v99_rate_limit_rpc_tests {
             is_using_overage: false,
             observed_at: chrono::Utc::now(),
             windows: Vec::new(),
+            stale_reason: None,
         };
         assert!(snapshot.peak_window().is_none());
     }

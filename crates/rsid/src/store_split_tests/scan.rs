@@ -1,7 +1,7 @@
 // Tests moved out of `rsid-store` (issue #1021 S4); see `mod.rs`.
 
 fn root_of(file: &str) -> std::path::PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::path::Path::new(rsi_common::manifest_dir!());
     if file.starts_with("rsid-store/") {
         manifest.join("../rsid-store/src")
     } else {
@@ -25,8 +25,8 @@ fn production_source(path: &std::path::Path) -> String {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
 fn every_stamp_execution_environment_caller_is_enumerated() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let store_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rsid-store/src");
+    let src = std::path::Path::new(rsi_common::manifest_dir!()).join("src");
+    let store_src = std::path::Path::new(rsi_common::manifest_dir!()).join("../rsid-store/src");
     let mut callers = std::collections::BTreeMap::new();
     // Both crates: a new caller in `rsid-store` must be enumerated too (keyed
     // `rsid-store/<path>`).

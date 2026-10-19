@@ -6,7 +6,7 @@
 
 use crate::types::{
     Issue, IssueArchiveFilterV1, IssueContentPatchV1, IssueDep, IssueEventPageV1, IssueEventV1,
-    IssueSemanticOperationV1, IssueSemanticRequestV1, IssueStatus,
+    IssueHandoffV1, IssueSemanticOperationV1, IssueSemanticRequestV1, IssueStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
@@ -141,6 +141,10 @@ pub struct ListIssuesPageRequestV1 {
     pub unassigned: bool,
     #[serde(default)]
     pub labels_all: Vec<String>,
+    /// #2381: keep an Issue that carries at least one of these labels (the
+    /// operator-request / operator-decision filter). Empty means no filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels_any: Vec<String>,
     #[serde(default)]
     pub provenance: Vec<IssueWorkspaceProvenanceV1>,
     #[serde(default)]
@@ -171,6 +175,7 @@ impl ListIssuesPageRequestV1 {
             return Err("Issue priorities must be 1..=4".to_string());
         }
         validate_labels(&self.labels_all)?;
+        validate_labels(&self.labels_any)?;
         if let Some(query) = &self.query
             && (query.trim().is_empty() || query.len() > 4096 || query.contains('\0'))
         {
@@ -422,6 +427,7 @@ impl UpdateIssueStatusV2RequestV1 {
                 issue_id: self.issue_id,
                 expected_row_version: self.expected_row_version,
                 status: self.status,
+                note: None,
             },
         ))
     }
@@ -604,6 +610,56 @@ impl ListIssueEventsV2RequestV1 {
 }
 
 pub type ListIssueEventsV2ResultV1 = IssueEventPageV1;
+
+/// Default page of stored handoff records. A record can be up to
+/// `ISSUE_HANDOFF_MAX_BYTES_V1`, so the page is far smaller than an event page.
+pub const ISSUE_HANDOFF_LIST_DEFAULT_LIMIT: u16 = 16;
+pub const ISSUE_HANDOFF_LIST_MAX_LIMIT: u16 = 32;
+
+/// `ListIssueHandoffs` (#2420): operator-only, project-scoped, ascending page
+/// over the append-only `issue_handoffs` records (#1750) that worker
+/// `AgentUpdateIssue {handoff}` calls publish. Only `AgentGetIssue` returned them
+/// before; the operator surface had no read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListIssueHandoffsRequestV1 {
+    pub project_id: Uuid,
+    pub issue_id: Uuid,
+    #[serde(default)]
+    pub after_sequence: Option<i64>,
+    #[serde(default = "default_handoff_limit")]
+    pub limit: u16,
+}
+
+impl ListIssueHandoffsRequestV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_project_issue_ids(self.project_id, self.issue_id)?;
+        if !(1..=ISSUE_HANDOFF_LIST_MAX_LIMIT).contains(&self.limit) {
+            return Err(format!(
+                "Issue handoff limit must be 1..={ISSUE_HANDOFF_LIST_MAX_LIMIT}"
+            ));
+        }
+        if self.after_sequence.is_some_and(|value| value < 0) {
+            return Err("after_sequence must be nonnegative".to_string());
+        }
+        Ok(())
+    }
+}
+
+const fn default_handoff_limit() -> u16 {
+    ISSUE_HANDOFF_LIST_DEFAULT_LIMIT
+}
+
+/// Ascending page of handoff records. `next_after_sequence` is the cursor of the
+/// next page, absent on the last one; `total` counts every record the Issue holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListIssueHandoffsResultV1 {
+    pub handoffs: Vec<IssueHandoffV1>,
+    #[serde(default)]
+    pub next_after_sequence: Option<i64>,
+    #[serde(default)]
+    pub total: i64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

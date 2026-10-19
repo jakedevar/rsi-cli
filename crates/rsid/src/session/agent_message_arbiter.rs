@@ -164,6 +164,7 @@ impl AgentMessageArbiter {
     }
 
     /// Diagnostic read of one root's current grant, if any.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn outstanding_for_root(
         &self,
@@ -175,6 +176,7 @@ impl AgentMessageArbiter {
             .cloned()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn outstanding_count(&self) -> usize {
         self.lock().outstanding.len()
@@ -239,6 +241,8 @@ pub(crate) struct ArbitrationGrant {
     /// that leaves this type goes through
     /// [`Self::render_payload_for_delivery`].
     request: DispatchGrantRequest,
+    /// Read only by tests that pin the generation a grant was planned at.
+    #[cfg(test)]
     granted_at_monitor_generation: u64,
     released: bool,
 }
@@ -263,11 +267,13 @@ impl ArbitrationGrant {
         self.request.logical_root_session_id
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn delivery_session_id(&self) -> Uuid {
         self.request.delivery_session_id
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn granted_at_monitor_generation(&self) -> u64 {
         self.granted_at_monitor_generation
@@ -467,6 +473,7 @@ fn decide_boundary_page(
     PagePull::Decided(BoundaryDecision::DeliverMail(Box::new(ArbitrationGrant {
         arbiter: Arc::clone(arbiter),
         request,
+        #[cfg(test)]
         granted_at_monitor_generation: monitor_generation,
         released: false,
     })))

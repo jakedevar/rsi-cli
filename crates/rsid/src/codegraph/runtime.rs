@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rsi_common::types::Project;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{IndexHandle, IndexManager, IndexWatcher, RegisteredWorkspace, Result};
@@ -26,6 +26,25 @@ const MAX_INDEXED_WORKSPACES: usize = 128;
 const REGISTRY_PAGE_SIZE: usize = 64;
 const MAX_REGISTRY_CANDIDATES: usize = MAX_GIT_WORKTREE_ENTRIES;
 const REGISTRY_SCAN_LIMIT: Duration = Duration::from_secs(30);
+
+/// Which checkouts of a registered project the registry admits for indexing.
+///
+/// Until content-shared storage lands (#2245) the daemon indexes only each
+/// project's primary checkout: an RSI sandbox is a full ~0.8 GB generation, up
+/// to 128 of them would fill the 4 GiB global budget, and a sandbox is a
+/// throwaway copy of source the primary already holds. `AllCheckouts` keeps the
+/// sandbox and worktree admission machinery, and its tests, for that follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceScope {
+    PrimaryOnly,
+    /// Not selected by [`PRODUCTION_SCOPE`]; only tests construct it until
+    /// #2245 lets sandboxes share content.
+    #[cfg_attr(not(test), allow(dead_code))]
+    AllCheckouts,
+}
+
+/// The policy the running daemon applies.
+const PRODUCTION_SCOPE: WorkspaceScope = WorkspaceScope::PrimaryOnly;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RegistryDiagnostics {
@@ -74,6 +93,7 @@ struct KnownRoots {
 
 #[derive(Clone, Copy)]
 enum RegistryStoreSource<'a> {
+    #[cfg(test)]
     Direct(&'a Store),
     Shared(&'a Arc<tokio::sync::Mutex<Store>>),
 }
@@ -81,6 +101,7 @@ enum RegistryStoreSource<'a> {
 impl RegistryStoreSource<'_> {
     fn with<T>(&self, operation: impl FnOnce(&Store) -> T) -> T {
         match self {
+            #[cfg(test)]
             Self::Direct(store) => operation(store),
             Self::Shared(store) => operation(&store.blocking_lock()),
         }
@@ -196,6 +217,11 @@ pub struct IndexRuntime {
     task: JoinHandle<()>,
     registry_task: Option<JoinHandle<()>>,
     known_roots: KnownRoots,
+    /// The startup registration (registry snapshot, project index databases,
+    /// inotify watches) is `attach_registry`'s first step, off the caller's
+    /// path (#2375): it was about 470 ms of the daemon's critical path and
+    /// must never gate request readiness.
+    startup_pending: bool,
 }
 
 impl IndexRuntime {
@@ -253,20 +279,26 @@ impl IndexRuntime {
         )
     }
 
-    /// Startup uses the same trusted admission builder as periodic refresh.
-    /// Historical custody is retained in Store for reads but consumes no slot.
-    pub fn start_from_store(
+    /// Starts the manager with no registrations (#2375). The first step of
+    /// [`Self::attach_registry`] builds the startup snapshot with the same
+    /// trusted admission builder as periodic refresh, opens the registered
+    /// projects' index databases and installs the watches, all off the
+    /// caller's path. Until it lands every workspace reads as unregistered,
+    /// exactly as after a rejected snapshot.
+    pub fn start_deferred(
         index_root: PathBuf,
-        store: &Store,
-        allowed_roots: &[PathBuf],
         events: Option<Arc<EventBus>>,
         enabled: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let mut known_roots = KnownRoots::default();
-        let (workspaces, diagnostics) =
-            registry_snapshot_reported(store, allowed_roots, &mut known_roots)?;
-        diagnostics.report_if_changed(&mut RegistryDiagnostics::default());
-        Self::start_with_workspaces(index_root, workspaces, events, enabled, known_roots)
+        let mut runtime = Self::start_with_workspaces(
+            index_root,
+            Vec::new(),
+            events,
+            enabled,
+            KnownRoots::default(),
+        )?;
+        runtime.startup_pending = true;
+        Ok(runtime)
     }
 
     fn start_with_workspaces(
@@ -290,6 +322,7 @@ impl IndexRuntime {
             task,
             registry_task: None,
             known_roots,
+            startup_pending: false,
         })
     }
 
@@ -303,11 +336,53 @@ impl IndexRuntime {
         let handle = self.handle.clone();
         let initial_watchers = std::mem::take(&mut self.watchers);
         let mut known_roots = std::mem::take(&mut self.known_roots);
+        let startup_pending = std::mem::take(&mut self.startup_pending);
         self.registry_task = Some(tokio::spawn(async move {
             let mut watchers = initial_watchers;
             let mut prior_diagnostics = RegistryDiagnostics::default();
             let mut prior_error: Option<String> = None;
-            let mut tick = tokio::time::interval(REGISTRY_REFRESH);
+            let mut tick = registry_interval();
+            if startup_pending {
+                let source = Arc::clone(&store);
+                let roots = allowed_roots.clone();
+                let startup_handle = handle.clone();
+                let started = Instant::now();
+                let startup = tokio::task::spawn_blocking(move || {
+                    let mut staged = KnownRoots::default();
+                    let (workspaces, diagnostics, staged) = registry_snapshot_with_source(
+                        RegistryStoreSource::Shared(&source),
+                        &roots,
+                        &mut staged,
+                        PRODUCTION_SCOPE,
+                        || {},
+                    )
+                    .map(|(workspaces, diagnostics)| (workspaces, diagnostics, staged))?;
+                    startup_handle.install_startup(workspaces.clone())?;
+                    let watchers = watch(&workspaces, &startup_handle, HashMap::new());
+                    Ok::<_, super::IndexError>((workspaces, diagnostics, staged, watchers))
+                })
+                .await;
+                match startup {
+                    Ok(Ok((workspaces, diagnostics, staged, installed))) => {
+                        known_roots = staged;
+                        watchers = installed;
+                        diagnostics.report_if_changed(&mut prior_diagnostics);
+                        info!(
+                            workspaces = workspaces.len(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Codegraph startup registration installed"
+                        );
+                        // This was the first refresh: do not repeat it at once.
+                        tick.tick().await;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(%error, "Codegraph startup snapshot rejected; registry refresh will retry");
+                    }
+                    Err(error) => {
+                        warn!(%error, "Codegraph startup registration stopped; periodic reconciliation remains active");
+                    }
+                }
+            }
             loop {
                 tick.tick().await;
                 let source = Arc::clone(&store);
@@ -318,6 +393,7 @@ impl IndexRuntime {
                         RegistryStoreSource::Shared(&source),
                         &roots,
                         &mut next_known_roots,
+                        PRODUCTION_SCOPE,
                         || {},
                     );
                     (result, next_known_roots)
@@ -367,15 +443,28 @@ impl IndexRuntime {
     }
 }
 
+/// The registry refresh cadence. A pass that overruns the period (a slow
+/// project database open, a large custody traversal) is followed by a full
+/// period of idle, never by back-to-back catch-up passes (#2930): the default
+/// `Burst` would fire every missed tick at once and keep the loop busy.
+fn registry_interval() -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(REGISTRY_REFRESH);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
+#[cfg(test)]
 fn registry_snapshot_reported(
     store: &Store,
     allowed_roots: &[PathBuf],
     known_roots: &mut KnownRoots,
+    scope: WorkspaceScope,
 ) -> Result<(Vec<RegisteredWorkspace>, RegistryDiagnostics)> {
     registry_snapshot_with_source(
         RegistryStoreSource::Direct(store),
         allowed_roots,
         known_roots,
+        scope,
         || {},
     )
 }
@@ -399,6 +488,7 @@ fn registry_snapshot_with_source(
     source: RegistryStoreSource<'_>,
     allowed_roots: &[PathBuf],
     known_roots: &mut KnownRoots,
+    scope: WorkspaceScope,
     mut after_page: impl FnMut(),
 ) -> Result<(Vec<RegisteredWorkspace>, RegistryDiagnostics)> {
     let started = Instant::now();
@@ -426,29 +516,30 @@ fn registry_snapshot_with_source(
         if started.elapsed() > REGISTRY_SCAN_LIMIT {
             return Err(super::IndexError::DiscoveryLimit("registry scan time"));
         }
+        if scope == WorkspaceScope::PrimaryOnly {
+            // No custody or worktree page is read: nothing but the primaries
+            // is admitted, so the Store only has to hold still across the
+            // project read.
+            let stable = source
+                .with(|store| store.codegraph_read_fence_matches(&mut fence))
+                .map_err(|error| super::IndexError::UnsafeWorkspace(error.to_string()))?;
+            if !stable {
+                continue;
+            }
+            return Ok((primaries, precheck));
+        }
         let project_roots = primaries
             .iter()
             .map(|primary| (primary.root().to_path_buf(), primary.project_id()))
             .collect::<Vec<_>>();
 
-        let mut changed = false;
         let mut scanned_known = 0usize;
         loop {
             let page = source
-                .with(|store| -> crate::error::Result<_> {
-                    if !store.codegraph_read_fence_matches(&mut fence)? {
-                        return Ok(None);
-                    }
-                    Ok(Some(store.codegraph_known_roots_since(
-                        staged.last_rowid,
-                        REGISTRY_PAGE_SIZE,
-                    )?))
+                .with(|store| {
+                    store.codegraph_known_roots_since(staged.last_rowid, REGISTRY_PAGE_SIZE)
                 })
                 .map_err(|error| super::IndexError::UnsafeWorkspace(error.to_string()))?;
-            let Some(page) = page else {
-                changed = true;
-                break;
-            };
             if page.is_empty() {
                 break;
             }
@@ -467,30 +558,14 @@ fn registry_snapshot_with_source(
             }
             after_page();
         }
-        if changed {
-            continue;
-        }
 
         let mut sandboxes = Vec::new();
         let mut after = None;
         let mut scanned_active = 0usize;
         loop {
             let page = source
-                .with(|store| -> crate::error::Result<_> {
-                    if !store.codegraph_read_fence_matches(&mut fence)? {
-                        return Ok(None);
-                    }
-                    Ok(Some(store.codegraph_custody_page(
-                        after,
-                        true,
-                        REGISTRY_PAGE_SIZE,
-                    )?))
-                })
+                .with(|store| store.codegraph_custody_page(after, true, REGISTRY_PAGE_SIZE))
                 .map_err(|error| super::IndexError::UnsafeWorkspace(error.to_string()))?;
-            let Some(page) = page else {
-                changed = true;
-                break;
-            };
             if page.is_empty() {
                 break;
             }
@@ -522,9 +597,6 @@ fn registry_snapshot_with_source(
                 }
             }
             after_page();
-        }
-        if changed {
-            continue;
         }
 
         let stable = source
@@ -564,6 +636,7 @@ fn registry_snapshot_with_source(
     ))
 }
 
+#[cfg(test)]
 fn build_registry(
     projects: Vec<Project>,
     sandboxes: Vec<SandboxRegistration>,
@@ -574,6 +647,7 @@ fn build_registry(
         .map(|(workspaces, _)| workspaces)
 }
 
+#[cfg(test)]
 fn build_registry_reported(
     projects: Vec<Project>,
     sandboxes: Vec<SandboxRegistration>,
@@ -583,6 +657,7 @@ fn build_registry_reported(
     build_registry_with_cache(projects, sandboxes, allowed_roots, known_roots, &[])
 }
 
+#[cfg(test)]
 fn build_registry_with_cache(
     projects: Vec<Project>,
     sandboxes: Vec<SandboxRegistration>,
@@ -732,6 +807,7 @@ fn eligible_sandbox(
 
 /// Detached admission comes only from Git's registered worktree list. Keep
 /// this entire read on the blocking registry worker, never the async tick.
+#[cfg(test)]
 fn registered_workspaces_with_detached(
     projects: Vec<Project>,
     sandboxes: Vec<SandboxRegistration>,
@@ -745,6 +821,7 @@ fn registered_workspaces_with_detached(
     )
 }
 
+#[cfg(test)]
 fn registered_workspaces_with_detached_excluding(
     projects: Vec<Project>,
     sandboxes: Vec<SandboxRegistration>,
@@ -1152,7 +1229,7 @@ mod tests {
         )
         .unwrap();
         let database = base.path().join("store.db");
-        let store = Store::open(&database).unwrap();
+        let store = Store::open_test_fixture(&database).unwrap();
         let external = Store::open(&database).unwrap();
         let project_id = Uuid::new_v4();
         store
@@ -1171,7 +1248,8 @@ mod tests {
         let valid_id = stored_custody(&store, &external, project_id, 129, &repo, &valid_root);
         let mut known = KnownRoots::default();
         let (workspaces, diagnostics) =
-            registry_snapshot_reported(&store, &[], &mut known).unwrap();
+            registry_snapshot_reported(&store, &[], &mut known, WorkspaceScope::AllCheckouts)
+                .unwrap();
         let valid_workspace = rsi_codegraph::CodegraphStore::workspace_id(
             project_id,
             &format!("rsi-sandbox:{valid_id}"),
@@ -1193,7 +1271,7 @@ mod tests {
         let repo = base.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let database = base.path().join("store.db");
-        let store = Store::open(&database).unwrap();
+        let store = Store::open_test_fixture(&database).unwrap();
         let external = Store::open(&database).unwrap();
         let project_id = Uuid::new_v4();
         store
@@ -1209,8 +1287,13 @@ mod tests {
             .unwrap();
             stored_custody(&store, &external, project_id, ordinal, &repo, &root);
         }
-        let error =
-            registry_snapshot_reported(&store, &[], &mut KnownRoots::default()).unwrap_err();
+        let error = registry_snapshot_reported(
+            &store,
+            &[],
+            &mut KnownRoots::default(),
+            WorkspaceScope::AllCheckouts,
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             super::super::IndexError::DiscoveryLimit("active registered workspaces")
@@ -1231,7 +1314,7 @@ mod tests {
         )
         .unwrap();
         let database = base.path().join("store.db");
-        let store = Store::open(&database).unwrap();
+        let store = Store::open_test_fixture(&database).unwrap();
         let external = Store::open(&database).unwrap();
         let project_id = Uuid::new_v4();
         store
@@ -1255,6 +1338,7 @@ mod tests {
             RegistryStoreSource::Shared(&shared),
             &[],
             &mut KnownRoots::default(),
+            WorkspaceScope::AllCheckouts,
             || {
                 page_count += 1;
                 if page_count == 3 {
@@ -1303,7 +1387,7 @@ mod tests {
         )
         .unwrap();
         let database = base.path().join("store.db");
-        let store = Store::open(&database).unwrap();
+        let store = Store::open_test_fixture(&database).unwrap();
         let external = Store::open(&database).unwrap();
         let project_id = Uuid::new_v4();
         store
@@ -1316,6 +1400,7 @@ mod tests {
             RegistryStoreSource::Shared(&shared),
             &[],
             &mut KnownRoots::default(),
+            WorkspaceScope::AllCheckouts,
             || {
                 page_count += 1;
                 if page_count == 1 {
@@ -1890,7 +1975,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let indexes = tempfile::tempdir().unwrap();
         let settings_path = indexes.path().join("daemon.sqlite");
-        let settings_store = Store::open(&settings_path).unwrap();
+        let settings_store = Store::open_test_fixture(&settings_path).unwrap();
         std::fs::write(root.path().join("lib.rs"), "pub fn first() {}\n").unwrap();
         let project = Project {
             id: Uuid::new_v4(),
@@ -2150,6 +2235,180 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
+    fn primary_only_scope_never_admits_sandbox_or_worktree_checkouts() {
+        let (base, repo) = git_fixture();
+        let sandbox_root = base.path().join("sandbox");
+        let detached_root = base.path().join("detached");
+        add_worktree(&repo, &sandbox_root);
+        add_worktree(&repo, &detached_root);
+        let database = base.path().join("store.db");
+        let store = Store::open_test_fixture(&database).unwrap();
+        let external = Store::open(&database).unwrap();
+        let project_id = Uuid::new_v4();
+        store
+            .insert_project(&project(project_id, repo.clone()))
+            .unwrap();
+        let sandbox_id = stored_custody(&store, &external, project_id, 0, &repo, &sandbox_root);
+        let roots = vec![base.path().to_path_buf()];
+        let primary = RegisteredWorkspace::primary(project_id, &repo).unwrap();
+
+        let (scoped, _) = registry_snapshot_reported(
+            &store,
+            &roots,
+            &mut KnownRoots::default(),
+            WorkspaceScope::PrimaryOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            scoped
+                .iter()
+                .map(RegisteredWorkspace::workspace_id)
+                .collect::<Vec<_>>(),
+            [primary.workspace_id()]
+        );
+
+        // The admission machinery stays intact for content-shared storage.
+        let (everything, _) = registry_snapshot_reported(
+            &store,
+            &roots,
+            &mut KnownRoots::default(),
+            WorkspaceScope::AllCheckouts,
+        )
+        .unwrap();
+        let sandbox_workspace = rsi_codegraph::CodegraphStore::workspace_id(
+            project_id,
+            &format!("rsi-sandbox:{sandbox_id}"),
+        )
+        .unwrap();
+        assert_eq!(everything.len(), 3);
+        assert!(
+            everything
+                .iter()
+                .any(|workspace| workspace.workspace_id() == sandbox_workspace)
+        );
+    }
+
+    /// #2375: the startup registration (registry snapshot, index databases,
+    /// watches) never runs inside `start_deferred`; the registry task installs
+    /// it in the background.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn startup_registration_is_deferred_to_the_registry_task() {
+        let (base, repo) = git_fixture();
+        let database = base.path().join("store.db");
+        let store = Store::open_test_fixture(&database).unwrap();
+        let project_id = Uuid::new_v4();
+        store
+            .insert_project(&project(project_id, repo.clone()))
+            .unwrap();
+        let indexes = tempfile::tempdir().unwrap();
+        let mut runtime = IndexRuntime::start_deferred(
+            indexes.path().to_path_buf(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(runtime.watchers.is_empty(), "no watch installed at start");
+        assert!(runtime.startup_pending);
+        assert!(
+            runtime
+                .handle()
+                .registered_project_workspaces(project_id)
+                .unwrap()
+                .is_empty(),
+            "nothing is registered before the registry task runs"
+        );
+        let handle = runtime.handle().clone();
+        runtime.attach_registry(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            vec![base.path().to_path_buf()],
+        );
+        assert!(!runtime.startup_pending, "the registry task owns it");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle
+                .registered_project_workspaces(project_id)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the registry task registers the startup snapshot");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn daemon_runtime_registers_only_the_primary_and_status_says_why() {
+        let (base, repo) = git_fixture();
+        let sandbox_root = base.path().join("sandbox");
+        add_worktree(&repo, &sandbox_root);
+        let database = base.path().join("store.db");
+        let store = Store::open_test_fixture(&database).unwrap();
+        let external = Store::open(&database).unwrap();
+        let project_id = Uuid::new_v4();
+        store
+            .insert_project(&project(project_id, repo.clone()))
+            .unwrap();
+        let sandbox_id = stored_custody(&store, &external, project_id, 0, &repo, &sandbox_root);
+        let indexes = tempfile::tempdir().unwrap();
+        let runtime = IndexRuntime::start_with_workspaces(
+            indexes.path().to_path_buf(),
+            {
+                let mut known = KnownRoots::default();
+                registry_snapshot_reported(
+                    &store,
+                    &[base.path().to_path_buf()],
+                    &mut known,
+                    PRODUCTION_SCOPE,
+                )
+                .unwrap()
+                .0
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+            KnownRoots::default(),
+        )
+        .unwrap();
+        let primary = RegisteredWorkspace::primary(project_id, &repo).unwrap();
+        let admitted = runtime
+            .handle()
+            .registered_project_workspaces(project_id)
+            .unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].workspace.workspace_id(), primary.workspace_id());
+
+        let handle = runtime.handle().clone();
+        let shared = Arc::new(tokio::sync::Mutex::new(store));
+        let sandbox_workspace = rsi_codegraph::CodegraphStore::workspace_id(
+            project_id,
+            &format!("rsi-sandbox:{sandbox_id}"),
+        )
+        .unwrap();
+        let (primary_status, sandbox_status) = tokio::task::spawn_blocking(move || {
+            let service = super::super::CodegraphReadService::with_store(&handle, shared);
+            let status = |workspace_id| {
+                service
+                    .status(&super::super::BoundCodegraphScope::from_daemon_identity(
+                        project_id,
+                        workspace_id,
+                        false,
+                    ))
+                    .unwrap()
+            };
+            (status(primary.workspace_id()), status(sandbox_workspace))
+        })
+        .await
+        .unwrap();
+        assert_eq!(primary_status.scope_note, None);
+        assert_eq!(
+            sandbox_status.scope_note.as_deref(),
+            Some("primary_checkout_only")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
     fn custody_uses_longest_registered_project_prefix() {
         let parent = tempfile::tempdir().unwrap();
         let repo = parent.path().join("repo");
@@ -2193,5 +2452,30 @@ mod tests {
                 .any(|workspace| workspace.workspace_id() == sandbox_id)
         );
         assert_eq!(workspaces.len(), 3);
+    }
+
+    /// #2930: a refresh pass that overruns the period gets one catch-up tick
+    /// and then a full idle period, never a burst of back-to-back passes.
+    /// Virtual time only: the paused clock advances when the runtime idles.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test(start_paused = true)]
+    async fn registry_refresh_does_not_burst_after_an_overrun_2930() {
+        let mut tick = registry_interval();
+        tick.tick().await;
+        // One pass that took three periods.
+        tokio::time::advance(REGISTRY_REFRESH * 3).await;
+        let late = tokio::time::Instant::now();
+        tick.tick().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            late,
+            "the overdue tick fires once"
+        );
+        tick.tick().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            late + REGISTRY_REFRESH,
+            "the next pass waits a full period instead of catching up"
+        );
     }
 }

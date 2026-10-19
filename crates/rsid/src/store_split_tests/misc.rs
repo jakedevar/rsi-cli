@@ -7,7 +7,6 @@ use rsid_store::idea_control::{IdeaControlError, IssueLinkConstraintClass};
 use rsid_store::store::Store;
 use rsid_store::store::d04_test_project_id;
 use rsid_store::test_support::make_test_session;
-use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -102,20 +101,28 @@ fn codegraph_indexing_defaults_off_and_validates_rpc_values() {
 fn discovery_only_catalog_identity_survives_store_reopen() {
     let directory = tempfile::tempdir().expect("create discovery-only catalog fixture");
     let database = directory.path().join("discovery-only-catalog.sqlite");
-    let store = Store::open(&database).expect("open discovery-only catalog store");
+    let store = Store::open_test_fixture(&database).expect("open discovery-only catalog store");
     let mut session = make_test_session();
     session.provider = SessionProvider::Codex;
     session.model = Some("gpt-6-astra".to_string());
     let registry = ProviderCapabilityRegistry::default();
-    registry
+    let catalog = registry
         .refresh_codex_catalog(
             "codex-cli 0.153.0",
-            include_bytes!("../../tests/fixtures/codex-models-0.155.1.json"),
+            &crate::provider_capabilities::discovery_only_codex_catalog_for_test(),
             "2026-09-03T12:34:56.123456789Z"
                 .parse()
                 .expect("fixed discovery observation"),
         )
         .expect("parse discovery-only future catalog");
+    assert_eq!(
+        catalog.snapshot().trust,
+        crate::provider_capabilities::CodexCatalogTrust::DiscoveryOnly
+    );
+    assert_eq!(
+        catalog.snapshot().trust_reason,
+        "catalog_field_missing:context_window"
+    );
     let mut request = ContextBudgetRequest::new(SessionProvider::Codex, "gpt-6-astra");
     request.configured_tokens = Some(400_000);
     let budget = registry.resolve_context_budget(request);

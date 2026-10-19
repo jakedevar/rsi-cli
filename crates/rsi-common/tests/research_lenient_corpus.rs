@@ -23,7 +23,7 @@ fn corpus_root() -> PathBuf {
     // Walk up from CARGO_MANIFEST_DIR (crates/rsi-common) to the workspace
     // root, then into thoughts/shared/research. Worktrees inherit the
     // thoughts/ tree from main, so this works inside any worktree.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(rsi_common::manifest_dir!());
     manifest
         .parent()
         .and_then(|p| p.parent())

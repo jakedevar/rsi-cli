@@ -44,4 +44,4 @@ git -C "$repo" worktree add --detach --quiet "$work/wt" "$sha" || exit 2
 exec 9>"$cache/.lock"
 flock 9
 export CARGO_TARGET_DIR="$cache"
-python3 "$checker" --repo "$work/wt" --base origin/rolling --head "$sha" --receipt-line
+python3 "$checker" --compile --repo "$work/wt" --base origin/rolling --head "$sha" --receipt-line

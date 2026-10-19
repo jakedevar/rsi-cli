@@ -14,8 +14,9 @@ use rsi_common::rpc::{ResolveTopologyAttemptParams, ResolveTopologyAttemptRespon
 use rsi_common::topology_agent::{
     AgentTopologyExecuteRequestV1, AgentTopologyExecuteResultV1,
     AgentTopologyGetExecutionRequestV1, AgentTopologyGetExecutionResultV1,
-    AgentTopologyInterruptRequestV1, AgentTopologyInterruptResultV1, AgentTopologyListRequestV1,
-    AgentTopologyListResultV1, AgentTopologyUpsertRequestV1, AgentTopologyUpsertResultV1,
+    AgentTopologyGetRequestV1, AgentTopologyGetResultV1, AgentTopologyInterruptRequestV1,
+    AgentTopologyInterruptResultV1, AgentTopologyListRequestV1, AgentTopologyListResultV1,
+    AgentTopologyUpsertRequestV1, AgentTopologyUpsertResultV1,
 };
 use uuid::Uuid;
 
@@ -44,9 +45,10 @@ fn audit<T>(verb: &'static str, caller: Uuid, outcome: &Result<T>) {
 }
 
 /// The six scoped topology verbs, in catalog order (plan §5.1).
-pub(crate) const TOPOLOGY_AGENT_VERBS: [AgentControlVerbV1; 6] = [
+pub(crate) const TOPOLOGY_AGENT_VERBS: [AgentControlVerbV1; 7] = [
     AgentControlVerbV1::TopologyUpsert,
     AgentControlVerbV1::TopologyList,
+    AgentControlVerbV1::TopologyGet,
     AgentControlVerbV1::TopologyExecute,
     AgentControlVerbV1::TopologyGetExecution,
     AgentControlVerbV1::TopologyInterrupt,
@@ -125,6 +127,13 @@ impl SessionManager {
             ),
             AgentControlVerbV1::TopologyList => serde_json::to_value(
                 self.agent_topology_list(
+                    caller,
+                    self.decode_recorded("list", caller, params).await?,
+                )
+                .await?,
+            ),
+            AgentControlVerbV1::TopologyGet => serde_json::to_value(
+                self.agent_topology_get(
                     caller,
                     self.decode_recorded("list", caller, params).await?,
                 )
@@ -277,6 +286,41 @@ impl SessionManager {
         finish("list", caller, outcome)
     }
 
+    /// `AgentTopologyGet`. Read-only like `AgentTopologyList`, so it is
+    /// ledgered under the `list` verb: the V133 ledger's verb CHECK is
+    /// released schema and a read needs no migration of its own.
+    pub(crate) async fn agent_topology_get(
+        &self,
+        caller: Uuid,
+        request: AgentTopologyGetRequestV1,
+    ) -> Result<AgentTopologyGetResultV1> {
+        let outcome = {
+            let store = self.store.lock().await;
+            let outcome = agent::get(&store, caller, &request);
+            let call = CallAudit {
+                verb: "list",
+                caller,
+                request_digest: agent::request_digest(&request),
+                epic_id: None,
+                topology_id: outcome
+                    .as_ref()
+                    .ok()
+                    .map(|result| result.topology.topology_id),
+                execution_id: None,
+            };
+            record_locked(
+                &store,
+                &call,
+                match &outcome {
+                    Ok(_) => CallOutcome::Accepted(None),
+                    Err(error) => CallOutcome::Refused(error),
+                },
+            );
+            outcome
+        };
+        finish("get", caller, outcome)
+    }
+
     /// `AgentTopologyGetExecution`.
     pub(crate) async fn agent_topology_get_execution(
         &self,
@@ -322,6 +366,37 @@ impl SessionManager {
         )
         .await;
         let executed = finish("execute", caller, outcome)?;
+        // Hub #2967: a fresh acceptance arms the requester's settle wake
+        // unless `wake:"none"`; a replay arms none (`arm_settle_wake`). It is
+        // armed before the driver starts so no settle can precede it.
+        let settle_wake = match self.get_session(caller).await {
+            None => agent::SettleWakeArm::default(),
+            Some(session) => {
+                let seat = agent::SettleWakeSeat {
+                    caller,
+                    working_dir: session
+                        .sandbox_root
+                        .clone()
+                        .unwrap_or_else(|| session.working_dir.clone()),
+                    provider: Some(session.provider),
+                    model: session.model.clone(),
+                    project_id: session.project_id,
+                };
+                let store = self.store.lock().await;
+                agent::arm_settle_wake(&store, seat, &request, &executed)
+            }
+        };
+        // #2427: executions this one superseded were interrupted at accept.
+        if !executed.superseded.is_empty() {
+            let executor = self.topology_executor().await;
+            for (old, updates) in executed.superseded {
+                for update in updates {
+                    self.event_bus()
+                        .publish(DaemonEvent::GraphExecution { update });
+                }
+                self.drive_topology_execution(executor.clone(), old);
+            }
+        }
         if let Some(update) = executed.accepted {
             self.event_bus()
                 .publish(DaemonEvent::GraphExecution { update });
@@ -336,7 +411,10 @@ impl SessionManager {
             let executor = self.topology_executor().await;
             self.drive_topology_execution(executor, executed.result.execution_id);
         }
-        Ok(executed.result)
+        let mut result = executed.result;
+        result.settle_wake_armed = settle_wake.armed;
+        result.settle_wake_refusal = settle_wake.refusal;
+        Ok(result)
     }
 
     /// `AgentTopologyInterrupt`.

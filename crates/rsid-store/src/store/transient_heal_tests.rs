@@ -493,3 +493,168 @@ fn pause_refusal_keeps_backoff_without_spending_budget_or_window() {
     );
     assert_eq!(next.attempt, 2);
 }
+
+const CAPACITY_STOP: &str =
+    "provider_error:codex:Selected model is at capacity. Please try a different model.";
+
+/// The events a real Codex capacity failure leaves (worker 2e6901d6, events
+/// 335-338): tool work, then the provider failure recorded as two Assistant
+/// messages, not as System events.
+fn record_mid_work_capacity_failure(store: &Store, session: Uuid) {
+    for (sequence, event_type, role, content) in [
+        (1, "Message", Some("User"), "do the work"),
+        (2, "ToolUse", None, ""),
+        (3, "ToolResult", None, "ok"),
+        (
+            4,
+            "Message",
+            Some("Assistant"),
+            "**Provider diagnostic (codex_event)**\n```\nSelected model is at capacity. Please try a different model.\n```",
+        ),
+        (
+            5,
+            "Message",
+            Some("Assistant"),
+            "**Process Error (codex_event)**\n```\nSelected model is at capacity. Please try a different model.\n```",
+        ),
+    ] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    session.to_string(),
+                    sequence,
+                    event_type,
+                    role,
+                    content,
+                    rfc3339(Utc::now())
+                ],
+            )
+            .unwrap();
+    }
+}
+
+/// #2109: a provider capacity failure, at launch or after hours of work, is
+/// resumed in the SAME session on the same model with #123's backoff, three
+/// times; the fourth failure spends the bound and the heal stops.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn provider_capacity_failure_resumes_the_same_session_a_bounded_number_of_times() {
+    let store = Store::open_in_memory().unwrap();
+    let session = failed(&store, None, Some(CAPACITY_STOP));
+    record_mid_work_capacity_failure(&store, session.id);
+    assert_eq!(store.capacity_resume_state(session.id).unwrap(), None);
+
+    let t0 = Utc::now();
+    let mut job = None;
+    for (attempt, wait) in [(1_u32, 60_i64), (2, 120), (3, 240)] {
+        let now = t0 + chrono::Duration::seconds(attempt as i64);
+        let schedule = scheduled(store.schedule_transient_heal(session.id, now).unwrap());
+        assert_eq!(schedule.attempt, attempt);
+        assert_eq!(schedule.max_attempts, CAPACITY_RESUME_MAX_ATTEMPTS);
+        assert_eq!(schedule.reason, "provider_capacity");
+        let row = store.get_scheduled_job(&schedule.job_id).unwrap().unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.wake_mode, WakeMode::Resume);
+        assert_eq!(
+            row.wake_session_id,
+            Some(session.id),
+            "the same session resumes"
+        );
+        assert_eq!(row.next_fire_at, now + chrono::Duration::seconds(wait));
+        assert!(
+            row.message.starts_with("capacity: resumed"),
+            "{}",
+            row.message
+        );
+        let state = store.capacity_resume_state(session.id).unwrap().unwrap();
+        assert_eq!(state.attempts, attempt);
+        assert_eq!(state.pending_until, Some(row.next_fire_at));
+        assert!(!state.exhausted);
+        fire(&store, schedule.job_id);
+        assert_eq!(
+            store
+                .capacity_resume_state(session.id)
+                .unwrap()
+                .unwrap()
+                .pending_until,
+            None,
+            "a fired resume is no longer pending"
+        );
+        job = Some(schedule.job_id);
+    }
+    let TransientHealOutcome::Exhausted(exhausted) = store
+        .schedule_transient_heal(session.id, t0 + chrono::Duration::seconds(10))
+        .unwrap()
+    else {
+        panic!("the fourth capacity failure must spend the bound");
+    };
+    assert_eq!(exhausted.max_attempts, CAPACITY_RESUME_MAX_ATTEMPTS);
+    assert_eq!(exhausted.not_before, None);
+    assert!(
+        !store
+            .get_scheduled_job(&job.unwrap())
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    let state = store.capacity_resume_state(session.id).unwrap().unwrap();
+    assert!(state.exhausted);
+    assert_eq!(state.pending_until, None);
+}
+
+/// #2109: only a capacity failure takes the capacity budget; every other
+/// provider error keeps today's behaviour (not healed).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn other_provider_errors_are_not_healed_as_capacity() {
+    let store = Store::open_in_memory().unwrap();
+    for stop in [
+        "provider_error:codex:invalid model",
+        "provider_error:provider_auth_invalid",
+        "provider_error:codex_usage_limit",
+        "provider_error:codex:exceeded your quota",
+        "provider_error:unclassified",
+    ] {
+        let session = failed(&store, None, Some(stop));
+        assert!(
+            matches!(
+                store
+                    .schedule_transient_heal(session.id, Utc::now())
+                    .unwrap(),
+                TransientHealOutcome::NotTransient(_)
+            ),
+            "{stop}"
+        );
+        assert_eq!(store.capacity_resume_state(session.id).unwrap(), None);
+    }
+}
+
+/// #2109: a manager's (or lead's) terminal watch on a capacity-failed session
+/// stays quiet while the same-session resume is armed, and fires once the
+/// resume has been spent or never ran inside its grace window.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn capacity_resume_holds_the_terminal_watch_only_while_armed() {
+    let store = Store::open_in_memory().unwrap();
+    let session = failed(&store, None, Some(CAPACITY_STOP));
+    let t0 = Utc::now();
+    assert!(!store.capacity_recovery_holds_watch(session.id, t0).unwrap());
+    let schedule = scheduled(store.schedule_transient_heal(session.id, t0).unwrap());
+    assert!(store.capacity_recovery_holds_watch(session.id, t0).unwrap());
+    // Past the resume's due time plus the grace window the watch fires.
+    let late = t0 + chrono::Duration::minutes(30);
+    assert!(
+        !store
+            .capacity_recovery_holds_watch(session.id, late)
+            .unwrap()
+    );
+    fire(&store, schedule.job_id);
+    assert!(!store.capacity_recovery_holds_watch(session.id, t0).unwrap());
+    // A non-capacity failure is never held.
+    let other = failed(&store, Some("aborted_streaming"), None);
+    scheduled(store.schedule_transient_heal(other.id, t0).unwrap());
+    assert!(!store.capacity_recovery_holds_watch(other.id, t0).unwrap());
+}

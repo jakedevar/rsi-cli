@@ -1,7 +1,9 @@
 mod live_context;
+mod write_roots;
 
 use crate::bedrock;
 use crate::claude::{LaunchConfig, StreamEvent};
+use crate::codex_live_catalog::{CatalogSource, CatalogView};
 use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::model_control::CliExecutionCapability;
@@ -25,7 +27,9 @@ use crate::provider_capabilities::{
 pub(crate) use crate::store_support::provider_defaults::{
     CODEX_TOOL_HISTORY_ERROR_CLASS, CODEX_USAGE_LIMIT_STOP_REASON, codex_reasoning_effort,
 };
+pub use crate::store_support::provider_settings::CodexConfigIsolation;
 pub use crate::store_support::provider_settings::CodexSandboxMode;
+use rsi_common::provider_lifecycle_hooks::LifecycleHookEvent;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -210,6 +214,58 @@ impl CodexClient {
         &self,
         reason: CatalogRefreshReason,
     ) -> Vec<(String, String)> {
+        self.discover_catalog_with_reason(reason).await.models
+    }
+
+    /// The bundled catalog joined with this login's live list (#2752): the
+    /// bundled snapshot supplies the menu, ordering and capability metadata;
+    /// the live list (a fresh `model/list`, falling back to non-bundled
+    /// `codex debug models`) decides which of those models the login can use.
+    /// A live-only visible model is appended. A failed live probe leaves the
+    /// bundled menu untouched and the result `degraded`.
+    pub(crate) async fn discover_catalog_with_reason(
+        &self,
+        reason: CatalogRefreshReason,
+    ) -> CodexDiscovery {
+        let base = self.discover_bundled_models_with_reason(reason).await;
+        let view = self.live_catalog_view().await;
+        join_live_catalog(base, view)
+    }
+
+    /// This login's live model list, cached per `codex_live_catalog_ttl_secs`
+    /// (0 = bundled only, so the returned view is `Bundled`).
+    pub(crate) async fn live_catalog_view(&self) -> CatalogView {
+        // Unit tests only probe a CLI they pinned: an ambient `codex` on the
+        // test host must never decide a launch.
+        #[cfg(test)]
+        if pinned_binary_for_test(&self.runtime_config).as_deref() != Some(&*self.binary_path) {
+            return CatalogView::disabled();
+        }
+        let ttl = self
+            .runtime_config
+            .codex_live_catalog_ttl_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::codex_live_catalog::live_view(&self.binary_path, ttl).await
+    }
+
+    /// The models a fresh live list omits from the menu, for status surfaces
+    /// (#2752). Reads the cached bundled snapshot (no bundled re-probe).
+    pub(crate) async fn live_unavailable_models(&self) -> (CatalogView, Vec<String>) {
+        let registry = provider_capabilities();
+        let base = registry
+            .cached_codex_catalog()
+            .map(|snapshot| snapshot.legacy_model_tuples())
+            .filter(|models| !models.is_empty())
+            .map(prioritize_codex_models)
+            .unwrap_or_else(codex_fallback_models);
+        let discovery = join_live_catalog(base, self.live_catalog_view().await);
+        (discovery.view, discovery.unavailable)
+    }
+
+    async fn discover_bundled_models_with_reason(
+        &self,
+        reason: CatalogRefreshReason,
+    ) -> Vec<(String, String)> {
         let registry = provider_capabilities();
         match self.refresh_catalog(registry, reason).await {
             Ok(refresh) => {
@@ -336,10 +392,37 @@ impl CodexClient {
         Ok(output.stdout)
     }
 
+    /// Operator's configured Codex config-isolation policy, read on every
+    /// spawn so an `UpdateDaemonConfig` mutation applies to the next launch.
+    /// An unparseable value (never written by `update_field`) fails to `Off`.
+    fn config_isolation(&self) -> CodexConfigIsolation {
+        let raw = self.runtime_config.codex_config_isolation.read().clone();
+        CodexConfigIsolation::parse(&raw).unwrap_or(CodexConfigIsolation::Off)
+    }
+
     /// Build the `codex exec [...]` Command — separated from `launch()` so
     /// tests can inspect the argv without spawning a real codex binary.
     /// The sandbox arg is read from `self.runtime_config` at call time, so
     /// runtime mutations are reflected on the next spawn.
+    /// #2768: the reasoning-effort ladder this login's live `model/list`
+    /// reported for the launch's model, read from the last good probe of this
+    /// binary (the launch chokepoint refreshes it). Only a Codex-routed launch
+    /// of the plain Codex CLI is judged by it; Pioneer, OpenRouter and Bedrock
+    /// run other catalogs, and an undescribed model returns `None`.
+    fn live_effort_ladder(&self, config: &LaunchConfig) -> Option<Vec<String>> {
+        if !matches!(
+            config.provider,
+            None | Some(
+                rsi_common::types::SessionProvider::Codex
+                    | rsi_common::types::SessionProvider::CodexAppServer
+            )
+        ) {
+            return None;
+        }
+        let model = config.model.as_deref()?;
+        crate::codex_live_catalog::known_effort_ladder(&self.binary_path, model)
+    }
+
     pub(crate) fn build_cmd(&self, config: &LaunchConfig) -> Result<Command> {
         self.build_cmd_with_vault(config, &crate::vault::global())
     }
@@ -449,10 +532,52 @@ impl CodexClient {
 
         cmd.args(["--json", "--skip-git-repo-check"]);
 
+        // #2759: a topology node's handoff turn has the harness constrain the
+        // final message to the handoff schema and write it to a file. Both
+        // files live in the session's execution scratch and are removed once
+        // the turn's message is read. Without a scratch directory the turn
+        // stays free text.
+        if config.structured_handoff {
+            match codex_structured_handoff_files(config) {
+                Some(files) => {
+                    cmd.arg("--output-schema")
+                        .arg(&files.schema)
+                        .arg("-o")
+                        .arg(&files.last_message);
+                }
+                None => tracing::warn!(
+                    "structured handoff turn has no execution scratch; launching it as free text"
+                ),
+            }
+        }
+
+        // #2760: operator-config isolation. `exec` and `exec resume` accept
+        // the same two flags, so every turn carries the current policy; `off`
+        // adds nothing. Every `-c` override below still applies.
+        cmd.args(self.config_isolation().cli_flags());
+
+        // #2763: subagent governance. Only a value the operator set is passed,
+        // so the defaults leave the argv untouched.
+        cmd.args(codex_subagent_overrides(
+            &self.runtime_config.codex_subagent_caps(),
+        ));
+
         let mode_str = self.runtime_config.codex_sandbox_mode.read().clone();
         // Defensive fallback — `update_field` validates inputs, so this
         // should never trip in practice.
-        let mode = CodexSandboxMode::parse(&mode_str).unwrap_or(CodexSandboxMode::WorkspaceWrite);
+        let mut mode =
+            CodexSandboxMode::parse(&mode_str).unwrap_or(CodexSandboxMode::WorkspaceWrite);
+        // #2758: a read-only policy narrows the daemon-wide sandbox for this
+        // session on every turn (fresh `--sandbox`, resume `-c sandbox_mode`);
+        // it never widens it.
+        if config
+            .tool_policy
+            .as_ref()
+            .and_then(|policy| policy.cli_access)
+            == Some(rsi_common::harness_tool_policy::CliAccessMode::ReadOnly)
+        {
+            mode = CodexSandboxMode::ReadOnly;
+        }
         if is_resume {
             // `exec resume` rejects `--sandbox`, but accepts config overrides.
             // Override the stored thread policy on every turn so changes in
@@ -471,13 +596,27 @@ impl CodexClient {
             cmd.args(["-m", model]);
         }
 
-        if let Some(effort) = validated_codex_reasoning_effort(config)? {
+        let live_ladder = self.live_effort_ladder(config);
+        if let Some(effort) = validated_codex_reasoning_effort(config, live_ladder.as_deref())? {
             cmd.args(["-c", &format!("model_reasoning_effort=\"{}\"", effort)]);
         }
 
         if let Some(tokens) = config.configured_context_window {
             validate_codex_configured_context_window(tokens)?;
             cmd.args(["-c", &format!("model_context_window={tokens}")]);
+        }
+
+        // hub #2765: the operator's allowlisted `-c` overrides. Validated at
+        // write time, so none names a key RSI sets below or one that widens
+        // the sandbox, approvals, hooks or MCP servers. Empty adds nothing.
+        if let Some(applied) = crate::provider_launch_overrides::resolve(
+            &self.runtime_config.provider_launch_overrides(),
+            rsi_common::provider_launch_overrides::OverrideProvider::Codex,
+        ) {
+            cmd.args(&applied.args);
+            if let Some(session_id) = config.rsi_session_id {
+                crate::provider_launch_overrides::note_applied(session_id, applied);
+            }
         }
 
         // Keep the MCP configuration session-ephemeral: Codex receives it as
@@ -526,10 +665,47 @@ impl CodexClient {
                 self.boundary_mail_hook_path.as_deref(),
                 &[rsi_common::boundary_mail_hook::MAIL_ONLY_FLAG],
             ) {
-                cmd.arg("-c")
-                    .arg(codex_boundary_mail_hook_override(&command))
-                    .arg("-c")
-                    .arg(codex_boundary_mail_hook_trust_override(&command));
+                // #2320: the same command, run at PreToolUse, refuses a shell
+                // command that breaks sandbox custody (branch change, stash,
+                // force push, kill by pattern) before it runs.
+                // #2766: plus the operator's Codex lifecycle hooks (PreCompact);
+                // an empty set passes exactly the three overrides above.
+                let lifecycle = self
+                    .runtime_config
+                    .provider_lifecycle_hooks()
+                    .codex_events();
+                for hook_override in
+                    codex_session_hook_overrides_with_lifecycle(&command, &lifecycle)
+                {
+                    cmd.arg("-c").arg(hook_override);
+                }
+            }
+        }
+
+        // #2767: explicit skills delivery. `codex exec` has no extra-root flag,
+        // so the launch pins the skill set through `skills.config`: the
+        // repository's `.agents/skills` enabled, every other skill Codex would
+        // read (nested, symlinked, project `.codex/skills`, user and admin
+        // roots) disabled, and Codex's bundled skills off (#2924). When the
+        // scan cannot prove it named every skill the launch is refused with a
+        // typed reason rather than run with a set it cannot vouch for. Absent
+        // under `ambient`.
+        if self.runtime_config.provider_skill_delivery().is_explicit() {
+            cmd.arg("-c")
+                .arg(rsi_common::provider_skill_delivery::CODEX_BUNDLED_SKILLS_OFF);
+            match crate::skill_delivery::codex_skills_override_for_launch(
+                config.working_dir.as_deref(),
+            ) {
+                Ok(Some(skills_override)) => {
+                    cmd.arg("-c").arg(skills_override);
+                }
+                Ok(None) => {}
+                Err(refusal) => {
+                    return Err(DaemonError::PolicyDenied(format!(
+                        "{}: provider_skill_delivery=explicit cannot name every skill this Codex launch would read; set it to ambient or trim the skill roots",
+                        refusal.code()
+                    )));
+                }
             }
         }
 
@@ -574,6 +750,36 @@ impl CodexClient {
 
         crate::claude::stamp_execution_environment(&mut cmd, config, uuid::Uuid::nil())?;
 
+        // #1202: `workspace-write` makes only the working directory writable,
+        // but a sandbox worktree keeps its Git administration and the build
+        // wrapper's slot state outside it. Grant exactly those paths (never
+        // the whole common Git directory, never `danger-full-access`).
+        if mode == CodexSandboxMode::WorkspaceWrite {
+            // #2746: the Git paths are authenticated against the common
+            // directory the sandbox custody recorded, never against what the
+            // worktree's own (worker-writable) pointer files claim.
+            let mut roots = config
+                .working_dir
+                .as_deref()
+                .zip(
+                    config
+                        .execution_scratch
+                        .as_ref()
+                        .and_then(|scratch| scratch.git_common_dir()),
+                )
+                .map(|(dir, common)| write_roots::git_write_roots(dir, common))
+                .unwrap_or_default();
+            roots.extend(write_roots::build_write_roots(|name| {
+                cmd.as_std()
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                    .and_then(|(_, value)| value.map(PathBuf::from))
+            }));
+            if let Some(roots_override) = write_roots::writable_roots_override(&roots) {
+                cmd.args(["-c", &roots_override]);
+            }
+        }
+
         // The Codex CLI reads the prompt from stdin when stdin is not a TTY.
         // We pipe stdin and write the query in, then close it (EOF) so the
         // process doesn't block waiting for more input.
@@ -582,6 +788,22 @@ impl CodexClient {
         cmd.stderr(Stdio::piped());
 
         Ok(cmd)
+    }
+
+    /// hub #2919: whether this launch installs the `SessionStart` hook: the
+    /// same condition as the hook install in the command build (a session
+    /// identity and the daemon's `rsi-rpc` sibling) plus the operator setting.
+    fn session_start_hook_installed(&self, config: &LaunchConfig) -> bool {
+        config.rsi_session_id.is_some()
+            && self
+                .runtime_config
+                .provider_lifecycle_hooks()
+                .contains(LifecycleHookEvent::SessionStart)
+            && crate::claude::boundary_mail_hook_command(
+                self.boundary_mail_hook_path.as_deref(),
+                &[rsi_common::boundary_mail_hook::MAIL_ONLY_FLAG],
+            )
+            .is_some()
     }
 
     #[cfg(test)]
@@ -613,7 +835,7 @@ impl CodexClient {
         let invocation_id = execution.invocation_id();
         let mut cmd = self.build_cmd(config)?;
         crate::claude::stamp_execution_environment(&mut cmd, config, invocation_id)?;
-        if matches!(
+        let detached = if matches!(
             config.provider,
             None | Some(rsi_common::SessionProvider::Codex)
         ) && let Some(shim) = crate::claude::turn_spool::available_shim(
@@ -624,37 +846,52 @@ impl CodexClient {
             let boundary = CodexTranscriptBoundary::for_launch(config.resume_session_id.as_deref());
             let payload = format!(
                 "{}\n",
-                codex_stdin_payload(config, config.resume_session_id.is_some())
+                codex_stdin_payload_routed(
+                    config,
+                    config.resume_session_id.is_some(),
+                    self.session_start_hook_installed(config)
+                )
             );
-            return crate::claude::turn_spool::launch(
+            let (wrapped, turn) = crate::claude::turn_spool::prepare_command(
                 &cmd,
                 config,
-                execution,
-                RuntimeExecutionRoute::CodexCli,
+                invocation_id,
                 &shim,
                 crate::claude::turn_spool::TurnOutput::Codex { boundary },
                 Some(payload.as_bytes()),
-            );
-        }
-        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
-        let is_resume = config.resume_session_id.is_some();
-        let transcript_boundary =
-            CodexTranscriptBoundary::for_launch(config.resume_session_id.as_deref());
+            )?;
+            cmd = wrapped;
+            Some(turn)
+        } else {
+            cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
+            None
+        };
 
+        let scope = crate::process_scope::command_scope(&cmd);
         let mut child = execution
             .bind_command(RuntimeExecutionRoute::CodexCli, cmd)
             .spawn()?;
-        let child_pid = child.id();
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), scope);
+        if let Some(turn) = detached {
+            return Ok(turn.into_process(child));
+        }
+        let is_resume = config.resume_session_id.is_some();
+        let transcript_boundary =
+            CodexTranscriptBoundary::for_launch(config.resume_session_id.as_deref());
 
         // Write the query to stdin and close the pipe. First-turn only, the
         // compact agent-discovery nudge is PREPENDED here (never in
         // `config.query`, which becomes the stored user event).
         if let Some(mut stdin) = child.stdin.take() {
-            let query = codex_stdin_payload(config, is_resume);
+            let query = codex_stdin_payload_routed(
+                config,
+                is_resume,
+                self.session_start_hook_installed(config),
+            );
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 let _ = stdin.write_all(query.as_bytes()).await;
@@ -675,6 +912,7 @@ impl CodexClient {
         let (stdout_done_tx, stdout_done_rx) = oneshot::channel();
 
         let stderr_tx = event_tx.clone();
+        let reader_stop = stop.clone();
         tokio::spawn(async move {
             let mut lines = BoundedLines::new(stdout, PROVIDER_MAX_LINE_BYTES);
             let mut thread_id: Option<String> = None;
@@ -714,9 +952,7 @@ impl CodexClient {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
-                        if let Some(pid) = child_pid {
-                            terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                        }
+                        let _ = reader_stop.terminate("provider pipe read failed");
                         let _ = event_tx.try_send(StreamEvent {
                             event_type: "process_error".to_string(),
                             data: serde_json::json!({
@@ -809,6 +1045,7 @@ impl CodexClient {
 
         // Capture stderr and surface errors as synthetic events
         if let Some(stderr) = stderr {
+            let reader_stop = stop.clone();
             tokio::spawn(async move {
                 let mut lines = BoundedLines::new(stderr, PROVIDER_MAX_LINE_BYTES);
                 let mut stderr_lines: Vec<String> = Vec::new();
@@ -820,9 +1057,7 @@ impl CodexClient {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(error) => {
-                            if let Some(pid) = child_pid {
-                                terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                            }
+                            let _ = reader_stop.terminate("provider pipe read failed");
                             let error_class = if matches!(error, BoundedLineError::Exceeded { .. })
                             {
                                 "provider_output_overflow"
@@ -863,9 +1098,7 @@ impl CodexClient {
                             .saturating_add(separator)
                             .saturating_add(line.len());
                         if next_bytes > PROVIDER_MAX_STDERR_BYTES {
-                            if let Some(pid) = child_pid {
-                                terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                            }
+                            let _ = reader_stop.terminate("provider pipe read failed");
                             let _ = stderr_tx.try_send(StreamEvent {
                                 event_type: "process_error".to_string(),
                                 data: serde_json::json!({
@@ -956,7 +1189,7 @@ impl CodexClient {
             });
         }
 
-        Ok((CodexProcess::direct(child), event_rx))
+        Ok((CodexProcess::direct(child, stop), event_rx))
     }
 }
 
@@ -968,6 +1201,9 @@ pub(crate) struct DetachedCodexDecoder {
     context: Option<live_context::LiveContextReader>,
     correlation: CodexStderrCorrelation,
     next_poll: std::time::Instant,
+    stderr_lines: Vec<String>,
+    stderr_bytes: usize,
+    fatal_stderr: CodexFatalStderrState,
 }
 
 impl DetachedCodexDecoder {
@@ -978,11 +1214,15 @@ impl DetachedCodexDecoder {
             thread: None,
             correlation: CodexStderrCorrelation::default(),
             next_poll: std::time::Instant::now(),
+            stderr_lines: Vec::new(),
+            stderr_bytes: 0,
+            fatal_stderr: CodexFatalStderrState::default(),
         }
     }
 
-    pub(crate) fn rehydrate(&mut self, raw: &StreamEvent) {
-        let _ = crate::claude::turn_spool::decode_codex(raw.clone(), &mut self.thread);
+    pub(crate) async fn rehydrate(&mut self, raw: StreamEvent) {
+        // Rebuild transcript correlation too, without replaying events or usage.
+        let _ = self.decode(raw).await;
     }
 
     pub(crate) async fn decode(
@@ -1052,27 +1292,46 @@ impl DetachedCodexDecoder {
         }
     }
 
-    pub(crate) fn stderr(&mut self, text: &str) -> Vec<StreamEvent> {
-        let mut lines = Vec::new();
-        let mut fatal = CodexFatalStderrState::default();
-        let mut events = Vec::new();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            if codex_stderr_suppression_reason(line.trim()).is_some() {
-                continue;
-            }
-            if let Some(error) = fatal.consume(line.to_string(), &mut lines) {
-                events.push(StreamEvent {
-                    event_type: "process_error".into(),
-                    data: serde_json::json!({
-                        "error": error, "source": "stderr", "terminal": true,
-                        "error_class": CODEX_STORAGE_FULL_ERROR_CLASS,
-                        "provider_event_type": CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE,
-                    }),
-                });
-            }
+    pub(crate) fn stderr_line(&mut self, line: String) -> Option<StreamEvent> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || codex_stderr_suppression_reason(trimmed).is_some() {
+            return None;
         }
+        let fatal = is_codex_storage_full_fatal_record(trimmed);
+        let companion = is_codex_storage_full_companion_record(trimmed);
+        if !fatal && !(self.fatal_stderr.storage_full_emitted && companion) {
+            let next = self
+                .stderr_bytes
+                .saturating_add(usize::from(!self.stderr_lines.is_empty()))
+                .saturating_add(line.len());
+            if next > PROVIDER_MAX_STDERR_BYTES {
+                return Some(detached_stderr_error(
+                    format!(
+                        "provider stderr exceeded {}-byte bound",
+                        PROVIDER_MAX_STDERR_BYTES
+                    ),
+                    "provider_output_overflow",
+                ));
+            }
+            self.stderr_bytes = next;
+        }
+        let error = self.fatal_stderr.consume(line, &mut self.stderr_lines)?;
+        self.stderr_bytes = self
+            .stderr_lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| line.len() + usize::from(index > 0))
+            .sum();
+        let mut event = detached_stderr_error(error, CODEX_STORAGE_FULL_ERROR_CLASS);
+        event.data["provider_event_type"] =
+            Value::String(CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE.into());
+        Some(event)
+    }
+
+    pub(crate) fn finish_stderr(&mut self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
         let records = filter_correlated_codex_stderr(
-            group_codex_stderr_records(lines),
+            group_codex_stderr_records(std::mem::take(&mut self.stderr_lines)),
             &mut self.correlation,
         );
         let diagnostic = summarize_codex_stderr_records(&records);
@@ -1085,12 +1344,40 @@ impl DetachedCodexDecoder {
     }
 }
 
+pub(crate) fn detached_stderr_error(error: String, class: &str) -> StreamEvent {
+    StreamEvent {
+        event_type: "process_error".into(),
+        data: serde_json::json!({"error": error, "source": "stderr", "terminal": true, "error_class": class}),
+    }
+}
+
 /// Return the Codex home directory used for persisted rollout transcripts.
 ///
 /// `codex exec` does not expose `ThreadTokenUsageUpdated` on its JSONL stdout,
 /// but it persists the unmodified core event to `$CODEX_HOME/sessions`. Keeping
 /// this lookup centralized also makes a custom `CODEX_HOME` work without a
 /// daemon configuration knob.
+/// The `-c` overrides a `codex exec` / `exec resume` turn passes for the
+/// operator's subagent caps (#2763, `[source]` Codex `agents.*` config): the
+/// `agents.default_subagent_model` string and the
+/// `agents.max_concurrent_threads_per_session` number. Empty for the defaults.
+/// The model is validated to a TOML-safe identifier on write
+/// (`normalize_subagent_model`), so quoting it cannot be broken out of.
+pub(crate) fn codex_subagent_overrides(
+    caps: &crate::store_support::provider_settings::SubagentCaps,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = &caps.model {
+        args.push("-c".to_string());
+        args.push(format!("agents.default_subagent_model=\"{model}\""));
+    }
+    if let Some(cap) = caps.max_concurrent {
+        args.push("-c".to_string());
+        args.push(format!("agents.max_concurrent_threads_per_session={cap}"));
+    }
+    args
+}
+
 fn codex_home_dir() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -1108,13 +1395,57 @@ fn codex_sessions_dir() -> Option<PathBuf> {
 pub(crate) const CODEX_BOUNDARY_MAIL_HOOK_KEY: &str =
     "/<session-flags>/config.toml:post_tool_use:0:0";
 
+/// Codex's trust key for the first handler of the first session-flag
+/// `PreToolUse` group, the custody guard (#2320). The provider contract canary
+/// (#2755, `provider_contract.rs`) asks the installed codex-cli for this key
+/// (`hooks/list`) at daemon start and whenever the CLI's version changes.
+pub(crate) const CODEX_CUSTODY_HOOK_KEY: &str = "/<session-flags>/config.toml:pre_tool_use:0:0";
+
+/// The Codex tool name the custody guard's `PreToolUse` hook matches: the
+/// shell tool (`Bash` in Codex's hook input).
+const CODEX_CUSTODY_HOOK_MATCHER: &str = "Bash";
+
 /// Codex's trust hash for the boundary-mail hook running `command`: the
 /// SHA-256 of the canonical (sorted-key, compact) JSON of its normalized
-/// identity, as codex-rs `hook_hash` / `version_for_toml` compute it. Pinned
-/// against hashes codex-cli 0.159.1 reported (`hooks/list`). If a future Codex
-/// hashes differently the hook is merely untrusted and does not run: mail then
-/// waits for turn end, it is never run unreviewed.
+/// identity, as codex-rs `hook_hash` / `version_for_toml` compute it. If a
+/// Codex build hashes differently the hook is merely untrusted and does not
+/// run: mail then waits for turn end, it is never run unreviewed. The contract
+/// canary (#2755) compares this hash with the `currentHash` the installed
+/// codex-cli reports, so a drift is noticed instead of silent.
 pub(crate) fn codex_boundary_mail_hook_trust_hash(command: &str) -> String {
+    let identity = serde_json::json!({
+        "event_name": "post_tool_use",
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+            "async": false,
+            "additionalContextLimit": 0,
+        }],
+    });
+    codex_hook_identity_hash(&identity)
+}
+
+/// Codex's trust hash for the custody `PreToolUse` hook running `command`.
+/// Unlike the mail hook it sets no `additionalContextLimit`, which Codex omits
+/// from the identity. The contract canary (#2755) checks it against the
+/// installed codex-cli's own `currentHash`.
+pub(crate) fn codex_custody_hook_trust_hash(command: &str) -> String {
+    let identity = serde_json::json!({
+        "event_name": "pre_tool_use",
+        "matcher": CODEX_CUSTODY_HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+            "async": false,
+        }],
+    });
+    codex_hook_identity_hash(&identity)
+}
+
+fn codex_hook_identity_hash(identity: &serde_json::Value) -> String {
     use sha2::Digest as _;
     fn canonical(value: &serde_json::Value) -> serde_json::Value {
         match value {
@@ -1131,18 +1462,7 @@ pub(crate) fn codex_boundary_mail_hook_trust_hash(command: &str) -> String {
             other => other.clone(),
         }
     }
-    let identity = serde_json::json!({
-        "event_name": "post_tool_use",
-        "matcher": "*",
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
-            "async": false,
-            "additionalContextLimit": 0,
-        }],
-    });
-    let bytes = serde_json::to_vec(&canonical(&identity)).unwrap_or_default();
+    let bytes = serde_json::to_vec(&canonical(identity)).unwrap_or_default();
     let digest = sha2::Sha256::digest(bytes);
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("sha256:{hex}")
@@ -1154,8 +1474,205 @@ pub(crate) fn codex_boundary_mail_hook_trust_hash(command: &str) -> String {
 /// hook and no other command.
 pub(crate) fn codex_boundary_mail_hook_trust_override(command: &str) -> String {
     format!(
-        "hooks.state={{\"{CODEX_BOUNDARY_MAIL_HOOK_KEY}\"={{trusted_hash=\"{}\"}}}}",
-        codex_boundary_mail_hook_trust_hash(command)
+        "hooks.state={{\"{CODEX_BOUNDARY_MAIL_HOOK_KEY}\"={{trusted_hash=\"{}\"}},\"{CODEX_CUSTODY_HOOK_KEY}\"={{trusted_hash=\"{}\"}}}}",
+        codex_boundary_mail_hook_trust_hash(command),
+        codex_custody_hook_trust_hash(command)
+    )
+}
+
+/// The three `-c` values a Codex launch passes to install and trust the
+/// session-flag hooks that run `command`: the boundary-mail `PostToolUse` hook
+/// (#1183), the custody `PreToolUse` hook (#2320) and the `hooks.state` trust
+/// for exactly those two. One list for the launch and for the contract canary
+/// (#2755), so the canary asks Codex about the very overrides a launch passes.
+pub(crate) fn codex_session_hook_overrides(command: &str) -> [String; 3] {
+    [
+        codex_boundary_mail_hook_override(command),
+        codex_custody_hook_override(command),
+        codex_boundary_mail_hook_trust_override(command),
+    ]
+}
+
+/// The hooks `hooks/list` must report for `command`, as `(key, hash)`: the
+/// trust key Codex derives and the hash RSI computes for it.
+pub(crate) fn codex_session_hook_expectations(command: &str) -> [(&'static str, String); 2] {
+    [
+        (
+            CODEX_BOUNDARY_MAIL_HOOK_KEY,
+            codex_boundary_mail_hook_trust_hash(command),
+        ),
+        (
+            CODEX_CUSTODY_HOOK_KEY,
+            codex_custody_hook_trust_hash(command),
+        ),
+    ]
+}
+
+/// #2766: Codex's trust key for the first handler of the first session-flag
+/// `PreCompact` group, the lifecycle hook installed when the operator enables
+/// `PreCompact` in `provider_lifecycle_hooks`.
+pub(crate) const CODEX_PRE_COMPACT_HOOK_KEY: &str = "/<session-flags>/config.toml:pre_compact:0:0";
+
+/// hub #2919: Codex's trust key for the first handler of the first
+/// session-flag `SessionStart` group (one unmatched group, as `PreCompact`).
+pub(crate) const CODEX_SESSION_START_HOOK_KEY: &str =
+    "/<session-flags>/config.toml:session_start:0:0";
+
+/// #2766: the Codex lifecycle events the contract canary always probes, so a
+/// trust drift is seen before an operator enables one.
+pub(crate) const CODEX_PROBED_LIFECYCLE_EVENTS: [LifecycleHookEvent; 2] = [
+    LifecycleHookEvent::PreCompact,
+    LifecycleHookEvent::SessionStart,
+];
+
+/// The Codex `hooks.<Event>` name, trust key and identity `event_name` of a
+/// lifecycle event, or `None` when Codex has no such hook (`StopFailure`).
+fn codex_lifecycle_hook_ids(
+    event: LifecycleHookEvent,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    match event {
+        LifecycleHookEvent::PreCompact => {
+            Some(("PreCompact", CODEX_PRE_COMPACT_HOOK_KEY, "pre_compact"))
+        }
+        LifecycleHookEvent::SessionStart => Some((
+            "SessionStart",
+            CODEX_SESSION_START_HOOK_KEY,
+            "session_start",
+        )),
+        LifecycleHookEvent::StopFailure => None,
+    }
+}
+
+/// #2766: Codex's trust hash for the lifecycle hook of `event` running
+/// `command`: an unmatched group, so the identity carries no `matcher`
+/// (observed against codex-cli 0.163.0 `hooks/list`).
+pub(crate) fn codex_lifecycle_hook_trust_hash(
+    event: LifecycleHookEvent,
+    command: &str,
+) -> Option<String> {
+    let (_, _, event_name) = codex_lifecycle_hook_ids(event)?;
+    let identity = serde_json::json!({
+        "event_name": event_name,
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+            "async": false,
+        }],
+    });
+    Some(codex_hook_identity_hash(&identity))
+}
+
+/// #2766: the `-c` override installing `command` as the Codex lifecycle hook
+/// of `event` (one unmatched group). No `onFailure`: a hook that fails to run
+/// is skipped and never blocks the session.
+pub(crate) fn codex_lifecycle_hook_override(
+    event: LifecycleHookEvent,
+    command: &str,
+) -> Option<String> {
+    let (hook_event, _, _) = codex_lifecycle_hook_ids(event)?;
+    let mut handler = toml::map::Map::new();
+    handler.insert("type".into(), toml::Value::String("command".into()));
+    handler.insert("command".into(), toml::Value::String(command.into()));
+    handler.insert(
+        "timeout".into(),
+        toml::Value::Integer(
+            i64::try_from(rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS)
+                .unwrap_or(i64::MAX),
+        ),
+    );
+    let mut group = toml::map::Map::new();
+    group.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(handler)]),
+    );
+    Some(format!(
+        "hooks.{hook_event}={}",
+        toml::Value::Array(vec![toml::Value::Table(group)])
+    ))
+}
+
+/// #2766: the lifecycle hooks `hooks/list` must report for `command` and
+/// `events`, as `(key, hash)`; events Codex has no hook for are skipped.
+pub(crate) fn codex_lifecycle_hook_expectations(
+    command: &str,
+    events: &[LifecycleHookEvent],
+) -> Vec<(&'static str, String)> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let (_, key, _) = codex_lifecycle_hook_ids(*event)?;
+            Some((key, codex_lifecycle_hook_trust_hash(*event, command)?))
+        })
+        .collect()
+}
+
+/// #2766: whether `key` is the trust key of a Codex lifecycle hook.
+pub(crate) fn is_codex_lifecycle_hook_key(key: &str) -> bool {
+    LifecycleHookEvent::ALL
+        .into_iter()
+        .filter_map(codex_lifecycle_hook_ids)
+        .any(|(_, lifecycle_key, _)| lifecycle_key == key)
+}
+
+/// #2766: the `-c` values a Codex launch passes for `command` with the
+/// lifecycle `events` enabled. With no Codex lifecycle event this is exactly
+/// [`codex_session_hook_overrides`]; otherwise the same mail and custody hooks,
+/// one override per lifecycle hook, and one `hooks.state` trusting exactly
+/// all of them (each by its key and RSI's hash).
+pub(crate) fn codex_session_hook_overrides_with_lifecycle(
+    command: &str,
+    events: &[LifecycleHookEvent],
+) -> Vec<String> {
+    let lifecycle = codex_lifecycle_hook_expectations(command, events);
+    if lifecycle.is_empty() {
+        return codex_session_hook_overrides(command).to_vec();
+    }
+    let mut overrides = vec![
+        codex_boundary_mail_hook_override(command),
+        codex_custody_hook_override(command),
+    ];
+    overrides.extend(
+        events
+            .iter()
+            .filter_map(|event| codex_lifecycle_hook_override(*event, command)),
+    );
+    let state = codex_session_hook_expectations(command)
+        .into_iter()
+        .chain(lifecycle)
+        .map(|(key, hash)| format!("\"{key}\"={{trusted_hash=\"{hash}\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    overrides.push(format!("hooks.state={{{state}}}"));
+    overrides
+}
+
+/// The `-c` override installing `command` as a Codex `PreToolUse` hook for the
+/// shell tool (#2320). The command runs with `--mail-only`, so it only denies:
+/// it never rewrites the call.
+pub(crate) fn codex_custody_hook_override(command: &str) -> String {
+    let mut handler = toml::map::Map::new();
+    handler.insert("type".into(), toml::Value::String("command".into()));
+    handler.insert("command".into(), toml::Value::String(command.into()));
+    handler.insert(
+        "timeout".into(),
+        toml::Value::Integer(
+            i64::try_from(rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS)
+                .unwrap_or(i64::MAX),
+        ),
+    );
+    let mut group = toml::map::Map::new();
+    group.insert(
+        "matcher".into(),
+        toml::Value::String(CODEX_CUSTODY_HOOK_MATCHER.into()),
+    );
+    group.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(handler)]),
+    );
+    format!(
+        "hooks.PreToolUse={}",
+        toml::Value::Array(vec![toml::Value::Table(group)])
     )
 }
 
@@ -2289,6 +2806,46 @@ fn filter_correlated_codex_stderr(
         .collect()
 }
 
+/// The Codex model menu with the live catalog joined in (#2752).
+pub(crate) struct CodexDiscovery {
+    pub(crate) models: Vec<(String, String)>,
+    pub(crate) view: CatalogView,
+    /// Menu models a fresh live list omits (empty unless the view is `Live`).
+    pub(crate) unavailable: Vec<String>,
+}
+
+fn join_live_catalog(mut models: Vec<(String, String)>, view: CatalogView) -> CodexDiscovery {
+    let mut unavailable = Vec::new();
+    if view.source != CatalogSource::Bundled {
+        for live in view.models.iter().filter(|live| !live.hidden) {
+            if !models
+                .iter()
+                .any(|(slug, _)| slug.eq_ignore_ascii_case(&live.id))
+            {
+                let label = live
+                    .display_name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| rsi_common::model_utils::abbreviate_model(&live.id));
+                models.push((live.id.clone(), label));
+            }
+        }
+    }
+    if view.source == CatalogSource::Live {
+        unavailable = models
+            .iter()
+            .filter(|(slug, _)| view.live_contains(slug) == Some(false))
+            .map(|(slug, _)| slug.clone())
+            .collect();
+    }
+    CodexDiscovery {
+        models,
+        view,
+        unavailable,
+    }
+}
+
 pub(crate) fn codex_fallback_models() -> Vec<(String, String)> {
     vec![
         ("gpt-6.1-sol".to_string(), "GPT-6.1 Sol".to_string()),
@@ -2337,7 +2894,21 @@ pub(crate) fn parse_codex_model_catalog(raw: &str) -> Result<Vec<(String, String
 /// present, is sent on both initial and resumed turns because Codex has no
 /// system-prompt channel. `config.query` is never mutated; this is a pure
 /// function over it, so the stored user event stays clean.
+#[cfg(test)]
 pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> String {
+    codex_stdin_payload_routed(config, is_resume, false)
+}
+
+/// [`codex_stdin_payload`] for a launch that installs the `SessionStart` hook
+/// (`session_start_hook`, hub #2919): a first turn defers the generic part to
+/// the hook when it fits, instead of prepending it. Any later turn puts back a
+/// preamble the hook never delivered. With no hook and nothing owed this is
+/// exactly [`codex_stdin_payload`].
+pub(crate) fn codex_stdin_payload_routed(
+    config: &LaunchConfig,
+    is_resume: bool,
+    session_start_hook: bool,
+) -> String {
     // `system_prompt` has historically not been a Codex CLI channel. Forward
     // only the daemon's dedicated custody and transport-recovery instructions;
     // arbitrary caller prompts must not change ordinary Codex launches.
@@ -2345,11 +2916,9 @@ pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> Str
         prompt.starts_with("## RSI sandbox custody (HARD)")
             || prompt.starts_with("## Codex transport recovery")
     });
+    let mut parts = Vec::new();
     if is_resume {
-        match launch_instruction {
-            Some(instruction) => format!("{instruction}\n\n{}", config.query),
-            None => config.query.clone(),
-        }
+        parts.extend(codex_undelivered_preamble(config));
     } else {
         // The same RSI-generic part every other provider gets, resolved
         // against the session's own tree (the thoughts policy is included
@@ -2359,21 +2928,81 @@ pub(crate) fn codex_stdin_payload(config: &LaunchConfig, is_resume: bool) -> Str
             .working_dir
             .clone()
             .or_else(|| std::env::current_dir().ok());
-        let mut parts = vec![crate::session::preamble::load_generic(
-            project_dir.as_deref(),
-        )];
-        if let Some(instruction) = launch_instruction {
-            parts.push(instruction.to_string());
+        let generic = crate::session::preamble::load_generic(project_dir.as_deref());
+        parts.extend(codex_generic_unless_deferred(
+            config,
+            session_start_hook,
+            generic,
+        ));
+    }
+    if let Some(instruction) = launch_instruction {
+        parts.push(instruction.to_string());
+    }
+    parts.push(config.query.clone());
+    parts.join("\n\n")
+}
+
+/// hub #2919: the generic part a first turn prepends, or `None` when it was
+/// deferred to the session's `SessionStart` hook.
+fn codex_generic_unless_deferred(
+    config: &LaunchConfig,
+    session_start_hook: bool,
+    generic: String,
+) -> Option<String> {
+    let Some(session_id) = config.rsi_session_id else {
+        return Some(generic);
+    };
+    if session_start_hook && crate::session_start_preamble::fits(&generic) {
+        crate::session_start_preamble::defer(session_id, generic);
+        return None;
+    }
+    // This first turn carries the preamble itself; nothing stays owed.
+    crate::session_start_preamble::forget(session_id);
+    Some(generic)
+}
+
+/// hub #2919: a preamble the `SessionStart` hook never delivered.
+fn codex_undelivered_preamble(config: &LaunchConfig) -> Option<String> {
+    let session_id = config.rsi_session_id?;
+    let preamble = crate::session_start_preamble::take_undelivered(session_id)?;
+    tracing::warn!(%session_id, "SessionStart hook did not deliver the preamble; it goes back in the prompt");
+    Some(preamble)
+}
+
+/// #2759: the schema and last-message files of a Codex handoff turn, written
+/// under the session's execution scratch. `None` without a session identity or
+/// a scratch directory, or when the files cannot be written.
+fn codex_structured_handoff_files(
+    config: &LaunchConfig,
+) -> Option<crate::structured_handoff::CodexHandoffFiles> {
+    let session_id = config.rsi_session_id?;
+    let scratch = config.execution_scratch.as_ref()?;
+    match crate::structured_handoff::prepare_codex_files(scratch.temp(), session_id) {
+        Ok(files) => Some(files),
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "structured handoff files not written");
+            None
         }
-        parts.push(config.query.clone());
-        parts.join("\n\n")
     }
 }
 
-fn validated_codex_reasoning_effort(config: &LaunchConfig) -> Result<Option<&'static str>> {
+/// Validate `config.effort` before it reaches `model_reasoning_effort`.
+///
+/// #2768: `live_ladder` is the model's ladder from this login's live
+/// `model/list` (`supportedReasoningEfforts`). When it is known it is the
+/// whole truth: a level it lists passes and any other is refused. Otherwise
+/// the effort must be in RSI's Codex vocabulary and, for a model the compiled
+/// table knows, on its compiled ladder.
+fn validated_codex_reasoning_effort(
+    config: &LaunchConfig,
+    live_ladder: Option<&[String]>,
+) -> Result<Option<String>> {
     let Some(raw_effort) = config.effort.as_deref() else {
         return Ok(None);
     };
+    if let (Some(model), Some(ladder)) = (config.model.as_deref(), live_ladder) {
+        return live_ladder_effort(raw_effort, model, ladder).map(Some);
+    }
     let effort = codex_reasoning_effort(Some(raw_effort)).ok_or_else(|| {
         let model = config
             .model
@@ -2398,7 +3027,23 @@ fn validated_codex_reasoning_effort(config: &LaunchConfig) -> Result<Option<&'st
         )));
     }
 
-    Ok(Some(effort))
+    Ok(Some(effort.to_string()))
+}
+
+/// `raw_effort` checked against a model's live ladder.
+fn live_ladder_effort(raw_effort: &str, model: &str, ladder: &[String]) -> Result<String> {
+    if ladder.iter().any(|level| level == raw_effort) {
+        return Ok(raw_effort.to_string());
+    }
+    Err(DaemonError::InvalidParam(format!(
+        "reasoning effort '{raw_effort}' is unsupported for Codex model '{model}' (this login's \
+         live catalog lists: {})",
+        if ladder.is_empty() {
+            "no effort levels".to_string()
+        } else {
+            ladder.join(", ")
+        }
+    )))
 }
 
 /// Non-fatal Codex rollout-recorder diagnostic.
@@ -2457,6 +3102,22 @@ fn is_codex_usage_limit_error(message: &str) -> bool {
             .strip_prefix(CODEX_USAGE_LIMIT_MESSAGE_PREFIX)
             .and_then(|suffix| suffix.chars().next())
             .is_some_and(char::is_whitespace)
+}
+
+/// The typed `RateLimitReachedType` a failure event carries (#2757), on the
+/// event or on its `error` object, camelCase (app-server) or snake_case. Only
+/// the closed protocol values count; an absent or unknown value is `None`, and
+/// the caller falls back to the message-prefix match.
+fn typed_rate_limit_reached(value: &Value) -> Option<&'static str> {
+    let error = value.get("error").filter(|error| error.is_object());
+    [Some(value), error].into_iter().flatten().find_map(|node| {
+        ["rateLimitReachedType", "rate_limit_reached_type"]
+            .into_iter()
+            .find_map(|key| {
+                node.get(key)
+                    .and_then(crate::codex_rate_limits::known_reached_type)
+            })
+    })
 }
 
 fn is_codex_missing_tool_output_error(message: &str) -> bool {
@@ -2649,12 +3310,17 @@ fn map_codex_json_to_stream_event_inner(
                     "Codex emitted error event with no message field".to_string()
                 }
             };
-            let usage_limited = classify_cli_usage_limit && is_codex_usage_limit_error(&message);
+            let reached = typed_rate_limit_reached(value).filter(|_| classify_cli_usage_limit);
+            let usage_limited = classify_cli_usage_limit
+                && (reached.is_some() || is_codex_usage_limit_error(&message));
             let mut data = serde_json::json!({
                 "error": message,
                 "source": "codex_event",
                 "provider_event_type": "error",
             });
+            if let Some(reached) = reached {
+                data["rate_limit_reached_type"] = Value::String(reached.to_string());
+            }
             if classify_cli_usage_limit {
                 data.as_object_mut()
                     .expect("Codex CLI error data is an object")
@@ -2680,13 +3346,18 @@ fn map_codex_json_to_stream_event_inner(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{:?}", error_obj));
-            let usage_limited = classify_cli_usage_limit && is_codex_usage_limit_error(&message);
+            let reached = typed_rate_limit_reached(value).filter(|_| classify_cli_usage_limit);
+            let usage_limited = classify_cli_usage_limit
+                && (reached.is_some() || is_codex_usage_limit_error(&message));
             let invalid_tool_history = is_codex_missing_tool_output_error(&message);
             let mut data = serde_json::json!({
                 "error": message,
                 "source": "codex_event",
                 "provider_event_type": "turn.failed",
             });
+            if let Some(reached) = reached {
+                data["rate_limit_reached_type"] = Value::String(reached.to_string());
+            }
             if usage_limited {
                 data.as_object_mut()
                     .expect("Codex turn.failed data is an object")
@@ -2825,6 +3496,7 @@ mod tests {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 
@@ -2860,6 +3532,470 @@ mod tests {
         })
     }
 
+    /// #2767 golden argv: `ambient` (the default) passes no `skills.config`;
+    /// `explicit` passes `-c skills.bundled.enabled=false` and exactly one
+    /// `-c skills.config=[...]` enabling the repository's `.agents/skills`, for a
+    /// fresh turn and a resume; two sandboxes with the same skills pass the same
+    /// override.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn explicit_skill_delivery_passes_one_skills_config_override() {
+        let skills = rsi_common::provider_skill_delivery::CODEX_SKILLS_DIR;
+        let repo = crate::skill_delivery::tests::repo_with_skills(skills, &["plan", "debug"]);
+        let overrides = |mode: &str, resume: Option<String>| -> Vec<String> {
+            let runtime_config = runtime_config_with_sandbox_mode("workspace-write");
+            runtime_config
+                .update_field("provider_skill_delivery", &serde_json::json!(mode))
+                .expect("mode");
+            let client = codex_client_for_test(runtime_config);
+            let mut config = launch_config_minimal(resume);
+            config.working_dir = Some(repo.path().to_path_buf());
+            cmd_args(&client.build_cmd(&config).unwrap())
+                .windows(2)
+                .filter(|pair| pair[0] == "-c" && pair[1].starts_with("skills."))
+                .map(|pair| pair[1].clone())
+                .collect()
+        };
+        assert!(overrides("ambient", None).is_empty());
+
+        for resume in [None, Some("thread-1".to_string())] {
+            let found = overrides("explicit", resume);
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert_eq!(
+                found[0],
+                rsi_common::provider_skill_delivery::CODEX_BUNDLED_SKILLS_OFF
+            );
+            let table: toml::Table = toml::from_str(&found[1]).expect("valid TOML override");
+            let entries = table["skills"]["config"].as_array().unwrap();
+            let paths: Vec<&str> = entries
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap())
+                .collect();
+            let root = std::fs::canonicalize(repo.path()).unwrap();
+            assert_eq!(
+                paths,
+                [
+                    root.join(skills).join("debug/SKILL.md").to_str().unwrap(),
+                    root.join(skills).join("plan/SKILL.md").to_str().unwrap(),
+                ]
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["enabled"].as_bool() == Some(true))
+            );
+        }
+    }
+
+    /// #2760: `codex_config_isolation` golden argv. `off` is today's argv;
+    /// `user`/`rules`/`all` add exactly their flags right after the fixed
+    /// `--json --skip-git-repo-check` pair, for a fresh turn and a resume,
+    /// and every RSI `-c` override (sandbox, effort, MCP) still applies.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn config_isolation_adds_only_its_flags_to_fresh_and_resume_argv() {
+        let build = |policy: Option<&str>, resume: Option<&str>| {
+            let mut cfg = crate::config::Config::from_env();
+            cfg.codex_sandbox_mode = "workspace-write".to_string();
+            if let Some(policy) = policy {
+                cfg.codex_config_isolation = policy.to_string();
+            }
+            let client = codex_client_for_test(RuntimeConfig::from_config(&cfg));
+            let mut config = launch_config_minimal(resume.map(str::to_string));
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            config.effort = Some("high".to_string());
+            cmd_args(&client.build_cmd(&config).unwrap())
+        };
+        for resume in [None, Some("thread-2760")] {
+            let baseline = build(None, resume);
+            assert_eq!(build(Some("off"), resume), baseline, "{resume:?}");
+            assert!(
+                baseline
+                    .iter()
+                    .all(|a| a != "--ignore-user-config" && a != "--ignore-rules")
+            );
+            let pos = baseline
+                .iter()
+                .position(|a| a == "--skip-git-repo-check")
+                .unwrap()
+                + 1;
+            for (policy, flags) in [
+                ("user", &["--ignore-user-config"][..]),
+                ("rules", &["--ignore-rules"][..]),
+                ("all", &["--ignore-user-config", "--ignore-rules"][..]),
+            ] {
+                let args = build(Some(policy), resume);
+                let mut expected = baseline.clone();
+                for (i, flag) in flags.iter().enumerate() {
+                    expected.insert(pos + i, (*flag).to_string());
+                }
+                assert_eq!(args, expected, "{policy} {resume:?}");
+                // The overrides still ride along (MCP, sandbox).
+                assert!(
+                    args.iter()
+                        .any(|a| a.contains("mcp_servers.rsi-agent.command")),
+                    "{policy}: {args:?}"
+                );
+                assert!(args.iter().any(|a| a.contains("sandbox")), "{policy}");
+                assert!(
+                    args.iter().any(|a| a.contains("model_reasoning_effort")),
+                    "{policy}: {args:?}"
+                );
+                assert_eq!(args.iter().any(|a| a == "resume"), resume.is_some());
+            }
+        }
+    }
+
+    /// #2763: subagent governance golden argv. The defaults are today's argv
+    /// byte for byte; a chosen model and cap add exactly their `-c` overrides,
+    /// for a fresh turn and a resume.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn subagent_governance_adds_only_its_overrides_to_fresh_and_resume_argv() {
+        let build = |model: Option<&str>, cap: Option<u64>, resume: Option<&str>| {
+            let mut cfg = crate::config::Config::from_env();
+            cfg.codex_sandbox_mode = "workspace-write".to_string();
+            let runtime = RuntimeConfig::from_config(&cfg);
+            if let Some(model) = model {
+                runtime
+                    .update_field("codex_subagent_model", &serde_json::json!(model))
+                    .unwrap();
+            }
+            if let Some(cap) = cap {
+                runtime
+                    .update_field("codex_max_concurrent_subagents", &serde_json::json!(cap))
+                    .unwrap();
+            }
+            let client = codex_client_for_test(runtime);
+            let mut config = launch_config_minimal(resume.map(str::to_string));
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            config.effort = Some("high".to_string());
+            cmd_args(&client.build_cmd(&config).unwrap())
+        };
+        for resume in [None, Some("thread-2763")] {
+            let baseline = build(None, None, resume);
+            assert!(
+                baseline.iter().all(|a| !a.starts_with("agents.")),
+                "defaults emit nothing: {baseline:?}"
+            );
+            // An explicit "unset" is the default too.
+            assert_eq!(build(Some(""), Some(0), resume), baseline, "{resume:?}");
+            for (model, cap, expected) in [
+                (
+                    Some("gpt-5.1-codex-mini"),
+                    None,
+                    vec!["agents.default_subagent_model=\"gpt-5.1-codex-mini\""],
+                ),
+                (
+                    None,
+                    Some(3),
+                    vec!["agents.max_concurrent_threads_per_session=3"],
+                ),
+                (
+                    Some("gpt-5.1-codex-mini"),
+                    Some(3),
+                    vec![
+                        "agents.default_subagent_model=\"gpt-5.1-codex-mini\"",
+                        "agents.max_concurrent_threads_per_session=3",
+                    ],
+                ),
+            ] {
+                let args = build(model, cap, resume);
+                let overrides: Vec<&str> = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-c" && pair[1].starts_with("agents."))
+                    .map(|pair| pair[1].as_str())
+                    .collect();
+                assert_eq!(overrides, expected, "{model:?} {cap:?} {resume:?}");
+                // Nothing else moved: removing the overrides gives the baseline.
+                let mut stripped = Vec::new();
+                let mut i = 0;
+                while i < args.len() {
+                    if args[i] == "-c" && args.get(i + 1).is_some_and(|a| a.starts_with("agents."))
+                    {
+                        i += 2;
+                    } else {
+                        stripped.push(args[i].clone());
+                        i += 1;
+                    }
+                }
+                assert_eq!(stripped, baseline, "{model:?} {cap:?} {resume:?}");
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    /// A one-shot fake Responses endpoint for the real-binary isolation check:
+    /// the first request answers with an `exec_command` tool call (so Codex
+    /// runs its PreToolUse and PostToolUse hooks), every later request is
+    /// refused to end the turn. Returns the base URL and the request bodies.
+    fn spawn_mock_responses_server() -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = StdBufReader::new(stream.try_clone().unwrap());
+                let mut length = 0_usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0_u8; length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let first = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(String::from_utf8_lossy(&body).into_owned());
+                    seen.len() == 1
+                };
+                let response = if first {
+                    let call = serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call_2877",
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"true\"}",
+                        },
+                    });
+                    let done = serde_json::json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp_2877", "usage": {
+                            "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                        }},
+                    });
+                    let sse = format!(
+                        "event: response.output_item.done\ndata: {call}\n\n\
+                         event: response.completed\ndata: {done}\n\n"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                } else {
+                    let error = r#"{"error":{"message":"mock end of turn"}}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{error}",
+                        error.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, bodies)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    /// What one real `codex exec` turn showed under an isolation policy.
+    struct RealCodexTurn {
+        /// The first model request body (effort, sandbox text, operator marker).
+        request: String,
+        /// The stub `rsi-agent-mcp` launches Codex made.
+        mcp_launches: String,
+        /// The stdin of every hook the stub `rsi-rpc` ran.
+        hook_events: String,
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    /// Run the argv `build_cmd` builds for `policy` against the real Codex
+    /// binary at `codex`, with an operator config in `$CODEX_HOME` and a fake
+    /// model endpoint, and report what that binary resolved and did.
+    fn run_real_codex_turn(codex: &Path, policy: &str) -> RealCodexTurn {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("codex-home");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        // The operator's own config: every key is something RSI also sets, so
+        // an ignored file and a merged file read differently.
+        std::fs::write(
+            home.join("config.toml"),
+            "developer_instructions = \"OPERATOR-CONFIG-MARKER-2877\"\n\
+             model_reasoning_effort = \"low\"\n\
+             sandbox_mode = \"read-only\"\n",
+        )
+        .unwrap();
+        let mcp_log = tmp.path().join("mcp.log");
+        let hook_log = tmp.path().join("hook.log");
+        let stub = |name: &str, body: String| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // The MCP stub records that Codex launched it, then exits.
+        let mcp = stub(
+            "rsi-agent-mcp",
+            format!("#!/bin/sh\necho launched >> '{}'\n", mcp_log.display()),
+        );
+        // The hook stub records the hook event Codex sent on stdin.
+        let rsi_rpc = stub(
+            "rsi-rpc",
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{0}'\n",
+                hook_log.display()
+            ),
+        );
+
+        let mut cfg = crate::config::Config::from_env();
+        cfg.codex_sandbox_mode = "workspace-write".to_string();
+        cfg.codex_config_isolation = policy.to_string();
+        let client = CodexClient::with_paths_for_test(
+            codex.to_path_buf(),
+            mcp,
+            RuntimeConfig::from_config(&cfg),
+        )
+        .with_boundary_mail_hook_path_for_test(Some(rsi_rpc));
+        let mut config = launch_config_minimal(None);
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        config.working_dir = Some(work.clone());
+        config.effort = Some("high".to_string());
+        let built = client.build_cmd(&config).expect("build_cmd");
+
+        let (url, bodies) = spawn_mock_responses_server();
+        let mut real = std::process::Command::new(codex);
+        real.args(cmd_args(&built))
+            .args([
+                "-c",
+                "model_provider=\"mock\"",
+                "-c",
+                "model=\"mock-model\"",
+                "-c",
+                "model_providers.mock.name=\"mock\"",
+                "-c",
+                &format!("model_providers.mock.base_url=\"{url}\""),
+                "-c",
+                "model_providers.mock.wire_api=\"responses\"",
+                "-c",
+                "model_providers.mock.requires_openai_auth=false",
+                "-c",
+                "model_providers.mock.supports_websockets=false",
+            ])
+            .current_dir(&work)
+            .env("CODEX_HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = real.spawn().expect("spawn real codex");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"say hi")
+            .expect("write prompt");
+        let started = std::time::Instant::now();
+        let output = loop {
+            if child.try_wait().expect("poll codex").is_some() {
+                break child.wait_with_output().expect("collect codex output");
+            }
+            if started.elapsed() > std::time::Duration::from_secs(120) {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("collect killed codex");
+                panic!(
+                    "real codex did not finish: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let request = bodies.lock().unwrap().first().cloned().unwrap_or_else(|| {
+            panic!(
+                "{policy}: codex sent no model request\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        RealCodexTurn {
+            request,
+            mcp_launches: std::fs::read_to_string(&mcp_log).unwrap_or_default(),
+            hook_events: std::fs::read_to_string(&hook_log).unwrap_or_default(),
+        }
+    }
+
+    /// #2877 (acceptance of #2760): against the real Codex binary,
+    /// `codex_config_isolation=user` (`--ignore-user-config`) drops the
+    /// operator's `$CODEX_HOME/config.toml` yet keeps every RSI `-c` override
+    /// in the config Codex resolves: the reasoning effort and sandbox mode it
+    /// sends the model, the `rsi-agent` MCP server it launches, and the RSI
+    /// PreToolUse and PostToolUse hooks it runs. `off` is the control that
+    /// proves the fake operator config is otherwise read. Reported as
+    /// `runner_unavailable` (and passes without asserting) when the host has
+    /// no `codex` that knows `--ignore-user-config`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn real_codex_user_isolation_keeps_rsi_overrides() {
+        let Some(codex) = crate::provider_cli::resolve("codex") else {
+            eprintln!("runner_unavailable: no codex binary on this host; 0 assertions run");
+            return;
+        };
+        let help = std::process::Command::new(&codex)
+            .args(["exec", "--help"])
+            .output();
+        if !help
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("--ignore-user-config"))
+        {
+            eprintln!(
+                "runner_unavailable: codex lacks exec --ignore-user-config; 0 assertions run"
+            );
+            return;
+        }
+
+        // Control: with no isolation Codex merges the operator's config, so
+        // the operator's marker reaches the model.
+        let off = run_real_codex_turn(&codex, "off");
+        assert!(
+            off.request.contains("OPERATOR-CONFIG-MARKER-2877"),
+            "off must merge the operator config: {}",
+            off.request
+        );
+
+        let user = run_real_codex_turn(&codex, "user");
+        let request: Value = serde_json::from_str(&user.request).expect("request is JSON");
+        assert!(
+            !user.request.contains("OPERATOR-CONFIG-MARKER-2877"),
+            "user isolation must not read the operator config"
+        );
+        // Effort: RSI's `high`, not the operator's `low`.
+        assert_eq!(request["reasoning"]["effort"], "high", "{request}");
+        // Sandbox: RSI's `workspace-write`, not the operator's `read-only`.
+        assert!(
+            user.request.contains("`sandbox_mode` is `workspace-write`"),
+            "sandbox override lost: {}",
+            user.request
+        );
+        // MCP: Codex launched the configured `rsi-agent` server command.
+        assert!(
+            user.mcp_launches.contains("launched"),
+            "rsi-agent MCP server was not launched"
+        );
+        // Hooks: both RSI session-flag hooks ran, so they are installed and
+        // trusted in the merged config.
+        for event in ["PreToolUse", "PostToolUse"] {
+            assert!(
+                user.hook_events
+                    .contains(&format!("\"hook_event_name\":\"{event}\"")),
+                "{event} hook did not run: {:?}",
+                user.hook_events
+            );
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn session_launch_injects_only_ephemeral_trusted_agent_mcp_config() {
@@ -2867,7 +4003,7 @@ mod tests {
         let client = codex_client_for_test(rc);
         let mut config = launch_config_minimal(None);
         config.rsi_session_id = Some(uuid::Uuid::new_v4());
-        config.rsi_session_token = Some("must-not-appear-in-argv".to_string());
+        config.rsi_session_token = Some("must-not-appear-in-argv".into());
         let command = client.build_cmd(&config).unwrap();
         let args = cmd_args(&command);
         assert!(
@@ -2885,7 +4021,9 @@ mod tests {
                 rsi_common::identity::ENV_SOCKET
             )));
         // #1175: only the rsi-agent server is pre-approved under approval
-        // policy "never", and no filesystem/network widening is added.
+        // policy "never", and no network or unrestricted filesystem widening
+        // is added. (#1202 adds `writable_roots` only for a launch whose
+        // working directory is a linked worktree; this one has none.)
         let approvals: Vec<&String> = args
             .iter()
             .filter(|arg| arg.contains("tools_approval_mode"))
@@ -2929,7 +4067,7 @@ mod tests {
                 .filter(|pair| pair[0] == "-c" && pair[1].starts_with("hooks."))
                 .map(|pair| toml::from_str(&pair[1]).expect("valid TOML override"))
                 .collect();
-            assert_eq!(overrides.len(), 2, "{resume:?}: {args:?}");
+            assert_eq!(overrides.len(), 3, "{resume:?}: {args:?}");
             let group = &overrides[0]["hooks"]["PostToolUse"][0];
             assert_eq!(group["matcher"].as_str(), Some("*"));
             let handler = &group["hooks"][0];
@@ -2940,13 +4078,24 @@ mod tests {
             );
             assert_eq!(handler["command"].as_str(), Some(expected_command.as_str()));
             assert_eq!(handler["additionalContextLimit"].as_integer(), Some(0));
-            let state = overrides[1]["hooks"]["state"]
+            // #2320: the same command guards the shell at PreToolUse.
+            let pre = &overrides[1]["hooks"]["PreToolUse"][0];
+            assert_eq!(pre["matcher"].as_str(), Some("Bash"));
+            assert_eq!(
+                pre["hooks"][0]["command"].as_str(),
+                Some(expected_command.as_str())
+            );
+            let state = overrides[2]["hooks"]["state"]
                 .as_table()
                 .expect("hook state");
-            assert_eq!(state.len(), 1, "exactly one hook is trusted");
+            assert_eq!(state.len(), 2, "exactly the two rsid hooks are trusted");
             assert_eq!(
                 state[CODEX_BOUNDARY_MAIL_HOOK_KEY]["trusted_hash"].as_str(),
                 Some(codex_boundary_mail_hook_trust_hash(&expected_command).as_str())
+            );
+            assert_eq!(
+                state[CODEX_CUSTODY_HOOK_KEY]["trusted_hash"].as_str(),
+                Some(codex_custody_hook_trust_hash(&expected_command).as_str())
             );
             assert!(
                 args.iter().all(|arg| !arg.contains("bypass-hook-trust")),
@@ -2956,6 +4105,137 @@ mod tests {
 
         let args = cmd_args(&client.build_cmd(&launch_config_minimal(None)).unwrap());
         assert!(args.iter().all(|arg| !arg.starts_with("hooks.")));
+    }
+
+    /// hub #2765: golden `-c`. An empty override list leaves the Codex argv
+    /// exactly as it was (fresh and resume); allowlisted keys are appended as
+    /// `-c key=<TOML>` pairs in order, and the launch notes what it applied.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn operator_launch_overrides_render_golden_config_args_and_empty_changes_nothing() {
+        let runtime = runtime_config_with_sandbox_mode("workspace-write");
+        let client = codex_client_for_test(Arc::clone(&runtime));
+        for resume in [None, Some("thread-1".to_string())] {
+            let session_id = uuid::Uuid::new_v4();
+            let mut config = launch_config_minimal(resume.clone());
+            config.rsi_session_id = Some(session_id);
+            runtime
+                .update_field(
+                    rsi_common::provider_launch_overrides::FIELD,
+                    &serde_json::json!(null),
+                )
+                .unwrap();
+            let baseline = cmd_args(&client.build_cmd(&config).unwrap());
+            assert_eq!(
+                crate::provider_launch_overrides::take_applied(session_id),
+                None,
+                "{resume:?}: an empty list records nothing"
+            );
+
+            runtime
+                .update_field(
+                    rsi_common::provider_launch_overrides::FIELD,
+                    &serde_json::json!({
+                        "codex": [
+                            "model_reasoning_summary=concise",
+                            "agents.enabled=true",
+                            "hide_agent_reasoning=true",
+                        ],
+                        "claude": ["--betas=b1"],
+                    }),
+                )
+                .unwrap();
+            let with = cmd_args(&client.build_cmd(&config).unwrap());
+            let golden = [
+                "-c",
+                "model_reasoning_summary=\"concise\"",
+                "-c",
+                "agents.enabled=true",
+                "-c",
+                "hide_agent_reasoning=true",
+            ];
+            let start = with
+                .iter()
+                .position(|arg| arg == "model_reasoning_summary=\"concise\"")
+                .map(|at| at - 1)
+                .unwrap_or_else(|| panic!("{resume:?}: overrides in {with:?}"));
+            assert_eq!(with[start..start + golden.len()], golden, "{resume:?}");
+            let mut without = with.clone();
+            without.drain(start..start + golden.len());
+            assert_eq!(
+                without, baseline,
+                "{resume:?}: only the overrides were added"
+            );
+            assert!(with.iter().all(|arg| arg != "--betas=b1"), "{with:?}");
+            let applied =
+                crate::provider_launch_overrides::take_applied(session_id).expect("applied note");
+            assert_eq!(
+                applied.entries,
+                vec![
+                    "model_reasoning_summary=concise",
+                    "agents.enabled=true",
+                    "hide_agent_reasoning=true",
+                ]
+            );
+        }
+    }
+
+    /// #2917: the subagent model and cap belong to the dedicated settings. An
+    /// operator launch override of either key is refused at write time, so a
+    /// fresh or resumed launch carries each exactly once, at the setting's value.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn launch_overrides_cannot_replace_the_subagent_governance_settings() {
+        for resume in [None, Some("thread-2917".to_string())] {
+            let runtime = runtime_config_with_sandbox_mode("workspace-write");
+            runtime
+                .update_field("codex_max_concurrent_subagents", &serde_json::json!(2))
+                .unwrap();
+            runtime
+                .update_field(
+                    "codex_subagent_model",
+                    &serde_json::json!("gpt-5.1-codex-mini"),
+                )
+                .unwrap();
+            for entry in [
+                "agents.max_concurrent_threads_per_session=64",
+                "agents.default_subagent_model=gpt-6-astra",
+            ] {
+                let error = runtime
+                    .update_field(
+                        rsi_common::provider_launch_overrides::FIELD,
+                        &serde_json::json!({"codex": [entry]}),
+                    )
+                    .expect_err("the managed key is refused");
+                assert!(
+                    error.contains(rsi_common::provider_launch_overrides::CODE_DENIED),
+                    "{entry}: {error}"
+                );
+            }
+            let client = codex_client_for_test(Arc::clone(&runtime));
+            let session_id = uuid::Uuid::new_v4();
+            let mut config = launch_config_minimal(resume.clone());
+            config.rsi_session_id = Some(session_id);
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            let agents: Vec<&str> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-c" && pair[1].starts_with("agents."))
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(
+                agents,
+                vec![
+                    "agents.default_subagent_model=\"gpt-5.1-codex-mini\"",
+                    "agents.max_concurrent_threads_per_session=2",
+                ],
+                "{resume:?}"
+            );
+            assert_eq!(
+                crate::provider_launch_overrides::take_applied(session_id),
+                None,
+                "{resume:?}: the refused write applied nothing"
+            );
+        }
     }
 
     /// #1183 review: with no installed `rsi-rpc` sibling (or a relative path)
@@ -2985,9 +4265,10 @@ mod tests {
         }
     }
 
-    /// The trust hash equals what codex-cli 0.159.1 itself reported
-    /// (`hooks/list` `currentHash`) for this exact session-flag hook
-    /// (`timeout = 10`, `additionalContextLimit = 0`).
+    /// Known-answer test of the mail hook's identity hash for this exact
+    /// session-flag hook (`timeout = 10`, `additionalContextLimit = 0`). Whether
+    /// the installed codex-cli still computes the same hash is the contract
+    /// canary's check (#2755, `provider_contract.rs`), not a pinned version.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn the_trust_hash_matches_the_hash_codex_computes() {
@@ -3000,6 +4281,135 @@ mod tests {
             codex_boundary_mail_hook_trust_hash("'/a/rsi-rpc' boundary-mail-hook --mail-only"),
             codex_boundary_mail_hook_trust_hash("'/b/rsi-rpc' boundary-mail-hook --mail-only")
         );
+    }
+
+    /// #2320: known-answer test of the custody hook's identity hash for this
+    /// exact session-flag `PreToolUse` hook (`matcher = "Bash"`, `timeout =
+    /// 10`, no `additionalContextLimit`). Drift against the installed codex-cli
+    /// is the contract canary's check (#2755).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn the_custody_hook_trust_hash_matches_the_hash_codex_computes() {
+        assert_eq!(
+            codex_custody_hook_trust_hash("/bin/echo hi"),
+            "sha256:203b9e69795701d7c424369e458020c33e810ad5c5ea4f117ec834891653a5d1"
+        );
+        assert_ne!(
+            codex_custody_hook_trust_hash("/bin/echo hi"),
+            codex_boundary_mail_hook_trust_hash("/bin/echo hi")
+        );
+    }
+
+    /// #2766: the empty lifecycle set (and a set with only `StopFailure`,
+    /// which Codex has no hook for) passes exactly today's three overrides.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn no_codex_lifecycle_event_leaves_the_hook_overrides_identical() {
+        let command = "'/x/rsi-rpc' boundary-mail-hook --mail-only";
+        let today = codex_session_hook_overrides(command).to_vec();
+        assert_eq!(
+            codex_session_hook_overrides_with_lifecycle(command, &[]),
+            today
+        );
+        assert_eq!(
+            codex_session_hook_overrides_with_lifecycle(
+                command,
+                &[LifecycleHookEvent::StopFailure]
+            ),
+            today
+        );
+    }
+
+    /// #2766: with `PreCompact` enabled a launch installs the unmatched
+    /// `PreCompact` hook running the same command and one `hooks.state`
+    /// trusting exactly the three rsid hooks.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_pre_compact_launch_installs_and_trusts_the_lifecycle_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rsi_rpc = tmp.path().join("rsi-rpc");
+        std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+        let runtime_config = runtime_config_with_sandbox_mode("workspace-write");
+        runtime_config
+            .update_field(
+                "provider_lifecycle_hooks",
+                &serde_json::json!("StopFailure,PreCompact"),
+            )
+            .expect("valid set");
+        let client = codex_client_for_test(runtime_config)
+            .with_boundary_mail_hook_path_for_test(Some(rsi_rpc.clone()));
+        let command = format!("'{}' boundary-mail-hook --mail-only", rsi_rpc.display());
+        let mut config = launch_config_minimal(None);
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        let overrides: Vec<toml::Table> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-c" && pair[1].starts_with("hooks."))
+            .map(|pair| toml::from_str(&pair[1]).expect("valid TOML override"))
+            .collect();
+        assert_eq!(overrides.len(), 4, "{args:?}");
+        assert_eq!(
+            overrides[0]["hooks"]["PostToolUse"][0]["matcher"].as_str(),
+            Some("*")
+        );
+        assert_eq!(
+            overrides[1]["hooks"]["PreToolUse"][0]["matcher"].as_str(),
+            Some("Bash")
+        );
+        let group = &overrides[2]["hooks"]["PreCompact"][0];
+        assert!(group.get("matcher").is_none(), "{group}");
+        assert_eq!(
+            group["hooks"][0]["command"].as_str(),
+            Some(command.as_str())
+        );
+        assert!(group["hooks"][0].get("onFailure").is_none());
+        let state = overrides[3]["hooks"]["state"]
+            .as_table()
+            .expect("hook state");
+        assert_eq!(state.len(), 3, "exactly the three rsid hooks are trusted");
+        assert_eq!(
+            state[CODEX_PRE_COMPACT_HOOK_KEY]["trusted_hash"].as_str(),
+            codex_lifecycle_hook_trust_hash(LifecycleHookEvent::PreCompact, &command).as_deref()
+        );
+        assert_eq!(
+            state[CODEX_CUSTODY_HOOK_KEY]["trusted_hash"].as_str(),
+            Some(codex_custody_hook_trust_hash(&command).as_str())
+        );
+        assert_eq!(
+            state[CODEX_BOUNDARY_MAIL_HOOK_KEY]["trusted_hash"].as_str(),
+            Some(codex_boundary_mail_hook_trust_hash(&command).as_str())
+        );
+        assert!(args.iter().all(|arg| !arg.contains("bypass-hook-trust")));
+    }
+
+    /// #2766: known-answer test of the `PreCompact` hook's identity hash: an
+    /// unmatched group, no `matcher` in the identity. The value is the
+    /// `currentHash` codex-cli 0.163.0 reported in `hooks/list` for
+    /// `hooks.PreCompact=[{hooks=[{type="command",command="/bin/echo hi",timeout=10}]}]`;
+    /// drift against the installed CLI is the contract canary's check.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn the_pre_compact_trust_hash_matches_the_hash_codex_computes() {
+        assert_eq!(
+            codex_lifecycle_hook_trust_hash(LifecycleHookEvent::PreCompact, "/bin/echo hi")
+                .as_deref(),
+            Some("sha256:5ecb8efc99a0ed7e9ed60cfb67f762f5befd008acec74b9b8fa44e9258f127bc")
+        );
+        assert_eq!(
+            codex_lifecycle_hook_trust_hash(LifecycleHookEvent::StopFailure, "/bin/echo hi"),
+            None
+        );
+        // hub #2919: observed against codex-cli 0.163.0 `hooks/list` (a
+        // throwaway CODEX_HOME): key `session_start:0:0`, `trusted`, this hash.
+        assert_eq!(
+            codex_lifecycle_hook_trust_hash(LifecycleHookEvent::SessionStart, "/bin/echo hi")
+                .as_deref(),
+            Some("sha256:1bbc35a343d6b5df8cfe4f776c140c997e929ec5a02c2ec1556d66c171fe9e90")
+        );
+        assert!(is_codex_lifecycle_hook_key(CODEX_PRE_COMPACT_HOOK_KEY));
+        assert!(is_codex_lifecycle_hook_key(CODEX_SESSION_START_HOOK_KEY));
+        assert!(!is_codex_lifecycle_hook_key(CODEX_CUSTODY_HOOK_KEY));
+        assert!(!is_codex_lifecycle_hook_key(CODEX_BOUNDARY_MAIL_HOOK_KEY));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3154,7 +4564,7 @@ mod tests {
         let sid = uuid::Uuid::new_v4();
         config.rsi_session_id = Some(sid);
         config.rsi_socket = Some(PathBuf::from("/tmp/rsi-test.sock"));
-        config.rsi_session_token = Some("tok-abc123".to_string());
+        config.rsi_session_token = Some("tok-abc123".into());
 
         let cmd = client.build_cmd(&config).unwrap();
         assert_eq!(
@@ -3192,6 +4602,78 @@ mod tests {
         let bare = launch_config_minimal(None);
         let cmd = client.build_cmd(&bare).unwrap();
         assert_eq!(cmd_env(&cmd, identity::ENV_CARGO_TARGET_DIR), None);
+    }
+
+    /// #2759: only a handoff turn passes `--output-schema <file> -o <file>`, on a
+    /// fresh and a resumed launch alike; both files are in the session's
+    /// execution scratch and the schema file is the handoff schema. A launch
+    /// that is not a handoff turn, or has no scratch, passes neither flag.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn structured_handoff_turn_passes_output_schema_and_last_message_files() {
+        use crate::sandbox::execution_scratch::SandboxExecutionScratch;
+
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+            .join("slice8-codex-provider-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("handoff-")
+            .tempdir_in(base)
+            .unwrap();
+        let scratch = SandboxExecutionScratch::prepare_for_test(root.path()).unwrap();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let flags = |args: &[String]| {
+            args.iter()
+                .filter(|arg| arg.as_str() == "--output-schema" || arg.as_str() == "-o")
+                .count()
+        };
+        for resume in [None, Some("thread-id".to_string())] {
+            // Not a handoff turn: neither flag.
+            let session_id = uuid::Uuid::new_v4();
+            let mut config = launch_config_minimal(resume.clone());
+            config.execution_scratch = Some(scratch.clone());
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            assert_eq!(flags(&args), 0, "{args:?}");
+
+            // A handoff turn with no scratch stays free text.
+            let mut config = launch_config_minimal(resume.clone());
+            config.rsi_session_id = Some(session_id);
+            config.structured_handoff = true;
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            assert_eq!(flags(&args), 0, "{args:?}");
+
+            // The handoff turn: the schema file and the last-message file.
+            crate::structured_handoff::arm(session_id);
+            assert!(crate::structured_handoff::take_for_launch(session_id));
+            let mut config = launch_config_minimal(resume.clone());
+            config.rsi_session_id = Some(session_id);
+            config.execution_scratch = Some(scratch.clone());
+            config.structured_handoff = true;
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            let at = args
+                .iter()
+                .position(|arg| arg == "--output-schema")
+                .unwrap_or_else(|| panic!("{args:?}"));
+            assert_eq!(args[at + 2], "-o", "{args:?}");
+            let schema_file = PathBuf::from(&args[at + 1]);
+            let last_message = PathBuf::from(&args[at + 3]);
+            assert!(schema_file.starts_with(scratch.temp()), "{schema_file:?}");
+            assert!(last_message.starts_with(scratch.temp()), "{last_message:?}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    &std::fs::read_to_string(&schema_file).unwrap()
+                )
+                .unwrap(),
+                rsi_common::structured_handoff::structured_handoff_schema()
+            );
+            assert_eq!(flags(&args), 2, "{args:?}");
+            assert_eq!(args.iter().any(|arg| arg == "resume"), resume.is_some());
+            // Reading the turn's message removes the files.
+            assert!(crate::structured_handoff::finish_turn(session_id));
+            assert!(!schema_file.exists());
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3259,6 +4741,132 @@ mod tests {
         }
     }
 
+    /// hub #2919: a client whose `SessionStart` hook can run (an installed
+    /// `rsi-rpc` sibling) with the operator set `lifecycle`, and a fresh
+    /// session config in a project without `.claude/commands`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    fn session_start_fixture(
+        lifecycle: &str,
+        sibling: bool,
+    ) -> (tempfile::TempDir, CodexClient, LaunchConfig) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rsi_rpc = tmp.path().join("rsi-rpc");
+        std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).expect("git marker");
+        let runtime_config = runtime_config_with_sandbox_mode("workspace-write");
+        runtime_config
+            .update_field("provider_lifecycle_hooks", &serde_json::json!(lifecycle))
+            .expect("valid set");
+        let client = codex_client_for_test(runtime_config)
+            .with_boundary_mail_hook_path_for_test(sibling.then_some(rsi_rpc));
+        let mut config = launch_config_minimal(None);
+        config.query = "do the thing".to_string();
+        config.working_dir = Some(project);
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        (tmp, client, config)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    fn launch_payload(client: &CodexClient, config: &LaunchConfig, is_resume: bool) -> String {
+        codex_stdin_payload_routed(
+            config,
+            is_resume,
+            client.session_start_hook_installed(config),
+        )
+    }
+
+    /// hub #2919: with `SessionStart` on, the first turn's stdin carries no
+    /// preamble, the launch installs and trusts the `SessionStart` hook, and
+    /// the hook's daemon claim returns exactly the generic part it left out.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_session_start_launch_moves_the_preamble_from_stdin_to_the_hook() {
+        use crate::session::preamble::load_generic;
+        let (_tmp, client, config) = session_start_fixture("SessionStart", true);
+        let session = config.rsi_session_id.unwrap();
+        let generic = load_generic(config.working_dir.as_deref());
+
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        let overrides: Vec<toml::Table> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-c" && pair[1].starts_with("hooks."))
+            .map(|pair| toml::from_str(&pair[1]).expect("valid TOML override"))
+            .collect();
+        let group = overrides
+            .iter()
+            .find_map(|table| table["hooks"].get("SessionStart"))
+            .expect("SessionStart hook installed");
+        assert!(group[0].get("matcher").is_none(), "{group}");
+        let state = overrides
+            .iter()
+            .find_map(|table| table["hooks"].get("state"))
+            .expect("hook state");
+        assert!(state.get(CODEX_SESSION_START_HOOK_KEY).is_some(), "{state}");
+
+        assert_eq!(launch_payload(&client, &config, false), "do the thing");
+        assert_eq!(
+            crate::session_start_preamble::claim_for_hook(session, "startup"),
+            Some(generic)
+        );
+        // Delivered: the next turn's stdin is the plain query again.
+        assert_eq!(launch_payload(&client, &config, true), "do the thing");
+        crate::session_start_preamble::forget(session);
+    }
+
+    /// hub #2919: a hook that never claimed the preamble (it did not run, or
+    /// the daemon could not answer) puts it back in the next turn's stdin,
+    /// once, and the hook of that turn then gets nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_missed_session_start_hook_falls_back_to_the_prompt_preamble() {
+        use crate::session::preamble::load_generic;
+        let (_tmp, client, config) = session_start_fixture("SessionStart", true);
+        let session = config.rsi_session_id.unwrap();
+        let generic = load_generic(config.working_dir.as_deref());
+
+        assert_eq!(launch_payload(&client, &config, false), "do the thing");
+        assert_eq!(
+            launch_payload(&client, &config, true),
+            format!("{generic}\n\ndo the thing")
+        );
+        assert_eq!(
+            crate::session_start_preamble::claim_for_hook(session, "resume"),
+            None
+        );
+        assert_eq!(launch_payload(&client, &config, true), "do the thing");
+    }
+
+    /// hub #2919: the default `none`, and `SessionStart` with no installed
+    /// `rsi-rpc` sibling (no hook can run), keep the first turn's stdin
+    /// byte-identical to the pre-#2919 payload.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn without_a_session_start_hook_the_stdin_payload_is_unchanged() {
+        for (lifecycle, sibling) in [
+            ("none", true),
+            ("PreCompact", true),
+            ("SessionStart", false),
+        ] {
+            let (_tmp, client, config) = session_start_fixture(lifecycle, sibling);
+            assert!(!client.session_start_hook_installed(&config), "{lifecycle}");
+            let expected = codex_stdin_payload(&config, false);
+            assert!(expected.starts_with(crate::session::preamble::agent_discovery_nudge()));
+            assert_eq!(
+                launch_payload(&client, &config, false),
+                expected,
+                "{lifecycle}"
+            );
+            assert_eq!(launch_payload(&client, &config, true), "do the thing");
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            assert!(
+                args.iter()
+                    .all(|arg| !arg.starts_with("hooks.SessionStart")),
+                "{lifecycle}: {args:?}"
+            );
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn stdin_payload_prepends_nudge_first_turn_only() {
@@ -3268,7 +4876,7 @@ mod tests {
         let mut config = launch_config_minimal(None);
         config.query = "do the thing".to_string();
         // A session in the rsi repo (which has `thoughts/`).
-        config.working_dir = Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        config.working_dir = Some(std::path::Path::new(rsi_common::manifest_dir!()).join("../.."));
 
         // First turn (!is_resume): nudge prepended, query preserved verbatim.
         let first = codex_stdin_payload(&config, false);
@@ -3473,6 +5081,208 @@ mod tests {
         let args = cmd_args(&cmd);
         let pair = args.windows(2).find(|w| w[0] == "--sandbox").unwrap();
         assert_eq!(pair[1], "workspace-write");
+    }
+
+    /// #2758: a read-only policy runs the Codex sandbox read-only on a fresh
+    /// turn (`--sandbox`) and on a resumed one (`-c sandbox_mode`, since `exec
+    /// resume` rejects `--sandbox`), whatever the daemon-wide mode is, keeps the
+    /// `rsi-agent` MCP server and the custody hook, and drops the writable
+    /// roots. A launch with no policy keeps the daemon-wide mode.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_read_only_policy_forces_the_read_only_sandbox_on_fresh_and_resumed_turns() {
+        use rsi_common::harness_tool_policy::{CliAccessMode, HarnessToolPolicy};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rsi_rpc = tmp.path().join("rsi-rpc");
+        std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+        for daemon_mode in ["workspace-write", "danger-full-access", "read-only"] {
+            let client = codex_client_for_test(runtime_config_with_sandbox_mode(daemon_mode))
+                .with_boundary_mail_hook_path_for_test(Some(rsi_rpc.clone()));
+            for resume in [None, Some("thread-2758".to_string())] {
+                let mut config = launch_config_minimal(resume.clone());
+                config.rsi_session_id = Some(uuid::Uuid::new_v4());
+                let plain = cmd_args(&client.build_cmd(&config).unwrap());
+                if resume.is_some() {
+                    assert!(
+                        plain.windows(2).any(|pair| pair[0] == "-c"
+                            && pair[1] == format!("sandbox_mode={daemon_mode:?}")),
+                        "{daemon_mode}: {plain:?}"
+                    );
+                } else {
+                    let pair = plain
+                        .windows(2)
+                        .find(|pair| pair[0] == "--sandbox")
+                        .unwrap();
+                    assert_eq!(pair[1], daemon_mode);
+                }
+
+                config.tool_policy = Some(HarnessToolPolicy {
+                    cli_access: Some(CliAccessMode::ReadOnly),
+                    ..HarnessToolPolicy::default()
+                });
+                let args = cmd_args(&client.build_cmd(&config).unwrap());
+                if resume.is_some() {
+                    assert!(
+                        args.windows(2)
+                            .any(|pair| pair[0] == "-c" && pair[1] == "sandbox_mode=\"read-only\""),
+                        "{daemon_mode}: {args:?}"
+                    );
+                    assert!(!args.iter().any(|arg| arg == "--sandbox"), "{args:?}");
+                } else {
+                    let pair = args.windows(2).find(|pair| pair[0] == "--sandbox").unwrap();
+                    assert_eq!(pair[1], "read-only", "{daemon_mode}");
+                    assert!(
+                        !args.iter().any(|arg| arg.starts_with("sandbox_mode=")),
+                        "{args:?}"
+                    );
+                }
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg.contains("sandbox_workspace_write")),
+                    "a read-only session has no writable roots: {args:?}"
+                );
+                // The rsi-agent MCP server and the custody hook stay.
+                assert!(
+                    args.iter()
+                        .any(|arg| arg.starts_with("mcp_servers.rsi-agent.command="))
+                );
+                assert!(
+                    args.iter().any(|arg| arg.starts_with("hooks.PreToolUse")),
+                    "custody hook kept: {args:?}"
+                );
+            }
+        }
+    }
+
+    /// A linked worktree laid out the way `git worktree add` does, returned as
+    /// (tempdir guard, worktree, admin dir, common dir).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let common = base.join("repo/.git");
+        let admin = common.join("worktrees/w1");
+        let worktree = base.join("sandboxes/w1");
+        for name in ["objects", "refs", "logs", "hooks"] {
+            std::fs::create_dir_all(common.join(name)).unwrap();
+        }
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        (dir, worktree, admin, common)
+    }
+
+    /// Execution scratch (on a disk-backed filesystem) carrying the Git common
+    /// directory the way sandbox custody records it (#2746).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    fn scratch_recording_common(
+        common: &Path,
+    ) -> (
+        tempfile::TempDir,
+        crate::sandbox::execution_scratch::SandboxExecutionScratch,
+    ) {
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"))
+            .join("write-roots-codex-fixtures");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("scratch-")
+            .tempdir_in(base)
+            .unwrap();
+        let scratch = crate::sandbox::execution_scratch::SandboxExecutionScratch::prepare_for_test(
+            root.path(),
+        )
+        .unwrap()
+        .with_git_common_dir_for_test(common.to_path_buf());
+        (root, scratch)
+    }
+
+    /// #1202: a workspace-write worker in a linked worktree can reach exactly
+    /// its Git admin dir and the common objects/refs/logs, nothing wider.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn workspace_write_grants_linked_worktree_git_roots_only() {
+        let (_guard, worktree, admin, common) = linked_worktree_fixture();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let (_scratch_guard, scratch) = scratch_recording_common(&common);
+        let mut config = launch_config_minimal(None);
+        config.working_dir = Some(worktree.clone());
+        config.execution_scratch = Some(scratch);
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        let overrides: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("sandbox_workspace_write.writable_roots="))
+            .collect();
+        assert_eq!(
+            overrides,
+            vec![&format!(
+                "sandbox_workspace_write.writable_roots=[{:?},{:?},{:?},{:?}]",
+                admin.display().to_string(),
+                common.join("objects").display().to_string(),
+                common.join("refs").display().to_string(),
+                common.join("logs").display().to_string(),
+            )]
+        );
+        assert!(args.iter().all(|arg| !arg.contains("danger-full-access")));
+        let sandbox = args.windows(2).find(|pair| pair[0] == "--sandbox").unwrap();
+        assert_eq!(sandbox[1], "workspace-write");
+    }
+
+    /// #2746: no custody-recorded common directory, or a different one, means
+    /// the worktree's own pointer files grant nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn workspace_write_needs_the_custody_recorded_common_dir() {
+        let (guard, worktree, _admin, common) = linked_worktree_fixture();
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let mut config = launch_config_minimal(None);
+        config.working_dir = Some(worktree);
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        assert!(args.iter().all(|arg| !arg.contains("writable_roots")));
+
+        let other = guard.path().join("other-common");
+        std::fs::create_dir_all(&other).unwrap();
+        let (_scratch_guard, scratch) = scratch_recording_common(&other);
+        config.execution_scratch = Some(scratch);
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        assert!(args.iter().all(|arg| !arg.contains("writable_roots")));
+        assert!(common.is_dir());
+    }
+
+    /// The grant is a workspace-write refinement: other modes and non-worktree
+    /// launches get no `writable_roots` override.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn writable_roots_override_is_workspace_write_and_worktree_only() {
+        let (_guard, worktree, _admin, _common) = linked_worktree_fixture();
+        for mode in ["read-only", "danger-full-access"] {
+            let client = codex_client_for_test(runtime_config_with_sandbox_mode(mode));
+            let mut config = launch_config_minimal(None);
+            config.working_dir = Some(worktree.clone());
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            assert!(
+                args.iter().all(|arg| !arg.contains("writable_roots")),
+                "{mode}"
+            );
+        }
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"));
+        let plain = tempfile::tempdir().unwrap();
+        let mut config = launch_config_minimal(None);
+        config.working_dir = Some(plain.path().to_path_buf());
+        let args = cmd_args(&client.build_cmd(&config).unwrap());
+        assert!(args.iter().all(|arg| !arg.contains("writable_roots")));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3832,6 +5642,58 @@ done
             .expect("-c config override must be present when effort is set");
 
         assert_eq!(pair[1], "model_reasoning_effort=\"max\"");
+    }
+
+    /// #2768: once this login's live `model/list` reported a model's ladder,
+    /// the launch is judged by it: `max` is refused for a model whose live
+    /// ladder omits it (the compiled table lists it) and `ultra` passes for a
+    /// model whose live ladder lists it (the compiled table does not). A model
+    /// the live list does not describe keeps the compiled table.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn launch_cmd_validates_effort_against_the_live_ladder_with_compiled_fallback() {
+        let stub = crate::codex_live_catalog::StubCodex::listing(&[]);
+        stub.set_entries(&[
+            serde_json::json!({"id": "gpt-6-astra", "supportedReasoningEfforts": [
+                {"reasoningEffort": "low"}, {"reasoningEffort": "high"}, {"reasoningEffort": "ultra"}]}),
+            serde_json::json!({"id": "gpt-6-luna", "supportedReasoningEfforts": [
+                {"reasoningEffort": "medium"}, {"reasoningEffort": "ultra"}]}),
+            serde_json::json!({"id": "gpt-5.5"}),
+        ])
+        .unwrap();
+        let view = crate::codex_live_catalog::live_view(&stub.path(), 300).await;
+        assert_eq!(view.source, CatalogSource::Live);
+        let rc = runtime_config_with_sandbox_mode("workspace-write");
+        let client =
+            CodexClient::with_paths_for_test(stub.path(), PathBuf::from("/usr/bin/true"), rc);
+        let build = |model: &str, effort: &str| {
+            let mut config = launch_config_minimal(None);
+            config.model = Some(model.to_string());
+            config.effort = Some(effort.to_string());
+            client.build_cmd(&config).map(|cmd| cmd_args(&cmd))
+        };
+        let passes = |args: Vec<String>, effort: &str| {
+            args.windows(2).any(|pair| {
+                pair[0] == "-c" && pair[1] == format!("model_reasoning_effort=\"{effort}\"")
+            })
+        };
+
+        let refused = build("gpt-6-astra", "max").expect_err("the live ladder omits max");
+        assert!(
+            matches!(refused, DaemonError::InvalidParam(ref message)
+                if message.contains("'max'") && message.contains("low, high, ultra")),
+            "got: {refused}"
+        );
+        assert!(passes(build("gpt-6-astra", "ultra").unwrap(), "ultra"));
+        assert!(passes(build("gpt-6-luna", "ultra").unwrap(), "ultra"));
+        // Undescribed by the live list: the compiled table decides.
+        assert!(passes(build("gpt-5.5", "high").unwrap(), "high"));
+        assert!(matches!(
+            build("gpt-5.5", "max"),
+            Err(DaemonError::InvalidParam(ref message)) if message.contains("gpt-5.5")
+        ));
+        assert!(passes(build("gpt-6-sol", "ultra").unwrap(), "ultra"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -4217,6 +6079,84 @@ done
             event.data.get("terminal").is_none(),
             "Codex App Server compatibility mapping preserves its terminal contract"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_typed_rate_limit_reached_value_classifies_a_usage_limit_without_the_message_prefix() {
+        for reached in [
+            "rate_limit_reached",
+            "workspace_owner_credits_depleted",
+            "workspace_member_credits_depleted",
+            "workspace_owner_usage_limit_reached",
+            "workspace_member_usage_limit_reached",
+        ] {
+            // A message the prefix match would never recognise.
+            let top_level = serde_json::json!({
+                "type": "error",
+                "message": "Your workspace is out of credits.",
+                "rateLimitReachedType": reached,
+            });
+            let nested = serde_json::json!({
+                "type": "turn.failed",
+                "error": {
+                    "message": "Your workspace is out of credits.",
+                    "rate_limit_reached_type": reached,
+                },
+            });
+            for value in [top_level, nested] {
+                let mut thread_id = None;
+                let event = map_codex_json_to_stream_event(&value, &mut thread_id).unwrap();
+                assert_eq!(
+                    event.data.get("error_class").and_then(Value::as_str),
+                    Some(CODEX_USAGE_LIMIT_ERROR_CLASS),
+                    "{reached}"
+                );
+                assert_eq!(
+                    event
+                        .data
+                        .get("rate_limit_reached_type")
+                        .and_then(Value::as_str),
+                    Some(reached)
+                );
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_missing_or_unknown_typed_value_falls_back_to_the_message_prefix() {
+        // No typed value: the prefix still classifies, and no typed field is invented.
+        let value = serde_json::json!({
+            "type": "error",
+            "message": "You've hit your usage limit. Retry later.",
+        });
+        let mut thread_id = None;
+        let event = map_codex_json_to_stream_event(&value, &mut thread_id).unwrap();
+        assert_eq!(
+            event.data.get("error_class").and_then(Value::as_str),
+            Some(CODEX_USAGE_LIMIT_ERROR_CLASS)
+        );
+        assert!(event.data.get("rate_limit_reached_type").is_none());
+
+        // An unknown typed value and a non-matching message: unclassified.
+        let value = serde_json::json!({
+            "type": "error",
+            "message": "Quota exceeded.",
+            "rateLimitReachedType": "a_future_kind",
+        });
+        let event = map_codex_json_to_stream_event(&value, &mut thread_id).unwrap();
+        assert!(event.data.get("error_class").is_none());
+
+        // The app-server compatibility mapping stays outside the CLI classifier.
+        let value = serde_json::json!({
+            "type": "error",
+            "message": "x",
+            "rateLimitReachedType": "rate_limit_reached",
+        });
+        let event = map_app_server_compatible_event(&value, &mut thread_id).unwrap();
+        assert!(event.data.get("error_class").is_none());
+        assert!(event.data.get("rate_limit_reached_type").is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -4979,6 +6919,38 @@ done
         let remaining = filter_correlated_codex_stderr(vec![record.clone()], &mut correlation);
 
         assert_eq!(remaining, vec![record]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn detached_codex_stderr_uses_direct_suppression_and_correlates_at_completion() {
+        let mut decoder = DetachedCodexDecoder::new(CodexTranscriptBoundary::ResumeUnavailable);
+        for _ in 0..(PROVIDER_MAX_STDERR_BYTES / 10) {
+            assert!(
+                decoder
+                    .stderr_line("Reading prompt from stdin...".into())
+                    .is_none()
+            );
+        }
+        assert_eq!(decoder.stderr_bytes, 0);
+        let failure = "resources/read failed: unknown MCP server 'filesystem'";
+        let record =
+            format!("2026-08-20T01:02:03.000Z ERROR codex_core::tools::router: error={failure}");
+        assert!(decoder.stderr_line(record.clone()).is_none());
+        assert!(decoder.stderr_line(record.clone()).is_none());
+        // Stdout evidence may arrive after stderr. Only one record is paired.
+        decoder
+            .correlation
+            .failure_evidence
+            .push(CodexToolFailureEvidence {
+                nested_tools: vec!["read_mcp_resource".into()],
+                output: failure.into(),
+            });
+        let events = decoder.finish_stderr();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["stderr_record_count"], 1);
+        assert_eq!(events[0].data["source"], "stderr");
+        assert_eq!(events[0].data["error"], record);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

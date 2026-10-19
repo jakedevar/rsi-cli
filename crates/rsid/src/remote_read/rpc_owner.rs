@@ -1,6 +1,9 @@
 //! Operator-local Remote read RPC dispatch. The public gateway remains closed;
 //! it must establish its own configured project scope before forwarding reads.
 use super::decision_targets::{parse_request, spawn_decision_targets_read};
+use super::manager_v2::{
+    parse_conversation, parse_list, spawn_conversation_read, spawn_list_seats_read,
+};
 use super::{
     ReadError, RemoteCursorSigner, RemoteReadCompleted, RemoteReadLimiter, spawn_decisions_read,
     spawn_history_read, spawn_info_read, spawn_projects_read, spawn_selected_session_read,
@@ -8,7 +11,9 @@ use super::{
 };
 use crate::session::SessionManager;
 use rsi_common::remote_read::{ReadRequestV1, WireDocumentV1};
-use rsi_common::rpc::{INTERNAL_ERROR, INVALID_PARAMS, RpcError, RpcRequest, RpcResponse};
+use rsi_common::rpc::{
+    INTERNAL_ERROR, INVALID_PARAMS, REMOTE_BUSY, RpcError, RpcRequest, RpcResponse,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io;
@@ -47,6 +52,8 @@ pub fn is_operator_read_method(method: &str) -> bool {
             | "RemoteGetHistoryPageV1"
             | "RemoteGetDecisionsV1"
             | "RemoteGetDecisionTargetsV1"
+            | "RemoteListManagerSeatsV2"
+            | "RemoteGetManagerConversationV2"
     )
 }
 
@@ -77,6 +84,34 @@ pub async fn send_operator_read<W: AsyncWrite + Unpin>(
             Ok(request) => {
                 settle(
                     spawn_decision_targets_read(limiter, Arc::clone(manager.store()), request),
+                    id,
+                    writer,
+                )
+                .await
+            }
+            Err(error) => send_error(writer, id, error).await,
+        };
+    }
+    // RSI Remote API v2 (#2962): manager seats and a seat's conversation, also
+    // outside the six V1 observation methods.
+    if rpc.method == rsi_common::remote_manager_v2::METHOD_LIST_SEATS {
+        return match parse_list(rpc) {
+            Ok(request) => {
+                settle(
+                    spawn_list_seats_read(limiter, Arc::clone(manager.store()), request),
+                    id,
+                    writer,
+                )
+                .await
+            }
+            Err(error) => send_error(writer, id, error).await,
+        };
+    }
+    if rpc.method == rsi_common::remote_manager_v2::METHOD_CONVERSATION {
+        return match parse_conversation(rpc) {
+            Ok(request) => {
+                settle(
+                    spawn_conversation_read(limiter, Arc::clone(manager.store()), request),
                     id,
                     writer,
                 )
@@ -249,8 +284,8 @@ fn remote_error(id: Option<serde_json::Value>, error: &ReadError) -> RpcResponse
         ReadError::InvalidSource => (INVALID_PARAMS, "invalid_request"),
         ReadError::NotFound => (INVALID_PARAMS, "not_found"),
         ReadError::StaleCursor => (INVALID_PARAMS, "stale_cursor"),
-        ReadError::Admission => (INTERNAL_ERROR, "admission"),
-        ReadError::Busy => (INTERNAL_ERROR, "busy"),
+        ReadError::Admission => (REMOTE_BUSY, "admission"),
+        ReadError::Busy => (REMOTE_BUSY, "busy"),
         ReadError::ResourceLimit => (INVALID_PARAMS, "resource_limit"),
         ReadError::SourceUnavailable | ReadError::Sql(_) | ReadError::Io(_) => {
             (INTERNAL_ERROR, "source_unavailable")
@@ -275,4 +310,25 @@ async fn send_error<W: AsyncWrite + Unpin>(
     writer.write_all(&response).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await
+}
+
+#[cfg(test)]
+mod busy_code_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn contended_reads_answer_the_typed_busy_code() {
+        for (error, remote_code) in [
+            (ReadError::Busy, "busy"),
+            (ReadError::Admission, "admission"),
+        ] {
+            let response = serde_json::to_value(remote_error(None, &error)).unwrap();
+            assert_eq!(response["error"]["code"], REMOTE_BUSY);
+            assert_eq!(response["error"]["data"]["remote_code"], remote_code);
+        }
+        let failed =
+            serde_json::to_value(remote_error(None, &ReadError::SourceUnavailable)).unwrap();
+        assert_eq!(failed["error"]["code"], INTERNAL_ERROR);
+    }
 }

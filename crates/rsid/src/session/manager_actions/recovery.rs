@@ -46,9 +46,7 @@ impl SessionManager {
         {
             return Ok(None);
         }
-        let status = self
-            .store
-            .lock()
+        let status = crate::store_lock::lock(&self.store, "recovery::manager_session_quiescent")
             .await
             .get_session(session)?
             .map(|s| s.status);
@@ -60,9 +58,11 @@ impl SessionManager {
         }
         let orphan_store = std::sync::Arc::clone(&self.store);
         let reaped = tokio::task::spawn_blocking(move || {
-            let turns = orphan_store
-                .blocking_lock()
-                .list_active_provider_turn_custody()?;
+            let turns = crate::store_lock::blocking_lock(
+                &orphan_store,
+                "recovery::manager_session_quiescent",
+            )
+            .list_active_provider_turn_custody()?;
             super::super::reaper::reap_orphans_for_session(session, turns)
         })
         .await;
@@ -151,9 +151,7 @@ impl SessionManager {
             return Ok((Unobservable, json!({"target": target})));
         };
         guards.push(guard);
-        let invocation = self
-            .store
-            .lock()
+        let invocation = crate::store_lock::lock(&self.store, "recovery::observe_resume_target")
             .await
             .conn
             .query_row(
@@ -277,11 +275,10 @@ impl SessionManager {
     /// keyed pre-spawn transcript refusals on quiescent resume targets. Other
     /// uncertain resumes still require explicit `settle_uncertain_action`.
     pub(in crate::session) async fn reconcile_uncertain_lead_actions(&self) -> Result<usize> {
-        let candidates = self
-            .store
-            .lock()
-            .await
-            .uncertain_manager_recovery_candidates()?;
+        let candidates =
+            crate::store_lock::lock(&self.store, "recovery::reconcile_uncertain_lead_actions")
+                .await
+                .uncertain_manager_recovery_candidates()?;
         let mut count = 0;
         for op in candidates {
             let id = op.receipt.operation_id;
@@ -300,15 +297,19 @@ impl SessionManager {
                 EffectObservation::Unobservable => continue,
             };
             witness["reconciled_by"] = json!("daemon");
-            let settled = self
-                .store
-                .lock()
-                .await
-                .reconcile_uncertain_manager_action(&op, state, outcome, &witness);
+            let settled =
+                crate::store_lock::lock(&self.store, "recovery::reconcile_uncertain_lead_actions")
+                    .await
+                    .reconcile_uncertain_manager_action(&op, state, outcome, &witness);
             drop(guards);
             match settled {
                 Ok(Some(_)) => {
                     count += 1;
+                    // #2462: an uncertain Issue-worker launch proven absent ended
+                    // without a worker; tell its launcher.
+                    if state == ManagerActionStateV2::Failed {
+                        self.settle_ended_issue_worker_launch(&op, outcome).await;
+                    }
                     self.publish_manager_action_notice(id).await;
                 }
                 Ok(None) => {}
@@ -324,9 +325,7 @@ impl SessionManager {
         claim: &ManagerActionClaimV2,
         operation_id: Uuid,
     ) -> Result<()> {
-        let op = self
-            .store
-            .lock()
+        let op = crate::store_lock::lock(&self.store, "recovery::execute_manager_settle")
             .await
             .manager_action_operation(operation_id)?
             .ok_or_else(|| refused("manager_v2_action_unavailable"))?;
@@ -340,11 +339,15 @@ impl SessionManager {
                 return Err(refused("manager_v2_effect_unobservable"));
             }
         };
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "recovery::execute_manager_settle")
             .await
             .apply_manager_settle_action(claim, state, outcome, &witness)?;
         drop(guards);
+        // #2478: a manager-settled Issue-worker launch proven absent ended
+        // without a worker, exactly like the daemon reconcile above.
+        if state == ManagerActionStateV2::Failed {
+            self.settle_ended_issue_worker_launch(&op, outcome).await;
+        }
         self.publish_manager_action_notice(operation_id).await;
         Ok(())
     }
@@ -359,18 +362,16 @@ impl SessionManager {
         if self.active.read().await.contains_key(&lead) {
             return Err(refused("manager_v2_lead_active"));
         }
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "recovery::execute_manager_retire")
             .await
             .apply_manager_retire_continuations(claim)
     }
 
     async fn publish_manager_action_notice(&self, operation_id: Uuid) {
-        let queued = self
-            .store
-            .lock()
-            .await
-            .reconcile_manager_action_notice(operation_id);
+        let queued =
+            crate::store_lock::lock(&self.store, "recovery::publish_manager_action_notice")
+                .await
+                .reconcile_manager_action_notice(operation_id);
         match queued {
             Ok(Some(job_id)) => self
                 .event_bus

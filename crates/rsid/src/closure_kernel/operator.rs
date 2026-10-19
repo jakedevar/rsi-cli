@@ -212,6 +212,7 @@ pub(crate) async fn launch_source(
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: Some(selector),
+        structured_handoff: false,
     };
     let root_session_id = manager
         .launch_reserved_closure_source(

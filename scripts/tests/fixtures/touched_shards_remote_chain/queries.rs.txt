@@ -1,0 +1,33 @@
+use super::SessionManager;
+
+impl SessionManager {
+    /// Use the real nonblocking session and native-writer sources before the
+    /// Store miss. The matching finish call runs only after Store unlock.
+    pub(crate) fn remote_runtime_only_pending_capture(
+        &self,
+        project: Uuid,
+        session: Uuid,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeOnlyPendingCapture> {
+        crate::remote_read::capture_runtime_only_pending_sources(
+            project,
+            session,
+            |project, session| self.remote_question_slot_list(project, session),
+            super::pending_approvals::remote_native_approval_list,
+        )
+    }
+
+
+    pub(crate) fn remote_runtime_only_pending_finish(
+        &self,
+        selected: &crate::remote_read::SelectedRuntimeOnlySession,
+        capture: crate::remote_read::RuntimeOnlyPendingCapture,
+    ) -> crate::remote_read::Result<crate::remote_read::RuntimeOnlyPendingSources> {
+        crate::remote_read::finish_runtime_only_pending_sources(
+            selected,
+            capture,
+            |before| self.remote_question_slot_list_recheck(before),
+            super::pending_approvals::remote_native_approval_list_recheck,
+        )
+    }
+
+}

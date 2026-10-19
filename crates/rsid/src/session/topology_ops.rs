@@ -520,7 +520,7 @@ mod tests {
     fn manager() -> (SessionManager, TempDir) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("rsi.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         let config = Config::from_env();
         let runtime_config = RuntimeConfig::from_config(&config);
         let manager = SessionManager::new(

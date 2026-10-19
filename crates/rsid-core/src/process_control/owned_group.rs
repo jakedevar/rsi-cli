@@ -13,13 +13,18 @@
 //! `waitid(WEXITED | WNOWAIT)`, which leaves the zombie in place, and refuses
 //! every group signal once reaping has begun.
 //!
-//! Where `waitid(WNOWAIT)` is unavailable (macOS) the leader is reaped when its
-//! exit is observed; from then on a group signal is logged and skipped.
+//! Linux (and the other targets nix covers) polls `waitid` through nix; macOS
+//! polls the same non-reaping `waitid` through rustix (#2812), so a group
+//! whose leader exited normally is still stopped there before the reap. Only
+//! where neither has it is the leader reaped when its exit is observed; from
+//! then on a group signal is logged and skipped.
 //!
 //! Descendants that call `setsid`/`setpgid` leave the group and are never
 //! signalled through it; [`capture_owned_group`] bounds how long they can hold
 //! the output pipes, then releases them.
 
+#[cfg(unix)]
+use super::signal_process_group_because;
 use super::terminate_process_group_because;
 use std::process::{ExitStatus, Output};
 use std::time::Duration;
@@ -36,12 +41,17 @@ pub struct OwnedGroupLeader {
     /// its child to reap): from then on the group id is not provably owned and
     /// no group signal is sent, this handle's drop included.
     released: bool,
+    scope: Option<String>,
 }
 
 impl OwnedGroupLeader {
     /// Take a just-spawned child that was configured with `process_group(0)`
     /// and has never been waited on. Take its pipes first.
     pub fn new(child: Child) -> std::io::Result<Self> {
+        Self::with_scope(child, None)
+    }
+
+    pub fn with_scope(child: Child, scope: Option<String>) -> std::io::Result<Self> {
         let pid = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned child was already reaped"))?;
@@ -51,6 +61,7 @@ impl OwnedGroupLeader {
             child,
             pgid: nix::unistd::Pid::from_raw(pid),
             released: false,
+            scope,
         })
     }
 
@@ -67,9 +78,9 @@ impl OwnedGroupLeader {
         !self.released && self.child.id().is_some()
     }
 
-    /// Resolve once the leader has exited. On Linux the leader is left a
-    /// zombie, so the group stays signallable; elsewhere it is reaped here and
-    /// later group signals are skipped. Cancel-safe.
+    /// Resolve once the leader has exited. On Linux and macOS the leader is
+    /// left a zombie, so the group stays signallable; elsewhere it is reaped
+    /// here and later group signals are skipped. Cancel-safe.
     pub async fn exited(&mut self) -> std::io::Result<()> {
         #[cfg(any(
             target_os = "android",
@@ -107,15 +118,31 @@ impl OwnedGroupLeader {
                 }
             }
         }
+        #[cfg(target_vendor = "apple")]
+        {
+            // #2812: nix has no `waitid` here, but the platform does; observe
+            // the exit without reaping so the caller can still stop the group.
+            if self.released {
+                return Ok(());
+            }
+            let observed = wait_exit_without_reaping(self.pgid).await;
+            if observed.is_err() {
+                // ECHILD: something else reaped it.
+                self.released = true;
+            }
+            observed
+        }
         #[cfg(not(any(
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
-            all(target_os = "linux", not(target_env = "uclibc"))
+            all(target_os = "linux", not(target_env = "uclibc")),
+            target_vendor = "apple"
         )))]
         {
             // No non-reaping wait: observing exit reaps the leader, which ends
-            // provable ownership of its group id.
+            // provable ownership of its group id. A caller's later group
+            // signal is refused and logged by `terminate_group`.
             let result = self.child.wait().await;
             self.released = true;
             result.map(|_| ())
@@ -127,6 +154,9 @@ impl OwnedGroupLeader {
     /// Returns whether the signal was sent.
     #[track_caller]
     pub fn terminate_group(&self, reason: &str) -> bool {
+        if let Some(unit) = &self.scope {
+            super::kill_worker_scope(unit, nix::sys::signal::Signal::SIGKILL);
+        }
         if !self.owns_group() {
             tracing::warn!(
                 target: "rsid::signal",
@@ -149,12 +179,53 @@ impl OwnedGroupLeader {
     }
 }
 
+/// Whether the child `pid` has exited, without reaping it and without
+/// blocking: `waitid(P_PID, WEXITED | WNOWAIT | WNOHANG)` through rustix, which
+/// zeroes the result and reads a filled `si_signo` as an exit. The macOS path
+/// of [`OwnedGroupLeader::exited`]; Linux test builds compile and run it too
+/// (Linux itself keeps the nix poll), so the macOS-only code still type-checks
+/// and is exercised on the hub.
+#[cfg(any(target_vendor = "apple", all(test, target_os = "linux")))]
+fn exited_without_reaping(pid: nix::unistd::Pid) -> std::io::Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let pid = Pid::from_raw(pid.as_raw())
+        .ok_or_else(|| std::io::Error::other("group leader pid is not positive"))?;
+    loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Ok(status) => return Ok(status.is_some()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Poll [`exited_without_reaping`] until the child `pid` exited, leaving it a
+/// zombie that pins its group id. Cancel-safe (it only sleeps between polls).
+#[cfg(any(target_vendor = "apple", all(test, target_os = "linux")))]
+async fn wait_exit_without_reaping(pid: nix::unistd::Pid) -> std::io::Result<()> {
+    /// The longest wait between polls; a poll starts at 1ms so a short-lived
+    /// child is not delayed by it.
+    const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let mut poll = Duration::from_millis(1);
+    while !exited_without_reaping(pid)? {
+        tokio::time::sleep(poll).await;
+        poll = (poll * 2).min(EXIT_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
 impl Drop for OwnedGroupLeader {
     fn drop(&mut self) {
         // Dropped before the caller settled the group (its future was
         // cancelled): stop the group while the leader still pins its id. The
         // child itself is then killed and reaped by tokio.
         if self.owns_group() {
+            if let Some(unit) = &self.scope {
+                super::kill_worker_scope(unit, nix::sys::signal::Signal::SIGKILL);
+            }
             terminate_process_group_because(
                 self.pgid,
                 "owned process group dropped before it was settled",
@@ -169,6 +240,9 @@ pub struct OwnedGroupLimits {
     /// How long the output pipes may stay open after the leader exits before
     /// the group is stopped and the pipes are released.
     pub post_exit_drain: Duration,
+    /// How long a stopped leader's group gets to handle SIGTERM before it is
+    /// escalated to SIGKILL.
+    pub terminate_grace: Duration,
     /// How long to wait for the leader's exit and the pipes' EOF after the
     /// group was stopped.
     pub cleanup: Duration,
@@ -208,6 +282,8 @@ pub async fn capture_owned_group(
     let mut read_failure = None;
     let mut exit_failure = None;
     let mut timed_out = false;
+    #[cfg(unix)]
+    let mut kill_deadline = None;
     {
         let mut stdout_read = std::pin::pin!(drain(stdout, &mut stdout_bytes));
         let mut stderr_read = std::pin::pin!(drain(stderr, &mut stderr_bytes));
@@ -234,9 +310,29 @@ pub async fn capture_owned_group(
                     None
                 };
                 if let Some(stop) = stop {
-                    leader.terminate_group(&stop);
-                    cleanup_deadline = Some(now + limits.cleanup);
+                    #[cfg(unix)]
+                    {
+                        let _ = signal_process_group_because(
+                            leader.pgid(),
+                            nix::sys::signal::Signal::SIGTERM,
+                            &stop,
+                        );
+                        kill_deadline = Some(now + limits.terminate_grace);
+                        cleanup_deadline = Some(now + limits.terminate_grace + limits.cleanup);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = stop;
+                        leader.terminate_group(reason);
+                        cleanup_deadline = Some(now + limits.cleanup);
+                    }
                 }
+            }
+            #[cfg(unix)]
+            if kill_deadline.is_some_and(|kill_at| now >= kill_at) {
+                leader.terminate_group(reason);
+                kill_deadline = None;
+                cleanup_deadline = Some(now + limits.cleanup);
             }
             if let Some(cleanup) = cleanup_deadline
                 && now >= cleanup
@@ -321,13 +417,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_control::recorded_group_signals::{last_to, sent_to};
+    #[cfg(target_os = "linux")]
+    use crate::process_control::recorded_group_signals::last_to;
+    use crate::process_control::recorded_group_signals::sent_to;
     use std::process::Stdio;
     use tokio::process::Command;
 
     fn limits() -> OwnedGroupLimits {
         OwnedGroupLimits {
             post_exit_drain: Duration::from_millis(300),
+            terminate_grace: Duration::ZERO,
             cleanup: Duration::from_secs(2),
         }
     }
@@ -362,8 +461,42 @@ mod tests {
     }
 
     /// The process `pid` still exists (signal 0 delivers nothing).
+    #[cfg(target_os = "linux")]
     fn exists(pid: i32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    /// #2812: the non-reaping exit wait macOS uses reports a running child as
+    /// running, an exited one as exited, and leaves it unreaped (still
+    /// waitable, so its group id stays pinned) for the later reap.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_portable_exit_wait_observes_exit_without_reaping() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn(&script(dir.path(), "sleep 1\nexit 3"));
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
+        assert!(
+            !exited_without_reaping(pid).unwrap(),
+            "the child still runs"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wait_exit_without_reaping(pid))
+                .await
+                .is_err(),
+            "the wait resolves only on exit"
+        );
+        tokio::time::timeout(Duration::from_secs(10), wait_exit_without_reaping(pid))
+            .await
+            .expect("the exit was observed")
+            .unwrap();
+        // Observed twice: the first observation did not consume the zombie.
+        assert!(exited_without_reaping(pid).unwrap());
+        assert!(
+            exists(pid.as_raw()),
+            "the exited leader is still an unreaped zombie"
+        );
+        let status = child.wait().await.unwrap();
+        assert_eq!(status.code(), Some(3));
     }
 
     #[tokio::test]
@@ -447,6 +580,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
             OwnedGroupLimits {
                 post_exit_drain: Duration::from_millis(300),
+                terminate_grace: Duration::ZERO,
                 cleanup: Duration::from_millis(300),
             },
             "test",

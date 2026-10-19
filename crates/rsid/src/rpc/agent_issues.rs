@@ -1,5 +1,24 @@
 use super::*;
 
+pub(crate) fn agent_issue_mutation_receipt(
+    result: rsi_common::rpc::AgentIssueMutationResultV1,
+    include_issue: bool,
+) -> Result<serde_json::Value> {
+    let issue = result.issue;
+    let mut receipt = serde_json::json!({
+        "issue_id": issue.id,
+        "display_number": issue.display_number,
+        "status": issue.status,
+        "row_version": issue.row_version,
+        "sequence": result.event.sequence,
+        "deduplicated": result.deduplicated,
+    });
+    if include_issue {
+        receipt["issue"] = serde_json::to_value(issue)?;
+    }
+    Ok(receipt)
+}
+
 pub(super) fn decode_issue_workspace_params<T: DeserializeOwned>(
     request: &RpcRequest,
 ) -> Result<T> {
@@ -79,11 +98,10 @@ impl RpcServer {
         })?;
         let params = crate::agent_issue_validation::decode_update(&request.params)
             .map_err(crate::error::agent_issue_invalid_request)?;
-        serialize_agent_issue_result(
-            self.session_manager
-                .agent_update_issue(caller, params)
-                .await,
-        )
+        self.session_manager
+            .agent_update_issue_value(caller, params)
+            .await
+            .map_err(crate::error::normalize_agent_issue_error)
     }
 
     pub(super) async fn handle_agent_update_issue_status(
@@ -99,11 +117,13 @@ impl RpcServer {
         })?;
         let params = crate::agent_issue_validation::decode_update_status(&request.params)
             .map_err(crate::error::agent_issue_invalid_request)?;
-        serialize_agent_issue_result(
-            self.session_manager
-                .agent_update_issue_status(caller, params)
-                .await,
-        )
+        let include_issue = params.include_issue;
+        let result = self
+            .session_manager
+            .agent_update_issue_status(caller, params)
+            .await
+            .map_err(crate::error::normalize_agent_issue_error)?;
+        agent_issue_mutation_receipt(result, include_issue)
     }
 
     pub(super) async fn handle_agent_archive_issue(

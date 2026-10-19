@@ -257,11 +257,12 @@ impl ConfigureManagerNodeRequestV1 {
                 .iter()
                 .all(|limit| self.policy.provider_limits.contains(limit))
             || self.grant.allowed_launches.len() != self.policy.allowed_launches.len()
-            || !self
-                .grant
-                .allowed_launches
-                .iter()
-                .all(|choice| self.policy.allowed_launches.contains(choice))
+            || !self.grant.allowed_launches.iter().all(|choice| {
+                self.policy
+                    .allowed_launches
+                    .iter()
+                    .any(|entry| entry.allows(choice) && choice.allows(entry))
+            })
         {
             return Err("manager_node_invalid_configuration");
         }
@@ -372,7 +373,7 @@ impl ManagerNodeGrantV1 {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.allowance.validate()?;
         if self.capabilities.len() > 16
-            || self.allowed_launches.len() > 32
+            || self.allowed_launches.len() > crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES
             || self
                 .allowed_launches
                 .iter()

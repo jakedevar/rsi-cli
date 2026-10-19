@@ -406,6 +406,7 @@ struct DeferredScratchFailure {
     bound: crate::sandbox::custody::BoundRetryCustody,
     permit: crate::model_control::AdmissionPermit,
     custody_id: Uuid,
+    transport_binding: crate::session::AgentTransportWitness,
 }
 
 const DEFERRED_GENERATION: u64 = 7;
@@ -440,7 +441,16 @@ async fn bind_deferred_scratch_failure(
         .write()
         .await
         .insert(reserved.child.id, tracked);
+    let transport_binding = {
+        let mut tokens = manager.agent_tokens.write().await;
+        tokens.insert(
+            "6bde568d172bbeb00fe88bfddb15025a4e7336d66813ffc6ea24285d3a6997b8".into(),
+            reserved.child.id,
+        );
+        tokens.binding_for_session(reserved.child.id).unwrap()
+    };
     DeferredScratchFailure {
+        transport_binding,
         bound: crate::sandbox::custody::BoundRetryCustody::transfer_for_test(
             fixture.custody_id,
             fixture.parent.id,
@@ -466,7 +476,7 @@ async fn settle_deferred_scratch_failure(
         failure.reserved.child.id,
         &failure.permit,
         DEFERRED_GENERATION,
-        "deferred-scratch-token",
+        failure.transport_binding,
         Some(&failure.bound),
         None,
         None,
@@ -511,6 +521,14 @@ async fn deferred_scratch_failure_waits_for_a_held_stripe_without_pinning_store_
         session_status(&manager, failure.reserved.child.id).await,
         SessionStatus::Failed
     );
+    assert_eq!(
+        manager
+            .agent_tokens
+            .read()
+            .await
+            .binding_for_session(failure.reserved.child.id),
+        None
+    );
     assert!(
         manager
             .active
@@ -551,6 +569,16 @@ async fn deferred_scratch_failure_leaves_a_replacement_incarnation_tracked() {
             .write()
             .await
             .insert(failure.reserved.child.id, replacement);
+        // Reinstall even the identical token value: only its new witness may
+        // survive the old launch's deferred settlement.
+        let mut tokens = manager.agent_tokens.write().await;
+        tokens.insert(
+            "6bde568d172bbeb00fe88bfddb15025a4e7336d66813ffc6ea24285d3a6997b8".into(),
+            failure.reserved.child.id,
+        );
+        tokens
+            .binding_for_session(failure.reserved.child.id)
+            .unwrap()
     };
     let run = run_behind_held_stripes(
         &manager.store,
@@ -559,7 +587,8 @@ async fn deferred_scratch_failure_leaves_a_replacement_incarnation_tracked() {
         async { tokio::join!(settle_deferred_scratch_failure(&manager, &failure), replace) },
     )
     .await;
-    run.assert_store_stayed_free("deferred scratch failure with a replacement");
+    let (_, replacement_binding) =
+        run.assert_store_stayed_free("deferred scratch failure with a replacement");
     assert_eq!(
         session_status(&manager, failure.reserved.child.id).await,
         SessionStatus::Failed
@@ -569,4 +598,12 @@ async fn deferred_scratch_failure_leaves_a_replacement_incarnation_tracked() {
         .get(&failure.reserved.child.id)
         .expect("the replacement incarnation stays tracked");
     assert_eq!(tracked.spawn_generation, DEFERRED_GENERATION + 1);
+    drop(active);
+    assert!(
+        manager
+            .agent_tokens
+            .read()
+            .await
+            .binding_matches(failure.reserved.child.id, replacement_binding)
+    );
 }

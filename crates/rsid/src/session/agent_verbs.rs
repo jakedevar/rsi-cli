@@ -104,7 +104,7 @@ use rsi_common::rpc::{
     AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
 };
 use rsi_common::types::{
-    IssueEventPageRequestV1, IssueEventPageV1, IssuePageV1, NewIssue, ScheduledJob, Session,
+    AgentIssuePageV1, IssueEventPageRequestV1, IssueEventPageV1, NewIssue, ScheduledJob, Session,
     SessionKind, WakeMode,
 };
 use std::collections::HashMap;
@@ -741,6 +741,33 @@ impl AgentControlHandle {
     /// committed by the time this runs; failing the whole call because the
     /// caller sits at its watch cap would report "not continued" for a child
     /// that very much was. The receipt reports what actually happened.
+    /// `AgentContinueChild` policy (#1644). A manager-scoped target normally
+    /// reaches the manager through its dedicated `to_manager` watch, so an
+    /// extra automatic watch would publish a second terminal wake. When the
+    /// manager itself armed an ordinary watch on the target (an Issue worker it
+    /// launched), that watch was consumed by the first completion and must be
+    /// re-armed, or the continued worker's completion never wakes the manager.
+    pub(crate) async fn rearm_child_watch_for_continue(
+        &self,
+        caller_session_id: Uuid,
+        target_session_id: Uuid,
+        manager_controlled: bool,
+    ) -> bool {
+        if manager_controlled {
+            let owns_ordinary_watch = self
+                .store
+                .lock()
+                .await
+                .owner_has_ordinary_terminal_watch(caller_session_id, target_session_id)
+                .unwrap_or(false);
+            if !owns_ordinary_watch {
+                return false;
+            }
+        }
+        self.rearm_child_watch_after_continue(caller_session_id, target_session_id)
+            .await
+    }
+
     pub(crate) async fn rearm_child_watch_after_continue(
         &self,
         caller_session_id: Uuid,
@@ -890,7 +917,12 @@ impl AgentControlHandle {
                     &params.idempotency_key,
                 )?
             } else {
-                store.create_agent_issue_idempotent_with_key(
+                // #2677: one finding becomes one Issue. A reviewer or a
+                // topology node that files a finding another of them already
+                // filed gets the existing open Issue back. The store
+                // authorizes the project first, then dedupes, and records the
+                // caller/key receipt atomically (#2678, #2679).
+                store.create_agent_issue_idempotent_with_title_dedupe(
                     caller_session_id,
                     issue_id,
                     &new,
@@ -918,7 +950,7 @@ impl AgentControlHandle {
         &self,
         caller_session_id: Uuid,
         request: AgentListIssuesRequestV1,
-    ) -> Result<IssuePageV1> {
+    ) -> Result<AgentIssuePageV1> {
         self.store
             .lock()
             .await
@@ -945,6 +977,37 @@ impl AgentControlHandle {
             .lock()
             .await
             .agent_update_issue(caller_session_id, &request)
+    }
+
+    /// #1750: a bound worker's handoff record (see
+    /// `Store::agent_append_issue_handoff`).
+    pub async fn agent_append_issue_handoff(
+        &self,
+        caller_session_id: Uuid,
+        request: AgentUpdateIssueRequestV1,
+    ) -> Result<rsi_common::types::AgentIssueHandoffReceiptV1> {
+        self.store
+            .lock()
+            .await
+            .agent_append_issue_handoff(caller_session_id, &request)
+    }
+
+    /// `AgentUpdateIssue` for both transports: a `handoff` request stores a
+    /// handoff record (#1750); anything else is the content mutation.
+    pub async fn agent_update_issue_value(
+        &self,
+        caller_session_id: Uuid,
+        request: AgentUpdateIssueRequestV1,
+    ) -> Result<serde_json::Value> {
+        if request.handoff.is_some() {
+            let receipt = self
+                .agent_append_issue_handoff(caller_session_id, request)
+                .await?;
+            return Ok(serde_json::to_value(receipt)?);
+        }
+        let include_issue = request.include_issue;
+        let result = self.agent_update_issue(caller_session_id, request).await?;
+        crate::rpc::agent_issues::agent_issue_mutation_receipt(result, include_issue)
     }
 
     pub async fn agent_update_issue_status(
@@ -999,6 +1062,7 @@ impl AgentControlHandle {
     /// inserts one deterministic one-shot Resume job and creates one
     /// deterministic attributed issue. It never launches synchronously and
     /// can never construct Fresh/AgentFresh.
+    #[cfg(test)]
     pub(crate) async fn enforce_master_no_idle(
         &self,
         caller_session_id: Uuid,
@@ -1891,6 +1955,23 @@ impl AgentControlHandle {
         reset_existing: bool,
         replace_name: bool,
     ) -> Result<ArmWatchOutcome> {
+        let store = self.store.lock().await;
+        Self::arm_terminal_watch_locked(
+            &store,
+            caller_session_id,
+            candidate,
+            reset_existing,
+            replace_name,
+        )
+    }
+
+    fn arm_terminal_watch_locked(
+        store: &crate::store::Store,
+        caller_session_id: Uuid,
+        candidate: ScheduledJob,
+        reset_existing: bool,
+        replace_name: bool,
+    ) -> Result<ArmWatchOutcome> {
         let WakeMode::OnTerminal(watched) = candidate.wake_mode else {
             return Err(DaemonError::InvalidParam(
                 "arm_terminal_watch requires an on_terminal candidate job".into(),
@@ -1914,7 +1995,6 @@ impl AgentControlHandle {
                 "watch_self_rejected: session {caller_session_id} cannot arm a terminal watch on itself"
             )));
         }
-        let store = self.store.lock().await;
         let jobs = store
             .list_enabled_terminal_watches()
             .map_err(|e| DaemonError::Rpc(format!("failed to list scheduled jobs: {e}")))?;
@@ -1942,7 +2022,7 @@ impl AgentControlHandle {
                     ));
                 }
             } else if let Some(delivered_at) = existing.last_fired_at
-                && watched_left_delivered_epoch(&store, watched, delivered_at)?
+                && watched_left_delivered_epoch(store, watched, delivered_at)?
             {
                 // #1391: the row still carries the previous epoch's delivery
                 // and is about to be retired as consumed. Deduplicating onto
@@ -2029,11 +2109,12 @@ impl AgentControlHandle {
             origin_session_id: caller,
         })
         .map_err(DaemonError::InvalidParam)?;
-        let replaced = self
-            .store
-            .lock()
-            .await
-            .insert_wake_when(&job, &state, replace_name)?;
+        let replaced = crate::scheduler::arm_authorized(
+            &*self.store.lock().await,
+            &job,
+            &state,
+            replace_name,
+        )?;
         Ok((job, replaced))
     }
 
@@ -2050,17 +2131,28 @@ impl AgentControlHandle {
     }
 
     /// The automatic on_terminal watch row for `(owner, child)`, not yet stored.
+    #[cfg(test)]
     pub(crate) async fn build_automatic_child_watch_candidate(
         &self,
+        owner_session_id: Uuid,
+        child_session_id: Uuid,
+    ) -> Result<ScheduledJob> {
+        let store = self.store.lock().await;
+        Self::automatic_child_watch_candidate_locked(&store, owner_session_id, child_session_id)
+    }
+
+    pub(crate) fn automatic_child_watch_candidate_locked(
+        store: &crate::store::Store,
         owner_session_id: Uuid,
         child_session_id: Uuid,
     ) -> Result<ScheduledJob> {
         use crate::session::harness::tools::schedule_wake::{
             ScheduleWakeRequest, build_agent_scheduled_job,
         };
-        let owner = self
-            .get_session(owner_session_id)
-            .await
+        let owner_session_id =
+            store.automatic_child_watch_owner(owner_session_id, child_session_id)?;
+        let owner = store
+            .get_session(owner_session_id)?
             .ok_or(DaemonError::SessionNotFound(owner_session_id))?;
         build_agent_scheduled_job(ScheduleWakeRequest {
             message: format!("automatic child terminal watch {child_session_id}"),
@@ -2085,12 +2177,19 @@ impl AgentControlHandle {
         child_session_id: Uuid,
         reset_existing: bool,
     ) -> Result<ArmWatchOutcome> {
-        let candidate = self
-            .build_automatic_child_watch_candidate(owner_session_id, child_session_id)
-            .await?;
-        let outcome = self
-            .arm_terminal_watch_inner(owner_session_id, candidate, reset_existing, false)
-            .await?;
+        // Resolve the node seat and insert/deduplicate under the same store
+        // lock, so succession cannot publish between resolution and arm.
+        let store = self.store.lock().await;
+        let candidate = Self::automatic_child_watch_candidate_locked(
+            &store,
+            owner_session_id,
+            child_session_id,
+        )?;
+        let wake_owner = candidate
+            .wake_session_id
+            .ok_or_else(|| DaemonError::Store("automatic child watch has no wake owner".into()))?;
+        let outcome =
+            Self::arm_terminal_watch_locked(&store, wake_owner, candidate, reset_existing, false)?;
         let disposition = match &outcome {
             ArmWatchOutcome::Armed(_) => "armed",
             ArmWatchOutcome::Deduplicated(_) => "deduplicated",
@@ -2456,6 +2555,7 @@ impl AgentControlHandle {
             .await?;
         let (outcome, target_provider) = {
             let store = self.store.lock().await;
+            let _admission = super::rpc_admission::admit_current_rpc(caller_session_id).await?;
             let outcome = store.accept_authorized_agent_message(
                 caller_session_id,
                 authority.spawn_request_id(),
@@ -2516,7 +2616,11 @@ impl AgentControlHandle {
             Ok(inbox) => Ok(inbox),
             // #1266: a portfolio seat holds no project manager inbox; it
             // still reads its failed and uncertain tier mail here.
-            Err(error) if !request.settle_notice_ids.is_empty() => Err(error),
+            Err(error)
+                if !request.settle_notice_ids.is_empty() || !request.read_notice_ids.is_empty() =>
+            {
+                Err(error)
+            }
             Err(error) => match store.tier_portfolio_ref(caller) {
                 Ok(Some(_)) => {
                     let (undelivered_tier_mail, more_undelivered_tier_mail) =
@@ -2765,7 +2869,7 @@ mod manager_session_control_tests {
         let sandbox = TempDir::new().unwrap();
         let session_manager = SessionManager::new(
             Arc::new(crate::bus::EventBus::new(16)),
-            Store::open(&directory.path().join("rsi.db")).unwrap(),
+            Store::open_test_fixture(&directory.path().join("rsi.db")).unwrap(),
             false,
             directory.path().join("daemon.sock"),
             None,
@@ -2959,7 +3063,7 @@ mod manager_session_control_tests {
         let sandbox = TempDir::new().unwrap();
         let session_manager = SessionManager::new(
             Arc::new(crate::bus::EventBus::new(16)),
-            Store::open(&directory.path().join("rsi.db")).unwrap(),
+            Store::open_test_fixture(&directory.path().join("rsi.db")).unwrap(),
             false,
             directory.path().join("daemon.sock"),
             None,
@@ -3371,7 +3475,7 @@ impl SessionManager {
         &self,
         caller_session_id: Uuid,
         request: AgentListIssuesRequestV1,
-    ) -> Result<IssuePageV1> {
+    ) -> Result<AgentIssuePageV1> {
         self.agent_control()
             .agent_list_issues(caller_session_id, request)
             .await
@@ -3394,6 +3498,26 @@ impl SessionManager {
     ) -> Result<AgentIssueMutationResultV1> {
         self.agent_control()
             .agent_update_issue(caller_session_id, request)
+            .await
+    }
+
+    pub async fn agent_append_issue_handoff(
+        &self,
+        caller_session_id: Uuid,
+        request: AgentUpdateIssueRequestV1,
+    ) -> Result<rsi_common::types::AgentIssueHandoffReceiptV1> {
+        self.agent_control()
+            .agent_append_issue_handoff(caller_session_id, request)
+            .await
+    }
+
+    pub async fn agent_update_issue_value(
+        &self,
+        caller_session_id: Uuid,
+        request: AgentUpdateIssueRequestV1,
+    ) -> Result<serde_json::Value> {
+        self.agent_control()
+            .agent_update_issue_value(caller_session_id, request)
             .await
     }
 
@@ -3540,6 +3664,29 @@ impl SessionManager {
             });
         }
         Ok(confirmed)
+    }
+
+    /// `RecordProviderLifecycleEvent` (#2766): the session's own lifecycle
+    /// hook (`StopFailure`, `PreCompact`, `SessionStart`) reports an event; the
+    /// target is the token-resolved caller. Never an error for a well-formed
+    /// request: a row that cannot be written is dropped and logged. A
+    /// `PreCompact` also drives the session's handoff (#2898; a failure leaves
+    /// `handoff` empty); a `SessionStart` returns the preamble the launch
+    /// deferred to the hook (hub #2919, `additional_context`).
+    pub async fn record_provider_lifecycle_event(
+        &self,
+        caller_session_id: Uuid,
+        params: rsi_common::provider_lifecycle_hooks::RecordProviderLifecycleEventParams,
+    ) -> super::provider_lifecycle_events::RecordProviderLifecycleEventResponse {
+        super::provider_lifecycle_events::record_provider_lifecycle_event(
+            &self.store,
+            &self.active,
+            &self.event_bus(),
+            &self.runtime_config,
+            caller_session_id,
+            params,
+        )
+        .await
     }
 
     /// The `ClaimBoundaryMail` reply could not be written (#1183): the claimed
@@ -3751,16 +3898,13 @@ impl SessionManager {
         if let Some(receipt) = fresh {
             return Ok(receipt);
         }
-        // The appointed manager already owns a dedicated to_manager watch.
-        // An automatic child watch here would publish a second terminal wake
-        // for a session the manager did not spawn.
-        let watch_rearmed = if manager_controlled {
-            false
-        } else {
-            control
-                .rearm_child_watch_after_continue(caller_session_id, request.target_session_id)
-                .await
-        };
+        let watch_rearmed = control
+            .rearm_child_watch_for_continue(
+                caller_session_id,
+                request.target_session_id,
+                manager_controlled,
+            )
+            .await;
 
         Ok(AgentContinueChildResultV1 {
             target_session_id: request.target_session_id,
@@ -4055,7 +4199,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::store::Store;
     use rsi_common::types::Recurrence;
-    use rsi_common::types::{ContextUsageConfidence, SessionProvider, SessionStatus};
+    use rsi_common::types::{SessionProvider, SessionStatus};
     use rusqlite::OptionalExtension;
     use tempfile::TempDir;
 
@@ -4493,6 +4637,15 @@ pub(crate) mod tests {
         Arc<crate::bus::EventBus>,
     ) {
         control_handle_for_store(Store::open_in_memory().expect("in-memory store"))
+    }
+
+    /// A control handle over a file-backed store (a cold-archive pass needs the
+    /// database file).
+    pub(crate) fn control_handle_for_file_store(
+        store: Store,
+    ) -> (AgentControlHandle, Arc<tokio::sync::Mutex<Store>>) {
+        let (control, store, _) = control_handle_for_store(store);
+        (control, store)
     }
 
     fn control_handle_for_store(
@@ -5002,7 +5155,8 @@ pub(crate) mod tests {
             for project_backed in [true, false] {
                 let directory = tempfile::tempdir().unwrap();
                 let database = directory.path().join("capacity-terminal-reopen.sqlite");
-                let (control, store, _) = control_handle_for_store(Store::open(&database).unwrap());
+                let (control, store, _) =
+                    control_handle_for_store(Store::open_test_fixture(&database).unwrap());
                 let session_id = Uuid::new_v4();
                 let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
                 session.status = SessionStatus::Failed;
@@ -5677,7 +5831,8 @@ pub(crate) mod tests {
         for unreadable in [false, true] {
             let dir = TempDir::new().unwrap();
             let database = dir.path().join("program-guard.sqlite");
-            let (control, store, _) = control_handle_for_store(Store::open(&database).unwrap());
+            let (control, store, _) =
+                control_handle_for_store(Store::open_test_fixture(&database).unwrap());
             let session_id = Uuid::new_v4();
             let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
             session.status = SessionStatus::Completed;
@@ -6060,7 +6215,7 @@ pub(crate) mod tests {
         let directory = TempDir::new().unwrap();
         let database = directory.path().join("closed-program-guard.db");
         let (control, store, _) =
-            control_handle_for_store(Store::open(&database).expect("open store"));
+            control_handle_for_store(Store::open_test_fixture(&database).expect("open store"));
         let session_id = Uuid::new_v4();
         let mut session = test_session(session_id, std::path::PathBuf::from("/tmp"));
         session.status = SessionStatus::Completed;
@@ -6671,7 +6826,7 @@ pub(crate) mod tests {
         let sandbox = TempDir::new().unwrap();
         let manager = SessionManager::new(
             Arc::new(crate::bus::EventBus::new(16)),
-            Store::open(&dir.path().join("rsi.db")).unwrap(),
+            Store::open_test_fixture(&dir.path().join("rsi.db")).unwrap(),
             false,
             dir.path().join("daemon.sock"),
             None,
@@ -7067,7 +7222,7 @@ pub(crate) mod tests {
     fn fresh_relaunch_system_prompt_carries_kind_preamble() {
         let parts = crate::session::launch::fresh_launch_preamble_parts(
             SessionKind::Task,
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+            &std::path::Path::new(rsi_common::manifest_dir!()).join("../.."),
         );
         assert!(
             parts
@@ -7578,7 +7733,10 @@ pub(crate) mod tests {
         // instead: every automatic/replay failure must route through the one
         // helper, which owns exactly one error log and one SystemMessage.
         let source = include_str!("agent_verbs.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let production = source
+            .split("#[cfg(test)]\npub(crate) mod tests {")
+            .next()
+            .unwrap();
         let c5_production = production
             .split("pub(crate) async fn maybe_autofile_terminal_failure(")
             .nth(1)
@@ -8038,6 +8196,8 @@ pub(crate) mod tests {
                 .agent_update_issue_status(
                     caller,
                     AgentUpdateIssueStatusRequestV1 {
+                        note: None,
+                        include_issue: false,
                         project_id: Some(rsi.id),
                         issue_id: Some(first.issue.id),
                         display_number: None,
@@ -8361,6 +8521,8 @@ pub(crate) mod tests {
                 .agent_list_issues(caller, AgentListIssuesRequestV1::default())
                 .await
                 .unwrap()
+                .into_full()
+                .expect("full Issue page")
                 .issues,
             vec![created.issue.clone()]
         );
@@ -8383,18 +8545,12 @@ pub(crate) mod tests {
             .agent_update_issue(
                 caller,
                 AgentUpdateIssueRequestV1 {
-                    project_id: None,
                     issue_id: Some(created.issue.id),
-                    display_number: None,
-                    expected_row_version: created.issue.row_version,
-                    idempotency_key: "agent-control-edit".into(),
-                    title: None,
                     body: Some("updated".into()),
-                    labels: None,
-                    priority: None,
-                    clear_priority: false,
-                    assignee: None,
-                    clear_assignee: false,
+                    ..AgentUpdateIssueRequestV1::new(
+                        created.issue.row_version,
+                        "agent-control-edit".into(),
+                    )
                 },
             )
             .await
@@ -8403,6 +8559,8 @@ pub(crate) mod tests {
             .agent_update_issue_status(
                 caller,
                 AgentUpdateIssueStatusRequestV1 {
+                    note: None,
+                    include_issue: false,
                     project_id: None,
                     issue_id: Some(created.issue.id),
                     display_number: None,
@@ -8430,6 +8588,8 @@ pub(crate) mod tests {
                 .agent_list_issues(caller, AgentListIssuesRequestV1::default())
                 .await
                 .unwrap()
+                .into_full()
+                .expect("full Issue page")
                 .issues
                 .is_empty()
         );
@@ -9466,6 +9626,53 @@ pub(crate) mod tests {
         assert_eq!(jobs[0].id, watch.id);
         assert!(jobs[0].enabled);
         assert_eq!(jobs[0].last_fired_at, None);
+    }
+
+    /// #1644: a manager that launched an Issue worker holds an ordinary
+    /// terminal watch on it. The first completion consumes that watch, so a
+    /// manager-controlled continue must re-arm it or the continued worker's
+    /// completion never wakes the manager. A manager-scoped target with no
+    /// ordinary watch keeps its single dedicated route (no second wake).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn manager_continue_rearms_only_its_own_consumed_worker_watch() {
+        let (control, store) = control_handle_with_store();
+        let manager = Uuid::new_v4();
+        let worker = Uuid::new_v4();
+        let routed_lead = Uuid::new_v4();
+        let mut manager_row = test_session(manager, std::path::PathBuf::from("/tmp"));
+        manager_row.status = SessionStatus::Completed;
+        store.lock().await.insert_session(&manager_row).unwrap();
+        let watch = watch_candidate(manager, worker);
+        store.lock().await.insert_scheduled_job(&watch).unwrap();
+        // The first terminal delivery consumed the watch.
+        store
+            .lock()
+            .await
+            .update_scheduled_job_fired(&watch.id, &chrono::Utc::now(), None, false)
+            .unwrap();
+        assert_eq!(enabled_watch_count(&store, manager).await, 0);
+
+        assert!(
+            !control
+                .rearm_child_watch_for_continue(manager, routed_lead, true)
+                .await,
+            "a manager-scoped target without an ordinary watch gets no second wake"
+        );
+        assert_eq!(enabled_watch_count(&store, manager).await, 0);
+
+        assert!(
+            control
+                .rearm_child_watch_for_continue(manager, worker, true)
+                .await
+        );
+        assert_eq!(enabled_watch_count(&store, manager).await, 1);
+        assert!(
+            control
+                .rearm_child_watch_for_continue(manager, routed_lead, false)
+                .await,
+            "a non-manager caller keeps the unconditional re-arm"
+        );
     }
 
     /// A8.1 review F2 (defense-in-depth): a candidate whose wake target is

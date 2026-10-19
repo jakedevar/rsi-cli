@@ -23,6 +23,10 @@ pub struct PromptProcessorConfig {
     pub custom_provider_id: Option<Uuid>,
     #[serde(default)]
     pub custom_base_url: Option<String>,
+    /// Pre-#3039 plaintext copy of the custom provider's key. This TUI
+    /// never reads or writes it (the daemon resolves the key by
+    /// `custom_provider_id`); it is kept as loaded so an older TUI reading
+    /// the same `state.json` loses nothing.
     #[serde(default)]
     pub custom_api_key: Option<String>,
 }
@@ -44,18 +48,50 @@ impl Default for PromptProcessorConfig {
     }
 }
 
-/// A user-defined OpenAI-compatible provider (stored in tui-state.json).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// A user-defined OpenAI-compatible provider as the daemon reports it
+/// (`ListCustomProviders`, hub #3039). The API key stays in the daemon's
+/// vault: the TUI only sees whether one is set and its fingerprint hint, and
+/// names the provider by `id` when a launch or a model role needs the key.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CustomProviderEntry {
-    /// Locally generated UUID — stable identifier for this config.
+    /// Daemon-held UUID (legacy entries kept theirs through the import).
     pub id: Uuid,
     /// Human-readable display name (e.g. "Groq", "My Ollama").
     pub name: String,
     /// API base URL (e.g. "https://api.groq.com/openai/v1").
     pub base_url: String,
-    /// API key (plaintext, stored in ~/.flywheel/tui-state.json).
-    pub api_key: String,
     /// Default model ID for this provider (e.g. "llama-3.3-70b-versatile").
+    pub default_model: String,
+    /// A key is stored in the daemon vault.
+    pub api_key_set: bool,
+    /// The vault fingerprint of that key (a hash prefix, never key bytes).
+    pub api_key_fingerprint: Option<String>,
+}
+
+impl From<rsi_common::operator_config::CustomProviderSummary> for CustomProviderEntry {
+    fn from(summary: rsi_common::operator_config::CustomProviderSummary) -> Self {
+        Self {
+            id: summary.id,
+            name: summary.name,
+            base_url: summary.base_url,
+            default_model: summary.default_model,
+            api_key_set: summary.api_key.state
+                == rsi_common::operator_config::CustomProviderKeyState::Set,
+            api_key_fingerprint: summary.api_key.fingerprint,
+        }
+    }
+}
+
+/// The pre-#3039 `custom_providers` entry of `state.json`, plaintext key
+/// included. The daemon imported these once; the TUI keeps the list exactly as
+/// it loaded it and writes it back unchanged, so an older TUI reading the same
+/// file loses nothing. Nothing in this TUI reads or edits it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyCustomProviderEntry {
+    pub id: Uuid,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
     pub default_model: String,
 }
 
@@ -74,10 +110,11 @@ impl MessageBridgeKind {
         }
     }
 
-    pub fn config_filename(self) -> &'static str {
+    /// The daemon's wire kind (`GetMessageBridge` / `PutMessageBridge`).
+    pub fn wire(self) -> rsi_common::operator_config::MessageBridgeKindV1 {
         match self {
-            Self::Signal => "signal.toml",
-            Self::Imessage => "imessage.toml",
+            Self::Signal => rsi_common::operator_config::MessageBridgeKindV1::Signal,
+            Self::Imessage => rsi_common::operator_config::MessageBridgeKindV1::Imessage,
         }
     }
 }
@@ -105,6 +142,28 @@ impl Default for MessageBridgeSettings {
             account: String::new(),
             allow_from: String::new(),
             working_dir: default_bridge_working_dir(),
+        }
+    }
+}
+
+impl MessageBridgeSettings {
+    /// The daemon's wire shape (`PutMessageBridge`).
+    pub fn to_wire(&self) -> rsi_common::operator_config::MessageBridgeConfigV1 {
+        rsi_common::operator_config::MessageBridgeConfigV1 {
+            enabled: self.enabled,
+            account: self.account.clone(),
+            allow_from: self.allow_from.clone(),
+            working_dir: self.working_dir.clone(),
+        }
+    }
+
+    /// From the daemon's wire shape (`GetMessageBridge`).
+    pub fn from_wire(config: rsi_common::operator_config::MessageBridgeConfigV1) -> Self {
+        Self {
+            enabled: config.enabled,
+            account: config.account,
+            allow_from: config.allow_from,
+            working_dir: config.working_dir,
         }
     }
 }
@@ -289,9 +348,26 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
-                field: "retry_max_default".to_string(),
-                label: "Max retries".to_string(),
-                value: DaemonFeatureValue::Display("?".to_string()),
+                field: "worker_cpu_quota_percent".to_string(),
+                label: "Worker CPU quota".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "100", "200", "400", "800", "1600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "hub_build_cpu_percent".to_string(),
+                label: "Hub build CPU budget".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["10", "25", "50", "75", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
             },
             Self {
                 field: "retry_on_stall".to_string(),
@@ -332,13 +408,16 @@ impl DaemonFeatureEntry {
             Self::rotation_threshold("context_rotation_codex_pct", "Rotation threshold (Codex)"),
             Self {
                 field: "coordinator_context_cap_tokens".to_string(),
-                label: "Coordinator context cap (0 off)".to_string(),
+                label: "Coordinator context cap (0 off, 1-100 = % of window)".to_string(),
                 value: DaemonFeatureValue::Cycle {
-                    options: ["0", "100000", "150000", "200000", "300000", "500000"]
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
-                    current: 0,
+                    options: [
+                        "0", "40", "50", "60", "70", "80", "100000", "150000", "200000", "300000",
+                        "400000", "500000",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                    current: 3,
                 },
             },
             Self {
@@ -482,6 +561,77 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "provider_launch_overrides".to_string(),
+                label: "Provider launch overrides".to_string(),
+                // The daemon's canonical JSON, "" while empty; Enter opens the
+                // text editor (hub #2765).
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "codex_config_isolation".to_string(),
+                label: "Codex user config isolation".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: vec![
+                        "off".to_string(),
+                        "user".to_string(),
+                        "rules".to_string(),
+                        "all".to_string(),
+                    ],
+                    // "off" is the canonical default (preserves the historical
+                    // launch argv) — overwritten by update_from_json after the
+                    // first GetDaemonConfig response.
+                    current: 0,
+                },
+            },
+            Self {
+                field: "claude_subagent_model".to_string(),
+                label: "Claude subagent model".to_string(),
+                // The daemon's model, "" while unset (subagents inherit the
+                // parent's); Enter opens the text editor (#2763).
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "claude_max_concurrent_subagents".to_string(),
+                label: "Claude max concurrent subagents".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1", "2", "4", "8", "12", "20", "40"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "codex_subagent_model".to_string(),
+                label: "Codex subagent model".to_string(),
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "codex_max_concurrent_subagents".to_string(),
+                label: "Codex max concurrent subagents".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1", "2", "4", "6", "8", "12", "20"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "claude_fallback_models".to_string(),
+                label: "Claude fallback models".to_string(),
+                // The daemon's chain as comma-separated text, "" while unset;
+                // Enter opens the text editor (#2762).
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "claude_max_budget_usd".to_string(),
+                label: "Claude spend cap per session (USD)".to_string(),
+                // The daemon's cap in USD, "0" = off; Enter opens the text
+                // editor (#2762).
+                value: DaemonFeatureValue::Display("0".to_string()),
+            },
+            Self {
                 field: "system_prompt_preset".to_string(),
                 label: "System prompt preset".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -530,7 +680,7 @@ impl DaemonFeatureEntry {
                 label: "OpenRouter engine".to_string(),
                 value: DaemonFeatureValue::Cycle {
                     options: vec!["codex_cli".to_string(), "harness".to_string()],
-                    current: 0,
+                    current: 1,
                 },
             },
             Self {
@@ -553,8 +703,13 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
-                field: "api_route.fallback".to_string(),
-                label: "API route fallback".to_string(),
+                field: "api_route.fallback.openrouter".to_string(),
+                label: "OpenRouter Codex fallback".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "api_route.fallback.bedrock".to_string(),
+                label: "Bedrock Codex fallback".to_string(),
                 value: DaemonFeatureValue::Bool(true),
             },
             Self {
@@ -607,9 +762,91 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "source_worktree_auto_settlement_enabled".to_string(),
+                label: "Automatic source settlement".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "disk_pressure_min_free_gb".to_string(),
+                label: "Disk pressure free space (GB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["10", "20", "30", "50", "75", "100", "150", "200", "500"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 5,
+                },
+            },
+            Self {
+                field: "target_pool_keep".to_string(),
+                label: "Warm build pools kept".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "6", "8"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 1,
+                },
+            },
+            Self {
+                field: "target_pool_status".to_string(),
+                label: "Warm build pools".to_string(),
+                value: DaemonFeatureValue::Display("R to refresh".to_string()),
+            },
+            Self {
                 field: "archived_sandbox_purge_enabled".to_string(),
                 label: "Purge archived sandboxes".to_string(),
                 value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "cold_archive_enabled".to_string(),
+                label: "Cold-storage archive".to_string(),
+                // The daemon's default since slice S5 (on); the daemon's own value
+                // replaces this when the settings are read.
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "cold_archive_after_days".to_string(),
+                label: "Cold-storage age (days)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["3", "7", "14", "21", "30", "45", "60", "90", "180", "365"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "cold_archive_dir".to_string(),
+                label: "Cold-storage directory".to_string(),
+                // The daemon's value; "" is the default. Enter opens the editor.
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "cold_archive_status".to_string(),
+                label: "Cold-storage status".to_string(),
+                value: DaemonFeatureValue::Display("R to refresh".to_string()),
+            },
+            Self {
+                field: "cold_archive_last_run".to_string(),
+                label: "Cold-storage last run".to_string(),
+                value: DaemonFeatureValue::Display("R to refresh".to_string()),
+            },
+            Self {
+                field: "cold_archive_run_now".to_string(),
+                label: "Run cold-storage pass".to_string(),
+                value: DaemonFeatureValue::Display("Press Enter".to_string()),
+            },
+            Self {
+                field: "tool_result_storage_cap_kib".to_string(),
+                label: "Stored tool-result cap (KiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "4", "8", "16", "32", "64", "128", "256", "512", "1024"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
             },
             Self {
                 field: "rolling_queue_enabled".to_string(),
@@ -638,6 +875,25 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "deploy_restarts_per_hour".to_string(),
+                label: "Deploy restarts per hour".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3"].into_iter().map(str::to_string).collect(),
+                    current: 1,
+                },
+            },
+            Self {
+                field: "supervisor_shutdown_grace_secs".to_string(),
+                label: "Shutdown grace (s)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["60", "120", "300", "600", "1800", "3600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 1,
+                },
+            },
+            Self {
                 field: "rolling_queue_batch_size".to_string(),
                 label: "Merge queue batch size".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -649,14 +905,6 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
-                field: "rolling_queue_speculation_depth".to_string(),
-                label: "Merge queue speculation depth".to_string(),
-                value: DaemonFeatureValue::Cycle {
-                    options: ["0", "1", "2"].into_iter().map(str::to_string).collect(),
-                    current: 1,
-                },
-            },
-            Self {
                 field: "rolling_queue_gate_timeout_mins".to_string(),
                 label: "Merge queue gate timeout (min)".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -664,7 +912,132 @@ impl DaemonFeatureEntry {
                         .into_iter()
                         .map(str::to_string)
                         .collect(),
-                    current: 5,
+                    current: 1,
+                },
+            },
+            Self {
+                field: "rolling_queue_full_qa_interval_mins".to_string(),
+                label: "Merge queue full-QA interval (min)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "15", "30", "60", "90", "120", "180", "240"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "qa_target_max_gib".to_string(),
+                label: "QA target size cap (GiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "10", "20", "30", "40", "60", "100", "200", "500"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "codex_live_catalog_ttl_secs".to_string(),
+                label: "Codex live model catalog TTL (s)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "60", "120", "300", "600", "1800", "3600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "codex_rate_limit_poll_secs".to_string(),
+                label: "Codex plan-window poll (s)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "30", "60", "120", "300", "600", "1800", "3600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
+            },
+            Self {
+                field: rsi_common::provider_lifecycle_hooks::SETTING_FIELD.to_string(),
+                label: "Provider lifecycle hooks".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_lifecycle_hooks::tui_options(),
+                    // "none" is the canonical default (installs exactly the
+                    // custody and mail hooks) — overwritten by update_from_json
+                    // after the first GetDaemonConfig response.
+                    current: 0,
+                },
+            },
+            Self {
+                field: rsi_common::provider_skill_delivery::SETTING_FIELD.to_string(),
+                label: "Provider skill delivery".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_skill_delivery::tui_options(),
+                    // "ambient" is the canonical default (the CLI discovers
+                    // skills itself, argv unchanged) — overwritten by
+                    // update_from_json after the first GetDaemonConfig response.
+                    current: 0,
+                },
+            },
+            Self {
+                field: "provider_contract_canary".to_string(),
+                label: "Provider CLI contract canary".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "codex_refuse_untrusted_custody_hook".to_string(),
+                label: "Refuse Codex launch when custody hook is untrusted".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "structured_handoff_default".to_string(),
+                label: "Schema-validated topology handoffs".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "job_thermal_ceiling_c".to_string(),
+                label: "Job thermal hold (C)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "70", "75", "80", "85", "90", "95", "100"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
+            },
+            Self {
+                field: "health_disk_used_pct".to_string(),
+                label: "Health alert: hub disk used (%)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "70", "80", "85", "90", "95", "98"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
+            },
+            Self {
+                field: "health_thermal_c".to_string(),
+                label: "Health alert: CPU hot (C)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "70", "75", "80", "85", "90", "95"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "health_stuck_minutes".to_string(),
+                label: "Health alert: work stuck (min)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "10", "15", "30", "60", "120", "240"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
                 },
             },
             Self {
@@ -744,6 +1117,17 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "governor_check_slots".to_string(),
+                label: "Check slots".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "6", "8"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 1,
+                },
+            },
+            Self {
                 field: "governor_max_load".to_string(),
                 label: "Governor max load (0 auto)".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -808,6 +1192,24 @@ impl DaemonFeatureEntry {
                         .collect(),
                     current: 0,
                 },
+            },
+            Self {
+                field: "harness_web_search_backend".to_string(),
+                label: "Harness web search backend".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["auto", "serper", "exa", "searxng", "disabled"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "harness_searxng_url".to_string(),
+                label: "Harness SearXNG URL".to_string(),
+                // The daemon's URL, "" while unset; Enter opens the text editor
+                // (#2393). `scripts/searxng-local.sh` prints the local URL.
+                value: DaemonFeatureValue::Display(String::new()),
             },
             Self {
                 field: "harness_context_editing".to_string(),
@@ -920,7 +1322,7 @@ impl DaemonFeatureEntry {
             Self {
                 field: "agent_build_sccache_enabled".to_string(),
                 label: "Worker sccache".to_string(),
-                value: DaemonFeatureValue::Bool(true),
+                value: DaemonFeatureValue::Bool(false),
             },
             Self {
                 field: "agent_build_sccache_cache_gib".to_string(),
@@ -1286,6 +1688,10 @@ impl DaemonFeatureEntry {
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Bool(b) => b.to_string(),
+                        // An unset nullable string field (`harness_searxng_url`).
+                        serde_json::Value::Null => String::new(),
+                        // An empty JSON field (`provider_launch_overrides`).
+                        serde_json::Value::Object(map) if map.is_empty() => String::new(),
                         _ => val.to_string(),
                     }),
                     DaemonFeatureValue::Cycle {
@@ -1312,6 +1718,30 @@ impl DaemonFeatureEntry {
                     }
                 };
             }
+        }
+    }
+
+    /// #1882: newest good pool, its age in commits and the pools' total size.
+    pub(crate) fn update_target_pool_status(
+        entries: &mut [Self],
+        status: &Result<rsi_common::target_pool::TargetPoolStatus, String>,
+    ) {
+        let summary = match status {
+            Ok(status) => status.summary_line(),
+            Err(error) => format!("Unavailable: {error}"),
+        };
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.field == "target_pool_status")
+        {
+            entry.value = DaemonFeatureValue::Display(summary);
+        }
+    }
+
+    /// Set the text of one `Display` row (the cold-storage status rows).
+    pub fn set_display_text(entries: &mut [Self], field: &str, text: String) {
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.field == field) {
+            entry.value = DaemonFeatureValue::Display(text);
         }
     }
 
@@ -1707,9 +2137,15 @@ pub struct UserSettings {
     #[serde(default)]
     pub sort_order: SortOrder,
 
-    /// User-defined OpenAI-compatible provider configs.
-    #[serde(default)]
+    /// User-defined OpenAI-compatible providers, read from the daemon
+    /// (`ListCustomProviders`); never persisted by the TUI.
+    #[serde(skip)]
     pub custom_providers: Vec<CustomProviderEntry>,
+
+    /// The pre-#3039 provider list (with plaintext keys) as loaded from
+    /// `state.json`, written back verbatim for older TUIs; never edited.
+    #[serde(default, rename = "custom_providers")]
+    pub legacy_custom_providers: Vec<LegacyCustomProviderEntry>,
 
     /// Signal/iMessage bridge connection settings.
     #[serde(default)]
@@ -1884,6 +2320,7 @@ impl Default for UserSettings {
             default_hide_tool_results: false,
             sort_order: SortOrder::default(),
             custom_providers: Vec::new(),
+            legacy_custom_providers: Vec::new(),
             message_bridges: MessageBridgeConnections::default(),
             prompt_processor: PromptProcessorConfig::default(),
             card_fields: default_card_fields(),
@@ -2157,150 +2594,6 @@ fn default_bridge_working_dir() -> String {
         .to_string()
 }
 
-pub fn message_bridge_config_path(kind: MessageBridgeKind) -> PathBuf {
-    rsi_common::identity::data_path(kind.config_filename(), kind.config_filename())
-}
-
-pub fn write_message_bridge_config(
-    kind: MessageBridgeKind,
-    settings: &MessageBridgeSettings,
-) -> std::io::Result<PathBuf> {
-    let path = message_bridge_config_path(kind);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, render_message_bridge_config(kind, settings))?;
-    Ok(path)
-}
-
-pub fn load_message_bridge_config(
-    kind: MessageBridgeKind,
-) -> Result<Option<MessageBridgeSettings>, String> {
-    let path = message_bridge_config_path(kind);
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-    let value: toml::Value = toml::from_str(&contents)
-        .map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
-    let table = value
-        .as_table()
-        .ok_or_else(|| format!("{} is not a TOML table", path.display()))?;
-
-    let mut settings = MessageBridgeSettings {
-        enabled: true,
-        ..MessageBridgeSettings::default()
-    };
-    if let Some(enabled) = table.get("enabled").and_then(toml::Value::as_bool) {
-        settings.enabled = enabled;
-    }
-    if let Some(account) = table.get("account").and_then(toml_scalar_to_string) {
-        settings.account = account;
-    }
-    if let Some(handles) = table
-        .get("allow_from")
-        .or_else(|| table.get("allowlist"))
-        .and_then(toml_string_array_value)
-    {
-        settings.allow_from = handles.join(", ");
-    }
-    if let Some(working_dir) = table
-        .get("default_working_dir")
-        .or_else(|| table.get("working_dir"))
-        .and_then(toml_scalar_to_string)
-    {
-        settings.working_dir = working_dir;
-    }
-
-    Ok(Some(settings))
-}
-
-fn render_message_bridge_config(
-    kind: MessageBridgeKind,
-    settings: &MessageBridgeSettings,
-) -> String {
-    let handles = split_bridge_handles(&settings.allow_from);
-    let dm_policy = if handles.is_empty() {
-        "open"
-    } else {
-        "allowlist"
-    };
-    let allow_from = toml_string_array(&handles);
-    let working_dir = toml_escape(&settings.working_dir);
-
-    match kind {
-        MessageBridgeKind::Signal => format!(
-            "enabled = {}\n\
-poll_interval_ms = 2000\n\
-dm_policy = \"{}\"\n\
-allow_from = {}\n\
-max_message_length = 4000\n\
-echo_cache_ttl_ms = 5000\n\
-debounce_ms = 500\n\
-default_working_dir = \"{}\"\n\
-default_provider = \"Claude\"\n\
-account = \"{}\"\n",
-            settings.enabled,
-            dm_policy,
-            allow_from,
-            working_dir,
-            toml_escape(&settings.account)
-        ),
-        MessageBridgeKind::Imessage => format!(
-            "enabled = {}\n\
-poll_interval_ms = 2000\n\
-dm_policy = \"{}\"\n\
-allow_from = {}\n\
-max_message_length = 4000\n\
-echo_cache_ttl_ms = 5000\n\
-debounce_ms = 500\n\
-default_working_dir = \"{}\"\n\
-default_provider = \"Claude\"\n",
-            settings.enabled, dm_policy, allow_from, working_dir
-        ),
-    }
-}
-
-fn split_bridge_handles(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn toml_string_array(items: &[String]) -> String {
-    let body = items
-        .iter()
-        .map(|s| format!("\"{}\"", toml_escape(s)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{}]", body)
-}
-
-fn toml_escape(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn toml_scalar_to_string(value: &toml::Value) -> Option<String> {
-    match value {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Integer(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-fn toml_string_array_value(value: &toml::Value) -> Option<Vec<String>> {
-    value
-        .as_array()?
-        .iter()
-        .map(toml_scalar_to_string)
-        .collect()
-}
-
 fn default_observation_threshold() -> u64 {
     50
 }
@@ -2369,6 +2662,35 @@ pub fn default_card_fields() -> Vec<CardFieldEntry> {
 
 #[cfg(test)]
 mod tests {
+    /// hub #3039: the pre-#3039 `custom_providers` list (plaintext keys
+    /// included) is written back exactly as loaded, so an older TUI reading
+    /// the same `state.json` loses nothing, while the daemon's provider list
+    /// is never persisted by this TUI.
+    #[test]
+    fn legacy_custom_providers_round_trip_verbatim_and_the_daemon_list_is_not_persisted() {
+        let legacy = serde_json::json!([{
+            "id": "3f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b",
+            "name": "Groq",
+            "base_url": "https://api.example.invalid/v1",
+            "api_key": "fake-legacy-key-3039",
+            "default_model": "llama-test"
+        }]);
+        let mut settings: UserSettings =
+            serde_json::from_value(serde_json::json!({"custom_providers": legacy})).unwrap();
+        assert!(settings.custom_providers.is_empty());
+        assert_eq!(settings.legacy_custom_providers.len(), 1);
+        settings.custom_providers.push(CustomProviderEntry {
+            id: Uuid::new_v4(),
+            name: "From the daemon".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            default_model: String::new(),
+            api_key_set: true,
+            api_key_fingerprint: Some("abc".into()),
+        });
+        let written = serde_json::to_value(&settings).unwrap();
+        assert_eq!(written["custom_providers"], legacy);
+    }
+
     use super::*;
 
     #[test]
@@ -2783,6 +3105,32 @@ mod tests {
         assert_eq!(restored.prompt_processor.model, "gemma4:e4b");
     }
 
+    #[test]
+    fn source_settlement_threshold_is_an_operator_cycle_and_tracks_custom_rpc_values() {
+        let mut entries = DaemonFeatureEntry::defaults();
+        let entry = entries
+            .iter()
+            .find(|v| v.field == "disk_pressure_min_free_gb")
+            .unwrap();
+        let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+            panic!("editable threshold");
+        };
+        assert_eq!(options[*current], "100");
+        assert!(options.iter().any(|v| v == "20"));
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({"disk_pressure_min_free_gb":17}),
+        );
+        let entry = entries
+            .iter()
+            .find(|v| v.field == "disk_pressure_min_free_gb")
+            .unwrap();
+        let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+            panic!("editable threshold");
+        };
+        assert_eq!(options[*current], "17");
+    }
+
     // RSI-022: DaemonFeatureEntry tests covering the new Cycle variant
     // and the Codex-sandbox entry plumbing.
 
@@ -2811,6 +3159,98 @@ mod tests {
                 assert_eq!(*current, 0);
             }
             other => panic!("expected Cycle, got {:?}", other),
+        }
+    }
+
+    /// #2760: the Codex config-isolation control is operator-editable from the
+    /// settings overlay (generic `Cycle` dispatch; presence in `defaults()` is
+    /// the contract).
+    #[test]
+    fn daemon_feature_defaults_has_codex_config_isolation_entry() {
+        let entries = DaemonFeatureEntry::defaults();
+        let entry = entries
+            .iter()
+            .find(|e| e.field == "codex_config_isolation")
+            .expect("codex_config_isolation entry must be present in defaults");
+        match &entry.value {
+            DaemonFeatureValue::Cycle { options, current } => {
+                assert_eq!(
+                    options.as_slice(),
+                    &[
+                        "off".to_string(),
+                        "user".to_string(),
+                        "rules".to_string(),
+                        "all".to_string(),
+                    ]
+                );
+                assert_eq!(*current, 0);
+            }
+            other => panic!("expected Cycle, got {:?}", other),
+        }
+    }
+
+    /// #2763: the four subagent-governance controls are operator-editable
+    /// from Settings > Provider Isolation: the models as free-text rows (the
+    /// daemon text editor), the caps as numeric choices starting at 0 = unset.
+    #[test]
+    fn daemon_feature_defaults_have_the_subagent_governance_entries() {
+        let entries = DaemonFeatureEntry::defaults();
+        for field in ["claude_subagent_model", "codex_subagent_model"] {
+            let entry = entries
+                .iter()
+                .find(|e| e.field == field)
+                .unwrap_or_else(|| panic!("{field} entry must be present in defaults"));
+            assert!(
+                matches!(&entry.value, DaemonFeatureValue::Display(text) if text.is_empty()),
+                "{field}: {:?}",
+                entry.value
+            );
+            assert!(
+                crate::overlay::daemon_text_field(field).is_some(),
+                "{field} opens the text editor"
+            );
+        }
+        for field in [
+            "claude_max_concurrent_subagents",
+            "codex_max_concurrent_subagents",
+        ] {
+            let entry = entries
+                .iter()
+                .find(|e| e.field == field)
+                .unwrap_or_else(|| panic!("{field} entry must be present in defaults"));
+            match &entry.value {
+                DaemonFeatureValue::Cycle { options, current } => {
+                    assert_eq!(options[0], "0");
+                    assert_eq!(*current, 0);
+                }
+                other => panic!("expected Cycle, got {other:?}"),
+            }
+        }
+        // The daemon's reported values land on the rows.
+        let mut entries = entries;
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({
+                "claude_subagent_model": "haiku",
+                "claude_max_concurrent_subagents": 5,
+            }),
+        );
+        let model = entries
+            .iter()
+            .find(|e| e.field == "claude_subagent_model")
+            .unwrap();
+        assert!(
+            matches!(&model.value, DaemonFeatureValue::Display(text) if text == "haiku"),
+            "{:?}",
+            model.value
+        );
+        let cap = entries
+            .iter()
+            .find(|e| e.field == "claude_max_concurrent_subagents")
+            .unwrap();
+        match &cap.value {
+            DaemonFeatureValue::Cycle { options, current } => assert_eq!(options[*current], "5"),
+            other => panic!("expected Cycle, got {other:?}"),
         }
     }
 
@@ -3068,7 +3508,7 @@ mod tests {
             .find(|entry| entry.field == "api_route.openrouter")
             .unwrap();
         assert!(
-            matches!(&route.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 0)
+            matches!(&route.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 1)
         );
         let bedrock = entries
             .iter()
@@ -3077,11 +3517,22 @@ mod tests {
         assert!(
             matches!(&bedrock.value, DaemonFeatureValue::Cycle { options, current } if options == &["codex_cli", "harness"] && *current == 0)
         );
-        let fallback = entries
+        let openrouter_fallback = entries
             .iter()
-            .find(|entry| entry.field == "api_route.fallback")
+            .find(|entry| entry.field == "api_route.fallback.openrouter")
             .unwrap();
-        assert!(matches!(&fallback.value, DaemonFeatureValue::Bool(true)));
+        assert!(matches!(
+            &openrouter_fallback.value,
+            DaemonFeatureValue::Bool(false)
+        ));
+        let bedrock_fallback = entries
+            .iter()
+            .find(|entry| entry.field == "api_route.fallback.bedrock")
+            .unwrap();
+        assert!(matches!(
+            &bedrock_fallback.value,
+            DaemonFeatureValue::Bool(true)
+        ));
         let mut entries = entries;
         DaemonFeatureEntry::update_from_json(
             &mut entries,
@@ -3122,7 +3573,7 @@ mod tests {
     }
 
     /// #1005: the coordinator context cap is an operator row that follows
-    /// the daemon value (default 0 = off until #1142; `0` off).
+    /// the daemon value (default 60 = 60% of the window; `0` off).
     #[test]
     #[allow(clippy::unwrap_used)]
     fn daemon_feature_defaults_expose_coordinator_context_cap() {
@@ -3136,8 +3587,8 @@ mod tests {
             other => panic!("cap row must be a cycle, got {other:?}"),
         };
         let mut entries = DaemonFeatureEntry::defaults();
-        assert_eq!(cap(&entries), "0");
-        for value in [200_000_u64, 0, 150_000] {
+        assert_eq!(cap(&entries), "60");
+        for value in [50_u64, 200_000, 0, 150_000] {
             DaemonFeatureEntry::update_from_json(
                 &mut entries,
                 &serde_json::json!({ "coordinator_context_cap_tokens": value }),
@@ -3938,6 +4389,7 @@ mod tests {
         for (field, expected_default) in [
             ("harness_web_access", "enabled"),
             ("harness_egress_mode", "deny_private"),
+            ("harness_web_search_backend", "auto"),
             ("harness_max_search_calls", "0"),
             ("harness_max_fetch_calls", "0"),
             ("harness_max_result_bytes", "0"),
@@ -3966,6 +4418,39 @@ mod tests {
             panic!("web access is a cycle");
         };
         assert_eq!(options, &["enabled", "hosted_only", "disabled"]);
+    }
+
+    /// #2315 / #2393: the SearXNG URL row is a text-edit row that shows the
+    /// daemon's value as typed, and "" while the daemon holds none (null).
+    #[test]
+    fn searxng_url_row_follows_the_daemon_value() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let shown = |features: &[DaemonFeatureEntry]| {
+            let feature = features
+                .iter()
+                .find(|feature| feature.field == "harness_searxng_url")
+                .expect("the SearXNG URL row is in the settings overlay");
+            let DaemonFeatureValue::Display(text) = &feature.value else {
+                panic!("the SearXNG URL row is a text-edit row");
+            };
+            text.clone()
+        };
+        assert_eq!(shown(&features), "");
+
+        for url in ["http://127.0.0.1:8888", "https://search.lan/searx"] {
+            DaemonFeatureEntry::update_from_json(
+                &mut features,
+                &serde_json::json!({ "harness_searxng_url": url }),
+            );
+            assert_eq!(shown(&features), url);
+        }
+
+        // The daemon clears it (null): the row is empty (the default) again.
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({ "harness_searxng_url": null }),
+        );
+        assert_eq!(shown(&features), "");
     }
 
     #[test]

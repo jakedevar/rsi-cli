@@ -24,24 +24,14 @@ pub fn encode_answer(provider: SessionProvider, response_text: &str) -> String {
     }
 }
 
-/// Typed code for a Claude `AskUserQuestion` that no human has answered.
-///
-/// The daemon runs Claude headless (`-p`, no TTY), so the CLI rejects the tool
-/// inside the turn with an error result that reads like a decline. The question
-/// is nevertheless recorded as pending and visible; the code marks both the
-/// transcript record and the agent-facing continuation text.
-pub const UNDELIVERABLE_CODE: &str = "ask_user_question_undeliverable";
-
-/// Agent-facing text for a continuation that arrives while the question is
-/// still unanswered: nobody can answer it here, so the agent decides.
-pub fn undeliverable_notice() -> String {
-    format!(
-        "[rsi:{UNDELIVERABLE_CODE}] Your AskUserQuestion was NOT declined by a human: the \
-         headless CLI auto-rejected it and no human has answered it here. Decide yourself \
-         and record the decision (and the assumption it rests on) in your handoff or commit \
-         message so the operator can review it."
-    )
-}
+// The daemon runs Claude headless (`-p`, no TTY), so the CLI rejects the tool
+// inside the turn with an error result that reads like a decline. The question
+// is nevertheless recorded as pending and visible; the code marks both the
+// transcript record and the agent-facing text. The text and code live in
+// `rsi_common` so the per-session `PreToolUse` hook (hub #1161) hands the model
+// the same notice in the same turn; a continuation that arrives while the
+// question is still unanswered repeats it (the fallback if the hook failed).
+pub use rsi_common::ask_user_question_notice::{UNDELIVERABLE_CODE, undeliverable_notice};
 
 /// Prefix `query` with the typed no-human-answer notice when the session still
 /// holds an unanswered question. `answer_question` clears the pending question

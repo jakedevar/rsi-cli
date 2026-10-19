@@ -450,6 +450,7 @@ async fn stage_and_integration_keep_the_archived_source_refusal() {
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "paths-stage",
             ),

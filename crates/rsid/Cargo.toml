@@ -15,6 +15,10 @@ name = "rsi-rolling-land"
 path = "src/bin/rsi-rolling-land.rs"
 
 [[bin]]
+name = "rsi-db-snapshot"
+path = "src/bin/rsi-db-snapshot.rs"
+
+[[bin]]
 name = "rsi-build-rustc"
 path = "src/bin/rsi-build-rustc.rs"
 
@@ -23,10 +27,20 @@ name = "rsi-recursive-dag-smoke-fixture"
 path = "src/bin/rsi-recursive-dag-smoke-fixture.rs"
 required-features = ["dev-fixtures"]
 
+# Test-only seeder for an isolated rsid state directory (local #122). Not built by default or in a
+# release: it needs the `e2e-seed` feature, which `build.rs` refuses in the release profile.
+[[bin]]
+name = "rsi-e2e-seed"
+path = "src/bin/rsi-e2e-seed.rs"
+required-features = ["e2e-seed"]
+
+
 [dependencies]
 rsi-common = { path = "../rsi-common" }
 rsid-core = { path = "../rsid-core" }
 rsid-store = { path = "../rsid-store" }
+rsid-remote-read = { path = "../rsid-remote-read" }
+rsid-harness = { path = "../rsid-harness" }
 rsi-graph = { path = "../rsi-graph" }
 rsi-codegraph = { path = "../rsi-codegraph" }
 rsi-remote = { path = "../rsi-remote" }
@@ -58,6 +72,10 @@ sha2 = "0.10"
 zeroize = "1"
 hex = "0.4"
 walkdir = "2"
+# #2254: gitignore-aware walking and glob matching for the native `grep`,
+# `glob` and `list_files` tools.
+ignore = { workspace = true }
+globset = "0.4"
 notify = "7"
 unicode-normalization = { workspace = true }
 serde_yaml_ng = { workspace = true }
@@ -71,15 +89,22 @@ base64 = { workspace = true }
 image = { workspace = true }
 tempfile = "3"
 similar = "2.7"
+# #2250: HTML to Markdown for the native `web_fetch` tool (Apache-2.0).
+htmd = "0.5"
 rmcp = { version = "=3.5.0", default-features = false, features = ["client", "transport-child-process"] }
+# hub #3143-#3151: project-file writes resolve and act through directory
+# handles of the root (capability-style), never through absolute pathnames.
+cap-std = "4"
 
 # Optional: heap profiling (Phase 0.4) — enabled via `dhat-heap` feature
 dhat = { version = "0.3", optional = true }
 # Optional: tokio-console subscriber (Phase 0.6) — enabled via `tokio-console` feature
 console-subscriber = { version = "0.4", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true }
+# `fs` (hub #3143-#3151): handle-relative no-follow opens, identity stats and
+# the no-replace rename (renameat2 / renameatx_np) of the project-file writes.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
 
 [build-dependencies]
 cc = "1"
@@ -99,6 +124,10 @@ rsid = { path = ".", features = ["test-seam"] }
 default = []
 test-ollama = []
 dev-fixtures = ["rusqlite/backup"]
+# Local #122: compiles the `rsi-e2e-seed` binary, which writes a finished session into an ISOLATED
+# state directory through the real Store API. Never in a release (build.rs refuses it; so does
+# scripts/check-release-seam.sh). It adds no code to the daemon: only a separate binary.
+e2e-seed = []
 # Test seam (#393): lets integration tests inject a hermetic /proc inventory
 # for the public archive-cleanup blocking workers. It exists only in test
 # builds (enabled through the self dev-dependency below); no RPC, agent verb,

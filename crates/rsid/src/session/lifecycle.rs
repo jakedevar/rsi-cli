@@ -20,6 +20,7 @@ use crate::store::manager_actions::fence::{
     CONTINUATION_TARGET_BUSY, CONTINUATION_TIP_CHANGED, ContinuationAuthorityV1,
     ContinuationFenceV1,
 };
+use chrono::Utc;
 use rsi_common::agent_coordination::{
     AgentContinuationCursorV1, AgentContinueChildResultV1, AgentContinueErrorCodeV1,
     AgentContinueRelaunchV1,
@@ -27,8 +28,9 @@ use rsi_common::agent_coordination::{
 use rsi_common::archive_cleanup::ArchiveSessionResultV1;
 use rsi_common::model_control::{InvocationOwner, ModelUsageConfidence};
 use rsi_common::types::{
-    ContextUsageConfidence, ConversationEvent, EventType, ReserveIdeaControllerRequestV1, Role,
-    SandboxKind, Session, SessionKind, SessionProvider, SessionStatus, WorkflowStage,
+    ContextUsageConfidence, ConversationEvent, EventType, Recurrence,
+    ReserveIdeaControllerRequestV1, Role, SandboxCleanupState, SandboxKind, ScheduleSpec,
+    ScheduledJob, Session, SessionKind, SessionProvider, SessionStatus, WakeMode, WorkflowStage,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +41,13 @@ use uuid::Uuid;
 pub(crate) use crate::store_support::manager_gates::{
     check_manager_notice_program_gate, manager_notice_deferred, resumable_provider_session_id,
 };
+
+/// #2528: the longest shutdown waits for model-call settlement producers to
+/// quiesce before it records the unsettled invocations for the next boot and
+/// exits. Settlement never finishes a turn the draining daemon refuses to serve,
+/// so an unbounded wait is a self-deadlock.
+pub(crate) const MODEL_CALL_SETTLEMENT_SHUTDOWN_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(120);
 
 /// The stop reason of a session whose valid handoff a later tool call
 /// superseded (#97); its Failed finalization is andon friction (#1333).
@@ -216,6 +225,9 @@ pub enum ContinuationPauseSeam {
     /// before the fence capture (review round 2
     /// `agent_continue_lead_authority_race`).
     AgentContinueAuthorized,
+    /// The resumable entry has left `completed`; the session is in neither
+    /// runtime map until the continuation publishes it or rolls back (#265).
+    AfterCompletedTaken,
 }
 
 #[cfg(test)]
@@ -361,11 +373,19 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::
 /// proves the provider did nothing to replay. Fail closed: the only events that
 /// are not effects are daemon System events and user messages (the query and
 /// any earlier heal's re-sent query); assistant output, tool calls and results,
-/// thinking, plans, compressed or gate events all count (#1082).
+/// thinking, plans, compressed or gate events all count (#1082). A provider
+/// diagnostic is the daemon's record of the provider's failure, not model
+/// output: Codex stores its capacity failure as two Assistant messages marked
+/// `provider_diagnostic`, which must not turn a first-turn failure into
+/// replayable work (#2109).
 pub(crate) fn heal_bootstrap_events_have_no_effect(events: &[ConversationEvent]) -> bool {
     events.iter().all(|event| {
         event.event_type == EventType::System
             || (event.event_type == EventType::Message && event.role == Some(Role::User))
+            || (event.event_type == EventType::Message
+                && rsi_common::agent_session_events::is_provider_diagnostic_metadata(
+                    event.metadata.as_deref(),
+                ))
     })
 }
 
@@ -525,6 +545,38 @@ fn install_continue_model_effort_config_observation_for_test(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(continue_custody_test_key(session_id, initial_sequence));
+}
+
+#[cfg(test)]
+static CONTINUE_PARENT_LOOKUP_FAILURE_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+fn install_continue_parent_lookup_failure_for_test(session_id: Uuid, initial_sequence: i32) {
+    CONTINUE_PARENT_LOOKUP_FAILURE_KEYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(continue_custody_test_key(session_id, initial_sequence));
+}
+
+/// Deterministic Store read failure for the Continue parent lookup (#2875).
+#[cfg(test)]
+fn apply_continue_parent_lookup_failure_for_test(
+    session: &Session,
+    initial_sequence: i32,
+) -> Result<()> {
+    let key = continue_custody_test_key(session.id, initial_sequence);
+    if CONTINUE_PARENT_LOOKUP_FAILURE_KEYS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key)
+    {
+        return Err(DaemonError::Store(
+            "injected parent lookup failure".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -751,8 +803,6 @@ fn cleanup_policy_denied(reason: CleanupBlockedReason) -> DaemonError {
         CleanupBlockedReason::UnreadableWorktree => {
             "sandbox ownership or worktree data could not be read"
         }
-        #[cfg(test)]
-        _ => reason.as_str(),
     };
     let stable_reason = if matches!(
         reason,
@@ -826,6 +876,7 @@ fn effective_provider_replacement_config(source: &Session, query: String) -> Lau
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     }
 }
 
@@ -875,6 +926,17 @@ pub(super) async fn classify_cleanup_candidate_runtime(
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
 ) -> CleanupDecision {
+    if let CleanupCandidate::Row(row) = &candidate {
+        match store
+            .lock()
+            .await
+            .session_or_custody_has_settlement_fence(row.session_id)
+        {
+            Ok(true) => return CleanupDecision::Blocked(CleanupBlockedReason::ConcurrentDrift),
+            Err(_) => return CleanupDecision::Blocked(CleanupBlockedReason::OwnershipReadFailure),
+            Ok(false) => {}
+        }
+    }
     let ownership_key = match &candidate {
         CleanupCandidate::Row(row) => Some((row.session_id, row.root.clone())),
         _ => None,
@@ -969,6 +1031,7 @@ pub(super) async fn interrupt_in_maps(
 /// use this before retry suppression so an active→completed transition that
 /// races the call is revalidated by the durable pending-retry path instead of
 /// consuming a newly armed timer without recording user intent.
+#[cfg(test)]
 pub(super) async fn interrupt_active_in_maps(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     session_id: Uuid,
@@ -1076,6 +1139,61 @@ pub(super) async fn suppress_pending_retry_in_maps(
     completed_session.retry_fired_at = None;
     exhaust_retry_budget(&mut completed_session.session);
     Ok(Some(max_retries))
+}
+
+/// One active session as the DRAIN wait reads it: its state at the instant of
+/// the read (#2387).
+struct DrainEntry {
+    id: Uuid,
+    provider: SessionProvider,
+    status: SessionStatus,
+    state: DrainState,
+}
+
+/// What an active session is doing, for the DRAIN wait (#2353).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainState {
+    WaitingForOperator,
+    /// Its only open work is a call the daemon is serving.
+    WaitingOnDaemon,
+    /// A worker the restarting `interrupt_workers` deploy named as interrupted
+    /// (#2371): the deploy already accepted cutting its turn, so the wait for
+    /// it cannot save the turn, only delay the restart.
+    DeployInterrupted,
+    FinishingCurrentTurn,
+}
+
+impl DrainState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForOperator => "waiting_for_operator",
+            Self::WaitingOnDaemon => "waiting_on_daemon",
+            Self::DeployInterrupted => "deploy_interrupted",
+            Self::FinishingCurrentTurn => "finishing_current_turn",
+        }
+    }
+
+    /// Whether the DRAIN wait still has to wait for a session in this state.
+    const fn blocks_drain(self) -> bool {
+        !matches!(self, Self::WaitingOnDaemon | Self::DeployInterrupted)
+    }
+}
+
+/// The outcome of one operator DRAIN wait poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorDrainDecision {
+    Wait,
+    Complete {
+        /// Sessions still active, every kind counted (the logged `active_count`).
+        active_count: usize,
+        /// Of those, the sessions waiting only on the daemon.
+        daemon_waiting: usize,
+        /// Of those, the workers the restarting deploy named as interrupted
+        /// (#2371); they do not hold the wait.
+        deploy_interrupted: usize,
+        /// The wait ended because its limit elapsed with sessions still active.
+        limit_reached: bool,
+    },
 }
 
 impl SessionManager {
@@ -1298,6 +1416,7 @@ impl SessionManager {
                     tracked.session.stop_reason.as_deref(),
                     c5_failure_cause.map(crate::store::daemon_settings::AutofileCause::as_str),
                     tracked.interrupt_source,
+                    tracked.interrupt_evidence,
                     pending_archive,
                 ) {
                     tracked.session.stop_reason = Some(cause);
@@ -1350,6 +1469,9 @@ impl SessionManager {
                         retry_fired_at: None,
                         superseded_by_retry: None,
                         events_hydrated: true,
+                        store_writes: super::types::CompletedStoreWrites::from_fields(
+                            tracked.store_fields,
+                        ),
                     }),
                     pending_archive,
                     c5_failure_cause,
@@ -1457,6 +1579,15 @@ impl SessionManager {
                     crate::friction::handoff_friction_event(sid, &completed_session.events)
             {
                 Box::pin(crate::friction::note(&store, event)).await;
+            }
+            // #1861: a manager seat that ended its turn asking in chat.
+            if durable_terminal && status == SessionStatus::Completed {
+                Box::pin(super::manager_question_stall::guard_completed_manager(
+                    &store,
+                    &completed_session.session,
+                    &completed_session.events,
+                ))
+                .await;
             }
             if durable_terminal
                 && status == SessionStatus::Failed
@@ -1601,6 +1732,7 @@ impl SessionManager {
                     title_forced_role,
                 );
                 let persistence_for_title = persistence.clone();
+                let active_for_title = active.clone();
                 let completed_for_title = completed.clone();
                 let store_for_title = store.clone();
                 let ollama_model = runtime_config.title_model_local.read().clone();
@@ -1629,6 +1761,9 @@ impl SessionManager {
                             // absent title but must never replace an explicit one.
                             // The durable row is the arbiter, so advance the
                             // projection only when the store accepted the fill.
+                            // #257: the fill answers with the `updated_at` it
+                            // stamped, mirrored into the completed entry with
+                            // the title so a late refinement is not custody drift.
                             let filled = match persistence_for_title
                                 .fill_session_title_if_absent(session_id, result.title.clone())
                                 .await
@@ -1636,15 +1771,19 @@ impl SessionManager {
                                 Ok(filled) => filled,
                                 Err(e) => {
                                     tracing::warn!(error = %e, session_id = %session_id, "Failed to persist refined title");
-                                    false
+                                    None
                                 }
                             };
-                            if filled {
-                                if let Some(cs) =
-                                    completed_for_title.write().await.get_mut(&session_id)
-                                {
-                                    cs.session.title = Some(result.title.clone());
-                                }
+                            if filled.is_some() {
+                                super::cohort_settlement::apply_store_write(
+                                    &active_for_title,
+                                    &completed_for_title,
+                                    session_id,
+                                    super::types::CompletedStoreField::Title,
+                                    filled,
+                                    |session| session.title = Some(result.title.clone()),
+                                )
+                                .await;
                             }
                             // #1390: a succession queued while the title was
                             // generating refuses the title fill above; leave
@@ -1656,17 +1795,28 @@ impl SessionManager {
                                 )
                                 .await
                             {
-                                if let Some(cs) =
-                                    completed_for_title.write().await.get_mut(&session_id)
-                                {
-                                    cs.session.description = Some(result.description.clone());
-                                }
-                                if let Err(e) = persistence_for_title
-                                    .update_session_description(session_id, result.description)
+                                let stamp = match persistence_for_title
+                                    .update_session_description(
+                                        session_id,
+                                        result.description.clone(),
+                                    )
                                     .await
                                 {
-                                    tracing::warn!(error = %e, session_id = %session_id, "Failed to persist refined description");
-                                }
+                                    Ok(stamp) => stamp,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, session_id = %session_id, "Failed to persist refined description");
+                                        None
+                                    }
+                                };
+                                super::cohort_settlement::apply_store_write(
+                                    &active_for_title,
+                                    &completed_for_title,
+                                    session_id,
+                                    super::types::CompletedStoreField::Description,
+                                    stamp,
+                                    |session| session.description = Some(result.description),
+                                )
+                                .await;
                             }
                         }
                         Err(e) => {
@@ -1701,10 +1851,16 @@ impl SessionManager {
                 None
             };
 
-            completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            // #265: a mirrored metadata write (a rename, the refinement
+            // spawned above) that committed while the session was in neither
+            // map is read from the Store here, never published stale.
+            super::cohort_settlement::publish_completed_from_store(
+                &completed,
+                &store,
+                session_id,
+                completed_session,
+            )
+            .await;
 
             // A continuation waiting on this event removes the resumable
             // source from `completed` immediately.  Publishing before the
@@ -2472,12 +2628,27 @@ impl SessionManager {
         }
         drop(completed);
 
-        let store = self.store.lock().await;
+        let store =
+            crate::store_lock::lock(&self.store, "lifecycle::check_manager_notice_resume").await;
         let persisted = store
             .get_session(target)?
             .ok_or_else(manager_notice_scope_revoked)?;
         if persisted.status != SessionStatus::Completed || persisted.pending_archive {
             return Err(manager_notice_deferred());
+        }
+        // #2296: a manager almost always has a one-shot resume wake parked
+        // (its safety wake, a `when` wait). That owner used to defer EVERY
+        // notice resume, so an actionable satellite report, failed action
+        // result or operator answer sat unread until the owner fired (1-3 h).
+        // A notice that justifies a wake (not `ROUTINE_NOTICE_PREDICATE`, #1675
+        // /#2322) is delivered anyway: the owner stays enabled and fires on its
+        // own schedule. Routine-only deliveries keep deferring to it.
+        let mut wake_worthy = false;
+        for &job_id in job_ids {
+            if store.manager_notice_undelivered_wake_count(job_id)? > 0 {
+                wake_worthy = true;
+                break;
+            }
         }
         // Read the raw question marker too: Session hydration deliberately
         // tolerates malformed JSON, which must not erase a human gate here.
@@ -2485,11 +2656,11 @@ impl SessionManager {
             "SELECT pending_question_json IS NOT NULL
                  OR EXISTS(SELECT 1 FROM approvals WHERE session_id=?1 AND status='Pending')
                  OR EXISTS(SELECT 1 FROM daemon_settings WHERE key=?2)
-                 OR EXISTS(SELECT 1 FROM scheduled_jobs
+                 OR (?4=0 AND EXISTS(SELECT 1 FROM scheduled_jobs
                            WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1 AND id<>?3
                              AND CASE WHEN json_valid(schedule_json)
                                  THEN json_extract(schedule_json,'$.recurrence.type')='Once'
-                                 ELSE 1 END)
+                                 ELSE 1 END))
                  OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents
                            WHERE state='open' AND controller_session_id=?1)
                  OR EXISTS(SELECT 1 FROM master_no_idle_capacity_incidents AS incident
@@ -2502,6 +2673,7 @@ impl SessionManager {
                 crate::store::daemon_settings::c5_autofile_pending_key(target),
                 super::harness::tools::schedule_wake::deterministic_program_guard_job_id(target)
                     .to_string(),
+                i64::from(wake_worthy),
             ],
             |row| row.get(0),
         )?;
@@ -2685,6 +2857,23 @@ impl SessionManager {
         Err(DaemonError::PolicyDenied(reason))
     }
 
+    /// Put back a completed entry a continuation took, when it fails or
+    /// hands the session to a replacement launch, reconciled from the Store
+    /// (#265, hub #2819): a mirrored write that committed while the session
+    /// was in neither map is read back, never dropped.
+    fn restore_completed_from_store(
+        &self,
+        session_id: Uuid,
+        entry: CompletedSession,
+    ) -> super::cohort_settlement::Publication<'_> {
+        super::cohort_settlement::publish_completed_from_store(
+            &self.completed,
+            &self.store,
+            session_id,
+            entry,
+        )
+    }
+
     async fn continue_session_fenced_inner(
         &self,
         session_id: Uuid,
@@ -2697,9 +2886,7 @@ impl SessionManager {
             .restart_draining
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(DaemonError::PolicyDenied(
-                "daemon restart drain is in progress".into(),
-            ));
+            return Err(crate::deploy_drain::restart_drain_error());
         }
         self.fence_prior_detached_turn(session_id).await?;
         // #1073: an automated continuation of a child session starts a worker
@@ -2831,6 +3018,10 @@ impl SessionManager {
         #[cfg(test)]
         pause_continuation_before_guard_for_test(session_id).await;
         let spawn_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+        // #2384: a cold session's rows come back under this guard before any
+        // check, fence or hydration reads them (the guard is the proof the
+        // restore needs; `ensure_session_hot` never acquires it).
+        self.ensure_session_hot(&spawn_guard, session_id).await?;
         if let Some(child) = agent_child.as_ref() {
             let existing = self
                 .store
@@ -2895,13 +3086,29 @@ impl SessionManager {
         pause_continuation_seam_for_test(ContinuationPauseSeam::AfterFenceCheck, session_id).await;
         let cwd_admission_guard =
             super::spawn_single_flight::acquire_provider_cwd_admission().await;
+        #[cfg(test)]
+        super::launch::pause_controller_candidate_test(
+            session_id,
+            super::launch::ControllerCandidateTestPhase::BeforeTreeAdmission,
+        )
+        .await;
+        let tree_admission_guard = Box::pin(super::tree_admission::session_writer_admission(
+            &self.store,
+            &self.active,
+            session_id,
+        ))
+        .await?;
+        #[cfg(test)]
+        super::launch::pause_controller_candidate_test(
+            session_id,
+            super::launch::ControllerCandidateTestPhase::TreeAdmissionHeld,
+        )
+        .await;
         if self
             .restart_draining
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(DaemonError::PolicyDenied(
-                "daemon restart drain is in progress".into(),
-            ));
+            return Err(crate::deploy_drain::restart_drain_error());
         }
         if operator_intent
             && self
@@ -3127,6 +3334,10 @@ impl SessionManager {
             }
         };
 
+        #[cfg(test)]
+        pause_continuation_seam_for_test(ContinuationPauseSeam::AfterCompletedTaken, session_id)
+            .await;
+
         // C7 Phase 1: a restored session may still carry the hydration
         // placeholder (`events_hydrated == false`, `events` empty) -- see
         // `SessionManager::restore_sessions`. Below, `completed_session.events`
@@ -3135,10 +3346,8 @@ impl SessionManager {
         // unhydrated placeholder here would silently truncate the resumed
         // session's history to nothing. Hydrate before any of that.
         if let Err(e) = self.hydrate_completed_events(&mut completed_session).await {
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             return Err(e);
         }
 
@@ -3190,10 +3399,8 @@ impl SessionManager {
                 | SessionStatus::Failed
                 | SessionStatus::WaitingApproval
         ) {
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             return Err(DaemonError::Rpc(format!(
                 "Session {} cannot be continued (status: {:?})",
                 session_id, current_status
@@ -3233,17 +3440,13 @@ impl SessionManager {
                 Err(error) => Err(error),
             };
             if let Err(error) = source_authorization {
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
             let replacement_source = completed_session.session.clone();
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             // The replacement path may spawn a new CLI child. Fence its
             // provider effect before handing control to that launch path.
             if let Some(id) = operator_message_id {
@@ -3253,6 +3456,7 @@ impl SessionManager {
                     .mark_operator_message_effect_possible(id)?;
             }
             tier_delivery.effect_possible = true;
+            drop(tree_admission_guard);
             Box::pin(self.launch_effective_provider_replacement(
                 replacement_source,
                 query,
@@ -3262,11 +3466,13 @@ impl SessionManager {
             return Ok(ContinueSessionOutcome::Started);
         }
 
-        let initial_sequence = completed_session
-            .events
-            .last()
-            .map(|event| event.sequence + 1)
-            .unwrap_or(0);
+        // #62: number after every stored row, not only the cached ones.
+        let initial_sequence = super::queries::next_transcript_sequence(
+            &self.store,
+            session_id,
+            &completed_session.events,
+        )
+        .await;
 
         // An operator Continue of a session whose own sandbox custody went
         // terminal (quarantined/failed/purged) without passing to a successor
@@ -3288,10 +3494,8 @@ impl SessionManager {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -3306,30 +3510,36 @@ impl SessionManager {
                 CustodyService::authorize_ordinary(&completed_session.session)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                // Store first, stripe without blocking the Store (#1166).
-                let (mut store, root) =
-                    crate::store::custody_lock_order::lock_store_then_session_root(
-                        &self.store,
-                        completed_session.session.id,
-                    )
-                    .await;
-                CustodyService::authorize_live_holding(
-                    &completed_session.session,
-                    &mut store,
-                    self.sandbox_allocator.base_dir(),
-                    rsi_common::types::SandboxCustodyTransitionV1::Continue,
-                    root,
+                // Bound both Store and stripe acquisition before begin_effect
+                // (#1162), releasing Store while the stripe remains busy.
+                match crate::store::custody_lock_order::lock_store_then_session_root_within(
+                    &self.store,
+                    completed_session.session.id,
+                    crate::store::custody_lock_order::admission_wait(),
                 )
+                .await
+                {
+                    Some((mut store, root)) => CustodyService::authorize_live_holding(
+                        &completed_session.session,
+                        &mut store,
+                        self.sandbox_allocator.base_dir(),
+                        rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                        root,
+                    ),
+                    None => Err(CustodyService::refusal(
+                        rsi_common::types::SandboxCustodyErrorCodeV1::RootBusy,
+                        Some(completed_session.session.id),
+                        rsi_common::types::SandboxCustodyTransitionV1::Continue,
+                    )),
+                }
             }
             Err(error) => Err(error),
         };
         let prepared_launch = match custody {
             Ok(custody) => PreparedLaunch::new(custody),
             Err(error) => {
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         };
@@ -3339,10 +3549,8 @@ impl SessionManager {
         if rotate_codex_thread && let Some(thread_id) = resumable_id.as_deref() {
             if let Err(error) = crate::codex::validate_codex_resume_tool_history(thread_id) {
                 if !matches!(error, DaemonError::CodexResumeTornTail) {
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
                 // This path already starts a new provider thread with an
@@ -3420,10 +3628,8 @@ impl SessionManager {
             None if fresh_relaunch || rotate_codex_thread || heal_bootstrap => (None, None),
             None => {
                 let error = unavailable_resume_error(completed_session.session.provider);
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         };
@@ -3459,10 +3665,8 @@ impl SessionManager {
             }
             Ok(None) => {}
             Err(error) => {
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -3474,10 +3678,8 @@ impl SessionManager {
             &completed_session.session,
             initial_sequence,
         ) {
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             return Err(error);
         }
 
@@ -3498,10 +3700,8 @@ impl SessionManager {
         {
             Ok(permit) => permit,
             Err(error) => {
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         };
@@ -3516,10 +3716,8 @@ impl SessionManager {
                 Ok(Some(task)) => task,
                 Ok(None) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(crate::error::agent_continue_error(
                         AgentContinueErrorCodeV1::ResumeUnavailableTaskUnresolved,
                         None,
@@ -3528,10 +3726,8 @@ impl SessionManager {
                 }
                 Err(error) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             };
@@ -3554,10 +3750,8 @@ impl SessionManager {
                 Ok(InsertRelaunchIntent::Inserted) => {}
                 Ok(InsertRelaunchIntent::TipInProgress) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(crate::error::agent_continue_error(
                         AgentContinueErrorCodeV1::RelaunchInProgress,
                         None,
@@ -3566,10 +3760,8 @@ impl SessionManager {
                 }
                 Ok(InsertRelaunchIntent::Existing(row)) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     let row = if row.state == RelaunchState::Intent {
                         self.recover_agent_child_relaunch(&row).await?
                     } else {
@@ -3579,10 +3771,8 @@ impl SessionManager {
                 }
                 Err(error) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -3594,22 +3784,33 @@ impl SessionManager {
             initial_sequence,
         ) {
             drop(context_permit);
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             return Err(error);
         }
         let build_worker = match completed_session.session.parent_id {
             Some(parent_id) => {
-                let parent = match self.store.lock().await.get_session(parent_id) {
+                // Release the Store guard before any rollback: the rollback
+                // re-reads the Store and the mutex is not reentrant (#2875).
+                let parent_lookup = {
+                    let store = self.store.lock().await;
+                    #[cfg(test)]
+                    let injected = apply_continue_parent_lookup_failure_for_test(
+                        &completed_session.session,
+                        initial_sequence,
+                    );
+                    #[cfg(not(test))]
+                    let injected = Ok(());
+                    let lookup = injected.and_then(|()| store.get_session(parent_id));
+                    drop(store);
+                    lookup
+                };
+                let parent = match parent_lookup {
                     Ok(parent) => parent,
                     Err(error) => {
                         drop(context_permit);
-                        self.completed
-                            .write()
-                            .await
-                            .insert(session_id, completed_session);
+                        self.restore_completed_from_store(session_id, completed_session)
+                            .await;
                         return Err(error);
                     }
                 };
@@ -3628,13 +3829,14 @@ impl SessionManager {
                     .map(|scratch| scratch.with_build_env(&self.runtime_config, build_worker)),
                 Err(error) => {
                     drop(context_permit);
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             };
+        if let Some(scratch) = &execution_scratch {
+            scratch.seed_target_from_pool().await;
+        }
 
         if let Err(error) = crate::provider_capabilities::refresh_installed_catalog_for_provider(
             completed_session.session.provider,
@@ -3671,20 +3873,16 @@ impl SessionManager {
             Ok(true) => install_context_budget(&mut completed_session.session, next_budget),
             Ok(false) => {
                 drop(context_permit);
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(DaemonError::Store(
                     "session context budget changed while continue was preparing".into(),
                 ));
             }
             Err(error) => {
                 drop(context_permit);
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -3748,7 +3946,7 @@ impl SessionManager {
         };
         let system_prompt = super::preamble::prepend_sandbox_custody_instruction(
             system_prompt,
-            super::preamble::sandbox_custody_instruction_for_session(&completed_session.session),
+            super::preamble::standing_instruction_for_session(&completed_session.session),
         );
         let system_prompt = if rotate_codex_thread {
             let recovery_context =
@@ -3782,7 +3980,8 @@ impl SessionManager {
             .lock()
             .await
             .remove_controller_grant_v1(session_id);
-        let session_token = self.remint_session_token(session_id).await;
+        let (session_token, session_binding) =
+            super::remint_agent_token_with_witness(&self.agent_tokens, session_id).await;
 
         let mut config = LaunchConfig {
             completion_gates: None,
@@ -3861,6 +4060,7 @@ impl SessionManager {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         };
         config.completion_gates = super::completion_gates_launch::resolve_launch_completion_gates(
             &self.store,
@@ -3927,10 +4127,8 @@ impl SessionManager {
                 Ok(reaped) => reaped,
                 Err(error) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             };
@@ -4043,10 +4241,8 @@ impl SessionManager {
         #[cfg(test)]
         if take_continue_admission_failure_for_test(session_id) {
             self.revoke_agent_token_for_session(session_id).await;
-            self.completed
-                .write()
-                .await
-                .insert(session_id, completed_session);
+            self.restore_completed_from_store(session_id, completed_session)
+                .await;
             return Err(DaemonError::PolicyDenied(
                 "injected model admission refusal".into(),
             ));
@@ -4072,20 +4268,16 @@ impl SessionManager {
                     phase: crate::store::capacity_recovery::CapacityDeliveryPhase::LaunchConfirmed,
                 }) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Ok(ContinueSessionOutcome::CapacityAlreadyLaunchConfirmed(
                         invocation_id,
                     ));
                 }
                 Err(error) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -4094,10 +4286,8 @@ impl SessionManager {
                 Ok(AdmissionDecision::Admitted(permit)) => (permit, false),
                 Ok(AdmissionDecision::Duplicate { invocation_id }) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     if fresh_relaunch {
                         let child = agent_child.as_ref().expect("fresh relaunch intent");
                         let store = self.store.lock().await;
@@ -4113,10 +4303,8 @@ impl SessionManager {
                 }
                 Err(error) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     if fresh_relaunch {
                         let child = agent_child.as_ref().expect("fresh relaunch intent");
                         let receipt = serde_json::json!({"request_id":child.row.request_id,"reason":"admission_refused"}).to_string();
@@ -4141,10 +4329,8 @@ impl SessionManager {
             );
             if let Err(error) = bind_result {
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -4168,10 +4354,8 @@ impl SessionManager {
                 )
                 .await;
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -4187,10 +4371,8 @@ impl SessionManager {
                 session_id,
             ) {
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(DaemonError::Process(
                     "injected failure after capacity admission before provider spawn".into(),
                 ));
@@ -4294,10 +4476,8 @@ impl SessionManager {
                 Ok(reaped) => reaped,
                 Err(error) => {
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             };
@@ -4332,10 +4512,8 @@ impl SessionManager {
                 )
                 .await;
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -4363,10 +4541,8 @@ impl SessionManager {
                     )
                     .await;
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -4394,10 +4570,8 @@ impl SessionManager {
                 )
                 .await;
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -4415,10 +4589,8 @@ impl SessionManager {
                 )
                 .await;
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(error);
             }
         }
@@ -4448,10 +4620,8 @@ impl SessionManager {
                     )
                     .await;
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -4491,10 +4661,8 @@ impl SessionManager {
                     )
                     .await;
                     self.revoke_agent_token_for_session(session_id).await;
-                    self.completed
-                        .write()
-                        .await
-                        .insert(session_id, completed_session);
+                    self.restore_completed_from_store(session_id, completed_session)
+                        .await;
                     return Err(error);
                 }
             }
@@ -4549,19 +4717,22 @@ impl SessionManager {
                         tracing::warn!(error = %release, "topology answer claim not released");
                     }
                 }
-                let safe_error_class = if matches!(&e, DaemonError::CodexResumeTornTail) {
-                    "codex_resume_rollout_torn_tail"
+                let preflight_cause = super::provider_spawn::openrouter_preflight_cause(&e);
+                let safe_error_class = if let Some(cause) = preflight_cause {
+                    crate::error::openrouter_preflight_code(cause)
+                } else if matches!(&e, DaemonError::CodexResumeTornTail) {
+                    "codex_resume_rollout_torn_tail".to_string()
                 } else if matches!(&e, DaemonError::CodexResumeToolHistory(_)) {
-                    "codex_resume_tool_history_invalid"
+                    "codex_resume_tool_history_invalid".to_string()
                 } else {
-                    "spawn_failed"
+                    "spawn_failed".to_string()
                 };
                 if capacity_delivery.is_none() {
                     if let Err(settle_error) = complete_invocation(
                         &self.store,
                         &admission_permit,
                         InvocationCompletion {
-                            error_class: Some(safe_error_class.to_string()),
+                            error_class: Some(safe_error_class),
                             confidence: Some(ModelUsageConfidence::Unavailable),
                             ..InvocationCompletion::default()
                         },
@@ -4577,10 +4748,19 @@ impl SessionManager {
                     }
                 }
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                // #3141: a continuation the OpenRouter Harness preflight refused
+                // ends the session Failed, naming the cause, with a System row.
+                if let Some(cause) = preflight_cause {
+                    super::provider_spawn::fail_completed_session_for_route_preflight(
+                        &self.persistence,
+                        &self.store,
+                        &mut completed_session,
+                        cause,
+                    )
+                    .await;
+                }
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 if fresh_relaunch {
                     let child = agent_child.as_ref().expect("fresh relaunch intent");
                     let receipt = serde_json::json!({"request_id":child.row.request_id,"reason":"spawn_failed","invocation_id":admission_permit.invocation_id()}).to_string();
@@ -4702,10 +4882,8 @@ impl SessionManager {
                 })
                 .and_then(|result| result);
                 self.revoke_agent_token_for_session(session_id).await;
-                self.completed
-                    .write()
-                    .await
-                    .insert(session_id, completed_session);
+                self.restore_completed_from_store(session_id, completed_session)
+                    .await;
                 return Err(DaemonError::Store(format!(
                     "capacity launch confirmation failed after provider spawn: {error}; kill={kill_result:?}; checked_reap={reap_result:?}"
                 )));
@@ -4796,6 +4974,7 @@ impl SessionManager {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
+            interrupt_evidence: Default::default(),
             rotation,
             live_input_tokens: if is_codex { 0 } else { live_input },
             live_output_tokens: if is_codex { 0 } else { live_output },
@@ -4825,18 +5004,28 @@ impl SessionManager {
             work_time_base_ms: 0,
             received_meaningful_output: false,
             exit_code: None,
-            retry_attempt: 0,
             max_retries: 0,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
+            turn_tools: Default::default(),
             last_usage_update: None,
             last_mismatch_warn: None,
             last_classified_at: None,
             classification_count: 0,
             last_verdict: None,
+            store_fields: completed_session.store_writes.fields,
         };
 
-        self.active.write().await.insert(session_id, tracked);
+        // #265 (hub #2819): a mirrored metadata write (a parent move, a
+        // rename) that committed while the session was in neither map is
+        // read from the Store here, never published stale.
+        super::cohort_settlement::publish_active_from_store(
+            &self.active,
+            &self.store,
+            session_id,
+            tracked,
+        )
+        .await;
         if let Err(error) = self
             .persistence
             .update_status(session_id, SessionStatus::Starting)
@@ -4848,6 +5037,13 @@ impl SessionManager {
                 "Continued provider is live but durable active status was not established"
             );
         }
+        // update_status queues a command; its await does not acknowledge the
+        // write. Keep the admission until the worker has processed it. Runtime
+        // occupancy also fences the provider if that write failed.
+        if let Err(error) = self.persistence.barrier().await {
+            tracing::warn!(%session_id, %error, "continue status publication barrier failed");
+        }
+        drop(tree_admission_guard);
         drop(cwd_admission_guard);
         #[cfg(test)]
         super::launch::pause_controller_candidate_test(
@@ -4862,7 +5058,7 @@ impl SessionManager {
             session_id,
             controller_project_id,
             provider,
-            &session_token,
+            session_binding,
         )
         .await;
         if controller_grant == super::SameIdControllerGrantOutcome::EstablishmentInvalid {
@@ -4871,16 +5067,14 @@ impl SessionManager {
 
         let fresh_receipt = if fresh_relaunch {
             let child = agent_child.as_ref().expect("fresh relaunch intent");
-            let watch_rearmed = if child.manager_scope.is_some() {
-                false
-            } else {
-                self.agent_control()
-                    .rearm_child_watch_after_continue(
-                        child.row.caller_session_id,
-                        child.row.target_session_id,
-                    )
-                    .await
-            };
+            let watch_rearmed = self
+                .agent_control()
+                .rearm_child_watch_for_continue(
+                    child.row.caller_session_id,
+                    child.row.target_session_id,
+                    child.manager_scope.is_some(),
+                )
+                .await;
             let receipt = AgentContinueChildResultV1 {
                 target_session_id: child.row.target_session_id,
                 continued_session_id: session_id,
@@ -5256,6 +5450,20 @@ impl SessionManager {
     }
 
     pub async fn archive_session(&self, session_id: Uuid) -> Result<ArchiveSessionResultV1> {
+        {
+            let store = self.store.lock().await;
+            let session = store
+                .get_session(session_id)?
+                .ok_or(DaemonError::SessionNotFound(session_id))?;
+            if session.sandbox_root.is_some()
+                && session.sandbox_cleanup_state != Some(SandboxCleanupState::Purged)
+                && store.session_or_custody_has_settlement_fence(session_id)?
+            {
+                return Err(DaemonError::PolicyDenied(
+                    "source-worktree settlement journal fences this session archive".into(),
+                ));
+            }
+        }
         // The private proof service owns the only positive destructive path.
         // Its read-only structural classifier returns `None` for every shape
         // that must remain on the unchanged generic D00 lifecycle policy.
@@ -5271,6 +5479,20 @@ impl SessionManager {
 
     async fn archive_one_session(&self, session_id: Uuid) -> Result<()> {
         let spawn_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+        {
+            let store = self.store.lock().await;
+            let session = store
+                .get_session(session_id)?
+                .ok_or(DaemonError::SessionNotFound(session_id))?;
+            if session.sandbox_root.is_some()
+                && session.sandbox_cleanup_state != Some(SandboxCleanupState::Purged)
+                && store.session_or_custody_has_settlement_fence(session_id)?
+            {
+                return Err(DaemonError::PolicyDenied(
+                    "source-worktree settlement journal fences this session archive".into(),
+                ));
+            }
+        }
         if self.active.read().await.contains_key(&session_id) {
             return Err(DaemonError::Rpc(
                 "Cannot archive active session".to_string(),
@@ -5422,15 +5644,19 @@ impl SessionManager {
         session_id: Uuid,
         project_id: Option<Uuid>,
     ) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_project(session_id, project_id)
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.project_id = project_id;
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.project_id = project_id;
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Project,
+            stamp,
+            |session| session.project_id = project_id,
+        )
+        .await;
         self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
             session_id,
             model: None,
@@ -5454,15 +5680,19 @@ impl SessionManager {
         session_id: Uuid,
         workflow_id: Option<Uuid>,
     ) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_workflow(session_id, workflow_id)
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.workflow_id = workflow_id;
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.workflow_id = workflow_id;
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Workflow,
+            stamp,
+            |session| session.workflow_id = workflow_id,
+        )
+        .await;
         self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
             session_id,
             model: None,
@@ -5478,15 +5708,19 @@ impl SessionManager {
     }
 
     pub async fn update_session_title(&self, session_id: Uuid, title: String) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_title(session_id, title.clone())
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.title = Some(title.clone());
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.title = Some(title);
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Title,
+            stamp,
+            |session| session.title = Some(title),
+        )
+        .await;
         Ok(())
     }
 
@@ -5495,28 +5729,36 @@ impl SessionManager {
         session_id: Uuid,
         description: String,
     ) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_description(session_id, description.clone())
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.description = Some(description.clone());
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.description = Some(description);
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Description,
+            stamp,
+            |session| session.description = Some(description),
+        )
+        .await;
         Ok(())
     }
 
     pub async fn update_session_rating(&self, session_id: Uuid, rating: Option<i16>) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_rating(session_id, rating)
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.rating = rating;
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.rating = rating;
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Rating,
+            stamp,
+            |session| session.rating = rating,
+        )
+        .await;
         Ok(())
     }
 
@@ -5525,15 +5767,19 @@ impl SessionManager {
         session_id: Uuid,
         active_task: Option<String>,
     ) -> Result<()> {
-        self.persistence
+        let stamp = self
+            .persistence
             .update_session_active_task(session_id, active_task.clone())
             .await?;
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.active_task = active_task.clone();
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.active_task = active_task;
-        }
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::ActiveTask,
+            stamp,
+            |session| session.active_task = active_task,
+        )
+        .await;
         Ok(())
     }
 
@@ -5880,6 +6126,7 @@ impl SessionManager {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         };
 
         // Launch as a new session (new UUID), linked via continued_from.  The
@@ -6196,25 +6443,123 @@ impl SessionManager {
                 }
             }
         }
+        self.settle_model_calls_for_shutdown(MODEL_CALL_SETTLEMENT_SHUTDOWN_BOUND)
+            .await
+    }
+
+    /// Model-call settlement shutdown (#2528). Settlement waits for every live
+    /// producer to quiesce, and a producer is a provider turn. A turn that
+    /// started after the restart was decided (a continuation that passed its
+    /// drain check before the decision and spawned after the first interrupt
+    /// pass) must not hold the daemon: each failed attempt gives any session
+    /// now in the active map the ordinary restart treatment (a durable restart
+    /// intent, then an interrupt attributed to the deploy restart, then a kill
+    /// on the next attempt), so it is resumed after the restart like every other
+    /// session the deploy interrupts. The wait itself is bounded: past `bound`
+    /// the invocations still running are recorded durably for the next boot to
+    /// reconcile and shutdown completes, instead of retrying forever against a
+    /// turn whose RPCs the draining daemon refuses.
+    pub(super) async fn settle_model_calls_for_shutdown(
+        &self,
+        bound: std::time::Duration,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
         let mut settlement_attempt = 0_u64;
+        let mut interrupted_late: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::new();
         loop {
             settlement_attempt = settlement_attempt.saturating_add(1);
-            match self.model_call_settlements.shutdown().await {
+            let error = match self.model_call_settlements.shutdown().await {
                 Ok(()) => return Ok(()),
-                Err(error) => {
-                    // Settlement shutdown is fail-closed: a bounded worker
-                    // attempt may time out, but production must not unwind the
-                    // runtime and discard the still-owned recovery boundary.
-                    // Remain visibly in failed-shutdown recovery and retry the
-                    // same idempotent state machine until it converges.
-                    tracing::error!(
-                        attempt = settlement_attempt,
-                        error = %error,
-                        "Model-call settlement shutdown incomplete; daemon remains in shutdown recovery"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Err(error) => error,
+            };
+            tracing::error!(
+                attempt = settlement_attempt,
+                error = %error,
+                "Model-call settlement shutdown incomplete; daemon remains in shutdown recovery"
+            );
+            if started.elapsed() >= bound {
+                self.record_unsettled_model_invocations_at_shutdown(bound)
+                    .await;
+                return Ok(());
+            }
+            self.cut_late_restart_sessions(&mut interrupted_late).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    /// The durable record of what a bounded shutdown gave up on (#2528). A
+    /// failed write is logged and shutdown still completes: the next boot
+    /// reconciles every running invocation whether or not it was recorded.
+    async fn record_unsettled_model_invocations_at_shutdown(&self, bound: std::time::Duration) {
+        let recorded = self
+            .store
+            .lock()
+            .await
+            .record_unsettled_model_invocations(self.program_run_boot_id);
+        match recorded {
+            Ok(invocation_ids) => tracing::error!(
+                bound_secs = bound.as_secs_f64(),
+                unsettled = invocation_ids.len(),
+                invocation_ids = ?invocation_ids,
+                "Model-call settlement did not quiesce within its bound; recorded the unsettled invocations for recovery on the next boot and completing shutdown"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                "Model-call settlement did not quiesce within its bound and the unsettled invocations could not be recorded; the next boot still reconciles running invocations"
+            ),
+        }
+    }
+
+    /// Give a session that is in the active map during model-call settlement
+    /// the restart treatment: the first time it is seen, journal a restart
+    /// intent and interrupt it; the next time, kill its process and drop it
+    /// from the active map. A detached turn survives the restart and is left.
+    async fn cut_late_restart_sessions(&self, interrupted: &mut std::collections::HashSet<Uuid>) {
+        let preserved = match self.deploy_detached_sessions().await {
+            Ok(preserved) => preserved,
+            Err(error) => {
+                tracing::warn!(%error, "Could not classify late sessions during shutdown");
+                return;
+            }
+        };
+        let late: Vec<Uuid> = self
+            .active
+            .read()
+            .await
+            .keys()
+            .copied()
+            .filter(|id| !preserved.contains(id))
+            .collect();
+        if late.is_empty() {
+            return;
+        }
+        let (kill, interrupt): (Vec<Uuid>, Vec<Uuid>) =
+            late.into_iter().partition(|id| interrupted.contains(id));
+        if !interrupt.is_empty() {
+            tracing::warn!(
+                sessions = ?interrupt,
+                "Sessions became active after shutdown began; interrupting them for the restart"
+            );
+            interrupted.extend(interrupt.iter().copied());
+            if let Err(error) = self.interrupt_restart_sessions(interrupt).await {
+                tracing::warn!(%error, "Late restart interrupt failed");
+            }
+        }
+        if !kill.is_empty() {
+            tracing::warn!(
+                sessions = ?kill,
+                "Late sessions did not stop after the restart interrupt; killing them"
+            );
+            let mut active = self.active.write().await;
+            for id in &kill {
+                if let Some(tracked) = active.get_mut(id)
+                    && let Some(process) = tracked.process.as_mut()
+                {
+                    let _ = process.kill().await;
                 }
             }
+            active.retain(|id, _| !kill.contains(id));
         }
     }
 
@@ -6293,17 +6638,85 @@ impl SessionManager {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub async fn drain_restart_status(&self) -> serde_json::Value {
+    /// The active sessions as the DRAIN wait sees them, each classified in the
+    /// same read of the active map (#2387). The classification has no await
+    /// point: the turn ledger (which the monitor updates under the write lock)
+    /// and the in-flight call registry are read at the instant the caller
+    /// decides, never from an earlier snapshot, so a tool that opened or a call
+    /// that completed before this read is a full wait.
+    async fn drain_entries(&self) -> Vec<DrainEntry> {
+        let named = self.deploy_named_interrupted_workers().await;
+        let now = tokio::time::Instant::now();
         let active = self.active.read().await;
-        let mut sessions = active
+        active
             .values()
-            .map(|tracked| {
+            .map(|tracked| DrainEntry {
+                id: tracked.session.id,
+                provider: tracked.session.provider,
+                status: tracked.session.status,
+                state: if named.contains(&tracked.session.id) {
+                    DrainState::DeployInterrupted
+                } else {
+                    self.drain_state(tracked, now)
+                },
+            })
+            .collect()
+    }
+
+    /// The workers the restarting `interrupt_workers` deploy named as
+    /// interrupted (#2371): a store read, never a process probe. The set is
+    /// empty without such a deploy (and until the deploy has recorded it), so
+    /// every other restart keeps the full wait. A failed read fails closed to
+    /// the full wait.
+    async fn deploy_named_interrupted_workers(&self) -> std::collections::HashSet<Uuid> {
+        if !self.drain_restart_requested() {
+            return std::collections::HashSet::new();
+        }
+        match self
+            .store
+            .lock()
+            .await
+            .restarting_deploy_interrupted_workers()
+        {
+            Ok(workers) => workers.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(%error, "DRAIN could not read the deploy's interrupted workers");
+                std::collections::HashSet::new()
+            }
+        }
+    }
+
+    /// Why the DRAIN wait still has to wait for one session (#2353). A session
+    /// is `WaitingOnDaemon` only when the daemon-owned proof in
+    /// [`super::daemon_wait`] holds: Claude CLI turn, no pending question, a
+    /// control call in flight past its settle time, and every open tool call a
+    /// typed control tool. A shell tool is never a daemon wait (#2388). Idle
+    /// time is never consulted.
+    fn drain_state(&self, tracked: &TrackedSession, now: tokio::time::Instant) -> DrainState {
+        if tracked.pending_question.is_some() {
+            DrainState::WaitingForOperator
+        } else if tracked.session.provider == SessionProvider::Claude
+            && self
+                .daemon_wait
+                .is_waiting_on_daemon(tracked.session.id, &tracked.turn_tools, now)
+        {
+            DrainState::WaitingOnDaemon
+        } else {
+            DrainState::FinishingCurrentTurn
+        }
+    }
+
+    pub async fn drain_restart_status(&self) -> serde_json::Value {
+        let mut sessions = self
+            .drain_entries()
+            .await
+            .iter()
+            .map(|entry| {
                 serde_json::json!({
-                    "session_id": tracked.session.id,
-                    "provider": tracked.session.provider,
-                    "status": tracked.session.status,
-                    "state": if tracked.pending_question.is_some() { "waiting_for_operator" }
-                             else { "finishing_current_turn" },
+                    "session_id": entry.id,
+                    "provider": entry.provider,
+                    "status": entry.status,
+                    "state": entry.state.as_str(),
                 })
             })
             .collect::<Vec<_>>();
@@ -6314,32 +6727,97 @@ impl SessionManager {
         })
     }
 
-    pub async fn shutdown_drain(&self, max_wait: std::time::Duration) -> Result<()> {
-        self.begin_restart_drain();
+    /// One poll of the operator DRAIN wait: complete when no session is
+    /// active, when every active session waits only on the daemon or is a
+    /// worker the restarting deploy named as interrupted (#2371), or when
+    /// `limit` has elapsed since the wait began.
+    pub async fn operator_drain_decision(
+        &self,
+        elapsed: std::time::Duration,
+        limit: std::time::Duration,
+    ) -> OperatorDrainDecision {
+        let entries = self.drain_entries().await;
+        let active_count = entries.len();
+        let count = |state: DrainState| entries.iter().filter(|entry| entry.state == state).count();
+        let daemon_waiting = count(DrainState::WaitingOnDaemon);
+        let deploy_interrupted = count(DrainState::DeployInterrupted);
+        if active_count == 0
+            || elapsed >= limit
+            || !entries.iter().any(|entry| entry.state.blocks_drain())
+        {
+            OperatorDrainDecision::Complete {
+                active_count,
+                daemon_waiting,
+                deploy_interrupted,
+                limit_reached: active_count != 0 && elapsed >= limit,
+            }
+        } else {
+            OperatorDrainDecision::Wait
+        }
+    }
+
+    /// Wait for the turns a restart can still let finish. A session blocks only
+    /// if its turn can end: a detached turn survives the restart and a turn
+    /// waiting only on the daemon cannot end while the daemon drains (#2353).
+    /// Returns whether `max_wait` ran out with such a turn still open.
+    pub(crate) async fn wait_for_finishable_turns(
+        &self,
+        max_wait: std::time::Duration,
+    ) -> Result<bool> {
         let deadline = tokio::time::Instant::now() + max_wait;
         while tokio::time::Instant::now() < deadline {
             let preserved = self.deploy_detached_sessions().await?;
-            if self
-                .active
-                .read()
-                .await
-                .keys()
-                .all(|id| preserved.contains(id))
+            let entries = self.drain_entries().await;
+            if !entries
+                .iter()
+                .any(|entry| !preserved.contains(&entry.id) && entry.state.blocks_drain())
             {
-                break;
+                return Ok(false);
             }
             let snapshot = self.drain_restart_status().await;
             tracing::info!(state=%snapshot, "DRAIN waiting for current turns to settle");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        Ok(true)
+    }
+
+    pub async fn shutdown_drain(&self, max_wait: std::time::Duration) -> Result<()> {
+        self.begin_restart_drain();
+        let deadline_reached = self.wait_for_finishable_turns(max_wait).await?;
         if !self.active.read().await.is_empty() {
-            tracing::warn!(state=%self.drain_restart_status().await,
-                "DRAIN deadline reached; using bounded hard restart fallback");
+            if deadline_reached {
+                tracing::warn!(state=%self.drain_restart_status().await,
+                    "DRAIN deadline reached; using bounded hard restart fallback");
+            } else {
+                tracing::info!(state=%self.drain_restart_status().await,
+                    "DRAIN ending early: remaining turns wait only on the daemon; using bounded hard restart fallback");
+            }
         }
         self.shutdown().await
     }
 
+    /// Claim the restart journal and continue every claimed session in
+    /// journal order. Startup splits the two halves
+    /// ([`Self::claim_restart_intents_at_startup`] before readiness,
+    /// [`Self::continue_claimed_restart_intents`] after it, #2375); tests and
+    /// callers that need the whole pass use this composition.
     pub async fn reconcile_restart_intents_at_startup(&self) -> Result<()> {
+        let claimed = self.claim_restart_intents_at_startup().await?;
+        self.continue_claimed_restart_intents(claimed).await;
+        Ok(())
+    }
+
+    /// The authority half of the restart journal pass: claim each exact
+    /// intent, refuse what cannot resume, and queue the manager notices. Store
+    /// work only, cheap. The returned intents stay durably `claimed` (so the
+    /// topology executor and every other reader still treat the session as
+    /// journal-owned) until [`Self::continue_claimed_restart_intents`]
+    /// dispatches each provider continuation, which costs hundreds of
+    /// milliseconds per session and must not gate readiness (#2375). The
+    /// order is the journal order: review-owned intents first.
+    pub async fn claim_restart_intents_at_startup(&self) -> Result<Vec<(Uuid, Uuid)>> {
+        let mut recovered_sessions = Vec::new();
+        let mut to_continue = Vec::new();
         // A DB review owns its reviewer continuation. Claim those exact rows
         // first; the ordinary pass deliberately excludes active assignments.
         for review_owned in [true, false] {
@@ -6375,6 +6853,7 @@ impl SessionManager {
                     .await
                     .get_session(intent.session_id)?
                     .ok_or(DaemonError::SessionNotFound(intent.session_id))?;
+                recovered_sessions.push(intent.session_id);
                 // App-server continuation currently replaces the provider and
                 // UUID rather than rebinding this exact restart invocation.
                 // Report that unsupported path instead of claiming delivery.
@@ -6388,18 +6867,121 @@ impl SessionManager {
                     self.publish_restart_refusal(intent.session_id).await?;
                     continue;
                 }
-                if let Err(error) = self
-                    .continue_restart_intent(intent.id, intent.session_id)
+                to_continue.push((intent.id, intent.session_id));
+            }
+        }
+        self.queue_restart_recovery_manager_wakes(recovered_sessions)
+            .await?;
+        Ok(to_continue)
+    }
+
+    /// The dispatch half of the restart journal pass: continue each claimed
+    /// session in order. A dispatch failure fails that intent and moves on.
+    pub async fn continue_claimed_restart_intents(&self, claimed: Vec<(Uuid, Uuid)>) {
+        for (intent_id, session_id) in claimed {
+            if let Err(error) = self.continue_restart_intent(intent_id, session_id).await {
+                tracing::warn!(intent_id=%intent_id, session_id=%session_id, %error,
+                    "Graceful restart continuation deferred");
+                let failed = self
+                    .store
+                    .lock()
                     .await
-                {
-                    tracing::warn!(intent_id=%intent.id, session_id=%intent.session_id, %error,
-                        "Graceful restart continuation deferred");
-                    self.store
-                        .lock()
-                        .await
-                        .fail_restart_intent(intent.id, "dispatch_failed")?;
-                    self.publish_restart_refusal(intent.session_id).await?;
+                    .fail_restart_intent(intent_id, "dispatch_failed");
+                if let Err(error) = failed {
+                    tracing::warn!(intent_id=%intent_id, %error,
+                        "Could not record the failed restart continuation");
+                    continue;
                 }
+                if let Err(error) = self.publish_restart_refusal(session_id).await {
+                    tracing::warn!(session_id=%session_id, %error,
+                        "Could not publish the restart refusal");
+                }
+            }
+        }
+    }
+
+    /// One immediate resume per live manager seat summarizes the worker turns
+    /// handled by this startup's restart journal. A manager with an existing
+    /// resume wake already has a continuation owner, so its notice waits for
+    /// that turn to inspect the inbox instead of adding another wake.
+    pub(super) async fn queue_restart_recovery_manager_wakes(
+        &self,
+        sessions: Vec<Uuid>,
+    ) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let store = self.store.lock().await;
+        let mut workers_by_project: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for session_id in sessions {
+            let Some(session) = store.get_session(session_id)? else {
+                continue;
+            };
+            let Some(project_id) = session.project_id else {
+                continue;
+            };
+            workers_by_project
+                .entry(project_id)
+                .or_default()
+                .push(format!(
+                    "session={} issue={} state={:?}",
+                    session.id,
+                    session.issue_identifier.as_deref().unwrap_or("unknown"),
+                    session.status
+                ));
+        }
+        for (project_id, mut workers) in workers_by_project {
+            let Some(config) = store.get_harness_manager_notice_config(project_id)? else {
+                continue;
+            };
+            let Some(manager_id) = config.current_session_id else {
+                continue;
+            };
+            let Some(manager) = store.get_session(manager_id)? else {
+                continue;
+            };
+            if matches!(
+                manager.status,
+                SessionStatus::Archived | SessionStatus::Deleted
+            ) || store.session_has_enabled_resume_wake(manager_id)?
+            {
+                continue;
+            }
+            workers.sort();
+            let now = Utc::now();
+            let message = format!(
+                "Daemon restart recovery notice. Account for these worker turns:\n{}",
+                workers.join("\n")
+            );
+            let job = ScheduledJob {
+                id: Uuid::new_v5(
+                    &Uuid::NAMESPACE_OID,
+                    format!(
+                        "rsi:restart-recovery:{}:{}:{}",
+                        self.program_run_boot_id, project_id, manager_id
+                    )
+                    .as_bytes(),
+                ),
+                name: "Restart recovery notice".into(),
+                message,
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: Some(manager.working_dir.clone()),
+                provider: Some(manager.provider),
+                model: manager.model.clone(),
+                project_id: manager.project_id,
+                created_at: now,
+                updated_at: now,
+                wake_mode: WakeMode::Resume,
+                wake_session_id: Some(manager_id),
+            };
+            if store.get_scheduled_job(&job.id)?.is_none() {
+                store.insert_scheduled_job(&job)?;
             }
         }
         Ok(())
@@ -6589,7 +7171,7 @@ mod d00_tests {
         let base = std::env::var_os("CARGO_TARGET_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+                std::path::Path::new(rsi_common::manifest_dir!()).join("../../target")
             })
             .join("rsid-d00-fixtures");
         std::fs::create_dir_all(&base).expect("create disk-backed fixture base");
@@ -6615,7 +7197,7 @@ mod d00_tests {
         git(repo.path(), &["add", "README.md"]);
         git(repo.path(), &["commit", "-q", "-m", "initial"]);
 
-        let store = Store::open(&db.path().join("rsi.db")).expect("open store");
+        let store = Store::open_test_fixture(&db.path().join("rsi.db")).expect("open store");
         let manager = SessionManager::new(
             Arc::new(EventBus::new(64)),
             store,
@@ -7196,6 +7778,123 @@ mod d00_tests {
             .expect("missing transcript is not an error");
     }
 
+    /// #62: a master that finishes a turn after spawning a child has a row the
+    /// finalizer wrote straight to the store (the terminal sandbox observation)
+    /// that the completed map's transcript never held. The resumed turn must
+    /// number its events after that row: a reused sequence is hidden from any
+    /// reader that fetches `sequence > last seen`, which is how the TUI follows
+    /// a transcript, so the master's commentary stayed invisible until the next
+    /// full reload (a nudge).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn resumed_turn_is_numbered_after_rows_written_straight_to_the_store_62() {
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+
+        let test = test_manager();
+        let session_id = Uuid::new_v4();
+        let mut parked = session(session_id, test.repo.path());
+        parked.status = SessionStatus::Completed;
+        let message = |sequence: i32, role: Role, content: &str| ConversationEvent {
+            id: 0,
+            session_id,
+            sequence,
+            event_type: EventType::Message,
+            role: Some(role),
+            content: content.to_string(),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        };
+        let turn = vec![
+            message(0, Role::User, "orchestrate"),
+            message(1, Role::Assistant, "spawning the child"),
+        ];
+        {
+            let store = test.manager.store.lock().await;
+            store.insert_session(&parked).unwrap();
+            for event in &turn {
+                store.insert_event(event).unwrap();
+            }
+            // The finalizer's own write: MAX(sequence)+1, no in-memory copy.
+            store
+                .record_terminal_sandbox_worktree(session_id, Some(false))
+                .unwrap();
+        }
+
+        let initial = crate::session::queries::next_transcript_sequence(
+            &test.manager.store,
+            session_id,
+            &turn,
+        )
+        .await;
+        assert_eq!(initial, 3, "after the stored row at sequence 2");
+
+        // The resumed turn: the nudge/wake message, then the commentary.
+        let resumed = [
+            message(initial, Role::User, "child finished"),
+            message(initial + 1, Role::Assistant, "commentary after the child"),
+        ];
+        let store = test.manager.store.lock().await;
+        for event in &resumed {
+            store.insert_event(event).unwrap();
+        }
+        let all = store.load_events(session_id).unwrap();
+        let mut sequences: Vec<i32> = all.iter().map(|event| event.sequence).collect();
+        sequences.dedup();
+        assert_eq!(sequences, vec![0, 1, 2, 3, 4], "every sequence is unique");
+        // A reader that already saw the stored row (sequence 2) and fetches
+        // only what is newer still receives the resumed commentary.
+        let newer: Vec<String> = store
+            .load_events_since(session_id, Some(2))
+            .unwrap()
+            .into_iter()
+            .map(|event| event.content)
+            .collect();
+        assert_eq!(newer, vec!["child finished", "commentary after the child"]);
+    }
+
+    /// #62: the in-memory transcript still wins when it is ahead of the store.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn resumed_turn_keeps_the_cached_sequence_when_it_is_ahead_62() {
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+
+        let test = test_manager();
+        let session_id = Uuid::new_v4();
+        let cached = vec![ConversationEvent {
+            id: 0,
+            session_id,
+            sequence: 9,
+            event_type: EventType::Message,
+            role: Some(Role::Assistant),
+            content: "not yet stored".to_string(),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        }];
+        assert_eq!(
+            crate::session::queries::next_transcript_sequence(
+                &test.manager.store,
+                session_id,
+                &cached
+            )
+            .await,
+            10
+        );
+        assert_eq!(
+            crate::session::queries::next_transcript_sequence(&test.manager.store, session_id, &[])
+                .await,
+            0,
+            "an empty transcript starts at zero"
+        );
+    }
+
     async fn insert_completed_continue_fixture(
         test: &TestManager,
         sandboxed: bool,
@@ -7264,6 +7963,97 @@ mod d00_tests {
             .await
             .insert(session_id, CompletedSession::for_test(completed));
         (session_id, root)
+    }
+
+    /// #1162: a real admission timeout followed by two scheduled resumes
+    /// remains bounded even while the same custody stripe stays held.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn scheduled_resume_preauthentication_is_bounded_after_effect_admission_times_out() {
+        use crate::issue_tracker::poller::SessionLauncher;
+        use crate::store::custody_lock_order::{
+            is_lock_order_busy_error, set_bounded_wait_for_test,
+        };
+
+        let test = test_manager();
+        let (target, _) = insert_completed_continue_fixture(&test, true).await;
+        let session = test.manager.completed.read().await[&target].session.clone();
+        let (custody_id, handle) = {
+            let mut store = test.manager.store.lock().await;
+            let id = store.live_custody_for_session(target).unwrap().custody_id;
+            let handle = CustodyService::authorize_live(
+                &session,
+                &mut store,
+                test.sandbox_base.path(),
+                rsi_common::types::SandboxCustodyTransitionV1::Continue,
+            )
+            .unwrap();
+            (id, handle)
+        };
+        let process = super::super::launch::install_controller_candidate_test_process(target);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _root = crate::store::sandbox_custody::lock_custody_root(custody_id);
+            held_tx.send(()).unwrap();
+            let _ = released.recv();
+        });
+        held_rx.recv().unwrap();
+        set_bounded_wait_for_test(Some(std::time::Duration::from_millis(100)));
+        let error = CustodyService::begin_effect(
+            &test.manager.store,
+            &test.manager.custody_settlements,
+            &handle,
+            &session,
+            test.sandbox_base.path(),
+            test.manager.program_run_boot_id,
+            EffectKind::ContextRead,
+        )
+        .await
+        .err()
+        .expect("real admission surrenders on the held root");
+        assert!(is_lock_order_busy_error(&error), "{error}");
+        for _ in 0..2 {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                test.manager.resume_scheduled_job(
+                    target,
+                    "retry the retained wake".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect("preauthentication surrenders without waiting for release")
+            .expect_err("custody remains busy");
+            assert!(is_lock_order_busy_error(&error), "{error}");
+            assert!(
+                test.manager.store.try_lock().is_ok(),
+                "Store stays available"
+            );
+            assert!(test.manager.completed.read().await.contains_key(&target));
+        }
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        drop(release);
+        holder.join().unwrap();
+        // Production admission succeeds once the root is free.
+        let permit = CustodyService::begin_effect(
+            &test.manager.store,
+            &test.manager.custody_settlements,
+            &handle,
+            &session,
+            test.sandbox_base.path(),
+            test.manager.program_run_boot_id,
+            EffectKind::ContextRead,
+        )
+        .await
+        .expect("released custody admits the next effect");
+        drop(permit);
+        set_bounded_wait_for_test(None);
     }
 
     mod harness_manager_resume_tests {
@@ -7703,6 +8493,160 @@ mod d00_tests {
                     .lock()
                     .await
                     .get_scheduled_job(&job.id)
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            );
+        }
+
+        /// Replace the job's live notices with one `kind`/`state` row.
+        async fn set_only_notice(
+            test: &TestManager,
+            target: Uuid,
+            job: Uuid,
+            kind: &str,
+            subject: &str,
+            state: serde_json::Value,
+        ) {
+            let store = test.manager.store.lock().await;
+            let project: String = store
+                .conn
+                .query_row(
+                    "SELECT project_id FROM harness_manager_watches WHERE job_id=?1",
+                    [job.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE harness_manager_notices SET retired_at=?2
+                     WHERE job_id=?1 AND retired_at IS NULL",
+                    rusqlite::params![
+                        job.to_string(),
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store
+                .conn
+                .execute(
+                    "INSERT INTO harness_manager_notices
+                     (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+                      source_session_id,recipient_session_id,kind,subject_id,subject_version,
+                      state_json,recorded_at,queued_at)
+                     VALUES(?1,?2,?3,?4,1,NULL,'to_manager',NULL,?4,?5,?6,?1,?7,?8,?8)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        job.to_string(),
+                        project,
+                        target.to_string(),
+                        kind,
+                        subject,
+                        state.to_string(),
+                        at,
+                    ],
+                )
+                .unwrap();
+        }
+
+        async fn notice_resume_check(test: &TestManager, target: Uuid, job: Uuid) -> Result<()> {
+            let guard = crate::session::spawn_single_flight::acquire_spawn_guard(target).await;
+            test.manager
+                .check_manager_notice_resume(&guard, target, &[job])
+                .await
+        }
+
+        fn is_deferred(result: &Result<()>) -> bool {
+            matches!(result, Err(DaemonError::InvalidParam(message)) if message == "manager_notice_deferred")
+        }
+
+        /// #2296: a parked one-shot resume wake (the manager's safety wake or a
+        /// `when` wait) must not hold back an actionable notice, while routine
+        /// notices still defer to it (#1675/#2322/#2422).
+        #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+        #[tokio::test]
+        async fn actionable_notice_overrides_a_parked_one_shot_resume_owner_but_routine_does_not() {
+            let test = test_manager();
+            let (target, _) = insert_completed_continue_fixture(&test, false).await;
+            let job = bind_notice(&test, target).await;
+            let actionable = [
+                (
+                    "ledger_change",
+                    "satellite_report",
+                    serde_json::json!({"record_kind": "satellite_report", "report_kind": "result"}),
+                ),
+                (
+                    "action_result",
+                    "action-failed",
+                    serde_json::json!({"state": "failed"}),
+                ),
+                (
+                    "operator_answer",
+                    "answer-1",
+                    serde_json::json!({"answer": "go"}),
+                ),
+            ];
+            let routine = [
+                (
+                    "action_result",
+                    "action-ok",
+                    serde_json::json!({"state": "succeeded"}),
+                ),
+                (
+                    "ledger_change",
+                    "sandbox_target_reclaim",
+                    serde_json::json!({"record_kind": "sandbox_target_reclaim"}),
+                ),
+                (
+                    "ledger_change",
+                    "intent:abc",
+                    serde_json::json!({"record_kind": "intent", "payload": {"state": "worker"}}),
+                ),
+            ];
+
+            // Baseline: with no one-shot owner the actionable notice is deliverable.
+            set_only_notice(
+                &test,
+                target,
+                job,
+                actionable[0].0,
+                actionable[0].1,
+                actionable[0].2.clone(),
+            )
+            .await;
+            notice_resume_check(&test, target, job).await.unwrap();
+
+            let mut owner = wake(&test, target, Some(Uuid::new_v4()));
+            owner.wake_mode = rsi_common::types::WakeMode::Resume;
+            owner.schedule.recurrence = rsi_common::types::Recurrence::Once;
+            test.manager
+                .store
+                .lock()
+                .await
+                .insert_scheduled_job(&owner)
+                .unwrap();
+
+            for (kind, subject, state) in actionable {
+                set_only_notice(&test, target, job, kind, subject, state).await;
+                let result = notice_resume_check(&test, target, job).await;
+                assert!(result.is_ok(), "{kind}/{subject} must wake: {result:?}");
+            }
+            for (kind, subject, state) in routine {
+                set_only_notice(&test, target, job, kind, subject, state).await;
+                let result = notice_resume_check(&test, target, job).await;
+                assert!(
+                    is_deferred(&result),
+                    "{kind}/{subject} must defer: {result:?}"
+                );
+            }
+            assert!(
+                test.manager
+                    .store
+                    .lock()
+                    .await
+                    .get_scheduled_job(&owner.id)
                     .unwrap()
                     .unwrap()
                     .enabled
@@ -8571,7 +9515,8 @@ mod d00_tests {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let restarted = SessionManager::new(
             Arc::new(EventBus::new(64)),
-            Store::open(&test._db.path().join("rsi.db")).expect("reopen archived store"),
+            Store::open_test_fixture(&test._db.path().join("rsi.db"))
+                .expect("reopen archived store"),
             false,
             test._db.path().join("restarted-daemon.sock"),
             None,
@@ -8894,7 +9839,12 @@ mod d00_tests {
         tracked
     }
 
-    async fn d03_reconstruct(test: &TestManager, session_id: Uuid, project_id: Uuid, token: &str) {
+    async fn d03_reconstruct(
+        test: &TestManager,
+        session_id: Uuid,
+        project_id: Uuid,
+        binding: super::super::AgentTransportWitness,
+    ) {
         SessionManager::reconstruct_live_same_id_controller_grant(
             &test.manager.active,
             &test.manager.store,
@@ -8902,7 +9852,7 @@ mod d00_tests {
             session_id,
             Some(project_id),
             SessionProvider::Claude,
-            token,
+            binding,
         )
         .await;
     }
@@ -9047,14 +9997,21 @@ mod d00_tests {
             .write()
             .await
             .insert(session_id, tracked);
-        let token = "d03-current-a6".to_string();
+        let token = "55f26f0454ee3efdbc6bc2b4a5e39ae5da5b3a7dac463a3dd4f39f05aa866d65".to_string();
         test.manager
             .agent_tokens
             .write()
             .await
             .insert(token.clone(), session_id);
 
-        d03_reconstruct(&test, session_id, project.id, &token).await;
+        let original_binding = test
+            .manager
+            .agent_tokens
+            .read()
+            .await
+            .binding_for_session(session_id)
+            .unwrap();
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
         let grant = d03_grant(&test, session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("same-ID grant was not reconstructed"))?;
@@ -9124,8 +10081,57 @@ mod d00_tests {
             anyhow::bail!("work action did not carry an exact semantic claim witness");
         };
 
+        test.manager
+            .register_agent_token(token.clone(), session_id)
+            .await;
+        assert_d05_program_run_capabilities_revoked(
+            &stale_controller,
+            &stale_scheduler,
+            &ready.run,
+            &semantic_claim,
+        )
+        .await;
+        assert_eq!(operator.get(ready.run.id).await?.unwrap(), ready.run);
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
+        assert_eq!(d03_grant(&test, session_id).await, None);
+        let replacement_binding = test
+            .manager
+            .agent_tokens
+            .read()
+            .await
+            .binding_for_session(session_id)
+            .unwrap();
+        d03_reconstruct(&test, session_id, project.id, replacement_binding).await;
+        assert_eq!(
+            d03_grant(&test, session_id)
+                .await
+                .unwrap()
+                .controller_epoch(),
+            idea.controller_epoch
+        );
+
+        let before_reinstall_controller = test
+            .manager
+            .bind_program_run_controller_authority(session_id)
+            .await?;
+        let before_reinstall_scheduler = test
+            .manager
+            .bind_program_run_scheduler_authority(session_id, test.manager.program_run_boot_id)
+            .await?;
+        let mut reinstalled = super::super::AgentTokenRegistry::default();
+        reinstalled.insert(token.clone(), session_id);
+        *test.manager.agent_tokens.write().await = reinstalled;
+        assert_d05_program_run_capabilities_revoked(
+            &before_reinstall_controller,
+            &before_reinstall_scheduler,
+            &ready.run,
+            &semantic_claim,
+        )
+        .await;
+        assert_eq!(operator.get(ready.run.id).await?.unwrap(), ready.run);
+
         let reminted_token = test.manager.remint_session_token(session_id).await;
-        assert_ne!(reminted_token, token);
+        assert!(reminted_token.expose_for_transport() != token);
         assert_d05_program_run_capabilities_revoked(
             &stale_controller,
             &stale_scheduler,
@@ -9193,7 +10199,7 @@ mod d00_tests {
             );
             drop(active);
         }
-        d03_reconstruct(&test, session_id, project.id, &token).await;
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
         assert_eq!(
             d03_grant(&test, session_id).await,
             None,
@@ -9206,7 +10212,7 @@ mod d00_tests {
         );
 
         alive.store(false, Ordering::SeqCst);
-        d03_reconstruct(&test, session_id, project.id, &token).await;
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
         assert_eq!(d03_grant(&test, session_id).await, None);
 
         alive.store(true, Ordering::SeqCst);
@@ -9215,7 +10221,7 @@ mod d00_tests {
             .lock()
             .await
             .update_session_status(session_id, SessionStatus::Completed)?;
-        d03_reconstruct(&test, session_id, project.id, &token).await;
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
         assert_eq!(d03_grant(&test, session_id).await, None);
 
         test.manager
@@ -9223,7 +10229,7 @@ mod d00_tests {
             .lock()
             .await
             .update_session_status(session_id, SessionStatus::Starting)?;
-        d03_reconstruct(&test, session_id, project.id, "stale-a6-token").await;
+        d03_reconstruct(&test, session_id, project.id, original_binding).await;
         assert_eq!(d03_grant(&test, session_id).await, None);
         Ok(())
     }
@@ -9260,10 +10266,14 @@ mod d00_tests {
                 retry_fired_at: None,
                 superseded_by_retry: None,
                 events_hydrated: true,
+                store_writes: Default::default(),
             },
         );
         test.manager
-            .register_agent_token("d03-stale-continue-token".to_string(), session_id)
+            .register_agent_token(
+                "7b790b1f311d992a6254bf6f773e9ed8d38da1014c9e7e7b363ba1a32e4cfa34".to_string(),
+                session_id,
+            )
             .await;
         let scripted = super::super::launch::install_controller_candidate_test_process(session_id);
         let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
@@ -10401,6 +11411,52 @@ mod d00_tests {
                 .is_symlink()
         );
         assert!(!root.join(".rsi-tmp").exists());
+        super::super::launch::drop_controller_candidate_test_process(session_id);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn continue_parent_lookup_failure_restores_completed_without_store_deadlock() {
+        let test = test_manager();
+        let (session_id, _root) = insert_completed_continue_fixture(&test, true).await;
+        let parent_id = Uuid::new_v4();
+        test.manager
+            .completed
+            .write()
+            .await
+            .get_mut(&session_id)
+            .expect("completed fixture")
+            .session
+            .parent_id = Some(parent_id);
+        install_continue_parent_lookup_failure_for_test(session_id, 0);
+        super::super::launch::install_controller_candidate_test_process(session_id);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            test.manager
+                .continue_session(session_id, "parent lookup failure".to_string()),
+        )
+        .await
+        .expect("a parent lookup failure must not deadlock on the Store mutex");
+        let error = result.expect_err("parent lookup failure must fail continue");
+        assert!(
+            error.to_string().contains("injected parent lookup failure"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            test.manager
+                .completed
+                .read()
+                .await
+                .contains_key(&session_id),
+            "failed parent lookup must restore completed visibility"
+        );
+        assert!(!test.manager.active.read().await.contains_key(&session_id));
+        let store_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(5), test.manager.store.lock())
+                .await
+                .expect("the Store mutex stays usable after the rollback");
+        drop(store_guard);
         super::super::launch::drop_controller_candidate_test_process(session_id);
     }
 

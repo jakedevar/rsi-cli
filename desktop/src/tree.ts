@@ -18,6 +18,14 @@ export interface TreeFilter {
   showFinished: boolean;
   /** `archived` lists archived sessions (status Archived) with no finished filter. */
   mode?: 'active' | 'archived';
+  /**
+   * The Active view's zone (G2, app/sessions.rs): `main` leaves out the root
+   * sessions scheduled jobs launched, `jobs` lists only them, every status
+   * shown. Omitted: no zone filter.
+   */
+  zone?: 'main' | 'jobs';
+  /** Sort order (slice 4). Omitted: needs-you, then active, then newest update. */
+  order?: { cmp: (a: Session, b: Session) => number; activityFirst: boolean };
 }
 
 export interface TreeNode {
@@ -46,8 +54,11 @@ export interface TreeRow {
 
 function passesLeaf(s: Session, f: TreeFilter): boolean {
   const archived = f.mode === 'archived';
+  const job = !!s.scheduled_job_id && !s.parent_id;
+  if (!archived && f.zone === 'jobs' && !job) return false;
+  if (!archived && f.zone === 'main' && job) return false;
   if (!archived && HIDDEN_BY_DEFAULT.has(s.status)) return false;
-  if (!archived && !f.showFinished && !isActive(s) && s.status !== 'Interrupted' && s.status !== 'Failed') {
+  if (!archived && f.zone !== 'jobs' && !f.showFinished && !isActive(s) && s.status !== 'Interrupted' && s.status !== 'Failed') {
     return false;
   }
   if (f.projectId && s.project_id !== f.projectId) return false;
@@ -64,6 +75,20 @@ function byActivity(a: TreeNode, b: TreeNode): number {
   const act = Number(b.anyActive) - Number(a.anyActive);
   if (act !== 0) return act;
   return b.session.updated_at.localeCompare(a.session.updated_at);
+}
+
+/** Needs-you and in-flight sections first (unless label grouping), then the chosen order. */
+function nodeOrder(order: TreeFilter['order']): (a: TreeNode, b: TreeNode) => number {
+  if (!order) return byActivity;
+  return (a, b) => {
+    if (order.activityFirst) {
+      const need = Number(b.anyAttention) - Number(a.anyAttention);
+      if (need !== 0) return need;
+      const act = Number(b.anyActive) - Number(a.anyActive);
+      if (act !== 0) return act;
+    }
+    return order.cmp(a.session, b.session);
+  };
 }
 
 /**
@@ -87,6 +112,7 @@ export function buildTree(all: Session[], f: TreeFilter): TreeNode[] {
     }
   }
 
+  const byOrder = nodeOrder(f.order);
   const visited = new Set<string>();
   const build = (s: Session): TreeNode | null => {
     visited.add(s.id);
@@ -99,7 +125,7 @@ export function buildTree(all: Session[], f: TreeFilter): TreeNode[] {
     // A container is only shown for its descendants, unless it is empty and passes.
     const keep = children.length > 0 || passesLeaf(s, f);
     if (!keep) return null;
-    children.sort(byActivity);
+    children.sort(byOrder);
     const anyActive = isActive(s) || children.some((c) => c.anyActive);
     const anyAttention = needsAttention(s) || children.some((c) => c.anyAttention);
     return { session: s, children, anyActive, anyAttention };
@@ -116,7 +142,7 @@ export function buildTree(all: Session[], f: TreeFilter): TreeNode[] {
     const n = build(s);
     if (n) out.push(n);
   }
-  out.sort(byActivity);
+  out.sort(byOrder);
   return out;
 }
 

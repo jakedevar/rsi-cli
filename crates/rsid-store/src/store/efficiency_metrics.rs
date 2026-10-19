@@ -31,6 +31,17 @@ struct BucketExtras {
 
 type BucketKey = (String, Option<Uuid>);
 
+/// The invocations the Opus metrics read: foreground Claude Opus rows created in
+/// `[?1, ?2)`. One text for the row filter and for the session set that bounds
+/// the cost window (a zero-argument macro so `concat!` can embed it).
+macro_rules! opus_foreground_window_sql {
+    () => {
+        "mi.created_at >= ?1 AND mi.created_at < ?2
+               AND mi.provider = 'Claude' AND mi.model LIKE 'claude-opus%'
+               AND mi.foreground = 'foreground'"
+    };
+}
+
 impl Store {
     pub fn efficiency_metrics(
         &self,
@@ -53,12 +64,29 @@ impl Store {
         let mut values: BTreeMap<(String, Option<Uuid>), EfficiencyMetricValues> = BTreeMap::new();
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, created_at, input_tokens, output_tokens,
-                    cache_read_tokens, cache_creation_tokens, estimated_cost_usd
-             FROM model_invocations
-             WHERE created_at >= ?1 AND created_at < ?2
-               AND provider = 'Claude' AND model LIKE 'claude-opus%'
-               AND foreground = 'foreground'",
+            // The cost is the invocation's OWN cost (#2593): launch/resume rows
+            // store the session's running total, so the raw column would add
+            // up to many times the real spend. The predecessor window sorts
+            // only the sessions with an invocation in the window (`ids`), not
+            // every admitted invocation of the store (#330, hub #2972); a
+            // session-less invocation has no predecessor and keeps its cost.
+            concat!(
+                "WITH ids(id) AS (
+                SELECT DISTINCT mi.session_id FROM model_invocations mi
+                WHERE mi.session_id IS NOT NULL AND ",
+                opus_foreground_window_sql!(),
+                ")
+             SELECT mi.id, mi.session_id, mi.created_at, mi.input_tokens, mi.output_tokens,
+                    mi.cache_read_tokens, mi.cache_creation_tokens,
+                    CASE WHEN mi.session_id IS NULL THEN mi.estimated_cost_usd
+                         ELSE ci.cost_increment_usd END
+             FROM model_invocations mi
+             LEFT JOIN (",
+                crate::model_control::cost::cost_increment_for_ids_sql!(),
+                ") ci ON ci.invocation_id = mi.id
+             WHERE ",
+                opus_foreground_window_sql!()
+            ),
         )?;
         let mut invocations = stmt
             .query_map(params![from, to], |row| {
@@ -481,7 +509,7 @@ mod tests {
 
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("metrics.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("metrics.db")).unwrap();
         (dir, store)
     }
 
@@ -842,5 +870,137 @@ mod tests {
         let response = store.efficiency_metrics(params, Some(repo.path())).unwrap();
         assert_eq!(response.rows[0].values.landings, Some(0));
         assert_eq!(response.rows[0].values.opus_tokens_per_landing, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    fn insert_opus_invocation(
+        store: &Store,
+        id: &str,
+        purpose: &str,
+        session: Option<&str>,
+        cost: f64,
+        created_at: &str,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations(id, purpose, invocation_kind, foreground,
+                                               paid_risk, admission_status, status, provider,
+                                               model, trigger_source, session_id,
+                                               estimated_cost_usd, created_at)
+                 VALUES(?1, ?2, 'session_lifecycle', 'foreground', 'paid_capable', 'admitted',
+                        'completed', 'Claude', 'claude-opus-test', 'test', ?3, ?4, ?5)",
+                params![id, purpose, session, cost, created_at],
+            )
+            .unwrap();
+    }
+
+    /// The pre-#330 Opus cost of the window: the UNRESTRICTED derived table,
+    /// clamped at zero per row as the metric does.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    fn unrestricted_window_cost(store: &Store) -> f64 {
+        store
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(MAX(COALESCE(ci.cost_increment_usd, 0), 0)), 0)
+                     FROM model_invocations mi
+                     JOIN ({}) ci ON ci.invocation_id = mi.id
+                     WHERE mi.created_at >= ?1 AND mi.created_at < ?2
+                       AND mi.provider = 'Claude' AND mi.model LIKE 'claude-opus%'
+                       AND mi.foreground = 'foreground'",
+                    crate::model_control::cost::COST_INCREMENT_SQL
+                ),
+                params![
+                    format!("{DAY}T08:00:00.000000000Z"),
+                    "2026-09-28T13:00:00.000000000Z"
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// #330 (hub #2972): the Opus cost windows only the sessions that have an
+    /// invocation in the requested range. A predecessor before the range still
+    /// differences the first row inside it, a session-less invocation keeps its
+    /// cost, the result equals the unrestricted window's, and the VM steps (not
+    /// wall clock) do not grow with the history of unrelated sessions.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn opus_cost_equals_the_unrestricted_window_and_ignores_unrelated_history_330() {
+        use crate::sandbox::startup_restore_tests::vm_ops_during;
+
+        let measure = |unrelated_rows: usize| {
+            let (_dir, mut store) = fixture();
+            // The lead's running total was 3.0 the day before the window.
+            insert_opus_invocation(
+                &store,
+                "x0",
+                "session.launch.fresh",
+                Some(LEAD),
+                3.0,
+                "2026-09-27T09:00:00.000000000Z",
+            );
+            for (id, cost, time) in [
+                ("x1", 3.5, "09:30:00"),
+                ("x2", 1.0, "09:45:00"), // the total restarted
+                ("x3", 1.2, "10:30:00"),
+            ] {
+                insert_opus_invocation(
+                    &store,
+                    id,
+                    "session.continue.resume",
+                    Some(LEAD),
+                    cost,
+                    &format!("{DAY}T{time}.000000000Z"),
+                );
+            }
+            insert_opus_invocation(
+                &store,
+                "none",
+                "model.call",
+                None,
+                0.25,
+                &format!("{DAY}T09:50:00.000000000Z"),
+            );
+            for session in 0..20 {
+                for row in 0..unrelated_rows {
+                    insert_opus_invocation(
+                        &store,
+                        &format!("u-{session}-{row}"),
+                        "session.continue.resume",
+                        Some(&format!("00000000-0000-0000-0001-{session:012}")),
+                        0.1 * (row + 1) as f64,
+                        &format!("2026-09-27T10:{:02}:00.000000000Z", row % 50),
+                    );
+                }
+            }
+            let mut params = window();
+            params.group_by = EfficiencyMetricsGroupBy::Day;
+            let (response, scoped_ops) = vm_ops_during(&mut store, |store| {
+                store.efficiency_metrics(params, None).unwrap()
+            });
+            let got = response.rows[0].values.opus_estimated_cost_usd;
+            let want = unrestricted_window_cost(&store);
+            assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+            // The fixture's 4.5 plus 0.5 + 1.0 + 0.2 and the session-less 0.25.
+            assert!((got - 6.45).abs() < 1e-9, "{got}");
+            let (_, full_ops) = vm_ops_during(&mut store, |store| unrestricted_window_cost(store));
+            (scoped_ops, full_ops)
+        };
+        let (scoped_small, full_small) = measure(2);
+        let (scoped_large, full_large) = measure(30);
+        eprintln!(
+            "330 efficiency_metrics vm ops: scoped {scoped_small} -> {scoped_large}, \
+             unrestricted {full_small} -> {full_large}"
+        );
+        assert!(
+            scoped_large <= scoped_small + scoped_small / 20,
+            "the Opus cost must not grow with unrelated history: {scoped_small} -> {scoped_large}"
+        );
+        assert!(
+            full_large > full_small * 2,
+            "the probe must see the unrestricted window grow: {full_small} -> {full_large}"
+        );
     }
 }

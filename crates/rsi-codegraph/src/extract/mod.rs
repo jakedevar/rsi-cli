@@ -13,6 +13,7 @@ use tree_sitter::Node;
 use crate::{
     EvidenceFact, FactKey, FactProvenance, NodeFact, NodeIdentity, NodeKind, RelationFact,
     RelationKind, SourceFile, SourceSpan, UnresolvedReferenceFact, UnresolvedReferenceKind,
+    scope::{RustScope, Sym},
     staged::{FileDiagnostic, PARSER_MAX_FILE_BYTES, PerFileFacts},
 };
 
@@ -26,6 +27,7 @@ pub fn extract_file(file: SourceFile) -> PerFileFacts {
         relations: Vec::new(),
         unresolved_references: Vec::new(),
         diagnostic: FileDiagnostic::Parsed,
+        scope: RustScope::default(),
     };
     let bytes = &output.file.bytes;
     if bytes.len() > PARSER_MAX_FILE_BYTES {
@@ -97,6 +99,9 @@ pub fn extract_file(file: SourceFile) -> PerFileFacts {
     output.nodes = builder.nodes;
     output.relations = builder.relations;
     output.unresolved_references = builder.unresolved;
+    if errors == 0 {
+        output.scope = builder.scope;
+    }
     output
 }
 
@@ -117,6 +122,13 @@ struct Builder<'a> {
     node_counts: HashMap<(NodeKind, String), usize>,
     site_counts: HashMap<String, usize>,
     line_starts: Vec<usize>,
+    /// Rust syntax-local facts for the resolver.
+    scope: RustScope,
+    sym_ids: HashMap<String, Sym>,
+    /// Reused for macro-argument chunks.
+    parser: Option<tree_sitter::Parser>,
+    /// Calls recorded from macro arguments, bounded per file.
+    macro_calls: usize,
 }
 
 impl<'a> Builder<'a> {
@@ -136,7 +148,39 @@ impl<'a> Builder<'a> {
             node_counts: HashMap::new(),
             site_counts: HashMap::new(),
             line_starts,
+            scope: RustScope::default(),
+            sym_ids: HashMap::new(),
+            parser: None,
+            macro_calls: 0,
         }
+    }
+
+    /// Intern a string for the resolver scope tables.
+    fn sym(&mut self, value: &str) -> Sym {
+        if let Some(sym) = self.sym_ids.get(value) {
+            return *sym;
+        }
+        let sym = Sym::try_from(self.scope.syms.len()).unwrap_or(Sym::MAX);
+        self.scope.syms.push(value.to_owned());
+        self.sym_ids.insert(value.to_owned(), sym);
+        sym
+    }
+
+    /// Index of the node most recently pushed by [`Self::node`].
+    fn last_node(&self) -> u32 {
+        u32::try_from(self.nodes.len().saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+
+    /// A Rust parser for macro-argument chunks, created once per file.
+    fn rust_parser(&mut self) -> Option<&mut tree_sitter::Parser> {
+        if self.parser.is_none() {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter::Language::from(tree_sitter_rust::LANGUAGE))
+                .ok()?;
+            self.parser = Some(parser);
+        }
+        self.parser.as_mut()
     }
 
     fn text(&self, node: Node<'_>) -> &'a str {
@@ -241,7 +285,7 @@ impl<'a> Builder<'a> {
         raw: &str,
         start: usize,
         end: usize,
-    ) {
+    ) -> u32 {
         let site = format!("{}\0{kind:?}\0{raw}", owner.0);
         let ordinal = self.site_counts.entry(site.clone()).or_default();
         let digest = blake3::hash(format!("{site}\0{ordinal}").as_bytes())
@@ -256,6 +300,7 @@ impl<'a> Builder<'a> {
             span: self.span(start, end),
             provenance: FactProvenance::Extracted,
         });
+        u32::try_from(self.unresolved.len() - 1).unwrap_or(u32::MAX)
     }
 }
 

@@ -43,7 +43,10 @@ pub fn event_rendered_height(
     if crate::ui::tool_projection::is_transparent(event) {
         return 0;
     }
-    if event.event_type == EventType::System && !show_system_events {
+    if event.event_type == EventType::System
+        && !show_system_events
+        && !event.is_provider_health_notice()
+    {
         return 0;
     }
     if event.event_type == EventType::Thinking && !show_thinking_events {
@@ -118,7 +121,9 @@ pub fn update_event_heights(state: &mut SessionState, width: u16) {
         let sequence = state.events[i].sequence;
 
         if crate::ui::tool_projection::is_transparent(&state.events[i])
-            || (event_type == EventType::System && !state.show_system_events)
+            || (event_type == EventType::System
+                && !state.show_system_events
+                && !state.events[i].is_provider_health_notice())
         {
             state.event_heights.push(0);
             state.event_offsets.push(offset);
@@ -933,6 +938,34 @@ mod tests {
         assert_eq!(state.event_heights[1], 0);
         // Offsets: event 0 starts at 0, event 1 at height[0], event 2 at height[0] (same, since system is 0)
         assert_eq!(state.event_offsets[2], state.event_heights[0]);
+    }
+
+    /// #2756: a provider-health row (a worker with no `rsi-agent` tools, a
+    /// retry-category histogram) is the operator's evidence, so it keeps its
+    /// height while ordinary system rows are hidden.
+    #[test]
+    fn provider_health_row_keeps_height_while_system_rows_are_hidden() {
+        let mut state = make_test_state();
+        let mut health = make_event(
+            EventType::System,
+            "[claude] agent_mcp_unavailable: rsi-agent is not connected",
+            None,
+            None,
+        );
+        health.metadata = Some(Box::new(serde_json::json!({
+            rsi_common::types::PROVIDER_HEALTH_METADATA_KEY: {"kind": "agent_mcp_unavailable"},
+        })));
+        state.events = vec![
+            make_event(EventType::Message, "hello", None, None),
+            make_event(EventType::System, "info", None, None),
+            health,
+        ];
+        state.show_system_events = false;
+
+        update_event_heights(&mut state, 80);
+
+        assert_eq!(state.event_heights[1], 0);
+        assert!(state.event_heights[2] > 0, "{:?}", state.event_heights);
     }
 
     #[test]

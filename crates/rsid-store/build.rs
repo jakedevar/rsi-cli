@@ -17,6 +17,46 @@ fn collect_store_sources(directory: &Path, files: &mut Vec<PathBuf>) -> io::Resu
     Ok(())
 }
 
+/// A `rerun-if-changed` path relative to this package (#1741). Cargo stores
+/// paths under the package root relative to it but keeps any other path
+/// absolute; an absolute workspace path (`Cargo.lock`) pins the fingerprint to
+/// one checkout, so a target seeded from another sandbox at the same commit
+/// would rerun this script and rebuild every dependent crate. Cargo resolves a
+/// relative path against the package root, so `../../Cargo.lock` is the same
+/// file in every checkout.
+fn package_relative(manifest_directory: &Path, path: &Path) -> PathBuf {
+    if let Ok(inside) = path.strip_prefix(manifest_directory) {
+        return inside.to_path_buf();
+    }
+    let mut prefix = PathBuf::new();
+    for ancestor in manifest_directory.ancestors().skip(1) {
+        prefix.push("..");
+        if let Ok(rest) = path.strip_prefix(ancestor) {
+            return prefix.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// `to` relative to the directory `from`; `None` when they share no root (a
+/// different drive on Windows).
+fn relative_to(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
+}
+
 fn store_source_digest(manifest_directory: &Path) -> io::Result<String> {
     let workspace = manifest_directory
         .parent()
@@ -41,7 +81,10 @@ fn store_source_digest(manifest_directory: &Path) -> io::Result<String> {
         hasher.update(relative.as_bytes());
         hasher.update(&(contents.len() as u64).to_le_bytes());
         hasher.update(&contents);
-        println!("cargo:rerun-if-changed={}", path.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            package_relative(manifest_directory, &path).display()
+        );
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -87,10 +130,27 @@ fn generate_store_migrations(manifest_directory: &Path, out_directory: &Path) ->
     source.push_str(&format!(
         "pub const LATEST_SCHEMA_VERSION: i32 = {latest};\n\n"
     ));
+    // Include each file by its path relative to this generated file, not via
+    // `env!("CARGO_MANIFEST_DIR")` (#1741): a compile-time manifest path marks
+    // the crate as baking its checkout location, so a target seeded from
+    // another sandbox (scripts/target-pool) would have to rebuild it and every
+    // dependent. The relative path names the same file in every checkout whose
+    // target directory sits at the same place relative to the sources.
+    let relative_directory = relative_to(out_directory, &directory);
     for version in &versions {
-        source.push_str(&format!(
-            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/store/migrations/v{version:03}.rs\"));\n"
-        ));
+        let include = match &relative_directory {
+            Some(relative) => format!(
+                "include!({:?});\n",
+                relative
+                    .join(format!("v{version:03}.rs"))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            ),
+            None => format!(
+                "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/store/migrations/v{version:03}.rs\"));\n"
+            ),
+        };
+        source.push_str(&include);
     }
     source.push_str(
         "\n/// Every migration step in ascending version order. Each step gates its own\n\
@@ -103,7 +163,10 @@ fn generate_store_migrations(manifest_directory: &Path, out_directory: &Path) ->
     source.push_str("];\n");
     fs::write(out_directory.join("store_migrations.rs"), source)?;
     // A directory path makes cargo rescan it, so a new file reruns this script.
-    println!("cargo:rerun-if-changed={}", directory.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        package_relative(manifest_directory, &directory).display()
+    );
     Ok(())
 }
 

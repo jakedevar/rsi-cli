@@ -69,27 +69,56 @@ async fn bounded_line(reader: &mut BufReader<UnixStream>, max_bytes: usize) -> i
 
 /// One bounded request/response exchange. The caller owns the method
 /// allowlist; this only enforces the envelope.
-async fn exchange(
+pub(crate) async fn exchange(
     reader: &mut BufReader<UnixStream>,
     method: &'static str,
     params: Value,
     max_response_bytes: usize,
     deadline: Duration,
 ) -> io::Result<RpcResponse> {
+    exchange_diagnosed(reader, method, params, max_response_bytes, deadline, None).await
+}
+
+async fn exchange_diagnosed(
+    reader: &mut BufReader<UnixStream>,
+    method: &'static str,
+    params: Value,
+    max_response_bytes: usize,
+    deadline: Duration,
+    mut diagnostics: Option<&mut super::diagnostics::Attempt>,
+) -> io::Result<RpcResponse> {
     let request = RpcRequest::new(method, params);
     let mut encoded = serde_json::to_vec(&request).map_err(io::Error::other)?;
     encoded.push(b'\n');
-    tokio::time::timeout(deadline, reader.get_mut().write_all(&encoded))
+    let start = Instant::now();
+    let written = tokio::time::timeout(deadline, reader.get_mut().write_all(&encoded))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC write timed out"))??;
-    let cap = max_response_bytes.min(MAX_RPC_ENVELOPE_BYTES);
-    let line = tokio::time::timeout(deadline, bounded_line(reader, cap))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC read timed out"))??;
-    let response: RpcResponse = serde_json::from_slice(&line).map_err(io::Error::other)?;
-    if response.jsonrpc != "2.0" || response.id != request.id {
-        return Err(protocol_error("invalid satellite RPC envelope"));
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "satellite RPC write timed out"))
+        .and_then(|result| result);
+    if let Some(attempt) = diagnostics.as_deref_mut() {
+        attempt.value.transport = super::diagnostics::measured(start, &written);
     }
+    written?;
+    let cap = max_response_bytes.min(MAX_RPC_ENVELOPE_BYTES);
+    let start = Instant::now();
+    let response = async {
+        let line = tokio::time::timeout(deadline, bounded_line(reader, cap))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "satellite RPC read timed out")
+            })??;
+        let response: RpcResponse = serde_json::from_slice(&line)
+            .map_err(|_| protocol_error("invalid satellite RPC JSON"))?;
+        if response.jsonrpc != "2.0" || response.id != request.id {
+            return Err(protocol_error("invalid satellite RPC envelope"));
+        }
+        Ok(response)
+    }
+    .await;
+    if let Some(attempt) = diagnostics {
+        attempt.value.daemon_rpc = super::diagnostics::measured(start, &response);
+    }
+    let response = response?;
     Ok(response)
 }
 
@@ -102,13 +131,43 @@ pub(crate) async fn call_read_rpc(
     max_response_bytes: usize,
     deadline: Duration,
 ) -> io::Result<Value> {
+    call_read_rpc_diagnosed(reader, method, params, max_response_bytes, deadline, None).await
+}
+
+pub(crate) async fn call_read_rpc_diagnosed(
+    reader: &mut BufReader<UnixStream>,
+    method: &'static str,
+    params: Value,
+    max_response_bytes: usize,
+    deadline: Duration,
+    mut diagnostics: Option<&mut super::diagnostics::Attempt>,
+) -> io::Result<Value> {
     if !matches!(method, "GetSatelliteIdentity" | "ListSatelliteSessions") {
         return Err(protocol_error(
             "satellite RPC method is outside read allowlist",
         ));
     }
-    let response = exchange(reader, method, params, max_response_bytes, deadline).await?;
+    if let Some(attempt) = diagnostics.as_deref_mut() {
+        attempt.value.rpc = if method == "GetSatelliteIdentity" {
+            rsi_common::satellite_diagnostics::SatelliteProbeRpcV1::Identity
+        } else {
+            rsi_common::satellite_diagnostics::SatelliteProbeRpcV1::SessionPage
+        };
+    }
+    let response = exchange_diagnosed(
+        reader,
+        method,
+        params,
+        max_response_bytes,
+        deadline,
+        diagnostics.as_deref_mut(),
+    )
+    .await?;
     if response.error.is_some() || response.result.is_none() {
+        if let Some(attempt) = diagnostics {
+            attempt.value.daemon_rpc.state =
+                rsi_common::satellite_diagnostics::SatelliteStageStateV1::InvalidResponse;
+        }
         return Err(protocol_error("invalid satellite RPC envelope"));
     }
     Ok(response.result.expect("checked result"))
@@ -246,6 +305,36 @@ pub(crate) async fn inspect_link_identity(
     Ok(identity)
 }
 
+pub(crate) async fn read_identity_diagnosed(
+    rpc: &mut BufReader<UnixStream>,
+    attempt: &mut super::diagnostics::Attempt,
+    deadline: Duration,
+) -> io::Result<SatelliteIdentityV1> {
+    let value = call_read_rpc_diagnosed(
+        rpc,
+        "GetSatelliteIdentity",
+        Value::Null,
+        MAX_RPC_ENVELOPE_BYTES,
+        deadline,
+        Some(attempt),
+    )
+    .await?;
+    let parsed = serde_json::from_value::<SatelliteIdentityV1>(value)
+        .map_err(|_| protocol_error("invalid satellite identity"))
+        .and_then(|identity| {
+            identity
+                .validate()
+                .map_err(|_| protocol_error("invalid satellite identity"))?;
+            Ok(identity)
+        });
+    if parsed.is_err() {
+        attempt.value.daemon_rpc.state =
+            rsi_common::satellite_diagnostics::SatelliteStageStateV1::InvalidResponse;
+    }
+    let identity = parsed?;
+    Ok(identity)
+}
+
 /// One bounded peer read, invoked only after S3 operator policy enables it.
 /// Every page must belong to one identity, incarnation and snapshot.
 pub(crate) async fn probe_link(
@@ -253,6 +342,26 @@ pub(crate) async fn probe_link(
     peer: &RegistryPeer,
     link: &RegistryLink,
     continuity: &mut PeerContinuity,
+) -> io::Result<PeerSnapshot> {
+    let mut attempt = super::diagnostics::Attempt::new(peer.id, link);
+    attempt.observe_tunnel(link).await;
+    let result = probe_link_diagnosed(satellite_root, peer, link, continuity, &mut attempt).await;
+    if result.is_err()
+        && attempt.value.daemon_rpc.state
+            == rsi_common::satellite_diagnostics::SatelliteStageStateV1::Succeeded
+    {
+        attempt.value.daemon_rpc.state =
+            rsi_common::satellite_diagnostics::SatelliteStageStateV1::InvalidResponse;
+    }
+    result
+}
+
+async fn probe_link_diagnosed(
+    satellite_root: &Path,
+    peer: &RegistryPeer,
+    link: &RegistryLink,
+    continuity: &mut PeerContinuity,
+    attempt: &mut super::diagnostics::Attempt,
 ) -> io::Result<PeerSnapshot> {
     peer.validate(satellite_root).map_err(protocol_error)?;
     if !peer.enabled
@@ -273,25 +382,19 @@ pub(crate) async fn probe_link(
             "satellite link is not registered for peer",
         ));
     }
-    let socket = connect_owned_socket(satellite_root, &link.socket_path, RPC_DEADLINE).await?;
-    let mut rpc = BufReader::new(socket);
-    let identity_value = call_read_rpc(
-        &mut rpc,
-        "GetSatelliteIdentity",
-        Value::Null,
-        MAX_RPC_ENVELOPE_BYTES,
-        RPC_DEADLINE,
-    )
-    .await?;
-    let identity: SatelliteIdentityV1 =
-        serde_json::from_value(identity_value).map_err(io::Error::other)?;
-    identity.validate().map_err(io::Error::other)?;
+    let start = Instant::now();
+    let socket = connect_owned_socket(satellite_root, &link.socket_path, RPC_DEADLINE).await;
+    attempt.value.connect = super::diagnostics::measured(start, &socket);
+    let mut rpc = BufReader::new(socket?);
+    let identity = read_identity_diagnosed(&mut rpc, attempt, RPC_DEADLINE).await?;
     if continuity.observe(
         link.id,
         identity.installation_id.0,
         identity.daemon_incarnation_id.0,
     ) != ContinuityResult::Matched
     {
+        attempt.value.daemon_rpc.state =
+            rsi_common::satellite_diagnostics::SatelliteStageStateV1::Refused;
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "satellite installation identity requires review or is quarantined",
@@ -303,6 +406,8 @@ pub(crate) async fn probe_link(
     ) {
         return Err(protocol_error("satellite read protocol is incompatible"));
     }
+    attempt.identity(&identity);
+    super::record_reported_health(peer.id, identity.health.as_ref());
     let limits = &identity.capabilities.limits;
     let mut sessions = Vec::new();
     let mut seen = HashSet::new();
@@ -318,7 +423,7 @@ pub(crate) async fn probe_link(
         };
         request.validate(limits).map_err(io::Error::other)?;
         let params = serde_json::to_value(request).map_err(io::Error::other)?;
-        let page_value = call_read_rpc(
+        let page_value = call_read_rpc_diagnosed(
             &mut rpc,
             "ListSatelliteSessions",
             params,
@@ -326,6 +431,7 @@ pub(crate) async fn probe_link(
                 .unwrap_or(MAX_RPC_ENVELOPE_BYTES)
                 .saturating_add(4_096),
             RPC_DEADLINE,
+            Some(attempt),
         )
         .await?;
         let page: SatelliteSessionPageV1 =
@@ -509,6 +615,45 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn forwarded_socket_write_backpressure_is_a_transport_timeout() {
+        use rsi_common::satellite_diagnostics::SatelliteStageStateV1 as State;
+        let link = RegistryLink {
+            id: Uuid::new_v4(),
+            direction: LinkDirection::DialHomeReverse,
+            socket_path: "/fixture/peer.sock".into(),
+            ssh_target: None,
+            trust_reference: "fixture".into(),
+            enabled: true,
+            priority: 0,
+        };
+        let peer_id = Uuid::new_v4();
+        let (client, _unread_server) = UnixStream::pair().unwrap();
+        let mut rpc = BufReader::new(client);
+        let mut attempt = super::super::diagnostics::Attempt::new(peer_id, &link);
+        let error = call_read_rpc_diagnosed(
+            &mut rpc,
+            "GetSatelliteIdentity",
+            json!({"fixture": "x".repeat(2 * 1024 * 1024)}),
+            256,
+            Duration::from_millis(20),
+            Some(&mut attempt),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempt.value.transport.state, State::TimedOut);
+        assert!(attempt.value.transport.elapsed_ms.unwrap() >= 15);
+        assert_eq!(attempt.value.daemon_rpc.state, State::NotAttempted);
+        assert_eq!(attempt.value.auth.state, State::Unobserved);
+        assert_eq!(attempt.value.store_probe.state, State::Unobserved);
+        drop(attempt);
+        let published = crate::store_support::satellite::reachability(peer_id).unwrap();
+        assert_eq!(published.transport.state, State::TimedOut);
+        assert!(serde_json::to_vec(&published).unwrap().len() < 1_024);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn disabled_peers_never_claim_and_failures_back_off() {
         let now = Instant::now();
@@ -630,10 +775,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn registered_peer_collects_one_bounded_snapshot() {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-probe-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-probe-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -681,6 +823,9 @@ mod tests {
                 capabilities: SatelliteCapabilitiesV1 {
                     session_read: true,
                     limits: SatelliteReadLimitsV1::default(),
+                    qa_run: false,
+                    report_outcomes: false,
+                    deploy_interrupt: false,
                 },
                 health: None,
             };

@@ -13,16 +13,19 @@ SSH options:
   --port PORT          SSH server port (default: SSH config / OpenSSH default)
   --jump TARGET        ProxyJump target; use SSH config for ProxyCommand
   --ssh-config PATH    Operator-managed SSH config file
+  --replace-template   Overwrite a differing installed rsi-satellite-direct@.service even
+                       though other instances have no env file (you own their env files)
 EOF
 }
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then usage; exit 0; fi
-positionals=(); ssh_port=""; ssh_jump=""; ssh_config=""
+positionals=(); ssh_port=""; ssh_jump=""; ssh_config=""; replace_template=0
 while (($#)); do
   case "$1" in
     --port|--jump|--ssh-config)
       option="$1"; (($# >= 2)) || { echo "missing value for $option" >&2; exit 2; }
       case "$option" in --port) ssh_port="$2";; --jump) ssh_jump="$2";; --ssh-config) ssh_config="$2";; esac
       shift 2 ;;
+    --replace-template) replace_template=1; shift ;;
     --*) echo "unknown option: $1" >&2; exit 2 ;;
     *) positionals+=("$1"); shift ;;
   esac
@@ -61,7 +64,37 @@ fi
 
 mkdir -p -- "$unit_dir" "$config_dir" "$libexec_dir"
 chmod 700 -- "$config_dir"
-install -m 0644 "$script_dir/rsi-satellite-direct@.service" "$unit_dir/rsi-satellite-direct@.service"
+
+# Another instance's unit reads the template's env path; overwriting a differing template
+# with instances that have no %i-direct.env would leave them failing to start (hub #2946).
+template_src="$script_dir/rsi-satellite-direct@.service"
+template_dst="$unit_dir/rsi-satellite-direct@.service"
+if [[ -e "$template_dst" ]] && ! cmp -s -- "$template_src" "$template_dst" && ((replace_template == 0)); then
+  declare -A seen_instances=()
+  for path in "$unit_dir"/default.target.wants/rsi-satellite-direct@*.service \
+              "$unit_dir"/rsi-satellite-direct@*.service.d "$config_dir"/*-direct.env; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    instance="$(basename -- "$path")"
+    instance="${instance#rsi-satellite-direct@}"
+    instance="${instance%.service.d}"; instance="${instance%.service}"; instance="${instance%-direct.env}"
+    [[ -n "$instance" && "$instance" != "$name" ]] || continue
+    seen_instances["$instance"]=1
+  done
+  missing_env=()
+  for instance in "${!seen_instances[@]}"; do
+    [[ -f "$config_dir/$instance-direct.env" ]] || missing_env+=("$instance")
+  done
+  if ((${#missing_env[@]} > 0)); then
+    {
+      echo "refusing to overwrite the differing $template_dst:"
+      echo "these other instances have no $config_dir/<name>-direct.env and would fail to start:"
+      printf '  %s\n' "${missing_env[@]}"
+      echo "Write their env files, or rerun with --replace-template once you have migrated them."
+    } >&2
+    exit 1
+  fi
+fi
+install -m 0644 "$template_src" "$template_dst"
 install -m 0755 "$script_dir/direct.sh" "$libexec_dir/direct.sh"
 config_file="$config_dir/$name-direct.env"
 umask 077

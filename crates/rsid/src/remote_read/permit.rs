@@ -96,8 +96,8 @@ impl RemoteReadLimiter {
     }
 
     /// Run a read in capture → Store → finish order under one permit. Runtime
-    /// callbacks execute without the Store lock. Store acquisition never
-    /// waits, and its transaction/budget are restored before `finish` runs.
+    /// callbacks execute without the Store lock. Store acquisition waits at
+    /// most `STORE_LOCK_WAIT` (inside the permit and the read deadline), and its transaction/budget are restored before `finish` runs.
     /// The completed result still owns the permit through socket settlement.
     pub fn spawn_staged_store<C, S, T>(
         &self,
@@ -116,19 +116,41 @@ impl RemoteReadLimiter {
             budget.check()?;
             let captured = capture(budget)?;
             budget.check()?;
-            let saved = with_store_budget_deadline(
-                store.try_lock_owned().map_err(|_| ReadError::Busy)?,
-                sql_deadline,
-                |conn| {
+            let saved =
+                with_store_budget_deadline(acquire_store(&store, budget)?, sql_deadline, |conn| {
                     budget.check()?;
                     read_store(conn, &captured, budget)
-                },
-            )?;
+                })?;
             budget.check()?;
             let completed = finish(captured, saved, budget)?;
             budget.check()?;
             Ok(completed)
         })
+    }
+}
+
+/// Longest a Remote read waits for the Store lock before answering `busy`. A
+/// brief hold by another daemon task must not fail a phone read, but the wait
+/// stays inside the permit and the read deadline so it can never stall the daemon.
+const STORE_LOCK_WAIT: Duration = Duration::from_millis(100);
+const STORE_LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Take the Store lock from a blocking worker, polling for at most
+/// `STORE_LOCK_WAIT` (and never past the read's own deadline).
+pub(super) fn acquire_store(
+    store: &Arc<Mutex<Store>>,
+    budget: RemoteReadBudget,
+) -> Result<tokio::sync::OwnedMutexGuard<Store>> {
+    let give_up = (Instant::now() + STORE_LOCK_WAIT).min(budget.deadline);
+    loop {
+        if let Ok(guard) = Arc::clone(store).try_lock_owned() {
+            return Ok(guard);
+        }
+        let now = Instant::now();
+        if now >= give_up {
+            return Err(ReadError::Busy);
+        }
+        std::thread::sleep(STORE_LOCK_POLL.min(give_up - now));
     }
 }
 
@@ -255,10 +277,11 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[tokio::test]
-    async fn staged_store_worker_refuses_held_store_without_waiting() {
+    async fn staged_store_worker_refuses_held_store_after_a_short_bounded_wait() {
         let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
         let held = Arc::clone(&store).lock_owned().await;
         let limiter = RemoteReadLimiter::new();
+        let started = Instant::now();
         let completed = limiter
             .spawn_staged_store(
                 store,
@@ -270,6 +293,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(&completed.result, Err(ReadError::Busy)));
+        assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(limiter.slots.available_permits(), MAX_IN_FLIGHT - 1);
         drop(completed);
         drop(held);

@@ -247,7 +247,7 @@ async fn test_e2e_agent_created_project_is_followed_unless_the_setting_is_off() 
         idempotency_key: "agent-projects-seat".into(),
     };
     let grant = client.configure_global_manager(seat).await?;
-    let mut term = spawn_tui(&h)?.await?;
+    let term = spawn_tui(&h)?.await?;
     let outcome = async {
         visible(&term, "Agent project creator").await?;
         let before = settled_tab_dots(&term).await;

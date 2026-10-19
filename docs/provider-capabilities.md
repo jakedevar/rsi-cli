@@ -28,6 +28,29 @@ The semantic fixture is bounded and omits provider prompt payloads. Its digest i
 | `gpt-6-astra` maximum output | 128000 | [Official documentation](https://developers.openai.com/api/docs/models/gpt-6-astra); separate from installed catalog context |
 | Session compaction limit | runtime/configured when present | The installed 0.155.1 catalog omits a context-compaction threshold; `comp_hash` and `truncation_policy` are preserved metadata, not token capacity |
 
+## Harness direct-API routes
+
+Rendered from the Harness compatible table, so each row is the wire profile the provider sends. Mercury is Inception's diffusion model (`mercury-2`).
+
+| Property | Mercury (`mercury-2`) |
+| --- | --- |
+| Route | `mercury` at `https://api.inceptionlabs.ai/v1` |
+| Key | Provider Keys vault slot; env fallbacks `INCEPTION_API_KEY`, `MERCURY_API_KEY` |
+| Native tool calls | yes |
+| Reasoning effort | `reasoning_effort`: instant, low, medium, high |
+| Output cap | `max_completion_tokens` (16384, reasoning included) |
+| `tool_choice: "none"` beside `tools` | accepted |
+
+| RSI effort | Mercury `reasoning_effort` |
+| --- | --- |
+| `minimal` | instant |
+| `none` | instant |
+| `low` | low |
+| `medium` | medium |
+| `high` | high |
+| `xhigh` | high |
+| `max` | high |
+
 ## Catalog field classification
 
 | Field | Category | Handling | Detail |
@@ -82,7 +105,7 @@ The semantic fixture is bounded and omits provider prompt payloads. Its digest i
 | live-monitor | `crates/rsid/src/session/monitor.rs` | `persist_runtime_context_observation` | `call:resolve_runtime_context_budget` → `call:compare_and_update_session_model, call:install_context_budget, return` |
 | memory-flush | `crates/rsid/src/session/monitor.rs` | `memory_flush_turn_candidate` | `call:context_budget` → `call:should_run_memory_flush, field:active_tokens` |
 | rotation | `crates/rsid/src/session/rotation.rs` | `SessionManager::decide_rotation_successor` | `call:resolve_new_incarnation_context_budget` → `field:context_window, field:resolved_context_budget` |
-| context-injection | `crates/rsid/src/session/launch.rs` | `SessionManager::launch_session_with_retry_admission` | `call:context_injection_allowance` → `call:assemble` |
+| context-injection | `crates/rsid/src/session/launch.rs` | `SessionManager::compose_launch_system_prompt` | `call:context_injection_allowance` → `call:assemble` |
 | harness-full-window-compaction | `crates/rsid/src/session/harness/mod.rs` | `HarnessClient::launch_with_binding` | `parameter:resolved_context_budget` → `call:run_harness_loop_with_compact_budget` |
 | persistence | `crates/rsid-store/src/store/sessions.rs` | `persisted_context_budget` | `parameter:resolved` → `field:source, field:source_version, field:source_digest, field:observed_at` |
 | rpc-session | `crates/rsid/src/session/queries.rs` | `rehydrate_context_budget_projection` | `call:rehydrate_resolved_context_budget` → `assignment:session.resolved_context_budget` |

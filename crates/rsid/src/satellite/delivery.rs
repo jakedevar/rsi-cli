@@ -1,11 +1,15 @@
 //! Satellite side of #1017 slice 3: accept one message from an allowlisted hub
-//! for an idle session inside the operator-declared scope.
+//! for a session inside the operator-declared scope.
 //!
 //! The satellite trusts nothing the hub says beyond its own operator-set
-//! policy: the hub installation must be allowlisted, the target must be a
-//! scope root or a descendant of one, and the target must be idle at the
-//! moment of the call. Anything else is refused with no side effect, and every
-//! refusal that could reveal whether a session exists is identical.
+//! policy: the hub installation must be allowlisted and the target must be a
+//! scope root or a descendant of one. An idle target is continued with the
+//! message. A live (running) target is not made to wait for full idle (#2566):
+//! the message is queued durably on the target's operator queue, which the
+//! per-session `PostToolUse` hook drains at the next tool boundary (#1049) and
+//! the turn-end dispatcher drains otherwise. A target that is neither idle nor
+//! live (interrupted, failed, archived) is refused with no side effect, and
+//! every refusal that could reveal whether a session exists is identical.
 
 use crate::error::{DaemonError, Result};
 use crate::session::SessionManager;
@@ -15,13 +19,12 @@ use rsi_common::SessionStatus;
 use rsi_common::satellite_dispatch::{
     SATELLITE_BUSY, SATELLITE_LAUNCH_FAILED_CONTINUATION,
     SATELLITE_LAUNCH_FAILED_PROVIDER_BINARY_MISSING, SATELLITE_LAUNCH_FAILED_PROVIDER_SPAWN,
-    SATELLITE_MESSAGE_KEY_CONFLICT, SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeliverOutcomeV1,
+    SATELLITE_LAUNCH_FAILED_SANDBOX_CUSTODY, SATELLITE_MESSAGE_KEY_CONFLICT,
+    SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeliverOutcomeV1, SatelliteDeliverRedirectV1,
     SatelliteDeliverRequestV1, SatelliteDeliverResultV1, SatelliteDeployRequestV1,
+    remote_terminal_refusal,
 };
 use uuid::Uuid;
-
-/// Bound on the parent walk that decides whether a target is in scope.
-const MAX_SCOPE_DEPTH: usize = 32;
 
 fn not_authorized() -> DaemonError {
     DaemonError::PolicyDenied(SATELLITE_TARGET_NOT_AUTHORIZED.into())
@@ -41,6 +44,12 @@ fn launch_failure_refusal(error: DaemonError) -> DaemonError {
         {
             return error;
         }
+        // #2956: the typed custody refusal crosses as its own static class.
+        DaemonError::StructuredRpc { ref data, .. }
+            if data.get("kind").and_then(serde_json::Value::as_str) == Some("sandbox_custody") =>
+        {
+            SATELLITE_LAUNCH_FAILED_SANDBOX_CUSTODY
+        }
         DaemonError::ClaudeBinaryNotFound
         | DaemonError::CodexBinaryNotFound
         | DaemonError::AgyBinaryNotFound => SATELLITE_LAUNCH_FAILED_PROVIDER_BINARY_MISSING,
@@ -55,9 +64,19 @@ fn launch_failure_refusal(error: DaemonError) -> DaemonError {
 
 /// The provider-ready text: the shared attributed envelope naming the hub
 /// manager session, with the hub identity in the body for the audit trail.
-fn render(request: &SatelliteDeliverRequestV1) -> String {
+/// #272: a message redirected from a replaced seat says so in its header.
+fn render(
+    request: &SatelliteDeliverRequestV1,
+    redirected: Option<SatelliteDeliverRedirectV1>,
+) -> String {
+    let redirect = redirected.map_or_else(String::new, |redirect| {
+        format!(
+            "\n(Addressed to session {}, which resolved to {}, a manager seat another session has replaced; delivered to you, the project's current appointed seat, #272.)",
+            redirect.addressed_session_id, redirect.displaced_session_id,
+        )
+    });
     let body = format!(
-        "From hub manager \"{}\" (session {}, hub installation {}):\n\n{}",
+        "From hub manager \"{}\" (session {}, hub installation {}):{redirect}\n\n{}",
         request.sender_label,
         request.sender_session_id,
         request.hub_installation_id.0,
@@ -70,9 +89,43 @@ fn render(request: &SatelliteDeliverRequestV1) -> String {
     )
 }
 
+/// How an accepted message reaches its target (#2566).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// The target is idle: continue it with the message.
+    Continue,
+    /// The target is mid-turn: queue the message for its next boundary.
+    QueueForBoundary,
+}
+
+/// The effect for a live target: one durable operator-queue row keyed by the
+/// hub message id, so a replay can never queue a second copy. The row is the
+/// whole effect; the hook (or, failing that, the turn-end dispatcher) delivers
+/// it. A store refusal happened before any row existed, so it is a definite
+/// non-effect: `busy`, which the hub retries.
+async fn queue_for_boundary(
+    manager: &SessionManager,
+    target: Uuid,
+    request: &SatelliteDeliverRequestV1,
+    text: String,
+) -> Result<()> {
+    let queued = manager.store().lock().await.queue_operator_message(
+        target,
+        &text,
+        &request.message_id.to_string(),
+    );
+    match queued {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            tracing::warn!(message_id = %request.message_id, "satellite boundary queue failed: {error}");
+            Err(DaemonError::PolicyDenied(SATELLITE_BUSY.into()))
+        }
+    }
+}
+
 /// # Errors
 /// `target_not_authorized` for every policy or scope refusal, `busy` when the
-/// target is not idle, or a persistence/continuation error.
+/// target is neither idle nor live, or a persistence/continuation error.
 pub(crate) async fn deliver_hub_message(
     manager: &SessionManager,
     request: SatelliteDeliverRequestV1,
@@ -98,32 +151,17 @@ where
         .map_err(|code| DaemonError::InvalidParam(code.into()))?;
     let target = request.remote_session_id.0;
     let delivery_target;
+    let redirected;
+    let route;
     {
         let store = manager.store().lock().await;
-        let policy = store.satellite_inbound_policy()?;
-        if !policy
-            .allowed_hub_installations
-            .iter()
-            .any(|id| id.0 == request.hub_installation_id.0)
-        {
+        // #1928: one resolver for delivery, policy push, deploy and reports.
+        let scope = store.inbound_scope()?;
+        if !scope.allows_hub(request.hub_installation_id.0) {
             return Err(not_authorized());
         }
-        let roots: std::collections::HashSet<Uuid> =
-            policy.scope_roots.iter().map(|id| id.0).collect();
-        let mut cursor = Some(target);
-        let mut scope_root = None;
-        for _ in 0..MAX_SCOPE_DEPTH {
-            let Some(id) = cursor else { break };
-            let Some(session) = store.get_session(id)? else {
-                break;
-            };
-            if roots.contains(&id) {
-                scope_root = Some(id);
-                break;
-            }
-            cursor = session.parent_id;
-        }
-        let Some(scope_root) = scope_root else {
+        let scope_project = request.scope_project_id.map(|id| id.0);
+        let Some(hit) = store.inbound_scope_hit(&scope, target, scope_project)? else {
             return Err(not_authorized());
         };
         // A settled or pending receipt is reported before the lineage is
@@ -143,6 +181,7 @@ where
                     return Ok(SatelliteDeliverResultV1 {
                         message_id: request.message_id,
                         outcome: SatelliteDeliverOutcomeV1::AlreadyDelivered,
+                        redirected: None,
                     });
                 }
                 // Recorded before the effect and never settled: the effect
@@ -151,6 +190,7 @@ where
                     return Ok(SatelliteDeliverResultV1 {
                         message_id: request.message_id,
                         outcome: SatelliteDeliverOutcomeV1::Uncertain,
+                        redirected: None,
                     });
                 }
                 // A definite non-effect (the target was busy): retry below.
@@ -158,18 +198,59 @@ where
             }
         }
         // #1112: a declared seat that rotated is reached at its current
-        // rotation tip. An ambiguous, cross-project or unresolvable lineage
-        // fails closed.
-        let Some(tip) = store.satellite_delivery_tip(target, scope_root)? else {
+        // rotation tip; #1928: a declared project is reached at its current
+        // appointed manager. An ambiguous, cross-project, unappointed or
+        // revoked scope fails closed.
+        // #272: an address that resolves to a replaced seat reaches the
+        // declared project's current seat, and the receipt says so.
+        let Some(delivery) = store.inbound_scope_delivery(&scope, hit, target)? else {
             return Err(not_authorized());
         };
-        delivery_target = tip;
-        let status = store.get_session(delivery_target)?.map(|s| s.status);
-        // Interrupted (by the operator or a restart) is not idle: the operator
-        // stopped it, so hub mail must not resume it.
-        if !matches!(status, Some(SessionStatus::Completed)) {
-            return Err(DaemonError::PolicyDenied(SATELLITE_BUSY.into()));
+        delivery_target = delivery.seat;
+        redirected = delivery
+            .displaced
+            .map(|displaced| SatelliteDeliverRedirectV1 {
+                addressed_session_id: target,
+                displaced_session_id: displaced,
+                delivered_session_id: delivery.seat,
+            });
+        if let Some(redirect) = redirected {
+            tracing::info!(message_id = %request.message_id, addressed = %target,
+                displaced = %redirect.displaced_session_id, seat = %delivery.seat,
+                "hub message to a replaced manager seat redirected to the current seat");
         }
+        let session = store.get_session(delivery_target)?;
+        let status = session.as_ref().map(|s| s.status);
+        route = match status {
+            Some(SessionStatus::Completed) => Route::Continue,
+            // #2566: a live turn gets the message at its next boundary; it is
+            // not held until the session happens to go idle.
+            Some(
+                SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval,
+            ) => Route::QueueForBoundary,
+            // #2744: a failed, archived or deleted target can never take a
+            // turn. Say so with its real status and stop reason, so the
+            // sender repairs the target instead of reading `busy` as "working".
+            Some(
+                terminal @ (SessionStatus::Failed
+                | SessionStatus::Archived
+                | SessionStatus::Deleted),
+            ) => {
+                let name = match terminal {
+                    SessionStatus::Failed => "failed",
+                    SessionStatus::Archived => "archived",
+                    _ => "deleted",
+                };
+                let stop_reason = session.as_ref().and_then(|s| s.stop_reason.as_deref());
+                return Err(DaemonError::PolicyDenied(remote_terminal_refusal(
+                    name,
+                    stop_reason,
+                )));
+            }
+            // Interrupted (by the operator or a restart) is not idle: the
+            // operator stopped it, so hub mail must not resume it.
+            _ => return Err(DaemonError::PolicyDenied(SATELLITE_BUSY.into())),
+        };
     }
     // Write-ahead: the attempt is durable BEFORE the effect, so a crash or a
     // failed settle can only leave it `pending` (uncertain), never a second
@@ -191,11 +272,19 @@ where
         return Ok(SatelliteDeliverResultV1 {
             message_id: request.message_id,
             outcome: SatelliteDeliverOutcomeV1::Uncertain,
+            redirected: None,
         });
     }
     // The continuation itself refuses (`busy`) rather than interrupts if the
     // session became active after the read above.
-    if let Err(error) = effect(delivery_target, render(&request)).await {
+    let effect_result = match route {
+        Route::Continue => effect(delivery_target, render(&request, redirected)).await,
+        Route::QueueForBoundary => {
+            let text = render(&request, redirected);
+            queue_for_boundary(manager, delivery_target, &request, text).await
+        }
+    };
+    if let Err(error) = effect_result {
         // Only `busy` is a definite non-effect; any other failure may have
         // happened after the provider was handed the message, so the attempt
         // stays `pending` (uncertain) rather than risk a replay.
@@ -221,35 +310,8 @@ where
     Ok(SatelliteDeliverResultV1 {
         message_id: request.message_id,
         outcome: SatelliteDeliverOutcomeV1::Delivered,
+        redirected,
     })
-}
-
-/// #1131: the first declared scope root whose current rotation tip is live,
-/// as `(declared root, tip)`. The scope stays checked on the declared id and
-/// keys the deploy replay (stable across rotation); the deploy is owned by the
-/// seat's tip (the same lineage rule as hub mail, #1112), so a rotated
-/// sub-manager still owns its settlement wake. A branched, cross-project,
-/// over-long or unknown lineage skips that root (fail closed).
-fn live_deploy_owner(
-    store: &crate::store::Store,
-    scope_roots: &[rsi_common::satellite::SatelliteUuidV1],
-) -> Result<Option<(Uuid, Uuid)>> {
-    for root in scope_roots {
-        let Some(tip) = store.satellite_delivery_tip(root.0, root.0)? else {
-            continue;
-        };
-        let Some(session) = store.get_session(tip)? else {
-            continue;
-        };
-        if matches!(
-            session.status,
-            SessionStatus::Archived | SessionStatus::Deleted
-        ) {
-            continue;
-        }
-        return Ok(Some((root.0, session.id)));
-    }
-    Ok(None)
 }
 
 /// #1017 slice 2: a hub-initiated deploy on this satellite. Accepted only from
@@ -275,22 +337,29 @@ pub(crate) async fn request_hub_deploy(
         .map_err(|code| DaemonError::InvalidParam(code.into()))?;
     let (owner, record_root, roots) = {
         let store = manager.store().lock().await;
-        let policy = store.satellite_inbound_policy()?;
-        if !policy
-            .allowed_hub_installations
-            .iter()
-            .any(|id| id.0 == request.hub_installation_id.0)
-        {
+        // #1131/#1928: the owner is the live seat of the first declared scope
+        // entry (a root's rotation tip or a project's appointed manager). The
+        // replay identity stays the declared id, stable across rotation and
+        // re-appointment.
+        let scope = store.inbound_scope()?;
+        if !scope.allows_hub(request.hub_installation_id.0) {
             return Err(not_authorized());
         }
-        let (root, owner) = live_deploy_owner(&store, &policy.scope_roots)?.ok_or_else(|| {
+        let (root, owner) = scope.first_live().ok_or_else(|| {
             DaemonError::PolicyDenied(
                 rsi_common::agent_deploy::SATELLITE_DEPLOY_OWNER_REQUIRED.into(),
             )
         })?;
-        let roots: Vec<Uuid> = policy.scope_roots.iter().map(|id| id.0).collect();
-        (owner, root, roots)
+        (owner, root, scope.declared_addresses())
     };
+    let local_request = request.as_local_request();
+    if local_request.is_cancel() {
+        let receipt = manager
+            .agent_control()
+            .cancel_owned_deploy(owner, &local_request, now, true, Some(&roots))
+            .await?;
+        return Ok(receipt);
+    }
     crate::session::deploy_verb::stage_owned_deploy(
         manager.store(),
         owner,
@@ -298,10 +367,11 @@ pub(crate) async fn request_hub_deploy(
             lookup: &roots,
             record: record_root,
         }),
-        request.as_local_request(),
+        local_request,
         service,
         now,
         None,
+        Some((&manager.deploy_drain(), &manager.runtime_config)),
     )
     .await
 }
@@ -339,7 +409,7 @@ mod tests {
     fn rig(allow_hub: bool) -> Rig {
         let dir = TempDir::new().unwrap();
         let sandbox = TempDir::new().unwrap();
-        let store = Store::open(&dir.path().join("rsi.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("rsi.db")).unwrap();
         let root = insert(&store, None, SessionStatus::Completed);
         let child = insert(&store, Some(root), SessionStatus::Running);
         let outsider = insert(&store, None, SessionStatus::Completed);
@@ -352,6 +422,7 @@ mod tests {
                     Vec::new()
                 },
                 scope_roots: vec![SatelliteUuidV1(root)],
+                ..Default::default()
             })
             .unwrap();
         let manager = SessionManager::new(
@@ -384,6 +455,7 @@ mod tests {
             sender_label: "hub manager".into(),
             sender_session_id: Uuid::new_v4(),
             remote_session_id: SatelliteUuidV1(target),
+            scope_project_id: None,
             message: text.into(),
         }
     }
@@ -427,17 +499,118 @@ mod tests {
         );
     }
 
+    /// Drive one queued operator row through the tool-boundary claim the hook
+    /// makes (`claim_operator_queue`): claim, cross the effect boundary, settle
+    /// `delivered`. Returns the text the model would be shown.
+    async fn boundary_claim(rig: &Rig, target: Uuid) -> Option<String> {
+        let mut store = rig.manager.store().lock().await;
+        let message = store.claim_operator_message(target).unwrap()?;
+        store
+            .mark_operator_message_effect_possible(message.id)
+            .unwrap();
+        store
+            .deliver_operator_message_with_transcript(message.id, None)
+            .unwrap();
+        Some(message.content)
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn running_target_in_scope_is_busy_and_records_nothing() {
+    async fn running_target_in_scope_gets_the_message_at_its_next_boundary() {
         let rig = rig(true);
         let id = Uuid::new_v4();
+        let delivered =
+            deliver_hub_message(&rig.manager, request(&rig, rig.child, id, "assignment"))
+                .await
+                .unwrap();
+        assert_eq!(delivered.outcome, SatelliteDeliverOutcomeV1::Delivered);
+        assert_eq!(attempt_state(&rig, id).await, Some(InboundState::Delivered));
+        {
+            let store = rig.manager.store().lock().await;
+            let queued = store.list_operator_messages(rig.child).unwrap();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].state, "queued");
+        }
+        let shown = boundary_claim(&rig, rig.child).await.expect("claimable");
+        assert!(shown.contains("assignment"), "{shown}");
+        assert!(shown.contains(&id.to_string()), "{shown}");
+        // The session is still running; nothing was continued or interrupted.
+        let store = rig.manager.store().lock().await;
+        assert_eq!(
+            store.get_session(rig.child).unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+        assert_eq!(
+            store.list_operator_messages(rig.child).unwrap()[0].state,
+            "delivered"
+        );
+    }
+
+    /// #2566: a target that never goes idle still receives every message, in
+    /// order, and a replay of a delivered id queues nothing new.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_target_that_never_goes_idle_receives_every_message_in_order() {
+        let rig = rig(true);
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (n, id) in ids.iter().enumerate() {
+            let outcome = deliver_hub_message(
+                &rig.manager,
+                request(&rig, rig.child, *id, &format!("work-{n}")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.outcome, SatelliteDeliverOutcomeV1::Delivered);
+        }
+        let replay = deliver_hub_message(&rig.manager, request(&rig, rig.child, ids[0], "work-0"))
+            .await
+            .unwrap();
+        assert_eq!(replay.outcome, SatelliteDeliverOutcomeV1::AlreadyDelivered);
+        for n in 0..3 {
+            let shown = boundary_claim(&rig, rig.child).await.expect("queued");
+            assert!(shown.contains(&format!("work-{n}")), "{shown}");
+        }
+        assert!(boundary_claim(&rig, rig.child).await.is_none());
+        let store = rig.manager.store().lock().await;
+        assert_eq!(
+            store.get_session(rig.child).unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_failed_boundary_queue_is_a_definite_non_effect_the_hub_retries() {
+        let rig = rig(true);
+        let id = Uuid::new_v4();
+        rig.manager
+            .store()
+            .lock()
+            .await
+            .conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_queue BEFORE INSERT ON operator_messages BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            )
+            .unwrap();
         let text = refusal_text(
             deliver_hub_message(&rig.manager, request(&rig, rig.child, id, "hi")).await,
         );
         assert!(text.contains(SATELLITE_BUSY), "{text}");
-        let store = rig.manager.store().lock().await;
-        assert!(store.satellite_inbound_delivery(id).unwrap().is_none());
+        assert_eq!(
+            attempt_state(&rig, id).await,
+            Some(InboundState::NotDelivered)
+        );
+        rig.manager
+            .store()
+            .lock()
+            .await
+            .conn
+            .execute_batch("DROP TRIGGER fail_queue;")
+            .unwrap();
+        let retry = deliver_hub_message(&rig.manager, request(&rig, rig.child, id, "hi"))
+            .await
+            .unwrap();
+        assert_eq!(retry.outcome, SatelliteDeliverOutcomeV1::Delivered);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -486,6 +659,50 @@ mod tests {
         assert!(text.contains(SATELLITE_BUSY), "{text}");
         let store = rig.manager.store().lock().await;
         assert!(store.satellite_inbound_delivery(id).unwrap().is_none());
+    }
+
+    /// #2744: a failed, archived or deleted target is answered with its real
+    /// status and stop reason (never `busy`), records nothing, and a target
+    /// mid-turn is still accepted for its next boundary.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn terminal_targets_are_named_and_a_mid_turn_target_is_not_refused() {
+        let rig = rig(true);
+        for (status, name) in [
+            (SessionStatus::Failed, "failed"),
+            (SessionStatus::Archived, "archived"),
+            (SessionStatus::Deleted, "deleted"),
+        ] {
+            let target = {
+                let store = rig.manager.store().lock().await;
+                let mut session = rsid_store::test_support::make_test_session();
+                session.parent_id = Some(rig.root);
+                session.status = status;
+                session.stop_reason = Some("provider_error: codex 401 /home/x".into());
+                store.insert_session(&session).unwrap();
+                session.id
+            };
+            let id = Uuid::new_v4();
+            let text = refusal_text(
+                deliver_hub_message(&rig.manager, request(&rig, target, id, "hi")).await,
+            );
+            assert!(
+                text.contains(&format!(
+                    "remote_terminal|{name}|provider_error:_codex_401__home_x"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains(SATELLITE_BUSY), "{text}");
+            let store = rig.manager.store().lock().await;
+            assert!(store.satellite_inbound_delivery(id).unwrap().is_none());
+        }
+        let delivered = deliver_hub_message(
+            &rig.manager,
+            request(&rig, rig.child, Uuid::new_v4(), "work"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered.outcome, SatelliteDeliverOutcomeV1::Delivered);
     }
 
     fn counting_effect(
@@ -548,17 +765,20 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_busy_rotation_tip_refuses_even_when_the_declared_seat_is_idle() {
+    async fn a_running_rotation_tip_is_queued_to_even_when_the_declared_seat_is_idle() {
         let rig = rig(true);
-        {
+        let tip = {
             let store = rig.manager.store().lock().await;
-            rotate(&store, rig.root, SessionStatus::Running);
-        }
+            rotate(&store, rig.root, SessionStatus::Running)
+        };
         let id = Uuid::new_v4();
-        let text = refusal_text(
-            deliver_hub_message(&rig.manager, request(&rig, rig.root, id, "hi")).await,
-        );
-        assert!(text.contains(SATELLITE_BUSY), "{text}");
+        let delivered = deliver_hub_message(&rig.manager, request(&rig, rig.root, id, "hi"))
+            .await
+            .unwrap();
+        assert_eq!(delivered.outcome, SatelliteDeliverOutcomeV1::Delivered);
+        let store = rig.manager.store().lock().await;
+        assert_eq!(store.list_operator_messages(tip).unwrap().len(), 1);
+        assert!(store.list_operator_messages(rig.root).unwrap().is_empty());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -609,6 +829,34 @@ mod tests {
             deliver_hub_message(&rig.manager, request(&rig, rig.root, Uuid::new_v4(), "hi")).await,
         );
         assert_eq!(text, not_authorized().to_string());
+    }
+
+    /// #2956: a target whose custody refuses the continuation crosses the link
+    /// as its own static class, so the hub's notice names the cause.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_custody_refusal_crosses_as_the_sandbox_custody_class() {
+        use rsi_common::types::{
+            SandboxCustodyErrorCodeV1, SandboxCustodyErrorV1, SandboxCustodyRecoveryV1,
+            SandboxCustodyTransitionV1,
+        };
+        let refused =
+            launch_failure_refusal(crate::error::sandbox_custody_error(SandboxCustodyErrorV1 {
+                version: 1,
+                code: SandboxCustodyErrorCodeV1::OwnershipMissing,
+                session_id: Some(Uuid::new_v4()),
+                transition: SandboxCustodyTransitionV1::Continue,
+                retryable: false,
+                recovery: SandboxCustodyRecoveryV1::CreateNewSession,
+            }));
+        assert_eq!(
+            refused.to_string(),
+            DaemonError::PolicyDenied(SATELLITE_LAUNCH_FAILED_SANDBOX_CUSTODY.into()).to_string()
+        );
+        assert_eq!(
+            rsi_common::satellite_dispatch::satellite_launch_failure_class(&refused.to_string()),
+            Some(SATELLITE_LAUNCH_FAILED_SANDBOX_CUSTODY)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -936,6 +1184,8 @@ mod tests {
             binaries_dir: deploy.source.to_string_lossy().into_owned(),
             idempotency_key: key.into(),
             max_wait_secs: None,
+            interrupt_workers: None,
+            cancel: None,
         }
     }
 
@@ -963,6 +1213,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #2587: the hub's `interrupt_workers` reaches the satellite's own deploy
+    /// row, so its drain hold ends and a mid-turn worker no longer blocks it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_records_the_interrupt_workers_option_on_the_satellite_row() {
+        let rig = rig(true);
+        let deploy = deploy_rig(true);
+        let mut wire = deploy_request(&rig, &deploy, "k-interrupt");
+        wire.interrupt_workers = Some(true);
+        let receipt = request_hub_deploy(&rig.manager, &deploy.service, wire, Utc::now())
+            .await
+            .unwrap();
+        assert!(receipt.interrupt_workers);
+        let interrupt = rig
+            .manager
+            .store()
+            .lock()
+            .await
+            .agent_deploy_interrupt(receipt.deploy_id)
+            .unwrap();
+        assert!(interrupt.requested);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1011,6 +1284,135 @@ mod tests {
         assert!(error.contains("deploy_already_in_progress"), "{error}");
     }
 
+    /// #268: the scope root is a manager seat the operator replaced; it is
+    /// still declared first, beside the project. A hub deploy is owned by the
+    /// seat that holds the published appointment now, so its settlement wake
+    /// ("Check AgentGetDaemonInfo") reaches the current manager.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_is_owned_by_the_current_appointed_seat_not_a_replaced_root() {
+        let rig = rig(true);
+        let deploy = deploy_rig(true);
+        let current = reseat_declared_root(&rig).await;
+        let receipt = request_hub_deploy(
+            &rig.manager,
+            &deploy.service,
+            deploy_request(&rig, &deploy, "k-reseated"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let row = rig
+            .manager
+            .store()
+            .lock()
+            .await
+            .get_agent_deploy(receipt.deploy_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.owner_session_id, Some(current));
+    }
+
+    /// #268/#272: the scope root was the project's manager and another
+    /// session was appointed in its place; the root stays declared first,
+    /// beside the project. Returns the current seat.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    async fn reseat_declared_root(rig: &Rig) -> Uuid {
+        let project = crate::store::d04_test_project_id();
+        let store = rig.manager.store().lock().await;
+        // The file fixture does not seed the sessions' project row.
+        store
+            .insert_project(&rsi_common::types::Project {
+                id: project,
+                name: "Satellite project".into(),
+                path: None,
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        appoint(&store, project, rig.root, Some(None));
+        let current = insert(&store, None, SessionStatus::Completed);
+        appoint(&store, project, current, Some(None));
+        store
+            .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                allowed_hub_installations: vec![SatelliteUuidV1(rig.hub)],
+                scope_roots: vec![SatelliteUuidV1(rig.root)],
+                scope_projects: vec![SatelliteUuidV1(project)],
+                ..Default::default()
+            })
+            .unwrap();
+        current
+    }
+
+    /// #272: the hub PM addresses the old seat's session id (a declared scope
+    /// root) after the operator re-appointed the project. The message reaches
+    /// the seat that holds the appointment now, says whom the hub addressed,
+    /// and the receipt names the original and actual recipient. Once the old
+    /// session is appointed again it receives its own mail directly.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_hub_message_to_a_replaced_seat_reaches_the_current_appointed_seat() {
+        let rig = rig(true);
+        let current = reseat_declared_root(&rig).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = |seen: &Arc<std::sync::Mutex<Vec<(Uuid, String)>>>| {
+            let seen = Arc::clone(seen);
+            move |target: Uuid, text: String| {
+                seen.lock().unwrap().push((target, text));
+                std::future::ready(Ok(()))
+            }
+        };
+        let result = deliver_with_effect(
+            &rig.manager,
+            request(&rig, rig.root, Uuid::new_v4(), "work order"),
+            recorder(&seen),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, SatelliteDeliverOutcomeV1::Delivered);
+        assert_eq!(
+            result.redirected,
+            Some(SatelliteDeliverRedirectV1 {
+                addressed_session_id: rig.root,
+                displaced_session_id: rig.root,
+                delivered_session_id: current,
+            })
+        );
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, current);
+            assert!(seen[0].1.contains("work order"), "{}", seen[0].1);
+            assert!(
+                seen[0]
+                    .1
+                    .contains(&format!("Addressed to session {}", rig.root)),
+                "{}",
+                seen[0].1
+            );
+        }
+
+        appoint(
+            &*rig.manager.store().lock().await,
+            crate::store::d04_test_project_id(),
+            rig.root,
+            Some(None),
+        );
+        let result = deliver_with_effect(
+            &rig.manager,
+            request(&rig, rig.root, Uuid::new_v4(), "second order"),
+            recorder(&seen),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, SatelliteDeliverOutcomeV1::Delivered);
+        assert_eq!(result.redirected, None);
+        assert_eq!(seen.lock().unwrap()[1].0, rig.root);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn hub_deploy_replays_the_same_request_and_reports_local_refusals() {
@@ -1039,6 +1441,102 @@ mod tests {
         .expect_err("needs supervisor")
         .to_string();
         assert!(error.contains("deploy_needs_supervisor"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_cancel_withdraws_only_a_waiting_row() {
+        let rig = rig(true);
+        let deploy = deploy_rig(true);
+        let mut request = deploy_request(&rig, &deploy, "cancel-waiting");
+        let staged = request_hub_deploy(&rig.manager, &deploy.service, request.clone(), Utc::now())
+            .await
+            .unwrap();
+        request.cancel = Some(true);
+        let cancelled =
+            request_hub_deploy(&rig.manager, &deploy.service, request.clone(), Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(cancelled.deploy_id, staged.deploy_id);
+        assert_eq!(
+            cancelled.reason.as_deref(),
+            Some(rsi_common::agent_deploy::DEPLOY_CANCELLED)
+        );
+        let repeated = request_hub_deploy(&rig.manager, &deploy.service, request, Utc::now())
+            .await
+            .expect_err("a settled satellite deploy cannot be cancelled")
+            .to_string();
+        assert!(repeated.contains("deploy_cancel_too_late"), "{repeated}");
+
+        let mut started = deploy_request(&rig, &deploy, "cancel-started");
+        let staged = request_hub_deploy(&rig.manager, &deploy.service, started.clone(), Utc::now())
+            .await
+            .unwrap();
+        rig.manager
+            .store()
+            .lock()
+            .await
+            .mark_agent_deploy_restarting(staged.deploy_id, Utc::now())
+            .unwrap();
+        started.cancel = Some(true);
+        let error = request_hub_deploy(&rig.manager, &deploy.service, started, Utc::now())
+            .await
+            .expect_err("a restarting deploy cannot be cancelled")
+            .to_string();
+        assert!(error.contains("deploy_cancel_too_late"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_cancel_finds_the_row_after_the_seat_rotates() {
+        let rig = rig(true);
+        let deploy = deploy_rig(true);
+        let mut request = deploy_request(&rig, &deploy, "cancel-rotated");
+        let staged = request_hub_deploy(&rig.manager, &deploy.service, request.clone(), Utc::now())
+            .await
+            .unwrap();
+        // The seat that staged the deploy rotates while it waits.
+        let tip = {
+            let store = rig.manager.store().lock().await;
+            let tip = rotate(&store, rig.root, SessionStatus::Completed);
+            store
+                .update_session_status(rig.root, SessionStatus::Archived)
+                .unwrap();
+            tip
+        };
+        assert_ne!(tip, rig.root);
+        request.cancel = Some(true);
+        let cancelled = request_hub_deploy(&rig.manager, &deploy.service, request, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(cancelled.deploy_id, staged.deploy_id);
+        assert_eq!(
+            cancelled.reason.as_deref(),
+            Some(rsi_common::agent_deploy::DEPLOY_CANCELLED)
+        );
+        let row = rig
+            .manager
+            .store()
+            .lock()
+            .await
+            .get_agent_deploy(staged.deploy_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, rsi_common::agent_deploy::DeployState::Failed);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_cancel_of_an_unknown_deploy_is_not_found() {
+        let rig = rig(true);
+        let deploy = deploy_rig(true);
+        let mut request = deploy_request(&rig, &deploy, "cancel-unknown");
+        request.cancel = Some(true);
+        let error = request_hub_deploy(&rig.manager, &deploy.service, request, Utc::now())
+            .await
+            .expect_err("nothing was staged")
+            .to_string();
+        assert!(error.contains("deploy_not_found"), "{error}");
     }
 
     async fn deploy_after_rotation(
@@ -1152,6 +1650,7 @@ mod tests {
             .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
                 allowed_hub_installations: vec![SatelliteUuidV1(rig.hub)],
                 scope_roots: vec![SatelliteUuidV1(Uuid::new_v4())],
+                ..Default::default()
             })
             .unwrap();
         let error = deploy_after_rotation(&rig, "k").await.unwrap_err();
@@ -1237,6 +1736,7 @@ mod tests {
             .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
                 allowed_hub_installations: vec![SatelliteUuidV1(rig.hub)],
                 scope_roots: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         let deploy = deploy_rig(true);
@@ -1250,5 +1750,506 @@ mod tests {
         .expect_err("owner required")
         .to_string();
         assert!(error.contains("satellite_deploy_owner_required"), "{error}");
+    }
+
+    /// #1928: declare the rig's project (not a pinned session id) as the whole
+    /// inbound scope and appoint `seat` as its manager.
+    async fn declare_project_scope(rig: &Rig, seat: Uuid) -> Uuid {
+        let store = rig.manager.store().lock().await;
+        let project = store
+            .get_session(seat)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        // The rig's sessions use the shared test project id; make it a real
+        // project row so a manager can be appointed in it.
+        if store.get_project(project).unwrap().is_none() {
+            store
+                .insert_project(&rsi_common::types::Project {
+                    id: project,
+                    name: "satellite scope".into(),
+                    path: None,
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.to_string(),
+                    context_files: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                })
+                .unwrap();
+        }
+        appoint(&store, project, seat, Some(None));
+        store
+            .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                allowed_hub_installations: vec![SatelliteUuidV1(rig.hub)],
+                scope_projects: vec![SatelliteUuidV1(project)],
+                ..Default::default()
+            })
+            .unwrap();
+        project
+    }
+
+    /// The operator seats `seat` as the project's manager; `scope` is `Some(None)`
+    /// for the whole project and `Some(Some(vec![]))` revokes the appointment.
+    fn appoint(store: &Store, project: Uuid, seat: Uuid, scope: Option<Option<Vec<Uuid>>>) {
+        let version = store
+            .get_harness_manager(project)
+            .unwrap()
+            .map_or(0, |config| config.row_version);
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: seat,
+                    epic_ids: scope.unwrap_or(None),
+                    group_ids: Vec::new(),
+                    expected_row_version: version,
+                },
+            )
+            .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn project_scope_mail_reaches_the_current_seat_across_rotation_and_reappointment() {
+        let rig = rig(true);
+        let project = declare_project_scope(&rig, rig.root).await;
+        let first_id = Uuid::new_v4();
+        assert_eq!(
+            delivered_to(&rig, project, first_id).await.unwrap(),
+            rig.root
+        );
+
+        // The operator seats a NEW manager (not a rotation of the declared
+        // session): the same project declaration reaches it.
+        let reseated = {
+            let store = rig.manager.store().lock().await;
+            let reseated = insert(&store, None, SessionStatus::Completed);
+            appoint(&store, project, reseated, Some(None));
+            reseated
+        };
+        assert_eq!(
+            delivered_to(&rig, project, Uuid::new_v4()).await.unwrap(),
+            reseated
+        );
+
+        // A replay of the first message is answered from its receipt, even
+        // though the seat moved since.
+        let replay = deliver_hub_message(&rig.manager, request(&rig, project, first_id, "hi"))
+            .await
+            .unwrap();
+        assert_eq!(replay.outcome, SatelliteDeliverOutcomeV1::AlreadyDelivered);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn unappointed_or_revoked_project_scope_refuses_like_any_out_of_scope_target() {
+        let rig = rig(true);
+        // Declared but never appointed.
+        {
+            let store = rig.manager.store().lock().await;
+            let project = store
+                .get_session(rig.root)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .unwrap();
+            store
+                .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                    allowed_hub_installations: vec![SatelliteUuidV1(rig.hub)],
+                    scope_projects: vec![SatelliteUuidV1(project)],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let project = {
+            let store = rig.manager.store().lock().await;
+            store
+                .get_session(rig.root)
+                .unwrap()
+                .unwrap()
+                .project_id
+                .unwrap()
+        };
+        let unappointed = refusal_text(
+            deliver_hub_message(&rig.manager, request(&rig, project, Uuid::new_v4(), "hi")).await,
+        );
+        assert_eq!(unappointed, not_authorized().to_string());
+
+        // Appointed, then revoked by an explicit empty scope.
+        declare_project_scope(&rig, rig.root).await;
+        assert_eq!(
+            delivered_to(&rig, project, Uuid::new_v4()).await.unwrap(),
+            rig.root
+        );
+        {
+            let store = rig.manager.store().lock().await;
+            appoint(&store, project, rig.root, Some(Some(Vec::new())));
+        }
+        let revoked = refusal_text(
+            deliver_hub_message(&rig.manager, request(&rig, project, Uuid::new_v4(), "hi")).await,
+        );
+        assert_eq!(revoked, not_authorized().to_string());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn descendants_of_the_project_seat_are_reachable_by_session_id() {
+        let rig = rig(true);
+        let _ = declare_project_scope(&rig, rig.root).await;
+        let child = {
+            let store = rig.manager.store().lock().await;
+            insert(&store, Some(rig.root), SessionStatus::Completed)
+        };
+        assert_eq!(
+            delivered_to(&rig, child, Uuid::new_v4()).await.unwrap(),
+            child
+        );
+        // An unrelated idle session is still out of scope.
+        let outside = refusal_text(
+            deliver_hub_message(
+                &rig.manager,
+                request(&rig, rig.outsider, Uuid::new_v4(), "hi"),
+            )
+            .await,
+        );
+        assert_eq!(outside, not_authorized().to_string());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn hub_deploy_owner_follows_the_project_seat() {
+        let rig = rig(true);
+        let project = declare_project_scope(&rig, rig.root).await;
+        let first = deploy_after_rotation(&rig, "k1").await.unwrap();
+        async fn owner_of(rig: &Rig, id: Uuid) -> Option<Uuid> {
+            rig.manager
+                .store()
+                .lock()
+                .await
+                .get_agent_deploy(id)
+                .unwrap()
+                .unwrap()
+                .owner_session_id
+        }
+        assert_eq!(owner_of(&rig, first.deploy_id).await, Some(rig.root));
+        // The first deploy settles; the operator re-seats the manager.
+        let reseated = {
+            let store = rig.manager.store().lock().await;
+            store
+                .settle_agent_deploy(
+                    first.deploy_id,
+                    rsi_common::agent_deploy::DeployState::Succeeded,
+                    None,
+                    Utc::now(),
+                )
+                .unwrap();
+            let reseated = insert(&store, None, SessionStatus::Completed);
+            appoint(&store, project, reseated, Some(None));
+            reseated
+        };
+        let second = deploy_after_rotation(&rig, "k2").await.unwrap();
+        assert_eq!(owner_of(&rig, second.deploy_id).await, Some(reseated));
+
+        // An unappointed (revoked) project leaves no owner.
+        {
+            let store = rig.manager.store().lock().await;
+            store
+                .settle_agent_deploy(
+                    second.deploy_id,
+                    rsi_common::agent_deploy::DeployState::Succeeded,
+                    None,
+                    Utc::now(),
+                )
+                .unwrap();
+            appoint(&store, project, reseated, Some(Some(Vec::new())));
+        }
+        let error = deploy_after_rotation(&rig, "k3").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("satellite_deploy_owner_required"),
+            "{error}"
+        );
+    }
+
+    /// The hub host for the two-host tests: one dispatch-enabled peer whose
+    /// whole declared scope is `project`, with no pinned session id.
+    struct Hub {
+        store: Store,
+        owner: Uuid,
+        peer: Uuid,
+    }
+
+    fn hub_declaring_project(project: Uuid) -> Hub {
+        use rsi_common::satellite::{SatellitePeerConfigV1, SatellitePutPeerRequestV1};
+        let store = Store::open_in_memory().unwrap();
+        let owner = rsid_store::test_support::make_test_session();
+        store.insert_session(&owner).unwrap();
+        let peer = Uuid::new_v4();
+        store
+            .put_satellite_peer(
+                &SatellitePutPeerRequestV1 {
+                    expected_registry_revision: 1,
+                    peer: SatellitePeerConfigV1 {
+                        peer_id: SatelliteUuidV1(peer),
+                        label: "laptop".into(),
+                        expected_installation_id: Some(SatelliteUuidV1(Uuid::new_v4())),
+                        enabled: true,
+                        read_enabled: true,
+                        dispatch_enabled: true,
+                    },
+                    repair_quarantine: false,
+                },
+                std::path::Path::new("/tmp/satellites"),
+            )
+            .unwrap();
+        store
+            .put_satellite_peer_scope_entries(2, peer, &[], &[SatelliteUuidV1(project)])
+            .unwrap();
+        Hub {
+            store,
+            owner: owner.id,
+            peer,
+        }
+    }
+
+    fn hub_request(
+        hub: &Hub,
+        target: Uuid,
+        project: Option<Uuid>,
+        key: &str,
+    ) -> rsi_common::satellite_dispatch::AgentSendSatelliteMessageRequestV1 {
+        rsi_common::satellite_dispatch::AgentSendSatelliteMessageRequestV1 {
+            peer_id: SatelliteUuidV1(hub.peer),
+            remote_session_id: SatelliteUuidV1(target),
+            scope_project_id: project.map(SatelliteUuidV1),
+            message: "please rebase".into(),
+            idempotency_key: key.into(),
+            expires_at: None,
+            issue_refs: Vec::new(),
+        }
+    }
+
+    /// One hub message end to end: the hub's admission, its per-attempt scope
+    /// re-check, the wire request exactly as the dispatcher builds it (through
+    /// a JSON round trip), then the satellite's own decision. Returns the wire
+    /// request and the satellite session that received it.
+    async fn hub_message(
+        rig: &Rig,
+        hub: &Hub,
+        target: Uuid,
+        project: Option<Uuid>,
+        key: &str,
+    ) -> Result<(SatelliteDeliverRequestV1, Uuid)> {
+        let receipt = hub.store.queue_satellite_message(
+            hub.owner,
+            &hub_request(hub, target, project, key),
+            Utc::now(),
+        )?;
+        let row = hub
+            .store
+            .queued_satellite_messages(64)?
+            .into_iter()
+            .find(|row| row.id == receipt.message_id)
+            .expect("the accepted message is queued");
+        hub.store
+            .dispatch_peer_facts(row.peer_id, row.remote_session_id, row.scope_project_id)?
+            .ok_or_else(not_authorized)?;
+        let wire = crate::satellite::dispatch::deliver_request(&row, rig.hub, "hub manager".into());
+        let wire: SatelliteDeliverRequestV1 =
+            serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        deliver_with_effect(&rig.manager, wire.clone(), move |tip, _| {
+            *sink.lock().unwrap() = Some(tip);
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        let tip = seen.lock().unwrap().expect("effect ran");
+        Ok((wire, tip))
+    }
+
+    /// Self-succession of the project's manager: `seat` rotates to a recorded
+    /// successor, which is the appointed manager from now on.
+    fn rotate_seat(store: &Store, seat: Uuid) -> Uuid {
+        store
+            .update_session_status(seat, SessionStatus::Archived)
+            .unwrap();
+        let mut successor = rsid_store::test_support::make_test_session();
+        successor.status = SessionStatus::Completed;
+        successor.continued_from = Some(seat);
+        successor.rotation_depth += 1;
+        store.insert_session(&successor).unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(seat, successor.id)
+                .unwrap()
+        );
+        successor.id
+    }
+
+    /// Review #1943: a hub that declared only the project reaches a session in
+    /// the seat's tree. The hub carries the project beside the session target;
+    /// the satellite validates live ancestry on every delivery.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_project_only_hub_scope_reaches_the_seat_tree_across_rotation_and_reappointment() {
+        let rig = rig(true);
+        let project = declare_project_scope(&rig, rig.root).await;
+        let hub = hub_declaring_project(project);
+        let child = {
+            let store = rig.manager.store().lock().await;
+            insert(&store, Some(rig.root), SessionStatus::Completed)
+        };
+
+        // The hub cannot see the satellite's sessions, so a bare descendant id
+        // is not a declared address: only the bound form is admitted.
+        let bare = hub
+            .store
+            .queue_satellite_message(hub.owner, &hub_request(&hub, child, None, "k0"), Utc::now())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(bare, not_authorized().to_string());
+
+        // Bound to the project: a descendant, the seat and the address.
+        let (first, tip) = hub_message(&rig, &hub, child, Some(project), "k1")
+            .await
+            .unwrap();
+        assert_eq!(tip, child);
+        assert_eq!(first.scope_project_id, Some(SatelliteUuidV1(project)));
+        assert_eq!(
+            hub_message(&rig, &hub, rig.root, Some(project), "k2")
+                .await
+                .unwrap()
+                .1,
+            rig.root
+        );
+        assert_eq!(
+            hub_message(&rig, &hub, project, None, "k3")
+                .await
+                .unwrap()
+                .1,
+            rig.root
+        );
+
+        // Self-succession: the seat's old tree stays reachable, the old seat
+        // id is reached at its successor, and the successor's new children
+        // count, with no scope edit on either host.
+        let (successor, fresh) = {
+            let store = rig.manager.store().lock().await;
+            let successor = rotate_seat(&store, rig.root);
+            (
+                successor,
+                insert(&store, Some(successor), SessionStatus::Completed),
+            )
+        };
+        assert_eq!(
+            hub_message(&rig, &hub, child, Some(project), "k4")
+                .await
+                .unwrap()
+                .1,
+            child
+        );
+        assert_eq!(
+            hub_message(&rig, &hub, rig.root, Some(project), "k5")
+                .await
+                .unwrap()
+                .1,
+            successor
+        );
+        assert_eq!(
+            hub_message(&rig, &hub, fresh, Some(project), "k6")
+                .await
+                .unwrap()
+                .1,
+            fresh
+        );
+        // A session in the project that is not under the seat is out.
+        let refused = hub_message(&rig, &hub, rig.outsider, Some(project), "k7")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(refused, not_authorized().to_string());
+
+        // Operator re-appointment: a different manager now owns the project.
+        // The previous tree is out of scope on the next message; the new
+        // tree is in. The hub's declaration never changed.
+        let (reseated, reseated_child) = {
+            let store = rig.manager.store().lock().await;
+            let reseated = insert(&store, None, SessionStatus::Completed);
+            appoint(&store, project, reseated, Some(None));
+            (
+                reseated,
+                insert(&store, Some(reseated), SessionStatus::Completed),
+            )
+        };
+        for stale in [child, fresh, successor] {
+            let refused = hub_message(&rig, &hub, stale, Some(project), &format!("s-{stale}"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(refused, not_authorized().to_string());
+        }
+        assert_eq!(
+            hub_message(&rig, &hub, reseated_child, Some(project), "k8")
+                .await
+                .unwrap()
+                .1,
+            reseated_child
+        );
+        assert_eq!(
+            hub_message(&rig, &hub, project, None, "k9")
+                .await
+                .unwrap()
+                .1,
+            reseated
+        );
+
+        // A replay of a message delivered before the seat moved is answered
+        // from its receipt, not refused.
+        let replay = deliver_hub_message(&rig.manager, first).await.unwrap();
+        assert_eq!(replay.outcome, SatelliteDeliverOutcomeV1::AlreadyDelivered);
+    }
+
+    /// The hub cannot widen what the satellite's own operator declared: a
+    /// project the satellite does not declare, or a revoked appointment,
+    /// refuses the bound message however the hub scope reads.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_hub_bound_project_must_be_declared_and_appointed_on_the_satellite() {
+        let rig = rig(true);
+        let project = declare_project_scope(&rig, rig.root).await;
+        let child = {
+            let store = rig.manager.store().lock().await;
+            insert(&store, Some(rig.root), SessionStatus::Completed)
+        };
+        // The hub declares a project the satellite never declared.
+        let stray = Uuid::new_v4();
+        let stray_hub = hub_declaring_project(stray);
+        let refused = hub_message(&rig, &stray_hub, child, Some(stray), "k1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(refused, not_authorized().to_string());
+
+        // A matching declaration works, until the appointment is revoked.
+        let hub = hub_declaring_project(project);
+        assert_eq!(
+            hub_message(&rig, &hub, child, Some(project), "k2")
+                .await
+                .unwrap()
+                .1,
+            child
+        );
+        {
+            let store = rig.manager.store().lock().await;
+            appoint(&store, project, rig.root, Some(Some(Vec::new())));
+        }
+        let revoked = hub_message(&rig, &hub, child, Some(project), "k3")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(revoked, not_authorized().to_string());
     }
 }

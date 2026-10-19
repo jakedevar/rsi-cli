@@ -29,7 +29,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 
 #[test]
 fn closure_review_lane_binds_environment_runs_real_cli_and_advances_only_evidence_ref() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = Path::new(rsi_common::manifest_dir!())
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");

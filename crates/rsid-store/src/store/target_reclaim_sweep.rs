@@ -343,6 +343,7 @@ pub(crate) fn validate_v119_catalog(connection: &Connection) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v119-target-reclaim-sweep-catalog
 
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: target-reclaim-identity-events-migration
 /// Provisional schema version of the identity-keyed terminal evidence rebuild
 /// (#1035). The lander assigns the final number.
@@ -462,7 +463,7 @@ pub(crate) enum TargetReclaimSweepV119MigrationFault {
     BeforeCommit,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl TargetReclaimSweepV119MigrationFault {
     const ALL: [Self; 7] = [
         Self::AfterPreflight,
@@ -480,7 +481,7 @@ thread_local! {
     static MIGRATION_FAULT: std::cell::Cell<Option<TargetReclaimSweepV119MigrationFault>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_v119_migration(fault: TargetReclaimSweepV119MigrationFault) {
     MIGRATION_FAULT.with(|slot| slot.set(Some(fault)));
 }
@@ -557,14 +558,30 @@ pub struct TargetReclaimIntentCounts {
     pub abandoned: u32,
 }
 
+/// Active intents whose last state change is older than a cutoff (#2731).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TargetReclaimStuckIntents {
+    pub prepared: u32,
+    pub staged: u32,
+    pub deleting: u32,
+    /// `updated_at` of the oldest stuck intent (RFC3339, nanoseconds).
+    pub oldest_updated_at: Option<String>,
+}
+
+impl TargetReclaimStuckIntents {
+    pub fn is_empty(&self) -> bool {
+        self.prepared == 0 && self.staged == 0 && self.deleting == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TargetReclaimIntentTerminalState {
+pub enum TargetReclaimIntentTerminalState {
     Completed,
     Abandoned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TargetReclaimIntentEvent {
+pub struct TargetReclaimIntentEvent {
     pub schedule_id: u64,
     pub custody_id: Uuid,
     pub generation: u64,
@@ -652,7 +669,7 @@ pub enum PrepareTargetReclaimIntentResult {
     SuccessorReservationPending,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 impl PrepareTargetReclaimIntentResult {
     fn active(self) -> TargetReclaimIntent {
         match self {
@@ -705,8 +722,9 @@ pub fn target_reclaim_slot_name(custody_id: Uuid, generation: u64) -> String {
 }
 
 impl Store {
-    /// Record each newly staged cache and queue a durable owning-manager notice.
-    /// No paths or process command lines enter friction telemetry.
+    /// Record an incomplete staged cache as friction and queue a durable
+    /// owning-manager notice. A completed removal is expected reclamation, not
+    /// friction. No paths or process command lines enter friction telemetry.
     pub fn record_target_reclaim_notice(
         &self,
         session_id: Uuid,
@@ -719,11 +737,13 @@ impl Store {
         let session = self.get_session(session_id)?;
         let project = session.and_then(|session| session.project_id);
         let outcome = if pending { "pending" } else { "removed" };
-        self.record_friction_event(
-            &NewFrictionEventV1::new(FrictionKind::SandboxTargetReclaim, &[outcome])
-                .session(Some(session_id))
-                .evidence("custody", custody_id),
-        )?;
+        if pending {
+            self.record_friction_event(
+                &NewFrictionEventV1::new(FrictionKind::SandboxTargetReclaim, &["pending"])
+                    .session(Some(session_id))
+                    .evidence("custody", custody_id),
+            )?;
+        }
         let Some(project) = project else {
             return Ok(None);
         };
@@ -773,6 +793,7 @@ impl Store {
         load_target_reclaim_intent(&self.conn, custody_id, generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepared_target_reclaim_owner(
         &self,
         intent: &TargetReclaimIntent,
@@ -1043,6 +1064,43 @@ impl Store {
         } else {
             Ok(page)
         }
+    }
+
+    /// Active intents not changed since `cutoff` (an RFC3339-nanosecond time),
+    /// per state, with the oldest `updated_at`. The residue the sweep neither
+    /// completed nor abandoned (#2731).
+    pub fn target_reclaim_intents_stuck_since(
+        &self,
+        cutoff: &str,
+    ) -> Result<TargetReclaimStuckIntents> {
+        let count = |row: &rusqlite::Row<'_>, index: usize| -> rusqlite::Result<u32> {
+            u32::try_from(row.get::<_, i64>(index)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        };
+        self.conn
+            .query_row(
+                "SELECT
+                    coalesce(sum(state='Prepared'),0),
+                    coalesce(sum(state='Staged'),0),
+                    coalesce(sum(state='Deleting'),0),
+                    min(updated_at)
+                 FROM sandbox_target_reclaim_intents WHERE updated_at<?1",
+                params![cutoff],
+                |row| {
+                    Ok(TargetReclaimStuckIntents {
+                        prepared: count(row, 0)?,
+                        staged: count(row, 1)?,
+                        deleting: count(row, 2)?,
+                        oldest_updated_at: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     pub fn target_reclaim_intent_counts(&self) -> Result<TargetReclaimIntentCounts> {
@@ -1882,7 +1940,12 @@ fn select_page(
         // newer than every key the cursor will ever reach. Restart from the
         // top when the newest eligible row is newer than the recorded head, so
         // pressure reclaim sees a fresh finisher on its next pass (#1737).
-        let newest = select_recent_terminal_keys(connection, None, 1)?
+        let newest_sql = if skip_absent {
+            SELECT_RECENT_PRESENT_KEYS_SQL
+        } else {
+            SELECT_RECENT_TERMINAL_KEYS_SQL
+        };
+        let newest = select_recent_keys_with(connection, newest_sql, None, 1)?
             .into_iter()
             .next();
         let arrivals = match (&newest, recent_state.as_ref().and_then(|r| r.head.as_ref())) {
@@ -1917,11 +1980,16 @@ fn select_page(
             absent_sessions.extend(scan.absent.iter().copied());
             (scan.accepted, scan.last_scanned, scan.scanned)
         }
+        // Rows with no live verified custody can never become candidates, so
+        // they must not spend the page budget: a long run of them (old sessions
+        // whose custody was tombstoned) would otherwise leave every pass with
+        // zero candidates while the cursor crawls `limit` rows at a time
+        // (#1933). Rows that do have custody keep their budget, including
+        // those whose target is absent.
         Some(upper) => {
-            let keys = select_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
-            let last = keys.last().cloned();
-            let scanned = keys.len() as u32;
-            (keys, last, scanned)
+            let scan =
+                select_custody_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
+            (scan.accepted, scan.last_scanned, scan.scanned)
         }
         None => (Vec::new(), None, 0),
     };
@@ -1934,6 +2002,12 @@ fn select_page(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
+        .map(|mut candidate| {
+            candidate.final_handoff = store.latest_turn_pipeline_handoff(candidate.session_id)?;
+            Ok(candidate)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .map(|candidate| {
             // Use the same store snapshot and consumer fence as preparation.
             // Every raw key still consumes its fair-walk position, so a wake
@@ -2098,13 +2172,41 @@ const SELECT_RECENT_TERMINAL_KEYS_SQL: &str =
        AND (?2 IS NULL OR (s.updated_at,s.id)<(?2,?3))
      ORDER BY s.updated_at DESC,s.id DESC LIMIT ?1";
 
+/// The pressure pass's recent lane (#2682). Unlike
+/// [`SELECT_RECENT_TERMINAL_KEYS_SQL`] it keeps rows that already have a recorded
+/// reclaim: a worker that was reclaimed, resumed in the same custody generation
+/// and rebuilt `target/` (one reclaim event per old directory inode; the intent
+/// identity includes the inode, so a regrown directory is reclaimable again)
+/// would otherwise never be seen again by this lane, and the oldest-first walk
+/// reached it a whole cycle later. The caller filters by the target being on
+/// disk, so a reclaimed row whose `target/` is gone costs one stat, not a slot.
+const SELECT_RECENT_PRESENT_KEYS_SQL: &str =
+    "SELECT s.updated_at,s.id,r.sandbox_root FROM sessions s
+     JOIN sandbox_custody_roots r
+       ON r.owner_session_id=s.id AND s.sandbox_custody_id=r.custody_id
+     WHERE s.status IN ('Completed','Failed','Interrupted','Archived','Deleted')
+       AND r.state='live' AND r.validation_state='verified'
+       AND r.validated_generation=r.generation
+       AND r.reserved_effects=0 AND r.active_effects=0
+       AND (?2 IS NULL OR (s.updated_at,s.id)<(?2,?3))
+     ORDER BY s.updated_at DESC,s.id DESC LIMIT ?1";
+
 fn select_recent_terminal_keys(
     connection: &Connection,
     after: Option<&TerminalReclaimSweepKey>,
     limit: u32,
 ) -> Result<Vec<TerminalReclaimSweepKey>> {
+    select_recent_keys_with(connection, SELECT_RECENT_TERMINAL_KEYS_SQL, after, limit)
+}
+
+fn select_recent_keys_with(
+    connection: &Connection,
+    sql: &'static str,
+    after: Option<&TerminalReclaimSweepKey>,
+    limit: u32,
+) -> Result<Vec<TerminalReclaimSweepKey>> {
     connection
-        .prepare(SELECT_RECENT_TERMINAL_KEYS_SQL)?
+        .prepare(sql)?
         .query_map(
             params![
                 i64::from(limit),
@@ -2188,6 +2290,42 @@ fn select_present_terminal_keys(
     Ok(scan)
 }
 
+/// Oldest-first walk keys that own a candidate custody row, until `want`
+/// were found or [`ABSENT_SCAN_CAP`] rows were examined. Rows without one are
+/// walked past for free; the cursor moves past every row examined.
+fn select_custody_terminal_keys(
+    connection: &Connection,
+    after: Option<&TerminalReclaimSweepKey>,
+    upper: &TerminalReclaimSweepKey,
+    want: u32,
+) -> Result<PresentScan> {
+    let mut scan = PresentScan {
+        accepted: Vec::new(),
+        last_scanned: None,
+        scanned: 0,
+        absent: Vec::new(),
+    };
+    let mut cursor = after.cloned();
+    'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
+        let chunk = select_terminal_keys(connection, cursor.as_ref(), upper, ABSENT_SCAN_CHUNK)?;
+        if chunk.is_empty() {
+            break;
+        }
+        for key in chunk {
+            scan.scanned += 1;
+            scan.last_scanned = Some(key.clone());
+            cursor = Some(key.clone());
+            if select_candidate_for_key(connection, &key)?.is_some() {
+                scan.accepted.push(key);
+            }
+            if scan.accepted.len() as u32 >= want {
+                break 'chunks;
+            }
+        }
+    }
+    Ok(scan)
+}
+
 /// Newest-first recent lane, skipping rows whose target is gone.
 fn select_recent_present_keys(
     connection: &Connection,
@@ -2203,7 +2341,7 @@ fn select_recent_present_keys(
     let mut cursor = after.cloned();
     'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
         let chunk = connection
-            .prepare(SELECT_RECENT_TERMINAL_KEYS_SQL)?
+            .prepare(SELECT_RECENT_PRESENT_KEYS_SQL)?
             .query_map(
                 params![
                     i64::from(ABSENT_SCAN_CHUNK),
@@ -2237,7 +2375,10 @@ fn select_recent_present_keys(
     Ok(scan)
 }
 
-const SELECT_CANDIDATE_FOR_KEY_SQL: &str = "SELECT r.custody_id,r.generation,s.id,s.updated_at
+const SELECT_CANDIDATE_FOR_KEY_SQL: &str = "SELECT r.custody_id,r.generation,s.id,s.updated_at,
+        COALESCE((SELECT q.state='published' FROM rolling_queue_entries q
+                  WHERE q.source_session_id=s.id
+                  ORDER BY q.sequence DESC LIMIT 1),0)
      FROM sessions s
      JOIN sandbox_custody_roots r
        ON r.owner_session_id=s.id AND s.sandbox_custody_id=r.custody_id
@@ -2280,6 +2421,8 @@ fn select_candidate_for_key(
                         )
                     })?,
                     updated_at: row.get(3)?,
+                    rolling_queue_settled: row.get(4)?,
+                    final_handoff: false,
                 })
             },
         )
@@ -2523,7 +2666,7 @@ mod tests {
     fn terminal_custody_reclaim_candidates_feed_durable_sweep_and_survive_reopen() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-reopen");
         let database = fixture.path().join("reclaim.db");
-        let mut store = Store::open(&database).unwrap();
+        let mut store = Store::open_test_fixture(&database).unwrap();
         let ids = (0..5)
             .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
             .collect::<Vec<_>>();
@@ -2778,7 +2921,7 @@ mod tests {
     fn pressure_page_advances_past_absent_targets_durably_and_retries_next_cycle() {
         let fixture = FixtureDirectory::create("target-reclaim-absent-rotation");
         let database = fixture.path().join("rotation.db");
-        let mut store = Store::open(&database).unwrap();
+        let mut store = Store::open_test_fixture(&database).unwrap();
         let ids = (0..6)
             .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
             .collect::<Vec<_>>();
@@ -2870,7 +3013,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
-    fn target_reclaim_sweep_bounds_raw_rows_and_custody_lookups_before_later_candidate() {
+    fn target_reclaim_sweep_walks_past_custodyless_rows_without_spending_the_page_budget() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-raw-bound");
         let mut store = Store::open_in_memory().unwrap();
         for ordinal in 0..40 {
@@ -2878,19 +3021,16 @@ mod tests {
         }
         let eligible = seed_candidate(&mut store, fixture.path(), 50);
 
-        for _ in 0..5 {
-            let page = store.reserve_terminal_reclaim_page(8).unwrap();
-            assert!(page.candidates.is_empty());
-            assert_eq!(page.evidence.inspected_terminal_rows, 8);
-            assert_eq!(page.evidence.custody_lookups, 8);
-            assert!(page.has_more);
-        }
-        let later = store.reserve_terminal_reclaim_page(8).unwrap();
-        assert_eq!(later.evidence.inspected_terminal_rows, 1);
-        assert_eq!(later.evidence.custody_lookups, 1);
-        assert_eq!(later.candidates.len(), 1);
-        assert_eq!(later.candidates[0].session_id, eligible);
-        assert!(!later.has_more);
+        // Rows with no live custody never become candidates, so they must not
+        // use up the page: the first pass reaches the later candidate (#1933),
+        // and the raw-row scan stays bounded by `ABSENT_SCAN_CAP`.
+        let page = store.reserve_terminal_reclaim_page(8).unwrap();
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.candidates[0].session_id, eligible);
+        assert_eq!(page.evidence.inspected_terminal_rows, 41);
+        assert_eq!(page.evidence.custody_lookups, 41);
+        assert!(page.evidence.inspected_terminal_rows <= ABSENT_SCAN_CAP);
+        assert!(!page.has_more);
     }
 
     fn seed_intent(store: &mut Store, fixture: &Path, ordinal: u32) -> TargetReclaimIntent {
@@ -2904,6 +3044,79 @@ mod tests {
             )
             .unwrap()
             .active()
+    }
+
+    /// #2682: an Archived session that still owns a live, verified custody
+    /// root and a `target/` is a pressure candidate, in the recent lane.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_reaches_an_archived_session_holding_a_target() {
+        let fixture = FixtureDirectory::create("target-reclaim-archived-target");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..3)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Archived' WHERE id=?1",
+                params![ids[0].to_string()],
+            )
+            .unwrap();
+        std::fs::create_dir_all(fixture.path().join("sandbox-0/target")).unwrap();
+
+        let preview = store
+            .preview_terminal_reclaim_page_filtered(4, true, true)
+            .unwrap();
+        assert_eq!(
+            preview
+                .candidates
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect::<Vec<_>>(),
+            vec![ids[0]],
+            "the Archived session's target is the only one on disk"
+        );
+        assert_eq!(preview.absent_skipped, 2);
+    }
+
+    /// #2682: a worker whose `target/` was reclaimed once, then resumed in the
+    /// same custody generation and rebuilt it, stayed invisible to the recent
+    /// lane (its recorded reclaim event excluded it) while the disk was 98%
+    /// full; only the oldest-first walk of a later cycle reached it. The
+    /// pressure lane now takes it again when its `target/` is on disk.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_sees_a_target_regrown_after_a_recorded_reclaim() {
+        let fixture = FixtureDirectory::create("target-reclaim-regrown-target");
+        let mut store = Store::open_in_memory().unwrap();
+        seed_candidate(&mut store, fixture.path(), 1);
+        // Freeze a cycle whose upper bound is the older row.
+        let first = store
+            .reserve_terminal_reclaim_page_filtered(4, true, true)
+            .unwrap();
+        assert!(first.candidates.is_empty(), "{first:?}");
+
+        // A worker finishes after the cycle started, is reclaimed once, then
+        // rebuilds its target.
+        let intent = seed_intent(&mut store, fixture.path(), 5);
+        let owner = Uuid::from_u128(6);
+        let staged = store.mark_target_reclaim_staged(&intent).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+        std::fs::create_dir_all(fixture.path().join("sandbox-5/target")).unwrap();
+
+        let page = store
+            .reserve_terminal_reclaim_page_filtered(4, true, true)
+            .unwrap();
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect::<Vec<_>>(),
+            vec![owner],
+            "the regrown target is a candidate again, ahead of the walk"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3075,6 +3288,11 @@ mod tests {
                             predicate: WakePredicate {
                                 jobs_terminal: None,
                                 sha_on_rolling: Some("a".repeat(40)),
+                                issue_closed: None,
+                                todo_closed: None,
+                                topology_execution_settled: None,
+                                health_anomaly: None,
+                                settlement_run_settled: None,
                             },
                             armed_at: now,
                             deadline: None,
@@ -3187,6 +3405,11 @@ mod tests {
                         workspace: false,
                         all_targets: false,
                         release: false,
+                        no_default_features: false,
+                        features: Vec::new(),
+                        shards: Vec::new(),
+                        cpu_quota_percent: None,
+                        sha: None,
                     }),
                     // The job belongs to the owner even if it builds from a gate clone.
                     cwd: fixture.path().join("gate").display().to_string(),
@@ -3254,7 +3477,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
-    fn target_reclaim_routes_friction_and_manager_notice() {
+    fn target_reclaim_records_friction_only_when_removal_is_pending() {
         let store = Store::open_in_memory().unwrap();
         let (config, lead) = crate::store::manager_coordinator::tests::fixture(
             &store,
@@ -3273,16 +3496,128 @@ mod tests {
         assert_eq!(state["generation"], 3);
         assert_eq!(state["bytes"], 4096);
         assert_eq!(state["outcome"], "removed");
-        let signature: String = store
+        let removed_friction: u32 = store
             .conn
             .query_row(
-                "SELECT signature FROM friction_events WHERE session_id=?1 AND project_id=?2",
+                "SELECT count(*) FROM friction_events WHERE session_id=?1 AND project_id=?2
+             AND signature='sandbox_target_reclaim:removed'",
                 params![lead.id.to_string(), config.project_id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(signature, "sandbox_target_reclaim:removed");
+        assert_eq!(removed_friction, 0);
         assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 1);
+
+        let pending_job = store
+            .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 4, 2048, true)
+            .unwrap()
+            .unwrap();
+        let pending_friction: u32 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM friction_events WHERE session_id=?1 AND project_id=?2
+             AND signature='sandbox_target_reclaim:pending'",
+                params![lead.id.to_string(), config.project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_friction, 1);
+        assert_eq!(
+            store.manager_notice_undelivered_count(pending_job).unwrap(),
+            2
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn routine_notices_do_not_wake_but_ride_the_next_real_wake() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = crate::store::manager_coordinator::tests::fixture(
+            &store,
+            rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
+        );
+        // #1675: a routine reclaim notice is queued and readable, but it
+        // owes the manager no wake (the transport is quiet: NotReady).
+        let job = store
+            .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 1, 1024, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 1);
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 0);
+        assert_eq!(store.manager_notice_first_wake_pending(job).unwrap(), None);
+        assert_eq!(
+            store.manager_watch_delivery_state(job).unwrap(),
+            Some(false)
+        );
+
+        // A valid JSON object without a recognized routine state is still
+        // wake-worthy; SQL NULL must not make it disappear from the watch.
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_notices
+                 (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+                  source_session_id,recipient_session_id,kind,subject_id,subject_version,
+                  state_json,recorded_at,queued_at)
+                 VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'action_result',
+                        'unclassified-action','1','{}',?6,?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    job.to_string(),
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    crate::store::harness_manager_v2::now(),
+                ],
+            )
+            .unwrap();
+        store.refresh_manager_notice_job(job).unwrap();
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 1);
+        assert_eq!(store.manager_watch_delivery_state(job).unwrap(), Some(true));
+
+        // A notice the manager has to act on still wakes exactly once, and
+        // the wake names both queued routine and unclassified subjects too.
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_notices
+                 (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+                  source_session_id,recipient_session_id,kind,subject_id,subject_version,
+                  state_json,recorded_at,queued_at)
+                 VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'ledger_change',
+                        'worker_context_cap:test','1','{\"record_kind\":\"worker_context_cap\"}',
+                        ?6,?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    job.to_string(),
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    crate::store::harness_manager_v2::now(),
+                ],
+            )
+            .unwrap();
+        store.refresh_manager_notice_job(job).unwrap();
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 2);
+        assert_eq!(
+            store.manager_notice_first_wake_pending(job).unwrap(),
+            Some(3)
+        );
+        assert_eq!(store.manager_watch_delivery_state(job).unwrap(), Some(true));
+        let (enabled, message): (bool, String) = store
+            .conn
+            .query_row(
+                "SELECT enabled,message FROM scheduled_jobs WHERE id=?1",
+                [job.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(enabled);
+        // #2533: the wake names the notices that justify it; the routine reclaim
+        // notice rides along as one count line.
+        assert!(message.contains("- 1 routine notices settled"), "{message}");
+        assert!(message.contains("unclassified-action"));
+        assert!(message.contains("worker_context_cap:test"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3395,7 +3730,7 @@ mod tests {
     fn target_reclaim_intent_scheduler_crosses_two_pages_after_reopen_and_defers_new_tail() {
         let fixture = FixtureDirectory::create("target-reclaim-intent-pages");
         let database = fixture.path().join("intents.db");
-        let mut store = Store::open(&database).unwrap();
+        let mut store = Store::open_test_fixture(&database).unwrap();
         let expected = (0..7)
             .map(|ordinal| seed_intent(&mut store, fixture.path(), ordinal).schedule_id)
             .collect::<Vec<_>>();
@@ -3557,6 +3892,38 @@ mod tests {
                 .execute("DELETE FROM sandbox_target_reclaim_intent_events", [])
                 .is_err()
         );
+    }
+
+    /// #2731: residual active intents older than a cutoff are counted per
+    /// state with the oldest change time; terminal and younger ones are not.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn stuck_intents_are_counted_per_state_past_a_cutoff_2731() {
+        let fixture = FixtureDirectory::create("target-reclaim-stuck-intents");
+        let mut store = Store::open_in_memory().unwrap();
+        let _prepared = seed_intent(&mut store, fixture.path(), 0);
+        let to_stage = seed_intent(&mut store, fixture.path(), 1);
+        let _staged = store.mark_target_reclaim_staged(&to_stage).unwrap();
+        let to_delete = seed_intent(&mut store, fixture.path(), 2);
+        let staged = store.mark_target_reclaim_staged(&to_delete).unwrap();
+        let _deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        let finished = seed_intent(&mut store, fixture.path(), 3);
+        let staged = store.mark_target_reclaim_staged(&finished).unwrap();
+        let deleting = store.mark_target_reclaim_deleting(&staged).unwrap();
+        store.complete_target_reclaim_intent(&deleting).unwrap();
+
+        let future =
+            (Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let stuck = store.target_reclaim_intents_stuck_since(&future).unwrap();
+        assert_eq!((stuck.prepared, stuck.staged, stuck.deleting), (1, 1, 1));
+        assert!(stuck.oldest_updated_at.is_some());
+        assert!(!stuck.is_empty());
+
+        let past =
+            (Utc::now() - chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let none = store.target_reclaim_intents_stuck_since(&past).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(none.oldest_updated_at, None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3759,7 +4126,7 @@ mod tests {
         for fault in TargetReclaimSweepV119MigrationFault::ALL {
             let fixture = FixtureDirectory::create("target-reclaim-sweep-migration");
             let database = fixture.path().join("migration.db");
-            let store = Store::open(&database).unwrap();
+            let store = Store::open_test_fixture(&database).unwrap();
             rewind_store_to_schema_version(&store.conn, 118);
             assert_eq!(fingerprint(&store.conn), V118_FULL_CATALOG_FINGERPRINT);
             let before = fingerprint(&store.conn);
@@ -3787,7 +4154,9 @@ mod tests {
                 crate::store::LATEST_SCHEMA_VERSION
             );
             validate_v119_catalog(&reopened.conn)?;
-            crate::store::source_worktree_v120::validate_v120_catalog(&reopened.conn)?;
+            crate::store::source_worktree_v120::health_v175::validate_current_catalog(
+                &reopened.conn,
+            )?;
             crate::store::restart_intents::validate_v134_catalog(&reopened.conn)?;
         }
         Ok(())
@@ -3887,7 +4256,7 @@ mod tests {
     fn target_reclaim_sweep_write_contention_is_bounded_and_restores_timeout() {
         let fixture = FixtureDirectory::create("target-reclaim-sweep-busy");
         let database = fixture.path().join("reclaim.db");
-        let mut store = Store::open(&database).unwrap();
+        let mut store = Store::open_test_fixture(&database).unwrap();
         seed_candidate(&mut store, fixture.path(), 0);
         let blocker = Connection::open(&database).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();

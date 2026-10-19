@@ -47,6 +47,47 @@ fn err(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+pub(crate) fn schema_error(
+    name: &str,
+    args: &serde_json::Value,
+) -> Option<rsi_common::agent_control_schema::AgentControlParamErrorV1> {
+    rsi_common::agent_control_schema::agent_control_catalog_v1()
+        .iter()
+        .find(|descriptor| {
+            descriptor
+                .native_tool
+                .is_some_and(|tool| tool.name() == name)
+        })
+        .and_then(|descriptor| descriptor.verb.schema_error(args))
+}
+
+/// Whether `name` is a native control tool whose arguments the catalog's own
+/// schema diagnostic (`schema_error`) already checks.
+pub(super) fn has_catalog_schema(name: &str) -> bool {
+    rsi_common::agent_control_schema::agent_control_catalog_v1()
+        .iter()
+        .any(|descriptor| {
+            descriptor
+                .native_tool
+                .is_some_and(|tool| tool.name() == name)
+        })
+}
+
+pub(super) fn enrich_schema_refusal(
+    diagnostic: Option<rsi_common::agent_control_schema::AgentControlParamErrorV1>,
+    result: &mut ToolResult,
+) {
+    if !result.success {
+        if let Some(diagnostic) = diagnostic {
+            let original = result.error_msg.as_deref().unwrap_or("");
+            let mut envelope = serde_json::from_str(original)
+                .unwrap_or_else(|_| serde_json::json!({"message": original}));
+            diagnostic.enrich(&mut envelope);
+            result.error_msg = Some(envelope.to_string());
+        }
+    }
+}
+
 /// Native controls bypass RpcServer, so mirror its best-effort refusal hook
 /// before rendering the existing tool error. Names come from the same catalog
 /// that registers the tools, never from model-supplied arguments.
@@ -467,6 +508,18 @@ impl HarnessTool for RsiControlStatusTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let args = match self
+            .control
+            .expand_id_prefixes(self.caller_session_id, AgentControlVerbV1::GetStatus, args)
+            .await
+        {
+            Ok(args) => args,
+            Err(e) => {
+                let message = e.to_string();
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                return err(message);
+            }
+        };
         let target = match resolve_target_id(&args, self.caller_session_id) {
             Ok(t) => t,
             Err(e) => {
@@ -631,6 +684,22 @@ impl HarnessTool for RsiControlProgressTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let args = match self
+            .control
+            .expand_id_prefixes(
+                self.caller_session_id,
+                AgentControlVerbV1::GetProgress,
+                args,
+            )
+            .await
+        {
+            Ok(args) => args,
+            Err(e) => {
+                let message = e.to_string();
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                return err(message);
+            }
+        };
         let params = match progress_params_from_args(&args) {
             Ok(params) => params,
             Err(e) => {
@@ -693,7 +762,7 @@ impl RsiControlReadSessionEventsTool {
 
 /// The global manager verbs that have a native tool (#872 Slice B), plus
 /// the N-level routing verbs (#1238) and the node overview (#1240).
-pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 8] = [
+pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 17] = [
     AgentControlVerbV1::GlobalOverview,
     AgentControlVerbV1::GlobalSend,
     AgentControlVerbV1::ReportToGlobal,
@@ -703,6 +772,19 @@ pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 8] = [
     // #1626: project administration for project managers and portfolio seats.
     AgentControlVerbV1::CreateProject,
     AgentControlVerbV1::UpdateProject,
+    // #1747: the operator to-do list, for any manager node seat.
+    AgentControlVerbV1::OperatorTodoUpsert,
+    AgentControlVerbV1::OperatorTodoClose,
+    // #2649: relay a standing operator directive to a scope below the seat.
+    AgentControlVerbV1::StandingDirective,
+    AgentControlVerbV1::ListSourceWorktreeCohorts,
+    AgentControlVerbV1::AuditSourceWorktreeCohort,
+    AgentControlVerbV1::ApplySourceWorktreeCohort,
+    // #1964: read and withdraw your own merge-queue entries.
+    AgentControlVerbV1::ListRollingQueue,
+    AgentControlVerbV1::CancelRollingQueueEntry,
+    // #2310: check a worker's verification receipt before enqueue.
+    AgentControlVerbV1::CheckLandingCandidate,
 ];
 
 /// Run one native global-manager verb (#872 Slice B). Authority is checked by
@@ -715,6 +797,12 @@ pub(crate) async fn execute_global_verb(
 ) -> crate::error::Result<serde_json::Value> {
     let invalid = |error: serde_json::Error| {
         crate::error::DaemonError::InvalidParam(format!("invalid {verb:?} arguments: {error}"))
+    };
+    let settlement_invalid = |_: serde_json::Error| {
+        crate::store::cohort_settlement::agent_settlement_refusal(
+            "storage_control_invalid_request",
+            "match the closed settlement request schema",
+        )
     };
     let value = match verb {
         AgentControlVerbV1::GlobalOverview => serde_json::to_value(
@@ -742,11 +830,9 @@ pub(crate) async fn execute_global_verb(
                 .agent_send_down(caller, serde_json::from_value(args).map_err(invalid)?)
                 .await?,
         ),
-        AgentControlVerbV1::ManagerOverview => serde_json::to_value(
-            control
-                .agent_manager_overview(caller, serde_json::from_value(args).map_err(invalid)?)
-                .await?,
-        ),
+        AgentControlVerbV1::ManagerOverview => Ok(control
+            .agent_manager_overview_value(caller, serde_json::from_value(args).map_err(invalid)?)
+            .await?),
         AgentControlVerbV1::CreateProject => serde_json::to_value(
             control
                 .agent_create_project(caller, serde_json::from_value(args).map_err(invalid)?)
@@ -755,6 +841,63 @@ pub(crate) async fn execute_global_verb(
         AgentControlVerbV1::UpdateProject => serde_json::to_value(
             control
                 .agent_update_project(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::ListSourceWorktreeCohorts => {
+            let _: rsi_common::cohort_settlement::ListSourceWorktreeCohortsParams =
+                serde_json::from_value(args).map_err(settlement_invalid)?;
+            serde_json::to_value(control.agent_list_source_worktree_cohorts(caller).await?)
+        }
+        AgentControlVerbV1::AuditSourceWorktreeCohort => serde_json::to_value(
+            control
+                .agent_audit_source_worktree_cohort_view(
+                    caller,
+                    serde_json::from_value(args).map_err(settlement_invalid)?,
+                )
+                .await?,
+        ),
+        AgentControlVerbV1::ApplySourceWorktreeCohort => serde_json::to_value(
+            control
+                .agent_apply_source_worktree_cohort(
+                    caller,
+                    serde_json::from_value(args).map_err(settlement_invalid)?,
+                )
+                .await?,
+        ),
+        AgentControlVerbV1::OperatorTodoUpsert => serde_json::to_value(
+            control
+                .agent_operator_todo_upsert(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::OperatorTodoClose => serde_json::to_value(
+            control
+                .agent_operator_todo_close(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::StandingDirective => serde_json::to_value(
+            control
+                .agent_standing_directive(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::ListRollingQueue => serde_json::to_value(
+            control
+                .agent_list_rolling_queue(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::CancelRollingQueueEntry => serde_json::to_value(
+            control
+                .agent_cancel_rolling_queue_entry(
+                    caller,
+                    serde_json::from_value(args).map_err(invalid)?,
+                )
+                .await?,
+        ),
+        AgentControlVerbV1::CheckLandingCandidate => serde_json::to_value(
+            control
+                .agent_check_landing_candidate(
+                    caller,
+                    serde_json::from_value(args).map_err(invalid)?,
+                )
                 .await?,
         ),
         _ => {
@@ -811,6 +954,15 @@ impl HarnessTool for RsiControlGlobalTool {
             },
             Err(e) => {
                 note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                if matches!(
+                    self.verb,
+                    AgentControlVerbV1::ListSourceWorktreeCohorts
+                        | AgentControlVerbV1::AuditSourceWorktreeCohort
+                        | AgentControlVerbV1::ApplySourceWorktreeCohort
+                ) && let DaemonError::StructuredRpc { data, .. } = e
+                {
+                    return err(data.to_string());
+                }
                 err(e.to_string())
             }
         }
@@ -898,6 +1050,167 @@ impl HarnessTool for RsiControlQueryFailureSignaturesTool {
     }
 }
 
+/// `rsi_control_worker_roster` (#2311): read-only roster of the caller's
+/// workers (or its project's, for the appointed manager) with derived states.
+pub struct RsiControlWorkerRosterTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+}
+
+impl RsiControlWorkerRosterTool {
+    pub fn new(control: AgentControlHandle, caller_session_id: Uuid) -> Self {
+        Self {
+            control,
+            caller_session_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlWorkerRosterTool {
+    fn name(&self) -> &str {
+        "rsi_control_worker_roster"
+    }
+
+    fn description(&self) -> &str {
+        "Read each worker's real state in one call: derived state (running, parked_on_job, \
+         parked_on_wake, stranded, final_handoff, failed), bound Issue, model/effort, newest \
+         job (kind, state, exit code, refusal, receipt head), armed wakes, last activity and \
+         whether a final PIPELINE HANDOFF was written. Scope: the workers you launched \
+         yourself; a project's appointed manager (or a portfolio seat naming project_id) gets \
+         the project."
+    }
+
+    fn parameters_json(&self) -> &str {
+        AgentControlVerbV1::WorkerRoster
+            .descriptor()
+            .parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let request: rsi_common::agent_worker_roster::AgentWorkerRosterRequestV1 =
+            match serde_json::from_value(args) {
+                Ok(request) => request,
+                Err(e) => {
+                    let message = format!("invalid worker_roster arguments: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    return err(message);
+                }
+            };
+        match self
+            .control
+            .agent_worker_roster(self.caller_session_id, request)
+            .await
+        {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(output) => ToolResult {
+                    success: true,
+                    output,
+                    error_msg: None,
+                },
+                Err(e) => {
+                    let message = format!("failed to serialize worker roster: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
+            },
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
+        }
+    }
+}
+
+/// `rsi_control_list_wakes` (#2389): the caller's own armed wakes, so a
+/// successor seat confirms what carried over without reading the store.
+pub struct RsiControlListWakesTool {
+    control: AgentControlHandle,
+    caller_session_id: Uuid,
+}
+
+impl RsiControlListWakesTool {
+    pub fn new(control: AgentControlHandle, caller_session_id: Uuid) -> Self {
+        Self {
+            control,
+            caller_session_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTool for RsiControlListWakesTool {
+    fn name(&self) -> &str {
+        "rsi_control_list_wakes"
+    }
+
+    fn description(&self) -> &str {
+        AgentControlVerbV1::ListWakes.descriptor().description
+    }
+
+    fn parameters_json(&self) -> &str {
+        AgentControlVerbV1::ListWakes.descriptor().parameters_json()
+    }
+
+    async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let params: rsi_common::agent_control_schema::AgentListWakesParams =
+            match serde_json::from_value(args) {
+                Ok(params) => params,
+                Err(e) => {
+                    let message = format!("invalid list_wakes arguments: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    return err(message);
+                }
+            };
+        match self
+            .control
+            .agent_list_wakes(self.caller_session_id, params)
+            .await
+        {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(output) => ToolResult {
+                    success: true,
+                    output,
+                    error_msg: None,
+                },
+                Err(e) => {
+                    let message = format!("failed to serialize wakes: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
+            },
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl HarnessTool for RsiControlReadSessionEventsTool {
     fn name(&self) -> &str {
@@ -918,6 +1231,22 @@ impl HarnessTool for RsiControlReadSessionEventsTool {
     }
 
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+        let args = match self
+            .control
+            .expand_id_prefixes(
+                self.caller_session_id,
+                AgentControlVerbV1::ReadSessionEvents,
+                args,
+            )
+            .await
+        {
+            Ok(args) => args,
+            Err(e) => {
+                let message = e.to_string();
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                return err(message);
+            }
+        };
         let request: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
             match serde_json::from_value(args) {
                 Ok(request) => request,
@@ -1115,14 +1444,12 @@ impl HarnessTool for RsiControlIssueTool {
 
     fn description(&self) -> &str {
         match self.kind {
-            IssueControlToolKind::List => {
-                "List bounded local Issues in the project owned by the Epic you currently lead."
-            }
+            IssueControlToolKind::List => AgentControlVerbV1::ListIssues.descriptor().description,
             IssueControlToolKind::Get => {
                 "Read one local Issue in the project owned by the Epic you currently lead."
             }
             IssueControlToolKind::Update => {
-                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may append to its own Issue's body only."
+                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may publish its handoff (handoff field, its own record) or append to the body of its own Issue only."
             }
             IssueControlToolKind::UpdateStatus => {
                 "CAS-update one Issue status as the current owning-Epic lead or manager with issue-coordinate authority."
@@ -1176,7 +1503,7 @@ impl HarnessTool for RsiControlIssueTool {
             IssueControlToolKind::Update => match agent_update_issue_from_args(&args) {
                 Ok(params) => {
                     self.control
-                        .agent_update_issue(self.caller_session_id, params)
+                        .agent_update_issue_value(self.caller_session_id, params)
                         .await
                 }
                 Err(validation) => {
@@ -1190,9 +1517,16 @@ impl HarnessTool for RsiControlIssueTool {
             IssueControlToolKind::UpdateStatus => {
                 match agent_update_issue_status_from_args(&args) {
                     Ok(params) => {
+                        let include_issue = params.include_issue;
                         self.control
                             .agent_update_issue_status(self.caller_session_id, params)
                             .await
+                            .and_then(|result| {
+                                crate::rpc::agent_issues::agent_issue_mutation_receipt(
+                                    result,
+                                    include_issue,
+                                )
+                            })
                     }
                     Err(validation) => {
                         let error = crate::error::agent_issue_invalid_request(validation);
@@ -2210,7 +2544,8 @@ mod tests {
                 "send schema must never advertise {forbidden}"
             );
         }
-        // Exactly the four contract fields, no more.
+        // Exactly the contract fields, no more: `session_id` plus its
+        // deprecated one-release alias `target_session_id` (#2313).
         let advertised: std::collections::BTreeSet<&str> = props
             .as_object()
             .expect("object properties")
@@ -2220,6 +2555,7 @@ mod tests {
         assert_eq!(
             advertised,
             [
+                "session_id",
                 "target_session_id",
                 "message",
                 "idempotency_key",

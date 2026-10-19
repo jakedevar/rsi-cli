@@ -222,9 +222,10 @@ fn clock_jumped(prev: &Ready, wall: DateTime<Utc>, mono: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::short_tempdir as tempdir;
     use std::path::Path;
     use std::sync::Arc;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 

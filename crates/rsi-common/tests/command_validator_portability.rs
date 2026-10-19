@@ -119,7 +119,7 @@ fn copy_dir(source: &Path, destination: &Path) {
 }
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(rsi_common::manifest_dir!())
         .parent()
         .and_then(Path::parent)
         .expect("workspace root")
@@ -205,19 +205,12 @@ fn rsi_workspace_requires_buildable_validators_and_preserves_failures() {
 
 #[test]
 fn canonical_commands_share_order_and_preserve_continuation_boundaries() {
-    let research = policy_block("research.md", "rsi-research-validate");
-    let team = policy_block("team_research.md", "rsi-research-validate");
     let resume = policy_block("resume_handoff.md", "rsi-handoff-validate");
-    assert_eq!(
-        research, team,
-        "research commands must share availability policy"
-    );
-    assert_eq!(
-        research, resume,
-        "all three commands must share the same five-state availability machine"
-    );
 
-    for policy in [&research, &team, &resume] {
+    // The handoff validator stays required: its five-state availability
+    // machine is the only policy block in the canonical commands.
+    {
+        let policy = &resume;
         let mut position = 0;
         for state in [
             "Present/repo-local",
@@ -239,6 +232,9 @@ fn canonical_commands_share_order_and_preserve_continuation_boundaries() {
         assert!(policy.contains("capability-probe error as a failure. It is never `SKIPPED`"));
     }
 
+    // #1920: the research JSON sidecar is optional (markdown is authoritative),
+    // so the research commands carry the optional-sidecar contract instead of
+    // the required-validator availability machine.
     let research_source =
         fs::read_to_string(repository_root().join(".claude/commands/research.md")).unwrap();
     let team_source =
@@ -246,14 +242,15 @@ fn canonical_commands_share_order_and_preserve_continuation_boundaries() {
     let resume_source =
         fs::read_to_string(repository_root().join(".claude/commands/resume_handoff.md")).unwrap();
     for source in [&research_source, &team_source] {
-        assert!(source.contains("Do not create a new JSON sidecar"));
-        assert!(
-            source.contains("do not overwrite, validate, trust, or delete a pre-existing sidecar")
-        );
+        assert!(source.contains("Generate a typed JSON sidecar ONLY when"));
+        assert!(source.contains("markdown is authoritative"));
         assert!(source.contains("json_companion_status: invalid"));
-        assert!(source.contains("same fallback as exit 2"));
-        assert!(source.contains("Validator exit failures are never `SKIPPED`"));
-        assert!(source.contains("markdown"));
+        assert!(source.contains("rsi-research-validate <doc>.json --strict"));
+        assert!(source.contains("delete `<doc>.json`"));
+        assert!(
+            !source.contains("Present/repo-local"),
+            "research commands must not require the validator availability machine"
+        );
     }
     assert!(resume_source.contains(
         "Do not write a `VALIDATOR_REJECTED` handoff; proceed immediately to Step 1 extraction."

@@ -6,7 +6,8 @@ use crate::error::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rsi_common::types::{SandboxCleanupState, Session};
 use rusqlite::{Transaction, TransactionBehavior, params};
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -36,24 +37,51 @@ impl Store {
 
     /// Recheck under one IMMEDIATE transaction before changing a status. A
     /// false result is an exclusion; an error leaves the session untouched.
+    ///
+    /// Runs the git probes inline, so the caller holds the Store for the
+    /// subprocesses: the periodic pass uses [`Self::retention_plan_one`], the
+    /// probe outside the lock and [`Self::retention_finish_one`] instead.
     pub fn retention_archive_one(
         &self,
         id: Uuid,
         window_hours: i64,
     ) -> Result<Option<&'static str>> {
+        let needs = match self.retention_plan_one(id, window_hours)? {
+            RetentionPlan::Held(reason) => return Ok(Some(reason)),
+            RetentionPlan::Probe(needs) => needs,
+        };
+        self.retention_finish_one(id, window_hours, &needs.probe())
+    }
+
+    /// Phase 1, read-only: evaluate every gate that needs no subprocess. A
+    /// candidate a database gate holds is `Held`; one that passes them all
+    /// returns the git facts the final gates will need (possibly none), which
+    /// the caller gathers with [`RetentionGitNeeds::probe`] without the Store
+    /// lock and hands to [`Self::retention_finish_one`].
+    pub fn retention_plan_one(&self, id: Uuid, window_hours: i64) -> Result<RetentionPlan> {
+        let needs = RefCell::new(RetentionGitNeeds::default());
+        let verdict = self.retention_verdict(id, window_hours, &GitSource::Collect(&needs))?;
+        Ok(match verdict {
+            Some(reason) => RetentionPlan::Held(reason),
+            None => RetentionPlan::Probe(needs.into_inner()),
+        })
+    }
+
+    /// Phase 3: the full gate chain again under one IMMEDIATE transaction with
+    /// the probed git facts, then the status change. A fact that no longer
+    /// matches the row (the root moved, a fact is missing) holds the session as
+    /// `probe_stale` for the next pass; an archive gate is never skipped.
+    pub fn retention_finish_one(
+        &self,
+        id: Uuid,
+        window_hours: i64,
+        git: &RetentionGitFacts,
+    ) -> Result<Option<&'static str>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let Some(session) = self.get_session(id)? else {
-            return Ok(Some("missing"));
-        };
-        let now = Utc::now();
-        let blocker = if rsi_common::is_leaf_kind(session.session_kind) {
-            self.retention_leaf_blocker(&session, now, window_hours)?
-        } else {
-            self.retention_container_blocker(&session, now, window_hours)?
-        };
-        if let Some(blocker) = blocker {
-            return Ok(Some(blocker));
+        if let Some(reason) = self.retention_verdict(id, window_hours, &GitSource::Probed(git))? {
+            return Ok(Some(reason));
         }
+        let now = Utc::now();
         let changed = self.conn.execute(
             "UPDATE sessions SET status='Archived',pending_archive=0,lead_session_id=NULL,
                retry_attempt=COALESCE(max_retries,retry_attempt),updated_at=?2
@@ -72,26 +100,148 @@ impl Store {
         Ok(None)
     }
 
+    /// The gate chain shared by both phases: `None` means every gate passed.
+    fn retention_verdict(
+        &self,
+        id: Uuid,
+        window_hours: i64,
+        git: &GitSource<'_>,
+    ) -> Result<Option<&'static str>> {
+        let Some(session) = self.get_session(id)? else {
+            return Ok(Some("missing"));
+        };
+        let now = Utc::now();
+        if rsi_common::is_leaf_kind(session.session_kind) {
+            return self.retention_leaf_blocker(&session, now, window_hours, git);
+        }
+        self.retention_container_blocker(&session, now, window_hours)
+    }
+
+    /// A digest of the effective retention window, session row stamps, wake /
+    /// review / Issue / pause facts, the latest eligible Issue binding and its
+    /// Issue state, and descendant identities/statuses for containers. A terminal
+    /// session gets a new event only by resuming, which moves its row.
+    /// Elapsed time and external git state are not fingerprinted; the capped
+    /// hold backoff still re-evaluates them, and a skip never archives anything.
+    pub fn retention_input_fingerprint(&self, id: Uuid, window_hours: i64) -> Result<String> {
+        let sid = id.to_string();
+        let (fingerprint, kind) = self.conn.query_row(
+            "SELECT ?4||'|'||COALESCE(s.status,'')||'|'||COALESCE(s.updated_at,'')||'|'
+               ||COALESCE(s.pinned_at,'')||'|'||COALESCE(s.pending_archive,'')||'|'
+               ||COALESCE(s.sandbox_root,'')||'|'||COALESCE(s.sandbox_cleanup_state,'')||'|'
+               ||COALESCE(s.parent_id,'')||'|'||COALESCE(s.lead_session_id,'')||'|'
+               ||(s.pending_question_json IS NOT NULL)||'|'
+               ||(SELECT COUNT(*)||':'||COALESCE(MAX(updated_at),'') FROM scheduled_jobs
+                   WHERE wake_session_id=?1 OR wake_mode=?2)||'|'
+               ||(SELECT COUNT(*)||':'||COALESCE(MAX(updated_at),'')
+                   FROM manager_review_assignments
+                   WHERE author_session_id=?1 OR reviewer_session_id=?1)||'|'
+               ||(SELECT COUNT(*) FROM issues WHERE created_by_session_id=?1)||'|'
+               ||COALESCE((SELECT json_array(i.id,i.status,i.archived_at,i.updated_at,
+                     (SELECT MAX(n.rowid) FROM harness_manager_v2_operations n
+                      WHERE n.kind='lifecycle_action'
+                        AND json_extract(n.payload_json,'$.issue_binding.issue_id')=i.id))
+                   FROM harness_manager_v2_operations o
+                   JOIN issues i ON i.project_id=o.project_id
+                    AND i.id=json_extract(o.payload_json,'$.issue_binding.issue_id')
+                   WHERE o.id=(SELECT b.id FROM harness_manager_v2_operations b
+                     WHERE b.kind='lifecycle_action' AND b.target_session_id=?1
+                       AND b.state IN ('running','succeeded')
+                       AND json_extract(b.payload_json,'$.issue_binding') IS NOT NULL
+                     ORDER BY b.rowid DESC LIMIT 1)), '')||'|'
+               ||(SELECT COUNT(*)||':'||COALESCE(MAX(updated_at),'')
+                   FROM harness_manager_v2_operations WHERE target_session_id=?1)||'|'
+               ||COALESCE((SELECT value FROM daemon_settings WHERE key=?3),'')||'|'
+               ||COALESCE((SELECT row_version||':'||updated_at
+                   FROM harness_manager_v2_policies WHERE project_id=s.project_id),'')
+               ,s.session_kind
+             FROM sessions s WHERE s.id=?1",
+            params![
+                sid,
+                format!("on_terminal:{sid}"),
+                format!("manager_operator_pause:{sid}"),
+                window_hours
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let kind = serde_json::from_value(serde_json::Value::String(kind))?;
+        let mut digest = blake3::Hasher::new();
+        digest.update(fingerprint.as_bytes());
+        if !rsi_common::is_leaf_kind(kind) {
+            // Use the gate's bounded traversal, including its cycle/size checks.
+            // Sorting makes the digest independent of traversal order.
+            let mut descendants = self.manager_action_descendant_ids(id)?;
+            descendants.sort_unstable();
+            let mut status = self
+                .conn
+                .prepare("SELECT status FROM sessions WHERE id=?1")?;
+            for child in descendants.into_iter().filter(|child| *child != id) {
+                let state: String = status.query_row([child.to_string()], |row| row.get(0))?;
+                digest.update(child.as_bytes());
+                digest.update(state.as_bytes());
+                digest.update(&[0]);
+            }
+        }
+        Ok(digest.finalize().to_hex().to_string())
+    }
+
+    /// #247: why an AUTOMATIC archive or sandbox reclaim must leave a terminal
+    /// but resumable session alone: the operator paused it, or it is a worker
+    /// bound to an Issue that is still `InProgress` with no final handoff (a
+    /// manager halt for higher-priority work looks exactly like a finished
+    /// Interrupted session once its tree is clean and in Git). The retention
+    /// pass and the source-worktree settlement share this one predicate; an
+    /// explicit archive does not consult it, and a finished worker, a closed or
+    /// relaunched Issue and an archived session release it, so nothing is
+    /// retained indefinitely.
+    pub fn automatic_reclaim_resume_hold(&self, session_id: Uuid) -> Result<Option<&'static str>> {
+        if self.manager_action_operator_paused(session_id)? {
+            return Ok(Some("operator_paused"));
+        }
+        if let Some(pause) = self.automatic_reclaim_pause_hold(session_id)? {
+            return Ok(Some(pause));
+        }
+        if self.unfinished_issue_worker_hold(session_id)? {
+            return Ok(Some("unfinished_issue_worker"));
+        }
+        Ok(None)
+    }
+
+    /// The manager-side pauses that cover a session without any per-worker
+    /// operator marker: the project policy's `paused` / `paused_epic_ids`
+    /// (while the grant is not revoked) and the Epic's lead pause. A paused
+    /// Epic's workers are resumable work, so neither the logical archive nor
+    /// the source-worktree settlement may reclaim them (#2683). Read-only; it
+    /// is part of [`Self::automatic_reclaim_resume_hold`], so the settlement
+    /// audit and its pre-effect fence see a pause that arrives after intent.
+    fn automatic_reclaim_pause_hold(&self, session_id: Uuid) -> Result<Option<&'static str>> {
+        let Some(project) = self.get_session(session_id)?.and_then(|s| s.project_id) else {
+            return Ok(None);
+        };
+        let epic = self.manager_action_session_epic(session_id)?;
+        if let Some(policy) = self.get_harness_manager_policy(project)?
+            && !policy.revoked
+            && (policy.policy.paused
+                || epic.is_some_and(|id| policy.policy.paused_epic_ids.contains(&id)))
+        {
+            return Ok(Some("manager_policy_paused"));
+        }
+        if let (Some(config), Some(epic)) = (self.get_harness_manager(project)?, epic)
+            && self.manager_v2_action_pause(&config, epic)?.1
+        {
+            return Ok(Some("lead_paused"));
+        }
+        Ok(None)
+    }
+
     fn retention_common_blocker(
         &self,
         session: &Session,
         now: DateTime<Utc>,
         window_hours: i64,
     ) -> Result<Option<&'static str>> {
-        if let Some(project) = session.project_id {
-            let epic = self.manager_action_session_epic(session.id)?;
-            if let Some(policy) = self.get_harness_manager_policy(project)?
-                && !policy.revoked
-                && (policy.policy.paused
-                    || epic.is_some_and(|id| policy.policy.paused_epic_ids.contains(&id)))
-            {
-                return Ok(Some("manager_policy_paused"));
-            }
-            if let (Some(config), Some(epic)) = (self.get_harness_manager(project)?, epic)
-                && self.manager_v2_action_pause(&config, epic)?.1
-            {
-                return Ok(Some("lead_paused"));
-            }
+        if let Some(pause) = self.automatic_reclaim_pause_hold(session.id)? {
+            return Ok(Some(pause));
         }
         match self.recovery_owner_gate(
             session.id,
@@ -107,8 +257,8 @@ impl Store {
         if session.pinned_at.is_some() {
             return Ok(Some("pinned"));
         }
-        if self.manager_action_operator_paused(session.id)? {
-            return Ok(Some("operator_paused"));
+        if let Some(hold) = self.automatic_reclaim_resume_hold(session.id)? {
+            return Ok(Some(hold));
         }
         let id = session.id.to_string();
         let wake: bool = self.conn.query_row(
@@ -144,6 +294,7 @@ impl Store {
         session: &Session,
         now: DateTime<Utc>,
         window_hours: i64,
+        git: &GitSource<'_>,
     ) -> Result<Option<&'static str>> {
         if self
             .delegated_archive_blocker_with_window(session, now, window_hours)?
@@ -159,20 +310,27 @@ impl Store {
         {
             return Ok(Some("sealed_source"));
         }
-        if session.sandbox_cleanup_state == Some(SandboxCleanupState::Live)
-            && !worktree_clean(session.sandbox_root.as_deref())
-        {
-            return Ok(Some("live_worktree"));
+        let root = session.sandbox_root.as_deref();
+        if session.sandbox_cleanup_state == Some(SandboxCleanupState::Live) {
+            match git.worktree_clean(root) {
+                None => return Ok(Some("probe_stale")),
+                Some(false) => return Ok(Some("live_worktree")),
+                Some(true) => {}
+            }
         }
         let filed: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM issues WHERE created_by_session_id=?1)",
             [session.id.to_string()],
             |r| r.get(0),
         )?;
-        if !filed && !rolling_contains_worktree_head(session.sandbox_root.as_deref()) {
-            return Ok(Some("undelivered"));
+        if filed {
+            return Ok(None);
         }
-        Ok(None)
+        match git.delivered(root) {
+            None => Ok(Some("probe_stale")),
+            Some(false) => Ok(Some("undelivered")),
+            Some(true) => Ok(None),
+        }
     }
 
     fn retention_container_blocker(
@@ -207,14 +365,101 @@ impl Store {
     }
 }
 
-/// Local ref is refreshed by normal rolling publication. Failure is a hold.
-fn rolling_contains_worktree_head(root: Option<&Path>) -> bool {
-    let Some(root) = root else {
-        return false;
-    };
-    if !worktree_clean(Some(root)) {
-        return false;
+/// What phase 1 found the final gates will ask git: the sandbox root and
+/// which probes. Owned data, so the probe can run on a blocking thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionGitNeeds {
+    root: Option<PathBuf>,
+    live_worktree: bool,
+    delivery: bool,
+}
+
+impl RetentionGitNeeds {
+    /// No subprocess is needed: phase 3 can follow phase 1 at once.
+    pub fn is_empty(&self) -> bool {
+        !self.live_worktree && !self.delivery
     }
+
+    /// Run the probes. Blocking (`git status`, `git merge-base`): call it with
+    /// no Store lock held. The delivery probe reuses the cleanliness verdict
+    /// when this call already computed it, so the tree is read once.
+    pub fn probe(&self) -> RetentionGitFacts {
+        let root = self.root.as_deref();
+        let clean = self.live_worktree.then(|| worktree_clean(root));
+        let delivered = self.delivery.then(|| {
+            let clean = clean.unwrap_or_else(|| worktree_clean(root));
+            clean && root.is_some_and(rolling_contains_head)
+        });
+        RetentionGitFacts {
+            root: self.root.clone(),
+            worktree_clean: clean,
+            delivered,
+        }
+    }
+}
+
+/// The probed git facts for one candidate, bound to the root they describe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionGitFacts {
+    root: Option<PathBuf>,
+    worktree_clean: Option<bool>,
+    delivered: Option<bool>,
+}
+
+/// Phase 1 of a candidate's evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionPlan {
+    /// A database gate holds the session.
+    Held(&'static str),
+    /// Every database gate passed; these git facts decide the rest.
+    Probe(RetentionGitNeeds),
+}
+
+/// Where the leaf gates get their git facts: phase 1 records what it needs and
+/// assumes it passes; phase 3 reads the probed answer.
+enum GitSource<'a> {
+    Collect(&'a RefCell<RetentionGitNeeds>),
+    Probed(&'a RetentionGitFacts),
+}
+
+impl GitSource<'_> {
+    /// `None` is a probed fact that is missing or describes another root.
+    fn worktree_clean(&self, root: Option<&Path>) -> Option<bool> {
+        let Some(root) = root else {
+            return Some(false);
+        };
+        match self {
+            Self::Collect(needs) => {
+                let mut needs = needs.borrow_mut();
+                needs.root = Some(root.to_path_buf());
+                needs.live_worktree = true;
+                Some(true)
+            }
+            Self::Probed(facts) if facts.root.as_deref() == Some(root) => facts.worktree_clean,
+            Self::Probed(_) => None,
+        }
+    }
+
+    fn delivered(&self, root: Option<&Path>) -> Option<bool> {
+        let Some(root) = root else {
+            return Some(false);
+        };
+        match self {
+            Self::Collect(needs) => {
+                let mut needs = needs.borrow_mut();
+                needs.root = Some(root.to_path_buf());
+                needs.delivery = true;
+                Some(true)
+            }
+            Self::Probed(facts) if facts.root.as_deref() == Some(root) => facts.delivered,
+            Self::Probed(_) => None,
+        }
+    }
+}
+
+/// Local ref is refreshed by normal rolling publication. Failure is a hold.
+/// The caller has already established a clean tree.
+fn rolling_contains_head(root: &Path) -> bool {
     matches!(Command::new("git").args(["merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/rolling"])
         .current_dir(root).status(), Ok(status) if status.success())
 }
@@ -248,7 +493,9 @@ fn worktree_clean(root: Option<&Path>) -> bool {
 ))]
 mod tests {
     use super::*;
-    use rsi_common::types::{NewIssue, Project, SessionKind, SessionStatus};
+    use rsi_common::types::{
+        ConversationEvent, EventType, NewIssue, Project, Role, SessionKind, SessionStatus,
+    };
 
     fn fixture() -> (Store, Uuid) {
         let store = Store::open_in_memory().unwrap();
@@ -340,6 +587,111 @@ mod tests {
             store.get_session(recent).unwrap().unwrap().status,
             SessionStatus::Completed
         );
+    }
+
+    /// An Epic with a manager appointed over it, and a finished, filed leaf
+    /// under the Epic: only the project policy can hold the leaf.
+    fn leaf_under_managed_epic(store: &Store, project: Uuid) -> (Uuid, Uuid, Uuid) {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        let mut manager = crate::store::tests::make_test_session();
+        manager.project_id = Some(project);
+        manager.session_kind = SessionKind::Standard;
+        manager.status = SessionStatus::Completed;
+        store.insert_session(&manager).unwrap();
+        let mut group = manager.clone();
+        group.id = Uuid::new_v4();
+        group.session_kind = SessionKind::Group;
+        store.insert_session(&group).unwrap();
+        let mut epic = manager.clone();
+        epic.id = Uuid::new_v4();
+        epic.session_kind = SessionKind::Epic;
+        epic.status = SessionStatus::Running;
+        epic.parent_id = Some(group.id);
+        store.insert_session(&epic).unwrap();
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: project,
+                session_id: manager.id,
+                epic_ids: Some(vec![epic.id]),
+                expected_row_version: 0,
+            })
+            .unwrap();
+        let leaf = old_leaf(store, project);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![leaf.to_string(), epic.id.to_string()],
+            )
+            .unwrap();
+        file_issue(store, project, leaf);
+        (manager.id, epic.id, leaf)
+    }
+
+    fn set_policy(
+        store: &Store,
+        project: Uuid,
+        version: i64,
+        paused: bool,
+        paused_epic_ids: Vec<Uuid>,
+    ) {
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerPolicyV2,
+        };
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: project,
+                expected_scope_version: 1,
+                expected_policy_version: version,
+                idempotency_key: format!("policy-{version}"),
+                policy: ManagerPolicyV2 {
+                    capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                    paused,
+                    paused_epic_ids,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+
+    /// #2683: a leaf covered only by its Epic's (or the project's) policy pause
+    /// has no per-worker operator marker and no unfinished Issue, yet the shared
+    /// automatic-reclaim predicate (which the settlement audit and its
+    /// pre-effect fence consult) must hold it, exactly as the archive does; an
+    /// explicit archive does not consult it, and lifting the pause releases it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn an_epic_or_project_policy_pause_holds_the_shared_automatic_reclaim_predicate() {
+        let (store, project) = fixture();
+        let (_manager, epic, leaf) = leaf_under_managed_epic(&store, project);
+        set_policy(&store, project, 0, false, Vec::new());
+        assert_eq!(store.automatic_reclaim_resume_hold(leaf).unwrap(), None);
+
+        set_policy(&store, project, 1, false, vec![epic]);
+        assert_eq!(
+            store.automatic_reclaim_resume_hold(leaf).unwrap(),
+            Some("manager_policy_paused"),
+            "the Epic pause alone holds the worker"
+        );
+        assert_eq!(
+            store.retention_archive_one(leaf, 24).unwrap(),
+            Some("manager_policy_paused")
+        );
+        // A session outside the paused Epic is not held by it.
+        let outside = old_leaf(&store, project);
+        assert_eq!(store.automatic_reclaim_resume_hold(outside).unwrap(), None);
+
+        set_policy(&store, project, 2, true, Vec::new());
+        assert_eq!(
+            store.automatic_reclaim_resume_hold(outside).unwrap(),
+            Some("manager_policy_paused"),
+            "the project-wide pause holds every worker of the project"
+        );
+
+        set_policy(&store, project, 3, false, Vec::new());
+        assert_eq!(store.automatic_reclaim_resume_hold(leaf).unwrap(), None);
+        assert_eq!(store.retention_archive_one(leaf, 24).unwrap(), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -512,6 +864,236 @@ mod tests {
         );
     }
 
+    /// #247: a manager-halted worker whose Issue is still `InProgress` with no
+    /// final report in its latest turn is paused work, whatever Issue handoffs
+    /// it published. Its clean, delivered tree does not let the automatic
+    /// archive retire it (that would purge the root the manager plans to
+    /// resume); a current final report or a closed Issue releases it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn an_unfinished_issue_worker_is_not_archived_until_it_reports_or_its_issue_ends() {
+        let (store, project) = fixture();
+        let manager = old_leaf(&store, project);
+        let issue_for = |status: &str| {
+            let issue = store
+                .create_issue(&NewIssue {
+                    project_id: project,
+                    title: "bound Issue".into(),
+                    body: String::new(),
+                    priority: None,
+                    labels: vec![],
+                    created_by_session_id: None,
+                    assignee: None,
+                    idea_id: None,
+                    source_event_id: None,
+                    source_finding_ref: None,
+                })
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE issues SET status=?2 WHERE id=?1",
+                    params![issue.id.to_string(), status],
+                )
+                .unwrap();
+            issue.id
+        };
+        let halted_worker = |issue: Uuid| {
+            let worker = old_leaf(&store, project);
+            file_issue(&store, project, worker);
+            store
+                .update_session_status(worker, SessionStatus::Interrupted)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                    params![
+                        worker.to_string(),
+                        (Utc::now() - Duration::hours(50))
+                            .to_rfc3339_opts(SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+            let stamp = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let payload = serde_json::json!({
+                "request": {"operation": {"action": "create_session"}},
+                "issue_binding": {"issue_id": issue.to_string()},
+            });
+            store
+                .conn
+                .execute(
+                    "INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,
+                        scope_version,policy_version,idempotency_key,fingerprint,kind,payload_json,
+                        state,target_session_id,outcome_json,not_before,created_at,updated_at)
+                     VALUES(?1,?2,?3,1,1,?1,'fixture','lifecycle_action',?4,'succeeded',?5,'{}',?6,?6,?6)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        project.to_string(),
+                        manager.to_string(),
+                        payload.to_string(),
+                        worker.to_string(),
+                        stamp
+                    ],
+                )
+                .unwrap();
+            worker
+        };
+
+        let issue = issue_for("InProgress");
+        let paused = halted_worker(issue);
+        assert_eq!(
+            store.retention_archive_one(paused, 24).unwrap(),
+            Some("unfinished_issue_worker")
+        );
+        assert_eq!(
+            store.get_session(paused).unwrap().unwrap().status,
+            SessionStatus::Interrupted
+        );
+        let held = store.retention_input_fingerprint(paused, 24).unwrap();
+        assert_eq!(held, store.retention_input_fingerprint(paused, 24).unwrap());
+        let stamp = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE issues SET updated_at=?2 WHERE id=?1",
+                params![issue.to_string(), stamp],
+            )
+            .unwrap();
+        let updated = store.retention_input_fingerprint(paused, 24).unwrap();
+        assert_ne!(held, updated);
+        store
+            .conn
+            .execute(
+                "UPDATE issues SET archived_at=?2 WHERE id=?1",
+                params![issue.to_string(), stamp],
+            )
+            .unwrap();
+        let archived = store.retention_input_fingerprint(paused, 24).unwrap();
+        assert_ne!(updated, archived);
+        store
+            .conn
+            .execute(
+                "UPDATE issues SET archived_at=NULL WHERE id=?1",
+                [issue.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            updated,
+            store.retention_input_fingerprint(paused, 24).unwrap()
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE issues SET status='Closed' WHERE id=?1",
+                [issue.to_string()],
+            )
+            .unwrap();
+        assert_ne!(
+            updated,
+            store.retention_input_fingerprint(paused, 24).unwrap()
+        );
+        assert_eq!(store.retention_archive_one(paused, 24).unwrap(), None);
+        assert_eq!(
+            store.get_session(paused).unwrap().unwrap().status,
+            SessionStatus::Archived
+        );
+
+        // A final assistant report in the latest turn (the existing report
+        // contract) finishes the worker; the Issue stays InProgress.
+        let issue = issue_for("InProgress");
+        let finished = halted_worker(issue);
+        let event = |worker: Uuid, sequence: i32, role: Role, content: &str, hours: i64| {
+            store
+                .insert_event(&ConversationEvent {
+                    id: 0,
+                    session_id: worker,
+                    sequence,
+                    event_type: EventType::Message,
+                    role: Some(role),
+                    content: content.into(),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: Utc::now() - Duration::hours(hours),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: None,
+                })
+                .unwrap();
+        };
+        assert_eq!(
+            store.retention_archive_one(finished, 24).unwrap(),
+            Some("unfinished_issue_worker")
+        );
+        event(
+            finished,
+            1,
+            Role::Assistant,
+            "PIPELINE HANDOFF — IMPLEMENTATION:\nRESULT: done",
+            48,
+        );
+        assert_eq!(store.retention_archive_one(finished, 24).unwrap(), None);
+        assert_eq!(
+            store.get_session(finished).unwrap().unwrap().status,
+            SessionStatus::Archived
+        );
+
+        // An OLD (pre-verification) handoff, then the manager's Continue, then
+        // a halt: the Issue is unfinished again, so the worker stays held.
+        let issue = issue_for("InProgress");
+        let continued = halted_worker(issue);
+        let at = |hours: i64| {
+            (Utc::now() - Duration::hours(hours)).to_rfc3339_opts(SecondsFormat::Nanos, true)
+        };
+        store
+            .conn
+            .execute(
+                "INSERT INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key,
+                      body, created_at)
+                 VALUES (?1, 1, ?2, ?3, 'handoff-247', 'PREVERIFICATION', ?4)",
+                params![
+                    issue.to_string(),
+                    project.to_string(),
+                    continued.to_string(),
+                    at(49)
+                ],
+            )
+            .unwrap();
+        event(
+            continued,
+            1,
+            Role::User,
+            "Continue: correct the review finding",
+            48,
+        );
+        // A handoff published in the current turn without a final assistant
+        // report is progress, not completion.
+        store
+            .conn
+            .execute(
+                "INSERT INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key,
+                      body, created_at)
+                 VALUES (?1, 2, ?2, ?3, 'handoff-247-2', 'WIP', ?4)",
+                params![
+                    issue.to_string(),
+                    project.to_string(),
+                    continued.to_string(),
+                    at(47)
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.retention_archive_one(continued, 24).unwrap(),
+            Some("unfinished_issue_worker")
+        );
+        assert_eq!(
+            store.get_session(continued).unwrap().unwrap().status,
+            SessionStatus::Interrupted
+        );
+    }
+
     /// #1098: a Completed worker with commits not on rolling and an armed
     /// manager watch stays continuable across a cleanup pass, even when it
     /// filed an Issue (which otherwise exempts the delivery check).
@@ -570,5 +1152,220 @@ mod tests {
             store.get_session(worker).unwrap().unwrap().status,
             SessionStatus::Completed
         );
+    }
+
+    /// A clean git repository whose HEAD is already on `refs/remotes/origin/rolling`,
+    /// attached to `session` as its live worktree.
+    fn delivered_worktree(store: &Store, session: Uuid) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args([
+                        "-c",
+                        "user.name=Retention Test",
+                        "-c",
+                        "user.email=r@example.invalid",
+                    ])
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "base"]);
+        git(&["update-ref", "refs/remotes/origin/rolling", "HEAD"]);
+        store.conn.execute(
+            "UPDATE sessions SET sandbox_kind='GitWorktree',sandbox_root=?2,sandbox_cleanup_state='Live' WHERE id=?1",
+            params![session.to_string(), dir.path().to_str().unwrap()],
+        ).unwrap();
+        dir
+    }
+
+    /// Hub #3030: phase 1 runs no subprocess and names what git must answer;
+    /// phase 3 archives from those facts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn plan_names_the_git_probes_and_finish_archives_from_their_facts() {
+        let (store, project) = fixture();
+        let leaf = old_leaf(&store, project);
+        let _dir = delivered_worktree(&store, leaf);
+        let RetentionPlan::Probe(needs) = store.retention_plan_one(leaf, 24).unwrap() else {
+            panic!("a leaf that passes the database gates waits for git");
+        };
+        assert!(needs.live_worktree && needs.delivery && !needs.is_empty());
+        // Phase 1 changed nothing.
+        assert_eq!(
+            store.get_session(leaf).unwrap().unwrap().status,
+            SessionStatus::Completed
+        );
+        let facts = needs.probe();
+        assert_eq!(facts.worktree_clean, Some(true));
+        assert_eq!(facts.delivered, Some(true));
+        assert_eq!(store.retention_finish_one(leaf, 24, &facts).unwrap(), None);
+        assert_eq!(
+            store.get_session(leaf).unwrap().unwrap().status,
+            SessionStatus::Archived
+        );
+    }
+
+    /// The IMMEDIATE re-check keeps every gate: a hold that arrives after the
+    /// probe, or probed facts that describe another root, stop the archive.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn finish_rechecks_every_gate_and_refuses_facts_for_another_root() {
+        let (store, project) = fixture();
+        let leaf = old_leaf(&store, project);
+        let _dir = delivered_worktree(&store, leaf);
+        let RetentionPlan::Probe(needs) = store.retention_plan_one(leaf, 24).unwrap() else {
+            panic!("expected a probe plan");
+        };
+        let facts = needs.probe();
+
+        // Facts probed for a different root are stale, not trusted.
+        let other = tempfile::tempdir().unwrap();
+        let mut elsewhere = facts.clone();
+        elsewhere.root = Some(other.path().to_path_buf());
+        assert_eq!(
+            store.retention_finish_one(leaf, 24, &elsewhere).unwrap(),
+            Some("probe_stale")
+        );
+        // A missing fact is stale too.
+        assert_eq!(
+            store
+                .retention_finish_one(leaf, 24, &RetentionGitFacts::default())
+                .unwrap(),
+            Some("probe_stale")
+        );
+
+        // An operator pin placed between the probe and the update holds it.
+        store.toggle_session_pin(leaf).unwrap();
+        assert!(
+            store
+                .retention_finish_one(leaf, 24, &facts)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.get_session(leaf).unwrap().unwrap().status,
+            SessionStatus::Completed
+        );
+        store.toggle_session_pin(leaf).unwrap();
+        assert_eq!(store.retention_finish_one(leaf, 24, &facts).unwrap(), None);
+    }
+
+    /// A candidate held by a database gate never reaches git, and a leaf with
+    /// no worktree needs no probe at all.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn database_holds_and_worktreeless_leaves_need_no_probe() {
+        let (store, project) = fixture();
+        let pinned = old_leaf(&store, project);
+        file_issue(&store, project, pinned);
+        store.toggle_session_pin(pinned).unwrap();
+        assert!(matches!(
+            store.retention_plan_one(pinned, 24).unwrap(),
+            RetentionPlan::Held(_)
+        ));
+        let filed = old_leaf(&store, project);
+        file_issue(&store, project, filed);
+        let RetentionPlan::Probe(needs) = store.retention_plan_one(filed, 24).unwrap() else {
+            panic!("a filed leaf passes the database gates");
+        };
+        assert!(needs.is_empty());
+        assert_eq!(
+            store
+                .retention_finish_one(filed, 24, &needs.probe())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn input_fingerprint_changes_with_a_gate_input_and_not_without_one() {
+        let (store, project) = fixture();
+        let leaf = old_leaf(&store, project);
+        let other = old_leaf(&store, project);
+        let before = store.retention_input_fingerprint(leaf, 24).unwrap();
+        assert_eq!(before, store.retention_input_fingerprint(leaf, 24).unwrap());
+        assert_ne!(before, store.retention_input_fingerprint(leaf, 72).unwrap());
+        store.toggle_session_pin(other).unwrap();
+        assert_eq!(
+            before,
+            store.retention_input_fingerprint(leaf, 24).unwrap(),
+            "another session's change is not this candidate's input"
+        );
+        file_issue(&store, project, leaf);
+        let filed = store.retention_input_fingerprint(leaf, 24).unwrap();
+        assert_ne!(before, filed);
+        store.toggle_session_pin(leaf).unwrap();
+        let pinned = store.retention_input_fingerprint(leaf, 24).unwrap();
+        assert_ne!(filed, pinned);
+        store.record_manager_operator_pause(leaf, true).unwrap();
+        assert_ne!(pinned, store.retention_input_fingerprint(leaf, 24).unwrap());
+    }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn container_fingerprint_tracks_nested_descendant_status_and_membership() {
+        let (store, project) = fixture();
+        let root = old_leaf(&store, project);
+        let child = old_leaf(&store, project);
+        let grandchild = old_leaf(&store, project);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET session_kind='Group' WHERE id=?1",
+                [root.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET session_kind='Epic',parent_id=?2 WHERE id=?1",
+                params![child.to_string(), root.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![grandchild.to_string(), child.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.retention_plan_one(root, 24).unwrap(),
+            RetentionPlan::Held("children_live")
+        );
+        let before = store.retention_input_fingerprint(root, 24).unwrap();
+        assert_eq!(before, store.retention_input_fingerprint(root, 24).unwrap());
+        store
+            .update_session_status(grandchild, SessionStatus::Archived)
+            .unwrap();
+        let nested = store.retention_input_fingerprint(root, 24).unwrap();
+        assert_ne!(before, nested);
+        store
+            .update_session_status(child, SessionStatus::Archived)
+            .unwrap();
+        let finished = store.retention_input_fingerprint(root, 24).unwrap();
+        assert_ne!(nested, finished);
+        assert!(matches!(
+            store.retention_plan_one(root, 24).unwrap(),
+            RetentionPlan::Probe(_)
+        ));
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=NULL WHERE id=?1",
+                [grandchild.to_string()],
+            )
+            .unwrap();
+        assert_ne!(
+            finished,
+            store.retention_input_fingerprint(root, 24).unwrap()
+        );
+        assert_eq!(store.retention_archive_one(root, 24).unwrap(), None);
     }
 }

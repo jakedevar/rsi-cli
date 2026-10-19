@@ -14,11 +14,12 @@ use crate::error::DaemonError;
 use crate::model_control::ModelExecutionCapability;
 use crate::session::harness::api_key::ApiCredential;
 use crate::session::harness::bedrock_stream::read_bedrock_anthropic_stream;
-use crate::session::harness::errors::{self, ProviderError, ProviderErrorClass};
+use crate::session::harness::errors::{self, ProviderError, ProviderErrorClass, ProviderErrorExt};
 use crate::session::harness::provider::{ApiProvider, Result, WebCapabilities};
 use crate::session::harness::sse::{AccumulatedToolCall, read_anthropic_sse_stream};
 use crate::session::harness::types::*;
-use serde_json::{Value, json};
+use rsid_harness::providers::anthropic as anthropic_wire;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 pub struct AnthropicProvider {
@@ -37,33 +38,7 @@ enum Transport {
     Bedrock { region: String },
 }
 
-/// Beta header that enables server-side context editing.
-const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
-/// Context editing starts only past this prompt size, so a short session
-/// never pays a cache write for it.
-const CONTEXT_EDIT_TRIGGER_TOKENS: u64 = 100_000;
-/// Recent tool use/result pairs that always stay readable.
-const CONTEXT_EDIT_KEEP_TOOL_USES: u64 = 8;
-/// An edit that clears less than this is skipped: clearing breaks the prompt
-/// cache prefix, so it must free enough to be worth the write (bulk, rarely).
-const CONTEXT_EDIT_CLEAR_AT_LEAST_TOKENS: u64 = 40_000;
-
-/// The `context_management` request field (names verified against the
-/// context-editing docs). Constant for a session, so the request prefix stays
-/// cache-stable until the API actually clears.
-pub(crate) fn context_management_config() -> Value {
-    json!({
-        "edits": [{
-            "type": "clear_tool_uses_20250919",
-            "trigger": {"type": "input_tokens", "value": CONTEXT_EDIT_TRIGGER_TOKENS},
-            "keep": {"type": "tool_uses", "value": CONTEXT_EDIT_KEEP_TOOL_USES},
-            "clear_at_least": {"type": "input_tokens", "value": CONTEXT_EDIT_CLEAR_AT_LEAST_TOKENS},
-        }]
-    })
-}
-
-/// `anthropic_version` Bedrock requires in the Messages body.
-const BEDROCK_ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
+use rsid_harness::providers::anthropic::CONTEXT_MANAGEMENT_BETA;
 
 pub(crate) use crate::store_support::provider_defaults::uses_adaptive_thinking;
 
@@ -83,10 +58,7 @@ impl AnthropicProvider {
         if credential.current().is_none() {
             return Err(Self::missing_key());
         }
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| DaemonError::Process(format!("HTTP client build error: {e}")))?;
+        let http = crate::session::harness::net::client()?;
 
         Ok(Self {
             http,
@@ -122,18 +94,12 @@ impl AnthropicProvider {
     /// Transport-specific body: Bedrock takes the model from the URL, picks
     /// streaming by operation, and requires its own `anthropic_version`.
     fn transport_body(&self, request: &ChatRequest) -> Value {
-        let mut body = self.build_request_body(request);
-        if matches!(self.transport, Transport::Bedrock { .. })
-            && let Some(object) = body.as_object_mut()
-        {
-            object.remove("model");
-            object.remove("stream");
-            object.insert(
-                "anthropic_version".into(),
-                Value::String(BEDROCK_ANTHROPIC_VERSION.into()),
-            );
+        let body = self.build_request_body(request);
+        if matches!(self.transport, Transport::Bedrock { .. }) {
+            anthropic_wire::bedrock_body(body)
+        } else {
+            body
         }
-        body
     }
 
     fn missing_key() -> DaemonError {
@@ -147,9 +113,7 @@ impl AnthropicProvider {
     /// applied by the API to what it is sent; the client never rewrites an
     /// earlier message. Direct Anthropic API only (not Bedrock).
     fn context_editing_active(&self, request: &ChatRequest) -> bool {
-        request.context_editing
-            && self.transport == Transport::Direct
-            && request.model.starts_with("claude")
+        anthropic_wire::context_editing_active(request, self.transport == Transport::Direct)
     }
 
     /// Extra headers for this request: the context-management beta when the
@@ -165,179 +129,13 @@ impl AnthropicProvider {
         headers
     }
 
-    /// Build Anthropic-format request body.
+    /// Build Anthropic-format request body (the wire shape lives in `rsid-harness`).
     fn build_request_body(&self, request: &ChatRequest) -> Value {
-        // Extract system message (Anthropic wants it as top-level field)
-        let mut system_content: Option<String> = None;
-        let mut messages = Vec::new();
-
-        for msg in &request.messages {
-            match msg.role {
-                MessageRole::System => {
-                    // Anthropic: system is top-level, not in messages array
-                    system_content = Some(msg.content.clone());
-                }
-                MessageRole::User => {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": msg.content,
-                    }));
-                }
-                MessageRole::Assistant => {
-                    if msg.tool_calls.is_empty() {
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": msg.content,
-                        }));
-                    } else {
-                        // Assistant with tool calls
-                        let mut content_blocks: Vec<Value> = Vec::new();
-                        if !msg.content.is_empty() {
-                            content_blocks.push(json!({
-                                "type": "text",
-                                "text": msg.content,
-                            }));
-                        }
-                        for tc in &msg.tool_calls {
-                            let input: Value =
-                                serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
-                            content_blocks.push(json!({
-                                "type": if tc.hosted { "server_tool_use" } else { "tool_use" },
-                                "id": tc.id,
-                                "name": tc.name,
-                                "input": input,
-                            }));
-                        }
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": content_blocks,
-                        }));
-                    }
-                }
-                MessageRole::Tool => {
-                    if let Some(block) = msg
-                        .tool_blocks()
-                        .into_iter()
-                        .find(|block| matches!(block, ToolContentBlock::ServerToolResult { .. }))
-                        && let ToolContentBlock::ServerToolResult { result } = block
-                    {
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": [result],
-                        }));
-                        continue;
-                    }
-                    let content = if msg.has_typed_tool_blocks() {
-                        json!(
-                            msg.tool_blocks()
-                                .into_iter()
-                                .map(|block| match block {
-                                    ToolContentBlock::Text { text } => json!({
-                                        "type": "text",
-                                        "text": text,
-                                    }),
-                                    ToolContentBlock::Image {
-                                        media_type, data, ..
-                                    } => json!({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": media_type,
-                                            "data": data,
-                                        },
-                                    }),
-                                    ToolContentBlock::ServerToolResult { result } => result,
-                                })
-                                .collect::<Vec<_>>()
-                        )
-                    } else {
-                        json!(msg.content)
-                    };
-                    let mut tool_result = json!({
-                        "type": "tool_result",
-                        "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                        "content": content,
-                    });
-                    if msg.is_error {
-                        tool_result["is_error"] = json!(true);
-                    }
-                    messages.push(json!({
-                        "role": "user",
-                        "content": [tool_result],
-                    }));
-                }
-            }
-        }
-
-        // Build tools array in Anthropic format
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|t| match &t.kind {
-                HarnessToolSpecKind::Function => {
-                    let schema: Value = serde_json::from_str(&t.parameters_json)
-                        .unwrap_or(json!({"type": "object"}));
-                    json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": schema,
-                    })
-                }
-                HarnessToolSpecKind::AnthropicWebSearch { wire_type }
-                | HarnessToolSpecKind::AnthropicWebFetch { wire_type } => json!({
-                    "type": wire_type,
-                    "name": t.name,
-                }),
-                HarnessToolSpecKind::ResponsesWebSearch => Value::Null,
-            })
-            .filter(|tool| !tool.is_null())
-            .collect();
-
-        let mut body = json!({
-            "model": request.model,
-            "messages": messages,
-            "max_tokens": request.max_tokens.unwrap_or(8192),
-        });
-
-        if let Some(ref sys) = system_content {
-            body["system"] = json!(sys);
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
-        let adaptive_thinking = uses_adaptive_thinking(&request.model);
-        if !adaptive_thinking {
-            if let Some(temp) = request.temperature {
-                body["temperature"] = json!(temp);
-            }
-        }
-        if request.stream {
-            body["stream"] = json!(true);
-        }
-        if self.context_editing_active(request) {
-            body["context_management"] = context_management_config();
-        }
-
-        // Current Claude models use adaptive thinking and output_config effort.
-        if let Some(ref effort) = request.reasoning_effort {
-            if adaptive_thinking {
-                body["thinking"] = json!({ "type": "adaptive" });
-                body["output_config"] = json!({ "effort": effort });
-            } else {
-                let budget = match effort.as_str() {
-                    "low" => 1024,
-                    "medium" => 4096,
-                    "high" => 8192,
-                    _ => 4096,
-                };
-                body["thinking"] = json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                });
-            }
-        }
-
-        body
+        anthropic_wire::build_request_body(
+            request,
+            self.context_editing_active(request),
+            uses_adaptive_thinking(&request.model),
+        )
     }
 
     /// Resolved on every request, so a vault rotation applies to the next
@@ -357,26 +155,7 @@ impl AnthropicProvider {
     }
 
     fn convert_tool_calls(accumulated: Vec<AccumulatedToolCall>) -> Vec<ToolCall> {
-        let (results, calls): (Vec<_>, Vec<_>) =
-            accumulated.into_iter().partition(|tc| tc.is_result);
-        let mut calls: Vec<ToolCall> = calls
-            .into_iter()
-            .map(|tc| ToolCall {
-                id: tc.id,
-                name: tc.name,
-                arguments: tc.arguments,
-                hosted: tc.hosted,
-                hosted_result: None,
-            })
-            .collect();
-        for result in results {
-            if let Some(result_value) = &result.hosted_result {
-                if let Some(call) = calls.iter_mut().find(|call| call.id == result.id) {
-                    call.hosted_result = Some(result_value.clone());
-                }
-            }
-        }
-        calls
+        anthropic_wire::convert_tool_calls(accumulated)
     }
 }
 
@@ -400,7 +179,8 @@ impl ApiProvider for AnthropicProvider {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .headers(self.beta_headers(request))
-            .json(&req_body);
+            .json(&req_body)
+            .timeout(crate::session::harness::net::total_timeout(false));
         let resp = execution
             .bind_http(
                 crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessAnthropicHttp,
@@ -427,111 +207,7 @@ impl ApiProvider for AnthropicProvider {
             .await
             .map_err(|e| DaemonError::Process(format!("Anthropic parse error: {e}")))?;
 
-        // Parse response
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-
-        if let Some(blocks) = json.get("content").and_then(|c| c.as_array()) {
-            for block in blocks {
-                match block.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            content.push_str(text);
-                        }
-                    }
-                    Some("tool_use") => {
-                        tool_calls.push(ToolCall {
-                            id: block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            name: block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            arguments: block
-                                .get("input")
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                            hosted: false,
-                            hosted_result: None,
-                        });
-                    }
-                    Some("server_tool_use") => {
-                        tool_calls.push(ToolCall {
-                            id: block
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            name: block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            arguments: block
-                                .get("input")
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                            hosted: true,
-                            hosted_result: None,
-                        });
-                    }
-                    Some("web_search_tool_result" | "web_fetch_tool_result") => {
-                        let id = block
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if let Some(call) = tool_calls.iter_mut().find(|call| call.id == id) {
-                            call.hosted_result = Some(block.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let usage = if let Some(u) = json.get("usage") {
-            TokenUsage {
-                prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                cache_creation_tokens: u
-                    .get("cache_creation_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                cache_read_tokens: u
-                    .get("cache_read_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
-                reasoning_tokens: 0,
-                total_tokens: 0, // Computed below
-                cost_usd: None,
-            }
-        } else {
-            TokenUsage::default()
-        };
-
-        let stop_reason = json
-            .get("stop_reason")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        Ok(ChatResponse {
-            content,
-            tool_calls,
-            usage: TokenUsage {
-                total_tokens: usage.prompt_tokens
-                    + usage.completion_tokens
-                    + usage.cache_creation_tokens
-                    + usage.cache_read_tokens,
-                ..usage
-            },
-            reasoning_content: None,
-            stop_reason,
-        })
+        Ok(anthropic_wire::parse_chat_response(&json))
     }
 
     async fn stream_chat(
@@ -591,6 +267,7 @@ impl ApiProvider for AnthropicProvider {
                 is_final: true,
                 usage: Some(usage.clone()),
                 stop_reason: stop_reason.clone(),
+                warning: None,
             })
             .await;
 
@@ -628,6 +305,10 @@ impl ApiProvider for AnthropicProvider {
 mod tests {
     use super::*;
     use crate::model_control::registry::RuntimeExecutionRoute;
+    use rsid_harness::providers::anthropic::{
+        BEDROCK_ANTHROPIC_VERSION, context_management_config,
+    };
+    use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -703,6 +384,7 @@ mod tests {
             stream: false,
             reasoning_effort: effort.map(str::to_string),
             context_editing: false,
+            tool_choice_none: false,
         }
     }
 
@@ -823,91 +505,6 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
-    fn tool_result_error_flag_is_sent_only_for_failures() {
-        let mut successful = request("claude-opus-5", None);
-        successful.messages = vec![ChatMessage::tool_result("call-1", "ok")];
-        let success_body = provider().build_request_body(&successful);
-        assert_eq!(
-            success_body["messages"][0]["content"][0],
-            json!({
-                "type": "tool_result",
-                "tool_use_id": "call-1",
-                "content": "ok"
-            })
-        );
-
-        let mut failed = request("claude-opus-5", None);
-        failed.messages = vec![ChatMessage::tool_error_result("call-1", "Error: failed")];
-        let failure_body = provider().build_request_body(&failed);
-        assert_eq!(failure_body["messages"][0]["content"][0]["is_error"], true);
-        assert_eq!(
-            failure_body["messages"][0]["content"][0]["content"],
-            "Error: failed"
-        );
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-    #[test]
-    fn typed_tool_results_use_anthropic_content_blocks() {
-        let mut request = request("claude-opus-5", None);
-        let image = crate::session::harness::tools::view_image::test_png_image_block(Some("low"));
-        let ToolContentBlock::Image {
-            media_type, data, ..
-        } = &image
-        else {
-            panic!("test image block");
-        };
-        request.messages = vec![
-            ChatMessage::tool_result_blocks(
-                "text",
-                vec![ToolContentBlock::Text { text: "ok".into() }],
-                false,
-            ),
-            ChatMessage::tool_result_blocks(
-                "image",
-                vec![
-                    ToolContentBlock::Text {
-                        text: "preview".into(),
-                    },
-                    image.clone(),
-                ],
-                false,
-            ),
-            ChatMessage::tool_result_blocks(
-                "error",
-                vec![ToolContentBlock::Text {
-                    text: "failed".into(),
-                }],
-                true,
-            ),
-        ];
-        let body = provider().build_request_body(&request);
-        assert_eq!(
-            body["messages"][0]["content"][0]["content"],
-            json!([
-                {"type": "text", "text": "ok"}
-            ])
-        );
-        assert_eq!(
-            body["messages"][1]["content"][0]["content"],
-            json!([
-                {"type": "text", "text": "preview"},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": media_type, "data": data
-                }}
-            ])
-        );
-        assert_eq!(
-            body["messages"][2]["content"][0]["content"],
-            json!([
-                {"type": "text", "text": "failed"}
-            ])
-        );
-        assert_eq!(body["messages"][2]["content"][0]["is_error"], true);
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-    #[test]
     fn current_models_use_adaptive_thinking_without_temperature_or_budget() {
         for model in [
             "claude-fable-5-1",
@@ -946,23 +543,10 @@ mod tests {
         assert!(body.get("temperature").is_none());
     }
 
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-    #[test]
-    fn older_models_keep_legacy_thinking_request_shape() {
-        let body = provider().build_request_body(&request("claude-opus-4-6", Some("high")));
-
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 8192);
-        assert!(body.get("output_config").is_none());
-        let temperature = body["temperature"]
-            .as_f64()
-            .expect("temperature is numeric");
-        assert!((temperature - 0.2).abs() < 1e-6);
-    }
-
     fn editing_request(model: &str, editing: bool) -> ChatRequest {
         ChatRequest {
             context_editing: editing,
+            tool_choice_none: false,
             ..request(model, None)
         }
     }
@@ -1107,7 +691,7 @@ mod tests {
         let mut history = vec![ChatMessage::user("run the tests")];
         history.extend([call("t1"), ChatMessage::tool_result("t1", &stub)]);
         history.push(ChatMessage::assistant("one failure, reading it"));
-        let mut turn = |history: &[ChatMessage]| {
+        let turn = |history: &[ChatMessage]| {
             let mut request = editing_request("claude-opus-5-5", true);
             request.messages = history.to_vec();
             provider.build_request_body(&request)

@@ -17,6 +17,19 @@ pub struct ProviderQuirks {
     pub auth_style: AuthStyle,
     /// Whether this provider supports native function-calling tool_calls.
     pub native_tools: bool,
+    /// How the route spells the reasoning-effort request parameter (#2253).
+    pub reasoning_effort: ReasoningEffortWire,
+    /// Which request field carries the output-token cap (#2253).
+    pub max_tokens_field: MaxTokensField,
+    /// The route's default per-call output budget, reasoning included. The
+    /// Harness loop lifts its generic per-call cap to this when it is larger
+    /// (#2253).
+    pub default_max_output_tokens: Option<u32>,
+    /// Whether the route accepts `tool_choice: "none"` next to `tools` while
+    /// the history already holds `tool_calls`. A route that does lets the
+    /// wrap-up and final-answer turns keep `tools` (#2253); the others drop
+    /// them for those turns.
+    pub tool_choice_none: bool,
 }
 
 impl Default for ProviderQuirks {
@@ -28,6 +41,69 @@ impl Default for ProviderQuirks {
             strip_think_tags: false,
             auth_style: AuthStyle::Bearer,
             native_tools: false,
+            reasoning_effort: ReasoningEffortWire::None,
+            max_tokens_field: MaxTokensField::MaxTokens,
+            default_max_output_tokens: None,
+            tool_choice_none: false,
+        }
+    }
+}
+
+/// How a chat-completions route takes the reasoning effort (#2253).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningEffortWire {
+    /// The route takes no effort parameter (the default; OpenRouter has its
+    /// own `reasoning.effort` path).
+    #[default]
+    None,
+    /// Top-level `reasoning_effort` with `low|medium|high`.
+    OpenAi,
+    /// Top-level `reasoning_effort` with `instant|low|medium|high` (Inception
+    /// Mercury).
+    OpenAiWithInstant,
+    /// Top-level `reasoning_effort` with `none|low|medium|high` (local
+    /// Ollama-style routes, where `none` turns a reasoning model's thinking
+    /// off so the whole budget goes to the answer, #2603).
+    OpenAiWithNone,
+}
+
+impl ReasoningEffortWire {
+    /// Map an RSI effort level to this route's wire value, or `None` when the
+    /// route takes no effort or the level is unknown. RSI levels run
+    /// `minimal|none|low|medium|high|xhigh|max`: the bottom two are the
+    /// route's lowest level and the top two its highest.
+    pub fn wire_value(self, effort: &str) -> Option<&'static str> {
+        let lowest = match self {
+            Self::None => return None,
+            Self::OpenAi => "low",
+            Self::OpenAiWithInstant => "instant",
+            Self::OpenAiWithNone => "none",
+        };
+        match effort.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "none" => Some(lowest),
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
+        }
+    }
+}
+
+/// The request field that carries a route's output-token cap (#2253).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MaxTokensField {
+    /// `max_tokens` (the default).
+    #[default]
+    MaxTokens,
+    /// `max_completion_tokens`, which counts reasoning tokens.
+    MaxCompletionTokens,
+}
+
+impl MaxTokensField {
+    pub fn field_name(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
         }
     }
 }
@@ -66,15 +142,33 @@ const DEFAULT_QUIRKS: ProviderQuirks = ProviderQuirks {
     strip_think_tags: false,
     auth_style: AuthStyle::Bearer,
     native_tools: false,
+    reasoning_effort: ReasoningEffortWire::None,
+    max_tokens_field: MaxTokensField::MaxTokens,
+    default_max_output_tokens: None,
+    tool_choice_none: false,
 };
+
+/// Mercury's default `max_completion_tokens` (16,384, reasoning included).
+/// Written as a product because it is an output budget, not a context window:
+/// the provider-capability drift scan reads a bare 8,000..=10M literal next to
+/// a model-like name in this table as a context-size mapping.
+const MERCURY_DEFAULT_MAX_COMPLETION_TOKENS: u32 = 16 * 1024;
 
 pub static COMPATIBLE_TABLE: &[CompatibleEntry] = &[
     CompatibleEntry {
         name: "mercury",
         base_url: "https://api.inceptionlabs.ai/v1",
         env_vars: &["INCEPTION_API_KEY", "MERCURY_API_KEY"],
+        // Inception Chat Completions (#2253): `reasoning_effort` takes
+        // `instant|low|medium|high`, `max_tokens` is deprecated for
+        // `max_completion_tokens` (default 16,384, reasoning included), and
+        // `tool_choice: "none"` is accepted next to `tools`.
         quirks: ProviderQuirks {
             native_tools: true,
+            reasoning_effort: ReasoningEffortWire::OpenAiWithInstant,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            default_max_output_tokens: Some(MERCURY_DEFAULT_MAX_COMPLETION_TOKENS),
+            tool_choice_none: true,
             ..DEFAULT_QUIRKS
         },
     },

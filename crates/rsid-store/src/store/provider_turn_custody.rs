@@ -41,6 +41,8 @@ pub struct NewProviderTurnCustody {
     pub invocation_id: Uuid,
     pub session_id: Uuid,
     pub spool_dir: PathBuf,
+    /// Exact daemon-selected scope, immutable for this session/invocation.
+    pub worker_scope: Option<String>,
     pub pid: u32,
     pub start_time: Option<u64>,
     pub boot_id: Uuid,
@@ -51,6 +53,8 @@ pub struct ProviderTurnCustody {
     pub invocation_id: Uuid,
     pub session_id: Uuid,
     pub spool_dir: PathBuf,
+    /// Exact daemon-selected scope, immutable for this session/invocation.
+    pub worker_scope: Option<String>,
     pub pid: u32,
     pub start_time: Option<u64>,
     pub boot_id: Uuid,
@@ -173,6 +177,47 @@ pub struct ProviderTurnEvent {
     pub question: Option<PendingQuestion>,
 }
 
+// Some(None) means no lock file (including an already removed spool);
+// None means a live shim still holds the lock. Hold an acquired lock until removal.
+fn spool_cleanup_lock(path: &std::path::Path) -> Result<Option<Option<std::fs::File>>> {
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .open(path.join("alive.lock"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(None)),
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Some(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn remove_finished_spool(row: &ProviderTurnCustody) -> Result<()> {
+    // Custody stores an internal path, but deletion additionally requires its
+    // unique invocation basename and a real directory, never a symlink.
+    if row.spool_dir.file_name().and_then(|name| name.to_str())
+        != Some(row.invocation_id.to_string().as_str())
+    {
+        return Err(DaemonError::Store(
+            "turn spool cleanup requires the invocation directory".into(),
+        ));
+    }
+    match std::fs::symlink_metadata(&row.spool_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(&row.spool_dir)?,
+        Ok(_) => {
+            return Err(DaemonError::Store(
+                "turn spool cleanup requires a real directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -226,6 +271,7 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<ProviderTurnCustody> {
         state,
         created_at: decode(row, 8)?,
         updated_at: decode(row, 9)?,
+        worker_scope: row.get(10)?,
     })
 }
 
@@ -244,7 +290,7 @@ impl Store {
             ));
         }
         let old: Option<ProviderTurnCustody> = self.conn.query_row(
-            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at
+            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at,worker_scope
              FROM provider_turn_custody WHERE session_id=?1 AND boot_id<>?2 AND state IN ('live','adopted')",
             params![session_id.to_string(), current_boot_id.to_string()], map_row,
         ).optional()?;
@@ -290,6 +336,13 @@ impl Store {
                 "turn custody PID must be positive".into(),
             ));
         }
+        if turn
+            .worker_scope
+            .as_deref()
+            .is_some_and(|unit| !rsid_core::process_control::is_worker_scope_unit(unit))
+        {
+            return Err(DaemonError::Store("invalid worker scope".into()));
+        }
         let path = &turn.spool_dir;
         if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(DaemonError::Store(
@@ -303,10 +356,10 @@ impl Store {
         let at = now();
         self.conn.execute(
             "INSERT INTO provider_turn_custody
-             (invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,0,'live',?7,?7)",
+             (invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at,worker_scope)
+             VALUES(?1,?2,?3,?4,?5,?6,0,'live',?7,?7,?8)",
             params![turn.invocation_id.to_string(), turn.session_id.to_string(), path,
-                turn.pid, start_time, turn.boot_id.to_string(), at],
+                turn.pid, start_time, turn.boot_id.to_string(), at, turn.worker_scope],
         )?;
         Ok(())
     }
@@ -316,7 +369,7 @@ impl Store {
         invocation_id: Uuid,
     ) -> Result<Option<ProviderTurnCustody>> {
         Ok(self.conn.query_row(
-            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at
+            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at,worker_scope
              FROM provider_turn_custody WHERE invocation_id=?1",
             [invocation_id.to_string()], map_row,
         ).optional()?)
@@ -325,7 +378,7 @@ impl Store {
     /// Startup candidates only: being listed is not proof that a shim lives.
     pub fn list_active_provider_turn_custody(&self) -> Result<Vec<ProviderTurnCustody>> {
         let mut statement = self.conn.prepare(
-            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at
+            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at,worker_scope
              FROM provider_turn_custody WHERE state IN ('live','adopted') ORDER BY created_at,invocation_id"
         )?;
         Ok(statement
@@ -503,13 +556,59 @@ impl Store {
         Ok(Some(ids))
     }
 
-    /// Call after observing durable exit.json and consuming the final events.
+    /// Call after consuming the final events. A held shim lock prevents both
+    /// settlement and cleanup; a stale boot can never remove another owner's spool.
     pub fn finish_provider_turn_custody(&self, invocation_id: Uuid, boot_id: Uuid) -> Result<bool> {
-        self.settle_provider_turn_custody(
+        let Some(row) = self.get_provider_turn_custody(invocation_id)? else {
+            return Ok(false);
+        };
+        if row.boot_id != boot_id {
+            return Ok(false);
+        }
+        let lock = spool_cleanup_lock(&row.spool_dir)?;
+        if lock.is_none() {
+            return Ok(false);
+        }
+        let settled = self.settle_provider_turn_custody(
             invocation_id,
             boot_id,
             ProviderTurnCustodyState::Finished,
-        )
+        )?;
+        if settled || row.state == ProviderTurnCustodyState::Finished {
+            // Keep the lock through removal. Failure leaves a Finished row for
+            // the startup retry rather than making an already consumed turn live.
+            if let Err(error) = remove_finished_spool(&row) {
+                tracing::warn!(%invocation_id, %error, "Finished turn spool cleanup failed");
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Remove the spool of every ended turn whose shim is proved gone: a
+    /// Finished turn whose cleanup a daemon crash interrupted, and an Abandoned
+    /// turn, whose failure evidence and stdin prompt outlived the abandonment
+    /// that could only remove the prompt. A held shim lock keeps the spool.
+    pub fn cleanup_ended_provider_turn_spools(&self) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT invocation_id,session_id,spool_dir,pid,start_time,boot_id,stdout_offset,state,created_at,updated_at,worker_scope
+             FROM provider_turn_custody WHERE state IN ('finished','abandoned')"
+        )?;
+        for row in statement.query_map([], map_row)? {
+            let row = row?;
+            if !row.spool_dir.exists() {
+                continue;
+            }
+            let cleanup: Result<()> = (|| {
+                let Some(_lock) = spool_cleanup_lock(&row.spool_dir)? else {
+                    return Ok(());
+                };
+                remove_finished_spool(&row)
+            })();
+            if let Err(error) = cleanup {
+                tracing::warn!(invocation_id = %row.invocation_id, %error, "Ended turn spool cleanup retry failed");
+            }
+        }
+        Ok(())
     }
 
     /// Call when the lock is released without a durable exit, or identity
@@ -519,11 +618,27 @@ impl Store {
         invocation_id: Uuid,
         boot_id: Uuid,
     ) -> Result<bool> {
-        self.settle_provider_turn_custody(
+        let settled = self.settle_provider_turn_custody(
             invocation_id,
             boot_id,
             ProviderTurnCustodyState::Abandoned,
-        )
+        )?;
+        if settled {
+            if let Some(row) = self.get_provider_turn_custody(invocation_id)? {
+                // Failed turns retain output evidence, but an ended provider
+                // no longer needs its private stdin prompt.
+                if let Some(_lock) = spool_cleanup_lock(&row.spool_dir)? {
+                    match std::fs::remove_file(row.spool_dir.join("stdin")) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            tracing::warn!(%invocation_id, %error, "Ended turn prompt cleanup failed")
+                        }
+                    }
+                }
+            }
+        }
+        Ok(settled)
     }
 
     fn settle_provider_turn_custody(

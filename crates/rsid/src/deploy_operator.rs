@@ -106,6 +106,8 @@ fn same_payload(row: &DeployRow, sha: &str, manifest: &[DeployBinaryV1]) -> bool
 pub async fn request(
     store: &Mutex<Store>,
     service: &DeployService,
+    drain: &crate::deploy_drain::DeployDrain,
+    config: &crate::config::RuntimeConfig,
     request: RequestOperatorRestartRequestV1,
     now: DateTime<Utc>,
 ) -> Result<OperatorRestartStatusV1> {
@@ -192,7 +194,10 @@ pub async fn request(
         now,
     );
     match inserted {
-        Ok(row) => status(&guard, Some(&row), service.is_supervised()),
+        Ok(row) => {
+            crate::deploy::engage_hold_at_stage(&guard, &row, drain, config, now)?;
+            status(&guard, Some(&row), service.is_supervised())
+        }
         Err(error) => {
             crate::deploy::remove_staged(&manifest, id);
             Err(error)
@@ -266,6 +271,7 @@ mod tests {
         restarts: Arc<AtomicUsize>,
         store: Mutex<Store>,
         drain: DeployDrain,
+        config: Arc<crate::config::RuntimeConfig>,
     }
 
     fn insert_session(store: &Store, id: Uuid, status: &str, parent: Option<Uuid>) {
@@ -321,6 +327,25 @@ mod tests {
             restarts,
             store: Mutex::new(Store::open_in_memory().unwrap()),
             drain: DeployDrain::new(),
+            config: crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env()),
+        }
+    }
+
+    impl Fixture {
+        async fn request(
+            &self,
+            request: RequestOperatorRestartRequestV1,
+            now: DateTime<Utc>,
+        ) -> Result<OperatorRestartStatusV1> {
+            super::request(
+                &self.store,
+                &self.service,
+                &self.drain,
+                &self.config,
+                request,
+                now,
+            )
+            .await
         }
     }
 
@@ -344,6 +369,27 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
+    async fn operator_staging_engages_holds_before_the_first_poll() {
+        for enabled in [true, false] {
+            let f = fixture(true);
+            f.config
+                .deploy_drain_enabled
+                .store(enabled, Ordering::Relaxed);
+            f.config.deploy_drain_hold_secs.store(0, Ordering::Relaxed);
+            let staged = f.request(ask(&f, false), Utc::now()).await.unwrap();
+            assert_eq!(staged.state, Some(DeployState::Staged));
+            assert_eq!(f.drain.holds_job_start(Some(Uuid::new_v4()), true), enabled);
+            assert_eq!(f.drain.hold_queue_admission(true), enabled);
+            // Operator deploys hold through the deadline, even with a zero cap.
+            assert_eq!(
+                f.drain.release_by().map(|(id, _)| id),
+                enabled.then_some(staged.deploy_id.unwrap())
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
     async fn a_restart_waits_for_a_manager_and_a_worker_mid_turn_then_restarts_when_they_end() {
         let f = fixture(true);
         let (manager, worker) = (Uuid::new_v4(), Uuid::new_v4());
@@ -353,9 +399,7 @@ mod tests {
             insert_session(&store, worker, "Running", Some(manager));
         }
         let now = Utc::now();
-        let status = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        let status = f.request(ask(&f, false), now).await.unwrap();
         assert!(status.pending);
         assert_eq!(status.state, Some(DeployState::Staged));
         assert_eq!(status.sha.as_deref(), Some(SHA));
@@ -398,9 +442,7 @@ mod tests {
         let f = fixture(true);
         insert_session(&*f.store.lock().await, Uuid::new_v4(), "Running", None);
         let now = Utc::now();
-        let status = request(&f.store, &f.service, ask(&f, true), now)
-            .await
-            .unwrap();
+        let status = f.request(ask(&f, true), now).await.unwrap();
         assert!(status.forced);
         let mut gate = GateState::default();
         let outcome = poll(&f, &mut gate, now).await;
@@ -415,9 +457,7 @@ mod tests {
         let f = fixture(true);
         insert_session(&*f.store.lock().await, Uuid::new_v4(), "Running", None);
         let now = Utc::now();
-        request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        f.request(ask(&f, false), now).await.unwrap();
         let mut gate = GateState::default();
         assert!(matches!(
             poll(&f, &mut gate, now).await,
@@ -439,9 +479,7 @@ mod tests {
         let f = fixture(true);
         insert_session(&*f.store.lock().await, Uuid::new_v4(), "Running", None);
         let now = Utc::now();
-        request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        f.request(ask(&f, false), now).await.unwrap();
         let status = cancel(&f.store, &f.service, now).await.unwrap();
         assert!(!status.pending);
         assert_eq!(status.state, Some(DeployState::Failed));
@@ -452,9 +490,7 @@ mod tests {
         let nothing = cancel(&f.store, &f.service, now).await.unwrap_err();
         assert!(nothing.to_string().contains(RESTART_NOTHING_PENDING));
         // A new request is accepted once the cancelled one has settled.
-        let again = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        let again = f.request(ask(&f, false), now).await.unwrap();
         assert!(again.pending);
     }
 
@@ -462,9 +498,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsupervised_daemon_refuses_so_the_installer_can_restart_directly() {
         let f = fixture(false);
-        let error = request(&f.store, &f.service, ask(&f, false), Utc::now())
-            .await
-            .unwrap_err();
+        let error = f.request(ask(&f, false), Utc::now()).await.unwrap_err();
         assert!(error.to_string().contains(DEPLOY_NEEDS_SUPERVISOR));
         let status = get(&f.store, &f.service).await.unwrap();
         assert!(!status.pending);
@@ -476,12 +510,8 @@ mod tests {
     async fn a_repeated_request_is_idempotent_and_an_agent_deploy_is_never_displaced() {
         let f = fixture(true);
         let now = Utc::now();
-        let first = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
-        let second = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        let first = f.request(ask(&f, false), now).await.unwrap();
+        let second = f.request(ask(&f, false), now).await.unwrap();
         assert_eq!(first.deploy_id, second.deploy_id);
         cancel(&f.store, &f.service, now).await.unwrap();
 
@@ -510,9 +540,7 @@ mod tests {
                 now,
             )
             .unwrap();
-        let refused = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap_err();
+        let refused = f.request(ask(&f, false), now).await.unwrap_err();
         assert!(refused.to_string().contains(DEPLOY_IN_PROGRESS));
         assert!(
             cancel(&f.store, &f.service, now)
@@ -529,9 +557,7 @@ mod tests {
         let f = fixture(true);
         let (manager, now) = (Uuid::new_v4(), Utc::now());
         insert_session(&*f.store.lock().await, manager, "Running", None);
-        let first = request(&f.store, &f.service, ask(&f, true), now)
-            .await
-            .unwrap();
+        let first = f.request(ask(&f, true), now).await.unwrap();
         let first_staged = |f: &Fixture| {
             std::fs::read_dir(&f.install)
                 .unwrap()
@@ -542,9 +568,7 @@ mod tests {
         assert_eq!(first_staged(&f), 1);
         // The operator rebuilds while the first request still waits.
         std::fs::write(f.build.join("rsid"), b"newer-rsid").unwrap();
-        let second = request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        let second = f.request(ask(&f, false), now).await.unwrap();
         assert_ne!(first.deploy_id, second.deploy_id);
         assert!(second.pending);
         assert!(second.forced, "a forced pending request stays forced");
@@ -573,9 +597,7 @@ mod tests {
         let f = fixture(true);
         insert_session(&*f.store.lock().await, Uuid::new_v4(), "Running", None);
         let now = Utc::now();
-        request(&f.store, &f.service, ask(&f, false), now)
-            .await
-            .unwrap();
+        f.request(ask(&f, false), now).await.unwrap();
         let mut gate = GateState::default();
         let late = now + chrono::Duration::seconds(61);
         let settled = poll(&f, &mut gate, late).await;

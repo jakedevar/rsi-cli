@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "rows": {
+    "section:rsi-specific-commands": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/managers.ts and each slice's commands table",
+      "note": "every command of the generated table is registered by its slice and tracked as its own cmd: row (aliases resolve through the keymap)"
+    },
+    "cmd:manual": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "the generated manual (docs/manual/rsi-manual.md, compiled in and rendered with the transcript sanitizer) in an in-app reader with a section picker; j/k g/G scroll, q closes. :manual pdf opens the system print dialog (Save as PDF); :manual pager opens the same reader (a desktop has no pager)"
+    },
+    "cmd:rotation-abandon": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "AbandonBlockedRotation {session_id, provider?, model?, idempotency_key} for the open session, else the cursor row; provider[/model] parsed case-insensitively; the first run shows the TUI's notice and the same command within 10 s sends"
+    },
+    "cmd:manager-reseat": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "ReseatHarnessManager {project_id, provider, model?, effort: null, reason, provider_unavailable: true} for the session's project; <provider>[/<model>] <reason> required; run twice within 10 s to confirm"
+    },
+    "cmd:cold-restore": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "RestoreColdSession {session_id} for the open session, else the cursor row (the Archived view included); restored / already-live toast"
+    },
+    "cmd:cold-archive": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "GetColdArchiveStatus shown as the TUI's status and last-pass lines; run/stage, move, verify and compact send RunColdArchiveNow {mode}; move (deletes verified rows from the live database) asks first"
+    },
+    "cmd:blank": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "bare :blank opens the launch dialog; :blank <text> launches directly (the runtime claims the core launch action) on the :model default provider and model in the filtered project's directory"
+    },
+    "cmd:context": {
+      "status": "done",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "UpdateActiveTask {session_id, active_task}: :context <text> sets it (capped at 500 bytes on a character), bare :context clears it"
+    },
+    "cmd:split": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: the desktop window is one fixed split (session list beside the open session); :split moves the keys between the list and the transcript"
+    },
+    "cmd:vsplit": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: as :split"
+    },
+    "cmd:only": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: closes the open overlay pane (terminal, file viewer, graph, manager or Issues view) as :close does; the list and session panes always stay"
+    },
+    "cmd:tabnew": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: a desktop tab is the project filter, so :tabnew opens the project picker"
+    },
+    "cmd:tabclose": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: returns the project filter to all projects"
+    },
+    "section:vim-commands-pass-through": {
+      "status": "substitute",
+      "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
+      "note": "substitute: the desktop has no modalkit windows; :split/:vsplit move the keys, :only and :close close the overlay pane, :tabnew/:tabclose/:tabnext/:tabprev drive the project filter (see each cmd row)"
+    }
+  }
+}

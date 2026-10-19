@@ -69,6 +69,7 @@ pub const NON_AGENT_ATTRIBUTED_VERBS: &[RpcVerbDeclaration] = &[
     decl("GetTurnMetrics", RpcVerbAudience::Read),
     decl("ClaimBoundaryMail", RpcVerbAudience::Hook),
     decl("ConfirmBoundaryMail", RpcVerbAudience::Hook),
+    decl("RecordProviderLifecycleEvent", RpcVerbAudience::Hook),
 ];
 
 const fn bytes_eq(a: &str, b: &str) -> bool {

@@ -8,7 +8,7 @@ use super::{
 };
 // Fixture-only: `insert_session_with_pre_v98_custody` is itself `#[cfg(test)]`,
 // so its frozen-shape session insert must not be imported into a normal build.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 use super::sessions::insert_legacy_session_on;
 use crate::error::{DaemonError, Result, sandbox_custody_error};
 use chrono::{SecondsFormat, Utc};
@@ -24,12 +24,63 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use uuid::Uuid;
 
+/// The restart-retry eligibility predicate over every Failed session.
+/// `STARTUP_RETRY_ELIGIBLE_BY_CUSTODY_SQL` is this text plus the single
+/// `sandbox_custody_id` narrowing below; the two are plain literals (the
+/// protected-writer source scanner cannot prove a macro-built statement
+/// sink-free) and `retry_eligibility_sql_variants_stay_in_step_2354` pins that
+/// they cannot drift apart.
+pub(crate) const STARTUP_RETRY_ELIGIBLE_SQL: &str = "SELECT s.id FROM sessions s
+             JOIN session_execution_projections p ON p.session_id=s.id
+             LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id
+             WHERE s.status='Failed'
+               AND (s.stop_reason IS NULL OR s.stop_reason NOT GLOB 'sandbox_custody:*')
+               AND NOT EXISTS (
+                    SELECT 1 FROM source_worktree_settlement_items i
+                    WHERE (i.session_id=s.id OR i.custody_id=p.custody_id)
+                      AND i.phase NOT IN ('refused','unattempted')
+               )
+               AND (
+                    (p.execution_state='ordinary_unsandboxed' AND p.freshness='verified')
+                 OR (p.execution_state='live_sandboxed' AND p.freshness='verified'
+                     AND r.state='live' AND r.validation_state='verified'
+                     AND r.owner_session_id=s.id AND r.generation=p.custody_generation)
+               )";
+/// [`STARTUP_RETRY_ELIGIBLE_SQL`] restricted to one custody's participants.
+pub(crate) const STARTUP_RETRY_ELIGIBLE_BY_CUSTODY_SQL: &str = "SELECT s.id FROM sessions s
+             JOIN session_execution_projections p ON p.session_id=s.id
+             LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id
+             WHERE s.status='Failed'
+               AND (s.stop_reason IS NULL OR s.stop_reason NOT GLOB 'sandbox_custody:*')
+               AND NOT EXISTS (
+                    SELECT 1 FROM source_worktree_settlement_items i
+                    WHERE (i.session_id=s.id OR i.custody_id=p.custody_id)
+                      AND i.phase NOT IN ('refused','unattempted')
+               )
+               AND (
+                    (p.execution_state='ordinary_unsandboxed' AND p.freshness='verified')
+                 OR (p.execution_state='live_sandboxed' AND p.freshness='verified'
+                     AND r.state='live' AND r.validation_state='verified'
+                     AND r.owner_session_id=s.id AND r.generation=p.custody_generation)
+               )
+ AND s.sandbox_custody_id=?1";
 const STARTUP_AGGREGATE_PAGE_SQL: &str = "SELECT custody_id,sandbox_root,custody_id FROM sandbox_custody_roots WHERE custody_id>?1 ORDER BY custody_id LIMIT ?2";
 const STARTUP_ROOTED_PAGE_SQL: &str = "SELECT sandbox_root,sandbox_root,NULL FROM sessions INDEXED BY idx_sessions_startup_unlinked_root WHERE sandbox_root IS NOT NULL AND sandbox_custody_id IS NULL AND sandbox_root>?1 GROUP BY sandbox_root ORDER BY sandbox_root LIMIT ?2";
 const STARTUP_ROOTLESS_PAGE_SQL: &str = "SELECT id,NULL,NULL FROM sessions INDEXED BY idx_sessions_startup_unlinked_rootless WHERE sandbox_root IS NULL AND sandbox_custody_id IS NULL AND id>?1 ORDER BY id LIMIT ?2";
 
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+/// `Connection::execute` through the prepared-statement cache. The startup
+/// custody pass issues the same few statements once per root, so parsing each
+/// call afresh was a measurable share of the restore (#2354).
+fn execute_cached(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<usize> {
+    conn.prepare_cached(sql)?.execute(params)
 }
 
 fn prepared_reclaim_for_owner_tuple_on(
@@ -111,14 +162,18 @@ fn bounded_admission_path_variants(path: &Path) -> Option<Vec<PathBuf>> {
 #[cfg(any(test, feature = "test-seam"))]
 static FAIL_NEXT_EFFECT_RELEASES: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_effect_releases(count: usize) {
     FAIL_NEXT_EFFECT_RELEASES.store(count, Ordering::Release);
 }
 
 /// A held custody root. It also marks its thread as holding a root, so
 /// Store acquisition on that thread is bounded (see `custody_lock_order`).
-pub struct CustodyRootGuard(Uuid, super::custody_lock_order::HeldScope);
+pub struct CustodyRootGuard(
+    Uuid,
+    #[allow(dead_code)] // RAII scope marking this thread as holding a root: dropped, never read.
+    super::custody_lock_order::HeldScope,
+);
 
 pub fn lock_custody_root(custody_id: Uuid) -> CustodyRootGuard {
     let (bucket, released) = &ROOT_LOCKS[custody_root_lock_shard(custody_id)];
@@ -296,11 +351,12 @@ pub(crate) enum ArchivedRotationRestoration {
 #[cfg(any(test, feature = "test-seam"))]
 macro_rules! rotation_session_field_classes {
     (authority: [$($authority:ident),* $(,)?], non_authority: [$($non_authority:ident),* $(,)?],) => {
-        #[cfg(any(test, feature = "test-seam"))]
+        #[cfg(test)]
         const ROTATION_AUTHORITY_SESSION_FIELDS: &[&str] = &[$(stringify!($authority)),*];
+#[cfg(test)]
         const TEST_ROTATION_NON_AUTHORITY_SESSION_FIELDS: &[&str] = &[$(stringify!($non_authority)),*];
 
-        #[cfg(any(test, feature = "test-seam"))]
+        #[cfg(test)]
         fn assert_rotation_session_fields_exhaustive(session: &Session) {
             let Session { $($authority: _,)* $($non_authority: _,)* } = session;
         }
@@ -585,7 +641,8 @@ impl BoundRotationCustody {
 
 /// Opaque-to-establishment fence for a rotation successor that was already
 /// bound.  Unlike direct-launch failure, a transferred successor remains the
-/// live root owner while Failed; no backward transfer is possible.
+/// live root owner while Failed. Only guarded unstarted-cap recovery can return
+/// it to the predecessor, using a new generation and an atomic recovery receipt.
 #[derive(Debug, Clone, Copy)]
 pub enum BoundRotationCustody {
     Ordinary {
@@ -811,7 +868,7 @@ impl Store {
         Ok(groups)
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn startup_custody_group_page_query_plan(&self, phase: &str) -> Result<Vec<String>> {
         let sql = match phase {
             "aggregate" => STARTUP_AGGREGATE_PAGE_SQL,
@@ -844,7 +901,7 @@ impl Store {
             // bidirectional.  In particular, a Session named by immutable
             // ownership history remains a participant even when a corrupt
             // SQL link and cached root have both been nulled.
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare_cached(
                 "SELECT id FROM (
                      SELECT id FROM sessions
                       WHERE sandbox_custody_id=?1 AND id>?3
@@ -866,7 +923,7 @@ impl Store {
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else if let Some(root) = &group.sandbox_root {
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare_cached(
                 "SELECT id FROM sessions WHERE sandbox_root=?1 AND sandbox_custody_id IS NULL
                  AND id > ?2 ORDER BY id LIMIT ?3",
             )?;
@@ -902,9 +959,13 @@ impl Store {
         session_id: Uuid,
         custody_id: Uuid,
     ) -> Result<bool> {
+        // Cached: startup runs this once per custody participant, and a fresh
+        // parse per call is a measurable share of the restore (#2354).
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND sandbox_custody_id=?2)",
+            )?
+            .query_row(
                 params![session_id.to_string(), custody_id.to_string()],
                 |row| row.get(0),
             )
@@ -989,33 +1050,14 @@ impl Store {
     /// Every durable participant must be named by the immutable ownership
     /// chain. A SQL link alone is only a cache/projection relation and is not
     /// authority to restore an executable session.
-    /// Return the one immutable generation at which a Session became owner.
-    /// Duplicate owner events are malformed history rather than an ambiguity
-    /// that startup may choose between.
+    /// Return the latest authenticated ownership generation. Repeated ownership
+    /// requires an exact cap-recovery receipt; other duplicates remain malformed.
     pub(crate) fn startup_session_ownership_generation(
         &self,
         session_id: Uuid,
         custody_id: Uuid,
     ) -> Result<Option<u64>> {
-        let mut statement = self.conn.prepare(
-            "SELECT to_generation FROM sandbox_custody_events
-                  WHERE custody_id=?1 AND to_owner_session_id=?2
-                    AND event_kind IN ('allocated','transferred')
-                  ORDER BY sequence LIMIT 2",
-        )?;
-        let generations = statement
-            .query_map(
-                params![custody_id.to_string(), session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        match generations.as_slice() {
-            [] => Ok(None),
-            [generation] if *generation > 0 => Ok(Some(*generation as u64)),
-            _ => Err(DaemonError::Store(
-                "sandbox custody ownership event generation is ambiguous".into(),
-            )),
-        }
+        ownership_generation_on(&self.conn, session_id, custody_id)
     }
 
     pub(crate) fn startup_session_projection_matches(
@@ -1026,12 +1068,14 @@ impl Store {
         execution_state: &str,
     ) -> Result<bool> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(
                     SELECT 1 FROM session_execution_projections
                      WHERE session_id=?1 AND custody_id=?2
                        AND custody_generation=?3 AND execution_state=?4
                 )",
+            )?
+            .query_row(
                 params![
                     session_id.to_string(),
                     custody_id.to_string(),
@@ -1047,41 +1091,38 @@ impl Store {
     /// selected as restart retry candidates.  This reads durable Session state
     /// rather than relying on a process-local restore filter.
     pub fn startup_retry_eligible_sessions(&self) -> Result<std::collections::HashSet<Uuid>> {
-        let mut statement = self.conn.prepare(
-            "SELECT s.id FROM sessions s
-             JOIN session_execution_projections p ON p.session_id=s.id
-             LEFT JOIN sandbox_custody_roots r ON r.custody_id=p.custody_id
-             WHERE s.status='Failed'
-               AND (s.stop_reason IS NULL OR s.stop_reason NOT GLOB 'sandbox_custody:*')
-               AND NOT EXISTS (
-                    SELECT 1 FROM source_worktree_settlement_items i
-                    WHERE (i.session_id=s.id OR i.custody_id=p.custody_id)
-                      AND i.phase NOT IN ('refused','unattempted')
-               )
-               AND (
-                    (p.execution_state='ordinary_unsandboxed' AND p.freshness='verified')
-                 OR (p.execution_state='live_sandboxed' AND p.freshness='verified'
-                     AND r.state='live' AND r.validation_state='verified'
-                     AND r.owner_session_id=s.id AND r.generation=p.custody_generation)
-               )",
-        )?;
+        let mut statement = self.conn.prepare(STARTUP_RETRY_ELIGIBLE_SQL)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
             .map(|id| Uuid::parse_str(&id?).map_err(|error| DaemonError::Store(error.to_string())))
             .collect()
     }
 
+    /// True when any participant of `custody_id` (a session linked to it) is a
+    /// restart retry candidate. This is exactly the predicate of
+    /// [`Self::startup_retry_eligible_sessions`] restricted to one custody
+    /// through the `sandbox_custody_id` index, so a caller that probes one root
+    /// does not scan the whole Failed corpus once per root (#2354: the absent
+    /// root adoption gate paid that scan for every retained candidate).
+    pub(crate) fn custody_has_retry_eligible_participant(&self, custody_id: Uuid) -> Result<bool> {
+        let mut statement = self
+            .conn
+            .prepare_cached(STARTUP_RETRY_ELIGIBLE_BY_CUSTODY_SQL)?;
+        let mut rows = statement.query([custody_id.to_string()])?;
+        let found = rows.next()?.is_some();
+        Ok(found)
+    }
+
     pub(crate) fn startup_custody_has_settlement_fence(&self, custody_id: Uuid) -> Result<bool> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(
                     SELECT 1 FROM source_worktree_settlement_items
                     WHERE custody_id=?1
                       AND phase NOT IN ('refused','unattempted')
                  )",
-                [custody_id.to_string()],
-                |row| row.get(0),
-            )
+            )?
+            .query_row([custody_id.to_string()], |row| row.get(0))
             .map_err(Into::into)
     }
 
@@ -1178,8 +1219,10 @@ impl Store {
         sandbox_root: &str,
     ) -> Result<Option<StartupCustodyRoot>> {
         self.conn
-            .query_row(
+            .prepare_cached(
                 "SELECT custody_id,allocation_id,owner_session_id,state,generation,canonical_repo_dir,sandbox_root,sandbox_branch,repository_identity,source_commit FROM sandbox_custody_roots WHERE sandbox_root=?1",
+            )?
+            .query_row(
                 [sandbox_root],
                 |row| {
                     let custody_id: String = row.get(0)?;
@@ -1320,7 +1363,7 @@ impl Store {
     /// A root seeded here carries no allocation identity, exactly like a
     /// genuinely pre-V98 deployed row, so V98 backfills it from the sequence-one
     /// `allocated` event's owner when the fixture migrates forward.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn insert_session_with_pre_v99_custody(
         &mut self,
         session: &Session,
@@ -1808,6 +1851,14 @@ impl Store {
                 "direct launch failure settlement projection fence lost".into(),
             ));
         }
+        // #2462: a launch that fails before any provider output names its
+        // cause (`terminal_reason` plus a System event), never silently.
+        Self::record_failure_cause_in_tx(
+            &tx,
+            session_id,
+            &format!("launch_failed:{error_code}"),
+            &format!("Launch failed before the provider produced any output: {error_code}"),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2490,6 +2541,86 @@ impl Store {
         Ok(())
     }
 
+    /// #1158: undo an unstarted cap rotation with a *new* custody generation.
+    /// The seat/grant have not been published, so they remain on the predecessor.
+    /// Both spawn guards and the root stripe exclude Continue and effect admission;
+    /// the transaction fences the exact reservation and closes its intent atomically.
+    pub fn restore_unstarted_cap_rotation_holding(
+        &mut self,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
+        rotation_id: &str,
+        held: Option<CustodyRootGuard>,
+    ) -> Result<bool> {
+        let predecessor = guards.predecessor();
+        let successor = guards.successor();
+        // Without a verified live root there is no safe return path.
+        let Ok(custody) = self.live_custody_for_session(successor) else {
+            return Ok(false);
+        };
+        let _root_guard = held.unwrap_or_else(|| lock_custody_root(custody.custody_id));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions p
+               JOIN sessions s ON s.continued_from=p.id
+               JOIN sandbox_custody_roots r ON r.custody_id=s.sandbox_custody_id
+               JOIN session_execution_projections projection ON projection.session_id=p.id
+               WHERE p.id=?1 AND s.id=?2 AND p.status IN ('Completed','Failed','Interrupted')
+                 AND p.pending_archive=0 AND s.status='Failed' AND s.pending_archive=0
+                 AND p.sandbox_custody_id=r.custody_id AND r.owner_session_id=s.id
+                 AND r.state='live' AND r.validation_state='verified'
+                 AND r.validated_generation=r.generation
+                 AND r.reserved_effects=0 AND r.active_effects=0
+                 AND projection.execution_state='historical_transferred'
+                 AND projection.custody_id=r.custody_id
+                 AND projection.custody_generation=r.generation-1
+                 AND EXISTS(SELECT 1 FROM sandbox_custody_events e
+                   WHERE e.custody_id=r.custody_id AND e.to_generation=r.generation
+                     AND e.event_kind='transferred' AND e.cause='rotation'
+                     AND e.from_owner_session_id=p.id AND e.to_owner_session_id=s.id)
+                 AND EXISTS(SELECT 1 FROM rotation_events e WHERE e.session_id=p.id
+                   AND e.rotation_id=?3 AND e.event_type='entered'
+                   AND json_valid(e.metadata) AND json_extract(e.metadata,'$.trigger')='cap_triggered')
+                 AND (SELECT COUNT(DISTINCT json_extract(e.metadata,'$.successor_id'))
+                   FROM rotation_events e WHERE e.session_id=p.id AND e.rotation_id=?3
+                   AND e.event_type='successor_reserved' AND json_valid(e.metadata))=1
+                 AND EXISTS(SELECT 1 FROM rotation_events e WHERE e.session_id=p.id
+                   AND e.rotation_id=?3 AND e.event_type='successor_reserved'
+                   AND json_valid(e.metadata) AND json_extract(e.metadata,'$.successor_id')=s.id)
+                 AND NOT EXISTS(SELECT 1 FROM rotation_events e WHERE e.session_id=p.id
+                   AND e.rotation_id=?3 AND (e.event_type IN
+                     ('completed','suppressed_final_handoff','aborted_empty_session')
+                     OR e.event_type LIKE 'refused:%' OR e.phase='depth_limit_hit')))",
+            params![predecessor.to_string(), successor.to_string(), rotation_id],
+            |row| row.get(0),
+        )?;
+        if !eligible || !super::rotation_abandon::rotation_holder_never_started_on(&tx, successor)?
+        {
+            return Ok(false);
+        }
+        transfer_root(
+            &tx,
+            predecessor,
+            custody.custody_id,
+            successor,
+            custody.generation,
+            CustodyCause::Rotation,
+            Some(predecessor),
+            None,
+        )?;
+        tx.execute(
+            "INSERT INTO rotation_events(session_id,rotation_id,phase,event_type,metadata,created_at)
+             VALUES (?1,?2,'completed','refused:successor_unstarted_custody_returned',?3,?4)",
+            params![predecessor.to_string(), rotation_id,
+                serde_json::json!({"successor_id": successor, "custody_returned": true,
+                    "custody_id": custody.custody_id, "custody_generation": custody.generation + 1}).to_string(),
+                timestamp()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Restore only the exact ordinary predecessor archived by the rotation
     /// saga. Refusal is distinct from SQLite failure and never mutates the row.
     pub(crate) fn restore_archived_rotation_predecessor(
@@ -2834,8 +2965,15 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_ordinary_session_tuple(&tx, session_id)?;
-        tx.execute(
-            "UPDATE session_execution_projections SET execution_state='ordinary_unsandboxed', freshness='verified', effective_cwd=canonical_repo_dir, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1",
+        // Publication is idempotent (#2354): a projection that already holds
+        // exactly this verified state is left untouched, so a steady-state
+        // boot commits nothing for its thousands of ordinary sessions. `IS`
+        // keeps the comparison two-valued for NULL columns; a row that
+        // differs in any field (including a missing `validated_at`) is
+        // rewritten exactly as before.
+        execute_cached(
+            &tx,
+            "UPDATE session_execution_projections SET execution_state='ordinary_unsandboxed', freshness='verified', effective_cwd=canonical_repo_dir, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1 AND NOT (execution_state IS 'ordinary_unsandboxed' AND freshness IS 'verified' AND effective_cwd IS canonical_repo_dir AND custody_id IS NULL AND custody_generation IS NULL AND error_code IS NULL AND validated_at IS NOT NULL)",
             params![session_id.to_string(), timestamp()],
         )?;
         tx.commit()?;
@@ -2863,13 +3001,28 @@ impl Store {
             ));
         }
         let now = timestamp();
-        tx.execute(
-            "UPDATE sandbox_custody_roots SET validation_state='verified', validated_generation=?2, validated_at=?3, validation_error_code=NULL, updated_at=?3 WHERE custody_id=?1 AND owner_session_id=?4 AND generation=?2 AND state='live'",
-            params![custody_id.to_string(), generation as i64, now, session_id.to_string()],
+        // Idempotent (#2354): an already verified root and projection are not
+        // rewritten, so a restart that finds the same live state commits
+        // nothing; any differing field is republished exactly as before.
+        execute_cached(
+            &tx,
+            "UPDATE sandbox_custody_roots SET validation_state='verified', validated_generation=?2, validated_at=?3, validation_error_code=NULL, updated_at=?3 WHERE custody_id=?1 AND owner_session_id=?4 AND generation=?2 AND state='live' AND NOT (validation_state IS 'verified' AND validated_generation IS ?2 AND validation_error_code IS NULL AND validated_at IS NOT NULL)",
+            params![
+                custody_id.to_string(),
+                generation as i64,
+                now,
+                session_id.to_string()
+            ],
         )?;
-        tx.execute(
-            "UPDATE session_execution_projections SET execution_state='live_sandboxed', freshness='verified', effective_cwd=(SELECT sandbox_root FROM sandbox_custody_roots WHERE custody_id=?2), custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id=?1",
-            params![session_id.to_string(), custody_id.to_string(), generation as i64, timestamp()],
+        execute_cached(
+            &tx,
+            "UPDATE session_execution_projections SET execution_state='live_sandboxed', freshness='verified', effective_cwd=(SELECT sandbox_root FROM sandbox_custody_roots WHERE custody_id=?2), custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id=?1 AND NOT (execution_state IS 'live_sandboxed' AND freshness IS 'verified' AND effective_cwd IS (SELECT sandbox_root FROM sandbox_custody_roots WHERE custody_id=?2) AND custody_id IS ?2 AND custody_generation IS ?3 AND error_code IS NULL AND validated_at IS NOT NULL)",
+            params![
+                session_id.to_string(),
+                custody_id.to_string(),
+                generation as i64,
+                timestamp()
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -2910,21 +3063,39 @@ impl Store {
         let now = timestamp();
         match root.state {
             RootState::Purged => {
-                tx.execute(
-                    "UPDATE session_execution_projections SET execution_state='historical_purged', freshness='verified', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1)",
-                    params![custody_id.to_string(), custody_id.to_string(), root.generation as i64, now],
+                execute_cached(
+                    &tx,
+                    "UPDATE session_execution_projections SET execution_state='historical_purged', freshness='verified', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1) AND NOT (execution_state IS 'historical_purged' AND freshness IS 'verified' AND effective_cwd IS NULL AND custody_id IS ?2 AND custody_generation IS ?3 AND error_code IS NULL AND validated_at IS NOT NULL)",
+                    params![
+                        custody_id.to_string(),
+                        custody_id.to_string(),
+                        root.generation as i64,
+                        now
+                    ],
                 )?;
             }
             RootState::Failed => {
-                tx.execute(
-                    "UPDATE session_execution_projections SET execution_state='historical_cleanup_failed', freshness='verified', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1)",
-                    params![custody_id.to_string(), custody_id.to_string(), root.generation as i64, now],
+                execute_cached(
+                    &tx,
+                    "UPDATE session_execution_projections SET execution_state='historical_cleanup_failed', freshness='verified', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=NULL, updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1) AND NOT (execution_state IS 'historical_cleanup_failed' AND freshness IS 'verified' AND effective_cwd IS NULL AND custody_id IS ?2 AND custody_generation IS ?3 AND error_code IS NULL AND validated_at IS NOT NULL)",
+                    params![
+                        custody_id.to_string(),
+                        custody_id.to_string(),
+                        root.generation as i64,
+                        now
+                    ],
                 )?;
             }
             RootState::Quarantined => {
-                tx.execute(
-                    "UPDATE session_execution_projections SET execution_state='quarantined', freshness='invalid', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=COALESCE((SELECT validation_error_code FROM sandbox_custody_roots WHERE custody_id=?1), error_code), updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1)",
-                    params![custody_id.to_string(), custody_id.to_string(), root.generation as i64, now],
+                execute_cached(
+                    &tx,
+                    "UPDATE session_execution_projections SET execution_state='quarantined', freshness='invalid', effective_cwd=NULL, custody_id=?2, custody_generation=?3, validated_at=?4, error_code=COALESCE((SELECT validation_error_code FROM sandbox_custody_roots WHERE custody_id=?1), error_code), updated_at=?4 WHERE session_id IN (SELECT id FROM sessions WHERE sandbox_custody_id=?1) AND NOT (execution_state IS 'quarantined' AND freshness IS 'invalid' AND effective_cwd IS NULL AND custody_id IS ?2 AND custody_generation IS ?3 AND error_code IS COALESCE((SELECT validation_error_code FROM sandbox_custody_roots WHERE custody_id=?1), error_code) AND validated_at IS NOT NULL)",
+                    params![
+                        custody_id.to_string(),
+                        custody_id.to_string(),
+                        root.generation as i64,
+                        now
+                    ],
                 )?;
             }
             RootState::Live => {
@@ -3002,15 +3173,24 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = timestamp();
-        let changed = tx.execute(
-            "UPDATE session_execution_projections SET execution_state='historical_purged', freshness='verified', effective_cwd=NULL, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1 AND EXISTS (SELECT 1 FROM sessions WHERE id=?1 AND sandbox_kind='GitWorktree' AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state='Purged')",
-            params![session_id.to_string(), now],
-        )?;
-        if changed != 1 {
+        // The tuple fence is checked on its own so an already published
+        // projection (zero rows changed) is not mistaken for a mismatch; the
+        // write itself is idempotent (#2354).
+        let tuple_matches: bool = tx
+            .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM session_execution_projections WHERE session_id=?1) AND EXISTS (SELECT 1 FROM sessions WHERE id=?1 AND sandbox_kind='GitWorktree' AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state='Purged')",
+            )?
+            .query_row([session_id.to_string()], |row| row.get(0))?;
+        if !tuple_matches {
             return Err(DaemonError::Store(
                 "rootless startup purged compatibility tuple mismatch".into(),
             ));
         }
+        execute_cached(
+            &tx,
+            "UPDATE session_execution_projections SET execution_state='historical_purged', freshness='verified', effective_cwd=NULL, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1 AND NOT (execution_state IS 'historical_purged' AND freshness IS 'verified' AND effective_cwd IS NULL AND custody_id IS NULL AND custody_generation IS NULL AND error_code IS NULL AND validated_at IS NOT NULL)",
+            params![session_id.to_string(), now],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3022,15 +3202,21 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = timestamp();
-        let changed = tx.execute(
-            "UPDATE session_execution_projections SET execution_state='historical_cleanup_failed', freshness='verified', effective_cwd=NULL, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1 AND EXISTS (SELECT 1 FROM sessions WHERE id=?1 AND sandbox_kind='GitWorktree' AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state='Failed' AND sandbox_custody_id IS NULL)",
-            params![session_id.to_string(), now],
-        )?;
-        if changed != 1 {
+        let tuple_matches: bool = tx
+            .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM session_execution_projections WHERE session_id=?1) AND EXISTS (SELECT 1 FROM sessions WHERE id=?1 AND sandbox_kind='GitWorktree' AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state='Failed' AND sandbox_custody_id IS NULL)",
+            )?
+            .query_row([session_id.to_string()], |row| row.get(0))?;
+        if !tuple_matches {
             return Err(DaemonError::Store(
                 "rootless startup failed compatibility tuple mismatch".into(),
             ));
         }
+        execute_cached(
+            &tx,
+            "UPDATE session_execution_projections SET execution_state='historical_cleanup_failed', freshness='verified', effective_cwd=NULL, custody_id=NULL, custody_generation=NULL, validated_at=?2, error_code=NULL, updated_at=?2 WHERE session_id=?1 AND NOT (execution_state IS 'historical_cleanup_failed' AND freshness IS 'verified' AND effective_cwd IS NULL AND custody_id IS NULL AND custody_generation IS NULL AND error_code IS NULL AND validated_at IS NOT NULL)",
+            params![session_id.to_string(), now],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -3317,7 +3503,7 @@ impl Store {
 
     /// End an active daemon-controlled effect.  Clearing `effect_boot_id`
     /// exactly when the final permit settles makes restart quarantine precise.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn release_effect(&mut self, reservation: EffectReservation) -> Result<()> {
         let _root_guard = lock_custody_root(reservation.custody_id);
         self.release_effect_locked(reservation)
@@ -3378,6 +3564,7 @@ impl Store {
 
     /// Settle a domain-reserved row that failed custody binding.  It never
     /// attaches a root or publishes an executable projection.
+    #[cfg(test)]
     pub(crate) fn settle_reserved_custody_failure(
         &mut self,
         session_id: Uuid,
@@ -3806,6 +3993,14 @@ pub struct TerminalCustodyReclaimCandidate {
     pub generation: u64,
     pub session_id: Uuid,
     pub updated_at: String,
+    /// A terminal rolling-queue entry means the accepted worker result no
+    /// longer needs its sandbox build cache, even when the configured idle
+    /// TTL has not elapsed.
+    pub rolling_queue_settled: bool,
+    /// The owner's latest turn ended with a final `PIPELINE HANDOFF` (hub
+    /// #3026). A satellite worker lands through the hub queue, so no local
+    /// queue entry settles; a published commit is then the early boundary.
+    pub final_handoff: bool,
 }
 
 #[derive(Debug)]
@@ -3838,7 +4033,7 @@ impl RootState {
 }
 
 fn load_root(tx: &Transaction<'_>, custody_id: Uuid) -> Result<RootRow> {
-    tx.query_row("SELECT owner_session_id,generation,event_sequence,state,validation_state,effect_boot_id,reserved_effects,active_effects FROM sandbox_custody_roots WHERE custody_id=?1", [custody_id.to_string()], |r| {
+    tx.prepare_cached("SELECT owner_session_id,generation,event_sequence,state,validation_state,effect_boot_id,reserved_effects,active_effects FROM sandbox_custody_roots WHERE custody_id=?1")?.query_row([custody_id.to_string()], |r| {
         let owner: Option<String> = r.get(0)?;
         let state: String = r.get(3)?;
         let validation_state: String = r.get(4)?;
@@ -4026,6 +4221,47 @@ pub(crate) fn transition_terminal_root_tx(
     Ok(linked_sessions)
 }
 
+/// Ordinary ownership is unique. A guarded return is the sole exception: its
+/// terminal rotation receipt names the exact root, generation and former holder.
+/// Startup and terminal cleanup use the same authentication rule.
+fn ownership_generation_on(conn: &Connection, session: Uuid, custody: Uuid) -> Result<Option<u64>> {
+    // Cached: startup authenticates every custody participant through this
+    // statement, and parsing it dominated the per-participant read cost (#2354).
+    let mut statement = conn.prepare_cached(
+        "SELECT e.to_generation, EXISTS(SELECT 1 FROM rotation_events r
+           WHERE r.session_id=e.to_owner_session_id
+             AND r.event_type='refused:successor_unstarted_custody_returned'
+             AND json_valid(r.metadata)
+             AND json_extract(r.metadata,'$.custody_returned')=1
+             AND json_extract(r.metadata,'$.custody_id')=e.custody_id
+             AND json_extract(r.metadata,'$.custody_generation')=e.to_generation
+             AND json_extract(r.metadata,'$.successor_id')=e.from_owner_session_id
+             AND e.event_kind='transferred' AND e.cause='rotation'
+             AND e.origin_session_id=e.to_owner_session_id
+             AND EXISTS(SELECT 1 FROM sandbox_custody_events prior
+               WHERE prior.custody_id=e.custody_id AND prior.event_kind='transferred'
+                 AND prior.to_generation=e.from_generation AND prior.cause='rotation'
+                 AND prior.from_owner_session_id=e.to_owner_session_id
+                 AND prior.to_owner_session_id=e.from_owner_session_id))
+         FROM sandbox_custody_events e WHERE e.custody_id=?1 AND e.to_owner_session_id=?2
+           AND e.event_kind IN ('allocated','transferred') ORDER BY e.sequence",
+    )?;
+    let events = statement.query_map(params![custody.to_string(), session.to_string()], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+    })?;
+    let mut latest = None;
+    for event in events {
+        let (generation, recovered) = event?;
+        if generation <= 0 || (latest.is_some() && !recovered) {
+            return Err(DaemonError::Store(
+                "sandbox custody ownership event generation is ambiguous".into(),
+            ));
+        }
+        latest = Some(generation as u64);
+    }
+    Ok(latest)
+}
+
 /// Authenticate the live owner and every SQL-linked custody participant before
 /// a terminal event can normalize the aggregate into historical state. Terminal
 /// transitions deliberately perform no filesystem or Git work: this is a
@@ -4065,18 +4301,17 @@ fn terminal_owner_and_linked_sessions(
             "custody terminal linked participant tuple mismatch".into(),
         ));
     }
-    let authenticated_history: i64 = tx.query_row(
-        "SELECT count(*) FROM sessions s WHERE s.sandbox_custody_id=?1 AND (SELECT count(*) FROM sandbox_custody_events e WHERE e.custody_id=?1 AND e.event_kind IN ('allocated','transferred') AND e.to_owner_session_id=s.id)=1",
-        [custody_id.to_string()],
-        |row| row.get(0),
-    )?;
-    if usize::try_from(authenticated_history)
-        .map_err(|_| DaemonError::Store("custody terminal linked session count overflow".into()))?
-        != linked_sessions
-    {
-        return Err(DaemonError::Store(
-            "custody terminal linked participant ownership history mismatch".into(),
-        ));
+    let mut statement = tx.prepare("SELECT id FROM sessions WHERE sandbox_custody_id=?1")?;
+    let participants =
+        statement.query_map([custody_id.to_string()], |row| row.get::<_, String>(0))?;
+    for participant in participants {
+        let participant = Uuid::parse_str(&participant?)
+            .map_err(|error| DaemonError::Store(error.to_string()))?;
+        if ownership_generation_on(tx, participant, custody_id)?.is_none() {
+            return Err(DaemonError::Store(
+                "custody terminal linked participant ownership history mismatch".into(),
+            ));
+        }
     }
     Ok(linked_sessions)
 }
@@ -4418,7 +4653,7 @@ fn insert_new_root(tx: &Transaction<'_>, session_id: Uuid, root: NewCustodyRoot)
 /// migration-chain fixtures only. See
 /// [`Store::insert_session_with_pre_v99_custody`] for why this exists instead
 /// of a schema-tolerant production insert.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn insert_pre_v98_new_root(
     tx: &Transaction<'_>,
     session_id: Uuid,
@@ -4517,11 +4752,11 @@ fn transfer_root(
 }
 
 fn ensure_ordinary_session_tuple(tx: &Transaction<'_>, session_id: Uuid) -> Result<()> {
-    let tuple_is_all_null: bool = tx.query_row(
-        "SELECT sandbox_kind IS NULL AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state IS NULL FROM sessions WHERE id=?1",
-        [session_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let tuple_is_all_null: bool = tx
+        .prepare_cached(
+            "SELECT sandbox_kind IS NULL AND sandbox_root IS NULL AND sandbox_branch IS NULL AND sandbox_cleanup_state IS NULL FROM sessions WHERE id=?1",
+        )?
+        .query_row([session_id.to_string()], |row| row.get(0))?;
     if tuple_is_all_null {
         Ok(())
     } else {

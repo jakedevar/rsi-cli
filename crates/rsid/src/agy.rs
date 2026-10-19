@@ -4,7 +4,7 @@ use crate::model_control::CliExecutionCapability;
 use crate::model_control::registry::RuntimeExecutionRoute;
 use crate::process_control::{
     AGY_MAX_TURN_BYTES, BoundedLineError, BoundedLines, CaptureLimits, PROVIDER_MAX_LINE_BYTES,
-    ProcessContainment, capture_bounded, configure_tokio_process_group, terminate_process_group,
+    ProcessContainment, capture_bounded, configure_tokio_process_group,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -351,36 +351,43 @@ impl AgyClient {
             None
         };
 
-        if let Some(shim) = crate::claude::turn_spool::available_shim(
+        let detached = if let Some(shim) = crate::claude::turn_spool::available_shim(
             config,
             self.runtime_config.as_deref(),
             shim_override,
         ) {
-            return crate::claude::turn_spool::launch(
+            let (wrapped, turn) = crate::claude::turn_spool::prepare_command(
                 &cmd,
                 config,
-                execution,
-                RuntimeExecutionRoute::AntigravityCli,
+                invocation_id,
                 &shim,
                 crate::claude::turn_spool::TurnOutput::Antigravity {
-                    conversation_cache_path,
-                    working_dir: capture_working_dir,
-                    pre_snapshot,
+                    conversation_cache_path: conversation_cache_path.clone(),
+                    working_dir: capture_working_dir.clone(),
+                    pre_snapshot: pre_snapshot.clone(),
                     capture: do_file_capture,
                 },
                 None,
-            );
-        }
-        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
-        configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
+            )?;
+            cmd = wrapped;
+            Some(turn)
+        } else {
+            cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::null());
+            configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
+            None
+        };
 
+        let scope = crate::process_scope::command_scope(&cmd);
         let mut child = execution
             .bind_command(RuntimeExecutionRoute::AntigravityCli, cmd)
             .spawn()?;
-        let child_pid = child.id();
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), scope);
+        if let Some(turn) = detached {
+            return Ok(turn.into_process(child));
+        }
         let stdout = child
             .stdout
             .take()
@@ -390,6 +397,7 @@ impl AgyClient {
         let (event_tx, event_rx) = mpsc::channel(100);
 
         // Spawn task to read stdout line-by-line as plain text and stream to TUI.
+        let reader_stop = stop.clone();
         tokio::spawn(async move {
             let mut lines = BoundedLines::new(stdout, PROVIDER_MAX_LINE_BYTES);
             let mut buf = String::new();
@@ -410,9 +418,7 @@ impl AgyClient {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
-                        if let Some(pid) = child_pid {
-                            terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                        }
+                        let _ = reader_stop.terminate("provider pipe read failed");
                         let _ = event_tx.try_send(StreamEvent {
                             event_type: "process_error".to_string(),
                             data: serde_json::json!({
@@ -426,9 +432,7 @@ impl AgyClient {
                     }
                 };
                 if buf.len().saturating_add(line.len()).saturating_add(1) > AGY_MAX_TURN_BYTES {
-                    if let Some(pid) = child_pid {
-                        terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                    }
+                    let _ = reader_stop.terminate("provider pipe read failed");
                     let _ = event_tx.try_send(StreamEvent {
                         event_type: "process_error".to_string(),
                         data: serde_json::json!({
@@ -504,7 +508,7 @@ impl AgyClient {
             let _ = event_tx.send(success_event).await;
         });
 
-        Ok((AgyProcess::direct(child), event_rx))
+        Ok((AgyProcess::direct(child, stop), event_rx))
     }
 }
 
@@ -598,6 +602,7 @@ mod tests {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 
@@ -678,18 +683,6 @@ printf '%s\n' "$1"
             .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8(arg.to_vec()).expect("utf8 arg"))
             .collect()
-    }
-
-    fn assert_arg_pair(args: &[String], flag: &str, expected_value: &str) {
-        let pos = args
-            .iter()
-            .position(|arg| arg == flag)
-            .unwrap_or_else(|| panic!("missing {flag} in args: {args:?}"));
-        assert_eq!(
-            args.get(pos + 1).map(String::as_str),
-            Some(expected_value),
-            "wrong value for {flag}; args: {args:?}"
-        );
     }
 
     fn assert_prompt_is_final_verbatim(args: &[String], prompt: &str) {

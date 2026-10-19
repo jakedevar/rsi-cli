@@ -185,6 +185,7 @@ pub(crate) struct MigrationAllocationReceipt {
     pub event_id: Option<i64>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MigrationAllocationEvent {
     pub id: i64,
@@ -919,7 +920,7 @@ impl Store {
         Ok((head(&self.conn, repository)?, claims))
     }
 
-    /// Page immutable audit events without exposing the operations payload.
+    #[cfg(test)]
     pub(crate) fn migration_allocation_events(
         &self,
         repository: &str,

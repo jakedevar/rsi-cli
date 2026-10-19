@@ -274,7 +274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         // Store::open runs init_schema which applies all migrations including V28
-        let store = Store::open(&db_path).unwrap();
+        let store = Store::open_test_fixture(&db_path).unwrap();
         // Return the tempdir guard so it lives for the duration of the test and
         // is removed when the test ends. Leaking it here orphans the directory
         // in /tmp permanently.

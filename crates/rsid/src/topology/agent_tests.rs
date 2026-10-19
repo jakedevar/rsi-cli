@@ -23,11 +23,21 @@ use uuid::Uuid;
 use super::agent::{self, AgentKnobs};
 use super::executor::Step;
 use super::store::{self as rows, AttemptStatus, ExecutionStatus};
-use super::tests::{Harness, ReviewScript, error_code, git};
+use super::tests::{Harness, ReviewScript, error_code, git, green_receipt, scoped_test_job};
 use crate::error::{DaemonError, Result};
 
+#[path = "get_tests.rs"]
+mod get_tests;
+#[path = "issue_close_tests.rs"]
+mod issue_close_tests;
+#[path = "review_work_tests.rs"]
+mod review_work_tests;
+#[path = "reviewer_read_tests.rs"]
+mod reviewer_read_tests;
 #[path = "starters_tests.rs"]
 mod starters_tests;
+#[path = "wake_tests.rs"]
+mod wake_tests;
 
 const KNOBS: AgentKnobs = AgentKnobs {
     executor_enabled: true,
@@ -209,6 +219,8 @@ impl World {
             inputs: serde_json::Value::Null,
             base_commit: Some(self.harness.base.clone()),
             idempotency_key: key.into(),
+            supersedes_execution: None,
+            wake: None,
         };
         agent::execute(&self.harness.executor.store, || KNOBS, caller, &request)
             .await
@@ -484,6 +496,155 @@ async fn t4_a1_worker_and_node_tokens_refused_on_all_six_verbs() {
     assert_eq!(
         world.harness.status(execution).await,
         ExecutionStatus::Running
+    );
+}
+
+// ─── #2267: any live leaf may validate a definition, nothing more ──────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn t4_2267_worker_validate_only_reports_structure_and_redacts_policy() {
+    let world = World::new(automation()).await;
+    let validate = |name: &str, definition: TopologyDefinition| {
+        let mut request = upsert_request(name, definition);
+        request.validate_only = true;
+        request
+    };
+
+    // A granted, well-formed definition validates clean and names no stored topology.
+    let flow = definition(&[("A", &luna())], &[]);
+    let clean = world
+        .upsert(world.worker, &validate("w-flow", flow.clone()))
+        .await
+        .unwrap();
+    assert!(clean.diagnostics.is_empty());
+    assert_eq!((clean.topology_id, clean.revision), (None, None));
+    assert!(!clean.deduplicated);
+    let lead_view = world
+        .upsert(world.lead_a, &validate("w-flow", flow))
+        .await
+        .unwrap();
+    assert_eq!(clean.definition_digest, lead_view.definition_digest);
+
+    // Structural diagnostics come back in full, exactly as a lead sees them.
+    let broken = definition(&[("A", &luna())], &[("A", "Z")]);
+    let from_lead = world
+        .upsert(world.lead_a, &validate("broken", broken.clone()))
+        .await
+        .unwrap()
+        .diagnostics;
+    assert!(!from_lead.is_empty());
+    assert_eq!(
+        world
+            .upsert(world.worker, &validate("broken", broken))
+            .await
+            .unwrap()
+            .diagnostics,
+        from_lead
+    );
+
+    // A launch outside the grant is "launch not granted", without the grant.
+    let opus = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-opus-5-5".into(),
+        effort: Some("high".into()),
+    };
+    let ungranted = world
+        .upsert(
+            world.worker,
+            &validate("opus-flow", definition(&[("A", &opus)], &[])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ungranted.diagnostics,
+        vec![agent::WORKER_POLICY_DIAGNOSTIC.to_owned()]
+    );
+    assert!(ungranted.diagnostics[0].starts_with("launch not granted"));
+    let revealed = ungranted.diagnostics.join(" ");
+    for secret in ["gpt-6-luna", "glm-5.3", "allowed_launches"] {
+        assert!(!revealed.contains(secret), "{secret} leaked: {revealed}");
+    }
+
+    // Nothing was written or bound: no topology exists, the ledger rows carry
+    // no caller kind and no idempotency key, and the lead can still create it.
+    assert!(
+        world
+            .list(world.lead_a, &AgentTopologyListRequestV1::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    {
+        let store = world.harness.executor.store.lock().await;
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM topology_agent_requests WHERE caller_session_id=?1 \
+                 AND verb='upsert' AND outcome='accepted' AND caller_kind IS NULL \
+                 AND idempotency_key IS NULL",
+                [world.worker.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 3);
+    }
+    let created = world
+        .upsert(
+            world.lead_a,
+            &upsert_request("w-flow", definition(&[("A", &luna())], &[])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.revision, Some(1));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn t4_2267_validate_only_opens_no_write_and_no_foreign_caller() {
+    let world = World::new(automation()).await;
+    let flow = || definition(&[("A", &luna())], &[]);
+
+    // A write by the same worker is still refused, even with a clean definition.
+    assert_eq!(
+        error_code(
+            &world
+                .upsert(world.worker, &upsert_request("w-write", flow()))
+                .await
+                .unwrap_err()
+        ),
+        "authority_denied"
+    );
+    // So is a validation by a session the daemon does not know.
+    let mut probe = upsert_request("w-probe", flow());
+    probe.validate_only = true;
+    assert_eq!(
+        error_code(&world.upsert(Uuid::new_v4(), &probe).await.unwrap_err()),
+        "authority_denied"
+    );
+    // A project the worker is not in is not served.
+    let mut foreign = probe.clone();
+    foreign.project_id = Some(Uuid::new_v4());
+    assert!(world.upsert(world.worker, &foreign).await.is_err());
+    // An archived session is not live.
+    world
+        .harness
+        .executor
+        .store
+        .lock()
+        .await
+        .update_session_status(world.worker, SessionStatus::Archived)
+        .unwrap();
+    assert_eq!(
+        error_code(&world.upsert(world.worker, &probe).await.unwrap_err()),
+        "authority_denied"
+    );
+    assert!(
+        world
+            .list(world.lead_a, &AgentTopologyListRequestV1::default())
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -903,6 +1064,8 @@ async fn t4_a6_idempotent_execute_is_deduplicated() {
     let changed = AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_a,
@@ -945,6 +1108,78 @@ async fn t4_a6_idempotent_execute_is_deduplicated() {
     assert_eq!(
         world.upsert(world.lead_a, &revised).await.unwrap().revision,
         Some(2)
+    );
+}
+
+/// #2264: `AgentTopologyList {include_executions}` lists live executions
+/// only; `include_settled` adds the settled run history, live first, then
+/// newest first, and implies `include_executions`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn t4_list_include_settled_exposes_the_run_history() {
+    let world = World::new(automation()).await;
+    let flow = world
+        .upsert(
+            world.lead_a,
+            &upsert_request("history", definition(&[("A", &luna())], &[])),
+        )
+        .await
+        .unwrap();
+    let mut settled_ids = Vec::new();
+    for (key, status) in [("h1", "failed"), ("h2", "succeeded")] {
+        let run = world
+            .execute(world.lead_a, &flow, world.epic_a, key)
+            .await
+            .unwrap();
+        let store = world.harness.executor.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE topology_executions SET status=?2 WHERE id=?1",
+                rusqlite::params![run.execution_id.to_string(), status],
+            )
+            .unwrap();
+        settled_ids.push(run.execution_id);
+        drop(store);
+        // Distinct created_at ordering between the runs.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let live = world
+        .execute(world.lead_a, &flow, world.epic_a, "h3")
+        .await
+        .unwrap();
+    let executions = |include_executions: bool, include_settled: bool| {
+        let world = &world;
+        async move {
+            let store = world.harness.executor.store.lock().await;
+            agent::list(
+                &store,
+                world.lead_a,
+                &AgentTopologyListRequestV1 {
+                    include_executions,
+                    include_settled,
+                    ..AgentTopologyListRequestV1::default()
+                },
+            )
+            .unwrap()
+            .executions
+            .into_iter()
+            .map(|summary| summary.execution_id)
+            .collect::<Vec<_>>()
+        }
+    };
+    assert!(executions(false, false).await.is_empty());
+    assert_eq!(
+        executions(true, false).await,
+        vec![live.execution_id],
+        "the default stays live-only"
+    );
+    let expected = vec![live.execution_id, settled_ids[1], settled_ids[0]];
+    assert_eq!(executions(true, true).await, expected);
+    assert_eq!(
+        executions(false, true).await,
+        expected,
+        "include_settled implies include_executions"
     );
 }
 
@@ -1646,6 +1881,8 @@ async fn t4_r1_execute_rechecks_topology_after_custody_resolution() {
     let request = |topology: Uuid, digest: &str, key: &str| AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: topology,
         expected_digest: digest.to_owned(),
         epic_id: world.epic_a,
@@ -2037,6 +2274,8 @@ async fn t4_r3_execute_rechecks_allowed_launches_after_custody_resolution() {
     let request = AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest,
         epic_id: world.epic_a,
@@ -2089,6 +2328,8 @@ async fn t4_r3_execute_rechecks_fanout_knob_after_custody_resolution() {
     let request = |key: &str| AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_a,
@@ -2170,6 +2411,8 @@ async fn t4_r3_execute_policy_race_records_refused_request() {
     let request = AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest,
         epic_id: world.epic_a,
@@ -2343,6 +2586,8 @@ async fn global_seat_runs_topology_in_a_granted_project_and_is_refused_outside_i
     let request = AgentTopologyExecuteRequestV1 {
         project_id: Some(world.project),
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_c,
@@ -2411,6 +2656,159 @@ async fn global_seat_runs_topology_in_a_granted_project_and_is_refused_outside_i
         error_code(&world.upsert(world.manager, &pm_foreign).await.unwrap_err()),
         MANAGER_PROJECT_NOT_IN_SCOPE
     );
+}
+
+// ─── #2472: a rotated portfolio seat keeps its executions ──────────────────
+
+/// A two-node run `A -> B` the portfolio seat accepted; node A has finished
+/// and its session completed, so the next advance launches B. Returns the
+/// execution id.
+async fn portfolio_run_with_a_done(world: &World, seat: Uuid) -> Uuid {
+    let mut flow = upsert_request(
+        "portfolio-flow",
+        definition(&[("A", &luna()), ("B", &luna())], &[("A", "B")]),
+    );
+    flow.project_id = Some(world.project);
+    flow.epic_id = Some(world.epic_a);
+    let flow = world.upsert(seat, &flow).await.unwrap();
+    let request = AgentTopologyExecuteRequestV1 {
+        project_id: Some(world.project),
+        on_call: None,
+        supersedes_execution: None,
+        wake: None,
+        topology_id: flow.topology_id.unwrap(),
+        expected_digest: flow.definition_digest.clone(),
+        epic_id: world.epic_a,
+        inputs: serde_json::Value::Null,
+        base_commit: Some(world.harness.base.clone()),
+        idempotency_key: "portfolio-run".into(),
+    };
+    let run = agent::execute(&world.harness.executor.store, || KNOBS, seat, &request)
+        .await
+        .unwrap()
+        .result
+        .execution_id;
+    assert_eq!(
+        world.harness.executor.advance(run).await.unwrap(),
+        Step::Wait
+    );
+    let first = world.harness.attempt(run, "A", 0, 1).await;
+    assert_eq!(first.status, AttemptStatus::Running);
+    world
+        .harness
+        .commit_and_complete(first.session_id, "portfolio-a");
+    run
+}
+
+/// Rotate the portfolio seat to a live continuation of itself (the #1005
+/// context-cap move) and return the successor.
+async fn rotate_portfolio_seat(world: &World, seat: Uuid) -> Uuid {
+    let successor = Uuid::new_v4();
+    let store = world.harness.executor.store.lock().await;
+    let mut row =
+        crate::session::agent_verbs::tests::test_session(successor, world.harness.repo.clone());
+    row.project_id = Some(world.project);
+    row.status = SessionStatus::Running;
+    row.continued_from = Some(seat);
+    store.insert_session(&row).unwrap();
+    assert!(store.transfer_global_seat(seat, successor).unwrap());
+    successor
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn rotated_portfolio_seat_keeps_observing_controlling_and_launching_its_execution() {
+    let world = World::new(automation()).await;
+    let (_, seat) = portfolio_over(&world).await;
+    let run = portfolio_run_with_a_done(&world, seat).await;
+
+    // The owning seat rotates between node A and node B.
+    let successor = rotate_portfolio_seat(&world, seat).await;
+    assert_eq!(
+        world
+            .get(successor, run)
+            .await
+            .unwrap()
+            .execution
+            .execution_id,
+        run,
+        "the successor observes the run"
+    );
+    assert!(
+        world.get(seat, run).await.is_err(),
+        "the retired seat holds no authority"
+    );
+
+    // B is admitted under the successor's live grant, exactly once.
+    for _ in 0..4 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    let attempts = world.harness.attempts(run).await;
+    let launched: Vec<_> = attempts.iter().filter(|a| a.node_id == "B").collect();
+    assert_eq!(launched.len(), 1, "{attempts:?}");
+    assert_eq!(launched[0].status, AttemptStatus::Running);
+    assert_eq!(world.harness.launches().len(), 2);
+    // The recorded requester is provenance and does not move.
+    {
+        let store = world.harness.executor.store.lock().await;
+        let recorded = rows::load_execution(&store, run).unwrap().unwrap();
+        assert_eq!(recorded.requested_by_session_id, Some(seat));
+    }
+
+    // The successor controls the run.
+    let version = world.harness.row_version(run).await;
+    world
+        .interrupt(successor, run, version, "successor-stop")
+        .await
+        .unwrap();
+    assert_eq!(
+        error_code(
+            &world
+                .interrupt(seat, run, version, "old-stop")
+                .await
+                .unwrap_err()
+        ),
+        "authority_denied"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn rotated_portfolio_seat_launch_still_refuses_a_narrowed_grant() {
+    use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+    let world = World::new(automation()).await;
+    let (_, seat) = portfolio_over(&world).await;
+    let run = portfolio_run_with_a_done(&world, seat).await;
+    let successor = rotate_portfolio_seat(&world, seat).await;
+    {
+        let store = world.harness.executor.store.lock().await;
+        let version = store.active_global_grant().unwrap().unwrap().grant_version;
+        store
+            .configure_global_manager(
+                &ConfigureGlobalManagerRequestV1 {
+                    session_id: successor,
+                    project_ids: vec![world.project],
+                    allowed_launches: vec![glm()],
+                    project_policy: policy(&[ManagerCapabilityV2::Automation], vec![], 64),
+                    expected_grant_version: version,
+                    idempotency_key: "narrow-after-rotation".into(),
+                },
+                "operator:test",
+            )
+            .unwrap();
+    }
+    for _ in 0..4 {
+        if world.harness.executor.advance(run).await.unwrap() == Step::Done {
+            break;
+        }
+    }
+    let attempts = world.harness.attempts(run).await;
+    let blocked = attempts.iter().find(|a| a.node_id == "B").expect("B");
+    assert_eq!(blocked.status, AttemptStatus::Blocked, "{attempts:?}");
+    // The operator edit opened a new authority epoch, which the run's
+    // recorded scope version no longer matches.
+    assert_eq!(blocked.error.as_deref(), Some("manager_scope_changed"));
+    assert_eq!(world.harness.launches().len(), 1, "only node A launched");
 }
 
 // ─── #1275: topology launches are charged up the portfolio chain ───────────
@@ -2818,10 +3216,200 @@ async fn landing_gate_follows_the_owners_live_authority() {
     assert!(gate(by_manager.execution_id).await.is_some());
 }
 
+// ─── #2532: a rotated project manager seat keeps landing its executions ─────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn landing_gate_follows_a_rotated_project_manager_seat() {
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let flow = world
+        .upsert(
+            world.lead_a,
+            &upsert_request("pm-rotation", review_definition(&sonnet(), &luna())),
+        )
+        .await
+        .unwrap();
+    let run = world
+        .execute(world.manager, &flow, world.epic_a, "pm-run")
+        .await
+        .unwrap();
+    let gate = |execution: Uuid| {
+        let world = &world;
+        async move {
+            let store = world.harness.executor.store.lock().await;
+            let execution = rows::load_execution(&store, execution).unwrap().unwrap();
+            agent::landing_gate(&store, &execution).unwrap()
+        }
+    };
+    assert_eq!(gate(run.execution_id).await, None);
+
+    // The seat rotates at the context cap: the predecessor is archived and its
+    // published successor is the appointment's current seat.
+    let successor = Uuid::new_v4();
+    {
+        let store = world.harness.executor.store.lock().await;
+        let predecessor = store.get_session(world.manager).unwrap().unwrap();
+        store
+            .update_session_status(world.manager, SessionStatus::Archived)
+            .unwrap();
+        let mut next = predecessor;
+        next.id = successor;
+        next.continued_from = Some(world.manager);
+        next.rotation_depth += 1;
+        next.status = SessionStatus::Running;
+        store.insert_session(&next).unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(world.manager, successor)
+                .unwrap()
+        );
+        assert_eq!(
+            store.project_manager_seat_now(world.manager).unwrap(),
+            Some(successor)
+        );
+        assert_eq!(store.project_manager_seat_now(successor).unwrap(), None);
+        let execution = rows::load_execution(&store, run.execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.requested_by_session_id, Some(world.manager));
+    }
+
+    // The old seat's execution lands under the new holder, still bound to the
+    // same grant: a pause stops it and a resume restores it.
+    assert_eq!(gate(run.execution_id).await, None);
+    world
+        .grant(ManagerPolicyV2 {
+            paused: true,
+            ..policy(
+                &[ManagerCapabilityV2::Automation],
+                vec![sonnet(), luna()],
+                64,
+            )
+        })
+        .await;
+    assert!(gate(run.execution_id).await.is_some());
+    world
+        .grant(policy(
+            &[ManagerCapabilityV2::Automation],
+            vec![sonnet(), luna()],
+            64,
+        ))
+        .await;
+    assert_eq!(gate(run.execution_id).await, None);
+
+    // A session outside the appointment's lineage is never the holder.
+    {
+        let store = world.harness.executor.store.lock().await;
+        assert_eq!(store.project_manager_seat_now(world.worker).unwrap(), None);
+    }
+}
+
+// ─── #3241: a rotated Epic lead keeps landing the executions it started ─────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn landing_gate_follows_a_rotated_epic_lead() {
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let flow = world
+        .upsert(
+            world.lead_a,
+            &upsert_request("lead-rotation", review_definition(&sonnet(), &luna())),
+        )
+        .await
+        .unwrap();
+    let run = world
+        .execute(world.lead_a, &flow, world.epic_a, "lead-rotation-run")
+        .await
+        .unwrap();
+    let gate = |execution: Uuid| {
+        let world = &world;
+        async move {
+            let store = world.harness.executor.store.lock().await;
+            let execution = rows::load_execution(&store, execution).unwrap().unwrap();
+            agent::landing_gate(&store, &execution).unwrap()
+        }
+    };
+    assert_eq!(gate(run.execution_id).await, None);
+
+    // The lead rotates at the context cap: the predecessor is archived, its
+    // published successor now leads the Epic.
+    let successor = Uuid::new_v4();
+    {
+        let store = world.harness.executor.store.lock().await;
+        let predecessor = store.get_session(world.lead_a).unwrap().unwrap();
+        store
+            .update_session_status(world.lead_a, SessionStatus::Archived)
+            .unwrap();
+        let mut next = predecessor;
+        next.id = successor;
+        next.continued_from = Some(world.lead_a);
+        next.rotation_depth += 1;
+        next.status = SessionStatus::Running;
+        store.insert_session(&next).unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(world.lead_a, successor)
+                .unwrap()
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET lead_session_id=?1 WHERE id=?2",
+                rusqlite::params![successor.to_string(), world.epic_a.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.epic_lead_seat_now(world.lead_a).unwrap(),
+            Some(successor)
+        );
+        assert_eq!(store.epic_lead_seat_now(successor).unwrap(), None);
+        assert_eq!(store.epic_lead_seat_now(world.worker).unwrap(), None);
+        let execution = rows::load_execution(&store, run.execution_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.requested_by_session_id, Some(world.lead_a));
+    }
+    // The predecessor's execution lands under the successor lead.
+    assert_eq!(gate(run.execution_id).await, None);
+
+    // A later replacement outside the rotation lineage is not the lead's heir.
+    {
+        let store = world.harness.executor.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET lead_session_id=?1 WHERE id=?2",
+                rusqlite::params![world.worker.to_string(), world.epic_a.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.epic_lead_seat_now(world.lead_a).unwrap(), None);
+    }
+    assert_eq!(gate(run.execution_id).await, Some("requester_unauthorized"));
+}
+
 // ─── #1687: a cancellation during the land probe stops the enqueue ──────────
 
 /// A land attempt of a running agent execution, with its enqueue request.
 async fn land_target(world: &World, key: &str) -> (Uuid, crate::topology::land::LandRequest) {
+    land_target_requested_by(world, world.lead_a, key).await
+}
+
+/// [`land_target`] for an execution that `requester` asked for.
+async fn land_target_requested_by(
+    world: &World,
+    requester: Uuid,
+    key: &str,
+) -> (Uuid, crate::topology::land::LandRequest) {
     let flow = world
         .upsert(
             world.lead_a,
@@ -2830,7 +3418,7 @@ async fn land_target(world: &World, key: &str) -> (Uuid, crate::topology::land::
         .await
         .unwrap();
     let execution = world
-        .execute(world.lead_a, &flow, world.epic_a, key)
+        .execute(requester, &flow, world.epic_a, key)
         .await
         .unwrap()
         .execution_id;
@@ -2866,16 +3454,18 @@ async fn land_target(world: &World, key: &str) -> (Uuid, crate::topology::land::
     let request = crate::topology::land::LandRequest {
         execution_id: execution,
         attempt_id: attempt.id,
-        node_id: "Land".into(),
         dedup_key: attempt.dedup_key,
         project_id: Some(world.project),
         epic_id: Some(world.epic_a),
         repo_root: world.harness.repo.clone(),
         source_commit: world.harness.base.clone(),
-        review_node: "R".into(),
-        review_assignment_id: Uuid::new_v4(),
+        acceptance: crate::topology::land::LandAcceptance::Review {
+            node: "R".into(),
+            assignment_id: Uuid::new_v4(),
+        },
         author_session_id: world.lead_a,
         test_filters: Vec::new(),
+        review_coverage: None,
     };
     (execution, request)
 }
@@ -2891,6 +3481,66 @@ fn land_control(world: &World) -> crate::session::agent_verbs::AgentControlHandl
             spawn_tx,
         )),
     )
+}
+
+/// hub #2969: the project manager seat rotates after the execution was
+/// requested; a land node that enqueues afterwards names the current seat as
+/// the entry's wake target, never the archived predecessor the execution
+/// recorded as its requester.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_enqueued_after_a_pm_rotation_wakes_the_current_seat_not_the_archived_one() {
+    use crate::topology::land::LandEnqueue;
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let control = land_control(&world);
+
+    // The execution is requested by the seat, then the seat rotates.
+    let (execution, request) =
+        land_target_requested_by(&world, world.manager, "post-rotation").await;
+    let successor = Uuid::new_v4();
+    {
+        let store = world.harness.executor.store.lock().await;
+        let predecessor = store.get_session(world.manager).unwrap().unwrap();
+        store
+            .update_session_status(world.manager, SessionStatus::Archived)
+            .unwrap();
+        let mut next = predecessor;
+        next.id = successor;
+        next.continued_from = Some(world.manager);
+        next.rotation_depth += 1;
+        next.status = SessionStatus::Running;
+        store.insert_session(&next).unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(world.manager, successor)
+                .unwrap()
+        );
+        let execution = rows::load_execution(&store, execution).unwrap().unwrap();
+        assert_eq!(execution.requested_by_session_id, Some(world.manager));
+    }
+
+    let answer = control
+        .enqueue_topology_admitted_for_test(&request, true)
+        .await
+        .unwrap();
+    let LandEnqueue::Queued(late) = answer else {
+        panic!("{answer:?}");
+    };
+    let store = world.harness.executor.store.lock().await;
+    let wake: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT wake_session_id FROM rolling_queue_entries WHERE id=?1",
+            [late.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wake, Some(successor.to_string()));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -2977,6 +3627,661 @@ async fn cancellation_during_the_land_probe_enqueues_nothing_and_cancels_the_att
         LandEnqueue::Queued(entry)
     );
     assert_eq!(entries(&world).await.len(), 1);
+}
+
+/// #2386: a land entry of a live execution is settled by the queue into the
+/// entry the land node reads, with no owner-seat wake; a refusal stays visible
+/// through the land status the node mirrors.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_settled_topology_land_entry_wakes_no_owner_and_the_land_node_reads_it() {
+    use crate::topology::land::LandEnqueue;
+    use rsi_common::rolling_queue::{RollingQueueEntryState, RollingQueueOutcome};
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let control = land_control(&world);
+    for (key, terminal) in [
+        ("settle-published", RollingQueueEntryState::Published),
+        ("settle-refused", RollingQueueEntryState::Refused),
+    ] {
+        let (_, request) = land_target(&world, key).await;
+        let answer = control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap();
+        let LandEnqueue::Queued(entry) = answer else {
+            panic!("{answer:?}");
+        };
+        let outcome = if terminal == RollingQueueEntryState::Published {
+            RollingQueueOutcome {
+                landed_sha: Some("a".repeat(40)),
+                ..RollingQueueOutcome::default()
+            }
+        } else {
+            RollingQueueOutcome {
+                refusal: Some("queue_gate_red".into()),
+                ..RollingQueueOutcome::default()
+            }
+        };
+        let store = world.harness.executor.store.lock().await;
+        let claimed = store
+            .claim_next_rolling_queue_entry(chrono::Utc::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.entry.id, entry);
+        store
+            .settle_rolling_queue_entry(entry, terminal, &outcome, chrono::Utc::now())
+            .unwrap()
+            .expect("the entry settles");
+        let wakes = store
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name.starts_with("merge-queue-"))
+            .count();
+        assert_eq!(wakes, 0, "{key}");
+        // The land node reads the settled entry; the refusal stays visible.
+        let settled = store.get_rolling_queue_entry(entry).unwrap().unwrap();
+        assert_eq!(settled.state, terminal, "{key}");
+        let outcome = settled.outcome.unwrap();
+        if terminal == RollingQueueEntryState::Published {
+            assert_eq!(outcome.landed_sha, Some("a".repeat(40)));
+        } else {
+            assert_eq!(outcome.refusal.as_deref(), Some("queue_gate_red"));
+        }
+    }
+}
+
+/// #1807/#1781/#1786: a land node with no explicit filters enqueues with the
+/// filters the daemon derives from the accepted diff (a 49-filter derivation
+/// is not refused or pruned; a filter over 256 bytes is split; focused filters
+/// naming one expression across shards collapse to one).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_land_node_without_filters_enqueues_with_derived_filters() {
+    use crate::topology::land::LandEnqueue;
+    use rsi_common::rolling_queue::{ROLLING_QUEUE_MAX_TEST_FILTERS, valid_test_filter};
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let repo = world.harness.repo.clone();
+    git(&repo, &["branch", "-f", "rolling", "HEAD"]);
+    let names: Vec<String> = (0..40)
+        .map(|i| format!("derived_test_name_{i:03}"))
+        .collect();
+    let mut suggested: Vec<String> = (0..49).map(|i| format!("rsi-common=module_{i}")).collect();
+    suggested.push("rsid=shard:store-01:test(focused_one)".into());
+    suggested.push("rsid=shard:session-02:test(focused_one)".into());
+    suggested.push("rsid-store=shard:store-01:test(focused_one)".into());
+    suggested.push(format!(
+        "rsid=shard:session-01:test(/^session::tests::(?:{})$/)",
+        names.join("|")
+    ));
+    std::fs::create_dir_all(repo.join("scripts")).unwrap();
+    std::fs::write(
+        repo.join("scripts/check-touched-shards"),
+        format!(
+            "import json\nprint(json.dumps({{'suggested_filters': {}}}))\n",
+            serde_json::to_string(&suggested).unwrap().replace('"', "'")
+        ),
+    )
+    .unwrap();
+    let control = land_control(&world);
+    let (_, request) = land_target(&world, "derived-filters").await;
+    assert!(request.test_filters.is_empty());
+    let answer = control
+        .enqueue_topology_admitted_for_test(&request, true)
+        .await
+        .unwrap();
+    let LandEnqueue::Queued(entry) = answer else {
+        panic!("{answer:?}");
+    };
+    let queued = world
+        .harness
+        .executor
+        .store
+        .lock()
+        .await
+        .get_rolling_queue_entry(entry)
+        .unwrap()
+        .unwrap();
+    let filters = queued.test_filters;
+    assert!(
+        filters.len() > ROLLING_QUEUE_MAX_TEST_FILTERS,
+        "{filters:?}"
+    );
+    assert!(filters.iter().all(|f| valid_test_filter(f)), "{filters:?}");
+    assert_eq!(
+        filters.iter().filter(|f| f.contains("focused_one")).count(),
+        1
+    );
+    for module in 0..49 {
+        assert!(filters.contains(&format!("rsi-common=module_{module}")));
+    }
+    let split: Vec<&String> = filters
+        .iter()
+        .filter(|f| f.contains("session::tests"))
+        .collect();
+    assert!(split.len() > 1);
+    for name in &names {
+        assert_eq!(
+            split.iter().filter(|f| f.contains(name.as_str())).count(),
+            1,
+            "{name}"
+        );
+    }
+}
+
+// ─── #2249: a land admitted by a verified session's own receipt ─────────────
+
+/// A verified-acceptance request for `commit`, backed by a settled green
+/// `scoped_test` job of the Epic lead (the verified session). Returns the job.
+async fn verified_request(
+    world: &World,
+    key: &str,
+    commit: &str,
+) -> (crate::topology::land::LandRequest, Uuid) {
+    use rsi_common::agent_jobs::JobState;
+    let (_, mut request) = land_target(world, key).await;
+    let job = scoped_test_job(
+        &world.harness,
+        world.lead_a,
+        JobState::Succeeded,
+        green_receipt(commit),
+    )
+    .await;
+    request.source_commit = commit.to_owned();
+    request.author_session_id = world.lead_a;
+    request.acceptance = crate::topology::land::LandAcceptance::Verified {
+        node: "Impl".into(),
+        session_id: world.lead_a,
+        job_id: job,
+        head: commit.to_owned(),
+    };
+    (request, job)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_admitted_by_verified_session_enqueues_exactly_that_commit() {
+    use crate::topology::land::LandEnqueue;
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let repo = world.harness.repo.clone();
+    git(&repo, &["branch", "-f", "rolling", "HEAD"]);
+    std::fs::create_dir_all(repo.join("scripts")).unwrap();
+    std::fs::write(
+        repo.join("scripts/check-touched-shards"),
+        "import json\nprint(json.dumps({'suggested_filters': ['rsi-common=verified_land']}))\n",
+    )
+    .unwrap();
+    let control = land_control(&world);
+    let commit = world.harness.base.clone();
+    let (request, _job) = verified_request(&world, "verified-enqueue", &commit).await;
+    assert!(request.test_filters.is_empty());
+
+    // No reviewer is consulted: the job row admits the commit.
+    let answer = control
+        .enqueue_topology_admitted_for_test(&request, true)
+        .await
+        .unwrap();
+    let LandEnqueue::Queued(entry) = answer else {
+        panic!("{answer:?}");
+    };
+    let store = world.harness.executor.store.lock().await;
+    let queued = store.get_rolling_queue_entry(entry).unwrap().unwrap();
+    assert_eq!(queued.source_commit, commit);
+    assert_eq!(queued.source_session_id, world.lead_a);
+    assert_eq!(
+        queued.test_filters,
+        vec!["rsi-common=verified_land".to_owned()]
+    );
+    assert!(!crate::rolling_queue::has_explicit_filters(entry));
+    // The settlement wake goes to the execution's owner (the requesting lead).
+    let wake: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT wake_session_id FROM rolling_queue_entries WHERE id=?1",
+            [entry.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wake, Some(world.lead_a.to_string()));
+    // A duplicate enqueue returns the same entry.
+    drop(store);
+    assert_eq!(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(entry)
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_verified_admission_rechecks_the_job_row() {
+    use crate::topology::land::{LandAcceptance, LandEnqueue};
+    use rsi_common::agent_jobs::JobState;
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    // The migration check needs a rolling ref to diff the source against.
+    git(&world.harness.repo, &["branch", "-f", "rolling", "HEAD"]);
+    let control = land_control(&world);
+    let entries = || async {
+        world
+            .harness
+            .executor
+            .store
+            .lock()
+            .await
+            .list_rolling_queue_entries(None, 10)
+            .unwrap()
+    };
+    let commit = world.harness.base.clone();
+
+    // The job row changes between the first admission and the insert's re-check.
+    let (request, job) = verified_request(&world, "verified-race", &commit).await;
+    let answer = control
+        .enqueue_topology_racing_for_test(&request, move |store| {
+            store
+                .conn
+                .execute_batch("DROP TRIGGER agent_jobs_terminal_immutable")
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET result_json=json_set(result_json,'$.receipt.head',\
+                     '0000000000000000000000000000000000000000') WHERE id=?1",
+                    [job.to_string()],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    let LandEnqueue::AdmissionLost(reason) = answer else {
+        panic!("{answer:?}");
+    };
+    assert!(reason.contains("no longer admits"), "{reason}");
+    assert!(entries().await.is_empty());
+
+    // Admission is refused up front when the job is not the accepted session's
+    // terminal scoped_test job for this commit.
+    let (mut other_owner, _) = verified_request(&world, "verified-owner", &commit).await;
+    if let LandAcceptance::Verified { session_id, .. } = &mut other_owner.acceptance {
+        *session_id = world.worker;
+    }
+    let (mut missing, _) = verified_request(&world, "verified-missing", &commit).await;
+    if let LandAcceptance::Verified { job_id, .. } = &mut missing.acceptance {
+        *job_id = Uuid::new_v4();
+    }
+    let (mut wrong_head, _) = verified_request(&world, "verified-head", &commit).await;
+    let other_head = "b".repeat(40);
+    let foreign = scoped_test_job(
+        &world.harness,
+        world.lead_a,
+        JobState::Succeeded,
+        green_receipt(&other_head),
+    )
+    .await;
+    if let LandAcceptance::Verified { job_id, .. } = &mut wrong_head.acceptance {
+        *job_id = foreign;
+    }
+    for (label, request) in [
+        ("owner", other_owner),
+        ("missing", missing),
+        ("head", wrong_head),
+    ] {
+        let answer = control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&answer, LandEnqueue::AdmissionLost(reason) if reason.contains("no longer admits")),
+            "{label}: {answer:?}"
+        );
+    }
+    assert!(entries().await.is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_admitted_by_verification_refuses_a_migration_source() {
+    use crate::topology::land::{LandAcceptance, LandEnqueue};
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let repo = world.harness.repo.clone();
+    let commit = |message: &str| {
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", message]);
+        git(&repo, &["rev-parse", "HEAD"])
+    };
+    // The rolling base carries migration v900.
+    let migrations = repo.join("crates/rsid-store/src/store/migrations");
+    std::fs::create_dir_all(&migrations).unwrap();
+    std::fs::write(migrations.join("v900.rs"), "// base head\n").unwrap();
+    let base = commit("base migration head");
+    git(&repo, &["branch", "-f", "rolling", &base]);
+    // A plain change, a numbered migration and a provisional declaration, each
+    // cut from the base.
+    std::fs::write(repo.join("docs.txt"), "docs\n").unwrap();
+    let plain = commit("plain change");
+    git(&repo, &["reset", "-q", "--hard", &base]);
+    std::fs::write(migrations.join("v901.rs"), "// new head\n").unwrap();
+    let numbered = commit("numbered migration");
+    git(&repo, &["reset", "-q", "--hard", &base]);
+    std::fs::create_dir_all(repo.join("tools/provisional-migrations")).unwrap();
+    std::fs::write(repo.join("tools/provisional-migrations/x.json"), "{}\n").unwrap();
+    let provisional = commit("provisional migration");
+
+    let control = land_control(&world);
+    let entries = || async {
+        world
+            .harness
+            .executor
+            .store
+            .lock()
+            .await
+            .list_rolling_queue_entries(None, 10)
+            .unwrap()
+    };
+
+    for (label, source) in [("numbered", &numbered), ("provisional", &provisional)] {
+        let (request, _) = verified_request(&world, &format!("verified-{label}"), source).await;
+        let answer = control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap();
+        let LandEnqueue::RequiresReview(reason) = answer else {
+            panic!("{label}: {answer:?}");
+        };
+        assert!(reason.contains("pre-land review"), "{label}: {reason}");
+    }
+    assert!(entries().await.is_empty(), "nothing is enqueued");
+
+    // The refusal is specific to admission by verification: a change without a
+    // migration enqueues, and a migration a reviewer accepted still does.
+    let (request, _) = verified_request(&world, "verified-plain", &plain).await;
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+    let (_, mut reviewed) = land_target(&world, "reviewed-migration").await;
+    reviewed.source_commit = numbered.clone();
+    assert!(matches!(reviewed.acceptance, LandAcceptance::Review { .. }));
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&reviewed, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+    assert_eq!(entries().await.len(), 2);
+}
+
+// ─── #2304 slice 3: the selected review policy at landing ───────────────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_with_review_coverage_blocks_a_stricter_candidate_before_an_entry_exists() {
+    use crate::topology::land::{LandAcceptance, LandEnqueue};
+    use crate::topology::review_policy::ReviewPolicy::{Ordinary, PostLand, PreMerge};
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    let repo = world.harness.repo.clone();
+    let commit = |message: &str| {
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", message]);
+        git(&repo, &["rev-parse", "HEAD"])
+    };
+    let write = |path: &str, text: &str| {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    };
+    // The unclassified source is cut before any rolling ref exists, so git can
+    // show no base to inspect it against.
+    write("docs.txt", "docs\n");
+    let no_base = commit("tooling change before rolling exists");
+    write(
+        "crates/rsid-store/src/store/migrations/v900.rs",
+        "// head\n",
+    );
+    let base = commit("base migration head");
+    git(&repo, &["branch", "-f", "rolling", &base]);
+    let cut = |path: &str, text: &str, message: &str| {
+        write(path, text);
+        let sha = commit(message);
+        git(&repo, &["reset", "-q", "--hard", &base]);
+        sha
+    };
+    let tooling = cut("scripts/fmt-changed.sh", "#!/bin/sh\n", "tooling");
+    let custody = cut(
+        "crates/rsid/src/session/branch_custody.rs",
+        "//\n",
+        "custody",
+    );
+    let vault = cut("crates/rsid-store/src/vault/mod.rs", "//\n", "vault");
+    let iam = cut("crates/rsid-store/src/bedrock_setup.rs", "//\n", "iam");
+    let network = cut("crates/rsid/src/remote_control.rs", "//\n", "network");
+    let migration = cut(
+        "crates/rsid-store/src/store/migrations/v901.rs",
+        "// new head\n",
+        "numbered migration",
+    );
+    let provisional = cut("tools/provisional-migrations/x.json", "{}\n", "provisional");
+
+    let control = land_control(&world);
+    let entries = || async {
+        world
+            .harness
+            .executor
+            .store
+            .lock()
+            .await
+            .list_rolling_queue_entries(None, 20)
+            .unwrap()
+    };
+    let verified = |source: &str, coverage, key: &str| {
+        let (source, key) = (source.to_owned(), key.to_owned());
+        let world = &world;
+        async move {
+            let (mut request, _) = verified_request(world, &key, &source).await;
+            request.review_coverage = coverage;
+            request
+        }
+    };
+    let blocked = |answer: LandEnqueue, policy: &str, source: &str| {
+        let LandEnqueue::RequiresReview(reason) = answer else {
+            panic!("expected a review block for {source}: {answer:?}");
+        };
+        assert!(reason.contains(policy), "{reason}");
+        assert!(reason.contains(source), "the exact source SHA: {reason}");
+    };
+
+    // A classified custody path is admitted only by a graph with the post-land
+    // review; an ordinary graph is blocked with the required policy.
+    let request = verified(&custody, Some(Ordinary), "cov-custody-ordinary").await;
+    blocked(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        "post_land",
+        &custody,
+    );
+    assert!(entries().await.is_empty());
+    let request = verified(&custody, Some(PostLand), "cov-custody-post").await;
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+
+    // Migration, credential, IAM and network-exposure changes need the
+    // pre-merge route: a post-land graph is not enough.
+    for (label, source) in [
+        ("vault", &vault),
+        ("iam", &iam),
+        ("network", &network),
+        ("migration", &migration),
+        ("provisional", &provisional),
+    ] {
+        for coverage in [Ordinary, PostLand] {
+            let request =
+                verified(source, Some(coverage), &format!("cov-{label}-{coverage:?}")).await;
+            blocked(
+                control
+                    .enqueue_topology_admitted_for_test(&request, true)
+                    .await
+                    .unwrap(),
+                "pre_merge",
+                source,
+            );
+        }
+    }
+    assert_eq!(entries().await.len(), 1, "only the post-land custody entry");
+
+    // The pre-merge graph (an accepted review of the exact head) lands them,
+    // and so does a repaired source of the same class.
+    let (_, mut reviewed) = land_target(&world, "cov-vault-reviewed").await;
+    reviewed.source_commit = vault.clone();
+    reviewed.review_coverage = Some(PreMerge);
+    assert!(matches!(reviewed.acceptance, LandAcceptance::Review { .. }));
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&reviewed, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+
+    // An ordinary tooling change passes with no reviewer; a custom topology
+    // (no coverage) keeps its behaviour for the same classified path.
+    let request = verified(&tooling, Some(Ordinary), "cov-tooling").await;
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+    let request = verified(&iam, None, "cov-custom").await;
+    assert!(matches!(
+        control
+            .enqueue_topology_admitted_for_test(&request, true)
+            .await
+            .unwrap(),
+        LandEnqueue::Queued(_)
+    ));
+    assert_eq!(entries().await.len(), 4);
+
+    // Unknown inspection fails closed before an entry exists: a source that
+    // git cannot place against rolling is not guessed to be ordinary.
+    git(&repo, &["branch", "-D", "rolling"]);
+    let before = entries().await.len();
+    let request = verified(&no_base, Some(Ordinary), "cov-unknown").await;
+    let answer = control
+        .enqueue_topology_admitted_for_test(&request, true)
+        .await
+        .unwrap();
+    blocked(answer, "pre_merge", &no_base);
+    let request = verified(&no_base, Some(PostLand), "cov-unknown-post").await;
+    let answer = control
+        .enqueue_topology_admitted_for_test(&request, true)
+        .await
+        .unwrap();
+    blocked(answer, "pre_merge", &no_base);
+    assert_eq!(entries().await.len(), before);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn an_ordinary_policy_land_still_stops_at_cancellation_and_lost_ownership() {
+    use crate::topology::land::LandEnqueue;
+    use crate::topology::review_policy::ReviewPolicy::Ordinary;
+    let world = World::new(policy(
+        &[ManagerCapabilityV2::Automation],
+        vec![sonnet(), luna()],
+        64,
+    ))
+    .await;
+    git(&world.harness.repo, &["branch", "-f", "rolling", "HEAD"]);
+    let control = land_control(&world);
+    let lead = world.lead_a;
+
+    // The owner's interrupt commits during the Git probe: nothing is enqueued.
+    let (execution, mut request) = land_target(&world, "ordinary-cancel").await;
+    request.review_coverage = Some(Ordinary);
+    let answer = control
+        .enqueue_topology_racing_for_test(&request, move |store| {
+            let row_version = rows::load_execution(store, execution)
+                .unwrap()
+                .unwrap()
+                .row_version;
+            agent::interrupt(
+                store,
+                lead,
+                &AgentTopologyInterruptRequestV1 {
+                    project_id: None,
+                    execution_id: execution,
+                    expected_row_version: row_version,
+                    idempotency_key: "ordinary-interrupt".into(),
+                },
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(answer, LandEnqueue::Cancelled);
+
+    // An execution that no longer exists admits nothing.
+    let (_, mut gone) = land_target(&world, "ordinary-gone").await;
+    gone.review_coverage = Some(Ordinary);
+    gone.execution_id = Uuid::new_v4();
+    let answer = control
+        .enqueue_topology_admitted_for_test(&gone, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(answer, LandEnqueue::AdmissionLost(_)),
+        "{answer:?}"
+    );
+    let store = world.harness.executor.store.lock().await;
+    assert!(
+        store
+            .list_rolling_queue_entries(None, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ─── S3a: the on-call seat and the visible wait (#1641) ────────────────────
@@ -3196,6 +4501,8 @@ async fn on_call_seat_must_cover_the_project_and_not_collide_with_inputs() {
     let mut request = AgentTopologyExecuteRequestV1 {
         project_id: None,
         on_call: None,
+        supersedes_execution: None,
+        wake: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_a,
@@ -3401,6 +4708,65 @@ async fn waiting_approval_time_does_not_count_toward_node_wall_time() {
     assert_eq!(timed_out.failure_class.as_deref(), Some("timeout"));
 }
 
+/// #2697: a node that has used half of its wall time tells the execution's
+/// owner, once, how many commits it has and when the last one landed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn half_wall_time_notifies_the_owner_once_per_attempt() {
+    let mut world = World::new(automation()).await;
+    let run = on_call_run(&world, None, "wall-notice").await;
+    world.harness.executor.advance(run).await.unwrap();
+    let attempt = world.harness.attempt(run, "A", 0, 1).await;
+    let session = attempt.session_id;
+    world.harness.commit_while_running(session, "first");
+    world.harness.commit_while_running(session, "second");
+
+    // An hour in (a quarter of the four-hour limit): nothing to say yet.
+    backdate_attempt(&world, run, 1).await;
+    world.harness.executor.advance(run).await.unwrap();
+    world.harness.executor.advance(run).await.unwrap();
+    assert!(world.harness.owner_notices().is_empty());
+
+    // Past the half: one notice naming node, elapsed time and the commits.
+    backdate_attempt(&world, run, 3).await;
+    for _ in 0..3 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    let notices = world.harness.owner_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let (owner, from, key, text) = &notices[0];
+    assert_eq!(*owner, Some(world.manager));
+    assert_eq!(*from, session);
+    assert_eq!(*key, format!("topology-wall-time:{}", attempt.id));
+    assert!(text.contains("node 'A'"), "{text}");
+    assert!(text.contains("has run 3h"), "{text}");
+    assert!(text.contains("of its 4h00m wall-time limit"), "{text}");
+    assert!(
+        text.contains("2 commit(s) on its branch since the base"),
+        "{text}"
+    );
+    assert!(text.contains("the last 0h00m ago"), "{text}");
+    assert_eq!(
+        world.harness.attempt(run, "A", 0, 1).await.status,
+        AttemptStatus::Running,
+        "the notice does not stop the node"
+    );
+
+    // The one-per-attempt record is durable: the restarted executor (a fresh
+    // fake with no memory of the first notice) sends nothing more.
+    world.harness.restart();
+    world.harness.executor.advance(run).await.unwrap();
+    assert!(world.harness.owner_notices().is_empty());
+    let kinds = event_kinds(&world, run).await;
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| *kind == "node_wall_time_notice")
+            .count(),
+        1
+    );
+}
+
 /// Pretend the run's node attempt started `seconds` ago.
 async fn backdate_attempt_seconds(world: &World, run: Uuid, seconds: i64) {
     let store = world.harness.executor.store.lock().await;
@@ -3423,7 +4789,7 @@ async fn backdate_attempt_seconds(world: &World, run: Uuid, seconds: i64) {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn wait_first_observed_after_the_limit_is_paused_from_its_real_start() {
-    let mut world = World::new(automation()).await;
+    let world = World::new(automation()).await;
     let run = on_call_run(&world, None, "late-observation").await;
     world.harness.executor.advance(run).await.unwrap();
     let session = world.harness.attempt(run, "A", 0, 1).await.session_id;
@@ -3464,7 +4830,7 @@ async fn wait_first_observed_after_the_limit_is_paused_from_its_real_start() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn wait_without_a_reported_start_is_paused_from_the_last_known_running_time() {
-    let mut world = World::new(automation()).await;
+    let world = World::new(automation()).await;
     let run = on_call_run(&world, None, "unknown-start").await;
     world.harness.executor.advance(run).await.unwrap();
     let session = world.harness.attempt(run, "A", 0, 1).await.session_id;
@@ -3569,6 +4935,19 @@ fn parked_on(attempt: &super::store::AttemptRow) -> String {
         .to_owned()
 }
 
+fn assert_answer_delivery(delivered: &[(Uuid, String)], session: Uuid, answer: &str) {
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].0, session);
+    let prefix = format!("My answer to your question: {answer}\n\n[Topology answer delivery ");
+    let delivery_id = delivered[0]
+        .1
+        .strip_prefix(&prefix)
+        .unwrap()
+        .strip_suffix(']')
+        .unwrap();
+    Uuid::parse_str(delivery_id).expect("a durable answer delivery identity");
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn blocked_handoff_with_question_waits_and_continues_same_session_on_ruling() {
@@ -3632,10 +5011,7 @@ async fn blocked_handoff_with_question_waits_and_continues_same_session_on_rulin
     // The ruling continues the SAME session with the answer, once.
     pm_rule(&world, &key, "Keep it", "rule-keep").await.unwrap();
     world.harness.executor.advance(run).await.unwrap();
-    assert_eq!(
-        world.harness.continues(),
-        vec![(session, "My answer to your question: Keep it".to_owned())]
-    );
+    assert_answer_delivery(&world.harness.continues(), session, "Keep it");
     let resumed = world.harness.attempt(run, "A", 0, 1).await;
     assert_eq!(resumed.status, AttemptStatus::Running);
     assert_eq!(resumed.session_id, session);
@@ -3654,6 +5030,348 @@ async fn blocked_handoff_with_question_waits_and_continues_same_session_on_rulin
         Step::Done
     );
     assert_eq!(world.harness.status(run).await, ExecutionStatus::Succeeded);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn topology_ruling_continues_only_the_asking_execution_without_a_lead_notice() {
+    let world = World::new(ruling_policy()).await;
+    let flow = world
+        .upsert(
+            world.manager,
+            &manager_upsert("answer-routing", definition(&[("A", &luna())], &[])),
+        )
+        .await
+        .unwrap();
+    let old = world
+        .execute(world.manager, &flow, world.epic_a, "old-execution")
+        .await
+        .unwrap()
+        .execution_id;
+    world.harness.executor.advance(old).await.unwrap();
+    let stale = world.harness.attempt(old, "A", 0, 1).await.session_id;
+    // A failed node session fails the first execution, leaving its session.
+    world.harness.set_status(stale, SessionStatus::Failed);
+    world.harness.executor.advance(old).await.unwrap();
+    assert_eq!(world.harness.status(old).await, ExecutionStatus::Failed);
+
+    let current = world
+        .execute(world.manager, &flow, world.epic_a, "asking-execution")
+        .await
+        .unwrap()
+        .execution_id;
+    world.harness.executor.advance(current).await.unwrap();
+    let asking = world.harness.attempt(current, "A", 0, 1).await.session_id;
+    world.harness.complete_blocked(
+        asking,
+        "technical_impasse",
+        Some("Keep the old field or rename it?"),
+    );
+    world.harness.executor.advance(current).await.unwrap();
+    let key = parked_on(&world.harness.attempt(current, "A", 0, 1).await);
+
+    // Reproduce the stale Epic lead route that used to receive operator_answer.
+    {
+        let store = world.harness.executor.store.lock().await;
+        let mut session =
+            crate::session::agent_verbs::tests::test_session(stale, world.harness.repo.clone());
+        session.project_id = Some(world.project);
+        session.parent_id = Some(world.epic_a);
+        session.session_kind = SessionKind::Task;
+        session.status = SessionStatus::Completed;
+        store.insert_session(&session).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET lead_session_id=?1 WHERE id=?2",
+                rusqlite::params![stale.to_string(), world.epic_a.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.manager_lead(world.project, world.epic_a).unwrap().id,
+            stale
+        );
+    }
+    pm_rule(&world, &key, "Keep it", "route-ruling")
+        .await
+        .unwrap();
+
+    // Reconcile before and after delivery, including repeat passes. Only the
+    // executor's continuation may deliver this answer.
+    for _ in 0..3 {
+        {
+            let store = world.harness.executor.store.lock().await;
+            let config = store.get_harness_manager(world.project).unwrap().unwrap();
+            store.manager_v2_reconcile_notices(&config).unwrap();
+            let notices: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM harness_manager_notices
+                     WHERE kind='operator_answer' AND subject_id=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(notices, 0, "topology answers use the attempt continuation");
+        }
+        world.harness.executor.advance(current).await.unwrap();
+    }
+    assert_answer_delivery(&world.harness.continues(), asking, "Keep it");
+    assert_eq!(world.harness.status(old).await, ExecutionStatus::Failed);
+    assert_eq!(
+        world.harness.attempt(current, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn resource_tooling_question_holds_its_execution_and_allows_sibling_launches() {
+    use rsi_common::harness_manager_v2::{AgentManagerInspectRequestV2, ManagerInspectSectionV2};
+
+    let mut world = World::new(ruling_policy()).await;
+    let flow = world
+        .upsert(
+            world.manager,
+            &manager_upsert(
+                "resource-tooling",
+                definition(
+                    &[("A", &luna()), ("C", &luna()), ("B", &luna())],
+                    &[("C", "B")],
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    let run = world
+        .execute(world.manager, &flow, world.epic_a, "tooling")
+        .await
+        .unwrap()
+        .execution_id;
+    world.harness.executor.advance(run).await.unwrap();
+    let asking = world.harness.attempt(run, "A", 0, 1).await.session_id;
+    let parallel = world.harness.attempt(run, "C", 0, 1).await.session_id;
+    world.harness.complete_with_content(
+        asking,
+        "PIPELINE HANDOFF — RESEARCH:\ndoc_path: inline\nstatus: blocked\n\
+         blocker: scoped_test cannot load its tool copy\nblocker_class: resource\n\
+         blocker_evidence: the installed rsid tool copy is stale\n\
+         blocker_question: May the hub redeploy rsid to restore scoped_test tooling?\n",
+    );
+    world.harness.executor.advance(run).await.unwrap();
+    let key = parked_on(&world.harness.attempt(run, "A", 0, 1).await);
+    world
+        .harness
+        .commit_and_complete(parallel, "parallel node done");
+    world.harness.executor.advance(run).await.unwrap();
+    assert_eq!(
+        world.harness.launches().len(),
+        2,
+        "B waits for this execution's ruling"
+    );
+
+    {
+        let store = world.harness.executor.store.lock().await;
+        let config = store.get_harness_manager(world.project).unwrap().unwrap();
+        // Exercise the actual manager launch predicate, as well as the board.
+        store
+            .manager_v2_decision_gate(&config, world.epic_a)
+            .unwrap();
+        let board = store
+            .manager_v2_inspect_operator(
+                world.project,
+                &AgentManagerInspectRequestV2 {
+                    section: ManagerInspectSectionV2::Decisions,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let row = board.rows.iter().find(|row| row["key"] == key).unwrap();
+        assert_eq!(row["answerable_by"], "manager");
+        assert_eq!(row["gate"], serde_json::Value::Null);
+        assert_eq!(row["blocks"]["launches"], true);
+        assert_eq!(row["blocks"]["epic_ids"], serde_json::json!([]));
+        assert_eq!(row["blocks"]["execution_ids"], serde_json::json!([run]));
+    }
+    // Restart preserves the scoped hold; another execution in the SAME Epic launches.
+    world.harness.restart();
+    let sibling = on_call_run(&world, None, "resource-sibling").await;
+    world.harness.executor.advance(sibling).await.unwrap();
+    assert_eq!(
+        world.harness.attempt(sibling, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    assert_eq!(world.harness.launches().len(), 3);
+    assert_eq!(
+        world.harness.attempt(run, "A", 0, 1).await.status,
+        AttemptStatus::Waiting
+    );
+
+    pm_rule(&world, &key, "Redeploy the tooling", "resource-ruling")
+        .await
+        .unwrap();
+    world.harness.executor.advance(run).await.unwrap();
+    assert_answer_delivery(&world.harness.continues(), asking, "Redeploy the tooling");
+    assert_eq!(
+        world.harness.attempt(run, "B", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    world
+        .harness
+        .commit_and_complete(asking, "tooling restored");
+    let successor = world.harness.attempt(run, "B", 0, 1).await.session_id;
+    world
+        .harness
+        .commit_and_complete(successor, "successor done");
+    assert_eq!(
+        world.harness.executor.advance(run).await.unwrap(),
+        Step::Done
+    );
+    assert_eq!(world.harness.status(run).await, ExecutionStatus::Succeeded);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn resource_blocker_naming_real_spend_keeps_the_operator_gate() {
+    use rsi_common::harness_manager_v2::{AgentManagerInspectRequestV2, ManagerInspectSectionV2};
+
+    let mut cases = vec![
+        (
+            "runner unavailable",
+            "the runner needs more capacity",
+            "May we rent a runner for $25?",
+        ),
+        (
+            "runner unavailable",
+            "the replacement runner costs $25",
+            "May we proceed with that runner?",
+        ),
+        (
+            "capacity unavailable",
+            "the eval cannot proceed",
+            "Which option should we use?",
+        ),
+        (
+            "tool copy unavailable",
+            "redeploy rsid on a paid instance costing 40 USD",
+            "May we proceed?",
+        ),
+    ]
+    .into_iter()
+    .map(|(b, e, q)| (b.to_owned(), e.to_owned(), q.to_owned()))
+    .collect::<Vec<_>>();
+    for wording in [
+        "40 USD",
+        "USD 40",
+        "50 dollars",
+        "EUR 50",
+        "20 euros",
+        "paid run",
+        "costs",
+        "costing",
+        "price",
+        "credits",
+        "charge",
+        "billed",
+        "GBP 40",
+        "40 GBP",
+        "JPY 50",
+        "50 JPY",
+        "one dollar",
+        "one euro",
+        "50 pounds",
+        "one pound",
+        "cost",
+        "priced",
+        "charged",
+        "credit",
+    ] {
+        // Tooling would otherwise permit a manager ruling. Exercise every input
+        // field so a money signal in the blocker cannot be hidden by the ask.
+        for field in 0..3 {
+            let mut parts = [
+                "tool copy unavailable".to_owned(),
+                "stale binary".to_owned(),
+                "May we proceed?".to_owned(),
+            ];
+            parts[field].push_str(&format!(" ({wording})"));
+            let [blocker, evidence, question] = parts;
+            cases.push((blocker, evidence, question));
+        }
+    }
+    for (blocker, evidence, question) in cases {
+        let world = World::new(ruling_policy()).await;
+        let run = on_call_run(&world, None, "spend").await;
+        world.harness.executor.advance(run).await.unwrap();
+        let session = world.harness.attempt(run, "A", 0, 1).await.session_id;
+        world.harness.complete_with_content(
+            session,
+            &format!(
+                "PIPELINE HANDOFF — RESEARCH:\ndoc_path: inline\nstatus: blocked\n\
+             blocker: {blocker}\nblocker_class: resource\n\
+             blocker_evidence: {evidence}\nblocker_question: {question}\n"
+            ),
+        );
+        world.harness.executor.advance(run).await.unwrap();
+        let key = parked_on(&world.harness.attempt(run, "A", 0, 1).await);
+        {
+            let store = world.harness.executor.store.lock().await;
+            let board = store
+                .manager_v2_inspect_operator(
+                    world.project,
+                    &AgentManagerInspectRequestV2 {
+                        section: ManagerInspectSectionV2::Decisions,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let row = board.rows.iter().find(|row| row["key"] == key).unwrap();
+            assert_eq!(row["gate"], "spend", "{blocker}; {evidence}; {question}");
+            assert_eq!(row["answerable_by"], "operator");
+            assert_eq!(row["blocks"]["execution_ids"], serde_json::json!([run]));
+        }
+        assert_eq!(
+            refusal_code(
+                pm_rule(&world, &key, "yes", "spend-ruling")
+                    .await
+                    .unwrap_err()
+            ),
+            "manager_v2_decision_operator_gate"
+        );
+        world.harness.executor.advance(run).await.unwrap();
+        assert_eq!(
+            world.harness.attempt(run, "A", 0, 1).await.status,
+            AttemptStatus::Waiting
+        );
+        assert_eq!(world.harness.operator_notices().len(), 1);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn non_resource_price_question_remains_manager_answerable() {
+    let world = World::new(ruling_policy()).await;
+    let run = on_call_run(&world, None, "price-question").await;
+    world.harness.executor.advance(run).await.unwrap();
+    let session = world.harness.attempt(run, "A", 0, 1).await.session_id;
+    world.harness.complete_blocked(
+        session,
+        "technical_impasse",
+        Some("Which price field should this parser use?"),
+    );
+    world.harness.executor.advance(run).await.unwrap();
+    let key = parked_on(&world.harness.attempt(run, "A", 0, 1).await);
+    let record = topology_decisions(&world).await.remove(0);
+    assert_eq!(record.payload["gate"], serde_json::Value::Null);
+    pm_rule(&world, &key, "Use the listed price", "price-ruling")
+        .await
+        .unwrap();
+    world.harness.executor.advance(run).await.unwrap();
+    assert_answer_delivery(&world.harness.continues(), session, "Use the listed price");
+    assert_eq!(
+        world.harness.attempt(run, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3719,12 +5437,23 @@ async fn blocked_handoff_production_class_goes_to_operator() {
                 |_, _, _, _| unreachable!("not an acceptance"),
             )
             .unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+        let notices: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM harness_manager_notices
+                 WHERE kind='operator_answer' AND subject_id=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notices, 0,
+            "the operator answer uses the attempt continuation"
+        );
     }
     world.harness.executor.advance(run).await.unwrap();
-    assert_eq!(
-        world.harness.continues(),
-        vec![(session, "My answer to your question: Use v1.2".to_owned())]
-    );
+    assert_answer_delivery(&world.harness.continues(), session, "Use v1.2");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3753,6 +5482,15 @@ async fn ordinary_blocked_handoffs_and_dead_ends_still_block() {
     let long = on_call_run(&world, None, "long").await;
     world.harness.executor.advance(long).await.unwrap();
     let session = world.harness.attempt(long, "A", 0, 1).await.session_id;
+    world
+        .harness
+        .complete_blocked(session, "technical_impasse", Some(&"q".repeat(2100)));
+    // #2584: the malformed handoff is continued once; a second one fails.
+    world.harness.executor.advance(long).await.unwrap();
+    assert_eq!(
+        world.harness.attempt(long, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
     world
         .harness
         .complete_blocked(session, "technical_impasse", Some(&"q".repeat(2100)));
@@ -3905,14 +5643,19 @@ async fn answered_node(
     pm_rule(world, &decision, "Keep it", &format!("rule-{key}"))
         .await
         .unwrap();
+    let binding = super::store::AnswerBinding {
+        execution_id: run,
+        attempt_id: parked.id,
+        decision_key: decision,
+    };
+    let prompt = {
+        let store = world.harness.executor.store.lock().await;
+        super::decision::bind_answer_continuation(&store, &binding, session, "Keep it").unwrap()
+    };
     let delivery = super::executor::AnswerContinuation {
         session_id: session,
-        prompt: "My answer to your question: Keep it".into(),
-        binding: super::store::AnswerBinding {
-            execution_id: run,
-            attempt_id: parked.id,
-            decision_key: decision,
-        },
+        prompt,
+        binding,
     };
     (run, parked, delivery)
 }
@@ -4033,11 +5776,17 @@ async fn crash_after_the_provider_took_the_answer_is_uncertain_and_never_resent(
         .harness
         .executor
         .effects
+        .lose_answer_turn_event
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    world
+        .harness
+        .executor
+        .effects
         .continue_with_answer(delivery)
         .await
         .unwrap();
     assert_eq!(world.harness.continues().len(), 1);
-    // The resumed turn was interrupted before it published another message.
+    // The resumed turn was interrupted before its user-turn event persisted.
     world
         .harness
         .set_status(session, SessionStatus::Interrupted);
@@ -4070,8 +5819,8 @@ async fn crash_after_the_provider_took_the_answer_is_uncertain_and_never_resent(
     );
 }
 
-/// #1715 finding 1: a claimed delivery whose session did take the answer (it
-/// is live, or finished with new output) resumes the attempt without resending.
+/// #1715 / #1752: the exact answer's post-spawn user-turn event is evidence
+/// whether the continued session is still live or has since finished.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn crash_after_a_delivered_answer_resumes_without_resending() {
@@ -4109,6 +5858,59 @@ async fn crash_after_a_delivered_answer_resumes_without_resending() {
         AttemptStatus::Running
     );
     assert_eq!(world.harness.continues().len(), 2, "never resent");
+}
+
+/// #1766: query wrappers preserve the delivery marker, so recovery recognises
+/// the answer's user turn whether the resumed session is live or finished.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn crash_after_a_wrapped_answer_resumes_without_resending() {
+    use crate::topology::executor::NodeEffects;
+    for finished in [false, true] {
+        let mut world = World::new(ruling_policy()).await;
+        let (run, parked, delivery) = answered_node(&world, "wrapped-answer").await;
+        let session = delivery.session_id;
+        let prompt = delivery.prompt.clone();
+        world
+            .harness
+            .executor
+            .effects
+            .continue_with_answer(delivery)
+            .await
+            .unwrap();
+        {
+            let store = world.harness.executor.store.lock().await;
+            let changed = store.conn.execute(
+                "UPDATE conversation_events SET content=?3 WHERE session_id=?1
+                   AND event_type='Message' AND role='User' AND content=?2",
+                rusqlite::params![session.to_string(), prompt,
+                    format!("Recover the previous session.\n\n{prompt}\n\nYou have unanswered requests.")],
+            ).unwrap();
+            assert_eq!(changed, 1, "the continued user query was wrapped");
+        }
+        if finished {
+            world
+                .harness
+                .commit_and_complete(session, "wrapped-answer-output");
+        }
+        world.harness.restart();
+        world.harness.executor.advance(run).await.unwrap();
+        let attempt = world.harness.attempt(run, "A", 0, 1).await;
+        assert_eq!(attempt.id, parked.id);
+        assert_eq!(
+            attempt.status,
+            if finished {
+                AttemptStatus::Succeeded
+            } else {
+                AttemptStatus::Running
+            }
+        );
+        assert_eq!(
+            world.harness.continues().len(),
+            1,
+            "the delivered answer is never resent"
+        );
+    }
 }
 
 /// #1715 finding 1: a delivery that fails after the provider effect started is
@@ -4471,6 +6273,245 @@ async fn exhausted_review_shows_round_unavailable_when_the_ledger_refuses_it() {
     assert_eq!(world.harness.review_requests().len(), 1, "nothing reopened");
 }
 
+/// Run the review flow until its second review attempt blocks `review_unsettled`
+/// (#2280): the execution is blocked on the review.
+async fn blocked_review_run(world: &World, name: &str) -> (Uuid, rows::AttemptRow) {
+    let flow = world
+        .upsert(
+            world.lead_a,
+            &upsert_request(name, review_definition(&sonnet(), &luna())),
+        )
+        .await
+        .unwrap();
+    let run = world
+        .execute(world.lead_a, &flow, world.epic_a, name)
+        .await
+        .unwrap()
+        .execution_id;
+    world.harness.executor.advance(run).await.unwrap();
+    let author = world.harness.attempt(run, "A", 0, 1).await;
+    world
+        .harness
+        .commit_and_complete(author.session_id, &format!("author-{name}"));
+    world.harness.script_reviews([
+        ReviewScript::Unsettled("superseded"),
+        ReviewScript::Unsettled("superseded again"),
+    ]);
+    for _ in 0..6 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    assert_eq!(world.harness.status(run).await, ExecutionStatus::Blocked);
+    let blocked = world.harness.attempt(run, "R", 0, 2).await;
+    assert_eq!(blocked.status, AttemptStatus::Blocked);
+    (run, blocked)
+}
+
+/// #2280: an Epic lead may retry a blocked review but only the manager rules
+/// on it, and neither can discard it; the manager's ruling lets the execution
+/// finish on the exact reviewed commit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn blocked_review_resolution_follows_the_scoped_authority() {
+    let world = World::new(review_world_policy()).await;
+    let (run, blocked) = blocked_review_run(&world, "lead-retries").await;
+    let confirm = "a".repeat(40);
+    for caller in [world.lead_a, world.manager] {
+        let error = world
+            .resolve(
+                caller,
+                run,
+                blocked.id,
+                TopologyAttemptAction::Discard,
+                "drop",
+                Some(&confirm),
+            )
+            .await
+            .unwrap_err();
+        let expected = if caller == world.lead_a {
+            "discard_requires_manager"
+        } else {
+            "precondition_failed"
+        };
+        assert_eq!(error_code(&error), expected);
+    }
+    assert_eq!(
+        error_code(
+            &world
+                .resolve(
+                    world.lead_a,
+                    run,
+                    blocked.id,
+                    TopologyAttemptAction::Accept,
+                    "lead-rules",
+                    None,
+                )
+                .await
+                .unwrap_err()
+        ),
+        "review_accept_requires_manager"
+    );
+    assert!(world.harness.oncall_acceptances().is_empty());
+
+    world.harness.script_reviews([ReviewScript::Accept]);
+    let retried = world
+        .resolve(
+            world.lead_a,
+            run,
+            blocked.id,
+            TopologyAttemptAction::Retry,
+            "lead-retry",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.attempt.resolution.as_deref(), Some("retried"));
+    for _ in 0..6 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    assert_eq!(
+        world.harness.attempt(run, "R", 0, 3).await.status,
+        AttemptStatus::Succeeded
+    );
+    assert_eq!(world.harness.status(run).await, ExecutionStatus::Succeeded);
+
+    // The manager rules on a second blocked review: the ledger fact names the
+    // latest assignment that examined the commit.
+    let (run, blocked) = blocked_review_run(&world, "manager-rules").await;
+    let examined = blocked.clone();
+    let ruled = world
+        .resolve(
+            world.manager,
+            run,
+            blocked.id,
+            TopologyAttemptAction::Accept,
+            "manager-rules",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ruled.attempt.resolution.as_deref(), Some("accepted"));
+    let rulings = world.harness.oncall_acceptances();
+    assert_eq!(rulings.len(), 1);
+    assert_eq!(rulings[0].attempt_id, examined.id);
+    assert_eq!(
+        Some(rulings[0].assignment_id),
+        examined.review_assignment_id
+    );
+    assert_eq!(rulings[0].commit, blocked.base_commit);
+    for _ in 0..4 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    assert_eq!(world.harness.status(run).await, ExecutionStatus::Succeeded);
+}
+
+/// #2280: the retry of a review with no usable verdict is a new assignment
+/// requested with the reviewer the ledger's round policy names, not a re-read
+/// of the first attempt's settled assignment.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_retry_requests_the_closing_reviewer_the_ledger_names() {
+    use super::review::ExtraRound;
+    let world = World::new(review_world_policy()).await;
+    let closing = rsi_common::types::ReviewerLaunch {
+        provider: rsi_common::types::SessionProvider::Claude,
+        model: "closing-reviewer-model".into(),
+        effort: "high".into(),
+    };
+    world
+        .harness
+        .script_extra_round(ExtraRound::Closure(closing.clone()));
+    let (run, blocked) = blocked_review_run(&world, "closing-retry").await;
+    let first = world.harness.attempt(run, "R", 0, 1).await;
+    assert_ne!(first.review_assignment_id, blocked.review_assignment_id);
+    let requests = world.harness.review_requests();
+    assert_eq!(requests.len(), 2, "attempt 2 opened its own assignment");
+    assert_eq!(requests[0].1.attempt_id, first.id);
+    assert_eq!(requests[1].1.attempt_id, blocked.id);
+    assert_eq!(requests[0].1.reviewer.model, luna().model);
+    assert_eq!(
+        requests[1].1.reviewer, closing,
+        "a different reviewer where the ledger requires one"
+    );
+    assert_eq!(
+        world.harness.extra_round_asks().len(),
+        1,
+        "only the retry asks the round policy"
+    );
+}
+
+/// #2280: a retry whose round the ledger offers no more of blocks visibly with
+/// the reason and no assignment; a retry resolution is refused up front, and the
+/// manager's ruling rides on the assignment that did examine the commit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn blocked_review_with_no_round_left_is_ruled_through_the_examining_assignment() {
+    use super::review::ExtraRound;
+    let world = World::new(review_world_policy()).await;
+    world.harness.script_extra_round(ExtraRound::Unavailable(
+        "manager_review_closure_specialist_required".into(),
+    ));
+    let (run, blocked) = blocked_review_run(&world, "no-round").await;
+    let first = world.harness.attempt(run, "R", 0, 1).await;
+    assert_eq!(blocked.failure_class.as_deref(), Some("review_unsettled"));
+    assert!(
+        blocked
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("manager_review_closure_specialist_required")
+    );
+    assert!(blocked.review_assignment_id.is_none(), "nothing requested");
+    assert_eq!(world.harness.review_requests().len(), 1);
+
+    let error = world
+        .resolve(
+            world.manager,
+            run,
+            blocked.id,
+            TopologyAttemptAction::Retry,
+            "retry-no-round",
+            None,
+        )
+        .await
+        .unwrap_err();
+    let DaemonError::StructuredRpc { data, .. } = error else {
+        panic!("a structured refusal");
+    };
+    assert_eq!(data["code"], "review_round_unavailable");
+    assert!(
+        data["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("manager_review_closure_specialist_required")
+    );
+    assert_eq!(
+        world.harness.attempt(run, "R", 0, 2).await.status,
+        AttemptStatus::Blocked,
+        "the refusal recorded nothing"
+    );
+
+    world
+        .resolve(
+            world.manager,
+            run,
+            blocked.id,
+            TopologyAttemptAction::Accept,
+            "rule-no-round",
+            None,
+        )
+        .await
+        .unwrap();
+    let rulings = world.harness.oncall_acceptances();
+    assert_eq!(rulings.len(), 1);
+    assert_eq!(rulings[0].attempt_id, first.id, "the examining attempt");
+    assert_eq!(Some(rulings[0].assignment_id), first.review_assignment_id);
+    assert_eq!(rulings[0].commit, blocked.base_commit);
+    for _ in 0..4 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    assert_eq!(world.harness.status(run).await, ExecutionStatus::Succeeded);
+}
+
 /// #1715 finding 4: where the store requires a closing reviewer, the offered
 /// round names it and the reopened review is requested with exactly that
 /// reviewer.
@@ -4611,6 +6652,67 @@ async fn unrelated_session_activity_is_not_a_delivered_answer() {
     );
 }
 
+/// #1752 P2: the claim committed, then the daemon crashed before starting its
+/// continuation. An unrelated operator turn (live or finished with new
+/// assistant output) cannot prove this answer was delivered.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn claimed_answer_ignores_unrelated_turns_after_a_crash() {
+    for finished in [false, true] {
+        let mut world = World::new(ruling_policy()).await;
+        let (run, parked, delivery) = answered_node(&world, "claim-before-spawn").await;
+        {
+            let store = world.harness.executor.store.lock().await;
+            rows::claim_answer_delivery(&store, &delivery.binding, delivery.session_id).unwrap();
+            // Even the same answer with another delivery's marker cannot
+            // settle this claimed continuation.
+            super::tests::record_user_turn(
+                &store,
+                delivery.session_id,
+                &format!(
+                    "My answer to your question: Keep it\n\n[Topology answer delivery {}]",
+                    Uuid::new_v4()
+                ),
+            )
+            .unwrap();
+        }
+        if finished {
+            world
+                .harness
+                .commit_and_complete(delivery.session_id, "unrelated-output");
+        } else {
+            world
+                .harness
+                .set_status(delivery.session_id, SessionStatus::Running);
+        }
+        world.harness.restart();
+        for _ in 0..3 {
+            world.harness.executor.advance(run).await.unwrap();
+        }
+        let blocked = world.harness.attempt(run, "A", 0, 1).await;
+        assert_eq!(blocked.id, parked.id);
+        assert_eq!(blocked.status, AttemptStatus::Blocked);
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .unwrap()
+                .contains(rows::ANSWER_UNCERTAIN)
+        );
+        assert!(
+            world.harness.continues().is_empty(),
+            "an uncertain claim is never resent"
+        );
+        assert!(
+            world
+                .harness
+                .operator_notices()
+                .iter()
+                .any(|(_, text)| text.contains("not sent again"))
+        );
+    }
+}
+
 /// #1704: a wait that begins and ends wholly between two observations leaves
 /// no open wait for the executor to see. The session's own total of ended
 /// waits carries it, so the node clock still pauses for it, and nothing
@@ -4683,7 +6785,7 @@ async fn wait_completed_between_observations_still_pauses_the_node_clock() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn counter_reset_to_zero_moves_the_wait_baseline() {
-    let mut world = World::new(automation()).await;
+    let world = World::new(automation()).await;
     let run = on_call_run(&world, None, "reset-baseline").await;
     world.harness.executor.advance(run).await.unwrap();
     let attempt = world.harness.attempt(run, "A", 0, 1).await;
@@ -4717,7 +6819,7 @@ async fn counter_reset_to_zero_moves_the_wait_baseline() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn unseen_wait_before_an_open_wait_keeps_both() {
-    let mut world = World::new(automation()).await;
+    let world = World::new(automation()).await;
     let run = on_call_run(&world, None, "between-then-open").await;
     world.harness.executor.advance(run).await.unwrap();
     let session = world.harness.attempt(run, "A", 0, 1).await.session_id;

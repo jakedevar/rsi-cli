@@ -5,6 +5,7 @@ pub mod file_renderer;
 pub mod glyphs;
 pub mod height;
 pub mod highlight;
+pub mod issue_detail;
 pub mod issues;
 pub mod navigator_layout;
 pub mod overlay;
@@ -15,6 +16,7 @@ pub mod settings;
 pub mod status;
 pub mod theme;
 pub mod theme_roles;
+pub mod todo_panel;
 pub mod tool_projection;
 pub mod treesitter;
 pub mod widget;
@@ -26,7 +28,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 /// Parse a hex color string (#RRGGBB) into a ratatui Color.
 pub(crate) fn parse_hex_color(hex: &str) -> Option<Color> {
@@ -108,11 +110,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     let has_transient_footer = !has_detail && should_render_root_footer(app);
+    let build_banner = app.local_build_warning.clone().map(local_build_banner);
+    let banner_height = build_banner.as_ref().map_or(0, |banner| {
+        u16::try_from(banner.line_count(area.width)).unwrap_or(u16::MAX)
+    });
     let constraints = if !has_transient_footer {
-        vec![Constraint::Length(1), Constraint::Fill(1)]
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(banner_height),
+            Constraint::Fill(1),
+        ]
     } else {
         vec![
             Constraint::Length(1), // Top chrome
+            Constraint::Length(banner_height),
             Constraint::Fill(1),   // Main area
             Constraint::Length(1), // Full-list command/footer bar
         ]
@@ -120,13 +131,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let areas = Layout::vertical(constraints).split(frame.area());
     let status_area = areas[0];
-    let main_area = areas[1];
-    let cmd_area = has_transient_footer.then(|| areas[2]);
+    let main_area = areas[2];
+    let cmd_area = has_transient_footer.then(|| areas[3]);
 
     let focused_pane = app.tabs[app.active_tab].focused_pane;
     render_split_node(frame, main_area, &mut layout_node, focused_pane, app);
 
     app.model_segment_rect = render_top_chrome(frame, status_area, app);
+    if let Some(banner) = build_banner {
+        frame.render_widget(banner, areas[1]);
+    }
 
     if let Some(cmd_area) = cmd_area {
         render_command_bar(frame, cmd_area, app);
@@ -159,6 +173,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.metrics.record_render(elapsed, counters);
         });
     }
+}
+
+fn local_build_banner(warning: String) -> Paragraph<'static> {
+    Paragraph::new(warning)
+        .style(
+            Style::default()
+                .fg(theme::peach())
+                .bg(theme::status_line_bg()),
+        )
+        .wrap(Wrap { trim: false })
 }
 
 fn split_tree_contains_detail(node: &SplitNode) -> bool {
@@ -206,6 +230,9 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
             Style::default().fg(theme::dim_metadata()).bg(bg),
         ),
     ];
+    // The operator to-do count (#1747), visible on every screen.
+    let mut left_spans = left_spans;
+    left_spans.extend(todo_panel::badge_spans(&app.todo_panel, bg));
     let left_width = spans_width(&left_spans).min(content_area.width);
 
     // Right cluster: the default launch model, then the project tab dots.
@@ -224,9 +251,18 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
     let chip_cluster_width = chip_width
         .saturating_add(u16::from(tabs_width > 0))
         .saturating_add(tabs_width);
+    // A live toast needs its whole message in the lane (a copied Issue UUID is
+    // 50+ cells), so it outranks the chip as well as the fixed minimum (#3231).
+    let toast_lane_needed = active_transient_notification(app)
+        .map(|notification| {
+            let width = unicode_width::UnicodeWidthStr::width(notification.message.as_str());
+            u16::try_from(width).unwrap_or(u16::MAX)
+        })
+        .unwrap_or(0)
+        .max(TOP_CHROME_MIN_TOAST_LANE);
     let show_chip = chip_cluster_width <= fit_right(chip_cluster_width)
         && centered_top_lane(content_area, left_width, chip_cluster_width)
-            .is_some_and(|lane| lane.width >= TOP_CHROME_MIN_TOAST_LANE);
+            .is_some_and(|lane| lane.width >= toast_lane_needed);
     let mut right_spans = Vec::new();
     if show_chip {
         right_spans.extend(chip_spans);
@@ -553,6 +589,20 @@ fn render_pane(
             // Clear the full pane area so no stale characters remain from a
             // previous pane type (e.g. SessionList → SessionDetail transition).
             frame.render_widget(Clear, area);
+            // The operator to-do panel (#1747) takes a column on the right of
+            // the first session detail in the tab; the rest lays out in what
+            // is left.
+            let owns_todo_panel = {
+                let tab = &app.tabs[app.active_tab];
+                tab.layout.leaf_ids().into_iter().find(|id| {
+                    matches!(tab.layout.find_pane(*id), Some(Pane::SessionDetail { .. }))
+                }) == Some(pane_id)
+            };
+            let (area, todo_area) =
+                todo_panel::split_panel_area(area, owns_todo_panel && app.todo_panel.open);
+            if let Some(todo_area) = todo_area {
+                todo_panel::render_todo_panel(frame, todo_area, app);
+            }
             let (sidebar_area, full_area) = compute_detail_layout_areas(area, app);
             if sidebar_area.width > 0 {
                 let sep_x = sidebar_area.x + sidebar_area.width;
@@ -612,7 +662,7 @@ fn render_pane(
     }
 }
 
-/// Geometry of one session-detail column (transcript plus input bar), computed
+/// Geometry of one session-detail column and its surrounding controls, computed
 /// by [`prepare_session_detail`] and drawn by [`render_session_conversation`].
 /// The detail pane and the global manager workspace's conversation pane
 /// (#1231) share both, so there is one conversation renderer.
@@ -620,8 +670,8 @@ fn render_pane(
 pub(crate) struct DetailColumn {
     /// The capped, aligned column inside the requested area.
     pub centered_area: Rect,
-    /// Width of the three-row title header from `content_area.x`. Wider than
-    /// the column only while it is pinned to the pane's left edge.
+    /// Width of the title header and input/activity bars from `content_area.x`.
+    /// Wider than the column only while it is pinned to the pane's left edge.
     pub header_width: u16,
     pub content_area: Rect,
     pub input_bar_area: Rect,
@@ -640,7 +690,7 @@ pub(crate) fn prepare_session_detail(
     session_area: Rect,
 ) -> DetailColumn {
     let mut clear_session_area = false;
-    // T5: cap the transcript/input-bar column on wide terminals. session_area
+    // T5: cap the transcript column on wide terminals. session_area
     // itself is kept UNNARROWED — it is still used below for the full-width
     // Clear on session switch, and gutter painting needs both Rects.
     let requested_detail_width = app
@@ -656,16 +706,14 @@ pub(crate) fn prepare_session_detail(
         compute_aligned_detail_area(session_area, requested_detail_width, gutter_pct);
     let header_width = detail_header_width(session_area, centered_area, gutter_pct);
 
-    // Compute dynamic input bar height against the FINAL (centered) width, so
-    // the height pre-computation and the actual render agree exactly.
+    // The input and activity bars share the header's width, including its
+    // expansion to the pane's right edge when the column is attached left.
+    // Compute wrapping against that final width so height and render agree.
     let input_bar_height = app
         .sessions
         .get(&session_id)
         .map(|state| {
-            session::compute_input_bar_height(
-                &state.input_bar.surface.textarea,
-                centered_area.width,
-            )
+            session::compute_input_bar_height(&state.input_bar.surface.textarea, header_width)
         })
         .unwrap_or(3);
 
@@ -675,11 +723,12 @@ pub(crate) fn prepare_session_detail(
     ])
     .split(centered_area);
 
-    // Both areas are split from the SAME centered_area, so they are
-    // pixel-identical in x/width by construction — "input bar width == message
-    // width" holds without a separate equality check anywhere.
+    // Keep the transcript's capped width while widening only its controls.
     let content_area = chunks[0];
-    let input_bar_area = chunks[1];
+    let input_bar_area = Rect {
+        width: header_width,
+        ..chunks[1]
+    };
 
     // Determine if loading bar will be shown (needed for viewport calc)
     let loading_container_height =
@@ -895,8 +944,7 @@ pub(crate) fn render_session_conversation(
                 - 1
                 - column.loading_container_height,
             column
-                .content_area
-                .width
+                .header_width
                 .saturating_sub(theme::SESSION_DETAIL_HORIZ_INSET),
             column.loading_container_height,
         );
@@ -915,7 +963,7 @@ pub(crate) fn render_session_conversation(
     session::render_input_bar(frame, column.input_bar_area, session_id, focused, app);
 }
 
-/// Paint the side gutters left over when `inner` (the centered content/input-bar
+/// Paint the side gutters left over when `inner` (the aligned transcript
 /// column) is narrower than `outer` (the full, unnarrowed `session_area`) with the
 /// same detail-surface background `render_session_detail` fills its own content
 /// with — so the gutters read as a continuation of the panel surface, never bare
@@ -1369,6 +1417,28 @@ mod tests {
     }
 
     #[test]
+    fn top_chrome_drops_the_model_chip_so_a_long_toast_shows_whole() {
+        let mut app = fixture_app();
+        let message = "issue 01eeaa21-3dee-5584-8a66-9e3a00ca2a3a copied";
+        let draw = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 1)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    render_top_chrome(frame, Rect::new(0, 0, 100, 1), app);
+                })
+                .expect("draw");
+            buffer_text(terminal.backend().buffer())
+        };
+        assert!(
+            draw(&app).contains("default "),
+            "without a toast the chip is drawn"
+        );
+        app.notify_success(message);
+        let text = draw(&app);
+        assert!(text.contains(message), "the whole toast shows: {text:?}");
+    }
+
+    #[test]
     fn global_model_dropdown_checks_the_default_only_on_its_own_provider() {
         use rsi_common::types::SessionProvider;
         let mut app = fixture_app();
@@ -1469,6 +1539,26 @@ mod tests {
             buffer_text(terminal.backend().buffer())
                 .contains("! workers full60 12.5% · high 6.0/min")
         );
+    }
+
+    #[test]
+    fn local_build_banner_persists_beside_notifications_and_wraps_on_narrow_terminals() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        for width in [40, 100] {
+            let mut app = fixture_app();
+            app.local_build_warning = Some(
+                "running build aaaaaaaaa, built build bbbbbbbbb: run make release-install".into(),
+            );
+            app.notify_success("saved");
+            let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
+            for _ in 0..2 {
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let text = buffer_text(terminal.backend().buffer());
+                assert!(text.contains("running build aaaaaaaaa"));
+                // Word wrapping may separate the command from its introductory text.
+                assert!(text.contains("make release-install"));
+            }
+        }
     }
 
     #[test]
@@ -1586,6 +1676,105 @@ mod tests {
 
         let narrow = Rect::new(0, 0, 80, 40);
         assert_eq!(detail_header_width(narrow, narrow, 0), narrow.width);
+    }
+
+    #[test]
+    fn detail_controls_match_header_width_and_wrap_at_rendered_width() {
+        use crate::settings::DetailColumnAlignment;
+
+        for (alignment, position, pane_width, expected_width) in [
+            (DetailColumnAlignment::Left, 50, 200, 200),
+            (DetailColumnAlignment::Dynamic, 0, 200, 200),
+            (
+                DetailColumnAlignment::Dynamic,
+                30,
+                200,
+                DETAIL_MAX_CONTENT_WIDTH,
+            ),
+            (
+                DetailColumnAlignment::Center,
+                50,
+                200,
+                DETAIL_MAX_CONTENT_WIDTH,
+            ),
+            (
+                DetailColumnAlignment::Dynamic,
+                100,
+                200,
+                DETAIL_MAX_CONTENT_WIDTH,
+            ),
+            (DetailColumnAlignment::Left, 0, 80, 80),
+        ] {
+            let (mut app, id) = app_test_helpers::with_session_detail();
+            app.settings.detail_column_alignment = alignment;
+            app.settings.detail_column_position_pct = position;
+            app.sessions
+                .get_mut(&id)
+                .unwrap()
+                .input_bar
+                .surface
+                .textarea
+                .insert_str(&"x".repeat(150));
+
+            let column = prepare_session_detail(&mut app, id, Rect::new(5, 3, pane_width, 40));
+            assert_eq!(column.header_width, expected_width);
+            assert_eq!(column.input_bar_area.width, expected_width);
+            assert_eq!(column.input_bar_area.x, column.content_area.x);
+            assert_eq!(
+                column.content_area.width,
+                pane_width.min(DETAIL_MAX_CONTENT_WIDTH)
+            );
+            assert_eq!(
+                column.input_bar_area.height,
+                session::compute_input_bar_height(
+                    &app.sessions[&id].input_bar.surface.textarea,
+                    expected_width
+                )
+            );
+            assert_eq!(column.content_area.bottom(), column.input_bar_area.y);
+            assert_eq!(column.input_bar_area.bottom(), 43);
+            if expected_width == 200 {
+                assert_eq!(
+                    column.input_bar_area.height, 3,
+                    "draft fits expanded composer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detail_left_attached_controls_render_at_pane_right_edge() {
+        let _pinned_theme = theme::pin_theme_state();
+        let (mut app, id) = app_test_helpers::with_session_detail();
+        app.settings.detail_column_alignment = crate::settings::DetailColumnAlignment::Dynamic;
+        app.settings.detail_column_position_pct = 0;
+        app.settings.activity_indicator_style =
+            crate::settings::ActivityIndicatorStyle::RainbowClassic;
+        app.sessions.get_mut(&id).unwrap().session.status =
+            rsi_common::types::SessionStatus::Running;
+        let area = Rect::new(5, 3, 200, 40);
+        let column = prepare_session_detail(&mut app, id, area);
+        assert!(column.show_loading_bar);
+        let mut terminal = Terminal::new(TestBackend::new(210, 45)).unwrap();
+        terminal
+            .draw(|frame| render_session_conversation(frame, &column, id, true, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(area.right() - 1, column.input_bar_area.y)].symbol(),
+            "┐"
+        );
+        assert_eq!(buffer[(area.right() - 1, area.bottom() - 1)].symbol(), "┘");
+        let loading_y = column.content_area.bottom() - 1 - column.loading_container_height;
+        let inset = theme::SESSION_DETAIL_HORIZ_INSET / 2;
+        for x in [area.x + inset, area.right() - inset - 1] {
+            assert_eq!(
+                buffer[(x, loading_y)].symbol(),
+                "▀",
+                "rainbow reaches both pane edges"
+            );
+        }
+        assert!(app.has_loading_bar);
     }
 
     #[test]

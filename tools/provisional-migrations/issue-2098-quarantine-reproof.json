@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "version": 171,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v171.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:eacf6cf7941ac02bec8b3c1680b0e5bfae7c46ca68a571ceccb844edbc6eb5ca",
+      "sites": [
+        {
+          "anchor": "fn migrate_v171(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 171 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 171)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/cohort_settlement/reproof.rs",
+      "path_template": "crates/rsid-store/src/store/cohort_settlement/reproof.rs",
+      "source_blob": "sha256:b6c18b6dc3bda2654ea859c66383545403f9d897244c57b64b798ac3e370fd74",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v171-settlement-reproof-schema",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-reproof-schema",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v171-settlement-reproof-schema",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-reproof-schema",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:1d5d605ba2207f2643993398343bff13299501c77fa63182eab3b703c4a29264",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v171-settlement-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-altered-objects",
+          "scope": "unit"
+        },
+        {
+          "anchor": "(171, &[\"source_worktree_settlement_items_forward_phase\", \"source_worktree_settlement_items_terminal\"]),",
+          "replacement": "(${VERSION}, &[\"source_worktree_settlement_items_forward_phase\", \"source_worktree_settlement_items_terminal\"]),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v171-settlement-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-altered-objects",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:59776c1958b93955f5923ecdfdfaf116b66bf7722b92d4475d71b514b4794b59",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 171;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 171 && target < 171 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 171 - 1).unwrap();",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION} - 1).unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 171,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tool_input: serde_json::json!({\"request_id\":\"171\"}),",
+          "replacement": "tool_input: serde_json::json!({\"request_id\":\"${VERSION}\"}),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "\"session_id\":session.id,\"request_id\":\"171\",\"params\":{\"threadId\":\"migration-thread\"}});",
+          "replacement": "\"session_id\":session.id,\"request_id\":\"${VERSION}\",\"params\":{\"threadId\":\"migration-thread\"}});",
+          "scope": "unit"
+        },
+        {
+          "anchor": "\"\\\"171\\\"\".into(),",
+          "replacement": "\"\\\"${VERSION}\\\"\".into(),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "insert(&first, \"171\").unwrap();",
+          "replacement": "insert(&first, \"${VERSION}\").unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "insert(&Uuid::new_v4().to_string(), \"\\\"171\\\"\").unwrap();",
+          "replacement": "insert(&Uuid::new_v4().to_string(), \"\\\"${VERSION}\\\"\").unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "insert(&Uuid::new_v4().to_string(), \"171\").is_err(),",
+          "replacement": "insert(&Uuid::new_v4().to_string(), \"${VERSION}\").is_err(),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "insert(&Uuid::new_v4().to_string(), \"171\").unwrap();",
+          "replacement": "insert(&Uuid::new_v4().to_string(), \"${VERSION}\").unwrap();",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

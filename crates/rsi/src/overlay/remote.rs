@@ -93,6 +93,22 @@ pub(crate) fn toggled_projects(status: &RemoteStatusV1, index: usize) -> Option<
     )
 }
 
+/// The edit that flips the phone's right to answer waiting decisions.
+pub(crate) fn toggled_answers(status: &RemoteStatusV1) -> RemoteSetConfigRequestV1 {
+    RemoteSetConfigRequestV1 {
+        allow_answers: Some(!status.allow_answers),
+        ..Default::default()
+    }
+}
+
+/// The edit that flips the phone's right to message manager seats (API v2).
+pub(crate) fn toggled_messages(status: &RemoteStatusV1) -> RemoteSetConfigRequestV1 {
+    RemoteSetConfigRequestV1 {
+        allow_messages: Some(!status.allow_messages),
+        ..Default::default()
+    }
+}
+
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
     let Some(current) = state(app) else { return };
     let focus = current.focus;
@@ -154,6 +170,16 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
             )
             .await;
         }
+        // The two write switches: answering waiting decisions, and messaging
+        // manager seats. Both are off until the operator turns them on here.
+        KeyCode::Char('n') => {
+            let request = toggled_answers(&current.status);
+            apply(app, request).await;
+        }
+        KeyCode::Char('m') => {
+            let request = toggled_messages(&current.status);
+            apply(app, request).await;
+        }
         // Re-converge gateway and serve route (after the one-time privilege step).
         KeyCode::Char('a') => apply(app, RemoteSetConfigRequestV1::default()).await,
         KeyCode::Char('r') => refresh(app).await,
@@ -205,6 +231,22 @@ mod tests {
         );
         assert_eq!(toggled_devices(&status, 0), Some(Vec::new()));
         assert_eq!(toggled_devices(&status, 9), None);
+    }
+
+    #[test]
+    fn the_write_switches_flip_only_their_own_field() {
+        let mut status = status();
+        let answers = toggled_answers(&status);
+        assert_eq!(answers.allow_answers, Some(true));
+        assert_eq!(answers.allow_messages, None);
+        assert_eq!(answers.enabled, None);
+        let messages = toggled_messages(&status);
+        assert_eq!(messages.allow_messages, Some(true));
+        assert_eq!(messages.allow_answers, None);
+        status.allow_messages = true;
+        status.allow_answers = true;
+        assert_eq!(toggled_messages(&status).allow_messages, Some(false));
+        assert_eq!(toggled_answers(&status).allow_answers, Some(false));
     }
 
     #[test]

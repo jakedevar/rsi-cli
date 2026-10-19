@@ -14,9 +14,9 @@ if ! tree="$($cargo_command tree --workspace --edges normal,build --prefix none 
     echo "check-release-seam: cannot read the dependency graph with $cargo_command tree" >&2
     exit 2
 fi
-offenders="$(printf '%s\n' "$tree" | grep -E '(^|[ ,])test-seam([ ,]|$)' | sort -u || true)"
+offenders="$(printf '%s\n' "$tree" | grep -E '(^|[ ,])(test-seam|e2e-seed)([ ,]|$)' | sort -u || true)"
 if [[ -n "$offenders" ]]; then
-    echo "check-release-seam: test-seam is enabled in the release dependency graph:" >&2
+    echo "check-release-seam: test-seam or e2e-seed is enabled in the release dependency graph:" >&2
     printf '  %s\n' "$offenders" >&2
     echo "Release builds must not compile the test seam; remove the feature from the non-dev dependency edge." >&2
     exit 1

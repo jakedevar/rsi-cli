@@ -1,15 +1,46 @@
 //! RSI desktop backend.
 //!
 //! The webview never touches the daemon directly: it calls the closed set of
-//! Tauri commands below, each of which validates its input and forwards
-//! exactly one daemon JSON-RPC method over `~/.rsi/daemon.sock`. There is no
-//! generic passthrough, so the frontend cannot reach any method not listed
-//! here.
+//! Tauri commands below and in the modules, each of which validates its input
+//! and forwards exactly one daemon JSON-RPC method over `~/.rsi/daemon.sock`.
+//! There is no generic passthrough, so the frontend cannot reach any method
+//! that is not a `#[tauri::command]` here. The invoke handler is the generated
+//! `handlers.generated.rs` (every `#[tauri::command]` in src/*.rs; run
+//! `node scripts/slices.mjs` in desktop/); a new module adds its `pub mod` line.
 
+pub mod admin;
+pub mod admin_ops;
 pub mod approvals;
+pub mod assist;
+pub mod boot;
+pub mod budgets;
+pub mod commandmode;
 pub mod daemon;
-pub mod markdown;
+pub mod dag_inspect;
+pub mod detail;
+pub mod emergency;
+pub mod files;
+pub mod graphs;
+pub mod hierarchy;
+pub mod input;
+pub mod issues;
+pub mod issues_tracker;
+pub mod lifecycle;
 pub mod live;
+pub mod manager_ops;
+pub mod managers;
+pub mod markdown;
+pub mod menu;
+pub mod nav;
+pub mod operator_config;
+pub mod prompt_files;
+pub mod prompts;
+pub mod pty;
+pub mod sessionlist;
+pub mod sessionops;
+pub mod settings;
+pub mod settings_state;
+pub mod todo;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -226,7 +257,19 @@ pub fn run() {
     let socket = default_socket();
     tauri::Builder::default()
         .manage(state)
+        // The terminal overlay's PTYs (slice 12): the Builder has no per-module
+        // hook for managed state or window events, so these two lines stay here.
+        .manage(pty::Terminals::default())
+        .on_window_event(pty::on_window_event)
         .setup(move |app| {
+            // First line of the process log; the page's `rsi-desktop: boot=...` line (boot.rs) follows
+            // once its startup steps ran. A start line with no boot line means the page never booted.
+            eprintln!(
+                "rsi-desktop: started version={} socket={}",
+                env!("CARGO_PKG_VERSION"),
+                default_socket().display()
+            );
+            app.on_menu_event(menu::forward_menu_event);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(live::run(
                 socket,
@@ -243,26 +286,8 @@ pub fn run() {
             ));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            daemon_info,
-            list_projects,
-            list_sessions,
-            list_archived_sessions,
-            get_session,
-            get_conversation,
-            send_message,
-            interrupt_session,
-            launch_session,
-            providers,
-            render_markdown,
-            live::live_link,
-            approvals::answer_question,
-            approvals::archive_session,
-            approvals::pause_session,
-            approvals::get_operator_pause,
-            approvals::set_operator_pause,
-            approvals::set_attention_count,
-        ])
+        // Every #[tauri::command] in src/*.rs, collected by desktop/scripts/slices.mjs.
+        .invoke_handler(include!("handlers.generated.rs"))
         .run(tauri::generate_context!())
         .expect("error while running rsi desktop");
 }

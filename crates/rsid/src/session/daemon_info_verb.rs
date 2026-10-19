@@ -9,11 +9,19 @@
 use super::agent_verbs::AgentControlHandle;
 use crate::daemon_info::DaemonInfoService;
 use crate::error::{DaemonError, Result};
-use rsi_common::agent_daemon_info::AgentGetDaemonInfoResultV1;
+use rsi_common::agent_daemon_info::{AgentGetDaemonInfoResultV1, DaemonInfoV1};
 use uuid::Uuid;
 
 /// Stable refusal for a caller that is neither manager nor Epic lead.
 pub const DAEMON_INFO_NOT_AUTHORIZED: &str = "daemon_info_not_authorized";
+
+/// The refusal text (#2426): the stable code first, then what a worker reads
+/// instead of the hub's deploy and load state.
+pub(crate) fn daemon_info_refusal() -> DaemonError {
+    DaemonError::PolicyDenied(format!(
+        "{DAEMON_INFO_NOT_AUTHORIZED}: only the appointed manager or the current lead of your Epic may read it; a worker reads its own job with AgentGetJob (a job held behind a deploy shows held_for_deploy and release_by) and leaves hub state to its manager"
+    ))
+}
 
 impl AgentControlHandle {
     /// # Errors
@@ -46,13 +54,13 @@ impl AgentControlHandle {
             .host_load
             .as_ref()
             .is_some_and(|gate| gate.hold_now().is_some());
-        let (schema_version, peers, queued_creates) = {
+        let (schema_version, peers, queued_creates, hub_reports, last_deploy) = {
             let store = self.store.lock().await;
             let projection = store
                 .agent_authority_projection(caller)
-                .map_err(|_| DaemonError::PolicyDenied(DAEMON_INFO_NOT_AUTHORIZED.into()))?;
+                .map_err(|_| daemon_info_refusal())?;
             if !(projection.is_lead || projection.is_manager) {
-                return Err(DaemonError::PolicyDenied(DAEMON_INFO_NOT_AUTHORIZED.into()));
+                return Err(daemon_info_refusal());
             }
             // Satellites are the appointed manager's to see; an Epic lead gets
             // the hub only.
@@ -76,7 +84,18 @@ impl AgentControlHandle {
             } else {
                 Vec::new()
             };
-            (store.schema_user_version()?, peers, queued_creates)
+            // #2242: the reporting seat reads what became of its hub reports.
+            let hub_reports = store.hub_report_status(caller)?;
+            // Hub #2980: this daemon's own newest deploy, from the record the
+            // hub reads as `satellites[].last_deploy`.
+            let last_deploy = crate::satellite::last_deploy_status(&store)?;
+            (
+                store.schema_user_version()?,
+                peers,
+                queued_creates,
+                hub_reports,
+                last_deploy,
+            )
         };
         // The store lock is released before hashing, statvfs, /proc reads or
         // any link I/O. Peers are read concurrently, each bounded by the link
@@ -85,8 +104,13 @@ impl AgentControlHandle {
             crate::satellite::deploy_link::read_peer_daemon_info(satellite_root, peer)
         }))
         .await;
+        // The pool script walks pool directories and runs git: off the async threads.
+        let target_pool = crate::target_pool::status().await;
         Ok(AgentGetDaemonInfoResultV1 {
-            hub: service.snapshot(schema_version),
+            hub: DaemonInfoV1 {
+                last_deploy,
+                ..service.snapshot(schema_version)
+            },
             satellites,
             deploy_drain: self
                 .deploy_drain
@@ -98,6 +122,10 @@ impl AgentControlHandle {
                 .as_ref()
                 .map(|gate| gate.status(&queued_creates))
                 .unwrap_or_default(),
+            hub_reports,
+            target_pool,
+            handoff_counters: crate::structured_handoff::counters(),
+            bus: Some(self.event_bus.stats()),
         })
     }
 }

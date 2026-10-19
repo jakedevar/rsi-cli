@@ -5,6 +5,28 @@ use uuid::Uuid;
 
 pub const CODEGRAPH_WIRE_VERSION: u8 = 1;
 
+/// How long a project's graph may stay Degraded or Failed before the daemon
+/// files an Issue and the TUI health row shows it (#2246).
+pub const CODEGRAPH_UNHEALTHY_NOTICE_SECS: i64 = 24 * 60 * 60;
+
+/// One project whose codegraph has been Degraded or Failed longer than
+/// [`CODEGRAPH_UNHEALTHY_NOTICE_SECS`] (#2246). Carried by `GetHealthStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodegraphHealthNoticeV1 {
+    pub project_id: Uuid,
+    pub workspace_id: Uuid,
+    /// `degraded` (a Ready head exists but the latest run failed) or `failed`
+    /// (no Ready head has ever been published).
+    pub phase: String,
+    /// RFC3339 time the graph last had a good state, or was first seen bad.
+    pub unhealthy_since: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Consecutive failed runs since `unhealthy_since`.
+    #[serde(default)]
+    pub failed_runs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodegraphCapabilitiesV1 {
     pub wire_version: u8,
@@ -255,6 +277,10 @@ pub struct CodegraphRunCountsV1 {
     pub changed_paths: usize,
     pub staged_files: usize,
     pub overflow_count: u64,
+    /// Included-extension paths the last run skipped because they are
+    /// symlinks. Skipped links are never read or followed.
+    #[serde(default)]
+    pub skipped_symlinks: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodegraphStatusV1 {
@@ -270,6 +296,16 @@ pub struct CodegraphStatusV1 {
     pub last_success_at: Option<String>,
     pub last_error: Option<String>,
     pub pending_rescan: bool,
+    /// Typed reasons (`cargo_metadata_no_deps`, `cargo_metadata_unavailable`)
+    /// the last run's snapshot omits part of the workspace's structure. Empty
+    /// means the run saw everything it is designed to index.
+    #[serde(default)]
+    pub partial_reasons: Vec<String>,
+    /// Set when this workspace is deliberately never indexed. Today only
+    /// `primary_checkout_only`: sandbox and worktree checkouts wait for
+    /// content-shared storage (#2245), so their reads are empty by design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_note: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodegraphWorkspaceV1 {

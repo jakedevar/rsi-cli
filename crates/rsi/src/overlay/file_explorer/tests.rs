@@ -617,21 +617,48 @@ fn undo_of_a_move_moves_back() {
 }
 
 #[test]
-fn prune_trash_removes_only_old_batches() {
+fn prune_trash_removes_only_batches_recorded_more_than_seven_days_ago() {
     let trash = tempfile::tempdir().unwrap();
-    let old = trash.path().join("old");
-    let fresh = trash.path().join("fresh");
+    let old_name =
+        rsi_common::trash_prune::new_batch_name(chrono::Utc::now() - chrono::Duration::days(8));
+    let old = trash.path().join(&old_name);
+    let fresh = trash.path().join(rsi_common::trash_prune::new_batch_name(
+        chrono::Utc::now() - chrono::Duration::days(6),
+    ));
+    let foreign = trash.path().join("old");
     fs::create_dir_all(old.join("x")).unwrap();
+    fs::write(trash.path().join(format!("{old_name}.origin")), "/p/x").unwrap();
     fs::create_dir_all(&fresh).unwrap();
+    fs::create_dir_all(&foreign).unwrap();
+    // A recent mtime does not extend an old batch's life.
     fs::File::open(&old)
         .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+        .set_modified(SystemTime::now())
         .unwrap();
 
     fs_ops::prune_trash(trash.path(), Duration::from_secs(7 * 24 * 60 * 60));
 
     assert!(!old.exists());
-    assert!(fresh.exists());
+    assert!(!trash.path().join(format!("{old_name}.origin")).exists());
+    assert!(fresh.is_dir());
+    assert!(foreign.is_dir());
+}
+
+#[test]
+fn restore_of_a_pruned_batch_says_it_is_no_longer_in_the_trash() {
+    let root = tempfile::tempdir().unwrap();
+    let trash = tempfile::tempdir().unwrap();
+    let path = root.path().join("notes.md");
+    fs::write(&path, "notes").unwrap();
+    let trashed = fs_ops::move_to_trash(trash.path(), &path).unwrap();
+    fs::remove_dir_all(trashed.parent().unwrap()).unwrap();
+
+    let error = fs_ops::restore_from_trash(&path, &trashed).unwrap_err();
+
+    assert_eq!(
+        error,
+        "Cannot restore: notes.md is no longer in the trash (entries are kept 7 days)"
+    );
 }
 
 #[test]

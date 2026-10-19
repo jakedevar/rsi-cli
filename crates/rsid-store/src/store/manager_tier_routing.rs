@@ -863,7 +863,7 @@ impl Store {
     }
 
     /// Every strict ancestor of `node`, nearest first (bounded).
-    fn tier_ancestors(&self, node: ManagerNodeRefV1) -> Result<Vec<ManagerNodeRefV1>> {
+    pub(crate) fn tier_ancestors(&self, node: ManagerNodeRefV1) -> Result<Vec<ManagerNodeRefV1>> {
         let mut chain = Vec::new();
         let mut cursor = node;
         for _ in 0..64 {
@@ -1863,6 +1863,215 @@ impl Store {
             &[&reference],
             now,
         )
+    }
+
+    /// (#2468) A portfolio node's seat moved to a successor under a new grant
+    /// version (context-cap transfer or grantor replacement). The node and its
+    /// authority epoch survive, so the communication and decision obligations
+    /// of the replaced grant follow it: each queued message at either end is
+    /// re-queued once against the node's current seat (original author, body
+    /// and creation time kept) and each open escalation hop addressed to the
+    /// node is re-opened to the current seat. Called after the successor grant
+    /// is active. Anything whose other end is no longer live is retired, as is
+    /// everything when the node has no live seat. Revocation never calls this.
+    pub(crate) fn rehome_tier_grant(&self, old_grant_id: Uuid, now: &str) -> Result<()> {
+        let grant: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT grant_version,node_id FROM global_manager_grants WHERE id=?1",
+                [old_grant_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((version, Some(node))) = grant else {
+            return Ok(());
+        };
+        let node = parse_uuid(&node)?;
+        let reference = format!("portfolio:{node}");
+        let current = match self.tier_endpoint(ManagerNodeRefV1::Portfolio { node_id: node }) {
+            Ok(current) if current.grant_version != Some(version) => current,
+            _ => return self.retire_tier_grant(old_grant_id, now),
+        };
+        self.rehome_tier_mail(
+            "(source_ref=?1 AND source_grant_version=?2) OR (target_ref=?1 AND target_grant_version=?2)",
+            &[&reference, &version],
+            &reference,
+            &current,
+            now,
+        )?;
+        let hops = hops_where(
+            &self.conn,
+            "WHERE h.target_ref=?1 AND h.target_grant_version=?2 AND h.state='open'",
+            params![reference, version],
+        )?;
+        for hop in hops {
+            self.rehome_tier_hop(&hop, &reference, &current, now)?;
+        }
+        Ok(())
+    }
+
+    /// (#2468) A project's PM seat was displaced by another session: queued
+    /// tier mail to the project and its queued reports follow the project to
+    /// the new seat. A cleared or vacant seat retires them instead.
+    pub(crate) fn rehome_tier_project_seat(&self, project: Uuid, now: &str) -> Result<()> {
+        let reference = format!("project:{project}");
+        let Ok(current) = self.tier_endpoint(ManagerNodeRefV1::Project {
+            project_id: project,
+        }) else {
+            return self.retire_tier_project_seat(project, now);
+        };
+        self.rehome_tier_mail(
+            "target_ref=?1 OR (source_ref=?1 AND kind='report')",
+            &[&reference],
+            &reference,
+            &current,
+            now,
+        )
+    }
+
+    /// Re-queue the queued tier mail matching `clause` (a static literal that
+    /// selects both ends of `reference`) against `current`, the end's live
+    /// endpoint. The old row is retired and its wake disabled in the same
+    /// transaction, so the message is delivered exactly once.
+    fn rehome_tier_mail(
+        &self,
+        clause: &'static str,
+        args: &[&dyn rusqlite::ToSql],
+        reference: &str,
+        current: &TierEndpoint,
+        now: &str,
+    ) -> Result<()> {
+        let select = format!(
+            // sql-dynamic-ok: static clause
+            "SELECT id FROM manager_tier_messages WHERE state='queued' AND target_ref<>'operator' AND ({clause}) ORDER BY created_at,id"
+        );
+        let ids: Vec<String> = {
+            let mut statement = self.conn.prepare(&select)?;
+            statement
+                .query_map(args, |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for id in ids {
+            let old = parse_uuid(&id)?;
+            let Some(row) = message_row_on(&self.conn, old)? else {
+                continue;
+            };
+            let target_side = row.target_ref == reference;
+            // A target-side escalation wake is superseded by the re-opened
+            // hop's own wake (or its hop is no longer open): retire it.
+            let rehome = !(target_side && row.kind == "escalation")
+                && self.rehome_other_end_current(&row, target_side)?;
+            let old_job = if rehome {
+                super::scheduled_jobs::get_scheduled_job_conn(&self.conn, &old)?
+            } else {
+                None
+            };
+            let (Some(old_job), Some(current_session)) = (old_job, current.session) else {
+                self.retire_tier_message(old)?;
+                continue;
+            };
+            let new = Uuid::new_v4();
+            let (target_session, source_version, target_version) = if target_side {
+                (
+                    Some(current_session),
+                    row.source_grant_version,
+                    current.grant_version,
+                )
+            } else {
+                (
+                    row.target_session,
+                    current.grant_version,
+                    row.target_grant_version,
+                )
+            };
+            self.retire_tier_message(old)?;
+            let moved = ScheduledJob {
+                id: new,
+                enabled: true,
+                next_fire_at: chrono::DateTime::parse_from_rfc3339(now)
+                    .map_err(|_| DaemonError::Store("invalid re-home timestamp".into()))?
+                    .with_timezone(&Utc),
+                wake_session_id: target_session,
+                last_fired_at: None,
+                ..old_job
+            };
+            super::scheduled_jobs::insert_scheduled_job_conn(&self.conn, &moved)?;
+            self.conn.execute(
+                "INSERT INTO manager_tier_messages(id,direction,kind,source_ref,target_ref,project_id,source_session_id,target_session_id,source_grant_version,target_grant_version,body,body_digest,idempotency_key,state,created_at,updated_at)
+                 SELECT ?2,direction,kind,source_ref,target_ref,project_id,source_session_id,?3,?4,?5,body,body_digest,?6,'queued',created_at,?7
+                 FROM manager_tier_messages WHERE id=?1",
+                params![
+                    old.to_string(),
+                    new.to_string(),
+                    target_session.map(|id| id.to_string()),
+                    source_version,
+                    target_version,
+                    format!("rehome:{old}"),
+                    now,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether the end of a queued message that did not change hands is still
+    /// live, so a re-homed message never outlives its sender's or recipient's
+    /// authority. Agent mail needs a current source; every message needs a
+    /// current target when the sender is the end that moved.
+    fn rehome_other_end_current(&self, row: &MessageRow, target_side: bool) -> Result<bool> {
+        if target_side {
+            let agent_mail = matches!(row.kind.as_str(), "message" | "report");
+            Ok(!agent_mail
+                || row.source_ref == OPERATOR_REF
+                || self.tier_end_current(&row.source_ref, row.source_grant_version, None, None)?)
+        } else {
+            self.tier_end_current(
+                &row.target_ref,
+                row.target_grant_version,
+                row.target_session,
+                None,
+            )
+        }
+    }
+
+    /// Re-open one open hop addressed to the replaced grant against the node's
+    /// current seat, keeping the escalation, its source and its original
+    /// actor. A hop whose source lost its grant is retired instead (the same
+    /// source fence a resolve applies).
+    fn rehome_tier_hop(
+        &self,
+        hop: &ManagerTierEscalationHopV1,
+        reference: &str,
+        current: &TierEndpoint,
+        now: &str,
+    ) -> Result<()> {
+        let Some(escalation) =
+            super::harness_manager::escalation_on(&self.conn, hop.escalation_id)?
+        else {
+            return self.retire_open_hop(hop.hop_id, reference, hop.target_session_id, now);
+        };
+        let source = ManagerNodeRefV1::parse_ref_text(&hop.source_ref);
+        if source.is_none()
+            || super::harness_manager::escalation_source_current_on(&self.conn, &escalation)
+                .is_err()
+        {
+            return self.retire_open_hop(hop.hop_id, reference, hop.target_session_id, now);
+        }
+        let actor: String = self.conn.query_row(
+            "SELECT actor_session_id FROM manager_tier_escalations WHERE id=?1",
+            [hop.hop_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let actor = parse_uuid(&actor)?;
+        self.retire_open_hop(hop.hop_id, reference, hop.target_session_id, now)?;
+        let source = TierEndpoint {
+            node: source,
+            session: Some(actor),
+            grant_version: None,
+            project: None,
+        };
+        self.open_tier_hop(&escalation, &source, actor, current, now)?;
+        Ok(())
     }
 
     // ----- escalations above the project root ---------------------------------

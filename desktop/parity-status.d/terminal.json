@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "rows": {
+    "global:ctrl/any-context": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts, src/actions/terminal.ts, src/terminal-model.ts, src-tauri/src/pty.rs",
+      "note": "Ctrl-\\ (Cmd-\\ on macOS) toggles the terminal overlay from anywhere, ahead of the vim keys and text fields; the shell keeps running when hidden"
+    },
+    "global:ctrl-c/embedded-terminal-open": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts, src/actions/terminal.ts, src/terminal-model.ts, src-tauri/src/pty.rs",
+      "note": "with the terminal focused Ctrl-C goes to the shell (its interrupt) instead of the webview"
+    },
+    "cmd:term": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts",
+      "note": ":term / :terminal / :shell toggle the terminal overlay; also View > Terminal and the palette"
+    },
+    "overlay:terminal-overlay-embedded-shell": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts, src/actions/terminal.ts, src/terminal-model.ts, src-tauri/src/pty.rs",
+      "note": "xterm.js over a backend PTY in the open session's working dir; insert mode passes every key to the shell, Esc enters normal mode (i/a, j/k, arrows, g/G, Ctrl-d/u), Ctrl-\\ hides. Windows: ConPTY through portable-pty (not yet built or run on Windows)."
+    },
+    "overlay-ref:terminal": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts, src/actions/terminal.ts, src/terminal-model.ts, src-tauri/src/pty.rs",
+      "note": "other keys go to the shell, Ctrl-C interrupts it, Ctrl-\\ closes the overlay"
+    },
+    "module:ui/overlay/terminal.rs": {
+      "status": "done",
+      "location": "src/actions/terminal-spec.ts, src/actions/terminal.ts, src/terminal-model.ts, src-tauri/src/pty.rs",
+      "note": "overlay placed like the TUI popup (90% x 80%, centered), one shell per session, all killed on window close. Windows: ConPTY through portable-pty (not yet built or run on Windows)."
+    }
+  }
+}

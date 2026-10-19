@@ -23,7 +23,7 @@ const INVALID: &[&str] = &[
 const BIN: &str = env!("CARGO_BIN_EXE_rsi-manifest-validate");
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(rsi_common::manifest_dir!())
         .join("tests")
         .join("fixtures")
         .join("manifests")

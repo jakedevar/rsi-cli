@@ -283,6 +283,49 @@ impl RpcServer {
         Ok(serde_json::to_value(result)?)
     }
 
+    /// #2237 (operator-only): appoint a manager and grant its policy in one
+    /// transaction (`ConfigureHarnessManagerWithPolicy`).
+    pub(super) async fn handle_configure_harness_manager_with_policy(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyRequestV2 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam("manager_invalid_request".into()))?;
+        params
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        self.session_manager
+            .validate_manager_launch_models(&params.policy.allowed_launches)
+            .await?;
+        let store = self.session_manager.store();
+        let (config, scope_outcome, policy) = store
+            .lock()
+            .await
+            .configure_harness_manager_with_policy(&params)?;
+        Ok(serde_json::to_value(
+            rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyResultV2 {
+                config,
+                scope_outcome,
+                policy,
+            },
+        )?)
+    }
+
+    /// #2750 (operator-only): replace the project's failed manager seat with a
+    /// successor on another provider (`ReseatHarnessManager`).
+    pub(super) async fn handle_reseat_harness_manager(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::manager_reseat::ReseatHarnessManagerParams =
+            serde_json::from_value(request.params.clone()).map_err(|_| {
+                DaemonError::InvalidParam(rsi_common::manager_reseat::RESEAT_INVALID.into())
+            })?;
+        let result = Box::pin(self.session_manager.reseat_harness_manager(params)).await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
     pub(super) async fn handle_get_harness_manager_state(
         &self,
         request: &RpcRequest,

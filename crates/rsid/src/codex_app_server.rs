@@ -38,6 +38,11 @@ use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 
+pub(crate) mod wire;
+use wire::{
+    build_thread_start_params, initialize_params, initialized_notification, turn_start_params,
+};
+
 fn is_operator_request(method: &str) -> bool {
     method.ends_with("/requestApproval")
         || matches!(
@@ -463,60 +468,11 @@ pub(crate) fn route_app_server_message(
 /// `event_rx` finally closes and the turn settles.
 ///
 /// Returns `true` when the signal was delivered.
-fn terminate_app_server_provider(child_pid: Option<u32>, reason: &str) -> bool {
-    let Some(pid) = child_pid else {
-        tracing::error!(
-            reason,
-            "CodexAppServer ingress: cannot terminate the provider, no PID was captured; \
-             the reader is stopping with the process possibly still running"
-        );
-        return false;
-    };
-    let pgid = nix::unistd::Pid::from_raw(pid as i32);
-    let target = crate::process_control::SignalTarget::describe(pgid.as_raw());
-    crate::process_control::log_signal(
-        &crate::process_control::SignalRecord {
-            pid: pgid.as_raw(),
-            pgid: Some(pgid.as_raw()),
-            signal: "SIGKILL",
-            reason,
-            target: &target,
-        },
-        std::panic::Location::caller(),
-        "sending",
-    );
-    let signal_result = match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
-        Ok(()) => Ok(()),
-        Err(group_error) => {
-            tracing::warn!(
-                reason,
-                pid,
-                error = %group_error,
-                "CodexAppServer ingress: process-group signal failed; trying direct child"
-            );
-            nix::sys::signal::kill(pgid, nix::sys::signal::Signal::SIGKILL)
-        }
-    };
-    match signal_result {
-        Ok(()) => {
-            tracing::warn!(
-                reason,
-                pid,
-                "CodexAppServer ingress failed closed; terminated the provider rather than \
-                 abandoning the stdout reader on a live process"
-            );
-            true
-        }
-        Err(errno) => {
-            tracing::error!(
-                reason,
-                pid,
-                error = %errno,
-                "CodexAppServer ingress: failed to terminate the provider"
-            );
-            false
-        }
-    }
+fn terminate_app_server_provider(
+    stop: &crate::process_control::WorkerStopHandle,
+    reason: &str,
+) -> bool {
+    stop.terminate(reason).is_ok()
 }
 
 /// Read provider stdout to EOF, routing each frame synchronously.
@@ -530,7 +486,7 @@ async fn run_app_server_stdout_reader<R>(
     response_tx: mpsc::Sender<(JsonRpcId, AppServerResponse)>,
     notification_tx: mpsc::Sender<AppServerNotification>,
     event_tx: mpsc::Sender<StreamEvent>,
-    child_pid: Option<u32>,
+    stop: crate::process_control::WorkerStopHandle,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -572,7 +528,7 @@ async fn run_app_server_stdout_reader<R>(
                         "error_class": error_class,
                     }),
                 });
-                let _ = terminate_app_server_provider(child_pid, error_class);
+                let _ = terminate_app_server_provider(&stop, error_class);
                 break;
             }
         };
@@ -605,7 +561,7 @@ async fn run_app_server_stdout_reader<R>(
                     // stderr task holds an `event_tx` clone forever so the
                     // monitor never observes EOF. Terminate the provider
                     // instead, then drain to real EOF.
-                    if terminate_app_server_provider(child_pid, "ingress_failed_closed") {
+                    if terminate_app_server_provider(&stop, "ingress_failed_closed") {
                         failed_closed = true;
                     } else {
                         break;
@@ -634,6 +590,7 @@ async fn run_app_server_stdout_reader<R>(
 /// Wraps a running Codex app-server process (without the session handle).
 pub struct CodexAppServerProcess {
     child: Child,
+    stop: crate::process_control::WorkerStopHandle,
 }
 
 impl CodexAppServerProcess {
@@ -651,7 +608,7 @@ impl CodexAppServerProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        crate::process_scope::kill_worker_child(&mut self.child).await
+        crate::process_scope::kill_worker_child(&mut self.child, &self.stop).await
     }
 
     /// OS pid of the provider child, `None` once it was reaped.
@@ -661,7 +618,13 @@ impl CodexAppServerProcess {
 
     /// Non-blocking check if the process has exited.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
+        Ok(self.stop.try_wait(&mut self.child)?)
+    }
+}
+
+impl Drop for CodexAppServerProcess {
+    fn drop(&mut self) {
+        self.stop.release();
     }
 }
 
@@ -882,7 +845,7 @@ impl CodexAppServerSession {
                 &write_tx,
                 &next_id,
                 "thread/start",
-                json!({"input":"controlled input"}),
+                json!({"cwd":"/var/tmp","dynamicTools":[]}),
                 execution,
             )
             .await?,
@@ -1032,11 +995,7 @@ impl ProviderSession for CodexAppServerSession {
             .display()
             .to_string();
 
-        let params = json!({
-            "threadId": self.thread_id,
-            "input": config.input,
-            "cwd": cwd,
-        });
+        let params = turn_start_params(&self.thread_id, &cwd, &config.input);
 
         if let Err(error) = send_admitted_app_server_request(
             &self.write_tx,
@@ -1096,11 +1055,7 @@ impl ProviderSession for CodexAppServerSession {
             .unwrap_or(&self.working_dir)
             .display()
             .to_string();
-        let params = json!({
-            "threadId": self.thread_id,
-            "input": config.input,
-            "cwd": cwd,
-        });
+        let params = turn_start_params(&self.thread_id, &cwd, &config.input);
 
         match send_admitted_app_server_request(
             &self.write_tx,
@@ -1243,30 +1198,6 @@ impl CodexAppServerClient {
         }
     }
 
-    /// Launch a `codex app-server` session and perform the initialize/thread_start handshake.
-    ///
-    /// Returns `(CodexAppServerProcess, CodexAppServerSession)` where:
-    /// - `CodexAppServerProcess` wraps the Child for interrupt/kill
-    /// - `CodexAppServerSession` implements `ProviderSession` for the monitor loop
-    pub(crate) async fn launch(
-        &self,
-        config: &LaunchConfig,
-        model_invocation_id: uuid::Uuid,
-        tool_specs: &[crate::tool_registry::ToolSpec],
-        turn_control: Arc<dyn ModelCallControl>,
-        app_server_control: Arc<AppServerControlPlane>,
-    ) -> Result<(CodexAppServerProcess, CodexAppServerSession)> {
-        self.launch_with_gate(
-            config,
-            model_invocation_id,
-            tool_specs,
-            &turn_control,
-            app_server_control,
-            |_| async { Ok(()) },
-        )
-        .await
-    }
-
     /// Daemon-only revalidation at the process and productive-request boundaries.
     /// This hook is not serialized and grants no authority of its own.
     pub(crate) async fn launch_with_gate<F, Fut>(
@@ -1301,10 +1232,12 @@ impl CodexAppServerClient {
 
         // MODEL_CALL_ADMISSION: mandatory turn_control admits thread/start before spawn.
         gate(AppServerLaunchGate::BeforeSpawn).await?;
+        let scope = crate::process_scope::command_scope(&cmd);
         let mut child = cmd.spawn()?;
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), scope);
+        let mut stop_guard = stop.release_on_drop();
         // Captured before any handle is taken: the reader task needs it to
         // terminate the provider when ingress fails closed (C-P2-15).
-        let child_pid = child.id();
 
         let stdin = child
             .stdin
@@ -1351,7 +1284,7 @@ impl CodexAppServerClient {
         ));
 
         // Reader task: reads stdout, routes responses vs notifications vs events.
-        // `child_pid` lets a fail-closed ingress terminate the provider rather
+        // The launch handle lets a fail-closed ingress terminate the provider rather
         // than abandon the reader on a live process (C-P2-15).
         tokio::spawn(run_app_server_stdout_reader(
             stdout,
@@ -1359,13 +1292,14 @@ impl CodexAppServerClient {
             response_tx,
             notification_tx,
             event_tx.clone(),
-            child_pid,
+            stop.clone(),
         ));
 
         // Stderr capture
         if let Some(stderr) = stderr {
             let err_tx = event_tx.clone();
             let stderr_plane = Arc::clone(&app_server_control);
+            let stop = stop.clone();
             tokio::spawn(async move {
                 let mut lines = BoundedLines::new(stderr, PROVIDER_MAX_LINE_BYTES);
                 let mut stderr_lines = Vec::new();
@@ -1392,7 +1326,7 @@ impl CodexAppServerClient {
                                     "error_class": error_class,
                                 }),
                             });
-                            let _ = terminate_app_server_provider(child_pid, error_class);
+                            let _ = terminate_app_server_provider(&stop, error_class);
                             return;
                         }
                     };
@@ -1428,8 +1362,7 @@ impl CodexAppServerClient {
                                 "error_class": "provider_output_overflow",
                             }),
                         });
-                        let _ =
-                            terminate_app_server_provider(child_pid, "provider_output_overflow");
+                        let _ = terminate_app_server_provider(&stop, "provider_output_overflow");
                         return;
                     }
                     stderr_bytes = next_bytes;
@@ -1480,20 +1413,8 @@ impl CodexAppServerClient {
         };
 
         // 1. Send initialize request
-        let (init_id, _) = send_and_wait(
-            &write_tx,
-            &next_id_clone,
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "rsi",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }),
-        )
-        .await?;
+        let (init_id, _) =
+            send_and_wait(&write_tx, &next_id_clone, "initialize", initialize_params()).await?;
 
         // Wait for initialize response
         let init_response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1523,10 +1444,7 @@ impl CodexAppServerClient {
         tracing::debug!(response = ?init_response, "app-server initialize response");
 
         // 2. Send initialized notification
-        let initialized_notif = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        });
+        let initialized_notif = initialized_notification();
         let bytes = format!("{}\n", serde_json::to_string(&initialized_notif)?).into_bytes();
         write_tx
             .send(bytes)
@@ -1534,7 +1452,9 @@ impl CodexAppServerClient {
             .map_err(|_| DaemonError::ChannelClosed)?;
 
         gate(AppServerLaunchGate::BeforeThreadAdmission).await?;
-        // 3. Send thread/start request with tools.
+        // 3. Send thread/start with the tools. `thread/start` only creates the thread (the
+        // protocol has no `input` on it); the launch query is delivered by the first
+        // `turn/start` below, which is the admitted model call.
         let thread_start_params = build_thread_start_params(config, &working_dir, tool_specs);
         let admitted_call = turn_control
             .admit(ModelCallKind::Primary, "thread_start", &config.query, None)
@@ -1551,15 +1471,14 @@ impl CodexAppServerClient {
             return Err(error);
         }
 
-        let thread_start_send = send_admitted_app_server_request(
+        let thread_start_send = send_and_wait(
             &write_tx,
             &next_id_clone,
             "thread/start",
             thread_start_params,
-            execution,
         )
         .await
-        .and_then(require_enqueued);
+        .map(|(id, _)| id);
         let thread_start_id = match thread_start_send {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -1624,6 +1543,34 @@ impl CodexAppServerClient {
 
         tracing::info!(thread_id = %thread_id, "Codex app-server thread started");
 
+        // 4. Deliver the launch query as the first turn. The admitted capability authorizes this
+        // one model request; the call settles on the turn's completion.
+        let first_turn = turn_start_params(
+            &thread_id,
+            &working_dir.display().to_string(),
+            &config.query,
+        );
+        if let Err(error) = send_admitted_app_server_request(
+            &write_tx,
+            &next_id_clone,
+            "turn/start",
+            first_turn,
+            execution,
+        )
+        .await
+        .and_then(require_enqueued)
+        {
+            turn_control
+                .fail(
+                    current_turn_call
+                        .take()
+                        .expect("initial turn/start permit is present"),
+                    "turn_start_send_failed",
+                )
+                .await?;
+            return Err(error);
+        }
+
         // Emit a synthetic system init event (like CLI thread.started)
         let _ = event_tx
             .send(StreamEvent {
@@ -1647,7 +1594,8 @@ impl CodexAppServerClient {
             turn_usage: TurnTokenUsage::default(),
         };
 
-        let process = CodexAppServerProcess { child };
+        let process = CodexAppServerProcess { child, stop };
+        stop_guard.disarm();
 
         Ok((process, session))
     }
@@ -1684,35 +1632,6 @@ fn settlement_error_event(stage: &str, error: DaemonError) -> StreamEvent {
             "source": "model_control",
         }),
     }
-}
-
-fn build_thread_start_params(
-    config: &LaunchConfig,
-    working_dir: &Path,
-    tool_specs: &[crate::tool_registry::ToolSpec],
-) -> Value {
-    let dynamic_tools: Vec<Value> = tool_specs
-        .iter()
-        .map(|spec| {
-            json!({
-                "name": spec.name,
-                "description": spec.description,
-                "input_schema": spec.parameters,
-            })
-        })
-        .collect();
-
-    let mut params = serde_json::Map::new();
-    params.insert("input".to_string(), json!(config.query));
-    params.insert("cwd".to_string(), json!(working_dir.display().to_string()));
-    params.insert("dynamicTools".to_string(), json!(dynamic_tools));
-    if let Some(model) = &config.model {
-        params.insert("model".to_string(), json!(model));
-    }
-    if let Some(system_prompt) = &config.system_prompt {
-        params.insert("developerInstructions".to_string(), json!(system_prompt));
-    }
-    Value::Object(params)
 }
 
 /// Map app-server NDJSON-style events to StreamEvents.
@@ -1767,9 +1686,6 @@ fn map_token_usage_notification(params: &Value) -> Option<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_server_control::{
-        AttemptKey, AttemptRegistrationOutcome, ProviderLifecycleSignal,
-    };
     use crate::model_control::call_control::{
         ModelCallControl, NoopModelCallControl, StoreBackedModelCallControl,
     };
@@ -1873,7 +1789,10 @@ mod tests {
         ))
     }
 
-    fn launch_config_for_prompt_test(query: &str, system_prompt: Option<&str>) -> LaunchConfig {
+    pub(super) fn launch_config_for_prompt_test(
+        query: &str,
+        system_prompt: Option<&str>,
+    ) -> LaunchConfig {
         LaunchConfig {
             completion_gates: None,
             query: query.to_string(),
@@ -1923,61 +1842,19 @@ mod tests {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
-    fn test_initialize_request_serialization() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "rsi",
-                    "version": "0.1.0",
-                }
-            }
-        });
-        let serialized = serde_json::to_string(&request).unwrap();
-        let parsed: Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed["jsonrpc"], "2.0");
-        assert_eq!(parsed["id"], 1);
-        assert_eq!(parsed["method"], "initialize");
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
-    #[test]
-    fn test_thread_start_request_serialization() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "thread/start",
-            "params": {
-                "input": "test query",
-                "cwd": "/tmp",
-                "dynamicTools": [],
-            }
-        });
-        let serialized = serde_json::to_string(&request).unwrap();
-        let parsed: Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed["method"], "thread/start");
-        assert_eq!(parsed["params"]["input"], "test query");
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
-    #[test]
-    fn thread_start_params_keep_input_as_query_body_and_send_developer_instructions_separately() {
+    fn thread_start_params_send_developer_instructions_and_never_the_query() {
         let config = launch_config_for_prompt_test(
             "Implement only the child task body.",
             Some("RSI worker preamble and contract"),
         );
         let params = build_thread_start_params(&config, Path::new("/tmp/work"), &[]);
 
-        assert_eq!(params["input"], "Implement only the child task body.");
         assert_eq!(
             params["developerInstructions"],
             "RSI worker preamble and contract"
@@ -1985,8 +1862,21 @@ mod tests {
         assert_eq!(params["cwd"], "/tmp/work");
         assert_eq!(params["dynamicTools"], json!([]));
         assert!(params.get("developer_instructions").is_none());
+        // The protocol has no `input` on thread/start: the query rides the first turn/start.
+        assert!(params.get("input").is_none());
+        let params = params.to_string();
+        assert!(!params.contains("Implement only the child task body."));
 
-        let input = params["input"].as_str().unwrap();
+        let turn = turn_start_params(
+            "thread-1",
+            "/tmp/work",
+            "Implement only the child task body.",
+        );
+        assert_eq!(
+            turn["input"],
+            json!([{"type": "text", "text": "Implement only the child task body."}])
+        );
+        let input = turn["input"].to_string();
         assert!(!input.contains("RSI worker preamble"));
         assert!(!input.contains("<docregblock>"));
         assert!(!input.contains("/spawn_child"));
@@ -2147,7 +2037,7 @@ mod tests {
         let config = launch_config_for_prompt_test("plain query", None);
         let params = build_thread_start_params(&config, Path::new("/tmp/work"), &[]);
 
-        assert_eq!(params["input"], "plain query");
+        assert!(params.get("input").is_none());
         assert!(params.get("developerInstructions").is_none());
     }
 
@@ -2168,10 +2058,12 @@ mod tests {
 
         let params = build_thread_start_params(&config, Path::new("/tmp/work"), &specs);
         assert_eq!(params["dynamicTools"][0]["name"], "rsi_memory_search");
+        assert_eq!(params["dynamicTools"][0]["type"], "function");
         assert_eq!(
-            params["dynamicTools"][0]["input_schema"],
+            params["dynamicTools"][0]["inputSchema"],
             specs[0].parameters.clone()
         );
+        assert!(params["dynamicTools"][0].get("input_schema").is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -2205,28 +2097,9 @@ mod tests {
         for (tool, spec) in dynamic_tools.iter().zip(&specs) {
             assert_eq!(tool["name"], spec.name);
             assert_eq!(tool["description"], spec.description);
-            assert_eq!(tool["input_schema"], spec.parameters);
-            assert_eq!(tool["input_schema"]["additionalProperties"], false);
+            assert_eq!(tool["inputSchema"], spec.parameters);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
-    #[test]
-    fn test_turn_start_request_serialization() {
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "turn/start",
-            "params": {
-                "threadId": "thread-abc",
-                "input": "continue",
-                "cwd": "/home/user",
-            }
-        });
-        let serialized = serde_json::to_string(&request).unwrap();
-        let parsed: Value = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(parsed["method"], "turn/start");
-        assert_eq!(parsed["params"]["threadId"], "thread-abc");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -2552,7 +2425,10 @@ mod tests {
         let msg: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(msg["method"], "turn/start");
         assert_eq!(msg["params"]["threadId"], "thread-abc");
-        assert_eq!(msg["params"]["input"], "continue working");
+        assert_eq!(
+            msg["params"]["input"],
+            json!([{"type": "text", "text": "continue working"}])
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -2887,7 +2763,7 @@ mod tests {
             &write_tx,
             &next_id,
             "thread/start",
-            json!({"input": "initial query", "cwd": "/tmp", "dynamicTools": []}),
+            json!({"cwd": "/tmp", "dynamicTools": []}),
             execution,
         )
         .await
@@ -3461,6 +3337,7 @@ mod tests {
         // A real, live process standing in for the app-server.
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .expect("spawn a stand-in provider process");
@@ -3493,7 +3370,7 @@ mod tests {
             response_tx,
             notification_tx,
             event_tx,
-            child_pid,
+            crate::process_control::WorkerStopHandle::new(child_pid, None),
         )
         .await;
 
@@ -3520,6 +3397,7 @@ mod tests {
     async fn oversized_stdout_frame_is_truncated_and_the_reader_continues() {
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .expect("spawn a stand-in provider process");
@@ -3549,7 +3427,7 @@ mod tests {
             response_tx,
             notification_tx,
             event_tx,
-            child_pid,
+            crate::process_control::WorkerStopHandle::new(child_pid, None),
         )
         .await;
 
@@ -4020,3 +3898,6 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod approval_protocol_tests;
+
+#[cfg(test)]
+mod wire_conformance_tests;

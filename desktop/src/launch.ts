@@ -1,5 +1,6 @@
 // New-session dialog.
-import { api } from './api.js';
+import { api, invoke } from './api.js';
+import { afterLaunch, launchExtras } from './prompts.js';
 import { $, el, toast } from './dom.js';
 import { refreshSessions } from './sessions.js';
 import { state } from './state.js';
@@ -37,18 +38,22 @@ export async function submitLaunch(ev: SubmitEvent): Promise<void> {
   if (!workingDir && projectId) {
     workingDir = state.projects.find((p) => p.id === projectId)?.path ?? '';
   }
+  const request = {
+    query: String(data.get('query') ?? ''),
+    provider: str('provider'),
+    model: str('model') || undefined,
+    effort: str('effort') || undefined,
+    project_id: projectId || undefined,
+    working_dir: workingDir || undefined,
+  };
   try {
-    await api.launch({
-      query: String(data.get('query') ?? ''),
-      provider: str('provider'),
-      model: str('model') || undefined,
-      effort: str('effort') || undefined,
-      project_id: projectId || undefined,
-      working_dir: workingDir || undefined,
-    });
+    // The settings side's sandbox (gap sweep G4, prompts.ts) needs the launch_prompt command.
+    const { sandbox } = launchExtras();
+    const result = sandbox ? await invoke<unknown>('launch_prompt', { request: { ...request, sandbox } }) : await api.launch(request);
     $<HTMLDialogElement>('launch-dialog').close();
     form.reset();
-    toast('Session launched', true);
+    toast(sandbox ? 'Session launched in its own git worktree' : 'Session launched', true);
+    void afterLaunch(result, request.project_id);
     window.setTimeout(() => void refreshSessions(), 500);
   } catch (e) {
     toast(`Launch failed: ${String(e)}`);

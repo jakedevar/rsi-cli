@@ -100,7 +100,7 @@ function makeGateway(config = {}) {
       return jsonResponse({ csrf: CSRF });
     }
     if (path === '/auth/logout') return emptyResponse(config.logoutStatus ?? 204);
-    if (config.dataStatus) return emptyResponse(config.dataStatus);
+    if (config.dataStatus) return config.dataBody ? jsonResponse(config.dataBody, config.dataStatus) : emptyResponse(config.dataStatus);
     if (config.data401) return emptyResponse(401);
     if (remaining401 > 0) { remaining401 -= 1; return emptyResponse(401); }
     if (pathname === '/api/v1/projects') return jsonResponse({ items: config.projects ?? [] });
@@ -213,6 +213,13 @@ test('403 and 502 surface distinct, actionable errors', async () => {
   await assert.rejects(forbidden.listSessions(), /gateway denied this request/);
   const unavailable = createApi(makeGateway({ dataStatus: 502 }).fetchImpl);
   await assert.rejects(unavailable.listSessions(), /RSI daemon is unavailable/);
+});
+
+test('503 is a calm busy message, 500 names its class, and neither says rsid is down', async () => {
+  const busy = createApi(makeGateway({ dataStatus: 503, dataBody: { error: 'busy' } }).fetchImpl);
+  await assert.rejects(busy.listSessions(), (error) => error.status === 503 && /host is busy; retrying/.test(error.message) && !/rsid/.test(error.message));
+  const malformed = createApi(makeGateway({ dataStatus: 500, dataBody: { error: 'malformed' } }).fetchImpl);
+  await assert.rejects(malformed.listSessions(), (error) => error.status === 500 && /could not use \(malformed\)/.test(error.message) && !/rsid/.test(error.message));
 });
 
 test('sessions fan out across projects and keep id->project routing', async () => {

@@ -1,6 +1,6 @@
 mod bridge;
 #[cfg(test)]
-mod bridge_tests;
+pub(in crate::session::harness) mod bridge_tests;
 mod search;
 mod stdio;
 #[cfg(test)]

@@ -28,18 +28,54 @@ if [ ! -x "$GATE" ]; then
   exit 2
 fi
 
-TMP="$(mktemp -d)"
+# Fixture Git never runs in the assigned sandbox (AGENTS.md hard rule 2, #2574).
+# The scratch directory is allocated outside the checkout that holds this script
+# (a sandbox sets TMPDIR to <sandbox>/target/.rsi-tmp, which is inside it), every
+# fixture Git call names the repository with `git -C`, and the repository-location
+# variables are cleared so an inherited GIT_DIR cannot redirect it.
+CHECKOUT="$(CDPATH='' cd -- "$HERE/../.." && pwd -P)"
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES
+
+outside_checkout() { # <directory>: succeeds when its physical path is outside CHECKOUT
+  _phys="$(CDPATH='' cd -- "$1" 2>/dev/null && pwd -P)" || return 1
+  case "$_phys/" in "$CHECKOUT"/*) return 1 ;; esac
+  case "$CHECKOUT/" in "$_phys"/*) return 1 ;; esac
+  return 0
+}
+
+TMP=""
+for parent in "${TMPDIR:-}" /var/tmp /private/tmp /tmp; do
+  [ -n "$parent" ] && [ -d "$parent" ] && [ -w "$parent" ] || continue
+  outside_checkout "$parent" || continue
+  TMP="$(mktemp -d "$parent/corpus-pins-test.XXXXXX")" || continue
+  break
+done
+if [ -z "$TMP" ]; then
+  echo "self-test: no scratch directory outside $CHECKOUT; stopping instead of using one inside it" >&2
+  exit 2
+fi
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
 REPO="$TMP/repo"
 mkdir -p "$REPO/crates/rsid/src"
+REPO="$(CDPATH='' cd -- "$REPO" && pwd -P)"
+if ! outside_checkout "$REPO"; then
+  echo "self-test: fixture repository $REPO is inside $CHECKOUT; stopping before Git" >&2
+  exit 2
+fi
+export GIT_CEILING_DIRECTORIES="$TMP"
+
+GIT() { git -C "$REPO" "$@"; }
+
+GIT init -q -b rolling
+GIT config user.name "Corpus Pins Self Test"
+GIT config user.email "corpus-pins@example.invalid"
+
+# The gate and the pre-commit hook under test read the repository from their
+# working directory, so they run from the validated fixture repository; this is
+# the only directory change, and no Git command rides on it.
 cd "$REPO"
-
-git init -q -b rolling
-git config user.name "Corpus Pins Self Test"
-git config user.email "corpus-pins@example.invalid"
-
-GIT() { git "$@"; }
 
 # --- c0: the parent tree -----------------------------------------------------
 mkdir -p crates/rsid/src

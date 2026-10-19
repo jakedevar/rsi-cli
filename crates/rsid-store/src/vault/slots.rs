@@ -72,6 +72,8 @@ pub const fn env_vars(slot: Slot) -> &'static [&'static str] {
         Slot::Cloudflare => &["CLOUDFLARE_API_KEY"],
         Slot::Anyscale => &["ANYSCALE_API_KEY"],
         Slot::Octoai => &["OCTOAI_API_KEY"],
+        Slot::Serper => &["SERPER_API_KEY"],
+        Slot::Exa => &["EXA_API_KEY"],
     }
 }
 
@@ -114,7 +116,9 @@ pub const fn has_codex_fallback(slot: Slot) -> bool {
     matches!(slot, Slot::Openrouter)
 }
 
-/// `api_route.fallback` default. Slice R wires the live setting.
+/// Conservative exposure assumption: the operator may enable the OpenRouter Codex
+/// fallback. The live setting `api_route.fallback.openrouter` defaults to off
+/// (#3141), so this only widens what the report calls possible exposure.
 pub const CODEX_FALLBACK_DEFAULT: bool = true;
 
 /// Capability-derived residual exposure R1 for `slot`.

@@ -70,10 +70,11 @@ nothing; explicitly saving regrants the displayed draft under the current scope.
 
 When an appointment changes the project's manager anchor, terminal watches and
 pending deploy outcomes follow the displaced seat's proven same-project lineage.
-A live deploy also transfers to the new owner. If that owner already used its
-deploy key, the save refuses `manager_deploy_transfer_key_conflict` and leaves the
-appointment and wakes unchanged. Cancel or settle the retained seat's live deploy
-before retrying the appointment (#1571; deploy identity follow-up #1572).
+A live deploy also transfers to the new owner: the deploy keeps the request
+identity its idempotency key was recorded under, and only its settling owner
+moves, so a key the new owner already used for a settled deployment never blocks
+the appointment (#1571, #1572). The new owner's own record under a shared key
+wins for a replay; a cancel by key and commit prefers the live deployment.
 
 ## Area manager nodes
 
@@ -138,10 +139,16 @@ them, and every call is daemon-checked against the active grant.
 
 - `:manager global` shows the active grant.
 - `:manager global appoint [project names...]` appoints the focused session over
-  the named projects (comma-separated for names with spaces; default: every
-  project). The allowlist defaults to Claude `claude-opus-5-5` at `high` effort
-  and the PM policy to the Execute preset. A new appoint replaces the previous
-  seat in one transaction.
+  the named projects (comma-separated for names with spaces). Re-seating an
+  active grant keeps its project list, launch allowlist and complete PM policy,
+  including capabilities and caps; named projects explicitly change coverage.
+  The request is fenced on the current grant version and replaces the previous
+  seat in one transaction under a new grant version. A first appointment
+  defaults to every project, the operator's default launch allowlist and the
+  Execute PM policy. After `revoke`, appoint also starts from those first-
+  appointment defaults: a revoked grant's projects, allowlist and policy are
+  not carried forward, and the notice says so. Use `set` or `configure` to edit
+  the policy.
 - `:manager global revoke` revokes the active grant.
 - `:manager global set <field> <value> [confirm]` changes one cap of the
   per-project policy and keeps the rest of the grant (#1401). Fields: `active`
@@ -176,8 +183,7 @@ one level up with `AgentReportUp` and mails any descendant node with
 `AgentSendDown`; `AgentReportToGlobal` and `AgentGlobalSend` remain as aliases
 for one release. A report from a root, and an escalation forwarded past the
 last portfolio node, reach the operator queue (`:manager escalations`).
-Authority belongs to the exact appointed seat: a rotated or replaced seat has
-none until the operator re-appoints. `AgentGlobalAppointManager`
+A context-cap rotation moves the grant to the published successor (new grant version), and the successor inherits authority and ledger. An operator re-appoint is needed only after a replacement or revoke. `AgentGlobalAppointManager`
 launches, appoints and saves the policy in one call, so the policy is not left
 revoked after a re-appoint. Since #1239 it is the project-target alias of
 `AgentManagerAppointChild`, which any portfolio seat may also use to create,
@@ -200,13 +206,13 @@ caller's own project): the eight Issue verbs, `AgentManagerLaunchIssueWorker`,
 `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`,
 `AgentManagerProgress` (its result carries the `fence` for that project),
 `AgentManagerInspect`, `AgentManagerUpdate`, `AgentTopologyUpsert`,
-`AgentTopologyList`, `AgentTopologyExecute`, `AgentTopologyGetExecution`,
+`AgentTopologyList`, `AgentTopologyGet`, `AgentTopologyExecute`, `AgentTopologyGetExecution`,
 `AgentTopologyInterrupt` (execution-keyed verbs, including
 `AgentTopologyResolveAttempt`, act in the execution's own project) and
 `AgentRequestDeploy` (needs `Deploy` in an executing project policy).
 `AgentEnqueueLandingSource` takes `source_session_id`: the repo is that
 in-reach session's sandbox. The `landing` and `cloud_gate` kinds of
-`AgentSubmitJob` take `sandbox_session_id`, which must name a terminal
+`AgentSubmitJob` take `source_session_id`, which must name a terminal
 in-reach session (`job_sandbox_session_live` otherwise). A topology execution
 the global requested launches its nodes only under the global grant. The target-session verbs
 (status, events, send, halt, continue, `on_terminal` watch) reach sessions
@@ -228,7 +234,9 @@ commit.
 
 With a PM live in the same project:
 - at most one live Issue-bound worker per Issue (`manager_issue_worker_already_live`;
-  an exact replay still deduplicates);
+  an exact replay still deduplicates). A worker whose turn ended is still live
+  while it owns a pending wake or a non-terminal job and has not written its final
+  `PIPELINE HANDOFF` (#2212); the refusal names it. `continue_from` replaces it;
 - mutations flow down: a PM or area node may not halt, continue, send to or
   archive the global seat or a session the global launched, nor run a lead
   action on an Epic whose lead (or AssignLead candidate) is one, at admission
@@ -304,9 +312,11 @@ operator must re-apply the saved Full preset to make live `SessionControl` use
 effective (2026-09-23 K1; `docs/harness-manager.md` policy history).
 
 For a new policy, Execute/Full start with four active sessions, eight created
-containers, 32 created sessions and three automatic recoveries. An empty launch
-list allows valid explicit manager launches but holds automatic intent recovery
-until the operator selects permitted launch choices. Saved and manually edited
+containers, 32 created sessions and three automatic recoveries. An empty
+`allowed_launches` list fails closed. An appointed project PM with an empty own
+list inherits its ancestor portfolio grant's effective launch list through
+`manager_effective_launches`; a seat with no portfolio ancestor, including a
+satellite seat, has no fallback (#1748). Saved and manually edited
 limits always survive preset selection, including zero, provider ceilings,
 spend, pauses and model restrictions. A zero that disables a profile operation
 is shown explicitly; the policy remains valid Custom. **Use suggested allowances** changes only the
@@ -333,7 +343,7 @@ Budgets section.
 | Grant OperatorDelegation | Permit `AgentManagerControl` `operator_call` (Execute mode, not paused) to invoke one method from the closed, versioned `DELEGABLE_OPERATOR_METHODS` allowlist against a leaf in the manager's own project. See Operator delegation below. |
 | Grant DaemonSettings | Permit the current appointed manager to change the operator-allowlisted daemon settings (maximum sandbox roots, sandbox minimum free GiB, the reclaim watermarks) through `AgentManagerControl` `operator_call` `ProposeDaemonSetting`, only inside the per-key bounds the operator sets under "Daemon settings · manager bounds" (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; needs no other grant. Spend, credentials, appointment and scope stay operator-only. See Operator delegation below. |
 | Grant StorageControl | Permit the current appointed manager to read sandbox storage status and run the bounded build-cache reclaim (preview or real pass) through `AgentManagerControl` `operator_call` (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; `OperatorDelegation` is not required and does not imply it. Daemon storage settings stay operator-only. See Operator delegation below and `docs/sandbox-storage.md`. |
-| Grant Deploy | Permit the current appointed manager to call `AgentRequestDeploy` (#1045): stage already-built binaries from a `binaries_dir`, wait for a quiet point (no lander or job running, no scoped worker mid-turn; bounded by `max_wait_secs`, default 900, at most 3600), then have the daemon swap them in and restart under `rsid-supervisor.sh` (exit 75, provider environment intact) and wake the caller once with the outcome. Needs Execute mode and no pause at call time. Off by default; granted by Full project control (since 2026-09-30), not by Execute; it is not a daemon setting. Refused `deploy_needs_supervisor` when the daemon is not run by the supervisor script, and `deploy_restart_budget` after two deploy restarts in an hour. Cut-off workers follow the normal restart recovery rules. Optional `interrupt_workers: true` (#1461) lets a worker mid-turn stop blocking the quiet point once `deploy_drain_hold_secs` is over (landings and local jobs still block); the interrupted workers are named in the outcome and filed as `deploy_interrupt` friction events. |
+| Grant Deploy | Permit the current appointed manager to call `AgentRequestDeploy` (#1045): stage already-built binaries from a `binaries_dir`, wait for a quiet point (no lander or job running, no scoped worker mid-turn; bounded by `max_wait_secs`, default 900, at most 3600), then have the daemon swap them in and restart under `rsid-supervisor.sh` (exit 75, provider environment intact) and wake the caller once with the outcome. Needs Execute mode and no pause at call time. Off by default; granted by Full project control (since 2026-09-30), not by Execute; it is not a daemon setting. Refused `deploy_needs_supervisor` when the daemon is not run by the supervisor script, and `deploy_restart_budget` once the hour's deploy restarts reach the operator setting `deploy_restarts_per_hour` (1-3, default 2; 3 is the supervisor's own cap; #1777). The refusal ends in `retry_after=<RFC3339>`, the moment the oldest counted restart leaves the hour: arm one wake for it. Cut-off workers follow the normal restart recovery rules. Optional `interrupt_workers: true` (#1461) lets a worker mid-turn stop blocking the quiet point once `deploy_drain_hold_secs` is over (landings and local jobs still block); the interrupted workers are named in the outcome and filed as `deploy_interrupt` friction events. |
 | Grant Automation | Permit the current appointed manager to author, execute, interrupt and resolve deterministic topologies on in-scope Epics through the six `AgentTopology*` verbs (#633). Every session node's explicit provider/model/effort must equal an `allowed_launches` entry (empty fails closed); manager-requested node launches charge the created-session quota; effects need Execute mode and no pause. Distinct from `Topology` (containers). Discarding preserved work is manager-only and needs the exact preserved commit. |
 | Grant Group / Grant Group by ID | Select existing project Groups (at most 32). Enter an ID if it is not cached in the session list. |
 | Allow root Group creation | Separate root-creation opt-in; also requires Topology. |
@@ -341,7 +351,7 @@ Budgets section.
 | Active session limit | 1–100, default 4; applies alongside existing provider/Model Control admission. |
 | Tier-2 minimum reviewer | Local, Standard (default), or Premium. Enter cycles the value. A work row marked `risk_tier: "tier2"` requires a DB-native reviewer at or above this model tier; use Tier-2 for authority, custody, and migration changes. The field is saved through the same operator policy RPC as the other budgets. |
 | Provider active limits | Optional 1–64 ceiling per provider. Blank removes the override and uses the overall policy. |
-| Allowed launches | Empty permits any valid explicit manager launch but holds automatic intent recovery. Adding entries restricts launches to those exact choices (up to 32) and enables intent recovery to choose among them, subject to its other gates. Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. Default effort means no explicit effort; it is not an effort wildcard. Enter on Remove deletes that draft choice; removing the last entry restores unrestricted explicit choices and holds intent recovery. Use currently configured valid model/effort values. |
+| Allowed launches | An empty `allowed_launches` list fails closed. An appointed project PM with an empty own list falls back to its ancestor portfolio grant's effective launch list through `manager_effective_launches`; a seat with no portfolio ancestor, including a satellite seat, has no fallback (#1748). Adding entries restricts launches to those choices (up to 64) and enables intent recovery to choose among them, subject to its other gates. Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. An entry with an explicit effort admits exactly that effort. An entry with the default (no) effort admits any effort for its provider and model, never another provider or model (#1905); when RSI knows the model's effort ladder, only efforts on it (#1953). Enter on Remove deletes that draft choice; removing the last entry restores the empty-list behavior above. Use currently configured valid model/effort values. |
 | Recovery attempt limit | 0–32 persisted attempts; default zero disables automatic recovery allowance. Existing retry owners and kill-switches still apply. |
 | Retry delay | 1–86400 seconds, default 60. Waiting for a due time remains an outstanding obligation. |
 | Request timeout | 30–604800 seconds, default 900. Expiration records a blocker/recovery obligation, never invented completion. |
@@ -383,10 +393,12 @@ attempt only after proving its process cohort gone; it does not infer permission
 to reuse a worktree from its pathname. The receipt identifies the retained
 allocation for the established custody-recovery workflow.
 
-With an empty allowed-launch list, automatic intent recovery records a
-`manager_v2_intent_launch_allowlist_required` hold. Explicit manager actions can
-still select any valid launch choice through their own admission path. With a
-nonempty list, intent recovery prefers the current lead's exact
+When `manager_effective_launches` resolves to an empty list, launches fail
+closed and automatic intent recovery records a
+`manager_v2_intent_launch_allowlist_required` hold. For a PM, that resolution
+uses the ancestor portfolio grant's effective list when its own list is empty;
+without an ancestor portfolio grant, it remains empty. With a nonempty list,
+intent recovery prefers the current lead's exact
 provider/model/effort when permitted, then tries the other listed choices under
 resource gates. Execute mode, capability grants, creation/recovery limits and
 operator pauses also apply.
@@ -416,7 +428,20 @@ to re-observe one uncertain action in the manager's project and scope. It needs
 `succeeded`; a provably absent one becomes `failed` with
 `manager_v2_recovered_effect_absent`; otherwise the request is blocked with
 `manager_v2_effect_unobservable` and the original stays uncertain. Root
-succession and integration keep their own reconcilers.
+succession and integration keep their own reconcilers. A `create_session` that
+ended `blocked` with the catch-all `manager_v2_lifecycle_unconfirmed` settles
+the same way (#1716) when its reserved target session never came to exist and no
+provider effect started: it becomes `failed` with
+`manager_v2_recovered_effect_absent`, nothing was launched and a relaunch under
+a new key is safe. Any other blocked action, or one whose target session row
+exists, is refused `manager_v2_action_not_uncertain`.
+
+A create held in the queue (deploy drain, host load) re-proves its caller's
+authority when it is finally claimed. A caller that was archived with a rotation
+successor is re-proved as the successor (#1335); one retired with none is
+revoked `manager_v2_actor_seat_retired`; one that another session was appointed
+over while the create waited is revoked `manager_v2_actor_seat_replaced`
+(#1716). Revoked means nothing launched: the current manager relaunches.
 
 `retire_lead_continuations {epic_id, expected}` targets a terminal or idle lead
 (`manager_v2_lead_active` otherwise). It disables, never deletes, the lead's
@@ -462,6 +487,25 @@ establishment and the atomic publication commit; the predecessor then loses that
 authority. `:manager` follows the current manager. The Overview row retains both
 logical and current identities; `o` opens the current manager session. Inspect the
 durable operation before another attempt, including after restart or an uncertain result.
+
+The seat's own enabled `resume` wakes do not hold the handoff and need no
+cancelling first. The publication hands the seat's durable obligations (job and
+deploy outcome wakes, predicate waits, terminal watches, live jobs and deploys)
+to the successor in its transaction, and cancels the displaced seat's generic
+backstops (safety nets, check-ins, recurring resumes) together with any late
+`keepalive-*`/`background-process-*` row: the rows stay, disabled. The succeeded
+receipt (`AgentManagerGetAction`, the stored `ManagerActionReceiptV2`) names them
+in the optional `cancelled_wakes {reason, job_ids}`, with reason
+`manager_succession_displaced_seat`; it is absent when none were cancelled, on a
+failed or refused succession, and on every other action. The
+`succession_wakes_settled` manager event keyed by the operation id records the
+transferred and cancelled ids for audit. An automatic context rotation is
+unchanged and still carries generic backstops (#2511). A wake due while the
+succession is unresolved is held by the scheduler and runs on the successor (or
+on the predecessor if the succession fails), so the displaced seat never wakes.
+Protected manager watches and a foreign seat's wakes are never cancelled, and a
+daemon-owned resume row (`keepalive-*`, `background-process-*`, or the wake of an
+open capacity incident) still refuses with `manager_v2_human_or_recovery_owner`.
 
 Explicit succession consumes one session-creation allowance and current capacity;
 it does not consume or reset automatic-recovery attempts. Retained and unknown
@@ -688,7 +732,7 @@ including inside nested operations. Daemon checks remain authoritative.
 | RPC | Native Harness / AppServer tool | Request |
 | --- | --- | --- |
 | `AgentManagerProgress` | `rsi_control_manager_progress` | `{}` or `after_epic_id`, `limit` (1–64, default 32); follow `next_after_epic_id` until null |
-| `AgentManagerInbox` | `rsi_control_manager_inbox` | `after_sequence` (default 0), `limit` (1–32, default 32), optional `request_id`; response also returns exact settled `notices` and `more_notices` |
+| `AgentManagerInbox` | `rsi_control_manager_inbox` | `after_sequence` (default 0), `limit` (1–32, default 32), optional `request_id`; routine manager reads return incoming mail, with outbound sends available via `include_sent:true`, `request_id`, or `fields:"full"`; `notice_kind` other than `message` suppresses messages; response also returns exact settled `notices` and `more_notices` |
 | `AgentManagerSend` | `rsi_control_manager_send` | `epic_id`, `message`, `idempotency_key` |
 | `AgentManagerReply` | `rsi_control_manager_reply` | `request_id`, `message`, `idempotency_key` |
 | `AgentManagerInspect` | `rsi_control_manager_inspect` | `section`, optional `epic_id`/`cursor`, `limit` (1–64, default 32); `{}` selects Overview |
@@ -891,7 +935,11 @@ Review assignments reaching `submitted` or `failed` record a `to_manager`
 `ledger_change` notice with subject `review:<assignment_id>` and the terminal
 state as its version, in the same transaction as the transition; when no live
 manager, in-scope Epic, or current lead resolves, the transition commits without
-a notice. Direct operator instructions take precedence;
+a notice. A `submitted` notice carries `receipt_id`, `verdict`, `finding_count`,
+`blocking_finding_count` and the findings themselves (`findings`: key, severity,
+blocking, summary clipped to 600 characters, location; blocking first, at most 16,
+`findings_truncated` set when more exist, #2602), so a verdict needs no store query.
+Direct operator instructions take precedence;
 surface conflicts and reply with evidence or a blocker. Human-gated sessions
 remain parked.
 
@@ -1122,6 +1170,7 @@ They have no agent/native tools and are excluded from agent `--schema` discovery
 | `ConfigureHarnessManager` | `project_id`, `session_id`, `epic_ids`, `expected_row_version` |
 | `GetHarnessManagerPolicy` | `project_id`; returns policy configuration or null |
 | `ConfigureHarnessManagerPolicy` | `project_id`, `expected_scope_version`, `expected_policy_version`, `idempotency_key`, `policy` |
+| `ConfigureHarnessManagerWithPolicy` | `scope` (a `ConfigureHarnessManager` request), `expected_policy_version`, `idempotency_key`, `policy`; appoints and grants in one transaction, a revocation is refused (#2237) |
 | `GetHarnessManagerState` | `project_id`, `query` (the typed inspection request) |
 | `AnswerHarnessManagerDecision` | `project_id`, `fence`, `decision_key`, `expected_row_version`, `target_digest`, `answer`, `idempotency_key` |
 
@@ -1240,7 +1289,13 @@ and the `:manager policy` "Daemon settings · manager bounds" rows edit them
 `sandbox_max_source_roots` (Maximum sandbox roots),
 `sandbox_min_free_gib`, `sandbox_build_cache_reclaim_high_watermark_pct` and
 `sandbox_build_cache_reclaim_low_watermark_pct`, each with the daemon's own hard
-range that the operator's bounds must sit inside. Spend policy, credentials,
+range that the operator's bounds must sit inside. `host_load_admission_threshold`,
+`rolling_queue_batch_size` (#1977), `governor_build_slots`,
+`governor_lander_slots`, `rolling_queue_full_qa_interval_mins` (#2123) and `hub_build_cpu_percent` (#2119) carry
+built-in default bounds (`8..=64`, `1..=8`, `1..=4`, `1..=5`, `30..=240` and `10..=50`; the last four are lower-only: their max is the registry default) that apply while the operator sets none; an explicit operator bound
+replaces and may narrow them. The TUI row shows `default 8-64` while a default
+applies; blank restores that default, and `off` (stored as the `0-0` bound
+entry, valid only for keys with defaults) makes the key not adjustable (#1997). Spend policy, credentials,
 appointment and scope are not in the table and stay operator-only
 (`UpdateDaemonConfig` stays in `NEVER_DELEGABLE`). A proposal is checked at
 admission and again at effect time against the grant's current policy, so a

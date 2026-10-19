@@ -1788,6 +1788,8 @@ async fn policy_editor_renders_titled_sections_usage_header_and_row_help() {
         "── Budgets ──",
         "── Launches ──",
         "Usage: sessions 152/1024 created · 872 left · active 3/4",
+        // #2502: the PM's own policy says what it governs.
+        "governs this PM's own launches only; caps above bind too (gm > b)",
         "Created session quota: 0",
         "Active session limit: 4",
         "Enter runs · Replace mode and grants with this preset; explicit limits are kept",
@@ -2758,4 +2760,25 @@ async fn decision_answer_is_edited_in_place_in_standard_mode() {
     let target = &board_state(&app).answer.as_ref().unwrap().target;
     assert_eq!(target.answer, "rolling");
     assert_ne!(target.idempotency_key, before, "editing refreshes the key");
+}
+
+#[test]
+fn intent_work_summary_renders_counts_preview_and_work_query() {
+    let row = json!({
+        "type":"intent", "work_versions_format":"work_summary_v1",
+        "work_counts":{"pending":0,"partial":0,"accepted":1,"integrated":200,"retired":2},
+        "work_versions":[{"key":"topology:live:review","version":3,"integrated":false}],
+        "work_versions_count":203, "work_versions_unfinished_count":1,
+        "work_query":{"section":"work","epic_id":"epic","limit":32}
+    });
+    let details = board::row_details(&row).join("\n");
+    for expected in [
+        "work versions format: work_summary_v1",
+        "work counts / integrated: 200",
+        "topology:live:review",
+        "work versions unfinished count: 1",
+        "work query / section: work",
+    ] {
+        assert!(details.contains(expected), "{expected}: {details}");
+    }
 }

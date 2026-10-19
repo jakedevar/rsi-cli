@@ -24,12 +24,12 @@ use super::SandboxAllocation;
 use crate::error::{DaemonError, Result};
 use crate::path_safety::canonicalize_non_strict;
 use crate::process_control::{
-    ProcessContainment, configure_std_process_group, terminate_process_group,
+    ProcessContainment, configure_std_process_group, terminate_owned_group_cleanup,
 };
 use rsi_common::types::SandboxKind;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -66,19 +66,85 @@ const QUARANTINE_TREE_MAX_ENTRIES: usize = 262_144;
 const QUARANTINE_TREE_MAX_RELATIVE_PATH_BYTES: usize = 64 * 1024 * 1024;
 const QUARANTINE_TREE_MAX_DEPTH: usize = 1_024;
 const QUARANTINE_TREE_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(not(target_os = "macos"))]
 const QUARANTINE_MOUNTINFO_MAX_BYTES: usize = 16 * 1024 * 1024;
 const QUARANTINE_MOUNTINFO_MAX_RECORDS: usize = 131_072;
 const WORKTREE_ADMIN_FILE_MAX_BYTES: usize = 16 * 1024;
 const MAX_RECOVERY_STATE_DISPATCHES: usize = 2;
 
-static REPOSITORY_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+static REPOSITORY_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<RepositoryMutationEntry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Who holds one repository's mutation guard (#2663). Recorded by the guard
+/// itself, so it reflects lock ownership and not journal chronology: a replayed
+/// older settlement run holds the repository while a newer run is the latest
+/// receipt, and an unrelated Git operation holds it while no run does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryHolder {
+    /// A settlement run is mutating one of the repository's roots.
+    SettlementRun(Uuid),
+    /// Any other daemon operation (audit, purge, cleanup, ...), named by a
+    /// static label; `with_repository_mutation` records `git_operation`.
+    Operation(&'static str),
+}
+
+/// The outcome of a bounded attempt to take the repository guard.
+#[derive(Debug)]
+pub enum RepositoryWait<T> {
+    Ran(T),
+    /// The guard stayed held for the whole wait; `holder` is the owner observed
+    /// at that moment (`None` only inside the instant between a holder taking
+    /// the guard and recording itself, or after it released).
+    Busy {
+        holder: Option<RepositoryHolder>,
+    },
+}
+
+struct RepositoryMutationEntry {
+    lock: Mutex<()>,
+    holder: Mutex<Option<RepositoryHolder>>,
+}
+
+impl RepositoryMutationEntry {
+    fn observe_holder(&self) -> Option<RepositoryHolder> {
+        self.holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record `holder` until the returned scope drops, which is before the
+    /// caller's lock guard releases.
+    fn record_holder(&self, holder: RepositoryHolder) -> RepositoryHolderScope<'_> {
+        *self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(holder);
+        RepositoryHolderScope { entry: self }
+    }
+}
+
+struct RepositoryHolderScope<'a> {
+    entry: &'a RepositoryMutationEntry,
+}
+
+impl Drop for RepositoryHolderScope<'_> {
+    fn drop(&mut self) {
+        *self
+            .entry
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
 
 #[cfg(any(test, feature = "test-seam"))]
 thread_local! {
     static ATOMIC_REF_PRE_SPAWN_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static DIRECT_REF_EMPTY_LOOKUP_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
         std::cell::RefCell::new(None);
     static WORKTREE_REMOVE_POST_EFFECT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -95,7 +161,13 @@ pub struct RepositoryTargetObservation {
     pub repository_identity: String,
     pub canonical_repo_dir: PathBuf,
     pub target_ref: String,
+    /// The commit that source ancestry is proved against: the local target
+    /// branch tip for [`observe_repository_target_locked`], the fetched
+    /// remote-tracking tip for [`observe_settlement_target_locked`] when the
+    /// repository has an `origin`.
     pub target_oid: String,
+    /// The local target branch tip, which a removal must leave untouched.
+    pub local_target_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +280,8 @@ impl QuarantineTreeProof {
     }
 
     #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
+    #[cfg(target_os = "linux")]
     fn entry_count(&self) -> usize {
         self.identities.len()
     }
@@ -254,29 +328,83 @@ impl QuarantineTreeDigestEntry {
 
 /// Serialize every daemon Git mutation for one repository. Callers must not
 /// await while inside `operation`; all Git work is synchronous and intended
-/// for a bounded blocking task.
+/// for a bounded blocking task. The holder is recorded as an anonymous
+/// `git_operation`; a caller that can name itself uses
+/// [`with_repository_mutation_as`].
 pub fn with_repository_mutation<T>(
     origin: &Path,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let identity = repository_identity_path(origin)?;
-    let lock = {
-        let mut registry = REPOSITORY_MUTATION_LOCKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(
-            registry
-                .entry(identity)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    };
-    let _guard = lock
+    with_repository_mutation_as(
+        origin,
+        RepositoryHolder::Operation("git_operation"),
+        operation,
+    )
+}
+
+/// [`with_repository_mutation`] that records `holder` for the time it holds the
+/// repository, so a bounded waiter can name the real owner (#2663).
+pub fn with_repository_mutation_as<T>(
+    origin: &Path,
+    holder: RepositoryHolder,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let entry = repository_mutation_entry(origin)?;
+    let _guard = entry
+        .lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _holder = entry.record_holder(holder);
     // Marks this thread as holding the repository mutex so Store and stripe
     // waits beneath it are bounded (global lock order, Issue #606).
     let _held = crate::store::custody_lock_order::HeldScope::repository();
     operation()
+}
+
+/// Like [`with_repository_mutation_as`], but gives up after `wait` and returns
+/// [`RepositoryWait::Busy`] with the observed holder, without running
+/// `operation`, when another holder still has the repository (#2622). A read
+/// that must answer inside its transport deadline uses this so a long
+/// settlement saga yields a typed busy answer instead of a timeout. The wait is
+/// polled, never unbounded, and takes nothing the holder owns.
+pub fn with_repository_mutation_within<T>(
+    origin: &Path,
+    wait: std::time::Duration,
+    holder: RepositoryHolder,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<RepositoryWait<T>> {
+    let entry = repository_mutation_entry(origin)?;
+    let deadline = std::time::Instant::now() + wait;
+    let _guard = loop {
+        match entry.lock.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(RepositoryWait::Busy {
+                        holder: entry.observe_holder(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    };
+    let _holder = entry.record_holder(holder);
+    let _held = crate::store::custody_lock_order::HeldScope::repository();
+    operation().map(RepositoryWait::Ran)
+}
+
+fn repository_mutation_entry(origin: &Path) -> Result<Arc<RepositoryMutationEntry>> {
+    let identity = repository_identity_path(origin)?;
+    let mut registry = REPOSITORY_MUTATION_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(Arc::clone(registry.entry(identity).or_insert_with(|| {
+        Arc::new(RepositoryMutationEntry {
+            lock: Mutex::new(()),
+            holder: Mutex::new(None),
+        })
+    })))
 }
 
 pub fn observe_repository_target_locked(origin: &Path) -> Result<RepositoryTargetObservation> {
@@ -303,8 +431,166 @@ pub fn observe_repository_target_locked(origin: &Path) -> Result<RepositoryTarge
         repository_identity,
         canonical_repo_dir,
         target_ref,
+        local_target_oid: target_oid.clone(),
         target_oid,
     })
+}
+
+fn repository_has_origin_remote_locked(origin: &Path) -> Result<bool> {
+    let output = run_git_raw(
+        origin,
+        &["config", "--get", "remote.origin.url"],
+        "observe origin remote",
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(DaemonError::Process(
+            "Git origin remote observation failed".into(),
+        )),
+    }
+}
+
+fn remote_tracking_ref_for(target_ref: &str) -> Result<String> {
+    target_ref
+        .strip_prefix("refs/heads/")
+        .map(|branch| format!("refs/remotes/origin/{branch}"))
+        .ok_or_else(|| DaemonError::InvalidParam("settlement target is not a local branch".into()))
+}
+
+/// Settlement authority refresh: fetch origin's copy of the symbolic target
+/// branch into `refs/remotes/origin/<branch>` with a bounded timeout. A
+/// repository without an `origin` has no remote authority and needs no fetch.
+/// A fetch that fails, times out or leaves no resolvable tracking ref is an
+/// error; the audit reports it as a typed refusal and never falls back to the
+/// local branch.
+///
+/// # Errors
+/// The target is detached, the fetch did not succeed, or its ref is unreadable.
+pub fn fetch_settlement_target_locked(origin: &Path) -> Result<()> {
+    if !repository_has_origin_remote_locked(origin)? {
+        return Ok(());
+    }
+    let target_ref = run_git_text(
+        origin,
+        &["symbolic-ref", "-q", "HEAD"],
+        "resolve target ref",
+    )?;
+    let tracking = remote_tracking_ref_for(&target_ref)?;
+    let refspec = format!("+{target_ref}:{tracking}");
+    let mut fetch = git_command();
+    fetch
+        .args([
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "origin",
+            refspec.as_str(),
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(origin);
+    let limits = ProcessLimits {
+        execution_timeout: ROLLING_FETCH_TIMEOUT,
+        ..ProcessLimits::default()
+    };
+    let fetched =
+        capture_bounded_with_limits(&mut fetch, "fetch settlement target tip", None, limits);
+    match fetched {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            return Err(DaemonError::Process(
+                "settlement target fetch did not succeed".into(),
+            ));
+        }
+    }
+    resolve_ref_locked(origin, &tracking)?.ok_or_else(|| {
+        DaemonError::Process("settlement target fetch left no tracking ref".into())
+    })?;
+    Ok(())
+}
+
+/// Settlement target authority: like [`observe_repository_target_locked`] but,
+/// when the repository has an `origin`, `target_oid` is the last fetched
+/// `refs/remotes/origin/<branch>` tip (the local branch is never advanced by
+/// anything, so it is stale on a long-lived hub). `local_target_oid` keeps the
+/// local tip for unchanged-ref postconditions. Never fetches; the audit calls
+/// [`fetch_settlement_target_locked`] first and apply rechecks the same tip.
+///
+/// # Errors
+/// As [`observe_repository_target_locked`], or the tracking ref is missing.
+pub fn observe_settlement_target_locked(origin: &Path) -> Result<RepositoryTargetObservation> {
+    let mut observation = observe_repository_target_locked(origin)?;
+    if repository_has_origin_remote_locked(origin)? {
+        let tracking = remote_tracking_ref_for(&observation.target_ref)?;
+        observation.target_oid = resolve_ref_locked(origin, &tracking)?.ok_or_else(|| {
+            DaemonError::InvalidParam("settlement fetched target tip is unavailable".into())
+        })?;
+    }
+    Ok(observation)
+}
+
+/// How fresh the ref a settlement audit compared source ancestry against is
+/// (#2731). A stale tracking ref reads as `nonancestor` for work that has in
+/// fact landed, so the audit names the ref and its age instead of leaving the
+/// operator to guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementTargetFreshness {
+    /// The ref ancestry was proved against: `refs/remotes/origin/<branch>` when
+    /// the repository has an `origin`, else the local target branch.
+    pub compared_ref: String,
+    /// Seconds since the ref file (or, for a packed ref, `packed-refs`) last
+    /// changed. A fetch that moves nothing does not touch it, so on a branch
+    /// that moves often a large value means no fetch has seen a new tip.
+    pub ref_updated_secs_ago: Option<u64>,
+    /// Seconds since the compared tip commit was committed.
+    pub tip_committed_secs_ago: Option<u64>,
+}
+
+/// Best-effort freshness of the settlement comparison ref. Never fetches and
+/// never fails: unreadable pieces are `None`.
+pub fn observe_settlement_target_freshness_locked(
+    origin: &Path,
+    target_ref: &str,
+) -> SettlementTargetFreshness {
+    let compared_ref = if repository_has_origin_remote_locked(origin).unwrap_or(false) {
+        remote_tracking_ref_for(target_ref).unwrap_or_else(|_| target_ref.to_string())
+    } else {
+        target_ref.to_string()
+    };
+    let now = std::time::SystemTime::now();
+    let secs_since = |time: std::time::SystemTime| {
+        now.duration_since(time)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+    };
+    let common_dir = run_git_text(
+        origin,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "locate common git dir",
+    )
+    .ok()
+    .map(PathBuf::from);
+    let ref_updated_secs_ago = common_dir.as_ref().and_then(|dir| {
+        let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        modified(dir.join(&compared_ref))
+            .or_else(|| modified(dir.join("packed-refs")))
+            .map(secs_since)
+    });
+    let tip_committed_secs_ago = run_git_text(
+        origin,
+        &["log", "-1", "--format=%ct", compared_ref.as_str(), "--"],
+        "read compared tip commit time",
+    )
+    .ok()
+    .and_then(|text| text.trim().parse::<u64>().ok())
+    .map(|committed| secs_since(std::time::UNIX_EPOCH + std::time::Duration::from_secs(committed)));
+    SettlementTargetFreshness {
+        compared_ref,
+        ref_updated_secs_ago,
+        tip_committed_secs_ago,
+    }
 }
 
 pub fn observe_configured_upstream_ref_locked(origin: &Path) -> Result<Option<String>> {
@@ -354,6 +640,110 @@ pub fn observe_worktree_ignoring_ignored_locked(
     observe_worktree_inner_locked(origin, root, false)
 }
 
+/// Only Git-ignored Python caches are disposable. Keep byte paths (porcelain
+/// -z is unquoted), exact directory components, and all tracked/untracked data.
+/// Requiring every record to be ignored also keeps rename source records from
+/// being mistaken for status records. Cache directories are accepted only when
+/// Git reports the collapsed directory itself; individual files below them
+/// must have a `.pyc` final component. The one non-cache record accepted is the
+/// daemon's own root-level build stamp, and only after
+/// [`daemon_build_stamp_is_authentic`] proves the file at `root` (#2610).
+fn only_regenerable_ignored_output(root: &Path, status: &[u8]) -> bool {
+    status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .all(|record| {
+            let Some(path) = record.strip_prefix(b"!! ") else {
+                return false;
+            };
+            if path == super::execution_scratch::BUILD_ENV_RECORD.as_bytes() {
+                return daemon_build_stamp_is_authentic(root);
+            }
+            let Some(final_component) = path.rsplit(|byte| *byte == b'/').next() else {
+                return false;
+            };
+            if final_component.ends_with(b".pyc") {
+                return true;
+            }
+            let collapsed_directory = path
+                .strip_suffix(b"/")
+                .and_then(|directory| directory.rsplit(|byte| *byte == b'/').next());
+            path.ends_with(b"/")
+                && collapsed_directory.is_some_and(|component| {
+                    component == b"__pycache__" || component == b".pytest_cache"
+                })
+        })
+}
+
+/// Largest stamp the daemon writes is a few hundred bytes of env names; refuse
+/// anything bigger rather than read an arbitrary ignored file.
+#[cfg(unix)]
+const BUILD_STAMP_MAX_BYTES: u64 = 64 * 1024;
+
+/// Prove `<root>/.rsi-build-env.json` is the stamp the daemon wrote: a regular
+/// file (opened without following a symlink), owned by the daemon user, with
+/// a single link, bounded size and the exact `{version: 1, env: {str: str}}`
+/// shape. The contents are parsed in memory only; they may carry transport or
+/// configuration values and are never logged or returned (#2610).
+///
+/// The ownership and no-follow proof needs Unix `O_NOFOLLOW`, `uid` and
+/// `nlink`; see the `cfg(not(unix))` twin for the other platforms (#2615).
+#[cfg(unix)]
+fn daemon_build_stamp_is_authentic(root: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = root.join(super::execution_scratch::BUILD_ENV_RECORD);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(&path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    // SAFETY: `geteuid` has no preconditions.
+    let daemon_uid = unsafe { nix::libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != daemon_uid
+        || metadata.nlink() != 1
+        || metadata.len() > BUILD_STAMP_MAX_BYTES
+    {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(BUILD_STAMP_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > BUILD_STAMP_MAX_BYTES
+    {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(record)) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    else {
+        return false;
+    };
+    record.len() == 2
+        && record.get("version") == Some(&serde_json::Value::from(1))
+        && record
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|env| env.values().all(serde_json::Value::is_string))
+}
+
+/// Platforms without Unix ownership metadata cannot prove the stamp is the
+/// daemon's: there is no portable no-follow open, owner or link-count check
+/// here, and a path-based check would follow a substituted symlink or accept a
+/// file another user planted. An unproven stamp is never normalized away, so
+/// the ignored record stays in the status, the root is not clean and it is
+/// retained (#2615). Never replace this with a shape-only check.
+#[cfg(not(unix))]
+fn daemon_build_stamp_is_authentic(_root: &Path) -> bool {
+    false
+}
+
 fn observe_worktree_inner_locked(
     origin: &Path,
     root: &Path,
@@ -396,6 +786,14 @@ fn observe_worktree_inner_locked(
             &status_args.iter().map(String::as_str).collect::<Vec<_>>(),
             "inspect worktree cleanliness",
         )?;
+        // Git's non-force worktree removal already discards ignored output.
+        // Normalize only the fixed cache allowlist in both audit and rechecks;
+        // audit itself performs no filesystem writes.
+        let status = if include_ignored && only_regenerable_ignored_output(root, &status) {
+            Vec::new()
+        } else {
+            status
+        };
         let (visibility_safe, visibility_digest) = inspect_index_visibility_locked(root)?;
         let clean = status.is_empty() && visibility_safe;
         let mut digest = Sha256::new();
@@ -728,6 +1126,16 @@ pub fn repair_moved_worktree_if_exact_locked(
 /// re-prove the digest immediately before removal, and the single-user threat
 /// boundary still excludes an adversarial same-UID pathname racer.
 pub fn prove_quarantine_tree_safe(root: &Path) -> Result<QuarantineTreeProof> {
+    #[cfg(target_os = "macos")]
+    return prove_quarantine_tree_safe_with(
+        root,
+        || reject_mounts_at_or_below_native(root),
+        QUARANTINE_TREE_MAX_ENTRIES,
+        QUARANTINE_TREE_MAX_RELATIVE_PATH_BYTES,
+        QUARANTINE_TREE_MAX_DEPTH,
+        QUARANTINE_TREE_DEADLINE,
+    );
+    #[cfg(not(target_os = "macos"))]
     prove_quarantine_tree_safe_at(
         root,
         Path::new("/proc/self/mountinfo"),
@@ -738,9 +1146,28 @@ pub fn prove_quarantine_tree_safe(root: &Path) -> Result<QuarantineTreeProof> {
     )
 }
 
+#[cfg(not(target_os = "macos"))]
 fn prove_quarantine_tree_safe_at(
     root: &Path,
     mountinfo_path: &Path,
+    max_entries: usize,
+    max_relative_path_bytes: usize,
+    max_depth: usize,
+    timeout: Duration,
+) -> Result<QuarantineTreeProof> {
+    prove_quarantine_tree_safe_with(
+        root,
+        || reject_mounts_at_or_below(root, mountinfo_path),
+        max_entries,
+        max_relative_path_bytes,
+        max_depth,
+        timeout,
+    )
+}
+
+fn prove_quarantine_tree_safe_with(
+    root: &Path,
+    read_mounts: impl FnOnce() -> Result<Option<HashSet<u64>>>,
     max_entries: usize,
     max_relative_path_bytes: usize,
     max_depth: usize,
@@ -760,7 +1187,7 @@ fn prove_quarantine_tree_safe_at(
         ));
     }
     ensure_quarantine_tree_deadline(deadline)?;
-    let ancestor_mount_devices = reject_mounts_at_or_below(root, mountinfo_path)?;
+    let ancestor_mount_devices = read_mounts()?;
     ensure_quarantine_tree_deadline(deadline)?;
     reject_extended_attributes(root)?;
     ensure_quarantine_tree_deadline(deadline)?;
@@ -1332,8 +1759,31 @@ fn require_path_absent(path: &Path, label: &str) -> Result<()> {
 /// impossible there (#934). Every other name still refuses the quarantine,
 /// including POSIX ACLs (`system.posix_acl_*`), file capabilities
 /// (`security.capability`) and `user.*` or `trusted.*` attributes.
+#[cfg(all(any(test, target_os = "linux"), not(target_os = "macos")))]
 const PERMITTED_QUARANTINE_XATTRS: &[&[u8]] = &[b"security.selinux"];
 
+/// Extended attributes macOS itself stamps on a file an ordinary process
+/// creates, each system-managed metadata with no payload a recursive removal
+/// could lose (the file's bytes are in its data fork). Darwin has no `SELinux`,
+/// so `security.selinux` is not permitted here: a file carrying it was labelled
+/// by something else and refuses like any other attribute.
+/// - `com.apple.provenance`: the kernel's Gatekeeper provenance mark, set on
+///   every file a process creates; a fixed flag, never user data.
+/// - `com.apple.quarantine`: the Gatekeeper download flag; a flag and the
+///   origin string of the download, never content.
+/// - `com.apple.macl`: the kernel-maintained list of apps that may open the
+///   file under TCC, rewritten whenever the file is opened through a sandboxed
+///   app; an access grant derived from use, not data.
+/// - `com.apple.lastuseddate#PS`: Finder/Spotlight's last-opened timestamp.
+#[cfg(target_os = "macos")]
+const PERMITTED_QUARANTINE_XATTRS: &[&[u8]] = &[
+    b"com.apple.provenance",
+    b"com.apple.quarantine",
+    b"com.apple.macl",
+    b"com.apple.lastuseddate#PS",
+];
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn check_quarantine_xattr_names(names: &[u8]) -> Result<()> {
     let permitted = names
         .split(|byte| *byte == 0)
@@ -1353,6 +1803,7 @@ fn check_quarantine_xattr_names(names: &[u8]) -> Result<()> {
 /// grew fails the read (ERANGE), and a list that shrank, for example a racer
 /// removing `user.test` so only `security.selinux` remains, must not pass as
 /// the shorter list (#934 review).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn quarantine_xattr_inventory(
     length: isize,
     read_names: impl FnOnce(&mut [u8]) -> isize,
@@ -1392,7 +1843,64 @@ fn reject_extended_attributes(path: &Path) -> Result<()> {
     check_quarantine_xattr_names(&names)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn reject_extended_attributes(path: &Path) -> Result<()> {
+    unsafe extern "C" {
+        fn acl_get_link_np(
+            path: *const nix::libc::c_char,
+            acl_type: nix::libc::c_int,
+        ) -> *mut nix::libc::c_void;
+        fn acl_free(object: *mut nix::libc::c_void) -> nix::libc::c_int;
+    }
+    /// `ACL_TYPE_EXTENDED` from `<sys/acl.h>`.
+    const ACL_TYPE_EXTENDED: nix::libc::c_int = 0x0000_0100;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| DaemonError::InvalidParam("settlement quarantine path contains NUL".into()))?;
+    // SAFETY: `c_path` is NUL terminated and a null/zero buffer asks the kernel
+    // only for the no-follow xattr-list length; no caller memory is written.
+    let length = unsafe {
+        nix::libc::listxattr(
+            c_path.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            nix::libc::XATTR_NOFOLLOW,
+        )
+    };
+    let names = quarantine_xattr_inventory(length, |names| {
+        // SAFETY: `names` is a writable buffer of exactly `names.len()` bytes
+        // and `c_path` is NUL terminated.
+        unsafe {
+            nix::libc::listxattr(
+                c_path.as_ptr(),
+                names.as_mut_ptr().cast(),
+                names.len(),
+                nix::libc::XATTR_NOFOLLOW,
+            )
+        }
+    })?;
+    check_quarantine_xattr_names(&names)?;
+    // SAFETY: `c_path` is NUL terminated; the call does not follow a final symlink.
+    let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        // ENOENT: the entry has no extended ACL.
+        return if error.raw_os_error() == Some(nix::libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(DaemonError::Process(format!(
+                "settlement quarantine ACL inventory failed: {error}"
+            )))
+        };
+    }
+    // SAFETY: `acl` came from `acl_get_link_np` and is freed once.
+    unsafe { acl_free(acl) };
+    Err(DaemonError::Process(
+        "settlement quarantine contains extended attributes or ACLs".into(),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reject_extended_attributes(_path: &Path) -> Result<()> {
     Err(DaemonError::Process(
         "settlement quarantine xattr proof is unsupported on this platform".into(),
@@ -1402,6 +1910,7 @@ fn reject_extended_attributes(_path: &Path) -> Result<()> {
 /// Refuse a mount at or below `root` and return the devices of the mounts at
 /// or above it (see `QuarantineTreeProof::filesystem_devices`); `None` when an
 /// ancestor record's device field cannot be parsed.
+#[cfg(not(target_os = "macos"))]
 fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<Option<HashSet<u64>>> {
     let mut mountinfo = Vec::with_capacity(64 * 1024);
     std::fs::File::open(mountinfo_path)
@@ -1456,7 +1965,57 @@ fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<Optio
     Ok(ancestor_devices)
 }
 
+/// The macOS counterpart of [`reject_mounts_at_or_below`]: the mount table
+/// from `getfsstat(2)` has no `major:minor` superblock numbers, so no ancestor
+/// device is returned and every mount stays a possible tree holder.
+#[cfg(target_os = "macos")]
+fn reject_mounts_at_or_below_native(root: &Path) -> Result<Option<HashSet<u64>>> {
+    let failed = |what: &str| {
+        DaemonError::Process(format!(
+            "settlement mount inventory {what}: {}",
+            std::io::Error::last_os_error()
+        ))
+    };
+    // SAFETY: a null buffer asks only for the current mount count.
+    let count = unsafe { nix::libc::getfsstat(std::ptr::null_mut(), 0, nix::libc::MNT_NOWAIT) };
+    let count = usize::try_from(count).map_err(|_| failed("count failed"))?;
+    if count > QUARANTINE_MOUNTINFO_MAX_RECORDS {
+        return Err(DaemonError::Process(
+            "settlement mount inventory count exceeded bound".into(),
+        ));
+    }
+    // Room for mounts added between the two calls; a full buffer fails closed.
+    let mut mounts = vec![
+        // SAFETY: `statfs` is plain data; all-zero is a valid value.
+        unsafe { std::mem::zeroed::<nix::libc::statfs>() };
+        count + 16
+    ];
+    let bytes = nix::libc::c_int::try_from(std::mem::size_of_val(mounts.as_slice()))
+        .map_err(|_| DaemonError::Process("settlement mount inventory is too large".into()))?;
+    // SAFETY: the buffer holds `bytes` bytes of `statfs` records.
+    let filled = unsafe { nix::libc::getfsstat(mounts.as_mut_ptr(), bytes, nix::libc::MNT_NOWAIT) };
+    let filled = usize::try_from(filled).map_err(|_| failed("read failed"))?;
+    if filled >= mounts.len() {
+        return Err(DaemonError::Process(
+            "settlement mount inventory changed during the read".into(),
+        ));
+    }
+    for mount in &mounts[..filled] {
+        let name = &mount.f_mntonname;
+        // SAFETY: the kernel NUL-terminates the fixed-size mount-point name.
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        let mount_point = Path::new(OsStr::from_bytes(name.to_bytes()));
+        if mount_point == root || mount_point.starts_with(root) {
+            return Err(DaemonError::Process(
+                "settlement quarantine contains a mount point".into(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
 /// Parse a mountinfo `major:minor` field into the `st_dev` encoding.
+#[cfg(not(target_os = "macos"))]
 fn parse_mountinfo_device(field: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(field).ok()?;
     let (major, minor) = text.split_once(':')?;
@@ -1485,6 +2044,7 @@ fn mountinfo_device_number(major: u64, minor: u64) -> Option<u64> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn decode_mountinfo_path(encoded: &[u8]) -> Result<Vec<u8>> {
     let mut decoded = Vec::with_capacity(encoded.len());
     let mut index = 0_usize;
@@ -1658,6 +2218,315 @@ pub fn observe_tracked_clean_idle(cwd: &Path) -> Result<bool> {
     Ok(status.is_empty())
 }
 
+/// What the bounded branch restoration did (#2539, #2541, #2556, #2557).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchRestoreOutcome {
+    /// `git switch` succeeded.
+    Switched,
+    /// Git refused (for example a path it would overwrite); nothing was lost.
+    Refused(String),
+    /// Git was killed (deadline) or died mid-switch and left an `index.lock`
+    /// behind. `tree` says what the daemon found after cleaning up (#2557).
+    Interrupted { error: String, tree: TreeAfterKill },
+}
+
+/// The state of the worktree after a switch that did not complete (#2557).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeAfterKill {
+    /// Git left no `index.lock`; the worktree status matches the pre-switch one.
+    Untouched,
+    /// The `index.lock` our git left was removed and the touched tracked paths
+    /// were put back; the worktree status matches the pre-switch one.
+    Recovered,
+    /// The worktree may be partially switched; `String` says what is left.
+    MaybePartial(String),
+}
+
+/// Bound for each recovery command after a killed switch.
+const RESTORE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn restore_git_command(cwd: &Path) -> Command {
+    let mut command = git_command();
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .current_dir(cwd);
+    command
+}
+
+fn run_restore_git(
+    cwd: &Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+    label: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = restore_git_command(cwd);
+    command.args(args);
+    capture_bounded_with_limits(
+        &mut command,
+        label,
+        input,
+        ProcessLimits {
+            execution_timeout: timeout,
+            ..ProcessLimits::default()
+        },
+    )
+}
+
+fn worktree_status_snapshot(cwd: &Path) -> Option<Vec<u8>> {
+    let output = run_restore_git(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        None,
+        "snapshot worktree status",
+        RESTORE_RECOVERY_TIMEOUT,
+    )
+    .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// One record of `git diff-tree -r -z --raw --no-renames`.
+struct TreeChange<'a> {
+    old_mode: String,
+    new_mode: String,
+    path: &'a [u8],
+}
+
+impl TreeChange<'_> {
+    fn is_gitlink(&self) -> bool {
+        self.old_mode == "160000" || self.new_mode == "160000"
+    }
+}
+
+fn parse_raw_tree_changes(raw: &[u8]) -> Vec<TreeChange<'_>> {
+    let mut fields = raw
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    let mut changes = Vec::new();
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        // ":<old mode> <new mode> <old sha> <new sha> <status>"
+        let meta = String::from_utf8_lossy(meta);
+        let mut parts = meta.trim_start_matches(':').split(' ');
+        changes.push(TreeChange {
+            old_mode: parts.next().unwrap_or("").to_owned(),
+            new_mode: parts.next().unwrap_or("").to_owned(),
+            path,
+        });
+    }
+    changes
+}
+
+/// Switch the worktree at `cwd` to the existing local `branch` without ever
+/// discarding local work, through the bounded Git runner.
+///
+/// `--no-overwrite-ignore` makes Git refuse a switch that would overwrite an
+/// ignored file (its default overwrites it silently; untracked files are
+/// always refused), so ignored and untracked paths are both protected and a
+/// collision is a `Refused` result (#2539). `--no-recurse-submodules` overrides
+/// a configured `submodule.recurse`, which would otherwise recurse through
+/// `read-tree`, where `--no-overwrite-ignore` does not apply (#2556).
+/// `--no-guess` keeps Git from creating the branch from a remote one when the
+/// local branch is missing (#2556). fsmonitor and hooks are disabled for this
+/// daemon operation. The runner drains both pipes and kills the whole process
+/// group when `timeout` passes, so a stalled smudge/process filter becomes an
+/// `Interrupted` result with no child left running (#2541). A killed Git cannot
+/// run its lockfile cleanup and has already begun rewriting files, so the
+/// daemon removes the `index.lock` it left (the lock was absent before) and puts
+/// the touched tracked paths back from the unchanged HEAD (#2557).
+pub fn restore_branch_bounded(
+    cwd: &Path,
+    branch: &str,
+    timeout: Duration,
+) -> Result<BranchRestoreOutcome> {
+    let git_dir = PathBuf::from(run_git_text(
+        cwd,
+        &["rev-parse", "--absolute-git-dir"],
+        "inspect restore Git directory",
+    )?);
+    let lock = git_dir.join("index.lock");
+    if lock.try_exists()? {
+        // Not ours: someone holds the index. Git would refuse; do not race it.
+        return Ok(BranchRestoreOutcome::Refused(format!(
+            "{} exists; another Git operation holds the index",
+            lock.display()
+        )));
+    }
+    // A moved submodule pointer would leave the submodule worktree behind the
+    // superproject (it is never recursed into, #2556) and a later `commit -a`
+    // would commit the stale pointer: leave that switch to the agent.
+    let target = format!("refs/heads/{branch}");
+    if let Ok(output) = run_restore_git(
+        cwd,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--raw",
+            "--no-renames",
+            "HEAD",
+            &target,
+        ],
+        None,
+        "compare submodule pointers",
+        RESTORE_RECOVERY_TIMEOUT,
+    ) && output.status.success()
+        && let Some(moved) = parse_raw_tree_changes(&output.stdout)
+            .iter()
+            .find(|change| change.is_gitlink())
+    {
+        return Ok(BranchRestoreOutcome::Refused(format!(
+            "submodule `{}` differs between the two branches and the daemon never updates \
+             submodules",
+            String::from_utf8_lossy(moved.path)
+        )));
+    }
+    let before = worktree_status_snapshot(cwd);
+    let mut command = restore_git_command(cwd);
+    command.args([
+        "switch",
+        "--quiet",
+        "--no-overwrite-ignore",
+        "--no-recurse-submodules",
+        "--no-guess",
+        branch,
+    ]);
+    let result = capture_bounded_with_limits(
+        &mut command,
+        "restore sandbox branch",
+        None,
+        ProcessLimits {
+            execution_timeout: timeout,
+            ..ProcessLimits::default()
+        },
+    );
+    let (error, refused) = match result {
+        Ok(output) if output.status.success() => return Ok(BranchRestoreOutcome::Switched),
+        Ok(output) => (
+            None,
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ),
+        Err(error) => (Some(error.to_string()), String::new()),
+    };
+    let lock_left = lock.try_exists().unwrap_or(true);
+    if error.is_none() && !lock_left {
+        // A clean refusal: Git removed its own lock and wrote nothing.
+        return Ok(BranchRestoreOutcome::Refused(refused));
+    }
+    let error = error.unwrap_or(refused);
+    let tree = if lock_left {
+        recover_after_killed_switch(cwd, &lock, branch, before.as_deref())
+    } else if before.is_some() && worktree_status_snapshot(cwd) == before {
+        TreeAfterKill::Untouched
+    } else {
+        TreeAfterKill::MaybePartial(
+            "its status could not be compared with the pre-switch one".into(),
+        )
+    };
+    Ok(BranchRestoreOutcome::Interrupted { error, tree })
+}
+
+/// The group is dead (the runner confirmed it) and the lock was absent before
+/// the switch, so the lock is ours. Index := HEAD (the pre-switch index, since
+/// the worktree was tracked-clean), delete the files the target tree added,
+/// and check out the other touched paths again from the index.
+fn recover_after_killed_switch(
+    cwd: &Path,
+    lock: &Path,
+    branch: &str,
+    before: Option<&[u8]>,
+) -> TreeAfterKill {
+    let partial = |why: String| TreeAfterKill::MaybePartial(why);
+    if let Err(error) = std::fs::remove_file(lock) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return partial(format!("{} could not be removed: {error}", lock.display()));
+        }
+    }
+    let step = |args: &[&str], input: Option<&[u8]>, label: &str| {
+        run_restore_git(cwd, args, input, label, RESTORE_RECOVERY_TIMEOUT)
+            .map_err(|error| format!("{label}: {error}"))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(output.stdout)
+                } else {
+                    Err(format!(
+                        "{label}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            })
+    };
+    let target = format!("refs/heads/{branch}");
+    let touched = match step(
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--raw",
+            "--no-renames",
+            "HEAD",
+            &target,
+        ],
+        None,
+        "list paths the killed switch may have touched",
+    ) {
+        Ok(bytes) => bytes,
+        Err(why) => return partial(why),
+    };
+    if let Err(why) = step(&["read-tree", "HEAD"], None, "reset the index to HEAD") {
+        return partial(why);
+    }
+    let mut checkout = Vec::new();
+    for change in parse_raw_tree_changes(&touched) {
+        if change.is_gitlink() {
+            continue; // submodules are never recursed into
+        }
+        let path = change.path;
+        let Ok(relative) = std::str::from_utf8(path) else {
+            return partial("a touched path is not UTF-8".into());
+        };
+        if Path::new(relative)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return partial(format!("unsafe touched path {relative:?}"));
+        }
+        if change.old_mode == "000000" {
+            // Absent from HEAD: the switch wrote it (Git verified nothing
+            // untracked or ignored was there), so it goes.
+            match std::fs::remove_file(cwd.join(relative)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return partial(format!("{relative} could not be removed: {error}")),
+            }
+        } else {
+            checkout.extend_from_slice(path);
+            checkout.push(0);
+        }
+    }
+    if !checkout.is_empty() {
+        if let Err(why) = step(
+            &["checkout-index", "--force", "--quiet", "-z", "--stdin"],
+            Some(&checkout),
+            "put touched tracked paths back from the index",
+        ) {
+            return partial(why);
+        }
+    }
+    match before {
+        Some(before) if worktree_status_snapshot(cwd).as_deref() == Some(before) => {
+            TreeAfterKill::Recovered
+        }
+        Some(_) => partial("its status still differs from the pre-switch one".into()),
+        None => partial("the pre-switch status was not captured".into()),
+    }
+}
+
 /// Read HEAD through the bounded Git runner without inspecting dirty files.
 pub(crate) fn observe_head_bounded(cwd: &Path) -> Result<String> {
     let head = run_git_text(
@@ -1675,7 +2544,7 @@ pub(crate) fn observe_head_bounded(cwd: &Path) -> Result<String> {
 
 /// The full symbolic ref (`refs/heads/..`) HEAD is attached to, through the
 /// bounded Git runner. `None` for a detached HEAD (#1144).
-pub(crate) fn observe_head_branch_bounded(cwd: &Path) -> Result<Option<String>> {
+pub fn observe_head_branch_bounded(cwd: &Path) -> Result<Option<String>> {
     let output = run_git_raw(
         cwd,
         &["symbolic-ref", "-q", "HEAD"],
@@ -2087,6 +2956,7 @@ fn probe_symbolic_ref_locked(origin: &Path, reference: &str, label: &str) -> Res
 }
 
 pub fn source_ref_has_symref_dependents_locked(origin: &Path, source_ref: &str) -> Result<bool> {
+    validate_transaction_ref(source_ref, "source worktree")?;
     let mut dependent = false;
     stream_git_lines(
         origin,
@@ -2101,7 +2971,102 @@ pub fn source_ref_has_symref_dependents_locked(origin: &Path, source_ref: &str) 
             Ok(())
         },
     )?;
-    Ok(dependent)
+    if dependent {
+        return Ok(true);
+    }
+    // for-each-ref omits dangling symrefs. After deleting the source, inspect
+    // loose refs as well so a dependent created during deletion remains visible.
+    let storage = run_git_raw(
+        origin,
+        &["config", "--get", "extensions.refStorage"],
+        "inspect symbolic dependency ref storage",
+    )?;
+    match storage.status.code() {
+        Some(1) => {}
+        Some(0) if storage.stdout == b"files\n" => {}
+        _ => {
+            return Err(DaemonError::Process(
+                "settlement symbolic dependency inventory requires Git files ref storage".into(),
+            ));
+        }
+    }
+    let common = run_git_text(
+        origin,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        "locate symbolic dependency inventory",
+    )?;
+    let refs = Path::new(&common).join("refs");
+    let mut pending = vec![refs];
+    let deadline = Instant::now() + GIT_EXECUTION_TIMEOUT;
+    let mut entries = 0;
+    while let Some(path) = pending.pop() {
+        entries += 1;
+        if entries > MAX_GIT_STREAM_RECORDS || Instant::now() >= deadline {
+            return Err(DaemonError::Process(
+                "settlement symbolic dependency inventory exceeded its bound".into(),
+            ));
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_dir() {
+            #[cfg(any(test, feature = "test-seam"))]
+            LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(&path);
+                }
+            });
+            // Git removes emptied ref directories (last loose ref deleted,
+            // `pack-refs --prune`), so a directory that vanishes before or
+            // during the listing is treated like a vanished file. Any other
+            // IO error still fails closed.
+            let listing = match std::fs::read_dir(&path) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in listing {
+                if Instant::now() >= deadline {
+                    return Err(DaemonError::Process(
+                        "settlement symbolic dependency inventory exceeded its bound".into(),
+                    ));
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(error.into()),
+                };
+                // Git lock files are in-flight writes, not published refs.
+                if entry.file_name().as_encoded_bytes().ends_with(b".lock") {
+                    continue;
+                }
+                if pending.len() + entries >= MAX_GIT_STREAM_RECORDS {
+                    return Err(DaemonError::Process(
+                        "settlement symbolic dependency inventory exceeded its bound".into(),
+                    ));
+                }
+                pending.push(entry.path());
+            }
+        } else {
+            match read_bounded_regular_text(&path, "loose symbolic dependency ref") {
+                Ok(text) if text.strip_prefix("ref:").map(str::trim) == Some(source_ref) => {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Concurrent deletion/packing of unrelated loose refs is safe.
+                    if !matches!(std::fs::symlink_metadata(&path), Err(ref io)
+                        if io.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn stream_git_lines(
@@ -2144,12 +3109,6 @@ pub fn is_ancestor_locked(origin: &Path, source: &str, target: &str) -> Result<b
     }
 }
 
-pub(crate) fn source_ref_in_use_locked(origin: &Path, source_ref: &str) -> Result<bool> {
-    Ok(list_worktrees_locked(origin)?
-        .iter()
-        .any(|entry| entry.branch.as_deref() == Some(source_ref)))
-}
-
 pub fn source_ref_is_registered_only_at_locked(
     origin: &Path,
     source_ref: &str,
@@ -2173,6 +3132,8 @@ pub fn source_ref_is_registered_only_at_locked(
 /// symbolic HEAD, so the expected commit is authenticated independently in
 /// the object database while the worktree registration and administrative
 /// HEAD remain bound to the source ref.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
 pub(crate) fn source_ref_is_registered_only_at_missing_ref_locked(
     origin: &Path,
     source_ref: &str,
@@ -2364,28 +3325,6 @@ pub fn source_ref_has_zero_registrations_locked(origin: &Path, source_ref: &str)
     Ok(!list_worktrees_locked(origin)?
         .iter()
         .any(|entry| entry.branch.as_deref() == Some(source_ref)))
-}
-
-pub fn other_ref_state_digest_locked(origin: &Path, excluded_ref: &str) -> Result<String> {
-    let mut digest = Sha256::new();
-    stream_git_lines(
-        origin,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(objectname) %(symref)",
-        ],
-        "snapshot unrelated refs",
-        |line| {
-            if line.starts_with(excluded_ref.as_bytes())
-                && line.get(excluded_ref.len()) == Some(&b' ')
-            {
-                return Ok(());
-            }
-            digest.update(line);
-            Ok(())
-        },
-    )?;
-    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 pub fn remove_worktree_non_force_locked(
@@ -2756,6 +3695,426 @@ pub fn delete_ref_compare_locked(
 /// Git holds their locks. Repository hooks are replaced only for this mutation;
 /// a configured hook cannot rewrite, reject, or delay the authorized operation.
 pub fn delete_source_ref_atomically_locked(
+    origin: &Path,
+    target_ref: &str,
+    expected_target_oid: &str,
+    source_ref: &str,
+    expected_source_oid: &str,
+) -> Result<()> {
+    delete_source_ref_transaction_locked(
+        origin,
+        target_ref,
+        expected_target_oid,
+        source_ref,
+        expected_source_oid,
+    )
+}
+
+/// Complete a retained quarantine in two bounded steps (#2131).
+///
+/// The exact quarantine is first removed with non-force `git worktree remove`
+/// inside a verify-only transaction on the *source* ref alone, so removing a
+/// large tree never holds the target ref lock (`refs/heads/rolling.lock`) and a
+/// killed Git cannot strand it. The short target-verify/source-delete
+/// transaction then runs with both locks held only for ref reads and writes. A
+/// crash between the steps leaves the branch-only shape (source ref exact, no
+/// path, no registration) that the audited completion retry already finishes.
+/// Registration residue with the path gone is not repaired here; the caller
+/// removes the exact stale registration first.
+pub fn complete_quarantine_and_delete_source_ref_locked(
+    origin: &Path,
+    original_root: &Path,
+    quarantine_root: &Path,
+    target_ref: &str,
+    expected_target_oid: &str,
+    source_ref: &str,
+    expected_source_oid: &str,
+) -> Result<()> {
+    require_path_absent(original_root, "original settlement root")?;
+    if quarantine_root.exists() {
+        prove_moved_worktree_exact_locked(
+            origin,
+            original_root,
+            quarantine_root,
+            source_ref,
+            expected_source_oid,
+        )?;
+        remove_quarantine_under_source_ref_lock_locked(
+            origin,
+            original_root,
+            quarantine_root,
+            source_ref,
+            expected_source_oid,
+        )?;
+    } else {
+        require_path_absent(quarantine_root, "settlement quarantine root")?;
+        if registration_for_path(origin, original_root)?.is_some()
+            || registration_for_path(origin, quarantine_root)?.is_some()
+            || !source_ref_has_zero_registrations_locked(origin, source_ref)?
+        {
+            return Err(DaemonError::Process(
+                "settlement completion has registration residue".into(),
+            ));
+        }
+    }
+    delete_source_ref_transaction_locked(
+        origin,
+        target_ref,
+        expected_target_oid,
+        source_ref,
+        expected_source_oid,
+    )?;
+    prove_branch_first_worktree_removed_locked(
+        origin,
+        original_root,
+        quarantine_root,
+        source_ref,
+        expected_source_oid,
+    )
+}
+
+/// Remove the exact, already-proved quarantine while only the live source ref
+/// is locked. A verify-only `update-ref` transaction holds the source ref lock;
+/// its daemon-authored `prepared` hook re-observes the source as a direct exact
+/// commit and runs non-force `git worktree remove`. The target ref is never
+/// locked, so the 30 s Git execution bound can strand at most this retired
+/// source ref's lock. Postconditions leave exactly the branch-only shape.
+fn remove_quarantine_under_source_ref_lock_locked(
+    origin: &Path,
+    original_root: &Path,
+    quarantine_root: &Path,
+    source_ref: &str,
+    expected_source_oid: &str,
+) -> Result<()> {
+    validate_transaction_ref(source_ref, "source")?;
+    if !valid_object_id(expected_source_oid) {
+        return Err(DaemonError::InvalidParam(
+            "settlement ref transaction requires canonical object ids".into(),
+        ));
+    }
+    require_direct_ref_at(origin, source_ref, expected_source_oid, "source")?;
+    let origin_text = origin
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("settlement repository is not UTF-8".into()))?;
+    let root_text = quarantine_root
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("settlement root is not UTF-8".into()))?;
+    let transaction =
+        format!("start\nverify {source_ref} {expected_source_oid}\nprepare\ncommit\n");
+    let hook_directory = settlement_live_ref_removal_hook_directory()?;
+    let hooks_path = hook_directory.path().to_str().ok_or_else(|| {
+        DaemonError::Process("settlement reference-hook path was not UTF-8".into())
+    })?;
+    let hooks_config = format!("core.hooksPath={hooks_path}");
+    let mut command = git_command();
+    command
+        .arg("-c")
+        .arg(&hooks_config)
+        .args(["update-ref", "--no-deref", "--stdin"])
+        .env("RSI_SETTLEMENT_ORIGIN", origin_text)
+        .env("RSI_SETTLEMENT_QUARANTINE_ROOT", root_text)
+        .env("RSI_SETTLEMENT_SOURCE_REF", source_ref)
+        .env("RSI_SETTLEMENT_SOURCE_OID", expected_source_oid)
+        .current_dir(origin);
+    let execution = capture_bounded_with_input(
+        command,
+        "remove settlement quarantine under source-ref lock",
+        transaction.as_bytes(),
+    );
+    let postcondition = prove_branch_only_residue_locked(
+        origin,
+        original_root,
+        quarantine_root,
+        source_ref,
+        expected_source_oid,
+    );
+    if postcondition.is_ok() {
+        // The exact postcondition is authoritative after a lost command ack.
+        require_acknowledged_or_reacquirable_ref_lock_locked(
+            origin,
+            source_ref,
+            expected_source_oid,
+            &execution,
+        )?;
+        return prove_branch_only_residue_locked(
+            origin,
+            original_root,
+            quarantine_root,
+            source_ref,
+            expected_source_oid,
+        );
+    }
+    match execution {
+        Err(error) => Err(error),
+        Ok(output) if !output.status.success() => Err(DaemonError::Process(
+            "non-force live-source Git worktree removal refused".into(),
+        )),
+        Ok(_) => postcondition,
+    }
+}
+
+/// The branch-only shape: the exact source ref is live and direct, the original
+/// and quarantine paths are absent, and no worktree is registered at either
+/// path or for the source ref.
+fn prove_branch_only_residue_locked(
+    origin: &Path,
+    original_root: &Path,
+    root: &Path,
+    source_ref: &str,
+    expected_oid: &str,
+) -> Result<()> {
+    require_commit_object_locked(origin, expected_oid)?;
+    require_path_absent(root, "settlement quarantine root")?;
+    if observe_direct_ref_locked(origin, source_ref)?
+        != DirectRefObservation::Commit(expected_oid.to_string())
+        || registration_for_path(origin, original_root)?.is_some()
+        || registration_for_path(origin, root)?.is_some()
+        || !source_ref_has_zero_registrations_locked(origin, source_ref)?
+    {
+        return Err(DaemonError::Process(
+            "worktree removal left source ref drift or worktree registration residue".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Exact Git administration of a quarantine whose directory is gone but whose
+/// worktree registration remains (`git worktree remove` can delete the tree and
+/// then fail to delete `<common>/worktrees/<id>`, or the quarantine can vanish
+/// by other means) (#2132).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleQuarantineRegistration {
+    pub admin_directory: PathBuf,
+    pub admin_id: String,
+}
+
+/// Find the single registration that is exactly the absent quarantine: both
+/// settlement paths are absent, nothing is registered at the original path, and
+/// exactly one `<common>/worktrees/*` directory points at `<quarantine>/.git`
+/// with a matching common dir, no lock, and a `HEAD` that is the source ref or
+/// its exact commit. `Ok(None)` means no registration at the quarantine path.
+pub fn observe_stale_quarantine_registration_locked(
+    origin: &Path,
+    original_root: &Path,
+    quarantine_root: &Path,
+    source_ref: &str,
+    expected_source_oid: &str,
+) -> Result<Option<StaleQuarantineRegistration>> {
+    validate_expected_worktree_identity(source_ref, expected_source_oid)?;
+    require_path_absent(original_root, "original settlement root")?;
+    require_path_absent(quarantine_root, "settlement quarantine root")?;
+    if registration_for_path(origin, original_root)?.is_some() {
+        return Err(DaemonError::Process(
+            "original settlement worktree remained registered".into(),
+        ));
+    }
+    let Some(registration) = registration_for_path(origin, quarantine_root)? else {
+        return Ok(None);
+    };
+    if registration
+        .branch
+        .as_deref()
+        .is_some_and(|branch| branch != source_ref)
+        || registration
+            .head
+            .as_deref()
+            .is_some_and(|head| head != expected_source_oid)
+    {
+        return Err(DaemonError::Process(
+            "stale quarantine registration branch or HEAD drifted".into(),
+        ));
+    }
+    let repository_identity = repository_identity_path(origin)?;
+    let registry =
+        std::fs::canonicalize(repository_identity.join("worktrees")).map_err(|error| {
+            DaemonError::Process(format!(
+                "repository worktree registry is unavailable: {error}"
+            ))
+        })?;
+    let expected_pointer = quarantine_root.join(".git");
+    let mut found: Option<PathBuf> = None;
+    let mut examined = 0usize;
+    let entries = std::fs::read_dir(&registry).map_err(|error| {
+        DaemonError::Process(format!("repository worktree registry read failed: {error}"))
+    })?;
+    for entry in entries {
+        examined += 1;
+        if examined > MAX_GIT_WORKTREE_ENTRIES {
+            return Err(DaemonError::Process(
+                "repository worktree registry exceeds its inspection bound".into(),
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            DaemonError::Process(format!("repository worktree registry read failed: {error}"))
+        })?;
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            _ => continue,
+        }
+        let Ok(pointer) = read_bounded_regular_text(&path.join("gitdir"), "stale gitdir pointer")
+        else {
+            continue;
+        };
+        if Path::new(&pointer) != expected_pointer {
+            continue;
+        }
+        if found.replace(path).is_some() {
+            return Err(DaemonError::Process(
+                "stale quarantine registration is claimed by multiple admin directories".into(),
+            ));
+        }
+    }
+    let admin_directory = found.ok_or_else(|| {
+        DaemonError::Process("stale quarantine registration has no exact admin directory".into())
+    })?;
+    let admin_id = admin_directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty() && value.len() <= 255)
+        .ok_or_else(|| DaemonError::Process("stale worktree admin id is invalid".into()))?
+        .to_string();
+    let commondir = read_bounded_regular_text(
+        &admin_directory.join("commondir"),
+        "stale worktree common-dir pointer",
+    )?;
+    let common_target =
+        std::fs::canonicalize(admin_directory.join(commondir)).map_err(|error| {
+            DaemonError::Process(format!("stale worktree common-dir target failed: {error}"))
+        })?;
+    if common_target != repository_identity {
+        return Err(DaemonError::Process(
+            "stale worktree common-dir identity drifted".into(),
+        ));
+    }
+    match std::fs::symlink_metadata(admin_directory.join("locked")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(DaemonError::Process(
+                "stale quarantine registration is locked or unreadable".into(),
+            ));
+        }
+    }
+    let head = read_bounded_regular_text(&admin_directory.join("HEAD"), "stale worktree HEAD")?;
+    if head != format!("ref: {source_ref}") && head != expected_source_oid {
+        return Err(DaemonError::Process(
+            "stale quarantine worktree HEAD is not the exact source".into(),
+        ));
+    }
+    Ok(Some(StaleQuarantineRegistration {
+        admin_directory,
+        admin_id,
+    }))
+}
+
+/// Delete exactly the proved stale admin directory while the live source ref is
+/// locked by a verify-only `update-ref` transaction (never a repository-wide
+/// prune). The `prepared` hook repeats the complete observation (source ref,
+/// both absent paths, admin identity, no lock, regular single-link private
+/// files, exact `HEAD` and common dir, unique `gitdir` claimant) immediately
+/// before removing that one directory, because the lock does not cover the
+/// admin files (#2147). The caller supplies the registration the retained
+/// marker authenticated; any drift from it refuses and preserves it.
+pub fn remove_stale_quarantine_registration_locked(
+    origin: &Path,
+    original_root: &Path,
+    quarantine_root: &Path,
+    source_ref: &str,
+    expected_source_oid: &str,
+    expected: &StaleQuarantineRegistration,
+) -> Result<()> {
+    validate_expected_worktree_identity(source_ref, expected_source_oid)?;
+    require_commit_object_locked(origin, expected_source_oid)?;
+    require_direct_ref_at(origin, source_ref, expected_source_oid, "source")?;
+    let fresh = observe_stale_quarantine_registration_locked(
+        origin,
+        original_root,
+        quarantine_root,
+        source_ref,
+        expected_source_oid,
+    )?;
+    if fresh.as_ref() != Some(expected) {
+        return Err(DaemonError::Process(
+            "stale quarantine registration changed before removal".into(),
+        ));
+    }
+    let registry = expected.admin_directory.parent().ok_or_else(|| {
+        DaemonError::Process("stale worktree admin directory has no registry".into())
+    })?;
+    let admin_text = expected.admin_directory.to_str().ok_or_else(|| {
+        DaemonError::InvalidParam("stale worktree admin directory is not UTF-8".into())
+    })?;
+    let registry_text = registry
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("worktree registry is not UTF-8".into()))?;
+    let root_text = quarantine_root
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("settlement root is not UTF-8".into()))?;
+    let original_text = original_root
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("settlement original root is not UTF-8".into()))?;
+    let common_dir = repository_identity_path(origin)?;
+    let common_text = common_dir
+        .to_str()
+        .ok_or_else(|| DaemonError::InvalidParam("repository identity is not UTF-8".into()))?;
+    let transaction =
+        format!("start\nverify {source_ref} {expected_source_oid}\nprepare\ncommit\n");
+    let hook_directory = settlement_stale_registration_removal_hook_directory()?;
+    let hooks_path = hook_directory.path().to_str().ok_or_else(|| {
+        DaemonError::Process("settlement reference-hook path was not UTF-8".into())
+    })?;
+    let hooks_config = format!("core.hooksPath={hooks_path}");
+    let mut command = git_command();
+    command
+        .arg("-c")
+        .arg(&hooks_config)
+        .args(["update-ref", "--no-deref", "--stdin"])
+        .env("RSI_SETTLEMENT_QUARANTINE_ROOT", root_text)
+        .env("RSI_SETTLEMENT_ORIGINAL_ROOT", original_text)
+        .env("RSI_SETTLEMENT_COMMON_DIR", common_text)
+        .env("RSI_SETTLEMENT_ADMIN_DIR", admin_text)
+        .env("RSI_SETTLEMENT_ADMIN_REGISTRY", registry_text)
+        .env("RSI_SETTLEMENT_ADMIN_ID", &expected.admin_id)
+        .env("RSI_SETTLEMENT_SOURCE_REF", source_ref)
+        .env("RSI_SETTLEMENT_SOURCE_OID", expected_source_oid)
+        .current_dir(origin);
+    // Test seam: the interval between the last Rust observation and the lock.
+    #[cfg(any(test, feature = "test-seam"))]
+    run_atomic_ref_pre_spawn_test_hook();
+    let execution = capture_bounded_with_input(
+        command,
+        "remove exact stale settlement registration under source-ref lock",
+        transaction.as_bytes(),
+    );
+    let postcondition = require_path_absent(&expected.admin_directory, "stale worktree admin")
+        .and_then(|()| {
+            prove_branch_only_residue_locked(
+                origin,
+                original_root,
+                quarantine_root,
+                source_ref,
+                expected_source_oid,
+            )
+        });
+    if postcondition.is_ok() {
+        require_acknowledged_or_reacquirable_ref_lock_locked(
+            origin,
+            source_ref,
+            expected_source_oid,
+            &execution,
+        )?;
+        return Ok(());
+    }
+    match execution {
+        Err(error) => Err(error),
+        Ok(output) if !output.status.success() => Err(DaemonError::Process(
+            "exact stale worktree registration removal refused".into(),
+        )),
+        Ok(_) => postcondition,
+    }
+}
+
+fn delete_source_ref_transaction_locked(
     origin: &Path,
     target_ref: &str,
     expected_target_oid: &str,
@@ -3220,6 +4579,153 @@ check_direct_exact_ref "$RSI_SETTLEMENT_SOURCE_REF" "$RSI_SETTLEMENT_SOURCE_OID"
     Ok(directory)
 }
 
+fn settlement_live_ref_removal_hook_directory() -> Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("rsi-settlement-live-remove-hooks-")
+        .tempdir()
+        .map_err(|error| {
+            DaemonError::Process(format!(
+                "failed to create settlement removal-hook directory: {error}"
+            ))
+        })?;
+    let hook = directory.path().join("reference-transaction");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+set -eu
+while IFS= read -r ignored; do :; done
+if [ "$#" -ne 1 ] || [ "$1" != prepared ]; then
+    exit 0
+fi
+if git symbolic-ref -q "$RSI_SETTLEMENT_SOURCE_REF" >/dev/null 2>&1; then
+    exit 1
+fi
+actual=$(git rev-parse --verify "${RSI_SETTLEMENT_SOURCE_REF}^{commit}") || exit 1
+[ "$actual" = "$RSI_SETTLEMENT_SOURCE_OID" ]
+git -c core.hooksPath=/dev/null -C "$RSI_SETTLEMENT_ORIGIN" \
+    worktree remove "$RSI_SETTLEMENT_QUARANTINE_ROOT"
+[ ! -e "$RSI_SETTLEMENT_QUARANTINE_ROOT" ]
+[ ! -L "$RSI_SETTLEMENT_QUARANTINE_ROOT" ]
+"#,
+    )
+    .map_err(|error| {
+        DaemonError::Process(format!("failed to write settlement removal hook: {error}"))
+    })?;
+    let mut permissions = std::fs::metadata(&hook)
+        .map_err(|error| {
+            DaemonError::Process(format!(
+                "failed to inspect settlement removal hook: {error}"
+            ))
+        })?
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&hook, permissions).map_err(|error| {
+        DaemonError::Process(format!(
+            "failed to make settlement removal hook executable: {error}"
+        ))
+    })?;
+    Ok(directory)
+}
+
+fn settlement_stale_registration_removal_hook_directory() -> Result<tempfile::TempDir> {
+    let directory = tempfile::Builder::new()
+        .prefix("rsi-settlement-stale-hooks-")
+        .tempdir()
+        .map_err(|error| {
+            DaemonError::Process(format!(
+                "failed to create settlement removal-hook directory: {error}"
+            ))
+        })?;
+    let hook = directory.path().join("reference-transaction");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+set -eu
+while IFS= read -r ignored; do :; done
+if [ "$#" -ne 1 ] || [ "$1" != prepared ]; then
+    exit 0
+fi
+# The whole stale-registration proof is repeated here, with the source ref
+# locked and immediately before the one deletion: nothing in the admin
+# directory is covered by that lock, so every field the daemon observed before
+# taking it (#2147) is re-proved. Any drift refuses and preserves the directory.
+admin=$RSI_SETTLEMENT_ADMIN_DIR
+registry=$RSI_SETTLEMENT_ADMIN_REGISTRY
+root=$RSI_SETTLEMENT_QUARANTINE_ROOT
+original=$RSI_SETTLEMENT_ORIGINAL_ROOT
+if git symbolic-ref -q "$RSI_SETTLEMENT_SOURCE_REF" >/dev/null 2>&1; then
+    exit 1
+fi
+actual=$(git rev-parse --verify "${RSI_SETTLEMENT_SOURCE_REF}^{commit}") || exit 1
+[ "$actual" = "$RSI_SETTLEMENT_SOURCE_OID" ]
+[ ! -e "$root" ]
+[ ! -L "$root" ]
+[ ! -e "$original" ]
+[ ! -L "$original" ]
+[ -d "$admin" ]
+[ ! -L "$admin" ]
+[ "$(dirname -- "$admin")" = "$registry" ]
+[ "$(basename -- "$admin")" = "$RSI_SETTLEMENT_ADMIN_ID" ]
+[ ! -e "$admin/locked" ]
+[ ! -L "$admin/locked" ]
+for name in gitdir HEAD commondir; do
+    if [ -z "$(find "$admin/$name" -type f -links 1 -print 2>/dev/null)" ]; then
+        exit 1
+    fi
+done
+pointer=$(cat -- "$admin/gitdir")
+[ "$pointer" = "$root/.git" ]
+head=$(cat -- "$admin/HEAD")
+if [ "$head" != "ref: $RSI_SETTLEMENT_SOURCE_REF" ] && [ "$head" != "$RSI_SETTLEMENT_SOURCE_OID" ]; then
+    exit 1
+fi
+commondir=$(cat -- "$admin/commondir")
+case "$commondir" in
+    /*) common_target=$commondir ;;
+    *) common_target=$admin/$commondir ;;
+esac
+resolved=$(cd -- "$common_target" 2>/dev/null && pwd -P) || exit 1
+[ "$resolved" = "$RSI_SETTLEMENT_COMMON_DIR" ]
+claims=0
+for entry in "$registry"/* "$registry"/.[!.]* "$registry"/..?*; do
+    [ -d "$entry" ] || continue
+    [ ! -L "$entry" ] || continue
+    [ -f "$entry/gitdir" ] || continue
+    [ ! -L "$entry/gitdir" ] || continue
+    claimed=$(cat -- "$entry/gitdir" 2>/dev/null) || continue
+    if [ "$claimed" = "$original/.git" ]; then
+        exit 1
+    fi
+    if [ "$claimed" = "$root/.git" ]; then
+        claims=$((claims + 1))
+        if [ "$entry" != "$admin" ]; then
+            exit 1
+        fi
+    fi
+done
+[ "$claims" -eq 1 ]
+rm -r -- "$admin"
+"#,
+    )
+    .map_err(|error| {
+        DaemonError::Process(format!("failed to write settlement removal hook: {error}"))
+    })?;
+    let mut permissions = std::fs::metadata(&hook)
+        .map_err(|error| {
+            DaemonError::Process(format!(
+                "failed to inspect settlement removal hook: {error}"
+            ))
+        })?
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&hook, permissions).map_err(|error| {
+        DaemonError::Process(format!(
+            "failed to make settlement removal hook executable: {error}"
+        ))
+    })?;
+    Ok(directory)
+}
+
 fn settlement_missing_ref_removal_hook_directory() -> Result<tempfile::TempDir> {
     let directory = tempfile::Builder::new()
         .prefix("rsi-settlement-remove-hooks-")
@@ -3330,6 +4836,8 @@ pub fn set_atomic_ref_pre_spawn_test_hook(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
+#[cfg(target_os = "linux")]
 fn inject_worktree_remove_lost_ack() {
     WORKTREE_REMOVE_LOST_ACK_TEST.with(|slot| {
         assert!(
@@ -3340,6 +4848,8 @@ fn inject_worktree_remove_lost_ack() {
 }
 
 #[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
+#[cfg(target_os = "linux")]
 fn inject_restore_reattach_lost_ack() {
     RESTORE_REATTACH_LOST_ACK_TEST.with(|slot| {
         assert!(
@@ -3359,6 +4869,7 @@ fn run_atomic_ref_pre_spawn_test_hook() {
 }
 
 #[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn set_direct_ref_empty_lookup_test_hook(hook: impl FnOnce() + 'static) {
     DIRECT_REF_EMPTY_LOOKUP_TEST_HOOK.with(|slot| {
         assert!(
@@ -3655,6 +5166,31 @@ fn inspect_index_visibility_locked(cwd: &Path) -> Result<(bool, String)> {
 
 fn capture_bounded(mut command: Command, label: &str) -> Result<std::process::Output> {
     capture_bounded_with_limits(&mut command, label, None, ProcessLimits::default())
+}
+
+/// Run one caller-built command (a networked Git call such as the archived
+/// sandbox purge's preservation push) under the same process-group
+/// containment and output bounds as every store Git call, with its own wall
+/// deadline. Portable: it needs no GNU `timeout`, which macOS lacks (hub
+/// #3055 part 2). A deadline or bound overrun is an error after the group is
+/// killed and reaped.
+///
+/// # Errors
+/// The command cannot start, overruns `timeout` or exceeds an output bound.
+pub fn capture_command_bounded_for(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    capture_bounded_with_limits(
+        &mut command,
+        label,
+        None,
+        ProcessLimits {
+            execution_timeout: timeout,
+            ..ProcessLimits::default()
+        },
+    )
 }
 
 fn capture_bounded_with_input(
@@ -4135,8 +5671,13 @@ fn run_bounded_process(
     })
 }
 
+/// Reason logged on the `rsid::signal` record of a git child's group cleanup.
+const GIT_CHILD_GROUP_CLEANUP_REASON: &str = "git child group cleanup";
+
 /// SIGKILL the leader's group unless the leader may already be reaped, when its
-/// numeric id could name an unrelated group (#1259).
+/// numeric id could name an unrelated group (#1259). The leader is a zombie
+/// here (`waitid` + `WNOWAIT`), so the signal is sent either way and only a
+/// surviving helper makes the record INFO (#293).
 #[track_caller]
 fn terminate_group_if_owned(pgid: nix::unistd::Pid, leader_reaped: bool) {
     if leader_reaped {
@@ -4148,7 +5689,7 @@ fn terminate_group_if_owned(pgid: nix::unistd::Pid, leader_reaped: bool) {
         );
         return;
     }
-    terminate_process_group(pgid);
+    terminate_owned_group_cleanup(pgid, GIT_CHILD_GROUP_CLEANUP_REASON);
 }
 
 fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd, label: &str, stream: &str) -> Result<()> {
@@ -4223,7 +5764,7 @@ fn decode_git_text(bytes: &[u8], label: &str) -> Result<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RollingBaseFallbackReason {
+pub enum RollingBaseFallbackReason {
     RemoteUnavailable,
     FetchTimedOut,
     FetchFailed,
@@ -4294,13 +5835,18 @@ pub fn fresh_rolling_base(
     local_source: String,
     policy: RollingBasePolicy,
 ) -> Result<RollingBaseSelection> {
+    // A default manager worker selects published rolling regardless of what
+    // the operator has checked out (#1809). Interactive and successor policies
+    // still apply only to a checkout on rolling.
     let branch = run_git_raw(
         origin,
         &["symbolic-ref", "--quiet", "HEAD"],
         "identify rolling checkout",
     )?;
-    if !branch.status.success()
-        || decode_git_text(&branch.stdout, "identify rolling checkout")? != "refs/heads/rolling"
+    if policy != RollingBasePolicy::PublishedTip
+        && (!branch.status.success()
+            || decode_git_text(&branch.stdout, "identify rolling checkout")?
+                != "refs/heads/rolling")
     {
         return Ok(RollingBaseSelection {
             commit: local_source,
@@ -4840,6 +6386,96 @@ mod tests {
         child.wait().expect("reap");
     }
 
+    /// Run `script` as a git-like child in its own group, wait until the leader
+    /// has exited WITHOUT reaping it (the state `run_bounded_process` cleans up
+    /// in), run the cleanup, and return what `rsid::signal` logged plus the pgid.
+    #[cfg(target_os = "linux")]
+    fn group_cleanup_log(script: &str) -> (String, i32) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        configure_std_process_group(&mut command, ProcessContainment::Group).expect("group");
+        let mut child = command.spawn().expect("spawn");
+        let raw = i32::try_from(child.id()).expect("pid");
+        let pgid = nix::unistd::Pid::from_raw(raw);
+        nix::sys::wait::waitid(
+            nix::sys::wait::Id::Pid(pgid),
+            nix::sys::wait::WaitPidFlag::WEXITED | nix::sys::wait::WaitPidFlag::WNOWAIT,
+        )
+        .expect("leader exits, still unreaped");
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            terminate_group_if_owned(pgid, false);
+        });
+        child.wait().expect("reap");
+        let logged = String::from_utf8(capture.0.lock().unwrap().clone()).expect("utf8");
+        (logged, raw)
+    }
+
+    /// #293: a git child that left a helper in its group still logs the signal
+    /// at INFO, with the real reason.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn git_child_group_cleanup_logs_info_when_a_helper_survived() {
+        let (logged, raw) = group_cleanup_log("sleep 30 & exit 0");
+        let line = logged
+            .lines()
+            .find(|line| line.contains("daemon signal") && line.contains(&format!("pgid={raw} ")))
+            .unwrap_or_else(|| panic!("no signal record in {logged:?}"));
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(
+            line.contains("reason=\"git child group cleanup\""),
+            "{line}"
+        );
+        assert!(line.contains("signal=\"SIGKILL\""), "{line}");
+        assert!(line.contains("outcome=\"sent\""), "{line}");
+    }
+
+    /// #293: a git child whose group holds only its exited leader is routine:
+    /// the record is DEBUG with the same reason, and no INFO record is written.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn git_child_group_cleanup_logs_debug_when_the_group_is_empty() {
+        let (logged, raw) = group_cleanup_log("exit 0");
+        let line = logged
+            .lines()
+            .find(|line| line.contains("daemon signal") && line.contains(&format!("pgid={raw} ")))
+            .unwrap_or_else(|| panic!("no signal record in {logged:?}"));
+        assert!(line.contains(" DEBUG "), "{line}");
+        assert!(
+            line.contains("reason=\"git child group cleanup\""),
+            "{line}"
+        );
+        assert!(!logged.contains(" INFO "), "{logged}");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn settlement_git_reaps_the_owned_leader_when_a_record_consumer_panics() {
@@ -4915,6 +6551,13 @@ mod tests {
         assert_eq!(sent_to(pid), signals_before_panic);
     }
 
+    /// `/tmp` itself, resolved: a symlink to `/private/tmp` on macOS. The
+    /// quarantine proofs demand an exact canonical root, so a fixture under the
+    /// unresolved name is refused there before the behaviour under test.
+    fn canonical_tmp() -> std::path::PathBuf {
+        std::fs::canonicalize("/tmp").expect("canonical /tmp")
+    }
+
     fn git(root: &Path, args: &[&str]) -> String {
         let mut command = git_command();
         command.arg("-C").arg(root).args(args);
@@ -4942,6 +6585,58 @@ mod tests {
         git(repository, &["add", "tracked"]);
         git(repository, &["commit", "-qm", "base"]);
         git(repository, &["rev-parse", "HEAD"])
+    }
+
+    /// #2159: git may remove an emptied ref directory while the symref
+    /// dependency walk is between its metadata check and its listing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn symref_dependency_walk_tolerates_a_ref_directory_vanishing_mid_walk() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        initialize_repository(&repository);
+        git(&repository, &["branch", "keep/nested"]);
+        let directory = repository.join(".git/refs/heads/keep");
+        assert!(directory.is_dir());
+        let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = removed.clone();
+        LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if path.ends_with("refs/heads/keep") {
+                    std::fs::remove_dir_all(path).expect("remove ref directory");
+                    seen.set(true);
+                }
+            }));
+        });
+        let result = source_ref_has_symref_dependents_locked(&repository, "refs/heads/rsi/absent");
+        LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        assert!(removed.get(), "the hook must have removed the directory");
+        assert!(!result.expect("vanished directory is tolerated"));
+    }
+
+    /// #2159: only NotFound means "vanished"; any other IO error fails closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn symref_dependency_walk_fails_closed_on_a_non_notfound_listing_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        initialize_repository(&repository);
+        git(&repository, &["branch", "keep/nested"]);
+        LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if path.ends_with("refs/heads/keep") {
+                    // The directory becomes a file: read_dir fails with ENOTDIR.
+                    std::fs::remove_dir_all(path).expect("remove ref directory");
+                    std::fs::write(path, b"not a directory\n").expect("replace with file");
+                }
+            }));
+        });
+        let result = source_ref_has_symref_dependents_locked(&repository, "refs/heads/rsi/absent");
+        LOOSE_REF_WALK_BEFORE_READ_DIR_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            result.is_err(),
+            "a non-NotFound listing error must propagate"
+        );
     }
 
     fn ref_lock_path(repository: &Path, reference: &str) -> PathBuf {
@@ -5483,6 +7178,7 @@ mod tests {
         .expect("dirty refusal preserves the branch");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_path_is_deterministic_private_and_collision_safe() {
@@ -5552,6 +7248,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_move_is_inode_bound_and_preserves_old_path_injection() {
@@ -5645,6 +7342,7 @@ mod tests {
         .expect("quarantine move and non-force removal");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_sentinel_blocks_add_and_removes_dangling_non_force() {
@@ -5782,6 +7480,556 @@ mod tests {
         .expect("branch-first removal and replay");
     }
 
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn completion_removes_the_quarantine_without_the_target_ref_lock() {
+        let temp = tempfile::tempdir().expect("completion target-lock fixture");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).expect("sandbox base");
+        std::fs::set_permissions(&sandboxes, std::fs::Permissions::from_mode(0o700))
+            .expect("private sandbox base");
+        let oid = initialize_repository(&repository);
+        let session_id = Uuid::new_v4();
+        let branch = format!("rsi/completion-target-lock/{session_id}");
+        let branch_ref = format!("refs/heads/{branch}");
+        let allocation = allocate(&sandboxes, session_id, &repository, &oid, Some(&branch))
+            .expect("source worktree");
+
+        with_repository_mutation(&repository, || {
+            let path =
+                prepare_settlement_quarantine_path(&allocation.root, Uuid::new_v4(), session_id)?;
+            move_worktree_to_quarantine_non_force_locked(&repository, &path, &branch_ref, &oid)?;
+
+            // A concurrent writer owns the target ref lock for the whole call.
+            // Removing the quarantine needs only the source ref lock, so the
+            // removal lands and only the short ref transaction is refused.
+            let target_lock = ref_lock_path(&repository, "refs/heads/main");
+            std::fs::write(&target_lock, b"concurrent target writer\n")
+                .expect("hold the target ref lock");
+            let error = complete_quarantine_and_delete_source_ref_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                "refs/heads/main",
+                &oid,
+                &branch_ref,
+                &oid,
+            )
+            .expect_err("a held target lock refuses the ref transaction");
+            assert!(
+                error.to_string().contains("atomic target verification"),
+                "unexpected error: {error}"
+            );
+            assert!(!path.quarantine_root.exists());
+            assert!(registration_for_path(&repository, &path.quarantine_root)?.is_none());
+            assert!(source_ref_has_zero_registrations_locked(
+                &repository,
+                &branch_ref
+            )?);
+            assert_eq!(
+                observe_direct_ref_locked(&repository, &branch_ref)?,
+                DirectRefObservation::Commit(oid.clone()),
+                "the branch-only shape retains the exact source ref"
+            );
+            assert_eq!(
+                std::fs::read(&target_lock).expect("foreign lock survives"),
+                b"concurrent target writer\n"
+            );
+            assert!(
+                !ref_lock_path(&repository, &branch_ref).exists(),
+                "no source ref lock residue remains"
+            );
+
+            // The crash window between the two steps is the branch-only shape;
+            // replay completes it once the target lock is free.
+            std::fs::remove_file(&target_lock).expect("release the target lock");
+            complete_quarantine_and_delete_source_ref_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                "refs/heads/main",
+                &oid,
+                &branch_ref,
+                &oid,
+            )?;
+            assert_eq!(
+                observe_direct_ref_locked(&repository, &branch_ref)?,
+                DirectRefObservation::Missing
+            );
+            assert_eq!(
+                observe_direct_ref_locked(&repository, "refs/heads/main")?,
+                DirectRefObservation::Commit(oid.clone())
+            );
+            Ok(())
+        })
+        .expect("completion without the target ref lock");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn completion_refused_removal_keeps_the_symbolic_quarantine_and_leaves_no_locks() {
+        let temp = tempfile::tempdir().expect("completion refusal fixture");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).expect("sandbox base");
+        std::fs::set_permissions(&sandboxes, std::fs::Permissions::from_mode(0o700))
+            .expect("private sandbox base");
+        let oid = initialize_repository(&repository);
+        let session_id = Uuid::new_v4();
+        let branch = format!("rsi/completion-refusal/{session_id}");
+        let branch_ref = format!("refs/heads/{branch}");
+        let allocation = allocate(&sandboxes, session_id, &repository, &oid, Some(&branch))
+            .expect("source worktree");
+
+        with_repository_mutation(&repository, || {
+            let path =
+                prepare_settlement_quarantine_path(&allocation.root, Uuid::new_v4(), session_id)?;
+            move_worktree_to_quarantine_non_force_locked(&repository, &path, &branch_ref, &oid)?;
+            // Non-force removal refuses an unclean tree and never overrides it.
+            std::fs::write(path.quarantine_root.join("unsaved.txt"), b"keep me\n")
+                .expect("dirty the quarantine");
+            assert!(
+                complete_quarantine_and_delete_source_ref_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    "refs/heads/main",
+                    &oid,
+                    &branch_ref,
+                    &oid,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(path.quarantine_root.join("unsaved.txt")).expect("dirty file"),
+                b"keep me\n"
+            );
+            prove_worktree_head(&path.quarantine_root, &branch_ref, &oid)?;
+            assert!(registration_for_path(&repository, &path.quarantine_root)?.is_some());
+            assert_eq!(
+                observe_direct_ref_locked(&repository, &branch_ref)?,
+                DirectRefObservation::Commit(oid.clone())
+            );
+            for reference in ["refs/heads/main", branch_ref.as_str()] {
+                assert!(
+                    !ref_lock_path(&repository, reference).exists(),
+                    "{reference} lock residue"
+                );
+            }
+            Ok(())
+        })
+        .expect("refused removal retains the exact quarantine");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn stale_quarantine_registration_is_removed_exactly_without_a_repository_prune() {
+        let temp = tempfile::tempdir().expect("stale registration fixture");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).expect("sandbox base");
+        std::fs::set_permissions(&sandboxes, std::fs::Permissions::from_mode(0o700))
+            .expect("private sandbox base");
+        let oid = initialize_repository(&repository);
+        let session_id = Uuid::new_v4();
+        let branch = format!("rsi/stale-registration/{session_id}");
+        let branch_ref = format!("refs/heads/{branch}");
+        let allocation = allocate(&sandboxes, session_id, &repository, &oid, Some(&branch))
+            .expect("source worktree");
+        let bystander_session = Uuid::new_v4();
+        let bystander_branch = format!("rsi/stale-bystander/{bystander_session}");
+        let bystander = allocate(
+            &sandboxes,
+            bystander_session,
+            &repository,
+            &oid,
+            Some(&bystander_branch),
+        )
+        .expect("bystander worktree");
+
+        with_repository_mutation(&repository, || {
+            let path =
+                prepare_settlement_quarantine_path(&allocation.root, Uuid::new_v4(), session_id)?;
+            move_worktree_to_quarantine_non_force_locked(&repository, &path, &branch_ref, &oid)?;
+            let admin = prove_moved_worktree_exact_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                &branch_ref,
+                &oid,
+            )?;
+            // An unrelated registration that is equally prunable must survive:
+            // only the exact quarantine registration may be touched.
+            let bystander_admin =
+                prove_admin_identity(&repository, &bystander.root, &[&bystander.root])?;
+            std::fs::remove_dir_all(&bystander.root).expect("lose the bystander tree");
+
+            // `git worktree remove` deleted the tree but not its registration.
+            assert!(
+                observe_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )
+                .is_err(),
+                "a present quarantine is not stale"
+            );
+            std::fs::remove_dir_all(&path.quarantine_root).expect("lose the quarantine tree");
+            assert!(registration_for_path(&repository, &path.quarantine_root)?.is_some());
+            assert!(
+                complete_quarantine_and_delete_source_ref_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    "refs/heads/main",
+                    &oid,
+                    &branch_ref,
+                    &oid,
+                )
+                .is_err(),
+                "completion itself never repairs registration residue"
+            );
+
+            let stale = observe_stale_quarantine_registration_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                &branch_ref,
+                &oid,
+            )?
+            .expect("the exact stale registration");
+            assert_eq!(stale.admin_directory, admin.admin_directory);
+            assert_eq!(stale.admin_id, admin.admin_id);
+
+            // A different admin directory is never removed for this quarantine.
+            let forged = StaleQuarantineRegistration {
+                admin_directory: bystander_admin.admin_directory.clone(),
+                admin_id: bystander_admin.admin_id.clone(),
+            };
+            assert!(
+                remove_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                    &forged,
+                )
+                .is_err()
+            );
+            assert!(stale.admin_directory.exists());
+            assert!(bystander_admin.admin_directory.exists());
+
+            remove_stale_quarantine_registration_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                &branch_ref,
+                &oid,
+                &stale,
+            )?;
+            assert!(!stale.admin_directory.exists());
+            assert!(registration_for_path(&repository, &path.quarantine_root)?.is_none());
+            assert!(
+                bystander_admin.admin_directory.exists()
+                    && registration_for_path(&repository, &bystander.root)?.is_some(),
+                "no repository-wide prune"
+            );
+            assert_eq!(
+                observe_direct_ref_locked(&repository, &branch_ref)?,
+                DirectRefObservation::Commit(oid.clone())
+            );
+            assert!(!ref_lock_path(&repository, &branch_ref).exists());
+            assert!(
+                observe_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )?
+                .is_none()
+            );
+
+            // The branch-only completion then proceeds.
+            complete_quarantine_and_delete_source_ref_locked(
+                &repository,
+                &path.original_root,
+                &path.quarantine_root,
+                "refs/heads/main",
+                &oid,
+                &branch_ref,
+                &oid,
+            )?;
+            assert_eq!(
+                observe_direct_ref_locked(&repository, &branch_ref)?,
+                DirectRefObservation::Missing
+            );
+            Ok(())
+        })
+        .expect("exact stale registration removal and completion");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn stale_registration_drift_after_the_last_observation_is_refused_under_the_lock() {
+        for case in [
+            "head-branch",
+            "head-detached",
+            "head-symlink",
+            "commondir",
+            "locked",
+            "gitdir-repointed",
+            "second-claimant",
+            "original-claimed",
+        ] {
+            let temp = tempfile::tempdir().expect("stale drift fixture");
+            let repository = temp.path().join("repository");
+            let sandboxes = temp.path().join("sandboxes");
+            std::fs::create_dir(&sandboxes).expect("sandbox base");
+            std::fs::set_permissions(&sandboxes, std::fs::Permissions::from_mode(0o700))
+                .expect("private sandbox base");
+            let foreign_common = temp.path().join("foreign-common");
+            std::fs::create_dir(&foreign_common).expect("foreign common dir");
+            let oid = initialize_repository(&repository);
+            let session_id = Uuid::new_v4();
+            let branch = format!("rsi/stale-drift-{case}/{session_id}");
+            let branch_ref = format!("refs/heads/{branch}");
+            let allocation = allocate(&sandboxes, session_id, &repository, &oid, Some(&branch))
+                .expect("source worktree");
+
+            with_repository_mutation(&repository, || {
+                let path = prepare_settlement_quarantine_path(
+                    &allocation.root,
+                    Uuid::new_v4(),
+                    session_id,
+                )?;
+                move_worktree_to_quarantine_non_force_locked(
+                    &repository,
+                    &path,
+                    &branch_ref,
+                    &oid,
+                )?;
+                let admin = prove_moved_worktree_exact_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )?;
+                std::fs::remove_dir_all(&path.quarantine_root).expect("lose the tree");
+                let stale = observe_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )?
+                .expect("exact stale registration");
+
+                // An external Git repair or writer changes the administration
+                // after the final Rust observation and before the locked hook.
+                let hook_repository = repository.clone();
+                let hook_admin = admin.admin_directory.clone();
+                let hook_root = path.quarantine_root.clone();
+                let hook_original = path.original_root.clone();
+                let hook_branch_ref = branch_ref.clone();
+                let hook_foreign = foreign_common.clone();
+                set_atomic_ref_pre_spawn_test_hook(move || {
+                    let registry = hook_admin.parent().expect("registry").to_path_buf();
+                    match case {
+                        "head-branch" => std::fs::write(
+                            hook_admin.join("HEAD"),
+                            b"ref: refs/heads/someone-else\n",
+                        )
+                        .expect("repoint HEAD to another branch"),
+                        "head-detached" => {
+                            git(
+                                &hook_repository,
+                                &["commit", "--allow-empty", "-qm", "foreign"],
+                            );
+                            let foreign = git(&hook_repository, &["rev-parse", "HEAD"]);
+                            std::fs::write(hook_admin.join("HEAD"), format!("{foreign}\n"))
+                                .expect("detach HEAD at a foreign commit");
+                        }
+                        "head-symlink" => {
+                            std::fs::write(
+                                hook_admin.join("HEAD.real"),
+                                format!("ref: {hook_branch_ref}\n"),
+                            )
+                            .expect("write the symlink target");
+                            std::fs::remove_file(hook_admin.join("HEAD")).expect("drop HEAD");
+                            std::os::unix::fs::symlink("HEAD.real", hook_admin.join("HEAD"))
+                                .expect("replace HEAD with a symlink");
+                        }
+                        "commondir" => std::fs::write(
+                            hook_admin.join("commondir"),
+                            format!("{}\n", hook_foreign.display()),
+                        )
+                        .expect("repoint the common dir"),
+                        "locked" => std::fs::write(hook_admin.join("locked"), b"held\n")
+                            .expect("lock the registration"),
+                        "gitdir-repointed" => std::fs::write(
+                            hook_admin.join("gitdir"),
+                            b"/nonexistent/elsewhere/.git\n",
+                        )
+                        .expect("repoint the gitdir pointer"),
+                        "second-claimant" | "original-claimed" => {
+                            let claimed = if case == "second-claimant" {
+                                &hook_root
+                            } else {
+                                &hook_original
+                            };
+                            let duplicate = registry.join("late-claimant");
+                            std::fs::create_dir(&duplicate).expect("late claimant");
+                            std::fs::write(
+                                duplicate.join("gitdir"),
+                                format!("{}/.git\n", claimed.display()),
+                            )
+                            .expect("late claimant pointer");
+                        }
+                        other => unreachable!("{other}"),
+                    }
+                });
+                let attempt = remove_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                    &stale,
+                );
+                assert!(attempt.is_err(), "{case}: drift must refuse the deletion");
+                assert!(
+                    admin.admin_directory.join("gitdir").exists(),
+                    "{case}: the drifted administration is preserved"
+                );
+                assert_eq!(
+                    observe_direct_ref_locked(&repository, &branch_ref)?,
+                    DirectRefObservation::Commit(oid.clone()),
+                    "{case}"
+                );
+                assert!(
+                    !ref_lock_path(&repository, &branch_ref).exists(),
+                    "{case}: no source lock residue"
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn stale_quarantine_registration_refuses_ambiguous_locked_or_drifted_administration() {
+        for case in ["locked", "head-drift", "duplicate-pointer", "source-moved"] {
+            let temp = tempfile::tempdir().expect("stale refusal fixture");
+            let repository = temp.path().join("repository");
+            let sandboxes = temp.path().join("sandboxes");
+            std::fs::create_dir(&sandboxes).expect("sandbox base");
+            std::fs::set_permissions(&sandboxes, std::fs::Permissions::from_mode(0o700))
+                .expect("private sandbox base");
+            let oid = initialize_repository(&repository);
+            let session_id = Uuid::new_v4();
+            let branch = format!("rsi/stale-refusal-{case}/{session_id}");
+            let branch_ref = format!("refs/heads/{branch}");
+            let allocation = allocate(&sandboxes, session_id, &repository, &oid, Some(&branch))
+                .expect("source worktree");
+
+            with_repository_mutation(&repository, || {
+                let path = prepare_settlement_quarantine_path(
+                    &allocation.root,
+                    Uuid::new_v4(),
+                    session_id,
+                )?;
+                move_worktree_to_quarantine_non_force_locked(
+                    &repository,
+                    &path,
+                    &branch_ref,
+                    &oid,
+                )?;
+                let admin = prove_moved_worktree_exact_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )?;
+                std::fs::remove_dir_all(&path.quarantine_root).expect("lose the tree");
+                let stale = observe_stale_quarantine_registration_locked(
+                    &repository,
+                    &path.original_root,
+                    &path.quarantine_root,
+                    &branch_ref,
+                    &oid,
+                )?
+                .expect("exact stale registration");
+                match case {
+                    "locked" => std::fs::write(admin.admin_directory.join("locked"), b"held\n")
+                        .expect("lock the stale worktree"),
+                    "head-drift" => std::fs::write(
+                        admin.admin_directory.join("HEAD"),
+                        b"ref: refs/heads/someone-else\n",
+                    )
+                    .expect("drift the stale HEAD"),
+                    "duplicate-pointer" => {
+                        let duplicate = admin
+                            .admin_directory
+                            .parent()
+                            .expect("registry")
+                            .join("duplicate-claim");
+                        std::fs::create_dir(&duplicate).expect("duplicate admin directory");
+                        std::fs::copy(
+                            admin.admin_directory.join("gitdir"),
+                            duplicate.join("gitdir"),
+                        )
+                        .expect("duplicate gitdir pointer");
+                    }
+                    _ => {
+                        git(&repository, &["commit", "--allow-empty", "-qm", "advance"]);
+                        let moved = git(&repository, &["rev-parse", "HEAD"]);
+                        git(&repository, &["update-ref", &branch_ref, &moved]);
+                    }
+                }
+                let attempt = if case == "source-moved" {
+                    remove_stale_quarantine_registration_locked(
+                        &repository,
+                        &path.original_root,
+                        &path.quarantine_root,
+                        &branch_ref,
+                        &oid,
+                        &stale,
+                    )
+                } else {
+                    observe_stale_quarantine_registration_locked(
+                        &repository,
+                        &path.original_root,
+                        &path.quarantine_root,
+                        &branch_ref,
+                        &oid,
+                    )
+                    .map(|_| ())
+                };
+                assert!(attempt.is_err(), "{case}");
+                assert!(
+                    admin.admin_directory.exists(),
+                    "{case}: the administration is retained"
+                );
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_lost_ack_rejects_stale_missing_source_lock() {
@@ -5852,6 +8100,7 @@ mod tests {
         .expect("stale source lock is rejected after an unacknowledged effect");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn branch_first_removed_replay_rejects_stale_source_lock() {
@@ -6004,6 +8253,7 @@ mod tests {
         .expect("exact source restoration");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_missing_quarantine_recovery_is_atomic_and_replayable() {
@@ -6104,6 +8354,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn reattached_quarantine_replay_rejects_stale_source_lock() {
@@ -6176,6 +8427,7 @@ mod tests {
         .expect("reattached replay rejects a stale ref lock");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn recovery_redispatches_same_oid_recreation_before_state_proof() {
@@ -6252,6 +8504,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_recovery_replays_same_oid_source_race_and_lost_ack() {
@@ -6329,6 +8582,7 @@ mod tests {
         .expect("same-OID source race recovers under the exact ref lock");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn detached_missing_recovery_refuses_source_create_collision() {
@@ -6399,6 +8653,7 @@ mod tests {
         .expect("collision retains exact external ref");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn non_force_remove_rejects_dangling_and_unreadable_residue() {
@@ -6475,6 +8730,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn exact_repair_recovers_only_the_renamed_worktree() {
@@ -6547,6 +8803,7 @@ mod tests {
     /// #934: `SELinux` hosts label every file with `security.selinux`; that
     /// policy-managed MAC label alone passes, while ACLs, capabilities and
     /// caller-set attributes still refuse the quarantine.
+    #[cfg(not(target_os = "macos"))]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_xattr_names_admit_only_the_selinux_label() {
@@ -6613,25 +8870,32 @@ mod tests {
         assert_eq!(names, full);
         assert!(check_quarantine_xattr_names(&names).is_err());
 
-        let selinux = isize::try_from(shrunk.len()).unwrap();
-        let names = quarantine_xattr_inventory(selinux, |names| {
-            names.copy_from_slice(shrunk);
-            selinux
+        // The one name the platform permits alone: the SELinux label on Linux,
+        // Gatekeeper provenance on macOS (which has no SELinux).
+        #[cfg(target_os = "macos")]
+        let alone: &[u8] = b"com.apple.provenance\0";
+        #[cfg(not(target_os = "macos"))]
+        let alone: &[u8] = shrunk;
+        let alone_length = isize::try_from(alone.len()).unwrap();
+        let names = quarantine_xattr_inventory(alone_length, |names| {
+            names.copy_from_slice(alone);
+            alone_length
         })
-        .expect("an unchanged SELinux-only list is read");
-        check_quarantine_xattr_names(&names).expect("the SELinux label alone passes");
+        .expect("an unchanged single-name list is read");
+        check_quarantine_xattr_names(&names).expect("the permitted label alone passes");
 
         let empty = quarantine_xattr_inventory(0, |_| panic!("no second read for an empty list"))
             .expect("no attributes");
         assert!(empty.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_tree_proof_rejects_mounts_hardlinks_specials_and_bounds() {
         let temp = tempfile::Builder::new()
             .prefix("q")
-            .tempdir_in("/tmp")
+            .tempdir_in(canonical_tmp())
             .expect("quarantine tree fixture");
         let root = temp.path().join("quarantine");
         std::fs::create_dir(&root).expect("quarantine root");
@@ -6744,6 +9008,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_tree_proof_accepts_only_hard_links_wholly_inside_the_tree() {
@@ -6752,7 +9017,7 @@ mod tests {
         // while any link reachable outside the tree still retains it.
         let temp = tempfile::Builder::new()
             .prefix("q")
-            .tempdir_in("/tmp")
+            .tempdir_in(canonical_tmp())
             .expect("quarantine tree fixture");
         let root = temp.path().join("quarantine");
         let deps = root.join("target/release/deps");
@@ -6828,6 +9093,8 @@ mod tests {
         assert_eq!(linked.entry_count(), 7);
     }
 
+    // The mount-inventory proof (mountinfo, xattr) exists on Linux only.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn quarantine_tree_proof_records_the_tree_superblock_devices() {
@@ -6835,15 +9102,16 @@ mod tests {
         // holder proof may excuse it when its path cannot be resolved.
         let temp = tempfile::Builder::new()
             .prefix("q")
-            .tempdir_in("/tmp")
+            .tempdir_in(canonical_tmp())
             .expect("quarantine tree fixture");
         let root = temp.path().join("quarantine");
         std::fs::create_dir(&root).expect("quarantine root");
         let mountinfo = temp.path().join("mountinfo");
         let device = std::fs::metadata(&root).expect("root identity").dev();
         let (major, minor) = (
-            u64::from(nix::libc::major(device)),
-            u64::from(nix::libc::minor(device)),
+            // `dev_t` is `i32` on macOS and `u64` on Linux, so convert both ways.
+            u64::try_from(nix::libc::major(device as _)).expect("major"),
+            u64::try_from(nix::libc::minor(device as _)).expect("minor"),
         );
         // `/` is an ancestor mount; `/elsewhere` is not.
         std::fs::write(
@@ -6862,7 +9130,10 @@ mod tests {
             proof.mount_device_may_hold_tree(7, 3),
             "ancestor superblock"
         );
-        assert!(!proof.mount_device_may_hold_tree(7, 4) || device == nix::libc::makedev(7, 4));
+        assert!(
+            !proof.mount_device_may_hold_tree(7, 4)
+                || device == u64::try_from(nix::libc::makedev(7, 4)).expect("makedev")
+        );
         assert!(proof.mount_device_may_hold_tree(u64::MAX, 0), "unencodable");
 
         // An unparseable ancestor device makes every mount a possible holder.
@@ -6891,12 +9162,24 @@ mod tests {
                 "fn delete_ref_compare_locked",
             ),
             (
+                "fn complete_quarantine_and_delete_source_ref_locked",
+                "fn delete_source_ref_transaction_locked",
+            ),
+            (
+                "struct StaleQuarantineRegistration",
+                "fn delete_source_ref_transaction_locked",
+            ),
+            (
+                "fn settlement_live_ref_removal_hook_directory",
+                "fn settlement_missing_ref_removal_hook_directory",
+            ),
+            (
                 "fn settlement_missing_ref_removal_hook_directory",
                 "fn settlement_reattach_hook_directory",
             ),
             (
                 "fn settlement_reattach_hook_directory",
-                "#[cfg(any(test, feature = \"test-seam\"))]\npub fn set_atomic_ref_pre_spawn_test_hook",
+                "fn set_atomic_ref_pre_spawn_test_hook",
             ),
         ] {
             let body = source
@@ -7600,6 +9883,40 @@ esac
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
+    fn settlement_cache_allowlist_preserves_other_status_records() {
+        for status in [
+            b"!! scripts/__pycache__/\0".as_slice(),
+            b"!! .pytest_cache/\0!! nested/cache.pyc\0".as_slice(),
+            b"!! odd\nname/__pycache__/\0".as_slice(),
+            b"!! scripts/__pycache__/generated.pyc\0".as_slice(),
+        ] {
+            assert!(only_regenerable_ignored_output(
+                Path::new("/nonexistent"),
+                status
+            ));
+        }
+        for status in [
+            b"!! ignored.secret\0".as_slice(),
+            b"!! ignored-parent/\0".as_slice(),
+            b"?? scripts/__pycache__/new.pyc\0".as_slice(),
+            b" M tracked.pyc\0".as_slice(),
+            b"!! __pycache__\0".as_slice(),
+            b"!! scripts/__pycache__/keep.secret\0".as_slice(),
+            b"!! .pytest_cache/x.secret\0".as_slice(),
+            b"!! prefix__pycache__/\0".as_slice(),
+            b"!! .pytest_cache_backup/\0".as_slice(),
+            b"!! __pycache__/\0!! ignored.secret\0".as_slice(),
+            b"R  renamed\0!! __pycache__/\0".as_slice(),
+        ] {
+            assert!(!only_regenerable_ignored_output(
+                Path::new("/nonexistent"),
+                status
+            ));
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
     fn settlement_cleanliness_includes_ignored_content() {
         let temp = tempfile::tempdir().expect("temporary repository");
         let repository = temp.path().join("repository");
@@ -7621,6 +9938,184 @@ esac
             Ok(())
         })
         .expect("observe ignored content");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_keeps_individually_ignored_files_under_cache_directories_dirty() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(
+            &repository,
+            &["config", "user.email", "settlement@example.test"],
+        );
+        git(&repository, &["config", "user.name", "Settlement Test"]);
+        std::fs::write(repository.join(".gitignore"), "*.pyc\n*.secret\n").expect("ignore rules");
+        git(&repository, &["add", ".gitignore"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        let cache = repository.join("scripts/__pycache__");
+        std::fs::create_dir_all(&cache).expect("cache directory");
+        std::fs::write(cache.join("generated.pyc"), "regenerable\n").expect("ignored bytecode");
+        std::fs::write(cache.join("keep.secret"), "unique ignored data\n").expect("ignored secret");
+
+        with_repository_mutation(&repository, || {
+            let observation = observe_worktree_locked(&repository, &repository)?;
+            assert!(
+                !observation.clean,
+                "an individually ignored non-cache file under __pycache__ is settlement data"
+            );
+            Ok(())
+        })
+        .expect("observe ignored cache contents");
+    }
+
+    fn stamped_repository(temp: &tempfile::TempDir) -> PathBuf {
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.email", "stamp@example.test"]);
+        git(&repository, &["config", "user.name", "Stamp Test"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            ".rsi-build-env.json\n*.pyc\n__pycache__/\n*.secret\n",
+        )
+        .expect("ignore rules");
+        std::fs::write(repository.join("tracked"), "base\n").expect("tracked file");
+        git(&repository, &["add", ".gitignore", "tracked"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        repository
+    }
+
+    fn write_daemon_stamp(repository: &Path) {
+        std::fs::write(
+            repository.join(super::super::execution_scratch::BUILD_ENV_RECORD),
+            br#"{"version":1,"env":{"CARGO_TARGET_DIR":"/x"}}"#,
+        )
+        .expect("daemon stamp");
+    }
+
+    fn settlement_clean(repository: &Path) -> bool {
+        with_repository_mutation(repository, || {
+            Ok(observe_worktree_locked(repository, repository)?.clean)
+        })
+        .expect("observe worktree")
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_accepts_the_daemon_stamp_with_python_caches_2610() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        write_daemon_stamp(&repository);
+        let cache = repository.join("scripts/__pycache__");
+        std::fs::create_dir_all(&cache).expect("cache directory");
+        std::fs::write(cache.join("generated.pyc"), "regenerable\n").expect("bytecode");
+        assert!(settlement_clean(&repository));
+    }
+
+    /// Without Unix ownership proof even a well-formed daemon stamp is
+    /// unproven, so the root is retained (#2615).
+    #[cfg(not(unix))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_the_stamp_without_ownership_proof_2615() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        write_daemon_stamp(&repository);
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_unknown_ignored_data_beside_the_stamp_2610() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        write_daemon_stamp(&repository);
+        std::fs::write(repository.join("operator.secret"), "unique data\n").expect("data");
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_a_substituted_stamp_2610() {
+        let stamp = super::super::execution_scratch::BUILD_ENV_RECORD;
+        // A symlink, even to a well-formed stamp.
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        #[cfg(unix)]
+        {
+            let elsewhere = temp.path().join("elsewhere.json");
+            std::fs::write(&elsewhere, br#"{"version":1,"env":{}}"#).expect("target");
+            std::os::unix::fs::symlink(&elsewhere, repository.join(stamp)).expect("symlink");
+            assert!(!settlement_clean(&repository));
+        }
+        // A regular file of the wrong shape.
+        for body in [
+            r#"{"version":2,"env":{}}"#,
+            r#"{"version":1,"env":{"A":1}}"#,
+            r#"{"version":1,"env":{},"extra":true}"#,
+            "not json",
+        ] {
+            let temp = tempfile::tempdir().expect("temporary repository");
+            let repository = stamped_repository(&temp);
+            std::fs::write(repository.join(stamp), body).expect("stamp");
+            assert!(!settlement_clean(&repository), "{body}");
+        }
+        // A directory in the stamp's place.
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        std::fs::create_dir(repository.join(stamp)).expect("directory");
+        std::fs::write(repository.join(stamp).join("x.secret"), "x").expect("file");
+        assert!(!settlement_clean(&repository));
+    }
+
+    /// A stamp over the size bound is retained even when it parses as the
+    /// exact shape (#2610, #2615).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_an_oversize_stamp_2615() {
+        let stamp = super::super::execution_scratch::BUILD_ENV_RECORD;
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        let padding = "x".repeat(70 * 1024);
+        std::fs::write(
+            repository.join(stamp),
+            format!(r#"{{"version":1,"env":{{"PAD":"{padding}"}}}}"#),
+        )
+        .expect("oversize stamp");
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_a_hardlinked_stamp_2615() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        write_daemon_stamp(&repository);
+        assert!(settlement_clean(&repository), "positive control");
+        std::fs::hard_link(
+            repository.join(super::super::execution_scratch::BUILD_ENV_RECORD),
+            temp.path().join("second-link.json"),
+        )
+        .expect("second link");
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_changed_source_beside_the_stamp_2610() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = stamped_repository(&temp);
+        write_daemon_stamp(&repository);
+        std::fs::write(repository.join("tracked"), "changed\n").expect("change");
+        assert!(!settlement_clean(&repository));
+        std::fs::write(repository.join("tracked"), "base\n").expect("restore");
+        std::fs::write(repository.join("new-source.rs"), "fn main() {}\n").expect("untracked");
+        assert!(!settlement_clean(&repository));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -7985,6 +10480,7 @@ esac
         assert!(!marker.exists(), "descendant survived process-group kill");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn bounded_capture_kills_quiet_descendant_pipe_holders_after_parent_exit() {
@@ -8054,5 +10550,147 @@ esac
         .expect_err("hung command reaches its execution deadline");
         assert!(timeout_result.to_string().contains("execution timed out"));
         assert_no_escape_helper_reaped(&timeout);
+    }
+
+    /// Off Linux and macOS the quarantine tree proof has no xattr inventory, so
+    /// it refuses a canonical, mount-free tree instead of vouching for it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn quarantine_tree_proof_is_refused_where_xattrs_cannot_be_inventoried() {
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in(canonical_tmp())
+            .expect("quarantine tree fixture");
+        let root = temp.path().join("quarantine");
+        std::fs::create_dir(&root).expect("quarantine root");
+        let mountinfo = temp.path().join("mountinfo");
+        std::fs::write(&mountinfo, "").expect("empty mount inventory");
+        let error =
+            prove_quarantine_tree_safe_at(&root, &mountinfo, 16, 1_024, 16, Duration::from_secs(1))
+                .expect_err("no xattr inventory, no proof");
+        assert!(
+            error.to_string().contains("xattr proof is unsupported"),
+            "{error}"
+        );
+    }
+
+    /// Off Linux a leader reaped by `try_wait` has its group left alone (#1259),
+    /// so a quiet descendant that holds the pipes ends in the bounded drain
+    /// timeout rather than a group kill.
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn bounded_capture_reports_quiet_descendant_pipe_holders_as_a_drain_timeout() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 1) & exit 0"]);
+        let limits = ProcessLimits {
+            post_exit_drain_timeout: Duration::from_millis(150),
+            ..ProcessLimits::default()
+        };
+        let started = Instant::now();
+        let error = capture_bounded_with_limits(&mut command, "quiet descendant", None, limits)
+            .expect_err("an unreaped descendant keeps the pipes open past the drain deadline");
+        assert!(error.to_string().contains("drain timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// macOS (#102): the tree proof reads the mount table with `getfsstat`, not
+    /// `/proc/self/mountinfo`, and refuses a root that is a mount point.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn macos_mount_inventory_refuses_a_mount_point_root_and_admits_a_plain_directory() {
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in(canonical_tmp())
+            .expect("mount fixture");
+        reject_mounts_at_or_below_native(temp.path()).expect("a plain directory has no mount");
+        let error = reject_mounts_at_or_below_native(Path::new("/"))
+            .expect_err("the root of the file system is a mount point");
+        assert!(
+            error.to_string().contains("contains a mount point"),
+            "{error}"
+        );
+    }
+
+    /// macOS (#102, hub #3091): each of the four permitted names passes alone
+    /// and together, `security.selinux` (no `SELinux` on Darwin) and every near
+    /// miss refuses.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn macos_quarantine_xattr_names_admit_exactly_the_four_platform_attributes() {
+        for name in [
+            &b"com.apple.provenance\0"[..],
+            b"com.apple.quarantine\0",
+            b"com.apple.macl\0",
+            b"com.apple.lastuseddate#PS\0",
+            b"com.apple.provenance\0com.apple.macl\0",
+            b"",
+        ] {
+            check_quarantine_xattr_names(name).expect("a platform attribute passes");
+        }
+        for name in [
+            &b"security.selinux\0"[..],
+            b"com.apple.provenancex\0",
+            b"com.apple.lastuseddate\0",
+            b"com.apple.FinderInfo\0",
+            b"com.apple.metadata:kMDItemWhereFroms\0",
+            b"user.test\0",
+            b"com.apple.provenance\0security.selinux\0",
+        ] {
+            let error = check_quarantine_xattr_names(name).expect_err("anything else refuses");
+            assert!(
+                error.to_string().contains("extended attributes or ACLs"),
+                "{error}"
+            );
+        }
+    }
+
+    /// macOS (#102): the platform's own provenance attributes pass, any other
+    /// extended attribute or an ACL refuses the tree.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn macos_tree_proof_allows_apple_provenance_and_refuses_other_attributes_and_acls() {
+        fn set_xattr(path: &Path, name: &str) {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let name = CString::new(name).unwrap();
+            // SAFETY: both strings are NUL terminated and the value is 1 byte.
+            let rc = unsafe {
+                nix::libc::setxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0, 0)
+            };
+            assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        }
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in(canonical_tmp())
+            .expect("xattr fixture");
+        let file = temp.path().join("file");
+        std::fs::write(&file, "x").expect("file");
+        reject_extended_attributes(&file).expect("a plain file passes");
+        set_xattr(&file, "com.apple.provenance");
+        reject_extended_attributes(&file).expect("provenance is the platform's own");
+        set_xattr(&file, "user.test");
+        let error = reject_extended_attributes(&file).expect_err("a foreign attribute refuses");
+        assert!(
+            error.to_string().contains("extended attributes or ACLs"),
+            "{error}"
+        );
+
+        let acl_file = temp.path().join("acl");
+        std::fs::write(&acl_file, "x").expect("file");
+        let status = Command::new("/bin/chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&acl_file)
+            .status()
+            .expect("chmod +a");
+        assert!(status.success());
+        let error = reject_extended_attributes(&acl_file).expect_err("an ACL refuses");
+        assert!(
+            error.to_string().contains("extended attributes or ACLs"),
+            "{error}"
+        );
     }
 }

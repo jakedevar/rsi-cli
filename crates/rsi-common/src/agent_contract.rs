@@ -99,6 +99,10 @@ pub enum PipelineStatusV2 {
     Partial,
     Blocked,
     HumanGate,
+    /// An Issue-input implement node proved the Issue's acceptance already
+    /// holds on its base (#2651). Terminal like `complete`; it carries
+    /// `evidence_commit` and no new commit.
+    AlreadySatisfied,
 }
 
 impl PipelineStatusV2 {
@@ -108,6 +112,7 @@ impl PipelineStatusV2 {
             "partial" => Some(Self::Partial),
             "blocked" => Some(Self::Blocked),
             "human_gate" => Some(Self::HumanGate),
+            "already_satisfied" => Some(Self::AlreadySatisfied),
             _ => None,
         }
     }
@@ -155,6 +160,10 @@ pub struct StrictPipelineHandoffV2 {
     /// `blocked` or `human_gate`, at most [`BLOCKER_QUESTION_MAX_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker_question: Option<String>,
+    /// The commit that already satisfies the Issue (#2651): present exactly on
+    /// an `already_satisfied` handoff, a lowercase 40-hex object id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PipelineHandoffWarningV2>,
 }
@@ -289,7 +298,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    fn from_marker(s: &str) -> Option<Self> {
+    /// Map an uppercase marker word to its stage; `None` for an unknown stage.
+    pub fn from_marker(s: &str) -> Option<Self> {
         match s {
             "RESEARCH" => Some(Self::Research),
             "PLAN" => Some(Self::Plan),
@@ -507,6 +517,9 @@ fn head_window(reply: &str) -> &str {
 /// Returns [`ContractError`] when the marker, required fields, ticket, or
 /// stage-specific schema are invalid.
 pub fn parse_pipeline_handoff(reply: &str, ticket: &str) -> Result<PipelineHandoff, ContractError> {
+    // #2759: a schema-validated last message (a JSON object in the structured
+    // handoff shape) is the same handoff; free text is read unchanged.
+    let reply = &*crate::structured_handoff::normalize_structured_handoff(reply);
     let stage_str = extract_pipeline_marker(reply)?;
     let stage = Stage::from_marker(&stage_str).ok_or_else(|| ContractError::UnknownStage {
         stage: stage_str.clone(),
@@ -546,7 +559,16 @@ pub fn parse_pipeline_handoff(reply: &str, ticket: &str) -> Result<PipelineHando
         })?
     };
 
-    if stage == Stage::Implementation && manifest_path.is_none() {
+    // A blocked or human_gate implementation stopped before doing the work,
+    // so it has no verification manifest to name; it still names its blocker
+    // and may ask the on-call manager a question (#1641 S7, #1775).
+    let stopped_before_work = pick_first(&kv, &["status"]).is_some_and(|status| {
+        matches!(
+            status.trim().to_ascii_lowercase().as_str(),
+            "blocked" | "human_gate"
+        )
+    });
+    if stage == Stage::Implementation && manifest_path.is_none() && !stopped_before_work {
         return Err(ContractError::MissingField {
             field: "manifest_path".to_string(),
         });
@@ -630,6 +652,8 @@ pub fn parse_pipeline_handoff_v2(
     reply: &str,
     ticket: &str,
 ) -> Result<StrictPipelineHandoffV2, ContractError> {
+    // #2759: see `parse_pipeline_handoff`.
+    let reply = &*crate::structured_handoff::normalize_structured_handoff(reply);
     extract_pipeline_marker(reply)?;
     let (normalized_reply, warnings) = canonicalize_v2_handoff_aliases(reply)?;
     let handoff = parse_pipeline_handoff(&normalized_reply, ticket)?;
@@ -642,7 +666,9 @@ pub fn parse_pipeline_handoff_v2(
     let strict_status =
         PipelineStatusV2::parse(&status_text).ok_or_else(|| ContractError::InvalidField {
             field: "status".into(),
-            message: format!("expected complete|partial|blocked|human_gate, got {status_text}"),
+            message: format!(
+                "expected complete|partial|blocked|human_gate|already_satisfied, got {status_text}"
+            ),
         })?;
     let blocker_class_text = meaningful_optional(strict_optional_value(
         &kv,
@@ -689,7 +715,44 @@ pub fn parse_pipeline_handoff_v2(
         "blocker_evidence",
     )?);
 
+    let evidence_commit = meaningful_optional(strict_optional_value(
+        &kv,
+        &["evidence_commit"],
+        "evidence_commit",
+    )?);
+    if let Some(commit) = &evidence_commit {
+        if strict_status != PipelineStatusV2::AlreadySatisfied {
+            return Err(ContractError::InvalidField {
+                field: "evidence_commit".into(),
+                message: "only an already_satisfied handoff may carry an evidence commit".into(),
+            });
+        }
+        if commit.len() != 40
+            || !commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ContractError::InvalidField {
+                field: "evidence_commit".into(),
+                message: "expected a lowercase 40-hex commit id".into(),
+            });
+        }
+    }
+
     match strict_status {
+        PipelineStatusV2::AlreadySatisfied => {
+            if evidence_commit.is_none() {
+                return Err(ContractError::MissingField {
+                    field: "evidence_commit".into(),
+                });
+            }
+            if blocker.is_some() || blocker_class.is_some() || blocker_evidence.is_some() {
+                return Err(ContractError::InvalidField {
+                    field: "status".into(),
+                    message: "already_satisfied handoff must not carry blocker fields".into(),
+                });
+            }
+        }
         PipelineStatusV2::Complete => {
             if blocker.is_some() || blocker_class.is_some() || blocker_evidence.is_some() {
                 return Err(ContractError::InvalidField {
@@ -742,6 +805,7 @@ pub fn parse_pipeline_handoff_v2(
         blocker_class,
         blocker_evidence,
         blocker_question,
+        evidence_commit,
         warnings,
     })
 }
@@ -1408,6 +1472,33 @@ mod tests {
     }
 
     #[test]
+    fn strict_v2_already_satisfied_requires_a_lowercase_40_hex_evidence_commit() {
+        let head = "PIPELINE HANDOFF — IMPLEMENTATION:\ndoc_path: inline\n\
+                    manifest_path: inline\nstatus: already_satisfied\n";
+        let good = format!("{head}evidence_commit: {}\n", "ab12".repeat(10));
+        let parsed = parse_pipeline_handoff_v2(&good, "").expect("parses");
+        assert_eq!(parsed.strict_status, PipelineStatusV2::AlreadySatisfied);
+        assert_eq!(
+            parsed.evidence_commit.as_deref(),
+            Some("ab12".repeat(10).as_str())
+        );
+        for bad in [
+            head.to_string(),
+            format!("{head}evidence_commit: abc123\n"),
+            format!("{head}evidence_commit: {}\n", "AB12".repeat(10)),
+            format!("{head}evidence_commit: {}\nblocker: x\n", "ab12".repeat(10)),
+        ] {
+            assert!(parse_pipeline_handoff_v2(&bad, "").is_err(), "{bad}");
+        }
+        let complete = format!(
+            "PIPELINE HANDOFF — IMPLEMENTATION:\ndoc_path: inline\nmanifest_path: inline\n\
+             status: complete\nevidence_commit: {}\n",
+            "ab12".repeat(10)
+        );
+        assert!(parse_pipeline_handoff_v2(&complete, "").is_err());
+    }
+
+    #[test]
     fn validate_first_line_accepts_research() {
         assert!(validate_first_line(well_formed_research()).is_ok());
     }
@@ -1539,6 +1630,23 @@ mod tests {
             ContractError::UnknownStage { stage } => assert_eq!(stage, "DEPLOY"),
             other => panic!("expected UnknownStage, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn blocked_implementation_handoff_with_a_question_needs_no_manifest() {
+        let r = "PIPELINE HANDOFF — IMPLEMENTATION:\n\
+             doc_path: inline\n\
+             status: blocked\n\
+             blocker: the product choice is unanswered\n\
+             blocker_class: technical_impasse\n\
+             blocker_evidence: [observed] no ruling yet\n\
+             blocker_question: Should it do A or B?\n";
+        let handoff = parse_pipeline_handoff_v2(r, "").expect("blocked handoff parses");
+        assert_eq!(handoff.strict_status, PipelineStatusV2::Blocked);
+        assert_eq!(
+            handoff.blocker_question.as_deref(),
+            Some("Should it do A or B?")
+        );
     }
 
     #[test]

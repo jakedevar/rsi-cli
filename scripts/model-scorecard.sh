@@ -131,7 +131,7 @@ sql "$SESSION_SCOPE SELECT provider,model,effort,count(*) sessions,
  FROM scoped GROUP BY provider,model,effort ORDER BY sessions DESC,provider,model,effort;"
 cat <<'EOF'
 
-[observed] Invocation usage is a separate accounting surface. Confidence is summarized in scalar counts; no session and invocation costs are added together. Embedding invocations are excluded from every invocation sum: failed embedding-index rows copy the owning session's provider usage (Issue #700), which would double count it.
+[observed] Invocation usage is a separate accounting surface. Confidence is summarized in scalar counts; no session and invocation costs are added together. Embedding invocations are excluded from every invocation sum: rows written before the #700 fix copy the owning session's provider usage (the daemon no longer does), which would double count it.
 
 EOF
 sql "WITH model_counts AS (SELECT provider,model,count(*) n FROM sessions GROUP BY provider,model),

@@ -29,6 +29,47 @@ impl EventClock for SystemEventClock {
     }
 }
 
+/// Render opportunity cadence. Input, PTY output, resize and data changes
+/// mark the app dirty and draw on the next opportunity (<= ~8.3 ms).
+const RENDER_TICK: Duration = Duration::from_micros(8333); // 120 Hz opportunities
+
+/// Minimum spacing between two draws that were requested only by an
+/// animation (loading bar, formulation reveal), not by a dirty event: ~30 fps.
+/// Four 120 Hz opportunities (33.3 ms) satisfy it, so animation draws at 30 fps.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Decides, per render opportunity, whether to draw.
+///
+/// A dirty app (key, PTY output, resize, bus/poll data, the 1 s defensive
+/// repaint) always draws on the next opportunity. An animation that was
+/// visible in the last frame schedules a further draw only after
+/// [`ANIMATION_FRAME_INTERVAL`], so animation alone cannot drive 120 Hz
+/// frames (#2932). With neither, nothing draws.
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderPacer {
+    last_draw: Option<Instant>,
+    animating: bool,
+}
+
+impl RenderPacer {
+    fn should_draw(&self, now: Instant, dirty: bool) -> bool {
+        if dirty {
+            return true;
+        }
+        self.animating
+            && self
+                .last_draw
+                .is_none_or(|last| now.saturating_duration_since(last) >= ANIMATION_FRAME_INTERVAL)
+    }
+
+    /// Record a completed draw and whether the painted frame holds a
+    /// time-based animation that needs a follow-up frame.
+    fn record_draw(&mut self, now: Instant, animating: bool) {
+        self.last_draw = Some(now);
+        self.animating = animating;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct KeyStepResult {
     suppress_poll: bool,
@@ -45,9 +86,9 @@ fn expire_esp_flash(app: &mut crate::app::App, now: Instant) {
             if now >= deadline {
                 *flash = None;
                 *flash_deadline = None;
-                app.needs_redraw = true;
+                app.mark_dirty_for(crate::draw_stats::DirtyReason::Expiry);
             } else {
-                app.needs_redraw = true;
+                app.mark_dirty_for(crate::draw_stats::DirtyReason::Expiry);
             }
         }
     }
@@ -402,7 +443,7 @@ async fn step_once_with_clock<C: EventClock>(
                     let in_settings =
                         matches!(app.focused_pane(), Some(crate::types::Pane::Settings));
                     if in_prompt_creator
-                        && crate::prompt_creator_keys::handle_prompt_creator_key(app, key)
+                        && crate::prompt_creator_keys::handle_prompt_creator_key(app, key).await
                     {
                         // Prompt creator consumed the key; drain any async actions queued by the handler
                         let deferred = std::mem::take(&mut app.pending_lc_actions);
@@ -476,7 +517,7 @@ async fn step_once_with_clock<C: EventClock>(
         }
     }
 
-    app.mark_dirty(); // Any keypress = redraw
+    app.mark_dirty_for(crate::draw_stats::DirtyReason::Key); // Any keypress = redraw
     KeyStepResult {
         suppress_poll: true,
     }
@@ -492,7 +533,8 @@ pub async fn run_event_loop(
     use futures::StreamExt;
 
     let mut reader = EventStream::new();
-    let mut render_interval = tokio::time::interval(Duration::from_micros(8333)); // 120fps
+    let mut render_interval = tokio::time::interval(RENDER_TICK);
+    let mut pacer = RenderPacer::default();
     let clock = SystemEventClock;
 
     // Skip missed ticks instead of bursting to catch up. Without this,
@@ -521,6 +563,13 @@ pub async fn run_event_loop(
     let mut repaint_interval = tokio::time::interval(Duration::from_secs(1));
     repaint_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Optional headless observation (#332): when RSI_DRAW_STATS_FILE names an
+    // absolute path, the 1 s tick rewrites a small JSON snapshot of the draw
+    // counters there. Unset (the default) writes nothing.
+    let draw_stats_file = std::env::var_os("RSI_DRAW_STATS_FILE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
+
     // Catch SIGTERM so cargo-watch rebuilds trigger clean exits with state saved.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("SIGTERM handler");
@@ -548,13 +597,14 @@ pub async fn run_event_loop(
             _ = render_interval.tick() => {
                 // Expire TTL-based notifications before rendering
                 if app.expire_notifications() {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Expiry);
                 }
 
                 // Expire ESP Square flash after deadline
                 expire_esp_flash(app, clock.now());
 
-                if app.needs_redraw {
+                let was_dirty = app.needs_redraw;
+                if pacer.should_draw(clock.now(), was_dirty) {
                     // Detect terminal size changes even when CEvent::Resize was
                     // dropped (known i3/Ghostty issue). If the backend reports a
                     // different size than last draw, force a full clear.
@@ -607,18 +657,18 @@ pub async fn run_event_loop(
                         app.quit = true;
                     } else {
                         app.record_first_frame();
+                        app.draw_stats.record_draw(was_dirty);
                     }
-                    // Keep redraws flowing while a loading bar is visible
-                    // so its time-based animation stays smooth (~30 fps).
-                    // Also keep redraws flowing while the terminal overlay is active so
-                    // PTY output (shell prompt, command results) appears immediately without
-                    // waiting for the next keypress or repaint interval.
-                    app.needs_redraw = app.has_loading_bar
-                        || app.has_formulation_animation
-                        || matches!(
-                            &app.overlay,
-                            crate::types::OverlayState::Terminal
-                        );
+                    // Dirty is consumed by the draw. A visible loading bar or
+                    // formulation reveal is time-based: the pacer schedules its
+                    // next frame at <= 30 fps instead of re-arming every 120 Hz
+                    // opportunity. PTY output marks dirty itself, so the
+                    // Terminal overlay needs no animation redraw.
+                    app.needs_redraw = false;
+                    pacer.record_draw(
+                        clock.now(),
+                        app.has_loading_bar || app.has_formulation_animation,
+                    );
                 }
             }
 
@@ -626,7 +676,7 @@ pub async fn run_event_loop(
             // bounded background tasks and applied only on this main task.
             Some(result) = app.bootstrap.recv() => {
                 if app.apply_bootstrap_event(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Bootstrap);
                 }
                 crate::editing_mode_prompt::settle_on_start(&mut *app).await;
             }
@@ -711,7 +761,7 @@ pub async fn run_event_loop(
                             }
                             _ => {}
                         }
-                        app.mark_dirty();
+                        app.mark_dirty_for(crate::draw_stats::DirtyReason::Mouse);
                     }
                     Some(Ok(CEvent::Paste(text))) => {
                         // Bracketed paste from terminal (e.g. Ghostty performable:ctrl+v).
@@ -737,7 +787,7 @@ pub async fn run_event_loop(
                                     || crate::input_bar::try_paste_text_input_bar(app, &text)
                             };
                             if handled {
-                                app.mark_dirty();
+                                app.mark_dirty_for(crate::draw_stats::DirtyReason::Paste);
                             }
                         }
                     }
@@ -748,7 +798,7 @@ pub async fn run_event_loop(
                         // blank screen (ratatui thinks nothing changed).
                         app.pane_switch_clear = true;
                         app.last_terminal_size = (w, h);
-                        app.mark_dirty();
+                        app.mark_dirty_for(crate::draw_stats::DirtyReason::Resize);
                     }
                     Some(Err(_)) => {
                         app.quit = true;
@@ -769,7 +819,7 @@ pub async fn run_event_loop(
             } => {
                 if let Some(stream_event) = event {
                     if app.apply_notification_stream_event(stream_event) {
-                        app.mark_dirty();
+                        app.mark_dirty_for(crate::draw_stats::DirtyReason::Push);
                     }
                     let deferred = std::mem::take(&mut app.pending_lc_actions);
                     for lc_action in deferred {
@@ -790,7 +840,7 @@ pub async fn run_event_loop(
             // `focus_fetch_tx` is held by `App` and outlives the loop.
             Some(focus_result) = app.focus_fetch_rx.recv() => {
                 if app.apply_focus_fetch_result(focus_result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
                 // Enhanced: Longer suppression when navigation effects are active
                 let suppression_duration = if !app.focus_fetch_inflight.is_empty()
@@ -807,7 +857,7 @@ pub async fn run_event_loop(
             // reconnect classification) stays on the event-loop task.
             Some(result) = app.conversation_poll_rx.recv() => {
                 if app.apply_conversation_poll_result(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -816,7 +866,7 @@ pub async fn run_event_loop(
             // daemon write on the event loop.
             Some(result) = app.auto_resume_handoff_rx.recv() => {
                 if app.apply_auto_resume_handoff_result(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -824,7 +874,7 @@ pub async fn run_event_loop(
             // destruction and returned-session placement.
             Some(result) = app.interactive_launch_rx.recv() => {
                 if app.apply_interactive_launch_result(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -832,7 +882,7 @@ pub async fn run_event_loop(
             // occur only after their exact semantic responses arrive.
             Some(result) = app.docreg_operation_rx.recv() => {
                 if app.apply_docreg_operation_result(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -840,7 +890,7 @@ pub async fn run_event_loop(
             // unchanged until the exact UpdateDaemonConfig response settles.
             Some(result) = app.classifier_config_rx.recv() => {
                 if app.apply_classifier_config_result(result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -848,7 +898,7 @@ pub async fn run_event_loop(
             // by the active navigation-node effect.
             Some(hierarchy_result) = app.hierarchy_fetch_rx.recv() => {
                 if app.apply_hierarchy_fetch_result(hierarchy_result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
                 // Enhanced: Longer suppression when navigation effects are active
                 let suppression_duration = if !app.focus_fetch_inflight.is_empty()
@@ -863,7 +913,14 @@ pub async fn run_event_loop(
             // MODEL SEGMENTS FETCH RESULT: model segments fetched on SessionDetail focus
             Some(segments_result) = app.model_segments_fetch_rx.recv() => {
                 if app.apply_model_segments_fetch_result(segments_result) {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
+                }
+            }
+
+            // COLD STORAGE TIER: an archived session's tier, read on open (#2384)
+            Some(tier_result) = app.cold_storage.rx.recv() => {
+                if app.apply_cold_tier_fetch(tier_result) {
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -902,7 +959,7 @@ pub async fn run_event_loop(
                 let (next_phase, changed) = app.poll_step(poll_phase.take().unwrap()).await;
                 poll_phase = next_phase;
                 if changed {
-                    app.mark_dirty();
+                    app.mark_dirty_for(crate::draw_stats::DirtyReason::Poll);
                 }
             }
 
@@ -931,9 +988,15 @@ pub async fn run_event_loop(
                     } else {
                         fallback
                     };
+                    // #2752: label models this login cannot use and show where
+                    // the list came from (live, bundled, stale) and how old it is.
+                    crate::ui::widget::model_dropdown::set_catalog_note(
+                        provider,
+                        models.catalog_note(chrono::Utc::now()),
+                    );
                     let _ = tx.send(crate::app::ModelDiscoveryResult {
                         provider,
-                        models: models.models,
+                        models: models.picker_models(),
                         effort_capabilities: models.effort_capabilities,
                     });
                 });
@@ -1351,11 +1414,16 @@ pub async fn run_event_loop(
                     .as_millis()
                     .min(i64::MAX as u128) as i64;
                 app.issue_workspace_tick(now);
-                app.mark_dirty();
+                app.mark_dirty_for(crate::draw_stats::DirtyReason::Defensive);
+                if let Some(path) = draw_stats_file.as_deref() {
+                    crate::draw_stats::write_snapshot_file(path, &app.draw_stats.snapshot());
+                }
             }
         }
 
         app.poll_worker_pressure_refresh().await;
+        app.poll_land_watch().await;
+        app.poll_todo_panel().await;
         app.poll_manager_roster_refresh().await;
         crate::overlay::global_manager_workspace::tick(app).await;
         crate::overlay::fleet::tick(app).await;
@@ -2553,6 +2621,137 @@ mod tests {
         assert!(matches!(app.overlay, OverlayState::None));
     }
 
+    /// Deterministic stand-in for the render arm of `run_event_loop`: a
+    /// simulated 120 Hz clock, a dirty flag and the pacer, with no sleeping.
+    struct RenderSim {
+        pacer: RenderPacer,
+        now: Instant,
+        dirty: bool,
+        /// What the painted frame reports (`has_loading_bar || formulation`).
+        animation_visible: bool,
+        draws: Vec<Duration>,
+        origin: Instant,
+    }
+
+    impl RenderSim {
+        fn new(animation_visible: bool) -> Self {
+            let origin = Instant::now();
+            Self {
+                pacer: RenderPacer::default(),
+                now: origin,
+                dirty: false,
+                animation_visible,
+                draws: Vec::new(),
+                origin,
+            }
+        }
+
+        /// One render opportunity: returns whether it drew.
+        fn tick(&mut self) -> bool {
+            self.now += RENDER_TICK;
+            if !self.pacer.should_draw(self.now, self.dirty) {
+                return false;
+            }
+            self.dirty = false;
+            self.pacer.record_draw(self.now, self.animation_visible);
+            self.draws.push(self.now - self.origin);
+            true
+        }
+
+        fn run_seconds(&mut self, seconds: u64, mut each_tick: impl FnMut(&mut Self, u64)) {
+            let ticks = seconds * 1_000_000 / RENDER_TICK.as_micros() as u64;
+            for n in 0..ticks {
+                each_tick(self, n);
+                self.tick();
+            }
+        }
+
+        fn draws_in(&self, from_s: u64, to_s: u64) -> usize {
+            self.draws
+                .iter()
+                .filter(|d| **d > Duration::from_secs(from_s) && **d <= Duration::from_secs(to_s))
+                .count()
+        }
+    }
+
+    #[test]
+    fn render_pacer_animation_only_draws_at_most_30_fps() {
+        let mut sim = RenderSim::new(true);
+        sim.dirty = true; // first frame paints the loading bar
+        sim.run_seconds(10, |_, _| {});
+        for second in 0..10 {
+            let n = sim.draws_in(second, second + 1);
+            assert!(n <= 30, "second {second}: {n} animation-only draws (> 30)");
+            assert!(n >= 28, "second {second}: {n} draws; animation stalled");
+        }
+        // Spacing between consecutive animation-only draws honours the interval.
+        for pair in sim.draws.windows(2) {
+            assert!(pair[1] - pair[0] >= ANIMATION_FRAME_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn render_pacer_idle_without_animation_draws_nothing() {
+        let mut sim = RenderSim::new(false);
+        sim.dirty = true;
+        sim.run_seconds(10, |_, _| {});
+        // Only the initial dirty frame; no loading bar, no formulation.
+        assert_eq!(sim.draws.len(), 1);
+    }
+
+    #[test]
+    fn render_pacer_input_pty_and_resize_draw_on_next_tick_during_animation() {
+        let mut sim = RenderSim::new(true);
+        sim.dirty = true;
+        sim.run_seconds(1, |_, _| {});
+        // A dirty event arriving right after an animation draw (so the
+        // animation interval has not elapsed) still draws on the very next
+        // tick: key, PTY output and resize all go through `mark_dirty`.
+        for event in ["key", "pty", "resize"] {
+            while !sim.tick() {} // land just after an animation draw
+            sim.dirty = true; // mark_dirty() from the event arm
+            assert!(sim.tick(), "{event}: dirty must draw on the next tick");
+            let gap = sim.draws[sim.draws.len() - 1] - sim.draws[sim.draws.len() - 2];
+            assert_eq!(gap, RENDER_TICK, "{event}: drew one tick after the event");
+        }
+    }
+
+    #[test]
+    fn render_pacer_dirty_events_are_not_throttled_below_tick_rate() {
+        let mut sim = RenderSim::new(false);
+        // PTY output arriving every tick draws every tick (typing echo, scrollback flood).
+        sim.run_seconds(1, |sim, _| sim.dirty = true);
+        assert_eq!(sim.draws.len(), 120);
+    }
+
+    #[test]
+    fn render_pacer_repaint_timer_recovers_a_missed_resize_while_idle() {
+        let mut sim = RenderSim::new(false);
+        // The 1 s defensive repaint marks dirty once per simulated second:
+        // exactly one resize-recovery draw per second, nothing in between.
+        sim.run_seconds(5, |sim, n| {
+            if n % 120 == 119 {
+                sim.dirty = true;
+            }
+        });
+        assert_eq!(sim.draws.len(), 5);
+    }
+
+    #[test]
+    fn render_pacer_animation_stops_when_indicator_disappears() {
+        let mut sim = RenderSim::new(true);
+        sim.dirty = true;
+        sim.run_seconds(1, |_, _| {});
+        sim.animation_visible = false; // session finished: no indicator painted
+        sim.run_seconds(1, |_, _| {});
+        let after_stop = sim.draws.len();
+        sim.run_seconds(5, |_, _| {});
+        // At most one further frame (the one that paints the indicator's absence),
+        // then idle.
+        assert!(sim.draws.len() <= after_stop + 1);
+        assert_eq!(sim.draws_in(3, 7), 0);
+    }
+
     fn esp_overlay(started_at: Instant, deadline: Instant) -> OverlayState {
         OverlayState::EspSquare {
             round: 0,
@@ -3151,7 +3350,20 @@ mod tests {
         ));
         let before = app.settings.text_area_backfill_enabled;
         step_once(&mut app, toggle).await;
+        assert_eq!(
+            app.settings.text_area_backfill_enabled, before,
+            "Space stages the value; nothing is live until it is applied"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+
+        let apply = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        assert!(matches!(
+            registered_request(&app, apply),
+            ActionAvailability::Available(request) if request.id == ActionId::SettingsApply
+        ));
+        step_once(&mut app, apply).await;
         assert_eq!(app.settings.text_area_backfill_enabled, !before);
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
     }
 
     #[tokio::test]

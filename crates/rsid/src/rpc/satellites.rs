@@ -10,11 +10,25 @@ impl RpcServer {
                 "GetSatelliteIdentity takes no parameters".into(),
             ));
         }
+        // #2120: the hub qualifies this satellite for a QA run from the same
+        // admission a start rechecks (build governor floor included). Health
+        // also reports OS/arch so the hub keeps its QA on the same OS (#2935).
+        let qa_host = self
+            .satellite_qa_host(rsi_common::identity::data_dir().join("jobs"))
+            .await;
+        // #2753: keep this host's CLI login probes within their TTL; the
+        // health below reports the cached result.
+        self.session_manager.provider_login().spawn_refresh_stale();
         let (installation_id, health) = {
             let store = self.session_manager.store().lock().await;
             let installation_id = store.satellite_installation_id()?;
             // Health is additive: a failed read must not hide the identity.
-            (installation_id, crate::satellite::health(&store).ok())
+            let health = crate::satellite::health(&store).ok().map(|mut health| {
+                health.qa_admission =
+                    crate::rolling_queue::satellite_qa::admission(&store, &qa_host).ok();
+                health
+            });
+            (installation_id, health)
         };
         let mut identity =
             crate::satellite::identity(installation_id, self.satellite_incarnation_id);
@@ -132,10 +146,11 @@ impl RpcServer {
             .store()
             .lock()
             .await
-            .put_satellite_peer_scope(
+            .put_satellite_peer_scope_entries(
                 input.expected_registry_revision,
                 input.peer_id.0,
                 &input.remote_session_ids,
+                &input.remote_project_ids,
             )?;
         Ok(serde_json::json!({ "revision": revision }))
     }
@@ -156,6 +171,26 @@ impl RpcServer {
             .await
             .satellite_inbound_policy()?;
         Ok(serde_json::to_value(policy)?)
+    }
+
+    /// #1928: this host's declared inbound scope with every entry resolved
+    /// against the live sessions (operator-only).
+    pub(super) async fn handle_get_satellite_scope_status(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        if !request.params.is_null() && request.params != serde_json::json!({}) {
+            return Err(DaemonError::InvalidParam(
+                "GetSatelliteScopeStatus takes no parameters".into(),
+            ));
+        }
+        let status = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .satellite_scope_status()?;
+        Ok(serde_json::to_value(status)?)
     }
 
     pub(super) async fn handle_put_satellite_inbound_policy(
@@ -217,12 +252,11 @@ impl RpcServer {
         input
             .validate()
             .map_err(|code| DaemonError::InvalidParam(code.into()))?;
-        let reply = self
-            .session_manager
-            .store()
-            .lock()
-            .await
-            .take_hub_reports(input.hub_installation_id.0, &input.acked)?;
+        let reply = self.session_manager.store().lock().await.take_hub_reports(
+            input.hub_installation_id.0,
+            &input.acked,
+            &input.outcomes,
+        )?;
         Ok(serde_json::to_value(reply)?)
     }
 
@@ -249,6 +283,138 @@ impl RpcServer {
         )
         .await?;
         Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// #2120: run (or report) the hub's async full-library QA for one exact
+    /// published SHA on this satellite. Operator-only wire method (never in
+    /// the agent catalog); the satellite enforces its own inbound policy,
+    /// host-load admission, disk floor and deploy drain.
+    pub(super) async fn handle_request_hub_qa_run(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::satellite_qa::{SATELLITE_QA_INVALID, SatelliteQaRunRequestV1};
+        if serde_json::to_vec(&request.params)?.len() > 1_024 {
+            return Err(DaemonError::InvalidParam(SATELLITE_QA_INVALID.into()));
+        }
+        let input: SatelliteQaRunRequestV1 = serde_json::from_value(request.params.clone())
+            .map_err(|_| DaemonError::InvalidParam(SATELLITE_QA_INVALID.into()))?;
+        // Nothing is recorded yet: a listed non-effect code, not raw text the
+        // hub could only read as uncertain (#2156).
+        let jobs = crate::agent_jobs::jobs_dir().map_err(|error| {
+            tracing::warn!(%error, "hub QA run: job directory unavailable");
+            DaemonError::PolicyDenied(rsi_common::satellite_qa::SATELLITE_QA_LAUNCH_FAILED.into())
+        })?;
+        let host = self.satellite_qa_host(jobs.clone()).await;
+        let runtime = crate::agent_jobs::platform_job_runtime();
+        let tools = crate::agent_jobs::JobTools::discover();
+        let receipt = crate::rolling_queue::satellite_qa::request_hub_qa_run(
+            self.session_manager.store(),
+            host,
+            input,
+            move |store, ctx, hold| {
+                crate::agent_jobs::submit_with_hold(
+                    store,
+                    &*runtime,
+                    &tools,
+                    &jobs,
+                    ctx,
+                    hold,
+                    chrono::Utc::now(),
+                )
+                .map(|(row, _)| row)
+            },
+        )
+        .await?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// This satellite's QA admission inputs now: host-load admission, the
+    /// deploy drain, the data filesystem, the live build governor (its
+    /// operator policy and sample, the gates the run's job would meet) and the
+    /// target the run needs above the governor's floor (#2176).
+    async fn satellite_qa_host(
+        &self,
+        jobs: std::path::PathBuf,
+    ) -> crate::rolling_queue::satellite_qa::QaHost {
+        let reclaimable_bytes = crate::target_pool::qa_reclaimable_bytes().await;
+        let governor =
+            crate::governor::Governor::global().snapshot(&self.runtime_config.governor_policy());
+        crate::rolling_queue::satellite_qa::QaHost {
+            target_bytes: crate::rolling_queue::satellite_qa::expected_target_bytes(&jobs),
+            jobs,
+            reclaimable_bytes,
+            data_reclaimable_bytes: {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let same_disk = std::fs::metadata("/")
+                        .and_then(|root| {
+                            std::fs::metadata(rsi_common::identity::data_dir())
+                                .map(|data| data.dev() == root.dev())
+                        })
+                        .unwrap_or(false);
+                    if same_disk { reclaimable_bytes } else { 0 }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            },
+            load_hold: self.session_manager.host_load().hold_now().is_some(),
+            draining: self.session_manager.deploy_drain().is_draining(),
+            disk_free: crate::satellite::disk_free_bytes(&rsi_common::identity::data_dir()),
+            build: crate::rolling_queue::satellite_qa::BuildGate::from_snapshot(&governor),
+        }
+    }
+
+    pub(super) async fn handle_request_hub_manager_policy(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::satellite_manager_policy::*;
+        if serde_json::to_vec(&request.params)?.len() > 32_768 {
+            return Err(DaemonError::InvalidParam(POLICY_INVALID.into()));
+        }
+        let wire: SatelliteManagerPolicyRequestV1 = serde_json::from_value(request.params.clone())
+            .map_err(|_| DaemonError::InvalidParam(POLICY_INVALID.into()))?;
+        let receipt = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .apply_hub_manager_policy(&wire)?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// #2750: a paired hub asks this satellite to move its failed manager seat
+    /// to another provider (`AgentReseatSatelliteManager` on the hub).
+    pub(super) async fn handle_request_hub_manager_reseat(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::manager_reseat::*;
+        if serde_json::to_vec(&request.params)?.len() > 8_192 {
+            return Err(DaemonError::InvalidParam(SATELLITE_RESEAT_INVALID.into()));
+        }
+        let wire: SatelliteManagerReseatRequestV1 = serde_json::from_value(request.params.clone())
+            .map_err(|_| DaemonError::InvalidParam(SATELLITE_RESEAT_INVALID.into()))?;
+        let project_id = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .hub_manager_reseat_project(&wire)?;
+        let result = Box::pin(
+            self.session_manager
+                .reseat_harness_manager(wire.request.reseat_params(project_id)),
+        )
+        .await?;
+        Ok(serde_json::to_value(SatelliteManagerReseatReceiptV1 {
+            hub_installation_id: wire.hub_installation_id,
+            sender_session_id: wire.sender_session_id,
+            result,
+        })?)
     }
 
     pub(super) async fn handle_put_satellite_link(

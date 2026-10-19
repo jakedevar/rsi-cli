@@ -1,7 +1,7 @@
 //! Transient per-user launchd services. No PID files or daemon-held children:
 //! launchd owns the job process group across session and daemon termination.
 
-use super::{JobParams, JobRuntime, LaunchSpec, WRAPPER, s, tail};
+use super::{JobParams, JobRuntime, LaunchSpec, WRAPPER, job_env, s, tail};
 use rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED;
 use std::io::Write;
 use std::path::PathBuf;
@@ -65,6 +65,25 @@ fn wrapper() -> String {
     )
 }
 
+/// launchd has no `MemoryMax`/`CPUQuota`, so a Mac build unit compiles with fewer
+/// workers and no debug info. These are launchd's own build tuning, not part of
+/// the shared job-environment names (`JOB_UNIT_ENV_NAMES`).
+///
+/// #2937: two concurrent units (the daemon's capacity gate, `host_memory`) of two
+/// rustc workers each use 4 of the satellite's 12 cores and, with a link of the
+/// 120 MB `rsid` binary, peak at 4-6 GB each of 16 GB. Test binaries default to
+/// one thread per core (12) and each test process can hold hundreds of MB, so
+/// the test threads are capped at four, as `cargo-slot` does on Linux. A job
+/// that asked for a smaller CPU budget still wins: its `env` prefix is set after
+/// this plist environment.
+const LAUNCHD_BUILD_TUNING: [(&str, &str); 5] = [
+    ("CARGO_BUILD_JOBS", "2"),
+    ("RUST_TEST_THREADS", "4"),
+    ("NEXTEST_TEST_THREADS", "4"),
+    ("CARGO_PROFILE_TEST_DEBUG", "0"),
+    ("CARGO_PROFILE_DEV_DEBUG", "0"),
+];
+
 fn plist(spec: &LaunchSpec, target: &str) -> String {
     // launchd's environment belongs to the user manager, rather than the
     // submitting process. Strip transport/ownership variables even if someone
@@ -87,19 +106,24 @@ fn plist(spec: &LaunchSpec, target: &str) -> String {
     ];
     argv.extend(spec.command.argv.iter().cloned());
     let mut env = String::new();
-    for key in ["HOME", "PATH"] {
+    for key in [job_env::HOME, job_env::PATH] {
         if let Ok(value) = std::env::var(key) {
             env.push_str(&format!("<key>{key}</key>{}", xml_string(&value)));
         }
     }
+    if let Some(max) = spec.command.admission_max_secs {
+        env.push_str(&format!(
+            "<key>{}</key>{}",
+            job_env::RSI_CARGO_ADMISSION_MAX_SEC,
+            xml_string(&max.to_string())
+        ));
+    }
     if let Some(build) = &spec.build_environment {
-        for (key, value) in [
-            ("TMPDIR", build.tmp_dir.display().to_string()),
-            ("CARGO_TARGET_DIR", build.target_dir.display().to_string()),
-            ("CARGO_BUILD_JOBS", s("2")),
-            ("CARGO_PROFILE_TEST_DEBUG", s("0")),
-            ("CARGO_PROFILE_DEV_DEBUG", s("0")),
-        ] {
+        for (key, value) in build
+            .scratch_env()
+            .into_iter()
+            .chain(LAUNCHD_BUILD_TUNING.iter().map(|(k, v)| (*k, s(v))))
+        {
             env.push_str(&format!("<key>{key}</key>{}", xml_string(&value)));
         }
     }
@@ -117,13 +141,22 @@ fn plist(spec: &LaunchSpec, target: &str) -> String {
 <key>KeepAlive</key><false/>
 <key>AbandonProcessGroup</key><false/>
 <key>ExitTimeOut</key><integer>{stop_timeout}</integer>
-<key>StandardErrorPath</key>{errors}
+{nice}<key>StandardErrorPath</key>{errors}
 </dict></plist>
 "#,
         label = xml_string(target.rsplit('/').next().unwrap_or(&spec.unit_name)),
         args = argv.iter().map(|arg| xml_string(arg)).collect::<String>(),
         cwd = xml_string(&spec.cwd.display().to_string()),
         stop_timeout = spec.command.stop_timeout_secs,
+        // #2112: launchd has no CPU weight; background work only lowers nice.
+        nice = if spec.command.background {
+            format!(
+                "<key>Nice</key><integer>{}</integer>\n",
+                super::BACKGROUND_NICE
+            )
+        } else {
+            String::new()
+        },
         errors = xml_string(
             &spec
                 .log_path
@@ -202,6 +235,13 @@ impl LaunchdJobRuntime {
 }
 
 impl JobRuntime for LaunchdJobRuntime {
+    fn check_toolchain(
+        &self,
+        params: &JobParams,
+        cwd: &std::path::Path,
+    ) -> std::result::Result<(), String> {
+        super::check_unit_toolchain(params, cwd)
+    }
     fn unit_name(&self, id: uuid::Uuid) -> String {
         format!("{}/rsi-job-{id}", self.domain)
     }
@@ -285,6 +325,7 @@ impl JobRuntime for LaunchdJobRuntime {
 
 #[cfg(test)]
 mod tests {
+    use super::super::JOB_UNIT_ENV_NAMES;
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
@@ -398,21 +439,65 @@ mod tests {
                 log_max_bytes: 1024,
                 memory_max_gib: 1,
                 cpu_quota_percent: 100,
+                background: false,
+                admission_max_secs: None,
             },
             build_environment: Some(super::super::BuildEnvironment {
+                admission_lock: None,
                 tmp_dir: PathBuf::from("/tmp/private"),
                 target_dir: PathBuf::from("/tmp/target"),
                 artifact_lock: None,
+                recorded_env: Vec::new(),
             }),
         };
+        let mut spec = spec;
         let xml = plist(&spec, "user/501/rsi-job-example");
+        // #2112: background work lowers its nice level (launchd has no weight).
+        spec.command.background = true;
+        assert!(
+            plist(&spec, "user/501/rsi-job-example")
+                .contains("<key>Nice</key><integer>10</integer>")
+        );
         assert!(xml.contains(
             "<string>literal &amp; &lt;tag&gt; &quot;quote&quot; &apos;x&apos; $HOME</string>"
         ));
+        assert!(xml.contains("<key>TMPDIR</key><string>/tmp/private</string>"));
+        // #2612: Git does not look above the private TMPDIR.
+        assert!(xml.contains("<key>GIT_CEILING_DIRECTORIES</key><string>/tmp/private</string>"));
         assert!(xml.contains("<key>RunAtLoad</key><false/>"));
         assert!(xml.contains("<key>KeepAlive</key><false/>"));
         assert!(xml.contains("<key>AbandonProcessGroup</key><false/>"));
         assert!(xml.contains("<key>CARGO_BUILD_JOBS</key><string>2</string>"));
+        // #2937: test threads are capped for the 16 GB satellite.
+        assert!(xml.contains("<key>RUST_TEST_THREADS</key><string>4</string>"));
+        assert!(xml.contains("<key>NEXTEST_TEST_THREADS</key><string>4</string>"));
+        // #2629: the plist sets no environment name outside the shared unit
+        // names and launchd's own build tuning, and every build-scratch
+        // variable the unit carries reaches it with its escaped value.
+        let section = xml
+            .split("<key>EnvironmentVariables</key><dict>")
+            .nth(1)
+            .and_then(|rest| rest.split("</dict>").next())
+            .unwrap();
+        let keys: Vec<&str> = section
+            .split("<key>")
+            .skip(1)
+            .map(|part| part.split("</key>").next().unwrap())
+            .collect();
+        for key in &keys {
+            assert!(
+                JOB_UNIT_ENV_NAMES.contains(key)
+                    || LAUNCHD_BUILD_TUNING.iter().any(|(name, _)| name == key),
+                "{key} is neither shared nor launchd tuning: {keys:?}"
+            );
+        }
+        let build = spec.build_environment.as_ref().unwrap();
+        for (name, value) in build.scratch_env() {
+            assert!(
+                section.contains(&format!("<key>{name}</key>{}", xml_string(&value))),
+                "{name} in {section}"
+            );
+        }
         assert!(xml.contains("<string>-u</string><string>RSI_SESSION_TOKEN</string>"));
         assert!(wrapper().contains("exec /bin/launchctl bootout \"$target\""));
     }

@@ -1363,6 +1363,7 @@ async fn test_graph_review_reopens_active_execution_in_executing_mode() {
             current_nodes: Vec::new(),
             on_call: None,
             rulings: Vec::new(),
+            node_attempts: Vec::new(),
             updates: Vec::new(),
         },
     );

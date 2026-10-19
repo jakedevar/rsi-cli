@@ -55,7 +55,7 @@ fn map_topology_row(row: &rusqlite::Row) -> rusqlite::Result<TopologyRow> {
 
 impl Store {
     /// Insert a new topology row. Caller is responsible for the name-uniqueness
-    /// pre-check; the DB UNIQUE constraint on `name` is the final guard.
+    /// pre-check; the DB owner-scope/name UNIQUE index is the final guard.
     pub fn insert_topology(&self, topology: &Topology) -> Result<()> {
         let definition_json = serde_json::to_string(&topology.definition).map_err(|e| {
             DaemonError::Store(format!("Failed to serialize topology definition: {}", e))
@@ -185,8 +185,9 @@ impl Store {
     }
 
     /// Check whether a topology with the given name exists, excluding the
-    /// optional `exclude_id` (for update-rename uniqueness checks).
-    /// Returns the existing row's UUID if a conflict is found.
+    /// optional `exclude_id` (for update-rename uniqueness checks). A create
+    /// checks operator ownership; an update checks the existing row's durable
+    /// ownership scope. Returns the conflicting row's UUID.
     pub fn topology_name_exists(
         &self,
         name: &str,
@@ -199,6 +200,9 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM topologies
              WHERE name = ?1 AND id != ?2
+               AND owner_kind = COALESCE((SELECT owner_kind FROM topologies WHERE id=?2),'operator')
+               AND project_id IS (SELECT project_id FROM topologies WHERE id=?2)
+               AND epic_id IS (SELECT epic_id FROM topologies WHERE id=?2)
              LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![name, exclude_str], |row| {
@@ -213,5 +217,125 @@ impl Store {
             Some(Err(e)) => Err(DaemonError::Database(e)),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn migration_replays_from_previous_head_preserving_topologies_and_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("topology-names.sqlite");
+        let store = Store::open_test_fixture(&path).unwrap();
+        crate::store::tests::rewind_post_v121_tail_to(&store.conn, 181);
+        store.conn.execute_batch(
+            "INSERT INTO topologies (rowid,id,name,definition_json,created_at,updated_at,
+                owner_kind,owner_session_id,project_id,revision,definition_digest,shared,archived_at)
+             VALUES (42,'private','issue-pipeline','{\"nodes\":[],\"edges\":[]}',
+                '2026-10-19T00:00:00.000000000Z','2026-10-19T00:00:00.000000000Z',
+                'manager','original-writer','project',9,'original-digest',0,NULL),
+                (87,'archived','retired','{}','old-created','old-updated',
+                'operator',NULL,NULL,3,NULL,1,'old-archived');
+             CREATE TABLE topology_name_migration_reference (
+                topology_id TEXT REFERENCES topologies(id) ON DELETE SET NULL);
+             INSERT INTO topology_name_migration_reference VALUES ('private');"
+        ).unwrap();
+        let snapshot = |store: &Store| -> Vec<String> {
+            store.conn.prepare(
+                "SELECT json_array(rowid,id,name,definition_json,created_at,updated_at,
+                    owner_kind,owner_session_id,project_id,epic_id,revision,definition_digest,shared,archived_at)
+                 FROM topologies ORDER BY id"
+            ).unwrap().query_map([], |row| row.get(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let before = snapshot(&store);
+        let catalog = crate::store::catalog_sql_by_name(&store.conn);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::store::LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot(&store), before);
+        crate::store::assert_catalog_preserved_across_replay(&catalog, &store.conn, 181);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT topology_id FROM topology_name_migration_reference",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "private"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check('topology_name_migration_reference')",
+            [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 0);
+        // Same name in distinct scopes is valid, including NULL operator
+        // ownership. A rotating manager's writer id is not a namespace key.
+        store.conn.execute_batch(
+            "INSERT INTO topologies (id,name,definition_json,created_at,updated_at)
+                VALUES ('00000000-0000-4000-8000-000000002304','issue-pipeline','{}','created','updated');
+             INSERT INTO topologies (id,name,definition_json,created_at,updated_at,owner_kind,project_id)
+                VALUES ('other-project','issue-pipeline','{}','created','updated','manager','other');
+             INSERT INTO topologies (id,name,definition_json,created_at,updated_at,owner_kind,project_id,epic_id)
+                VALUES ('epic','issue-pipeline','{}','created','updated','epic','project','epic-a');"
+        ).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM topologies WHERE name='issue-pipeline'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+        assert!(store.conn.execute(
+            "INSERT INTO topologies (id,name,definition_json,created_at,updated_at,owner_kind,project_id,owner_session_id)
+             VALUES ('duplicate','issue-pipeline','{}','created','updated','manager','project','successor-writer')", []
+        ).is_err());
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO topologies (id,name,definition_json,created_at,updated_at)
+             VALUES ('operator-duplicate','issue-pipeline','{}','created','updated')",
+                    []
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.topology_name_exists("issue-pipeline", None).unwrap(),
+            Some(Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_2304))
+        );
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM topologies WHERE name='issue-pipeline'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
     }
 }

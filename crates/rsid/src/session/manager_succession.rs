@@ -2,7 +2,7 @@
 //! Runtime guards and filesystem proofs never come from caller JSON or receipts.
 use super::agent_verbs::AgentControlHandle;
 use super::spawn_single_flight::{SpawnGuard, acquire_provider_cwd_admission, acquire_spawn_guard};
-use super::types::{LaunchPurpose, ProspectiveAgentTokenWitness};
+use super::types::{LaunchPurpose, ProspectiveAgentTransportWitness};
 use super::{AgentTokenRegistry, CompletedSession, SessionManager, TrackedSession};
 use crate::bus::{DaemonEvent, EventBus};
 use crate::claude::LaunchConfig;
@@ -42,7 +42,7 @@ pub(super) struct ManagerSuccessionLaunchContext {
     runtime: Runtime,
     predecessor_guard: Arc<Mutex<Option<SpawnGuard>>>,
     confirmation: Arc<Mutex<Option<oneshot::Sender<Result<ManagerActionReceiptV2>>>>>,
-    pub(super) prospective_a6: ProspectiveAgentTokenWitness,
+    pub(super) prospective_a6: ProspectiveAgentTransportWitness,
     pub(super) generation: Arc<AtomicU64>,
 }
 impl std::fmt::Debug for ManagerSuccessionLaunchContext {
@@ -73,8 +73,33 @@ impl AgentControlHandle {
             .custody_runtime
             .as_ref()
             .ok_or_else(|| refused("manager_succession_custody_runtime_required"))?;
+        // Same live value the effect recheck uses: a persisted-absent setting
+        // with the live choice off must refuse a new occurrence here, before any
+        // reservation. An identical-key retry of an already-queued succession
+        // still gets its stored receipt (as the Store gives it with the setting
+        // persisted off): refusing it would hide an occurrence that will run.
+        if self
+            .runtime_config
+            .as_ref()
+            .is_some_and(|config| !config.context_rotation_enabled.load(Ordering::Relaxed))
+        {
+            return match crate::store_lock::lock(
+                &self.store,
+                "manager_succession::enqueue_root_manager_succession",
+            )
+            .await
+            .replay_manager_succession(caller, &request)?
+            {
+                Some(receipt) => Ok(receipt),
+                None => Err(refused("manager_succession_rotation_disabled")),
+            };
+        }
         let predecessor = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_succession::enqueue_root_manager_succession",
+            )
+            .await;
             store.manager_succession_observation(caller)?;
             store
                 .get_session(caller)?
@@ -86,10 +111,12 @@ impl AgentControlHandle {
         let (verified, _) = runtime
             .prepare_manager_handoff(&predecessor, handoff)
             .await?;
-        self.store
-            .lock()
-            .await
-            .enqueue_manager_succession(caller, &request, &verified)
+        crate::store_lock::lock(
+            &self.store,
+            "manager_succession::enqueue_root_manager_succession",
+        )
+        .await
+        .enqueue_manager_succession(caller, &request, &verified)
     }
 }
 
@@ -109,17 +136,23 @@ impl SessionManager {
         &self,
         action: &ManagerActionClaimV2,
     ) -> Result<()> {
-        let mut claim = self.store.lock().await.claim_manager_succession(action)?;
+        let mut claim = crate::store_lock::lock(
+            &self.store,
+            "manager_succession::execute_manager_succession",
+        )
+        .await
+        .claim_manager_succession(action)?;
         let predecessor = claim.reservation.predecessor_session_id;
         let guard = acquire_spawn_guard(predecessor).await;
         // A terminal DB row is not a physical drain proof. Never interrupt the
         // predecessor from this tool/reconciler, including a late monitor drain.
         if self.active.read().await.contains_key(&predecessor) {
-            return self
-                .store
-                .lock()
-                .await
-                .defer_manager_succession_drain(&claim);
+            return crate::store_lock::lock(
+                &self.store,
+                "manager_succession::execute_manager_succession",
+            )
+            .await
+            .defer_manager_succession_drain(&claim);
         }
         if let Some(old) = self.completed.read().await.get(&predecessor) {
             if old.retry_cancel.is_some()
@@ -142,10 +175,12 @@ impl SessionManager {
             return Err(refused("manager_succession_rotation_disabled"));
         }
         let orphan_store = std::sync::Arc::clone(&self.store);
-        let turns = orphan_store
-            .lock()
-            .await
-            .list_active_provider_turn_custody()?;
+        let turns = crate::store_lock::lock(
+            &orphan_store,
+            "manager_succession::execute_manager_succession",
+        )
+        .await
+        .list_active_provider_turn_custody()?;
         tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor, turns))
             .await
             .map_err(|_| refused("manager_succession_predecessor_unsettled"))?
@@ -153,22 +188,32 @@ impl SessionManager {
                 tracing::warn!(session_id=%predecessor, %error, "manager predecessor drain remains unproved");
                 refused("manager_succession_predecessor_unsettled")
             })?;
-        let source = self
-            .store
-            .lock()
-            .await
-            .get_session(predecessor)?
-            .ok_or_else(|| refused("manager_session_unavailable"))?;
+        let (source, observed_invocation) = {
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_succession::execute_manager_succession",
+            )
+            .await;
+            let source = store
+                .get_session(predecessor)?
+                .ok_or_else(|| refused("manager_session_unavailable"))?;
+            (source, store.session_model_invocation_id(predecessor)?)
+        };
+        // #2667: witness the invocation the drained predecessor holds NOW. A
+        // turn it took after queueing the handoff (a decision-class notice is
+        // never held back) is accepted by the store within its bound; any
+        // other change is still refused there against this observation.
         let proof = ManagerPredecessorSettledWitness::after_checked_drain(
             &source,
-            claim.reservation.frozen.predecessor_invocation_id,
+            observed_invocation,
             self.program_run_boot_id,
         )?;
-        claim = self
-            .store
-            .lock()
-            .await
-            .record_manager_succession_predecessor_settled(&claim, &proof)?;
+        claim = crate::store_lock::lock(
+            &self.store,
+            "manager_succession::execute_manager_succession",
+        )
+        .await
+        .record_manager_succession_predecessor_settled(&claim, &proof)?;
         let (_, content) = self
             .custody_execution_runtime()
             .prepare_manager_handoff(&source, &claim.reservation.frozen.handoff)
@@ -184,7 +229,7 @@ impl SessionManager {
             runtime: self.manager_succession_runtime(),
             predecessor_guard: Arc::new(Mutex::new(Some(guard))),
             confirmation: Arc::new(Mutex::new(Some(tx))),
-            prospective_a6: ProspectiveAgentTokenWitness::default(),
+            prospective_a6: ProspectiveAgentTransportWitness::default(),
             generation: Arc::new(AtomicU64::new(0)),
         };
         let disabled = source.rotation_disabled_at.is_some();
@@ -212,11 +257,12 @@ impl SessionManager {
     }
 
     pub(super) async fn reconcile_manager_succession_cleanup(&self) -> Result<usize> {
-        let rows = self
-            .store
-            .lock()
-            .await
-            .list_recoverable_manager_successions(None, 64)?;
+        let rows = crate::store_lock::lock(
+            &self.store,
+            "manager_succession::reconcile_manager_succession_cleanup",
+        )
+        .await
+        .list_recoverable_manager_successions(None, 64)?;
         let runtime = self.manager_succession_runtime();
         let mut settled = 0;
         for root in rows {
@@ -262,16 +308,18 @@ impl ManagerSuccessionLaunchContext {
     }
     pub(super) async fn refresh(&self) -> Result<()> {
         let mut claim = self.claim.lock().await;
-        *claim = self
-            .runtime
-            .store
-            .lock()
+        *claim = crate::store_lock::lock(&self.runtime.store, "manager_succession::refresh")
             .await
             .claim_manager_succession(&claim.action)?;
         Ok(())
     }
     pub(super) async fn source_gate(&self) -> Result<()> {
         let claim = self.claim().await;
+        // #289: the store gate judges a Claude effort by the CLI's live
+        // ladder, so read it once if this daemon has not yet, as a launch
+        // does. Unit tests never probe the ambient CLI.
+        #[cfg(not(test))]
+        ensure_successor_effort_ladders(&claim.reservation.frozen.launch).await;
         self.runtime
             .custody
             .prepare_manager_handoff(
@@ -280,31 +328,24 @@ impl ManagerSuccessionLaunchContext {
             )
             .await?;
         if let Some(custody) = claim.reservation.candidate_custody.as_ref() {
-            let candidate = self
-                .runtime
-                .store
-                .lock()
-                .await
-                .get_session(self.candidate)?
-                .ok_or_else(|| refused("manager_succession_candidate_missing"))?;
+            let candidate =
+                crate::store_lock::lock(&self.runtime.store, "manager_succession::source_gate")
+                    .await
+                    .get_session(self.candidate)?
+                    .ok_or_else(|| refused("manager_succession_candidate_missing"))?;
             self.runtime
                 .custody
                 .authenticate_manager_candidate(&candidate, custody)
                 .await?;
         }
-        self.runtime
-            .store
-            .lock()
+        crate::store_lock::lock(&self.runtime.store, "manager_succession::source_gate")
             .await
             .manager_succession_effect_gate(&claim)
     }
     pub(super) async fn claim_effect(&self) -> Result<()> {
         self.source_gate().await?;
         let mut claim = self.claim.lock().await;
-        *claim = self
-            .runtime
-            .store
-            .lock()
+        *claim = crate::store_lock::lock(&self.runtime.store, "manager_succession::claim_effect")
             .await
             .claim_manager_succession_provider_effect(&claim)?;
         Ok(())
@@ -315,9 +356,9 @@ impl ManagerSuccessionLaunchContext {
         self.source_gate().await?;
         let claim = self.claim().await;
         let generation = self.generation.load(Ordering::Acquire);
-        let token = self
+        let binding = self
             .prospective_a6
-            .current_token()
+            .current_binding()
             .await
             .ok_or_else(|| refused("manager_succession_token_changed"))?;
         // The commit authenticates and writes under the active map, the Store and
@@ -327,7 +368,7 @@ impl ManagerSuccessionLaunchContext {
         // asynchronous back-off (#1166).
         let deadline = tokio::time::Instant::now() + PUBLICATION_STRIPE_BUDGET;
         let (predecessor, receipt) = loop {
-            match self.commit_publication(&claim, generation, &token).await {
+            match self.commit_publication(&claim, generation, binding).await {
                 Err(error)
                     if crate::store::custody_lock_order::is_lock_order_busy_error(&error)
                         && tokio::time::Instant::now() < deadline =>
@@ -363,7 +404,7 @@ impl ManagerSuccessionLaunchContext {
         &self,
         claim: &ManagerSuccessionClaim,
         generation: u64,
-        token: &str,
+        binding: super::AgentTransportWitness,
     ) -> Result<(rsi_common::types::Session, ManagerActionReceiptV2)> {
         let mut active = self.runtime.active.write().await;
         let tracked = active
@@ -388,9 +429,13 @@ impl ManagerSuccessionLaunchContext {
         if !confirmed {
             return Err(refused("manager_succession_candidate_unconfirmed"));
         }
-        let store = self.runtime.store.lock().await;
+        let store = crate::store_lock::lock(
+            &self.runtime.store,
+            "manager_succession::commit_publication",
+        )
+        .await;
         let mut tokens = self.runtime.tokens.write().await;
-        if tokens.get(token).copied() != Some(self.candidate) {
+        if !tokens.binding_matches(self.candidate, binding) {
             return Err(refused("manager_succession_token_changed"));
         }
         let proof = ManagerSuccessionPublicationWitness::after_provider_established(
@@ -422,7 +467,9 @@ impl ManagerSuccessionLaunchContext {
     pub(super) async fn fail_and_settle(&self) -> Result<()> {
         let claim = self.claim().await;
         let root = {
-            let store = self.runtime.store.lock().await;
+            let store =
+                crate::store_lock::lock(&self.runtime.store, "manager_succession::fail_and_settle")
+                    .await;
             let root = store
                 .manager_succession(claim.reservation.operation_id)?
                 .ok_or_else(|| refused("manager_succession_unavailable"))?;
@@ -473,7 +520,7 @@ impl Runtime {
     async fn cleanup(&self, root: &ManagerRootSuccession, generation: Option<u64>) -> Result<()> {
         let id = root.candidate_session_id;
         {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(&self.store, "manager_succession::cleanup").await;
             if store
                 .session_model_invocation_id(id)?
                 .is_some_and(|inv| inv != root.model_invocation_id)
@@ -505,8 +552,7 @@ impl Runtime {
             }
         }
         let orphan_store = std::sync::Arc::clone(&self.store);
-        let turns = orphan_store
-            .lock()
+        let turns = crate::store_lock::lock(&orphan_store, "manager_succession::cleanup")
             .await
             .list_active_provider_turn_custody()?;
         tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(id, turns))
@@ -516,9 +562,7 @@ impl Runtime {
                 tracing::warn!(session_id=%id, %error, "manager candidate process settlement remains unproved");
                 refused("manager_succession_cleanup_unsettled")
             })?;
-        if self
-            .store
-            .lock()
+        if crate::store_lock::lock(&self.store, "manager_succession::cleanup")
             .await
             .load_model_invocation_record(root.model_invocation_id)?
             .is_some()
@@ -536,7 +580,7 @@ impl Runtime {
             .await?;
         }
         let session = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(&self.store, "manager_succession::cleanup").await;
             if store.get_session(id)?.is_some() {
                 store.set_session_terminal_status(
                     id,
@@ -561,9 +605,7 @@ impl Runtime {
                 .insert(id, completed_row(session));
         }
         super::revoke_agent_tokens_for_session(&self.tokens, id).await;
-        match self
-            .store
-            .lock()
+        match crate::store_lock::lock(&self.store, "manager_succession::cleanup")
             .await
             .reconcile_manager_action_notice(root.operation_id)
         {
@@ -632,6 +674,7 @@ fn launch_config(root: &ManagerRootSuccession, content: String) -> Result<Launch
         topology_node_id: source.topology_node_id.clone(),
         topology_iteration: source.topology_iteration,
         closure_selector: None,
+        structured_handoff: false,
     })
 }
 
@@ -644,5 +687,20 @@ fn completed_row(session: rsi_common::types::Session) -> CompletedSession {
         retry_fired_at: None,
         superseded_by_retry: None,
         events_hydrated: false,
+        store_writes: Default::default(),
     }
+}
+
+/// #289: one unbilled `initialize` probe before a Claude successor seat's
+/// off-list effort (`ultracode`) meets the store gate; free otherwise
+/// (`ClaudeClient::ensure_effort_ladders_for`).
+#[cfg(not(test))]
+async fn ensure_successor_effort_ladders(launch: &ManagerLaunchChoiceV2) {
+    if launch.provider != SessionProvider::Claude {
+        return;
+    }
+    let Ok(client) = crate::claude::ClaudeClient::for_discovery() else {
+        return;
+    };
+    Box::pin(client.ensure_effort_ladders_for(launch.effort.as_deref())).await;
 }

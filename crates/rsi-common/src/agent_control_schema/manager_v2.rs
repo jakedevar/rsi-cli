@@ -42,6 +42,13 @@ fn boolean() -> Value {
 fn enumeration(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
+/// The keys a manager may pass to `ProposeDaemonSetting`, in allowlist order.
+fn daemon_setting_keys() -> Vec<&'static str> {
+    crate::manager_daemon_settings::MANAGER_ADJUSTABLE_DAEMON_SETTINGS
+        .iter()
+        .map(|setting| setting.key)
+        .collect()
+}
 fn optional(value: Value) -> Value {
     json!({"anyOf":[value,{"type":"null"}],"default":null})
 }
@@ -165,6 +172,22 @@ fn evidence() -> Value {
         ],
     )
 }
+fn job_evidence() -> Value {
+    object(
+        &[
+            ("job_id", uuid()),
+            ("source_commit", string()),
+            ("artifact_path", string()),
+            ("artifact_commit", string()),
+        ],
+        &[
+            "job_id",
+            "source_commit",
+            "artifact_path",
+            "artifact_commit",
+        ],
+    )
+}
 fn tagged(tag: &str, name: &str, fields: &[(&str, Value)], required: &[&str]) -> Value {
     let mut fields = fields.to_vec();
     fields.insert(0, (tag, json!({"type":"string","enum":[name]})));
@@ -209,6 +232,10 @@ fn inspect() -> Value {
     object(
         &[
             ("section", section),
+            (
+                "include_history",
+                json!({"type":"boolean","default":false,"description":"Workers only: true returns all retained history in creation order. Default: actionable workers newest first, including pending work/jobs/landings/questions and recent (7 days) failures or unpublished sandbox results."}),
+            ),
             ("epic_id", optional(uuid())),
             ("cursor", optional(json!({"type":"string","maxLength":512}))),
             ("limit", limit),
@@ -423,7 +450,11 @@ fn operator_call() -> Value {
             "ProposeDaemonSetting",
             object(
                 &[
-                    ("key", string()),
+                    // #2145: the key is the closed curated allowlist, so a
+                    // manager reads which settings it may propose from the
+                    // schema instead of guessing a registry key and meeting
+                    // `manager_v2_daemon_setting_not_allowlisted`.
+                    ("key", enumeration(&daemon_setting_keys())),
                     ("value", integer(0, 65_536)),
                     ("reason", string()),
                 ],
@@ -690,6 +721,7 @@ fn update() -> Value {
                     ),
                     ("note", string()),
                     ("evidence", optional(evidence())),
+                    ("job_evidence", optional(job_evidence())),
                 ],
                 vec!["stage", "state", "note"],
             ),

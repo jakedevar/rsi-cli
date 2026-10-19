@@ -11,15 +11,14 @@ fn fenced(
     policy_version: i64,
     operation: ManagerActionV2,
 ) -> AgentManagerControlRequestV2 {
-    AgentManagerControlRequestV2 {
-        project_id: None,
-        fence: ManagerFenceV2 {
+    AgentManagerControlRequestV2::new(
+        ManagerFenceV2 {
             scope_version,
             policy_version,
         },
-        idempotency_key: key.into(),
+        key.into(),
         operation,
-    }
+    )
 }
 
 impl Pilot {
@@ -390,6 +389,156 @@ async fn manager_recovery_settle_proven_absent_and_unobservable() {
         refused.outcome.as_deref(),
         Some("manager_v2_effect_unobservable")
     );
+}
+
+impl Pilot {
+    /// #1716: admit and claim a create, then record it `blocked` with
+    /// `outcome` exactly as the pre-effect failure path does (no effect
+    /// started, no session row). Returns the action, its target and version.
+    async fn blocked_create(&self, key: &str, outcome: &str) -> (Uuid, Uuid, i64) {
+        let receipt = self
+            .admit(
+                key,
+                ManagerActionV2::CreateSession {
+                    parent_id: self.epic,
+                    kind: SessionKind::Feature,
+                    query: "work".into(),
+                    launch: self.policy.allowed_launches[0].clone(),
+                    sandbox_source: None,
+                },
+            )
+            .await;
+        let claim = self.claim().await;
+        assert_eq!(claim.id(), receipt.operation_id);
+        let blocked = self
+            .manager
+            .store
+            .lock()
+            .await
+            .finish_manager_action(&claim, ManagerActionStateV2::Blocked, outcome)
+            .unwrap();
+        (
+            receipt.operation_id,
+            receipt.target_session_id.unwrap(),
+            blocked.row_version,
+        )
+    }
+}
+
+/// #1716: a create that ended `blocked` / `manager_v2_lifecycle_unconfirmed`
+/// with no session behind it (nothing launched) is closed by the same
+/// `settle_uncertain_action` verb, as `failed` with the proven-absent outcome.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_create_with_no_session_settles_failed() {
+    let p = pilot().await;
+    let (create, target, version) = p
+        .blocked_create("blocked-create", "manager_v2_lifecycle_unconfirmed")
+        .await;
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(target)
+            .unwrap()
+            .is_none(),
+        "no session was ever created"
+    );
+    let settle = p
+        .admit(
+            "settle-blocked-create",
+            ManagerActionV2::SettleUncertainAction {
+                operation_id: create,
+                expected_row_version: version,
+            },
+        )
+        .await;
+    p.execute().await.unwrap();
+    let original = p.receipt(create).await;
+    assert_eq!(original.state, ManagerActionStateV2::Failed, "{original:?}");
+    assert_eq!(
+        original.outcome.as_deref(),
+        Some("manager_v2_recovered_effect_absent")
+    );
+    assert_eq!(original.row_version, version + 1);
+    let own = p.receipt(settle.operation_id).await;
+    assert_eq!(own.state, ManagerActionStateV2::Succeeded, "{own:?}");
+    assert_eq!(
+        own.outcome.as_deref(),
+        Some("uncertain_action_settled_failed")
+    );
+    let evidence = p.settled_evidence(create).await;
+    assert_eq!(
+        evidence["settled_by_operation_id"],
+        serde_json::json!(settle.operation_id)
+    );
+    assert_eq!(evidence["settled_state"], serde_json::json!("failed"));
+    assert_eq!(
+        evidence["prior_receipt"]["state"],
+        serde_json::json!("blocked")
+    );
+}
+
+/// #1716: only the catch-all outcome settles, and only while the target
+/// session never came to exist; every other blocked action keeps its meaning.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_create_settles_only_for_the_catch_all_with_no_session() {
+    let p = pilot().await;
+    let control = p.manager.agent_control();
+    // A mapped blocked outcome names its own cause and is not settled here.
+    let (mapped, _, version) = p
+        .blocked_create("blocked-mapped", "manager_v2_source_unavailable")
+        .await;
+    let error = control
+        .agent_manager_control(
+            p.owner,
+            p.request(
+                "settle-mapped",
+                ManagerActionV2::SettleUncertainAction {
+                    operation_id: mapped,
+                    expected_row_version: version,
+                },
+            ),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("manager_v2_action_not_uncertain"), "{error}");
+
+    // The catch-all, but a session row exists for the target: something may
+    // have launched, so it is left for a person to read.
+    let (launched, target, version) = p
+        .blocked_create("blocked-launched", "manager_v2_lifecycle_unconfirmed")
+        .await;
+    {
+        let store = p.manager.store.lock().await;
+        let mut row = bare_session(target);
+        row.project_id = Some(p.project);
+        row.working_dir = p.repo.clone();
+        store.insert_session(&row).unwrap();
+    }
+    let error = control
+        .agent_manager_control(
+            p.owner,
+            p.request(
+                "settle-launched",
+                ManagerActionV2::SettleUncertainAction {
+                    operation_id: launched,
+                    expected_row_version: version,
+                },
+            ),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("manager_v2_action_not_uncertain"), "{error}");
+    assert_eq!(
+        p.receipt(launched).await.state,
+        ManagerActionStateV2::Blocked
+    );
+    assert_eq!(p.receipt(mapped).await.state, ManagerActionStateV2::Blocked);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -1090,7 +1239,7 @@ async fn manager_recovery_evidence_survives_reopen_and_replays() {
         .unwrap();
     p.execute().await.unwrap();
 
-    let reopened = crate::store::Store::open(&p._dir.path().join("rsi.db")).unwrap();
+    let reopened = crate::store::Store::open_test_fixture(&p._dir.path().join("rsi.db")).unwrap();
     reopened.manager_action_human_gate(p.lead).unwrap();
     let settled = reopened.manager_action_operation(create).unwrap().unwrap();
     assert_eq!(settled.receipt.state, ManagerActionStateV2::Failed);
@@ -1446,8 +1595,9 @@ async fn manager_recovery_predecessor_wake_cannot_restart_retired_lineage_tip() 
 /// #652: a Completed lead whose sandbox tuple is a historical cleanup failure
 /// (the on-disk root is only a path-only startup candidate) refuses its
 /// scheduled resume with the typed `sandbox_custody:cleanup_failed` code. The
-/// refusal must reach the manager as a durable notice naming the code, the
-/// sandbox directory must survive, and no provider process may start.
+/// refusal must reach the manager as one durable recovery wake naming the
+/// code and relaunch guidance (#3074), the sandbox directory must survive,
+/// and no provider process may start.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn path_only_sandbox_lead_resume_refusal_reaches_the_manager_as_a_typed_notice() {
@@ -1487,62 +1637,79 @@ async fn path_only_sandbox_lead_resume_refusal_reaches_the_manager_as_a_typed_no
     // The restart's custody pass retains the path-only candidate.
     p.manager.sandbox_orphan_sweep().await.unwrap();
     assert!(path_only_root.join("unmerged-work").exists(), "{base:?}");
+    let preserved_head = git(&p.repo, &["rev-parse", "HEAD"]);
 
     let Pilot {
         manager,
         _dir: dir,
         lead,
+        owner,
         ..
     } = p;
     let process = super::super::launch::install_controller_candidate_test_process(lead);
     let manager = std::sync::Arc::new(manager);
     let launcher: std::sync::Arc<dyn SessionLauncher> = manager.clone();
+    // A crash after the durable escalation but before retirement must retain
+    // the original wake. Replaying it then settles behind that same notice.
+    crate::scheduler::install_fault_for_test(wake.id, "crash_after_recovery_notice");
+    crate::scheduler::fire_job_for_test(&manager.store, manager.event_bus(), &launcher, &wake)
+        .await;
+    {
+        let store = manager.store.lock().await;
+        assert!(store.get_scheduled_job(&wake.id).unwrap().unwrap().enabled);
+        let notice_id = crate::store::gone_wake_escalation::gone_wake_escalation_id(wake.id);
+        assert!(store.get_scheduled_job(&notice_id).unwrap().is_some());
+    }
     crate::scheduler::fire_job_for_test(&manager.store, manager.event_bus(), &launcher, &wake)
         .await;
 
     assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
     assert!(path_only_root.join("unmerged-work").exists());
     let store = manager.store.lock().await;
-    let (kind, state, settled, retired): (String, String, Option<String>, Option<String>) = store
-        .conn
-        .query_row(
-            "SELECT kind,state_json,settled_at,retired_at FROM harness_manager_notices
-             WHERE subject_id=?1 AND subject_version='custody_refused:cleanup_failed'",
-            [lead.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .expect("typed custody refusal notice exists for the lead");
-    assert_eq!(kind, "session_state");
-    assert_eq!((settled, retired), (None, None));
-    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let settled = store.get_scheduled_job(&wake.id).unwrap().unwrap();
+    assert!(!settled.enabled);
+    assert!(settled.last_fired_at.is_some());
+    assert!(store.continuation_retry(wake.id).unwrap().is_none());
+    // Permanent refusals now use the #3074 recovery escalation rather than
+    // the older harness_manager_notices row. Assert its typed code as well
+    // as the actionable recovery path, not just the existence of a message.
+    let notice_id = crate::store::gone_wake_escalation::gone_wake_escalation_id(wake.id);
+    let notice = store
+        .get_scheduled_job(&notice_id)
+        .unwrap()
+        .expect("durable typed custody refusal notice exists");
+    assert_eq!(notice.wake_session_id, Some(owner));
+    assert_eq!(notice.wake_mode, rsi_common::types::WakeMode::Resume);
+    assert!(notice.enabled);
+    for fact in [
+        "sandbox_custody:cleanup_failed;",
+        "wake_recoverable",
+        "preserved exact head",
+        &preserved_head,
+        "Preserve the old worktree",
+        "relaunch a new authorized worker",
+        "sandbox_source",
+        &lead.to_string(),
+        &wake.id.to_string(),
+        &wake.message,
+    ] {
+        assert!(
+            notice.message.contains(fact),
+            "notice must name {fact}: {}",
+            notice.message
+        );
+    }
+    let notices: Vec<_> = store
+        .list_scheduled_jobs()
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.name == format!("gone-wake-escalation:{}", wake.id))
+        .collect();
     assert_eq!(
-        state["recovery_code"].as_str(),
-        Some("sandbox_custody:cleanup_failed")
+        notices.len(),
+        1,
+        "replaying the refusal keeps one manager notice"
     );
-    assert_eq!(state["next_action"].as_str(), Some("inspect_lead"));
-    // A second firing of the same refusal never duplicates the notice.
-    let error = crate::error::sandbox_custody_error(rsi_common::types::SandboxCustodyErrorV1 {
-        version: 1,
-        code: rsi_common::types::SandboxCustodyErrorCodeV1::CleanupFailed,
-        session_id: Some(lead),
-        transition: rsi_common::types::SandboxCustodyTransitionV1::ResumeWake,
-        retryable: false,
-        recovery: rsi_common::types::SandboxCustodyRecoveryV1::InspectStatus,
-    });
-    assert!(
-        store
-            .record_manager_custody_refusal_notice(lead, &error)
-            .unwrap()
-    );
-    let count: i64 = store
-        .conn
-        .query_row(
-            "SELECT count(*) FROM harness_manager_notices WHERE subject_id=?1 AND subject_version LIKE 'custody_refused:%'",
-            [lead.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
     // A transient reclaim gate is deferred by the scheduler, never noticed.
     let transient = crate::error::sandbox_custody_error(rsi_common::types::SandboxCustodyErrorV1 {
         version: 1,

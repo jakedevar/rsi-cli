@@ -1,7 +1,9 @@
 //! Daemon-owned rolling merge queue runner (#1007 slice S1).
 //!
 //! The runner claims up to N ready sources in FIFO order (the operator's batch
-//! size), runs the P0 lander (`rsi-rolling-land`) once with every source as an
+//! size) that share the head's project and git repository (every worker lands
+//! from its own sandbox worktree, so the repository is the git common
+//! directory, not the checkout path, #1945), runs the P0 lander (`rsi-rolling-land`) once with every source as an
 //! `--accepted` argument (the lander chain-merges them onto the tip, renumbers
 //! provisional migrations in that order, gates the candidate once with the
 //! union of the members' test filters and publishes it with one fast-forward)
@@ -30,14 +32,18 @@
 use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
+use crate::store::rolling_queue::{ClaimedQueueBatch, LanePackages};
 use chrono::Utc;
+use rsi_common::agent_landing_candidate::RollingMergeProbe;
 use rsi_common::rolling_queue::{
     QUEUE_BATCH_ANCESTRY_UNVERIFIED, QUEUE_BATCH_MERGE_CONFLICT, QUEUE_BATCH_POLICY_REFUSED,
-    QUEUE_BISECT_NO_PROGRESS, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_GATE_TIMEOUT,
-    QUEUE_MIGRATION_OUT_OF_ORDER, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_ALREADY_INTEGRATED,
+    QUEUE_BISECT_NO_PROGRESS, QUEUE_CLAIMED_FIX_STILL_RED, QUEUE_FILTER_MATCHES_NO_TESTS,
+    QUEUE_GATE_TIMEOUT, QUEUE_MIGRATION_OUT_OF_ORDER, QUEUE_REGATE_EXHAUSTED,
+    QUEUE_RELEASE_BUILD_FAILED, QUEUE_SOURCE_ALREADY_INTEGRATED,
     ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS, ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState,
     RollingQueueEntryV1, RollingQueueOutcome,
 };
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -46,18 +52,36 @@ use std::time::Duration;
 use tokio::process::Command;
 use uuid::Uuid;
 
+mod bounded_qa;
+#[cfg(test)]
+pub(crate) use bounded_qa::has_explicit_filters;
+pub(crate) use bounded_qa::note_explicit_filters;
+mod gate_base_red;
+mod known_failure_snapshot;
+mod lanes;
+pub(crate) mod satellite_qa;
+
 /// Poll interval of the runner loop.
 const TICK: Duration = Duration::from_secs(5);
 /// The lander's refusal of an `--accepted` source `origin/rolling` already
 /// contains ("accepted source <sha> is already integrated; ...").
 const ALREADY_INTEGRATED_MARKER: &str = "is already integrated";
-/// The out-of-band budget: a moved tip costs at most one regate of the head.
-const MAX_REGATES_ENV: &str = "RSI_LANDER_MAX_REGATED_STALE_RETRIES";
-const MAX_REGATES: usize = 1;
-/// Queue runs never reuse a gate across a moved tip: every stale advance re-gates
-/// the remade candidate, still bounded by the regate budget above.
+/// The out-of-band budget (#1940): the wall time the batch has left. A rolling
+/// tip that moves under a gate re-runs only what the advance overlaps, as often
+/// as the time already spent plus the cost of the re-run fits, instead of a
+/// fixed count of re-gates.
+const REGATE_BUDGET_ENV: &str = "RSI_LANDER_REGATE_BUDGET_SECS";
+/// Queue runs never publish an untested tree where an advance could change a
+/// result: the lander reuses the earlier gate across a moved tip only for what
+/// the advance provably does not touch, and re-runs the rest (#1007, #1940).
 const EXACT_GATE_ENV: &str = "RSI_LANDER_EXACT_GATE";
-const OUTCOME_TAIL_BYTES: usize = 2000;
+/// A batch member's commit is not in the queue checkout's object store (its
+/// sandbox was reclaimed and the commit pruned): the member is refused so its
+/// owner re-enqueues from a live checkout, and the rest of the batch goes on
+/// (#1945).
+pub(crate) const QUEUE_SOURCE_UNREACHABLE: &str = "queue_source_unreachable";
+/// Bytes of a lander's stderr/stdout the queue outcome detail keeps (the newest).
+pub const OUTCOME_TAIL_BYTES: usize = 2000;
 const MAX_FAILING_TESTS: usize = 32;
 /// Per-run lander logs (#1135): each stream keeps its newest bytes, and only the
 /// newest files stay in the log directory.
@@ -143,16 +167,143 @@ fn inherited_git_env(
         .collect()
 }
 
+/// The git binary every probe here runs. Tests may route it through a shim
+/// (#2912) that stalls selected calls; every other call passes through.
+#[cfg(test)]
+pub(crate) static TEST_GIT_PROGRAM: std::sync::OnceLock<std::ffi::OsString> =
+    std::sync::OnceLock::new();
+
+/// #2912: route every probe git through a shim that stalls one subcommand in a
+/// repository that asks for it (`stall_git`) and passes everything else to the
+/// real git, so it is safe to install once for the whole test process.
+#[cfg(test)]
+pub(crate) fn install_stalling_git_shim() {
+    use std::os::unix::fs::PermissionsExt;
+    TEST_GIT_PROGRAM.get_or_init(|| {
+        let real = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("git"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .expect("git on PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("git");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-C\" ] && [ -f \"$2/.rsi-stall\" ] \
+             && [ \"$3\" = \"$(cat \"$2/.rsi-stall\")\" ]; then\n  echo $$ > \"$2/.rsi-stall-pid\"\n  \
+             exec sleep 60\nfi\nexec {} \"$@\"\n",
+            real.display()
+        );
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::mem::forget(dir);
+        shim.into_os_string()
+    });
+}
+
+/// Make the next `git -C <repo> <subcommand> ...` stall for a minute.
+#[cfg(test)]
+pub(crate) fn stall_git(repo: &Path, subcommand: &str) {
+    install_stalling_git_shim();
+    let _ = std::fs::remove_file(repo.join(".rsi-stall-pid"));
+    std::fs::write(repo.join(".rsi-stall"), subcommand).unwrap();
+}
+
+/// Whether the git `stall_git` stalled was started and has since been killed.
+#[cfg(test)]
+pub(crate) fn stalled_git_was_killed(repo: &Path) -> bool {
+    let Ok(pid) = std::fs::read_to_string(repo.join(".rsi-stall-pid")) else {
+        return false;
+    };
+    let Ok(pid) = pid.trim().parse::<i32>() else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { nix::libc::kill(pid, 0) != 0 }
+}
+
+fn git_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(program) = TEST_GIT_PROGRAM.get() {
+        return program.clone();
+    }
+    "git".into()
+}
+
 /// A `git` command with the daemon's environment reduced to the allowlist.
 fn git_command() -> std::process::Command {
-    let mut command = std::process::Command::new("git");
+    let mut command = std::process::Command::new(git_program());
     command
         .env_clear()
         .envs(inherited_git_env(std::env::vars_os()));
     command
 }
 
+thread_local! {
+    /// #2912: the wall deadline of the git reads this thread runs (see
+    /// [`with_git_deadline`]), and whether one of them ran into it.
+    static GIT_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static GIT_DEADLINE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The most output one deadline-bound git read keeps; a larger answer is a read
+/// that could not finish.
+const BOUNDED_GIT_MAX_OUTPUT: u64 = 32 << 20;
+
+/// #2912: run `read` with every [`git`] and [`git_grep_hits`] call it makes
+/// bounded by the wall `deadline`: each runs in its own process group, which is
+/// killed and reaped when the deadline passes, and none starts after it. The
+/// bool is whether a call ran into the deadline, so the caller can tell a read
+/// that was cut short (retry) from one that found nothing. Blocking; the
+/// bound is per thread, so run it inside the same `spawn_blocking` closure
+/// that makes the reads.
+pub(crate) fn with_git_deadline<T>(
+    deadline: std::time::Instant,
+    read: impl FnOnce() -> T,
+) -> (T, bool) {
+    struct Restore(Option<std::time::Instant>, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GIT_DEADLINE.set(self.0);
+            GIT_DEADLINE_HIT.set(self.1);
+        }
+    }
+    let _restore = Restore(
+        GIT_DEADLINE.replace(Some(deadline)),
+        GIT_DEADLINE_HIT.replace(false),
+    );
+    let value = read();
+    (value, GIT_DEADLINE_HIT.get())
+}
+
+/// Run `command` under this thread's [`with_git_deadline`] bound, if any.
+/// `None` when there is no bound (the caller runs it unbounded); `Some(None)`
+/// when the read did not complete in time.
+fn run_under_git_deadline(
+    command: std::process::Command,
+) -> Option<Option<(Option<i32>, Vec<u8>)>> {
+    let deadline = GIT_DEADLINE.get()?;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let outcome = if remaining.is_zero() {
+        None
+    } else {
+        run_bounded(command, remaining, BOUNDED_GIT_MAX_OUTPUT)
+    };
+    if outcome.is_none() && std::time::Instant::now() >= deadline {
+        GIT_DEADLINE_HIT.set(true);
+    }
+    Some(outcome)
+}
+
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
+    let mut command = git_command();
+    command.arg("-C").arg(repo).args(args);
+    if let Some(outcome) = run_under_git_deadline(command) {
+        let (code, stdout) = outcome?;
+        return (code == Some(0)).then(|| String::from_utf8_lossy(&stdout).into_owned());
+    }
     let output = git_command()
         .arg("-C")
         .arg(repo)
@@ -171,19 +322,742 @@ pub(crate) fn source_commit_exists(repo: &Path, source: &str) -> bool {
     git(repo, &["cat-file", "-e", &format!("{source}^{{commit}}")]).is_some()
 }
 
+/// The commit `HEAD` names in `repo` (an operator landing's default source).
+pub(crate) fn head_commit(repo: &Path) -> Option<String> {
+    let head = git(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    Some(head.trim().to_owned())
+}
+
+/// The commit `branch` names in `repo`.
+pub(crate) fn branch_commit(repo: &Path, branch: &str) -> Option<String> {
+    let spec = format!("refs/heads/{branch}^{{commit}}");
+    let tip = git(repo, &["rev-parse", "--verify", &spec])?;
+    Some(tip.trim().to_owned())
+}
+
+/// Most bytes of `git diff --name-only` output the landing-candidate check
+/// reads before it gives up (#2344).
+const DELTA_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Most paths the landing-candidate check collects before it gives up.
+const DELTA_MAX_PATHS: usize = 50_000;
+/// How long the landing-candidate diff may run before it is killed.
+const DELTA_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Bounds on one streamed git listing.
+#[derive(Clone, Copy)]
+pub(crate) struct DeltaLimits {
+    pub max_bytes: usize,
+    pub max_paths: usize,
+    pub deadline: Duration,
+}
+
+impl DeltaLimits {
+    const DEFAULT: Self = Self {
+        max_bytes: DELTA_MAX_BYTES,
+        max_paths: DELTA_MAX_PATHS,
+        deadline: DELTA_DEADLINE,
+    };
+}
+
+/// Why a bounded delta listing is not a path list.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeltaRead {
+    Paths(Vec<String>),
+    /// Output past the byte or path cap, or the deadline: the delta is too
+    /// large to classify, so the caller must fail closed. Says why.
+    TooLarge(&'static str),
+    /// git could not read both commits.
+    Unreadable,
+}
+
+/// Paths that differ between two commits (`git diff --name-only from to`),
+/// for the landing-candidate check (#2310). Output is streamed under a byte
+/// and path cap and a subprocess deadline (#2344).
+pub(crate) fn changed_paths(repo: &Path, from: &str, to: &str) -> DeltaRead {
+    let mut command = git_command();
+    let Ok(child) = command
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only", "--no-renames", from, to, "--"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return DeltaRead::Unreadable;
+    };
+    read_delta(child, DeltaLimits::DEFAULT)
+}
+
+/// #2814: when `source` has several merge bases with rolling (it merged an
+/// earlier commit of rolling that landed under another SHA), the merge-base diff
+/// re-counts what rolling already holds. The candidate's real delta is the clean
+/// merge result against the rolling tip: returns `(rolling ref, merge tree)`.
+/// `None` for a single merge base, a conflicted merge or any git failure, so
+/// the caller keeps the merge-base diff.
+fn multi_base_merge_tree(repo: &Path, source: &str) -> Option<(String, String)> {
+    let reference = ["origin/rolling", "rolling"]
+        .into_iter()
+        .find(|reference| {
+            git(
+                repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{reference}^{{commit}}"),
+                ],
+            )
+            .is_some()
+        })?;
+    let bases = git(repo, &["merge-base", "--all", source, reference])?;
+    if bases.split_whitespace().count() < 2 {
+        return None;
+    }
+    let merged = git(repo, &["merge-tree", "--write-tree", reference, source])?;
+    let tree = merged.split_whitespace().next()?.to_string();
+    Some((reference.to_string(), tree))
+}
+
+/// Paths `source` changes relative to the rolling tip it was cut from
+/// (`git diff --name-only <merge-base> source`), bounded like
+/// [`changed_paths`]. No rolling ref or merge base is `Unreadable`, so a caller
+/// that must know the delta fails closed.
+pub(crate) fn source_changed_paths(repo: &Path, source: &str) -> DeltaRead {
+    if let Some((reference, tree)) = multi_base_merge_tree(repo, source) {
+        return changed_paths(repo, &reference, &tree);
+    }
+    let base = ["origin/rolling", "rolling"].iter().find_map(|reference| {
+        git(repo, &["merge-base", source, reference]).map(|out| out.trim().to_string())
+    });
+    match base.filter(|base| !base.is_empty()) {
+        Some(base) => changed_paths(repo, &base, source),
+        None => DeltaRead::Unreadable,
+    }
+}
+
+/// Collect a spawned child's stdout lines under `limits`; the child is killed
+/// the moment a limit is hit.
+fn read_delta(mut child: std::process::Child, limits: DeltaLimits) -> DeltaRead {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    enum Done {
+        Complete(Vec<u8>),
+        TooLarge(&'static str),
+        Failed,
+    }
+
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return DeltaRead::Unreadable;
+    };
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut lines = 0usize;
+        let done = loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break Done::Complete(bytes),
+                Ok(n) => {
+                    lines += chunk[..n].iter().filter(|b| **b == b'\n').count();
+                    if lines > limits.max_paths {
+                        break Done::TooLarge("path limit");
+                    }
+                    if bytes.len() + n > limits.max_bytes {
+                        break Done::TooLarge("output limit");
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break Done::Failed,
+            }
+        };
+        let _ = sender.send(done);
+    });
+    let done = receiver.recv_timeout(limits.deadline);
+    let outcome = match done {
+        Ok(Done::Complete(bytes)) => match child.wait() {
+            Ok(status) if status.success() => {
+                let listing = String::from_utf8_lossy(&bytes);
+                DeltaRead::Paths(listing.lines().map(str::to_owned).collect())
+            }
+            _ => DeltaRead::Unreadable,
+        },
+        Ok(Done::TooLarge(why)) => DeltaRead::TooLarge(why),
+        Ok(Done::Failed) => DeltaRead::Unreadable,
+        Err(_) => DeltaRead::TooLarge("deadline"),
+    };
+    // A no-op for a child already reaped; otherwise stops the runaway diff.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    outcome
+}
+
+/// What an operator is shown before a landing, read from the local
+/// `origin/rolling` without a fetch (the queue re-checks ancestry against a
+/// fresh tip before it gates): commits the source has beyond it, and whether
+/// the source is already an ancestor of it.
+pub(crate) fn land_position(repo: &Path, source: &str) -> (Option<u32>, bool) {
+    let on_rolling = git(
+        repo,
+        &["merge-base", "--is-ancestor", source, "origin/rolling"],
+    )
+    .is_some();
+    let ahead = git(
+        repo,
+        &["rev-list", "--count", &format!("origin/rolling..{source}")],
+    )
+    .and_then(|count| count.trim().parse().ok());
+    (ahead, on_rolling)
+}
+
+/// Whether the working tree of `repo` has uncommitted changes to tracked files.
+pub(crate) fn worktree_dirty(repo: &Path) -> bool {
+    git(repo, &["status", "--porcelain", "--untracked-files=no"])
+        .is_some_and(|status| !status.trim().is_empty())
+}
+
+/// Whether the replacement contains the queued source's history.
+pub(crate) fn source_descends_from(repo: &Path, old: &str, new: &str) -> bool {
+    git(repo, &["merge-base", "--is-ancestor", old, new]).is_some()
+}
+
+/// How long one conflict probe may run before it is killed (#2706).
+const MERGE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The most probe output read; a larger answer is a probe that could not run.
+const MERGE_PROBE_MAX_OUTPUT: u64 = 1 << 20;
+
+/// Run `command` (stdout piped) until it exits or `timeout` passes. On timeout
+/// the child's whole process group is killed and reaped and the result is
+/// `None`: a bounded outcome, never a hang (#2706). At most `max_output` bytes
+/// of stdout are read; a larger answer is `None` too.
+fn run_bounded(
+    mut command: std::process::Command,
+    timeout: Duration,
+    max_output: u64,
+) -> Option<(Option<i32>, Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(max_output + 1).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => break None,
+        }
+    };
+    if status.is_none() {
+        // SAFETY: `kill` takes a pid and a signal; the group id is the child's
+        // pid because it was started with `process_group(0)`.
+        unsafe {
+            nix::libc::kill(-(child.id() as i32), nix::libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let bytes = reader.join().ok()?;
+    let status = status?;
+    (bytes.len() as u64 <= max_output).then(|| (status.code(), bytes))
+}
+
+/// Make `command` a probe git: the allowlisted environment, no system, global
+/// or user config, no lazy fetch of a missing object from a promisor remote and
+/// no optional lock, so nothing the repository configures can run (#2706,
+/// #2714).
+fn isolate_probe_git(command: &mut std::process::Command) {
+    command
+        .env_clear()
+        .envs(inherited_git_env(std::env::vars_os()))
+        .env("HOME", "/dev/null")
+        .env("XDG_CONFIG_HOME", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+}
+
+/// One probe git read in `repo` under the probe isolation, killed when the
+/// shared `deadline` passes (#2714). `Some(stdout)` only on exit status 0.
+fn probe_git(repo: &Path, args: &[&str], deadline: std::time::Instant) -> Option<String> {
+    let (code, stdout) = probe_git_exit(repo, args, deadline)?;
+    (code == Some(0)).then(|| String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// [`probe_git`] with the exit code kept: `None` is a read that did not
+/// complete (the deadline passed and the process group was killed, or it could
+/// not run); `Some((code, stdout))` is one that did, whatever it answered
+/// (#2912).
+fn probe_git_exit(
+    repo: &Path,
+    args: &[&str],
+    deadline: std::time::Instant,
+) -> Option<(Option<i32>, Vec<u8>)> {
+    let mut command = std::process::Command::new(git_program());
+    isolate_probe_git(&mut command);
+    command.arg("-C").arg(repo).args(args);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)
+}
+
+/// The object id `name` names in `repo`, read without opening an object: a
+/// ref or a full object id (#2714). Peeling to a commit happens in the scratch
+/// directory, which has no promisor remote to fetch from.
+fn resolve_name(repo: &Path, name: &str, deadline: std::time::Instant) -> Option<String> {
+    let id = probe_git(repo, &["rev-parse", "--verify", "--quiet", name], deadline)?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+/// A scratch git directory for one merge probe (#2706): its own `HEAD`, an
+/// empty `refs`, a config that names no merge driver and no promisor remote,
+/// and the source repository's objects as an alternate. The probe sees none of
+/// the source's repository config, `info/attributes` or hooks, writes the
+/// merged tree into the scratch objects (nothing reaches the source
+/// repository), and cannot run a driver or a fetch helper the source
+/// repository configures.
+fn isolated_probe_dir(repo: &Path, deadline: std::time::Instant) -> Option<tempfile::TempDir> {
+    let objects = probe_git(
+        repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        deadline,
+    )?;
+    let objects = objects.trim();
+    if objects.is_empty() {
+        return None;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("rsi-merge-probe-")
+        .tempdir()
+        .ok()?;
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("objects/info")).ok()?;
+    std::fs::create_dir_all(root.join("refs")).ok()?;
+    std::fs::write(root.join("HEAD"), "ref: refs/heads/probe\n").ok()?;
+    std::fs::write(
+        root.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+    )
+    .ok()?;
+    std::fs::write(root.join("objects/info/alternates"), format!("{objects}\n")).ok()?;
+    Some(dir)
+}
+
+/// Point `command` at the scratch git directory `scratch`.
+fn use_probe_dir(command: &mut std::process::Command, scratch: &Path) {
+    command
+        .env("GIT_DIR", scratch)
+        .env("GIT_COMMON_DIR", scratch)
+        .env("GIT_OBJECT_DIRECTORY", scratch.join("objects"))
+        .env_remove("GIT_WORK_TREE")
+        .current_dir(scratch);
+}
+
+/// The commit `id` peels to, checked in the scratch directory (#2714).
+fn peel_commit(scratch: &Path, id: &str, deadline: std::time::Instant) -> Option<String> {
+    let mut command = std::process::Command::new(git_program());
+    isolate_probe_git(&mut command);
+    use_probe_dir(&mut command, scratch);
+    command.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{id}^{{commit}}"),
+    ]);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let (code, stdout) = run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)?;
+    if code != Some(0) {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&stdout).trim().to_owned();
+    (!id.is_empty()).then_some(id)
+}
+
+/// #2118: the paths `ours` and `theirs` would conflict on, from an in-memory
+/// `git merge-tree --write-tree` (nothing is written to the work tree, the
+/// index or the source repository's object store). `Some(paths)` (possibly
+/// empty when git names none) is a conflict; `None` is a clean merge or a probe
+/// that could not run (an object missing from `repo`, an old git, a timeout):
+/// never a refusal on doubt.
+///
+/// #2706: the probe is side-effect free and bounded. It runs in an isolated git
+/// directory (no system, global or repository config, so no external merge
+/// driver can run whatever `.gitattributes` names) with built-in merge
+/// semantics, and is killed after [`MERGE_PROBE_TIMEOUT`].
+fn merge_conflict_paths_with(
+    repo: &Path,
+    ours: &str,
+    theirs: &str,
+    launcher: &[&str],
+    timeout: Duration,
+) -> Option<Vec<String>> {
+    match merge_probe_with(repo, ours, theirs, launcher, timeout) {
+        Some(RollingMergeProbe::Conflict(paths)) => Some(paths),
+        _ => None,
+    }
+}
+
+/// [`merge_conflict_paths_with`] that also tells a clean merge from a probe that
+/// could not run (`None`), for the callers that report "merges cleanly" (#348).
+fn merge_probe_with(
+    repo: &Path,
+    ours: &str,
+    theirs: &str,
+    launcher: &[&str],
+    timeout: Duration,
+) -> Option<RollingMergeProbe> {
+    // Every read, the preflight ones included, runs isolated and under one
+    // deadline (#2714).
+    let deadline = std::time::Instant::now() + timeout;
+    let (ours, theirs) = (
+        resolve_name(repo, ours, deadline)?,
+        resolve_name(repo, theirs, deadline)?,
+    );
+    let scratch = isolated_probe_dir(repo, deadline)?;
+    let (ours, theirs) = (
+        peel_commit(scratch.path(), &ours, deadline)?,
+        peel_commit(scratch.path(), &theirs, deadline)?,
+    );
+    let (program, lead) = launcher.split_first()?;
+    let mut command = std::process::Command::new(program);
+    command.args(lead);
+    isolate_probe_git(&mut command);
+    use_probe_dir(&mut command, scratch.path());
+    command.args([
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        &ours,
+        &theirs,
+    ]);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let (code, stdout) = run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)?;
+    if code == Some(0) {
+        return Some(RollingMergeProbe::Clean);
+    }
+    if code != Some(1) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    let mut lines = text.lines();
+    // Line 1 is the (partially merged) tree id. An unknown commit also exits 1
+    // but prints no tree id on stdout: that is a probe that could not run.
+    let tree = lines.next()?.trim();
+    if tree.len() < 40 || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for line in lines.map(str::trim) {
+        if !line.is_empty() && !paths.iter().any(|seen| seen == line) {
+            paths.push(line.to_owned());
+        }
+    }
+    Some(RollingMergeProbe::Conflict(paths))
+}
+
+/// #348: a fresh trial merge of `source` onto the current rolling tip
+/// (`origin/rolling`, else `rolling`), read-only and bounded like the enqueue
+/// conflict scan. Blocking; call from `spawn_blocking`.
+pub(crate) fn rolling_merge_probe(repo: &Path, source: &str) -> RollingMergeProbe {
+    let deadline = std::time::Instant::now() + MERGE_PROBE_TIMEOUT;
+    for reference in ["origin/rolling", "rolling"] {
+        match probe_git_exit(
+            repo,
+            &["rev-parse", "--verify", "--quiet", reference],
+            deadline,
+        ) {
+            Some((Some(0), _)) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                return merge_probe_with(repo, reference, source, &["git"], remaining)
+                    .unwrap_or(RollingMergeProbe::Unknown);
+            }
+            Some(_) => {}
+            None => return RollingMergeProbe::Unknown,
+        }
+    }
+    RollingMergeProbe::Unknown
+}
+
+/// The most live entries one enqueue probes.
+const CONFLICT_PROBE_MAX_ENTRIES: usize = 32;
+
+/// #2907: the wall budget of one enqueue's whole conflict scan. The scan is a
+/// warning, so it never holds the call longer than this; what it did not reach
+/// is reported as [`QUEUE_CONFLICT_SCAN_INCOMPLETE`].
+///
+/// [`QUEUE_CONFLICT_SCAN_INCOMPLETE`]: rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE
+pub(crate) const ENQUEUE_CONFLICT_SCAN_BUDGET: Duration = Duration::from_secs(4);
+
+/// The scan with no practical bound, for tests that assert the warnings
+/// themselves.
+#[cfg(test)]
+pub(crate) fn queue_conflict_warnings(
+    repo: &Path,
+    source: &str,
+    ahead: &[(Uuid, i64, String)],
+) -> Vec<rsi_common::rolling_queue::QueueConflictWarningV1> {
+    queue_conflict_warnings_within(repo, source, ahead, Duration::from_secs(3600))
+}
+
+/// #2118: the typed warnings for a new `source`: a conflict with the rolling
+/// tip, then with each live entry ahead of it (`ahead`: id, sequence, source
+/// commit). Blocking; call from `spawn_blocking`.
+///
+/// #2907: the whole scan is bounded by `budget`. Each probe runs under the time
+/// left, no probe starts after the budget is spent, and a scan that did not
+/// reach every entry ends with one [`QUEUE_CONFLICT_SCAN_INCOMPLETE`] warning
+/// naming how many probes it skipped, so a missing warning never reads as "no
+/// conflict" when the scan was cut short.
+///
+/// [`QUEUE_CONFLICT_SCAN_INCOMPLETE`]: rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE
+pub(crate) fn queue_conflict_warnings_within(
+    repo: &Path,
+    source: &str,
+    ahead: &[(Uuid, i64, String)],
+    budget: Duration,
+) -> Vec<rsi_common::rolling_queue::QueueConflictWarningV1> {
+    use rsi_common::rolling_queue::{
+        QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICT_WARNING_MAX_FILES,
+        QUEUE_CONFLICTS_WITH_ENTRY, QUEUE_CONFLICTS_WITH_ROLLING, QueueConflictWarningV1,
+    };
+    let capped = |mut files: Vec<String>| {
+        files.truncate(QUEUE_CONFLICT_WARNING_MAX_FILES);
+        files
+    };
+    let started = std::time::Instant::now();
+    let deadline = started + budget;
+    let probe = |ours: &str| {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        merge_conflict_paths_with(
+            repo,
+            ours,
+            source,
+            &["git"],
+            remaining.min(MERGE_PROBE_TIMEOUT),
+        )
+    };
+    let spent = || std::time::Instant::now() >= deadline;
+    let mut warnings = Vec::new();
+    let mut skipped = 0_usize;
+    // #2912: the ref resolve runs under the scan's deadline too. A resolve that
+    // does not complete proves nothing about the tip, so it counts as a skipped
+    // probe rather than as "no rolling ref".
+    let mut tip = None;
+    for reference in ["origin/rolling", "rolling"] {
+        match probe_git_exit(
+            repo,
+            &["rev-parse", "--verify", "--quiet", reference],
+            deadline,
+        ) {
+            Some((Some(0), _)) => {
+                tip = Some(reference);
+                break;
+            }
+            Some(_) => {}
+            None => {
+                skipped += 1;
+                break;
+            }
+        }
+    }
+    if let Some(tip) = tip {
+        if spent() {
+            skipped += 1;
+        } else if let Some(files) = probe(tip) {
+            warnings.push(QueueConflictWarningV1 {
+                code: QUEUE_CONFLICTS_WITH_ROLLING.into(),
+                entry_id: None,
+                entry_sequence: None,
+                files: capped(files),
+                detail: "the source conflicts with the rolling tip: merge origin/rolling into the worker's branch, re-verify and enqueue that commit instead".into(),
+            });
+        } else if spent() {
+            skipped += 1;
+        }
+    }
+    let mut probed = 0_usize;
+    for (id, sequence, commit) in ahead.iter().take(CONFLICT_PROBE_MAX_ENTRIES) {
+        if commit == source {
+            continue;
+        }
+        if spent() {
+            skipped += 1;
+            continue;
+        }
+        probed += 1;
+        if let Some(files) = probe(commit) {
+            warnings.push(QueueConflictWarningV1 {
+                code: QUEUE_CONFLICTS_WITH_ENTRY.into(),
+                entry_id: Some(*id),
+                entry_sequence: Some(*sequence),
+                files: capped(files),
+                detail: format!(
+                    "the source conflicts with queue entry {id} (sequence {sequence}) ahead of it: once that entry lands, have the worker merge origin/rolling and re-verify, or cancel this entry until then; if that entry is withdrawn or refused this warning no longer applies"
+                ),
+            });
+        } else if spent() {
+            // The probe that ran into the deadline was killed: it proved nothing.
+            skipped += 1;
+        }
+    }
+    tracing::info!(
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        probed,
+        skipped,
+        warnings = warnings.len(),
+        "enqueue phase: conflict_scan"
+    );
+    if skipped > 0 {
+        warnings.push(QueueConflictWarningV1 {
+            code: QUEUE_CONFLICT_SCAN_INCOMPLETE.into(),
+            entry_id: None,
+            entry_sequence: None,
+            files: Vec::new(),
+            detail: format!(
+                "the conflict scan stopped after {} s with {skipped} probe(s) not completed, so the absence of a warning for them proves nothing; the entry is queued either way",
+                budget.as_secs().max(1)
+            ),
+        });
+    }
+    warnings
+}
+
+/// #3036: the wall budget of one refused land's scan for conflicting entries
+/// ahead. It runs once per refused land attempt (the executor records the
+/// result), off any RPC path.
+pub(crate) const LAND_CONFLICT_SCAN_BUDGET: Duration = Duration::from_secs(30);
+
+/// #3036: the live entries ahead (`ahead`: id, sequence, source commit) whose
+/// own change conflicts with `source`, a source the queue just refused
+/// `queue_batch_merge_conflict`. An entry counts when `git merge-tree` of the
+/// two sources conflicts on a path the entry itself changes relative to the
+/// rolling tip (`<tip>...<entry>`): that conflict is the entry's, so a repair
+/// that merges rolling before the entry publishes is refused again. A conflict
+/// with rolling that every newer entry merely carries is not the entry's and
+/// never holds a repair. A conflict git names no path for, or with no rolling
+/// ref to compare against, counts (a wait ends when the entry settles); a probe
+/// that cannot run or a spent `budget` proves nothing and adds none, so the
+/// repair runs at once. Blocking; call from `spawn_blocking`.
+pub(crate) fn conflicting_entries_ahead(
+    repo: &Path,
+    source: &str,
+    ahead: &[(Uuid, i64, String)],
+    budget: Duration,
+) -> Vec<Uuid> {
+    let deadline = std::time::Instant::now() + budget;
+    let tip = ["origin/rolling", "rolling"].into_iter().find(|reference| {
+        matches!(
+            probe_git_exit(
+                repo,
+                &["rev-parse", "--verify", "--quiet", reference],
+                deadline
+            ),
+            Some((Some(0), _))
+        )
+    });
+    let mut blockers = Vec::new();
+    for (id, _, commit) in ahead.iter().take(CONFLICT_PROBE_MAX_ENTRIES) {
+        if commit == source {
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(paths) = merge_conflict_paths_with(
+            repo,
+            commit,
+            source,
+            &["git"],
+            remaining.min(MERGE_PROBE_TIMEOUT),
+        ) else {
+            continue;
+        };
+        if entry_owns_conflict(repo, tip, commit, &paths, deadline) {
+            blockers.push(*id);
+        }
+    }
+    blockers
+}
+
+/// Whether entry `commit` itself changes one of the conflict `paths` relative
+/// to `tip`; an unnamed conflict or an unknown tip counts as the entry's.
+fn entry_owns_conflict(
+    repo: &Path,
+    tip: Option<&str>,
+    commit: &str,
+    paths: &[String],
+    deadline: std::time::Instant,
+) -> bool {
+    let Some(tip) = tip else {
+        return true;
+    };
+    if paths.is_empty() {
+        return true;
+    }
+    let range = format!("{tip}...{commit}");
+    let Some((Some(0), stdout)) = probe_git_exit(
+        repo,
+        &["diff", "--name-only", "--no-renames", &range],
+        deadline,
+    ) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&stdout);
+    text.lines()
+        .map(str::trim)
+        .any(|changed| paths.iter().any(|path| path == changed))
+}
+
 /// Exit status of `git grep` run in `repo`: `Some(true)` on a match,
 /// `Some(false)` on none, `None` when git itself failed.
 fn git_grep_hits(repo: &Path, args: &[&str]) -> Option<(bool, String)> {
-    let output = git_command()
-        .arg("-C")
-        .arg(repo)
-        .arg("grep")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    match output.status.code() {
-        Some(0) => Some((true, String::from_utf8_lossy(&output.stdout).into_owned())),
+    let mut command = git_command();
+    command.arg("-C").arg(repo).arg("grep").args(args);
+    let (code, stdout) = match run_under_git_deadline(command) {
+        Some(outcome) => outcome?,
+        None => {
+            let output = git_command()
+                .arg("-C")
+                .arg(repo)
+                .arg("grep")
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            (output.status.code(), output.stdout)
+        }
+    };
+    match code {
+        Some(0) => Some((true, String::from_utf8_lossy(&stdout).into_owned())),
         Some(1) => Some((false, String::new())),
         _ => None,
     }
@@ -201,6 +1075,52 @@ pub fn filter_selecting_no_tests(repo: &Path, commit: &str, filters: &[String]) 
         .iter()
         .find(|filter| filter_provably_empty(repo, commit, filter))
         .cloned()
+}
+
+/// What to add to a refusal that a test filter selects no test (#1937). A
+/// plain `PACKAGE=NAME` filters the package's library tests only, so the name
+/// of an integration test target (`tests/NAME.rs`) or a binary (`src/bin/NAME.rs`,
+/// `src/main.rs`) selects nothing; those targets are `PACKAGE=test:NAME` and
+/// `PACKAGE=bin:NAME`. Names the form a refused filter should have when
+/// `commit` has such a target. Starts with a space, so it appends to a message.
+#[must_use]
+pub fn no_test_filter_hint(repo: &Path, commit: &str, filters: &[String]) -> String {
+    let exists = |path: &str| git(repo, &["cat-file", "-e", &format!("{commit}:{path}")]).is_some();
+    let mut specific = Vec::new();
+    for filter in filters {
+        let Some((package, name)) = filter.split_once('=') else {
+            continue;
+        };
+        if name.is_empty() || name.contains([':', '(', '/']) {
+            continue;
+        }
+        let dir = format!("crates/{package}");
+        if exists(&format!("{dir}/tests/{name}.rs"))
+            || exists(&format!("{dir}/tests/{name}/main.rs"))
+        {
+            specific.push(format!(
+                "`{filter}` is an integration test target: use `{package}=test:{name}`"
+            ));
+        }
+        if exists(&format!("{dir}/src/bin/{name}.rs"))
+            || exists(&format!("{dir}/src/bin/{name}/main.rs"))
+            || (name == package && exists(&format!("{dir}/src/main.rs")))
+        {
+            specific.push(format!(
+                "`{filter}` is a binary: use `{package}=bin:{name}`"
+            ));
+        }
+    }
+    let mut hint = String::from(
+        " (a plain `PACKAGE=NAME` filters library tests; an integration test target is \
+         `PACKAGE=test:NAME` and a binary is `PACKAGE=bin:NAME`",
+    );
+    for form in specific {
+        hint.push_str("; ");
+        hint.push_str(&form);
+    }
+    hint.push(')');
+    hint
 }
 
 fn filter_provably_empty(repo: &Path, commit: &str, filter: &str) -> bool {
@@ -426,10 +1346,403 @@ pub(crate) fn derive_source_facts(repo: &Path, source: &str) -> SourceFacts {
     }
 }
 
+/// Wall-clock cap on one filter derivation (`check-touched-shards --filters-only`).
+const DERIVE_FILTERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// #1807/#1781/#1786: derive the landing filters of `source` the way a hand
+/// landing does, so no agent copies, prunes or splits them. Runs the repo's
+/// `scripts/check-touched-shards --filters-only --json` on `source` against the
+/// rolling tip, then normalizes the suggested filters (dedupe focused
+/// rsid/rsid-store filters across shards, split filters over the byte limit;
+/// the count is never capped).
+///
+/// Any failure (no script, no rolling ref, a timeout, unparsable output)
+/// yields no filters: the unfiltered gate is the always-correct fallback.
+pub(crate) async fn derive_test_filters(repo: &Path, source: &str) -> Vec<String> {
+    try_derive_test_filters(repo, source)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`derive_test_filters`] that tells a derivation that FAILED (the checker did
+/// not start, timed out, or printed no usable receipt) from one with nothing to
+/// derive (no checker script, no rolling ref: `Ok` of no filters, the always
+/// correct unfiltered gate). #2993: an entry recorded before its derivation
+/// finished is refused on the first, never gated unfiltered by surprise.
+pub(crate) async fn try_derive_test_filters(
+    repo: &Path,
+    source: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let script = repo.join("scripts").join("check-touched-shards");
+    if !script.is_file() {
+        tracing::warn!(repo = %repo.display(), "derive_filters: no scripts/check-touched-shards");
+        return Ok(Vec::new());
+    }
+    let repo = repo.to_path_buf();
+    let Some(base) = ["origin/rolling", "rolling"].into_iter().find(|reference| {
+        git(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{reference}^{{commit}}"),
+            ],
+        )
+        .is_some()
+    }) else {
+        return Ok(Vec::new());
+    };
+    let mut command =
+        tokio::process::Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command
+        .arg(&script)
+        .args(["--filters-only", "--json", "--repo"])
+        .arg(&repo)
+        .args(["--base", base, "--head", source])
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(DERIVE_FILTERS_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "derive_filters: check-touched-shards did not start");
+            return Err(format!("check-touched-shards did not start: {error}"));
+        }
+        Err(_) => {
+            tracing::warn!("derive_filters: check-touched-shards timed out");
+            return Err(format!(
+                "check-touched-shards timed out after {} s",
+                DERIVE_FILTERS_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    // A nonzero exit still prints a receipt (a failed audit); its filters are
+    // still the diff's filters.
+    parse_receipt_filters(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        format!(
+            "check-touched-shards exited {} without a usable suggested_filters receipt",
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".to_owned(), |code| code.to_string())
+        )
+    })
+}
+
+/// #2907: how long `AgentEnqueueLandingSource` waits inline for the filter
+/// derivation before it records the entry with its filters pending (#2993).
+pub(crate) const ENQUEUE_DERIVE_WAIT: Duration = Duration::from_secs(4);
+
+/// #2912: the wall bound of `AgentEnqueueLandingSource` as a whole. The filter
+/// derivation wait ([`ENQUEUE_DERIVE_WAIT`]) and the source probe share it, so
+/// the probe gets whatever the derivation left; every git read of the call
+/// (tip, source, conflict scan) is killed at its phase's deadline, and a probe
+/// the deadline cut short is refused `queue_probe_timeout` (retryable).
+pub(crate) const ENQUEUE_WALL_BOUND: Duration = Duration::from_secs(5);
+
+/// How long a finished derivation stays reusable for the same repository,
+/// source and rolling tip.
+const DERIVATION_REUSE: Duration = Duration::from_secs(600);
+
+type DerivationKey = (PathBuf, String, String);
+
+/// What a derivation ended with: its filters, or why it failed (#2993).
+type DerivationResult = std::result::Result<Vec<String>, String>;
+
+struct Derivation {
+    tx: tokio::sync::watch::Sender<Option<DerivationResult>>,
+    finished: Option<std::time::Instant>,
+}
+
+/// In-flight and recently finished derivations (#2907). A derivation outlives
+/// the call that started it: a call that stops waiting leaves it running, and
+/// the retry joins it (or reads its result) instead of starting again.
+static DERIVATIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<DerivationKey, Derivation>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn derivations() -> std::sync::MutexGuard<'static, HashMap<DerivationKey, Derivation>> {
+    DERIVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The commit `origin/rolling` (else `rolling`) names; empty when neither does.
+/// `None` when a read did not complete by `deadline` (#2912): the tip is then
+/// unknown, which is not the same as having none.
+fn base_tip(repo: &Path, deadline: std::time::Instant) -> Option<String> {
+    for reference in ["origin/rolling", "rolling"] {
+        let spec = format!("{reference}^{{commit}}");
+        let (code, stdout) =
+            probe_git_exit(repo, &["rev-parse", "--verify", "--quiet", &spec], deadline)?;
+        if code == Some(0) {
+            return Some(String::from_utf8_lossy(&stdout).trim().to_owned());
+        }
+    }
+    Some(String::new())
+}
+
+/// How a [`derive_test_filters_shared`] wait ended (#2993). Only the first two
+/// are answers; the other two keep the caller from reading a missing answer as
+/// "no filters".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SharedDerivation {
+    /// The derivation finished: its filters (none when there was nothing to
+    /// derive, the always correct unfiltered gate).
+    Ready(Vec<String>),
+    /// The derivation ran and failed; the reason. Not reused: a retry runs it
+    /// again.
+    Failed(String),
+    /// Still running at the caller's limit. It keeps running in the
+    /// background and joins the next caller.
+    Running,
+    /// The rolling-tip read behind the derivation key did not complete by the
+    /// caller's deadline (#2912, a slow or stalled git): the tip, so the
+    /// derivation, is unknown. No derivation was started.
+    TipUnreadable,
+}
+
+/// [`try_derive_test_filters`] run at most once per (repository, source, rolling
+/// tip) and shared by every caller that asks while it runs or shortly after
+/// (#2907). `wait` bounds how long this caller waits: `None` waits for the
+/// answer, `Some(limit)` returns [`SharedDerivation::Running`] when the
+/// derivation is still running at `limit` (it keeps running in the background
+/// and the next call joins it). A derivation that yielded no filters or failed
+/// is not reused, so a retry runs it again.
+pub(crate) async fn derive_test_filters_shared(
+    repo: &Path,
+    source: &str,
+    wait: Option<Duration>,
+) -> SharedDerivation {
+    // #2912: the wait is one deadline over the whole call: the tip read runs
+    // under it and the answer wait gets what is left. A tip read that does not
+    // complete is its own outcome (#2993), not a derivation that is running.
+    let deadline = wait.map(|limit| std::time::Instant::now() + limit);
+    let tip = {
+        let repo = repo.to_path_buf();
+        let read_by = deadline.unwrap_or_else(|| std::time::Instant::now() + MERGE_PROBE_TIMEOUT);
+        tokio::task::spawn_blocking(move || base_tip(&repo, read_by))
+            .await
+            .unwrap_or_default()
+    };
+    let Some(tip) = tip else {
+        return SharedDerivation::TipUnreadable;
+    };
+    let key: DerivationKey = (repo.to_path_buf(), source.to_owned(), tip);
+    let mut rx = {
+        let mut map = derivations();
+        map.retain(|_, derivation| {
+            derivation
+                .finished
+                .is_none_or(|at| at.elapsed() < DERIVATION_REUSE)
+        });
+        if let Some(derivation) = map.get(&key) {
+            derivation.tx.subscribe()
+        } else {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            map.insert(
+                key.clone(),
+                Derivation {
+                    tx: tx.clone(),
+                    finished: None,
+                },
+            );
+            let (repo, source) = (key.0.clone(), key.1.clone());
+            let task_key = key.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let derived = try_derive_test_filters(&repo, &source).await;
+                tracing::info!(
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    filters = derived.as_ref().map_or(0, Vec::len),
+                    failed = derived.is_err(),
+                    "enqueue phase: derive_filters"
+                );
+                {
+                    let mut map = derivations();
+                    if derived.as_ref().is_ok_and(|filters| !filters.is_empty()) {
+                        if let Some(derivation) = map.get_mut(&task_key) {
+                            derivation.finished = Some(std::time::Instant::now());
+                        }
+                    } else {
+                        map.remove(&task_key);
+                    }
+                }
+                tx.send_replace(Some(derived));
+            });
+            rx
+        }
+    };
+    let answer = async {
+        match rx.wait_for(Option::is_some).await {
+            Ok(done) => match done.clone() {
+                Some(Ok(filters)) => SharedDerivation::Ready(filters),
+                Some(Err(reason)) => SharedDerivation::Failed(reason),
+                None => SharedDerivation::Running,
+            },
+            Err(_) => {
+                SharedDerivation::Failed("the derivation task ended without an answer".into())
+            }
+        }
+    };
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline.into(), answer)
+            .await
+            .unwrap_or(SharedDerivation::Running),
+        None => answer.await,
+    }
+}
+
+/// Entries whose filter derivation a task in this process is finishing (#2993).
+static FINISHING_DERIVATIONS: std::sync::LazyLock<std::sync::Mutex<HashSet<Uuid>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Finish the filters of `entry`, recorded with its derivation pending (#2993),
+/// in the background: wait for the shared derivation of `commit` in `repo`, then
+/// store its filters so the lander can admit the entry, or settle it `refused`
+/// with its typed reason (`queue_filter_derivation_failed`,
+/// `queue_tip_read_timeout`, `filter_matches_no_tests: <filter>`) and wake its
+/// enqueuer once. At most one task per entry; a call for an entry a task already
+/// finishes does nothing, so the enqueue verb and the loop's sweep never race.
+pub(crate) fn finish_filter_derivation_in_background(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    entry: Uuid,
+    repo: PathBuf,
+    commit: String,
+) {
+    {
+        let mut finishing = FINISHING_DERIVATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !finishing.insert(entry) {
+            return;
+        }
+    }
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        if let Err(error) = finish_filter_derivation(&store, entry, &repo, &commit).await {
+            tracing::warn!(%entry, %error, "rolling queue filter derivation could not be recorded; the next tick retries");
+        }
+        FINISHING_DERIVATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&entry);
+    });
+}
+
+async fn finish_filter_derivation(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    entry: Uuid,
+    repo: &Path,
+    commit: &str,
+) -> Result<()> {
+    let refusal = match derive_test_filters_shared(repo, commit, None).await {
+        SharedDerivation::Ready(filters) => {
+            // The inline path refuses a filter that provably selects no test;
+            // an entry recorded earlier gets the same verdict as its outcome.
+            let (probe_repo, probe_commit, probe_filters) =
+                (repo.to_path_buf(), commit.to_owned(), filters.clone());
+            let empty = tokio::task::spawn_blocking(move || {
+                with_git_deadline(std::time::Instant::now() + MERGE_PROBE_TIMEOUT, || {
+                    filter_selecting_no_tests(&probe_repo, &probe_commit, &probe_filters)
+                })
+            })
+            .await
+            .map_err(|error| DaemonError::Process(format!("filter probe join: {error}")))?;
+            match empty {
+                (Some(filter), _) => Some((
+                    rsi_common::rolling_queue::QUEUE_FILTER_MATCHES_NO_TESTS,
+                    format!("a derived filter selects no test: {filter}"),
+                )),
+                (None, _) => {
+                    with_store(store, move |s| {
+                        s.finish_rolling_queue_filter_derivation(entry, &filters)
+                    })
+                    .await?;
+                    None
+                }
+            }
+        }
+        SharedDerivation::Failed(reason) => Some((
+            rsi_common::rolling_queue::QUEUE_FILTER_DERIVATION_FAILED,
+            reason,
+        )),
+        SharedDerivation::TipUnreadable | SharedDerivation::Running => Some((
+            rsi_common::rolling_queue::QUEUE_TIP_READ_TIMEOUT,
+            "the rolling-tip read behind the filter derivation did not finish".to_owned(),
+        )),
+    };
+    if let Some((code, detail)) = refusal {
+        with_store(store, move |s| {
+            s.refuse_rolling_queue_filter_derivation(entry, code, &detail, Utc::now())
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Re-attach a derivation to every entry recorded with its filters pending
+/// (#2993): after a daemon restart, or a task that did not record its result.
+/// Called on every queue tick; an entry a task already finishes is skipped.
+pub(crate) async fn resume_pending_filter_derivations(store: &Arc<tokio::sync::Mutex<Store>>) {
+    match with_store(store, |s| s.rolling_queue_entries_deriving_filters()).await {
+        Ok(pending) => {
+            for (entry, repo, commit) in pending {
+                finish_filter_derivation_in_background(store, entry, PathBuf::from(repo), commit);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "rolling queue pending-derivation sweep deferred"),
+    }
+}
+
+/// The normalized `suggested_filters` of a `check-touched-shards --json` receipt.
+/// Any malformed part (unparsable receipt, a non-string entry, a filter the
+/// queue would refuse) yields no filters: never a partial set, which would
+/// gate less than the checker selected.
+#[cfg(test)]
+fn parse_suggested_filters(stdout: &str) -> Vec<String> {
+    parse_receipt_filters(stdout).unwrap_or_default()
+}
+
+/// [`parse_suggested_filters`] telling a malformed receipt (`None`) from one
+/// that suggests no filters (`Some` of none).
+fn parse_receipt_filters(stdout: &str) -> Option<Vec<String>> {
+    let receipt = serde_json::from_str::<serde_json::Value>(stdout).ok()?;
+    let value = receipt.get("suggested_filters")?;
+    let filters = serde_json::from_value::<Vec<String>>(value.clone()).ok()?;
+    let filters = rsi_common::rolling_queue::normalize_test_filters(filters);
+    filters
+        .iter()
+        .all(|filter| rsi_common::rolling_queue::valid_test_filter(filter))
+        .then_some(filters)
+}
+
 /// After a fetch, the published tip when `source` is an ancestor of
 /// `origin/rolling`. `None` when it is not (or git cannot say).
 pub(crate) fn landed_tip(repo: &Path, source: &str) -> Option<String> {
     landed_tips(repo, &[source.to_string()]).pop().flatten()
+}
+
+/// #2732: whether git positively says `commit` is NOT an ancestor of a freshly
+/// fetched `origin/rolling` (the commit is supplied work that has not landed).
+/// `false` when it is an ancestor, or when the fetch or git cannot say, so an
+/// outage never reads as unlanded work: a failed fetch leaves a cached
+/// `origin/rolling` that may predate the commit's landing, so it is never read.
+pub(crate) fn commit_off_rolling(repo: &Path, commit: &str) -> bool {
+    if fetch_rolling(repo).is_err() {
+        return false;
+    }
+    let Some(tip) = read_origin_tip(repo) else {
+        return false;
+    };
+    git_command()
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", commit, &tip])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.code() == Some(1))
 }
 
 /// After ONE fetch, the published tip for each source that is an ancestor of
@@ -514,6 +1827,33 @@ pub(crate) fn source_declares_provisional(repo: &Path, source: &str) -> bool {
     .any(|path| path.starts_with(PROVISIONAL_DIR) && path.ends_with(".json"))
 }
 
+/// Count newly added provisional declaration files in one source. Multiple
+/// declarations are refused at enqueue because the lander's proof currently
+/// models one provisional migration per accepted source.
+pub(crate) fn source_provisional_declaration_count(repo: &Path, source: &str) -> Option<usize> {
+    let base = ["origin/rolling", "rolling"].iter().find_map(|reference| {
+        git(repo, &["merge-base", source, reference]).map(|out| out.trim().to_string())
+    });
+    let base = base.filter(|base| !base.is_empty())?;
+    let changed = git(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=A",
+            &base,
+            source,
+        ],
+    )?;
+    Some(
+        changed
+            .lines()
+            .filter(|path| path.starts_with(PROVISIONAL_DIR) && path.ends_with(".json"))
+            .count(),
+    )
+}
+
 /// One batch member's migration facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MigrationMember {
@@ -560,6 +1900,9 @@ pub(crate) fn plan_migration_order(tip_version: u32, members: &[MigrationMember]
 #[derive(Debug, Clone)]
 pub struct LanderLauncher {
     binary: PathBuf,
+    // Production launchers refresh the shared diagnostic snapshot before a
+    // gate. Tests opt in with a private path instead of touching operator data.
+    known_failure_snapshot: Option<PathBuf>,
     /// The daemon-owned queue directory (`~/.rsi/queue`): the persistent cargo
     /// target and the detached landing worktrees live under it (#1108). `None`
     /// runs the lander in the entry's own checkout with the daemon's env.
@@ -571,6 +1914,9 @@ pub struct LanderLauncher {
     /// (#1208). The runner loop refreshes it from the operator setting
     /// `rolling_queue_gate_timeout_mins` before each batch.
     gate_timeout: Duration,
+    /// #2119: run each lander in a scope of `rsi-build.slice`, so the gate's
+    /// cargo builds and tests share the hub build budget. Off for tests.
+    build_slice: bool,
 }
 
 impl LanderLauncher {
@@ -578,12 +1924,22 @@ impl LanderLauncher {
     pub fn new(binary: PathBuf) -> Self {
         Self {
             binary,
+            known_failure_snapshot: (!cfg!(test)).then(known_failure_snapshot::default_path),
             workspace: None,
             fence_abi: WriteFence::kernel_abi,
             gate_timeout: Duration::from_secs(
                 u64::from(ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS) * 60,
             ),
+            build_slice: false,
         }
+    }
+
+    /// Run each lander in a transient scope of `rsi-build.slice` (#2119) when
+    /// the slice can be configured; otherwise it runs as the daemon's child.
+    #[must_use]
+    pub fn with_build_slice(mut self) -> Self {
+        self.build_slice = true;
+        self
     }
 
     /// Bound each batch's gating to `timeout` of wall time (#1208).
@@ -733,13 +2089,20 @@ fn fetch_rolling(repo: &Path) -> std::result::Result<String, String> {
     git_ok(repo, FETCH_ROLLING)
 }
 
-/// The daemon-owned landing worktree for the repository `source` belongs to: a
-/// detached checkout of the fetched `origin/rolling`, created once and
-/// refreshed on every call so builds stay warm. `source` (an operator checkout
-/// or a session sandbox) is only read: the worktree shares its object store and
-/// remotes, so any accepted source commit is reachable here, but no file in
-/// `source` is ever touched. Callers serialize use (the queue runs one batch at
-/// a time).
+/// The daemon-owned landing checkout for the repository `source` belongs to: a
+/// queue-owned private clone, detached at the fetched `origin/rolling`, created
+/// once and refreshed on every call so builds stay warm (#1170).
+///
+/// The clone is a repository of its own under the queue workspace. It borrows
+/// the source's object store through a read-only alternate (`objects/info/alternates`)
+/// so any accepted source commit is reachable, and fetches `origin/rolling` itself
+/// from the source's `origin` URL. Nothing about it is registered in the source:
+/// no `worktrees/<name>` entry, no ref, no object, no config and no file of
+/// `source` is ever written, and the queue's fetch runs against the clone, not
+/// the source. `source` is only read (`rev-parse`, `remote get-url`,
+/// `config --get-all`). Callers serialize use (the queue runs one batch at a
+/// time).
+#[cfg(test)]
 pub(crate) fn ensure_queue_worktree(
     root: &Path,
     source: &Path,
@@ -762,95 +2125,236 @@ fn ensure_queue_worktree_with(
     // owned directories, never symlinks or aliases (#1113).
     prepare_queue_workspace(root)?;
     // The fence guards every reset; a host that cannot enforce it is refused
-    // before any worktree is created or touched (#1160).
+    // before any clone is created or touched (#1160).
     write_fence::require_abi(fence_abi())?;
     let path = root.join("worktrees").join(stable_key(&common));
-    let rolling = match fetch_rolling(source) {
-        Ok(_) => "origin/rolling^{commit}",
-        // Offline or no remote: the lander reports the real error; keep the
-        // last fetched tip (or the source HEAD) so the worktree still exists.
-        Err(_) => "HEAD",
-    };
-    let rev = match git_ok(source, &["rev-parse", "--verify", rolling]) {
-        Ok(rev) => rev,
-        Err(_) => git_ok(source, &["rev-parse", "--verify", "HEAD"])?,
-    };
-    if path.symlink_metadata().is_ok() {
-        match pin_queue_worktree(root, &path, &common) {
-            Ok(mut pinned) => {
-                pinned.fence_abi = fence_abi;
-                reset_pinned_worktree(&pinned, &rev)?;
-                return Ok(path);
+    let mut pinned = if path.symlink_metadata().is_ok() {
+        match pin_queue_worktree(root, &path) {
+            Ok(pinned) => pinned,
+            // An empty directory (a crashed creation) or a slot an earlier
+            // daemon registered as a linked worktree of the source is retired;
+            // anything else is refused with nothing touched.
+            Err(refusal) => {
+                retire_unusable_slot(root, &path, &common).map_err(|_| refusal)?;
+                create_queue_clone(root, &path)?
             }
-            // An empty directory (a crashed `worktree add`) is safe to
-            // retire; anything else is refused with nothing touched.
-            Err(refusal) => remove_empty_queue_dir(root, &path).map_err(|_| refusal)?,
         }
-    }
-    // `git worktree add` registers by path (R1 residual of #1170, see
-    // `write_fence.rs`); it runs with hooks, fsmonitor and attributes off on
-    // the command line and checks nothing out, and the population below is the
-    // fenced, pinned runner.
-    let _ = git_ok(source, &["worktree", "prune"]);
-    create_queue_registration(source, &path, &rev)?;
-    // The registration exists but nothing is checked out: populate it exactly
-    // like every later reset, through the pinned, fenced runner (#1160).
-    let mut pinned = pin_queue_worktree(root, &path, &common)?;
+    } else {
+        create_queue_clone(root, &path)?
+    };
     pinned.fence_abi = fence_abi;
+    // The clone's config and alternate are rewritten from the source on every
+    // call (the origin URL can change; a replaced file heals).
+    sync_queue_clone(&pinned, source, &common)?;
+    let rev = queue_rolling_rev(&pinned, source)?;
+    // Populate exactly like every later reset, through the pinned, fenced runner
+    // (#1160).
     reset_pinned_worktree(&pinned, &rev)?;
     Ok(path)
 }
 
-/// Register a detached worktree at `path` without checking anything out: git
-/// then creates only the registration and the `.git` pointer, and runs no
-/// checkout, hook or filter. The hook and filter settings are also disabled on
-/// the command line, so nothing the repository configures can run here.
-fn create_queue_registration(
-    source: &Path,
-    path: &Path,
-    rev: &str,
-) -> std::result::Result<(), String> {
-    let path_arg = path.display().to_string();
-    git_ok(
-        source,
-        &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "worktree",
-            "add",
-            "--quiet",
-            "--no-checkout",
-            "--detach",
-            "--force",
-            &path_arg,
-            rev,
-        ],
-    )
-    .map(drop)
+/// First line of a queue clone's `config`: what a validated slot must carry.
+const QUEUE_CLONE_MARKER: &str = "# rsi-queue-clone v1\n";
+
+/// Transport settings of the source that a fetch needs and the clone cannot
+/// derive: they carry the operator's authentication and network path. Only the
+/// repository-local values are copied (the clone reads the global config like
+/// the source did). Each is `(section, subsection, name)`.
+const COPIED_TRANSPORT_KEYS: &[(&str, Option<&str>, &str)] = &[
+    ("core", None, "sshCommand"),
+    ("core", None, "gitProxy"),
+    ("credential", None, "helper"),
+    ("http", None, "proxy"),
+    ("http", None, "sslCAInfo"),
+    ("remote", Some("origin"), "uploadpack"),
+    ("remote", Some("origin"), "proxy"),
+];
+
+/// `value` as a git config string, or `None` when it cannot be written on one
+/// line.
+fn config_quote(value: &str) -> Option<String> {
+    match value.contains(['\n', '\r', '\0']) {
+        true => None,
+        false => Some(format!(
+            "\"{}\"",
+            value.replace('\\', "\\\\").replace('"', "\\\"")
+        )),
+    }
 }
 
-/// Retire an empty queue slot without trusting any path: open the vetted
-/// `worktrees` directory without following symlinks, check the slot through
-/// that handle (`fstatat`, no-follow) and remove it with `unlinkat` relative to
-/// the same handle. `AT_REMOVEDIR` never removes a symlink or a non-empty
-/// directory, so a swap of the slot or of `worktrees` after the check cannot
-/// redirect the removal (#1141).
-fn remove_empty_queue_dir(root: &Path, path: &Path) -> std::result::Result<(), String> {
-    use std::ffi::CString;
+/// A remote URL as the clone must fetch it: a relative local path is made
+/// absolute against the source, since the clone lives elsewhere.
+fn absolute_remote_url(source: &Path, url: &str) -> String {
+    let local = !url.contains("://") && !url.contains(':') && Path::new(url).is_relative();
+    match local {
+        true if source.join(url).exists() => source.join(url).display().to_string(),
+        _ => url.to_string(),
+    }
+}
+
+/// The text of a queue clone's `config`, derived from reads of `source` only.
+fn queue_clone_config(source: &Path) -> String {
+    let mut config = String::from(QUEUE_CLONE_MARKER);
+    config.push_str(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+         \tlogAllRefUpdates = false\n\thooksPath = /dev/null\n\
+         [gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n",
+    );
+    let url = git_ok(source, &["remote", "get-url", "origin"])
+        .ok()
+        .map(|url| absolute_remote_url(source, &url))
+        .and_then(|url| config_quote(&url));
+    if let Some(url) = url {
+        config.push_str(&format!(
+            "[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        ));
+        let push = git_ok(source, &["remote", "get-url", "--push", "origin"])
+            .ok()
+            .map(|push| absolute_remote_url(source, &push))
+            .and_then(|push| config_quote(&push));
+        if let Some(push) = push {
+            config.push_str(&format!("[remote \"origin\"]\n\tpushurl = {push}\n"));
+        }
+    }
+    for (section, subsection, name) in COPIED_TRANSPORT_KEYS {
+        let key = match subsection {
+            Some(subsection) => format!("{section}.{subsection}.{name}"),
+            None => format!("{section}.{name}"),
+        };
+        let Ok(values) = git_ok(source, &["config", "--local", "--get-all", &key]) else {
+            continue;
+        };
+        let header = match subsection {
+            Some(subsection) => format!("[{section} \"{subsection}\"]"),
+            None => format!("[{section}]"),
+        };
+        for value in values.lines().filter_map(config_quote) {
+            config.push_str(&format!("{header}\n\t{name} = {value}\n"));
+        }
+    }
+    config
+}
+
+/// Write the clone's `config` and its read-only alternate (the source's object
+/// store), both by exclusive create plus rename relative to the pinned git
+/// directory, so a file a racing process put there is replaced, never written
+/// through.
+fn sync_queue_clone(
+    pinned: &PinnedWorktree,
+    source: &Path,
+    common: &str,
+) -> std::result::Result<(), String> {
+    if common.contains('\n') {
+        return Err("the source's object store path has a newline".to_string());
+    }
+    pinned.ensure_admin_unchanged()?;
+    let objects = private_git_dir::open_dir_at(&pinned.admin_dir, "objects")?;
+    let info = private_git_dir::open_dir_at(&objects, "info")?;
+    private_git_dir::replace_file_at(
+        &info,
+        "alternates",
+        format!("{common}/objects\n").as_bytes(),
+        0o644,
+    )?;
+    private_git_dir::replace_file_at(
+        &pinned.admin_dir,
+        "config",
+        queue_clone_config(source).as_bytes(),
+        0o644,
+    )?;
+    pinned.ensure_admin_unchanged()
+}
+
+/// Run git with the pinned clone as its current directory (the handle is
+/// resolved between `fork` and `exec`, so the path is never looked up by name).
+/// Unfenced, like every read of the queue's own clone.
+fn git_in_clone(pinned: &PinnedWorktree, args: &[&str]) -> std::result::Result<String, String> {
+    pinned.ensure_admin_unchanged()?;
+    let output = git_command()
+        .current_dir(pinned.handle_path())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot run git: {error}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    Err(format!(
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// The commit the queue clone is reset to: the freshly fetched `origin/rolling`
+/// of the CLONE, or, offline or with no remote, the source's `HEAD` (the lander
+/// reports the real error). The fetch writes only the clone (#1170); the source's
+/// own `origin/rolling` is no longer touched by the queue.
+fn queue_rolling_rev(
+    pinned: &PinnedWorktree,
+    source: &Path,
+) -> std::result::Result<String, String> {
+    if git_in_clone(pinned, FETCH_ROLLING).is_ok()
+        && let Ok(rev) = git_in_clone(
+            pinned,
+            &["rev-parse", "--verify", "origin/rolling^{commit}"],
+        )
+    {
+        return Ok(rev);
+    }
+    git_ok(source, &["rev-parse", "--verify", "HEAD^{commit}"])
+}
+
+/// Create the queue clone at `path`: a repository skeleton (git directory with
+/// `HEAD`, `config`, `objects`, `refs`; no `hooks`, no `info`, no templates)
+/// made relative to the vetted `worktrees` handle with exclusive creates and no
+/// symlink follow. No git process runs and nothing outside `path` is written.
+/// Returned pinned; [`sync_queue_clone`] gives it its real config and alternate.
+fn create_queue_clone(root: &Path, path: &Path) -> std::result::Result<PinnedWorktree, String> {
+    let (parent, name) = vetted_slot_parent(root, path)?;
+    private_git_dir::make_dir_at(&parent, &name)?;
+    let built = (|| {
+        let slot = private_git_dir::open_dir_at(&parent, &name)?;
+        private_git_dir::make_dir_at(&slot, ".git")?;
+        let admin = private_git_dir::open_dir_at(&slot, ".git")?;
+        private_git_dir::create_file_at(
+            &admin,
+            "HEAD",
+            b"ref: refs/heads/rsi-queue-unborn\n",
+            0o644,
+        )?;
+        private_git_dir::create_file_at(&admin, "config", QUEUE_CLONE_MARKER.as_bytes(), 0o644)?;
+        for dir in ["objects", "refs"] {
+            private_git_dir::make_dir_at(&admin, dir)?;
+        }
+        let objects = private_git_dir::open_dir_at(&admin, "objects")?;
+        for dir in ["info", "pack"] {
+            private_git_dir::make_dir_at(&objects, dir)?;
+        }
+        let refs = private_git_dir::open_dir_at(&admin, "refs")?;
+        for dir in ["heads", "tags"] {
+            private_git_dir::make_dir_at(&refs, dir)?;
+        }
+        pin_queue_worktree(root, path)
+    })();
+    if built.is_err() {
+        // The directory was created just now by this call and is ours alone.
+        let _ = private_git_dir::remove_tree_at(&parent, &name);
+    }
+    built
+}
+
+/// The vetted `worktrees` directory handle and the slot's name in it. The
+/// handle is opened without following a symlink and must resolve to the
+/// queue's own `worktrees` directory, owned by this user.
+fn vetted_slot_parent(
+    root: &Path,
+    path: &Path,
+) -> std::result::Result<(std::fs::File, String), String> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    let refuse = |why: &str| {
-        Err(format!(
-            "cannot retire queue slot {}: {why}",
-            path.display()
-        ))
-    };
-    let Some(name) = path.file_name() else {
+    let refuse = |why: &str| Err(format!("cannot use queue slot {}: {why}", path.display()));
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return refuse("no file name");
     };
     let parent_path = root.join("worktrees");
@@ -862,8 +2366,7 @@ fn remove_empty_queue_dir(root: &Path, path: &Path) -> std::result::Result<(), S
         .metadata()
         .map_err(|error| format!("cannot stat {}: {error}", parent_path.display()))?;
     // SAFETY: `geteuid` has no preconditions and does not mutate state.
-    let uid = unsafe { nix::libc::geteuid() };
-    if parent_meta.uid() != uid {
+    if parent_meta.uid() != unsafe { nix::libc::geteuid() } {
         return refuse("the worktrees directory is not owned by the daemon user");
     }
     let real_parent = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
@@ -875,7 +2378,93 @@ fn remove_empty_queue_dir(root: &Path, path: &Path) -> std::result::Result<(), S
     if real_parent != real_root.join("worktrees") {
         return refuse("the worktrees directory is not the queue's");
     }
-    let name = CString::new(name.as_bytes()).map_err(|_| "slot name has a NUL".to_string())?;
+    Ok((parent, name.to_string()))
+}
+
+/// Retire a slot that cannot be used as a queue clone: an empty directory, or
+/// the linked worktree an earlier daemon registered in the source repository.
+/// Removing the latter touches only the slot (handle-relative, no symlink
+/// follow); its registration in the source is left for git's own
+/// `worktree prune`, because the queue no longer writes the source at all.
+fn retire_unusable_slot(root: &Path, path: &Path, common: &str) -> std::result::Result<(), String> {
+    if legacy_registered_worktree(root, path, common) {
+        let (parent, name) = vetted_slot_parent(root, path)?;
+        return private_git_dir::remove_tree_at(&parent, &name);
+    }
+    remove_empty_queue_dir(root, path)
+}
+
+/// `path` is a worktree an earlier queue registered in the source repository: a
+/// real owned directory in the workspace whose `.git` FILE points at a
+/// `<common>/worktrees/<name>` registration that points back at `path`.
+fn legacy_registered_worktree(root: &Path, path: &Path, common: &str) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(dir) = open_queue_dir(path) else {
+        return false;
+    };
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    let uid = unsafe { nix::libc::geteuid() };
+    if dir.metadata().map(|meta| meta.uid()).ok() != Some(uid) {
+        return false;
+    }
+    let (Ok(real), Ok(real_root)) = (
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).canonicalize(),
+        root.canonicalize(),
+    ) else {
+        return false;
+    };
+    if !real.starts_with(real_root.join("worktrees")) {
+        return false;
+    }
+    let Ok(Some(pointer)) = private_git_dir::read_file_at(&dir, ".git") else {
+        return false;
+    };
+    let pointer = String::from_utf8_lossy(&pointer);
+    let Some(admin) = pointer.trim().strip_prefix("gitdir:").map(str::trim) else {
+        return false;
+    };
+    let Ok(admin_dir) = open_queue_dir(Path::new(admin)) else {
+        return false;
+    };
+    let admin_handle = PathBuf::from(format!("/proc/self/fd/{}", admin_dir.as_raw_fd()));
+    let (Ok(admin_real), Ok(common)) = (
+        admin_handle.canonicalize(),
+        Path::new(common).canonicalize(),
+    ) else {
+        return false;
+    };
+    if admin_dir.metadata().map(|meta| meta.uid()).ok() != Some(uid)
+        || admin_real.parent() != Some(common.join("worktrees").as_path())
+    {
+        return false;
+    }
+    let back = std::fs::read_to_string(admin_handle.join("gitdir")).unwrap_or_default();
+    Path::new(back.trim()).canonicalize().ok().as_deref() == Some(real.join(".git").as_path())
+}
+
+/// Retire an empty queue slot without trusting any path: open the vetted
+/// `worktrees` directory without following symlinks, check the slot through
+/// that handle (`fstatat`, no-follow) and remove it with `unlinkat` relative to
+/// the same handle. `AT_REMOVEDIR` never removes a symlink or a non-empty
+/// directory, so a swap of the slot or of `worktrees` after the check cannot
+/// redirect the removal (#1141).
+fn remove_empty_queue_dir(root: &Path, path: &Path) -> std::result::Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    let refuse = |why: &str| {
+        Err(format!(
+            "cannot retire queue slot {}: {why}",
+            path.display()
+        ))
+    };
+    let (parent, name) = match vetted_slot_parent(root, path) {
+        Ok(vetted) => vetted,
+        Err(why) => return refuse(&why),
+    };
+    // SAFETY: `geteuid` has no preconditions and does not mutate state.
+    let uid = unsafe { nix::libc::geteuid() };
+    let name = CString::new(name).map_err(|_| "slot name has a NUL".to_string())?;
     // SAFETY: `stat` is plain old data, `name` is NUL-terminated and the parent
     // handle stays open for both calls.
     let removed = unsafe {
@@ -948,22 +2537,24 @@ mod write_fence;
 use private_git_dir::PrivateGitDir;
 use write_fence::WriteFence;
 
-/// A queue worktree validated once and then held by open directory handles.
+/// A queue clone validated once and then held by open directory handles.
 /// Destructive git commands run from the handles, never from mutable paths, so a
-/// slot or a registration swapped for a symlink after validation cannot
+/// slot or a git directory swapped for a symlink after validation cannot
 /// redirect them (#1126, #1141).
 pub(crate) struct PinnedWorktree {
     dir: std::fs::File,
-    /// The worktree registration (`<common>/worktrees/<name>`) opened without
-    /// following a symlink. Git is pointed at the handle (`GIT_DIR=/proc/self/fd/N`),
-    /// so the registration is never resolved by path again.
+    /// The clone's own git directory (`<slot>/.git`) opened without following a
+    /// symlink. Git is never pointed at it: each reset runs in a fresh private
+    /// directory beneath it, and only `index` and `HEAD` are published back by
+    /// exclusive create plus rename relative to this handle.
     admin_dir: std::fs::File,
-    /// Where the registration was validated; the path is only used to detect a
+    /// Where the git directory was validated; the path is only used to detect a
     /// swap, never to run git.
     admin: PathBuf,
     admin_id: (u64, u64),
-    /// The shared object store (`<common>/objects`), read by the private git
-    /// directory's git through `GIT_OBJECT_DIRECTORY`.
+    /// The clone's object store (`<slot>/.git/objects`), read by the private git
+    /// directory's git through `GIT_OBJECT_DIRECTORY`. Its alternate names the
+    /// source's store, which is only ever read.
     objects: PathBuf,
     /// How the kernel's Landlock ABI is read; replaced only by tests.
     fence_abi: write_fence::AbiProbe,
@@ -985,13 +2576,13 @@ impl PinnedWorktree {
         PathBuf::from(format!("/proc/self/fd/{}", self.admin_dir.as_raw_fd()))
     }
 
-    /// The registration path still names the pinned inode: same device and
+    /// The git directory path still names the pinned inode: same device and
     /// inode, not a symlink, not moved. Fail closed otherwise.
     fn ensure_admin_unchanged(&self) -> std::result::Result<(), String> {
         use std::os::unix::fs::MetadataExt;
         let swapped = |why: &str| {
             Err(format!(
-                "queue worktree registration {} changed under the queue ({why}); refusing to run git",
+                "queue clone git directory {} changed under the queue ({why}); refusing to run git",
                 self.admin.display()
             ))
         };
@@ -1026,23 +2617,20 @@ fn open_queue_dir(path: &Path) -> std::result::Result<std::fs::File, String> {
         })
 }
 
-/// `path` is a worktree this queue created: a real owned directory inside the
-/// workspace whose `.git` file points at a registered worktree of `common`,
-/// and whose registration points back at `path`. Every check runs against one
-/// no-follow directory handle, which is returned so the caller keeps using
-/// exactly the inode that was validated.
-fn pin_queue_worktree(
-    root: &Path,
-    path: &Path,
-    common: &str,
-) -> std::result::Result<PinnedWorktree, String> {
+/// `path` is a queue clone this queue created: a real owned directory inside
+/// the workspace holding its own `.git` DIRECTORY (opened without following a
+/// symlink, owned by this user, carrying the queue's marker config) at its real
+/// location. Every check runs against no-follow directory handles, which are
+/// returned so the caller keeps using exactly the inodes that were validated.
+fn pin_queue_worktree(root: &Path, path: &Path) -> std::result::Result<PinnedWorktree, String> {
     use std::os::unix::fs::MetadataExt;
     let dir = open_queue_dir(path)?;
     let meta = dir
         .metadata()
         .map_err(|error| format!("queue path {} unreadable: {error}", path.display()))?;
     // SAFETY: `geteuid` has no preconditions and does not mutate state.
-    if meta.uid() != unsafe { nix::libc::geteuid() } {
+    let uid = unsafe { nix::libc::geteuid() };
+    if meta.uid() != uid {
         return Err(format!(
             "queue path {} is not owned by the daemon user; refusing to use it",
             path.display()
@@ -1054,7 +2642,7 @@ fn pin_queue_worktree(
     };
     let refuse = |why: &str| {
         Err(format!(
-            "queue worktree {} is not a registered worktree of this queue ({why}); refusing to reset it",
+            "queue path {} is not a queue clone ({why}); refusing to reset it",
             path.display()
         ))
     };
@@ -1068,56 +2656,44 @@ fn pin_queue_worktree(
     if !real.starts_with(real_root.join("worktrees")) {
         return refuse("outside the queue workspace");
     }
-    let dot_git = handle.join(".git");
-    match dot_git.symlink_metadata() {
-        Ok(meta) if meta.is_file() => {}
-        _ => return refuse("no regular .git file"),
-    }
-    let pointer = std::fs::read_to_string(&dot_git)
-        .map_err(|error| format!("cannot read {}: {error}", dot_git.display()))?;
-    let Some(admin) = pointer.trim().strip_prefix("gitdir:").map(str::trim) else {
-        return refuse("malformed .git file");
-    };
-    // Pin the registration itself: opened without following a final symlink,
-    // then every check below reads through the handle, so a swap of the
-    // registration path after this point cannot change what is validated or
-    // what git later uses.
-    let Ok(admin_dir) = open_queue_dir(Path::new(admin)) else {
-        return refuse("registration is missing or is a symlink");
+    // The git directory is pinned itself: every check below reads through the
+    // handle, so a swap of the `.git` path after this point cannot change what
+    // is validated or what a reset later publishes into.
+    let Ok(admin_dir) = private_git_dir::open_dir_at(&dir, ".git") else {
+        return refuse("no .git directory, or it is a symlink");
     };
     let admin_meta = admin_dir.metadata().map_err(|error| {
         format!(
-            "cannot stat the registration of {}: {error}",
+            "cannot stat the git directory of {}: {error}",
             path.display()
         )
     })?;
-    // SAFETY: `geteuid` has no preconditions and does not mutate state.
-    if admin_meta.uid() != unsafe { nix::libc::geteuid() } {
-        return refuse("registration is not owned by the daemon user");
+    if admin_meta.uid() != uid {
+        return refuse("the git directory is not owned by the daemon user");
     }
-    let admin_handle = {
+    let marked = matches!(
+        private_git_dir::read_file_at(&admin_dir, "config"),
+        Ok(Some(config)) if config.starts_with(QUEUE_CLONE_MARKER.as_bytes())
+    );
+    if !marked {
+        return refuse("the git directory does not carry the queue's marker");
+    }
+    let admin_real = {
         use std::os::fd::AsRawFd;
-        PathBuf::from(format!("/proc/self/fd/{}", admin_dir.as_raw_fd()))
+        PathBuf::from(format!("/proc/self/fd/{}", admin_dir.as_raw_fd())).canonicalize()
     };
-    let (Ok(admin_real), Ok(common)) = (
-        admin_handle.canonicalize(),
-        Path::new(common).canonicalize(),
-    ) else {
-        return refuse("registration is missing");
+    let Ok(admin_real) = admin_real else {
+        return refuse("the git directory is missing");
     };
-    if admin_real.parent() != Some(common.join("worktrees").as_path()) {
-        return refuse("gitdir is not a worktree registration of the source repository");
-    }
-    let back = std::fs::read_to_string(admin_handle.join("gitdir")).unwrap_or_default();
-    if Path::new(back.trim()).canonicalize().ok().as_deref() != Some(real.join(".git").as_path()) {
-        return refuse("registration does not point back at the worktree");
+    if admin_real != real.join(".git") {
+        return refuse("the git directory is not the slot's own");
     }
     let pinned = PinnedWorktree {
         dir,
         admin_dir,
+        objects: admin_real.join("objects"),
         admin: admin_real,
         admin_id: (admin_meta.dev(), admin_meta.ino()),
-        objects: common.join("objects"),
         fence_abi: WriteFence::kernel_abi,
         inherited_env: None,
     };
@@ -1128,11 +2704,11 @@ fn pin_queue_worktree(
 /// Run git inside the pinned worktree against the private git directory: the
 /// child's current directory comes from the inherited worktree handle and
 /// `GIT_DIR` names the inherited private-directory handle, so neither the
-/// worktree path nor any registration path is resolved again. The child gets no
+/// worktree path nor the clone's git directory path is resolved again. The child gets no
 /// operator config, hooks or filters (the private directory has its own config
 /// and no hooks; global and system config are off) and runs under a kernel
 /// write fence that permits writes only beneath those two handles (#1160). The
-/// registration identity is also checked before and after, failing closed on a
+/// git directory identity is also checked before and after, failing closed on a
 /// swap. `env` is extra environment for the child (tests park git between its
 /// work-tree normalization and its `chdir`).
 fn git_private(
@@ -1238,11 +2814,11 @@ fn git_private(
 
 /// Reset the pinned queue worktree to `rev` and drop untracked files.
 ///
-/// git never touches the registration: it works in a fresh private git
-/// directory seeded with a copy of the registration's index, and the resulting
+/// git never touches the clone's own git directory: it works in a fresh private
+/// git directory seeded with a copy of the clone's index, and the resulting
 /// `HEAD` and index are published back by exclusive create plus rename relative
-/// to the pinned registration handle. So nothing in the registration, nor any
-/// operator file a link there aliases, is ever written in place.
+/// to the pinned git directory handle. So nothing there, nor any file a link
+/// there aliases, is ever written in place.
 fn reset_pinned_worktree(pinned: &PinnedWorktree, rev: &str) -> std::result::Result<(), String> {
     reset_pinned_worktree_with_env(pinned, rev, &|_| Vec::new(), &|_, _| {})
 }
@@ -1311,6 +2887,176 @@ async fn queue_repo(
     .map_err(|error| format!("queue workspace task: {error}"))?
 }
 
+/// The repository a checkout belongs to: its git common directory, which every
+/// worktree of one repository shares (and so shares one object database). `None`
+/// when git cannot say (the checkout is gone or is not a repository).
+fn repository_identity(checkout: &Path) -> Option<String> {
+    let common = git_ok(
+        checkout,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let common = PathBuf::from(common);
+    Some(
+        std::fs::canonicalize(&common)
+            .unwrap_or(common)
+            .display()
+            .to_string(),
+    )
+}
+
+/// The key queued entries batch under. A checkout git cannot resolve keeps its
+/// own path, so it only ever batches with entries of that exact path (what the
+/// queue did before #1945) and never with a resolved repository.
+fn repository_key(checkout: &str) -> String {
+    match repository_identity(Path::new(checkout)) {
+        Some(common) => format!("git:{common}"),
+        None => format!("path:{checkout}"),
+    }
+}
+
+/// Claim the next batch: the FIFO head plus up to `size - 1` later entries of
+/// its project and repository. Every Issue worker lands from its own sandbox
+/// worktree, so entries batch by git common directory, not by checkout path
+/// (#1945). Git runs here, outside the store's write transaction; the claim only
+/// looks the answers up, and an entry enqueued after the probe is not in the
+/// map, so it keeps its own path and waits for a later claim.
+async fn claim_batch(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    size: usize,
+) -> Result<Option<ClaimedQueueBatch>> {
+    let checkouts = match size {
+        0 | 1 => Vec::new(),
+        _ => with_store(store, |s| s.queued_rolling_queue_repo_paths()).await?,
+    };
+    if checkouts.len() < 2 {
+        // One checkout (or a batch of one): the path is the repository.
+        return with_store(store, move |s| {
+            s.claim_rolling_queue_batch(Utc::now(), size)
+        })
+        .await;
+    }
+    let keys: HashMap<String, String> = tokio::task::spawn_blocking(move || {
+        checkouts
+            .into_iter()
+            .map(|checkout| {
+                let key = repository_key(&checkout);
+                (checkout, key)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| DaemonError::Process(format!("queue repository probe: {error}")))?;
+    with_store(store, move |s| {
+        s.claim_rolling_queue_batch_by(Utc::now(), size, &|checkout| {
+            keys.get(checkout)
+                .cloned()
+                .unwrap_or_else(|| format!("path:{checkout}"))
+        })
+    })
+    .await
+}
+
+/// Queued entries whose package sets one lane claim resolves (#1224). An entry
+/// further back is read as whole-workspace, which keeps it, and everything
+/// behind it, in order and bounds the git work of an attempt.
+const LANE_PROBE_WINDOW: usize = 32;
+
+/// [`repository_key`], remembered per checkout: a lane claim asks on every tick
+/// while a batch gates, and a checkout's repository does not change.
+fn repository_key_cached(checkout: &str) -> String {
+    static KEYS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(Default::default);
+    if let Some(known) = keys
+        .lock()
+        .ok()
+        .and_then(|keys| keys.get(checkout).cloned())
+    {
+        return known;
+    }
+    let key = repository_key(checkout);
+    if let Ok(mut keys) = keys.lock() {
+        if keys.len() >= 1024 {
+            keys.clear();
+        }
+        keys.insert(checkout.to_string(), key.clone());
+    }
+    key
+}
+
+/// [`claim_batch`] with lanes (#1224). With nothing gating this is the plain
+/// claim. While a batch gates, the queued sources and the gating ones are
+/// resolved to package sets (git, outside the store's write transaction) and the
+/// store claims a second batch only for a source disjoint from every gating
+/// batch: an rsi-only entry no longer waits behind an rsid shard batch.
+async fn claim_batch_in_lanes(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    size: usize,
+) -> Result<Option<ClaimedQueueBatch>> {
+    let (gating, queued) = with_store(store, |s| {
+        s.rolling_queue_lane_candidates(LANE_PROBE_WINDOW)
+    })
+    .await?;
+    if gating.is_empty() || queued.is_empty() {
+        return claim_batch(store, size).await;
+    }
+    let (keys, packages): (HashMap<String, String>, HashMap<String, LanePackages>) =
+        tokio::task::spawn_blocking(move || {
+            let mut keys = HashMap::new();
+            let mut packages = HashMap::new();
+            for (source, checkout) in gating.iter().chain(queued.iter()) {
+                keys.entry(checkout.clone())
+                    .or_insert_with(|| repository_key_cached(checkout));
+                packages
+                    .entry(source.clone())
+                    .or_insert_with(|| lanes::source_lane_packages(Path::new(checkout), source));
+            }
+            (keys, packages)
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("queue lane probe: {error}")))?;
+    with_store(store, move |s| {
+        s.claim_rolling_queue_batch_lanes(
+            Utc::now(),
+            size,
+            &|checkout| {
+                keys.get(checkout)
+                    .cloned()
+                    .unwrap_or_else(|| format!("path:{checkout}"))
+            },
+            &|source| packages.get(source).cloned().flatten(),
+        )
+    })
+    .await
+}
+
+/// The queue checkout a claimed batch runs in: made from the first member
+/// checkout that still resolves. Members of one repository share its object
+/// store and remotes, so any of them gives the same worktree; a head whose
+/// sandbox was reclaimed no longer fails the whole batch. With one checkout the
+/// refusal is that checkout's, as before.
+async fn queue_repo_for_batch(
+    launcher: &LanderLauncher,
+    checkouts: &[String],
+) -> std::result::Result<PathBuf, String> {
+    let mut tried: Vec<&String> = Vec::new();
+    let mut first_error = None;
+    for checkout in checkouts {
+        if tried.contains(&checkout) {
+            continue;
+        }
+        tried.push(checkout);
+        match queue_repo(launcher, checkout).await {
+            Ok(repo) => return Ok(repo),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| "the batch has no member checkout".to_string()))
+}
+
 /// The refusal code a failed queue workspace settles with: a host that cannot
 /// enforce the write fence gets its own typed code (#1160), anything else is
 /// the generic `lander_unavailable`.
@@ -1328,7 +3074,8 @@ pub(crate) struct RunResult {
     pub outcome: RollingQueueOutcome,
 }
 
-pub(crate) fn tail(text: &str) -> String {
+/// The queue outcome detail for `text`: its newest [`OUTCOME_TAIL_BYTES`].
+pub fn tail(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.len() <= OUTCOME_TAIL_BYTES {
         return trimmed.to_string();
@@ -1394,9 +3141,21 @@ pub fn failing_test_line(name: &str) -> String {
 }
 
 /// The failing tests a run reported: the lander's `failing_test=` receipt
-/// lines first, else the raw libtest `test ... FAILED` lines.
+/// lines first, else the libtest output: `test ... FAILED` lines, the
+/// `---- name stdout ----` headers and the closing `failures:` name list. The
+/// last two matter because a test that prints while it runs (a child process,
+/// a fixture) splits its `test name ... ok|FAILED` line, so the verdict never
+/// shares a line with the name (#1831).
 #[must_use]
 pub fn failing_tests(text: &str) -> Vec<String> {
+    let mut names = all_failing_tests(text);
+    names.truncate(MAX_FAILING_TESTS);
+    names
+}
+
+/// [`failing_tests`] before the cap: every name, sorted and deduplicated, so a
+/// caller can count what its own bound drops (#185).
+pub(crate) fn all_failing_tests(text: &str) -> Vec<String> {
     let marked: Vec<String> = text
         .lines()
         .filter_map(|line| line_value(line.trim(), FAILING_TEST_KEY))
@@ -1404,19 +3163,142 @@ pub fn failing_tests(text: &str) -> Vec<String> {
         .filter(|name| !name.is_empty())
         .collect();
     let mut names: Vec<String> = if marked.is_empty() {
-        text.lines()
-            .filter_map(|line| {
-                let rest = line.trim().strip_prefix("test ")?;
-                rest.strip_suffix(" ... FAILED").map(str::to_string)
-            })
-            .collect()
+        libtest_failure_names(text)
     } else {
         marked
     };
     names.sort();
     names.dedup();
-    names.truncate(MAX_FAILING_TESTS);
     names
+}
+
+/// The libtest failure header: `---- name stdout ----`.
+fn libtest_header_name(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("---- ")?
+        .strip_suffix(" stdout ----")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Every failing test name in libtest output, unsorted and possibly repeated.
+fn libtest_failure_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_block = false;
+    let mut block_has_names = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("test ") {
+            if let Some(name) = rest.strip_suffix(" ... FAILED") {
+                names.push(name.to_string());
+            }
+        }
+        if let Some(name) = libtest_header_name(line) {
+            names.push(name.to_string());
+        }
+        if line == "failures:" {
+            in_block = true;
+            block_has_names = false;
+        } else if in_block {
+            if line.starts_with("    ") && !trimmed.is_empty() {
+                block_has_names = true;
+                names.push(trimmed.to_string());
+            } else if !(trimmed.is_empty() && !block_has_names) {
+                in_block = false;
+            }
+        }
+    }
+    names
+}
+
+const SUMMARY_LINE_BYTES: usize = 300;
+const SUMMARY_BYTES: usize = 2048;
+
+fn clip_line(line: &str) -> String {
+    let line = line.trim();
+    if line.len() <= SUMMARY_LINE_BYTES {
+        return line.to_string();
+    }
+    let mut end = SUMMARY_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
+}
+
+/// A short libtest failures summary: the failing names, the first panic or
+/// `Error:` line of each failing test and the `test result:` line. `None`
+/// when the output holds no libtest failure.
+fn libtest_failure_summary(text: &str) -> Option<String> {
+    let names = failing_tests(text);
+    if names.is_empty() {
+        return None;
+    }
+    let mut summary = format!("failing tests: {}", names.join(", "));
+    let mut current: Option<&str> = None;
+    let mut found = false;
+    let mut result_line = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = libtest_header_name(line) {
+            current = Some(name);
+            found = false;
+            continue;
+        }
+        if trimmed.starts_with("test result: FAILED") {
+            result_line = Some(clip_line(trimmed));
+        }
+        let Some(name) = current else { continue };
+        if found {
+            continue;
+        }
+        if trimmed.contains("panicked at") || trimmed.starts_with("Error: ") {
+            found = true;
+            let evidence = format!("\n[{name}] {}", clip_line(trimmed));
+            if summary.len() + evidence.len() <= SUMMARY_BYTES {
+                summary.push_str(&evidence);
+            }
+        }
+    }
+    if let Some(result) = result_line {
+        summary.push('\n');
+        summary.push_str(&result);
+    }
+    Some(summary)
+}
+
+/// `text` without cargo/rustc `warning` blocks (a `warning:` line through the
+/// next blank line), so a refusal's detail is not filled with compiler noise.
+fn without_cargo_warnings(text: &str) -> String {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        if line.starts_with("warning:") || line.starts_with("warning[") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // A block ends at a blank line or at the first line that is not a
+            // continuation (indented, a source gutter, `...`, `note:`/`help:`):
+            // the one-line `warning: `x` generated N warnings` summary has no
+            // blank line after it.
+            let continues = line.starts_with(char::is_whitespace)
+                || line.starts_with('.')
+                || line.starts_with(|ch: char| ch.is_ascii_digit())
+                || line.starts_with("note:")
+                || line.starts_with("help:");
+            if line.trim().is_empty() {
+                skipping = false;
+                continue;
+            }
+            if continues {
+                continue;
+            }
+            skipping = false;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
 }
 
 /// Map one lander exit (`exit`, stdout evidence lines, stderr message) to a
@@ -1437,14 +3319,27 @@ pub(crate) fn classify_run(
         state: RollingQueueEntryState::Published,
         outcome: RollingQueueOutcome {
             landed_sha: Some(sha),
-            detail: timing.clone(),
+            detail: if line_value(stdout, "landing_outcome") == Some("already_on_rolling") {
+                Some(match &timing {
+                    Some(timing) => format!("already_on_rolling; {timing}"),
+                    None => "already_on_rolling".into(),
+                })
+            } else {
+                timing.clone()
+            },
             ..RollingQueueOutcome::default()
         },
     };
-    let detail = match (Some(tail(stderr)).filter(|text| !text.is_empty()), &timing) {
-        (Some(text), Some(timing)) => Some(format!("{timing}\n{text}")),
-        (Some(text), None) => Some(text),
-        (None, timing) => timing.clone(),
+    // The libtest failures summary leads the detail, then the stderr tail with
+    // cargo warnings dropped (#1831).
+    let summary = libtest_failure_summary(&format!("{stdout}\n{stderr}"));
+    let stderr_text = Some(tail(&without_cargo_warnings(stderr))).filter(|text| !text.is_empty());
+    let detail = {
+        let parts: Vec<String> = [summary, stderr_text, timing.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     };
     let refuse = |code: &str, state: RollingQueueEntryState| RunResult {
         state,
@@ -1499,6 +3394,16 @@ pub(crate) fn classify_run(
             RollingQueueEntryState::Refused,
         );
     }
+    // #2167: a claimed fix whose tests are still red (or never ran).
+    if stderr.contains(&format!("{QUEUE_CLAIMED_FIX_STILL_RED}: ")) {
+        return refuse(QUEUE_CLAIMED_FIX_STILL_RED, RollingQueueEntryState::Refused);
+    }
+    if let Some(package) = release_build_failed_crate(stderr) {
+        return refuse(
+            &format!("{QUEUE_RELEASE_BUILD_FAILED}:{package}"),
+            RollingQueueEntryState::Refused,
+        );
+    }
     if exit == Some(8) {
         let fence = line_value(stdout, "policy_fence").unwrap_or("unknown");
         return refuse(
@@ -1507,6 +3412,17 @@ pub(crate) fn classify_run(
         );
     }
     refuse("gate_failed", RollingQueueEntryState::Refused)
+}
+
+/// The crate named by the lander's `release_build_failed:<crate>` refusal
+/// (#1970), if the gate output carries one.
+pub(crate) fn release_build_failed_crate(stderr: &str) -> Option<&str> {
+    let marker = format!("{QUEUE_RELEASE_BUILD_FAILED}:");
+    let rest = &stderr[stderr.find(&marker)? + marker.len()..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
 }
 
 /// Whether a changed path can alter what the Rust gate builds or tests: any
@@ -1526,6 +3442,13 @@ fn path_affects_rust_gate(path: &str) -> bool {
 /// relative to rolling. Any git failure answers `false`: the member is then
 /// treated as code, so an unknown diff never narrows the gate.
 pub(crate) fn source_is_rust_free(repo: &Path, source: &str) -> bool {
+    if let Some((reference, tree)) = multi_base_merge_tree(repo, source) {
+        return git(
+            repo,
+            &["diff", "--name-only", "--no-renames", &reference, &tree],
+        )
+        .is_some_and(|changed| !changed.lines().any(path_affects_rust_gate));
+    }
     let base = ["origin/rolling", "rolling"].iter().find_map(|reference| {
         git(repo, &["merge-base", source, reference]).map(|out| out.trim().to_string())
     });
@@ -1563,6 +3486,14 @@ pub(crate) fn union_filters(
     union
 }
 
+/// #2167: every member's claimed fixes, first claim first. A batch's gate
+/// must run each green; a bisect step claims only its own members' fixes.
+pub(crate) fn union_fix_claims(entries: &[RollingQueueEntryV1]) -> Vec<String> {
+    entries.iter().fold(Vec::new(), |claims, entry| {
+        rsi_common::rolling_queue::union_fix_claims(&claims, &entry.fixes_tests)
+    })
+}
+
 /// Keep the newest `max` bytes of `text`.
 fn newest_bytes(text: &str, max: usize) -> &str {
     if text.len() <= max {
@@ -1575,7 +3506,8 @@ fn newest_bytes(text: &str, max: usize) -> &str {
     &text[start..]
 }
 
-/// Delete all but the newest `keep` regular files in `dir`.
+/// Keep the newest `keep` runs: each `.log` with its `.timings.tsv` sidecar,
+/// deleted together. Retention of logs is unchanged by the sidecar (#2085).
 fn prune_logs(dir: &Path, keep: usize) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
@@ -1584,12 +3516,14 @@ fn prune_logs(dir: &Path, keep: usize) {
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let meta = entry.metadata().ok()?;
-            meta.is_file().then(|| {
-                (
-                    meta.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    entry.path(),
-                )
-            })
+            (meta.is_file() && entry.path().extension().is_some_and(|ext| ext == "log")).then(
+                || {
+                    (
+                        meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                        entry.path(),
+                    )
+                },
+            )
         })
         .collect();
     if files.len() <= keep {
@@ -1598,14 +3532,35 @@ fn prune_logs(dir: &Path, keep: usize) {
     files.sort();
     let excess = files.len() - keep;
     for (_, path) in files.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path.with_extension("timings.tsv"));
         let _ = std::fs::remove_file(path);
     }
 }
 
 static RUN_LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Write one lander run's output to `<dir>/<batch>-<run>.log` (bounded, the
-/// directory rotated) and return its path. Best effort: `None` on an I/O error.
+/// Reserve `<dir>/<batch>-<run>.log` and its `.timings.tsv` sidecar before the
+/// lander starts (the directory rotated), so the lander can append per-test
+/// durations while it runs. Best effort: `None` on an I/O error.
+fn prepare_run_log(dir: &Path, batch_id: Uuid) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    let seq = RUN_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{batch_id}-{}-{seq}.log",
+        Utc::now().timestamp_millis()
+    ));
+    std::fs::write(&path, "lander running\n").ok()?;
+    // The sidecar is evidence only: a failure to create it never costs the log.
+    let _ = std::fs::write(
+        path.with_extension("timings.tsv"),
+        crate::integration::TEST_TIMINGS_HEADER,
+    );
+    prune_logs(dir, RUN_LOG_KEEP_FILES);
+    Some(path)
+}
+
+/// Reserve and fill one run's log in a single step (tests only).
+#[cfg(test)]
 fn write_run_log(
     dir: &Path,
     batch_id: Uuid,
@@ -1613,20 +3568,23 @@ fn write_run_log(
     stdout: &str,
     stderr: &str,
 ) -> Option<PathBuf> {
-    std::fs::create_dir_all(dir).ok()?;
-    let seq = RUN_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!(
-        "{batch_id}-{}-{seq}.log",
-        Utc::now().timestamp_millis()
-    ));
+    let path = prepare_run_log(dir, batch_id)?;
+    finish_run_log(&path, header, stdout, stderr)
+}
+
+/// Write one lander run's bounded output to its reserved log and return the
+/// path. Best effort: `None` on an I/O error.
+fn finish_run_log(path: &Path, header: &str, stdout: &str, stderr: &str) -> Option<PathBuf> {
     let body = format!(
         "{header}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
         newest_bytes(stdout, RUN_LOG_STREAM_BYTES),
         newest_bytes(stderr, RUN_LOG_STREAM_BYTES),
     );
-    std::fs::write(&path, body).ok()?;
-    prune_logs(dir, RUN_LOG_KEEP_FILES);
-    Some(path)
+    std::fs::write(path, body).ok()?;
+    if let Some(dir) = path.parent() {
+        prune_logs(dir, RUN_LOG_KEEP_FILES);
+    }
+    Some(path.to_path_buf())
 }
 
 /// The conflicting paths a lander conflict message names
@@ -1675,48 +3633,70 @@ async fn run_lander(
     launcher: &LanderLauncher,
     repo: &Path,
     entries: &[RollingQueueEntryV1],
-    regates_left: usize,
     expected_tip: Option<&str>,
     deadline: tokio::time::Instant,
+    timings_path: Option<&Path>,
 ) -> std::result::Result<std::process::Output, LanderError> {
     let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
     if budget.is_zero() {
         return Err(LanderError::TimedOut);
     }
-    let mut command = Command::new(&launcher.binary);
-    command
+    let mut inner = Command::new(&launcher.binary);
+    inner
         .current_dir(repo)
         .arg("--repo")
         .arg(repo)
         .args(["--remote", "origin"]);
     for entry in entries {
-        command.args(["--accepted", &entry.source_commit]);
+        inner.args(["--accepted", &entry.source_commit]);
     }
     for filter in union_filters(entries, |entry| {
         source_is_rust_free(repo, &entry.source_commit)
     }) {
-        command.args(["--test-filter", &filter]);
+        inner.args(["--test-filter", &filter]);
+    }
+    for name in union_fix_claims(entries) {
+        inner.args(["--fixes-test", &name]);
     }
     if let Some(tip) = expected_tip {
         // The tip the queue probed just before this run: a different initial
         // fetch is an out-of-band advance the lander charges as a re-gate.
-        command.args(["--expected-tip", tip]);
+        inner.args(["--expected-tip", tip]);
     }
-    command
-        .env(MAX_REGATES_ENV, regates_left.to_string())
+    if let Some(path) = &launcher.known_failure_snapshot {
+        inner.env("RSI_KNOWN_FAILURES_SNAPSHOT", path);
+    }
+    if let Some(path) = timings_path {
+        inner.env(crate::integration::TEST_TIMINGS_ENV, path);
+    }
+    inner
+        .env(REGATE_BUDGET_ENV, budget.as_secs().to_string())
         .env(EXACT_GATE_ENV, "1")
-        .env_remove("RSI_SESSION_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .env_remove("RSI_SESSION_TOKEN");
     if let Some(target) = launcher.target_dir() {
         // The queue owns its build directory: no per-session environment.
         std::fs::create_dir_all(&target).map_err(|error| {
             LanderError::Unavailable(format!("cannot create the queue target: {error}"))
         })?;
-        command.env("CARGO_TARGET_DIR", target);
+        inner.env("CARGO_TARGET_DIR", target);
     }
+    // #2119: the gate's cargo builds and tests run in the hub build slice, so
+    // they share its CPU budget with the job units. The scope is only used when
+    // the slice could be configured; otherwise the lander runs as before.
+    let mut scope_unit = None;
+    let mut command =
+        if launcher.build_slice && !crate::build_budget::apply("lander").await.is_unavailable() {
+            let (command, unit) = crate::build_budget::lander_scope_command(&inner);
+            scope_unit = Some(unit);
+            command
+        } else {
+            inner
+        };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     // Its own process group, so a timed-out run is stopped with everything it
     // started that stayed in the group. The group is signalled only while the
     // lander is unreaped, so a saved id can never hit a reused group (#1251).
@@ -1724,7 +3704,7 @@ async fn run_lander(
     let child = command
         .spawn()
         .map_err(|error| LanderError::Unavailable(format!("cannot start the lander: {error}")))?;
-    crate::process_control::capture_owned_group(
+    let result = crate::process_control::capture_owned_group(
         child,
         deadline,
         LANDER_SETTLE_LIMITS,
@@ -1736,7 +3716,12 @@ async fn run_lander(
         crate::process_control::OwnedGroupError::Io(error) => {
             LanderError::Unavailable(format!("lander wait failed: {error}"))
         }
-    })
+    });
+    if let (Err(_), Some(unit)) = (&result, scope_unit) {
+        // A descendant that left the lander's group is still in its scope.
+        crate::build_budget::kill_scope(unit).await;
+    }
+    result
 }
 
 /// How long a finished lander's output may stay open (a descendant that left
@@ -1745,6 +3730,7 @@ async fn run_lander(
 const LANDER_SETTLE_LIMITS: crate::process_control::OwnedGroupLimits =
     crate::process_control::OwnedGroupLimits {
         post_exit_drain: Duration::from_secs(10),
+        terminate_grace: Duration::from_secs(2),
         cleanup: Duration::from_secs(5),
     };
 
@@ -1763,9 +3749,6 @@ async fn with_store<T: Send + 'static>(
 struct GroupRun {
     result: RunResult,
     stdout: String,
-    /// Out-of-band re-gates the lander spent in this run (from its
-    /// `stale_retry_N=..:regated` evidence lines).
-    regates_used: usize,
     /// The exact commit this run pushed (the lander's `published_target_id`,
     /// or its forward revert): the only tip the queue may call its own. The
     /// observed remote head in `result.outcome.landed_sha` can be a later
@@ -1793,6 +3776,24 @@ impl GroupRun {
     }
 }
 
+/// Tag the lander's `gate_timing=` line in an outcome detail with the number of
+/// sources the run gated together, so the manager reads the batch size beside
+/// the gate's timing (#1945). A detail without that line is returned unchanged.
+fn note_batch_size(detail: Option<String>, size: usize) -> Option<String> {
+    detail.map(|text| {
+        if !text.lines().any(|line| line.starts_with("gate_timing=")) {
+            return text;
+        }
+        text.lines()
+            .map(|line| match line.starts_with("gate_timing=") {
+                true => format!("{line} batch_size={size}"),
+                false => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
 fn own_published_tip(stdout: &str) -> Option<String> {
     let reverted = line_value(stdout, "forward_revert_status") == Some("published");
     let revert = line_value(stdout, "forward_revert_id").filter(|_| reverted);
@@ -1802,34 +3803,50 @@ fn own_published_tip(stdout: &str) -> Option<String> {
         .filter(|tip| !tip.is_empty())
 }
 
-fn regates_used(stdout: &str) -> usize {
-    stdout
-        .lines()
-        .filter(|line| line.starts_with("stale_retry_") && line.ends_with(":regated"))
-        .count()
-}
-
 async fn run_group(
+    store: &Arc<tokio::sync::Mutex<Store>>,
     launcher: &LanderLauncher,
     batch_id: Uuid,
     repo: &Path,
     entries: &[RollingQueueEntryV1],
-    regates_left: usize,
     expected_tip: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> GroupRun {
+    let snapshot_diagnostic = if let Some(path) = launcher.known_failure_snapshot.clone() {
+        with_store(store, move |store| {
+            Ok(known_failure_snapshot::refresh_if_needed(
+                &path,
+                store,
+                Utc::now(),
+            ))
+        })
+        .await
+        .unwrap_or_else(|error| format!("known_failures=refresh_failed:{error}\n"))
+    } else {
+        String::new()
+    };
+    let log_path = launcher
+        .log_dir()
+        .and_then(|dir| prepare_run_log(&dir, batch_id));
+    let timings_path = log_path
+        .as_ref()
+        .map(|path| path.with_extension("timings.tsv"))
+        .filter(|path| path.is_file());
     match run_lander(
         launcher,
         repo,
         entries,
-        regates_left,
         expected_tip,
         deadline,
+        timings_path.as_deref(),
     )
     .await
     {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stdout = format!(
+                "{snapshot_diagnostic}{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let already_integrated =
                 output.status.code() != Some(0) && stderr.contains(ALREADY_INTEGRATED_MARKER);
@@ -1851,9 +3868,10 @@ async fn run_group(
                 None
             };
             let mut result = classify_run(output.status.code(), &stdout, &stderr, || landed);
-            let log_path = launcher.log_dir().and_then(|dir| {
+            result.outcome.detail = note_batch_size(result.outcome.detail.take(), entries.len());
+            let log_path = log_path.and_then(|path| {
                 let header = format!(
-                    "lander exit={:?} sources={}",
+                    "lander exit={:?} sources={}\n{snapshot_diagnostic}",
                     output.status.code(),
                     entries
                         .iter()
@@ -1861,8 +3879,23 @@ async fn run_group(
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                write_run_log(&dir, batch_id, &header, &stdout, &stderr)
+                finish_run_log(&path, &header, &stdout, &stderr)
             });
+            // #2705: a gate that failed reports the base reds it observed too.
+            // (A published run files them in `publish_group_with`, once its
+            // sources are verified.)
+            if result.state != RollingQueueEntryState::Published {
+                let lines = gate_base_red::file_base_reds(
+                    store,
+                    batch_id,
+                    entries,
+                    &stdout,
+                    log_path.as_deref(),
+                )
+                .await;
+                result.outcome.detail =
+                    gate_base_red::with_issue_lines(result.outcome.detail.take(), &lines);
+            }
             let cause = run_cause(&result, &stderr);
             if let Some(path) = &log_path {
                 let line = format!("lander_log={}", path.display());
@@ -1871,16 +3904,11 @@ async fn run_group(
                     None => line,
                 });
             }
-            let mut regates_used = regates_used(&stdout);
-            if result.outcome.refusal.as_deref() == Some(QUEUE_REGATE_EXHAUSTED) {
-                regates_used = regates_used.max(regates_left);
-            }
             let own_tip = own_published_tip(&stdout);
             let conflict_source = conflict_source(&stderr);
             GroupRun {
                 result,
                 stdout,
-                regates_used,
                 own_tip,
                 conflict_source,
                 log_path,
@@ -1891,10 +3919,16 @@ async fn run_group(
         Err(LanderError::TimedOut) => GroupRun {
             result: gate_timeout_result(launcher),
             stdout: String::new(),
-            regates_used: 0,
             own_tip: None,
             conflict_source: None,
-            log_path: None,
+            log_path: log_path.and_then(|path| {
+                finish_run_log(
+                    &path,
+                    QUEUE_GATE_TIMEOUT,
+                    "",
+                    "lander stopped at gate wall-time budget",
+                )
+            }),
             cause: Some(QUEUE_GATE_TIMEOUT.into()),
             already_integrated: false,
         },
@@ -1908,10 +3942,16 @@ async fn run_group(
                 },
             },
             stdout: String::new(),
-            regates_used: 0,
             own_tip: None,
             conflict_source: None,
-            log_path: None,
+            log_path: log_path.and_then(|path| {
+                finish_run_log(
+                    &path,
+                    "lander_unavailable",
+                    "",
+                    "lander could not start or be supervised",
+                )
+            }),
             cause: Some("lander_unavailable".into()),
             already_integrated: false,
         },
@@ -2016,6 +4056,75 @@ async fn settle_already_landed(
     Ok((kept, observed))
 }
 
+/// Refuse the members of a batch that came from several checkouts whose commit
+/// the queue checkout cannot read, returning the readable rest in queue order.
+/// Members of one repository share its object store, so a commit missing here is
+/// missing everywhere (its sandbox was reclaimed and the commit pruned): there
+/// is nothing to fetch, and the member is settled `queue_source_unreachable`
+/// with the checkout it was queued from instead of failing the whole batch's
+/// lander run (#1945). A batch from one checkout is left to the lander.
+async fn settle_unreachable_sources(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    repo: &Path,
+    batch_id: Uuid,
+    members: Vec<RollingQueueEntryV1>,
+    checkouts: &HashMap<Uuid, String>,
+    settled: &mut Vec<(Uuid, RunResult)>,
+) -> Result<Vec<RollingQueueEntryV1>> {
+    let mut distinct: Vec<&String> = checkouts.values().collect();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return Ok(members);
+    }
+    let probe_repo = repo.to_path_buf();
+    let sources: Vec<String> = members.iter().map(|m| m.source_commit.clone()).collect();
+    let present = tokio::task::spawn_blocking(move || {
+        sources
+            .iter()
+            .map(|source| source_commit_exists(&probe_repo, source))
+            .collect::<Vec<bool>>()
+    })
+    .await
+    .map_err(|error| DaemonError::Process(format!("source reachability probe: {error}")))?;
+    let mut kept = Vec::new();
+    let mut refused = Vec::new();
+    for (entry, present) in members.into_iter().zip(present) {
+        if present {
+            kept.push(entry);
+            continue;
+        }
+        let checkout = checkouts.get(&entry.id).cloned().unwrap_or_default();
+        bisect_event(
+            store,
+            batch_id,
+            "source_unreachable",
+            Some(entry.id),
+            serde_json::json!({ "source": entry.source_commit, "checkout": checkout }),
+        )
+        .await?;
+        refused.push((
+            entry.id,
+            RunResult {
+                state: RollingQueueEntryState::Refused,
+                outcome: RollingQueueOutcome {
+                    refusal: Some(QUEUE_SOURCE_UNREACHABLE.to_string()),
+                    detail: Some(format!(
+                        "{} (queued from {checkout}) is not in the repository's object \
+                         store; its sandbox was probably reclaimed: re-enqueue from a \
+                         live checkout",
+                        entry.source_commit
+                    )),
+                    ..RollingQueueOutcome::default()
+                },
+            },
+        ));
+    }
+    settle_group(store, &refused).await?;
+    settled.extend(refused);
+    Ok(kept)
+}
+
 /// Settle `members` after the batch's gate wall-time budget ran out: a member
 /// that landed meanwhile is published, every other one is refused with
 /// `queue_gate_timeout` (#1208).
@@ -2086,11 +4195,113 @@ fn as_batch_result(mut result: RunResult) -> RunResult {
 /// and settles every member with its typed refusal; a merge conflict is
 /// attributed by the lander (`take_conflict_culprit`), not by bisecting.
 fn is_bisectable(result: &RunResult) -> bool {
+    let release_prefix = format!("{QUEUE_RELEASE_BUILD_FAILED}:");
     result.state == RollingQueueEntryState::Refused
-        && matches!(
-            result.outcome.refusal.as_deref(),
-            Some("gate_failed" | QUEUE_FILTER_MATCHES_NO_TESTS)
-        )
+        && result.outcome.refusal.as_deref().is_some_and(|code| {
+            matches!(
+                code,
+                "gate_failed" | QUEUE_FILTER_MATCHES_NO_TESTS | QUEUE_CLAIMED_FIX_STILL_RED
+            ) || code.starts_with(&release_prefix)
+        })
+}
+
+/// Source files a red gate's output points at: rustc `--> path:line:col`
+/// locations and `panicked at path:line:col` sites.
+fn failure_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let located = line
+            .strip_prefix("--> ")
+            .or_else(|| line.split_once("panicked at ").map(|(_, rest)| rest));
+        let Some(rest) = located else { continue };
+        let path = rest.split(':').next().unwrap_or("").trim();
+        let path = path.strip_prefix("./").unwrap_or(path);
+        if !path.is_empty() {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// Files `source` changes relative to the tip it would land on.
+fn member_changed_files(repo: &Path, base: &str, source: &str) -> HashSet<String> {
+    git(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            &format!("{base}...{source}"),
+        ],
+    )
+    .map(|out| out.lines().map(str::to_string).collect())
+    .unwrap_or_default()
+}
+
+/// The one member a red gate is attributable to, by index into `members`
+/// (#1974): the failure names a file (a compile error or panic location) or a
+/// test module (a failing test's path component matches a changed `.rs` file's
+/// stem) that exactly one member changes. `None` when the output names nothing a
+/// member changes, or names files more than one member changes: only bisecting
+/// can tell those apart.
+fn attributable_member(
+    files: &[HashSet<String>],
+    text: &str,
+    failing_tests: &[String],
+) -> Option<usize> {
+    let named = failure_paths(text);
+    let modules: HashSet<&str> = failing_tests
+        .iter()
+        .flat_map(|name| name.split("::"))
+        .filter(|part| !matches!(*part, "tests" | "test" | "mod" | "lib" | "main"))
+        .collect();
+    let hits = |changed: &HashSet<String>| {
+        changed.iter().any(|path| {
+            named.contains(path)
+                || (path.ends_with(".rs")
+                    && Path::new(path)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| {
+                            !matches!(stem, "tests" | "test" | "mod" | "lib" | "main")
+                                && modules.contains(stem)
+                        }))
+        })
+    };
+    let mut culprits = files
+        .iter()
+        .enumerate()
+        .filter(|(_, changed)| hits(changed))
+        .map(|(index, _)| index);
+    let first = culprits.next()?;
+    culprits.next().is_none().then_some(first)
+}
+
+/// Tag a result's `gate_timing=` line with the bisect rounds run so far and why
+/// this member ended as it did (`outcome_reason`), adding the line when the
+/// lander printed none (#1974).
+fn note_bisect_outcome(result: &RunResult, rounds: usize, reason: &str) -> RunResult {
+    let mut tagged = result.clone();
+    let fields = format!("bisect_rounds={rounds} outcome_reason={reason}");
+    let detail = tagged.outcome.detail.take().unwrap_or_default();
+    let mut found = false;
+    let mut lines: Vec<String> = detail
+        .lines()
+        .map(|line| {
+            if line.starts_with("gate_timing=") && !found {
+                found = true;
+                format!("{line} {fields}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        lines.insert(0, format!("gate_timing={fields}"));
+    }
+    tagged.outcome.detail = Some(lines.join("\n"));
+    tagged
 }
 
 async fn settle(
@@ -2124,22 +4335,89 @@ async fn settle_group(
     Ok(())
 }
 
+/// What one `git merge-base --is-ancestor` probe established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Ancestry {
+    Ancestor,
+    /// git ran to completion and answered "no" (exit 1): a definite negative.
+    NotAncestor,
+    /// git was killed (daemon shutdown SIGKILL, #2595), could not start or
+    /// failed with an error: no verdict at all, never a negative one.
+    Unknown,
+}
+
+/// Classify the exit of an `--is-ancestor` probe: only exit 0 (yes) and exit 1
+/// (no) are verdicts; a signal death or any other status says nothing.
+fn classify_ancestry(status: std::io::Result<std::process::ExitStatus>) -> Ancestry {
+    match status.map(|status| status.code()) {
+        Ok(Some(0)) => Ancestry::Ancestor,
+        Ok(Some(1)) => Ancestry::NotAncestor,
+        _ => Ancestry::Unknown,
+    }
+}
+
+fn probe_ancestry(repo: &Path, source: &str) -> Ancestry {
+    classify_ancestry(
+        git_command()
+            .arg("-C")
+            .arg(repo)
+            .args(["merge-base", "--is-ancestor", source, "origin/rolling"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+}
+
+/// Attempts at an ancestry verdict, each after a fresh fetch: a source that is
+/// not (yet) seen as an ancestor is re-checked against the re-fetched remote
+/// tip before the queue fails it (#2595).
+const ANCESTRY_ATTEMPTS: usize = 2;
+
 /// Ancestry of each source in the published tip: after one fetch, a source is
 /// verified only when it is an ancestor of `origin/rolling`. Migration
 /// evidence in the lander's report never substitutes for the probe: the
 /// provisional commit the lander writes keeps the original source as a parent.
-fn verify_ancestry(repo: &Path, sources: &[String]) -> Vec<bool> {
-    let _ = fetch_rolling(repo);
-    sources
-        .iter()
-        .map(|source| {
-            git(
-                repo,
-                &["merge-base", "--is-ancestor", source, "origin/rolling"],
-            )
-            .is_some()
-        })
-        .collect()
+/// A source that is not an ancestor is re-checked after a re-fetch; a probe
+/// that never produced a verdict stays [`Ancestry::Unknown`].
+fn verify_ancestry(repo: &Path, sources: &[String]) -> Vec<Ancestry> {
+    verify_ancestry_with(
+        sources,
+        ANCESTRY_ATTEMPTS,
+        |source| probe_ancestry(repo, source),
+        || fetch_rolling(repo).is_ok(),
+    )
+}
+
+/// `refetch` reports whether the remote ref was refreshed. When it was not,
+/// `origin/rolling` may be stale: a positive answer still holds (history only
+/// grows), but a "no" proves nothing about the real tip and is recorded as
+/// [`Ancestry::Unknown`], never a verified negative (#2599). A definite
+/// negative an earlier, successfully refreshed attempt produced is kept.
+fn verify_ancestry_with(
+    sources: &[String],
+    attempts: usize,
+    probe: impl Fn(&str) -> Ancestry,
+    refetch: impl Fn() -> bool,
+) -> Vec<Ancestry> {
+    let mut verdicts = vec![Ancestry::Unknown; sources.len()];
+    for _ in 0..attempts.max(1) {
+        let fresh = refetch();
+        for (verdict, source) in verdicts.iter_mut().zip(sources) {
+            if *verdict == Ancestry::Ancestor {
+                continue;
+            }
+            let probed = probe(source);
+            if fresh || probed == Ancestry::Ancestor {
+                *verdict = probed;
+            }
+        }
+        if verdicts.iter().all(|v| *v == Ancestry::Ancestor) {
+            break;
+        }
+    }
+    verdicts
 }
 
 /// `(source, final_version)` per provisional migration the lander renumbered.
@@ -2230,6 +4508,7 @@ async fn order_migrations(
 
 /// Claim the FIFO head, run it and settle it. `Ok(None)` when nothing was
 /// runnable (empty queue or another entry is gating).
+#[cfg(test)]
 pub(crate) async fn run_next(
     store: &Arc<tokio::sync::Mutex<Store>>,
     launcher: &LanderLauncher,
@@ -2240,24 +4519,35 @@ pub(crate) async fn run_next(
 /// Claim up to `batch_size` ready sources in FIFO order, gate them once as one
 /// candidate, publish with one fast-forward and settle every member exactly
 /// once. Empty when nothing was runnable.
+#[cfg(test)]
 pub(crate) async fn run_next_batch(
     store: &Arc<tokio::sync::Mutex<Store>>,
     launcher: &LanderLauncher,
     batch_size: usize,
 ) -> Result<Vec<(Uuid, RunResult)>> {
     let size = batch_size.clamp(1, ROLLING_QUEUE_MAX_BATCH_SIZE as usize);
-    let Some(claimed) = with_store(store, move |s| {
-        s.claim_rolling_queue_batch(Utc::now(), size)
-    })
-    .await?
-    else {
+    let Some(claimed) = claim_batch(store, size).await? else {
         return Ok(Vec::new());
     };
+    run_claimed_batch(store, launcher, claimed).await
+}
+
+/// Gate, publish and settle a batch the store already claimed.
+pub(crate) async fn run_claimed_batch(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    launcher: &LanderLauncher,
+    claimed: ClaimedQueueBatch,
+) -> Result<Vec<(Uuid, RunResult)>> {
     let batch_id = claimed.batch_id;
     let deadline = tokio::time::Instant::now() + launcher.gate_timeout;
     let mut settled = Vec::new();
     let mut members = claimed.entries;
-    let repo = match queue_repo(launcher, &claimed.repo_path).await {
+    let checkouts: HashMap<Uuid, String> = members
+        .iter()
+        .map(|entry| entry.id)
+        .zip(claimed.repo_paths.iter().cloned())
+        .collect();
+    let repo = match queue_repo_for_batch(launcher, &claimed.repo_paths).await {
         Ok(repo) => repo,
         Err(message) => {
             let result = RunResult {
@@ -2277,6 +4567,25 @@ pub(crate) async fn run_next_batch(
             return Ok(settled);
         }
     };
+    if members.len() > 1 {
+        let mut distinct: Vec<&String> = checkouts.values().collect();
+        distinct.sort();
+        distinct.dedup();
+        bisect_event(
+            store,
+            batch_id,
+            "batch_formed",
+            None,
+            serde_json::json!({
+                "members": members.len(),
+                "checkouts": distinct.len(),
+                "queue_checkout": repo.display().to_string(),
+            }),
+        )
+        .await?;
+    }
+    members = settle_unreachable_sources(store, &repo, batch_id, members, &checkouts, &mut settled)
+        .await?;
     // A member already on rolling (landed outside the queue) is published
     // as is, never gated (#1208).
     (members, _) = settle_already_landed(store, &repo, batch_id, members, &mut settled).await?;
@@ -2286,16 +4595,7 @@ pub(crate) async fn run_next_batch(
     if members.is_empty() {
         return Ok(settled);
     }
-    let mut run = run_group(
-        launcher,
-        batch_id,
-        &repo,
-        &members,
-        MAX_REGATES,
-        None,
-        deadline,
-    )
-    .await;
+    let mut run = run_group(store, launcher, batch_id, &repo, &members, None, deadline).await;
     loop {
         if let Some(culprit) = take_conflict_culprit(&mut members, &run) {
             // An integration conflict belongs to one member: refuse that entry
@@ -2326,23 +4626,13 @@ pub(crate) async fn run_next_batch(
         } else {
             break;
         }
-        run = run_group(
-            launcher,
-            batch_id,
-            &repo,
-            &members,
-            MAX_REGATES,
-            None,
-            deadline,
-        )
-        .await;
+        run = run_group(store, launcher, batch_id, &repo, &members, None, deadline).await;
     }
     if is_gate_timeout(&run.result) {
         settle_timed_out(store, &repo, batch_id, members, &run.result, &mut settled).await?;
         return Ok(settled);
     }
     let in_batch = members.len() > 1;
-    let regates_left = MAX_REGATES.saturating_sub(run.regates_used);
     let result = if in_batch {
         as_batch_result(run.result.clone())
     } else {
@@ -2373,6 +4663,57 @@ pub(crate) async fn run_next_batch(
             Some(tip) => Some(tip.to_string()),
             None => probe_tip(&repo).await,
         };
+        // A failure that names files only one member changes is that member's
+        // alone: refuse it and gate the rest as one batch, no bisecting (#1974).
+        let evidence_text = format!(
+            "{}\n{}",
+            result.outcome.detail.as_deref().unwrap_or_default(),
+            run.stdout
+        );
+        let base_ref = first_base
+            .clone()
+            .unwrap_or_else(|| "origin/rolling".into());
+        let (probe_repo, sources) = (
+            repo.clone(),
+            members
+                .iter()
+                .map(|m| m.source_commit.clone())
+                .collect::<Vec<_>>(),
+        );
+        let files = tokio::task::spawn_blocking(move || {
+            sources
+                .iter()
+                .map(|source| member_changed_files(&probe_repo, &base_ref, source))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("member diff probe: {error}")))?;
+        let mut known_red = true;
+        let mut attributed = None;
+        if let Some(index) =
+            attributable_member(&files, &evidence_text, &result.outcome.failing_tests)
+        {
+            known_red = false;
+            let culprit = members.remove(index);
+            bisect_event(
+                store,
+                batch_id,
+                "bisect_attributed",
+                Some(culprit.id),
+                run.evidence(),
+            )
+            .await?;
+            if members.is_empty() {
+                // A batch of one: its red is the member's own.
+                let refused = note_bisect_outcome(&result, 0, "attributed_directly");
+                settle(store, culprit.id, &refused).await?;
+                settled.push((culprit.id, refused));
+                return Ok(settled);
+            }
+            // Held back, not refused: the complement's gate is the evidence
+            // that confirms or rejects the attribution.
+            attributed = Some(culprit);
+        }
         bisect_batch(
             store,
             launcher,
@@ -2381,7 +4722,8 @@ pub(crate) async fn run_next_batch(
             members,
             result,
             first_base,
-            regates_left,
+            known_red,
+            attributed,
             deadline,
             &mut settled,
         )
@@ -2410,20 +4752,62 @@ async fn publish_group(
     result: &RunResult,
     settled: &mut Vec<(Uuid, RunResult)>,
 ) -> Result<()> {
+    publish_group_with(
+        store,
+        repo,
+        batch_id,
+        group,
+        run,
+        result,
+        settled,
+        verify_ancestry,
+    )
+    .await
+}
+
+/// [`publish_group`] with the ancestry probe injected (tests).
+///
+/// A member whose probe produced no verdict ([`Ancestry::Unknown`]: git killed
+/// by a daemon shutdown, #2595) is left `gating` and not settled: the publish
+/// already happened, so restart reconcile re-checks it against the remote tip
+/// and settles it `published`. Only a definite "not an ancestor" fails it.
+#[allow(clippy::too_many_arguments)]
+async fn publish_group_with(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    repo: &Path,
+    batch_id: Uuid,
+    group: &[RollingQueueEntryV1],
+    run: &GroupRun,
+    result: &RunResult,
+    settled: &mut Vec<(Uuid, RunResult)>,
+    verify: fn(&Path, &[String]) -> Vec<Ancestry>,
+) -> Result<()> {
     let tip = result.outcome.landed_sha.clone();
     let sources: Vec<String> = group.iter().map(|m| m.source_commit.clone()).collect();
     let probe_repo = repo.to_path_buf();
-    let probe_sources = sources.clone();
-    let verified =
-        tokio::task::spawn_blocking(move || verify_ancestry(&probe_repo, &probe_sources))
-            .await
-            .map_err(|error| DaemonError::Process(format!("ancestry probe: {error}")))?;
+    // For a content-equivalent no-op the source need not be an ancestor: the
+    // lander checked its merged tree against this containing tip. Verify that
+    // tip is on fresh rolling rather than rejecting the equivalent content.
+    let already_on_rolling =
+        line_value(&run.stdout, "landing_outcome") == Some("already_on_rolling");
+    let probe_sources = if already_on_rolling {
+        tip.iter().cloned().collect()
+    } else {
+        sources.clone()
+    };
+    let mut verified = tokio::task::spawn_blocking(move || verify(&probe_repo, &probe_sources))
+        .await
+        .map_err(|error| DaemonError::Process(format!("ancestry probe: {error}")))?;
+    if already_on_rolling {
+        verified = vec![verified.first().copied().unwrap_or(Ancestry::Unknown); group.len()];
+    }
     let base = line_value(&run.stdout, "fetched_target_id").map(str::to_string);
     let candidate = line_value(&run.stdout, "candidate_id").map(str::to_string);
     let summary = serde_json::json!({
         "sources": sources,
         "published": tip,
         "verified": verified,
+        "already_on_rolling": already_on_rolling,
     });
     with_store(store, move |s| {
         s.record_rolling_queue_batch_gate(batch_id, base.as_deref(), candidate.as_deref(), &summary)
@@ -2449,9 +4833,22 @@ async fn publish_group(
         .await?;
     }
     let versions = migration_evidence(&run.stdout);
+    // #2698: a base red nothing owns reaches the manager as one qa Issue, and
+    // the outcome (so the owner's wake) names it.
+    let base_red_lines =
+        gate_base_red::file_base_reds(store, batch_id, group, &run.stdout, run.log_path.as_deref())
+            .await;
     let mut member_results = Vec::with_capacity(group.len());
-    for (entry, ok) in group.iter().zip(verified) {
-        let member_result = if ok {
+    for (entry, verdict) in group.iter().zip(verified) {
+        if verdict == Ancestry::Unknown {
+            tracing::warn!(
+                source = %entry.source_commit,
+                entry = %entry.id,
+                "ancestry probe produced no verdict; leaving the entry gating for restart reconcile"
+            );
+            continue;
+        }
+        let member_result = if verdict == Ancestry::Ancestor {
             if let Some((_, version)) = versions
                 .iter()
                 .find(|(source, _)| *source == entry.source_commit)
@@ -2472,7 +4869,10 @@ async fn publish_group(
                 })
                 .await?;
             }
-            result.clone()
+            let mut named = result.clone();
+            named.outcome.detail =
+                gate_base_red::with_issue_lines(named.outcome.detail.take(), &base_red_lines);
+            named
         } else {
             RunResult {
                 state: RollingQueueEntryState::Failed,
@@ -2489,6 +4889,20 @@ async fn publish_group(
         };
         member_results.push((entry.id, member_result));
     }
+    // #2112: land on compile plus the touched tests, run the full suite
+    // asynchronously. Recorded before settlement so a crash keeps it.
+    let derived = bounded_qa::derived_filter_members(group);
+    let obliged: Vec<Uuid> = member_results
+        .iter()
+        .filter(|(id, r)| r.state == RollingQueueEntryState::Published && derived.contains(id))
+        .map(|(id, _)| *id)
+        .collect();
+    if !obliged.is_empty() {
+        with_store(store, move |s| {
+            s.oblige_bounded_qa(batch_id, &obliged, "derived_filters", Utc::now())
+        })
+        .await?;
+    }
     settle_group(store, &member_results).await?;
     settled.extend(member_results);
     Ok(())
@@ -2497,6 +4911,11 @@ async fn publish_group(
 /// `origin/rolling` after one fetch (`None` when git cannot say).
 fn fetch_tip(repo: &Path) -> Option<String> {
     let _ = fetch_rolling(repo);
+    read_origin_tip(repo)
+}
+
+/// The locally cached `origin/rolling` commit (no fetch).
+fn read_origin_tip(repo: &Path) -> Option<String> {
     git(repo, &["rev-parse", "--verify", "origin/rolling^{commit}"])
         .map(|tip| tip.trim().to_string())
         .filter(|tip| !tip.is_empty())
@@ -2603,9 +5022,10 @@ fn run_base(stdout: &str, probed: Option<&String>) -> Option<String> {
 /// the remaining window would publish onto is not that base (an external push
 /// landed, or a prefix was gated on a different tip), the old red is stale and
 /// the window is gated again instead of refused. `expected_tip` follows the
-/// queue's own pushes; any other advance is external and spends the batch's one
-/// out-of-band re-gate (`regates_left`, carried across every run). A second
-/// external advance settles the rest with `queue_out_of_band_regate_exhausted`.
+/// queue's own pushes; any other advance is external and is re-gated within the
+/// batch's wall-time budget (#1940: the lander re-runs only what the advance
+/// overlaps, and the `deadline` settles whatever the budget cannot finish with
+/// `queue_gate_timeout`), however many external advances there are.
 /// Every step shrinks the window or the pending list;
 /// `queue_bisect_no_progress` settles the rest if that ever fails to hold.
 async fn bisect_batch(
@@ -2616,19 +5036,74 @@ async fn bisect_batch(
     members: Vec<RollingQueueEntryV1>,
     first_red: RunResult,
     first_base: Option<String>,
-    mut regates_left: usize,
+    known_red: bool,
+    mut attributed: Option<RollingQueueEntryV1>,
     deadline: tokio::time::Instant,
     settled: &mut Vec<(Uuid, RunResult)>,
 ) -> Result<()> {
     let mut pending = members;
-    let mut window: Option<usize> = Some(pending.len());
+    // `known_red`: `pending` as a whole is the red candidate the first red
+    // observed. With an `attributed` member held back it is not, and the
+    // complement is gated whole first: green confirms the attribution (the
+    // member is necessary for the failure), red rejects it and the halving
+    // bisect runs over the complement with the member still in play (#1974).
+    let mut complement_green = false;
+    let mut attribution_rejected = false;
+    let published_reason = |rejected: bool| {
+        if rejected {
+            "attribution_rejected"
+        } else {
+            "published_after_bisect"
+        }
+    };
+    // The base the attributing red was observed on: the complement confirms
+    // the attribution only when it gated on this very base (#2023).
+    let attribution_base = first_base.clone();
+    let mut window: Option<usize> = known_red.then_some(pending.len());
+    let mut rounds = 0usize;
     let mut evidence = first_red;
     let mut red_base = first_base.clone();
     let mut expected_tip = first_base;
-    let mut budget = pending.len() * 4 + 4;
-    while !pending.is_empty() {
+    let mut budget = (pending.len() + usize::from(attributed.is_some())) * 4 + 4;
+    loop {
+        if pending.is_empty() {
+            match attributed.take() {
+                Some(entry) if complement_green => {
+                    // The member may have reached rolling while the complement
+                    // gated: it is published as is, never refused (#2024).
+                    let (rest, _) =
+                        settle_already_landed(store, repo, batch_id, vec![entry], settled).await?;
+                    let Some(entry) = rest.into_iter().next() else {
+                        break;
+                    };
+                    bisect_event(
+                        store,
+                        batch_id,
+                        "bisect_attribution_confirmed",
+                        Some(entry.id),
+                        serde_json::json!({ "bisect_rounds": rounds }),
+                    )
+                    .await?;
+                    let refused = note_bisect_outcome(&evidence, rounds, "attributed_confirmed");
+                    settle(store, entry.id, &refused).await?;
+                    settled.push((entry.id, refused));
+                }
+                Some(entry) => {
+                    // The complement never produced a verdict (everything in
+                    // it reached rolling elsewhere): gate the member itself.
+                    pending.push(entry);
+                    window = None;
+                    red_base = None;
+                }
+                None => {}
+            }
+            if pending.is_empty() {
+                break;
+            }
+        }
         let no_progress = budget == 0 || window.is_some_and(|w| w == 0 || w > pending.len());
         if no_progress {
+            pending.extend(attributed.take());
             let result = RunResult {
                 state: RollingQueueEntryState::Refused,
                 outcome: RollingQueueOutcome {
@@ -2672,42 +5147,14 @@ async fn bisect_batch(
                 expected_tip = observed;
             }
             if pending.is_empty() {
-                break;
+                continue;
             }
         }
         let current = probe_tip(repo).await;
         if let Some(current) = current.as_ref() {
             if expected_tip.as_ref().is_some_and(|tip| tip != current) {
-                // Not the queue's own push: an external advance.
-                if regates_left == 0 {
-                    let result = RunResult {
-                        state: RollingQueueEntryState::Refused,
-                        outcome: RollingQueueOutcome {
-                            refusal: Some(QUEUE_REGATE_EXHAUSTED.to_string()),
-                            detail: Some(format!(
-                                "rolling advanced again to {current} outside the queue after the \
-                                 batch's one re-gate"
-                            )),
-                            ..RollingQueueOutcome::default()
-                        },
-                    };
-                    bisect_event(
-                        store,
-                        batch_id,
-                        "regate_exhausted",
-                        None,
-                        serde_json::json!({ "expected": expected_tip, "observed": current }),
-                    )
-                    .await?;
-                    let rest: Vec<(Uuid, RunResult)> = pending
-                        .drain(..)
-                        .map(|entry| (entry.id, result.clone()))
-                        .collect();
-                    settle_group(store, &rest).await?;
-                    settled.extend(rest);
-                    break;
-                }
-                regates_left -= 1;
+                // Not the queue's own push: an external advance. The lander
+                // re-runs what it overlaps, within the batch's remaining time.
                 bisect_event(
                     store,
                     batch_id,
@@ -2744,8 +5191,17 @@ async fn bisect_batch(
                 }),
             )
             .await?;
-            settle(store, entry.id, &evidence).await?;
-            settled.push((entry.id, evidence.clone()));
+            let isolated = note_bisect_outcome(
+                &evidence,
+                rounds,
+                if attribution_rejected {
+                    "attribution_rejected"
+                } else {
+                    "bisect_isolated"
+                },
+            );
+            settle(store, entry.id, &isolated).await?;
+            settled.push((entry.id, isolated));
             window = None;
             red_base = None;
             continue;
@@ -2753,17 +5209,19 @@ async fn bisect_batch(
         let take = window.map_or(pending.len(), |w| w.div_ceil(2));
         let group: Vec<RollingQueueEntryV1> = pending[..take].to_vec();
         record_migration_plan(store, repo, batch_id, &group).await?;
+        rounds += 1;
         let run = run_group(
+            store,
             launcher,
             batch_id,
             repo,
             &group,
-            regates_left,
             expected_tip.as_deref(),
             deadline,
         )
         .await;
         if is_gate_timeout(&run.result) {
+            pending.extend(attributed.take());
             settle_timed_out(store, repo, batch_id, pending, &run.result, settled).await?;
             break;
         }
@@ -2781,9 +5239,11 @@ async fn bisect_batch(
                 continue;
             }
         }
-        regates_left = regates_left.saturating_sub(run.regates_used);
-        let result = as_batch_result(run.result.clone());
+        let mut result = as_batch_result(run.result.clone());
         let base = run_base(&run.stdout, expected_tip.as_ref());
+        if result.state == RollingQueueEntryState::Published {
+            result = note_bisect_outcome(&result, rounds, published_reason(attribution_rejected));
+        }
         let outcome = if result.state == RollingQueueEntryState::Published {
             "green"
         } else if is_bisectable(&result) {
@@ -2799,6 +5259,7 @@ async fn bisect_batch(
             serde_json::json!({
                 "sources": group.iter().map(|e| e.source_commit.clone()).collect::<Vec<_>>(),
                 "window": window,
+                "bisect_rounds": rounds,
                 "outcome": outcome,
                 "base": base,
                 "cause": run.cause,
@@ -2831,6 +5292,29 @@ async fn bisect_batch(
                     )
                     .await?;
                 }
+                if attributed.is_some() {
+                    if exact && attribution_base.is_some() && attribution_base == base {
+                        complement_green = true;
+                    } else {
+                        // The complement gated on another base (an external
+                        // advance) or published an external descendant: the
+                        // attributing red is stale evidence. The member goes
+                        // back to pending and is gated on the current tip.
+                        bisect_event(
+                            store,
+                            batch_id,
+                            "bisect_attribution_stale",
+                            attributed.as_ref().map(|entry| entry.id),
+                            serde_json::json!({
+                                "red_base": attribution_base,
+                                "complement_base": base,
+                            }),
+                        )
+                        .await?;
+                        pending.extend(attributed.take());
+                        complement_green = false;
+                    }
+                }
                 window = if carried {
                     window.map(|w| w - take)
                 } else {
@@ -2847,12 +5331,28 @@ async fn bisect_batch(
                 expected_tip = run.own_tip.clone().or(landed).or(expected_tip);
             }
             "red" => {
+                if let Some(entry) = attributed.take() {
+                    // The complement is red without the attributed member:
+                    // the attribution was wrong. The member stays in play,
+                    // after the complement the red was observed on.
+                    bisect_event(
+                        store,
+                        batch_id,
+                        "bisect_attribution_rejected",
+                        Some(entry.id),
+                        serde_json::json!({ "bisect_rounds": rounds }),
+                    )
+                    .await?;
+                    pending.push(entry);
+                    attribution_rejected = true;
+                }
                 evidence = result;
                 window = Some(take);
                 red_base = base.clone();
                 expected_tip = base.or(expected_tip);
             }
             _ => {
+                pending.extend(attributed.take());
                 let mut rest = group.clone();
                 if let Some(culprit) = take_conflict_culprit(&mut rest, &run) {
                     // Only the conflicting member is refused; the group is
@@ -2938,7 +5438,7 @@ pub(crate) async fn reconcile_gating(
                 }
                 let outcome = RollingQueueOutcome {
                     landed_sha: Some(tip),
-                    detail: Some("settled by restart reconcile after ancestry check".into()),
+                    detail: Some("settled by restart reconcile after ancestry check; selection=unknown reason=publication_recovered_without_gate_receipt".into()),
                     ..RollingQueueOutcome::default()
                 };
                 let woke = with_store(store, move |s| {
@@ -2965,38 +5465,58 @@ pub(crate) async fn reconcile_gating(
 }
 
 /// One queue tick that respects the deploy drain (#1128): while a deploy is
-/// draining no new batch is admitted (queued entries wait; the caller already
-/// finished any running batch, as the loop is sequential), so the deploy's
+/// holding queue admission no new batch is admitted (queued entries wait;
+/// the caller finished any running batch, as the loop is sequential), so the deploy's
 /// `landing_in_progress` quiet-point blocker can clear. The held queue is
 /// reported in `deploy_drain.held`.
+#[cfg(test)]
 pub(crate) async fn run_drain_aware_batch(
     store: &Arc<tokio::sync::Mutex<Store>>,
     launcher: &LanderLauncher,
     size: usize,
     drain: &crate::deploy_drain::DeployDrain,
 ) -> Result<Vec<(Uuid, RunResult)>> {
-    if drain.is_draining() {
-        let queued = with_store(store, |s| {
-            s.list_rolling_queue_entries(Some(RollingQueueEntryState::Queued), 1)
-        })
-        .await?;
-        if drain.hold_queue_admission(!queued.is_empty()) {
-            return Ok(Vec::new());
-        }
-    } else {
-        drain.hold_queue_admission(false);
+    if admission_held(store, drain).await? {
+        return Ok(Vec::new());
     }
     run_next_batch(store, launcher, size).await
 }
 
+/// Whether a deploy holds queue admission (see [`run_drain_aware_batch`]).
+async fn admission_held(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    drain: &crate::deploy_drain::DeployDrain,
+) -> Result<bool> {
+    let queued = with_store(store, |s| {
+        s.list_rolling_queue_entries(Some(RollingQueueEntryState::Queued), 1)
+    })
+    .await?;
+    // #1806: a running batch can outlast the worker-start hold. #2190: the
+    // queue yields at every admission opportunity while a deploy is staged (to
+    // its deadline), so landings cannot starve the drain of its quiet point.
+    Ok(drain.hold_queue_admission(!queued.is_empty()))
+}
+
 /// The daemon task: reconcile once, then run the FIFO head whenever the
-/// operator has the queue enabled.
+/// operator has the queue enabled, and a second batch beside it when their
+/// packages are disjoint (#1224).
 pub async fn run_rolling_queue_loop(
     store: Arc<tokio::sync::Mutex<Store>>,
     config: Arc<RuntimeConfig>,
     launcher: LanderLauncher,
     drain: Arc<crate::deploy_drain::DeployDrain>,
+    host_load: Arc<crate::host_load::HostLoadAdmission>,
 ) {
+    // Independent of the publication loop: a long gate or a paused queue must
+    // not postpone full coverage of earlier bounded landings (#2092).
+    tokio::spawn(bounded_qa::run_loop(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        launcher.clone(),
+        Arc::clone(&drain),
+        host_load,
+    ));
+    resume_pending_filter_derivations(&store).await;
     match reconcile_gating(&store).await {
         Ok((settled, requeued)) if settled + requeued > 0 => {
             tracing::info!(settled, requeued, "rolling queue restart reconcile");
@@ -3007,9 +5527,27 @@ pub async fn run_rolling_queue_loop(
     let mut launcher = launcher;
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // One task per lane (#1224): a batch whose packages are disjoint from the
+    // gating one's gates beside it instead of waiting behind it.
+    let mut lanes: tokio::task::JoinSet<Result<Vec<(Uuid, RunResult)>>> =
+        tokio::task::JoinSet::new();
     loop {
         interval.tick().await;
-        if !config.rolling_queue_enabled.load(Ordering::Relaxed) {
+        resume_pending_filter_derivations(&store).await;
+        while let Some(finished) = lanes.try_join_next() {
+            match finished {
+                Ok(Ok(results)) => {
+                    for (id, result) in results {
+                        tracing::info!(%id, state = result.state.as_str(), "rolling queue entry settled");
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(%error, "rolling queue run deferred"),
+                Err(error) => tracing::error!(%error, "rolling queue lane task failed"),
+            }
+        }
+        if !config.rolling_queue_enabled.load(Ordering::Relaxed)
+            || lanes.len() >= crate::store::rolling_queue::ROLLING_QUEUE_MAX_LANES
+        {
             continue;
         }
         let size = (config.rolling_queue_batch_size.load(Ordering::Relaxed) as usize)
@@ -3018,12 +5556,23 @@ pub async fn run_rolling_queue_loop(
             .rolling_queue_gate_timeout_mins
             .load(Ordering::Relaxed);
         launcher.gate_timeout = Duration::from_secs(u64::from(minutes.max(1)) * 60);
-        match run_drain_aware_batch(&store, &launcher, size, &drain).await {
-            Ok(results) => {
-                for (id, result) in results {
-                    tracing::info!(%id, state = result.state.as_str(), "rolling queue entry settled");
-                }
+        match admission_held(&store, &drain).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "rolling queue run deferred");
+                continue;
             }
+        }
+        match claim_batch_in_lanes(&store, size).await {
+            Ok(Some(claimed)) => {
+                if claimed.parallel_lane {
+                    tracing::info!(batch = %claimed.batch_id, "rolling queue second lane claimed");
+                }
+                let (store, launcher) = (Arc::clone(&store), launcher.clone());
+                lanes.spawn(async move { run_claimed_batch(&store, &launcher, claimed).await });
+            }
+            Ok(None) => {}
             Err(error) => tracing::warn!(%error, "rolling queue run deferred"),
         }
     }
@@ -3034,6 +5583,80 @@ mod tests {
     use super::*;
     use rsi_common::rolling_queue::RollingQueueBinding;
     use std::os::unix::fs::PermissionsExt;
+
+    fn delta_cmd(script: &str) -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn limits(max_bytes: usize, max_paths: usize, deadline: Duration) -> DeltaLimits {
+        DeltaLimits {
+            max_bytes,
+            max_paths,
+            deadline,
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_delta_within_its_limits_is_listed() {
+        let read = read_delta(
+            delta_cmd("printf 'a.md\nb/c.rs\n'"),
+            limits(1024, 10, Duration::from_secs(30)),
+        );
+        assert_eq!(
+            read,
+            DeltaRead::Paths(vec!["a.md".to_owned(), "b/c.rs".to_owned()])
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_failing_diff_is_unreadable_not_empty() {
+        let read = read_delta(
+            delta_cmd("printf 'a.md\n'; exit 3"),
+            limits(1024, 10, Duration::from_secs(30)),
+        );
+        assert_eq!(read, DeltaRead::Unreadable);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_delta_past_the_path_cap_fails_closed_and_stops_the_child() {
+        // An endless listing would block forever if the child were not killed.
+        let read = read_delta(
+            delta_cmd("yes a.md"),
+            limits(usize::MAX, 100, Duration::from_secs(30)),
+        );
+        assert_eq!(read, DeltaRead::TooLarge("path limit"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_delta_past_the_byte_cap_fails_closed() {
+        let read = read_delta(
+            delta_cmd("head -c 100000 /dev/zero | tr '\\0' x"),
+            limits(4096, usize::MAX, Duration::from_secs(30)),
+        );
+        assert_eq!(read, DeltaRead::TooLarge("output limit"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_diff_that_outlives_its_deadline_is_killed_and_fails_closed() {
+        let started = std::time::Instant::now();
+        let read = read_delta(
+            delta_cmd("sleep 30"),
+            limits(1024, 10, Duration::from_millis(200)),
+        );
+        assert_eq!(read, DeltaRead::TooLarge("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
 
     fn ok_run(stdout: &str) -> RunResult {
         classify_run(Some(0), stdout, "", || None)
@@ -3055,10 +5678,18 @@ mod tests {
             "gate_timing=shards=9 base_hits=0 base_runs=9 prebuild_secs=1 wall_secs=1\n{timing}\npublished_target_id=abc123\n"
         ));
         assert_eq!(published.outcome.detail.as_deref(), Some(timing));
-        let refused = classify_run(Some(1), &format!("{timing}\n"), "gate red", || None);
-        assert_eq!(
-            refused.outcome.detail.as_deref(),
-            Some(format!("{timing}\ngate red").as_str())
+        // Even a verbose timing record must not hide the decisive reason
+        // when an operator surface clips the detail to 256 characters.
+        let verbose_timing = format!("{timing} shards={}", "x".repeat(300));
+        let refused = classify_run(Some(1), &format!("{verbose_timing}\n"), "gate red", || None);
+        let detail = refused.outcome.detail.as_deref().unwrap();
+        assert_eq!(detail, format!("gate red\n{verbose_timing}"));
+        assert!(
+            detail
+                .chars()
+                .take(256)
+                .collect::<String>()
+                .starts_with("gate red\n")
         );
     }
 
@@ -3087,6 +5718,97 @@ mod tests {
         assert_eq!(gate.outcome.failing_tests, vec!["rolling_queue::red"]);
     }
 
+    const CARGO_WARNINGS: &str = "warning: unused variable: `x`\n --> src/lib.rs:1:1\n  |\n1 | let x = 1;\n  |     ^ help: prefix it\n\nwarning: `demo` (lib) generated 1 warning\n";
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_lib_target_libtest_failure_fills_failing_tests_and_leads_the_detail() {
+        let stderr = format!(
+            "{CARGO_WARNINGS}    Finished `test` profile\n     Running unittests src/lib.rs (target/debug/deps/demo-1)\n\
+             test a::green ... ok\ntest a::red ... FAILED\n\nfailures:\n\n---- a::red stdout ----\n\
+             thread 'a::red' panicked at src/a.rs:9:5:\nassertion failed: left == right\n\n\
+             failures:\n    a::red\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\
+             error: test failed, to rerun pass `-p demo --lib`\n"
+        );
+        let gate = classify_run(
+            Some(1),
+            "publication_status=not_published\n",
+            &stderr,
+            || None,
+        );
+        assert_eq!(gate.outcome.refusal.as_deref(), Some("gate_failed"));
+        assert_eq!(gate.outcome.failing_tests, vec!["a::red"]);
+        let detail = gate.outcome.detail.expect("detail");
+        assert!(detail.starts_with("failing tests: a::red\n"), "{detail}");
+        assert!(
+            detail.contains("[a::red] thread 'a::red' panicked at src/a.rs:9:5:"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("test result: FAILED. 1 passed; 1 failed"),
+            "{detail}"
+        );
+        assert!(!detail.contains("warning:"), "{detail}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_integration_target_failure_with_a_split_test_line_still_names_the_test() {
+        // seq 373: the fixture's own output landed between the name and the
+        // verdict, so no `test X ... FAILED` line exists.
+        let stdout = "     Running tests/e2e_tui.rs (target/debug/deps/e2e_tui-1)\n\
+             test test_e2e_ok ... ok\n\
+             test test_e2e_sandbox_storage_settings ... [master (root-commit) e0796a4] fixture\n\
+             1 file changed, 1 insertion(+)\nFAILED\n\nfailures:\n\n\
+             ---- test_e2e_sandbox_storage_settings stdout ----\nfinal screen\n\
+             Error: Custom { kind: Other, error: \"target unreachable\" }\n\n\
+             failures:\n    test_e2e_sandbox_storage_settings\n\n\
+             test result: FAILED. 25 passed; 1 failed; 1 ignored\n";
+        let stderr =
+            format!("{CARGO_WARNINGS}error: test failed, to rerun pass `-p rsi --test e2e_tui`\n");
+        let gate = classify_run(Some(1), stdout, &stderr, || None);
+        assert_eq!(gate.outcome.refusal.as_deref(), Some("gate_failed"));
+        assert_eq!(
+            gate.outcome.failing_tests,
+            vec!["test_e2e_sandbox_storage_settings"]
+        );
+        let detail = gate.outcome.detail.expect("detail");
+        assert!(
+            detail.starts_with("failing tests: test_e2e_sandbox_storage_settings\n"),
+            "{detail}"
+        );
+        assert!(detail.contains("Error: Custom"), "{detail}");
+        assert!(detail.contains("error: test failed"), "{detail}");
+        assert!(!detail.contains("warning:"), "{detail}");
+    }
+
+    /// #1970: the lander's release-build refusal keeps the crate in a typed,
+    /// bisectable code.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_release_build_failure_is_its_own_refusal_naming_the_crate() {
+        let result = classify_run(
+            Some(1),
+            "publication_status=not_published\ngate_timing=shards=1 release_check_secs=7 wall_secs=9\n",
+            "release_build_failed:rsid-store: the non-test build of crate rsid-store failed",
+            || None,
+        );
+        assert_eq!(result.state, RollingQueueEntryState::Refused);
+        assert_eq!(
+            result.outcome.refusal.as_deref(),
+            Some("release_build_failed:rsid-store")
+        );
+        assert!(is_bisectable(&result));
+        assert!(
+            result
+                .outcome
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("release_check_secs=7"))
+        );
+        assert_eq!(release_build_failed_crate("nothing here"), None);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_gate_that_ran_no_tests_is_its_own_refusal_and_stays_bisectable() {
@@ -3109,6 +5831,38 @@ mod tests {
                 .is_some_and(|detail| detail.contains("test(rolling_land)"))
         );
         assert!(is_bisectable(&result));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_refused_plain_filter_names_the_target_form_it_needs() {
+        let (_dir, _origin, work) = repos();
+        sh(
+            &work,
+            "mkdir -p crates/rsi-common/tests crates/rsi-common/src/bin crates/rsi-remote/src \
+             && printf '%s\\n' '#[test]' 'fn t() {}' > crates/rsi-common/tests/portability.rs \
+             && printf '%s\\n' 'fn main() {}' > crates/rsi-common/src/bin/validate.rs \
+             && printf '%s\\n' 'fn main() {}' > crates/rsi-remote/src/main.rs \
+             && git add -A && git commit -qm targets",
+        );
+        let commit = head(&work);
+        let hint = |filter: &str| no_test_filter_hint(&work, &commit, &[filter.to_owned()]);
+        let integration = hint("rsi-common=portability");
+        assert!(
+            integration.contains("use `rsi-common=test:portability`"),
+            "{integration}"
+        );
+        let binary = hint("rsi-common=validate");
+        assert!(binary.contains("use `rsi-common=bin:validate`"), "{binary}");
+        let main = hint("rsi-remote=rsi-remote");
+        assert!(main.contains("use `rsi-remote=bin:rsi-remote`"), "{main}");
+        // Every hint states both forms, even for a name that is no target.
+        let none = hint("rsi-common=nothing_here");
+        assert!(
+            none.contains("`PACKAGE=test:NAME`") && none.contains("`PACKAGE=bin:NAME`"),
+            "{none}"
+        );
+        assert!(!none.contains("use `"), "{none}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3253,11 +6007,11 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn a_second_out_of_band_regate_is_refused_not_looped() {
+    fn a_regate_that_cannot_finish_within_the_budget_is_refused_not_looped() {
         let result = classify_run(
             Some(1),
             "publication_status=not_published\nobserved_target_id=def\n",
-            "rsi-rolling-land: stale retries exhausted: def overlaps the candidate after 1 re-gated retries (1 total)",
+            "rsi-rolling-land: stale retries exhausted: rolling moved to def (overlap:rsid:*) with 3000s of the 3600s re-gate wall-time budget spent and about 1400s needed to run the gate again",
             || None,
         );
         assert_eq!(result.state, RollingQueueEntryState::Refused);
@@ -3354,11 +6108,109 @@ mod tests {
         assert_eq!(landed_tip(&work, &head(&work)), None);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn commit_off_rolling_is_true_only_for_unlanded_work_after_a_successful_fetch() {
+        let (_dir, _origin, work) = repos();
+        let base = head(&work);
+        // Landed commit: an ancestor of the fetched tip is not off rolling.
+        assert!(!commit_off_rolling(&work, &base));
+        // Unlanded commit: positively not an ancestor of the fetched tip.
+        sh(
+            &work,
+            "git checkout -q -b feature && echo x > x && git add x && git commit -qm x",
+        );
+        assert!(commit_off_rolling(&work, &head(&work)));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn commit_off_rolling_is_false_when_the_fetch_fails_on_a_stale_cached_tip() {
+        let (_dir, _origin, work) = repos();
+        // C landed on the remote, but the cached origin/rolling predates it.
+        sh(
+            &work,
+            "echo c > c && git add c && git commit -qm c && git push -q origin rolling \
+             && git update-ref refs/remotes/origin/rolling HEAD~1",
+        );
+        let landed = head(&work);
+        // Sanity: with a working fetch, C is on rolling.
+        assert!(!commit_off_rolling(&work, &landed));
+        sh(
+            &work,
+            "git update-ref refs/remotes/origin/rolling HEAD~1 \
+             && git remote set-url origin /nonexistent/rsi-unreachable-origin.git",
+        );
+        assert!(
+            git(
+                &work,
+                &["merge-base", "--is-ancestor", &landed, "origin/rolling"]
+            )
+            .is_none(),
+            "the cached tip must predate the commit",
+        );
+        assert!(!commit_off_rolling(&work, &landed));
+    }
+
     fn fake_lander(dir: &Path, body: &str) -> LanderLauncher {
         let path = dir.join("fake-lander.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         LanderLauncher::new(path)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn snapshot_refresh_precedes_gate_and_failure_reason_reaches_gate_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let path = dir.path().join("snapshot.json");
+        let stale = rsi_common::failure_signature::Snapshot {
+            schema_version: 1,
+            exported_at: (Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+            source_rolling: None,
+            records: Vec::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let mut launcher = fake_lander(
+            dir.path(),
+            "test -s \"$RSI_KNOWN_FAILURES_SNAPSHOT\" || exit 9\necho snapshot_seen=1",
+        );
+        launcher.workspace = Some(dir.path().join("queue"));
+        launcher.known_failure_snapshot = Some(path.clone());
+        let run = run_group(
+            &store,
+            &launcher,
+            Uuid::new_v4(),
+            dir.path(),
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        let snapshot: rsi_common::failure_signature::Snapshot =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.stale_warning(Utc::now()), None);
+        assert!(run.stdout.contains("snapshot_seen=1"));
+        let log = std::fs::read_to_string(run.log_path.unwrap()).unwrap();
+        assert!(log.contains("known_failures=refreshed:"));
+        // An export failure is advisory and is visible in the gate's log.
+        launcher.known_failure_snapshot = Some(path.join("blocked.json"));
+        std::fs::write(&launcher.binary, "#!/bin/sh\necho gate_ran=1\n").unwrap();
+        let run = run_group(
+            &store,
+            &launcher,
+            Uuid::new_v4(),
+            dir.path(),
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        assert!(run.stdout.contains("gate_ran=1"));
+        let log = std::fs::read_to_string(run.log_path.unwrap()).unwrap();
+        assert!(log.contains("known_failures=refresh_failed:"));
+        assert!(log.contains("reason=cannot create"));
     }
 
     async fn queued(
@@ -3377,8 +6229,19 @@ mod tests {
         key: &str,
         session: Uuid,
     ) -> Uuid {
+        queued_in_project(store, repo, commit, key, session, None).await
+    }
+
+    async fn queued_in_project(
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        repo: &Path,
+        commit: &str,
+        key: &str,
+        session: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Uuid {
         let new = crate::store::rolling_queue::NewQueueEntry {
-            project_id: None,
+            project_id,
             repo_path: repo.display().to_string(),
             source_commit: commit.into(),
             source_session_id: session,
@@ -3388,6 +6251,7 @@ mod tests {
             migration_version: None,
             hot_files: vec![],
             test_filters: vec!["rsid=rolling_queue".into()],
+            fixes_tests: Vec::new(),
             idempotency_key: key.into(),
         };
         store
@@ -3420,7 +6284,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_draining_deploy_admits_no_new_batch_and_the_running_one_finishes() {
+    async fn a_staged_deploy_outlasting_the_worker_hold_admits_no_new_queue_batch() {
         let (dir, _origin, work) = repos();
         let first = commit_file(&work, "a", "a", "a");
         let second = commit_file(&work, "b", "b", "b");
@@ -3442,9 +6306,12 @@ mod tests {
             RollingQueueEntryState::Published
         );
 
-        // A deploy is requested while `b` is still queued.
+        // Simulate the first batch outlasting the worker-start hold (#1806).
+        // The next admission must still yield, for as long as the deploy is
+        // staged (#2190).
         let now = Utc::now();
-        drain.sync(
+        drain.set_hold_cap_secs(60);
+        drain.sync_until(
             Some(&crate::store::agent_deploys::DeployRow {
                 id: Uuid::new_v4(),
                 owner_session_id: Some(Uuid::new_v4()),
@@ -3456,9 +6323,11 @@ mod tests {
                 operator: false,
                 forced: false,
             }),
+            Some(now - chrono::Duration::seconds(1)),
             true,
             now,
         );
+        assert!(!drain.is_draining(), "the worker-start hold has elapsed");
         let held = run_drain_aware_batch(&store, &launcher, 1, &drain)
             .await
             .unwrap();
@@ -3469,6 +6338,8 @@ mod tests {
         );
         assert_eq!(drain.status().held.len(), 1);
         assert_eq!(drain.status().held[0].kind, "queue_batch");
+        assert!(drain.status().draining, "the queue pause is visible");
+        assert!(drain.status().release_by.is_some());
         // The queued-but-unadmitted entry is not a quiet-point blocker.
         let blockers = store
             .lock()
@@ -3489,6 +6360,106 @@ mod tests {
             RollingQueueEntryState::Published
         );
         assert!(drain.status().held.is_empty());
+    }
+
+    /// Stage a deploy (a new owner session and a live row) requested at `at`.
+    fn stage_deploy(store: &Store, at: chrono::DateTime<Utc>) -> Uuid {
+        let owner = Uuid::new_v4();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, provider, query, working_dir, status, created_at, \
+                 updated_at, session_kind) VALUES (?1,'Claude','q','/tmp','Running',?2,?2,'Task')",
+                rusqlite::params![
+                    owner.to_string(),
+                    at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        let id = Uuid::new_v4();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        store
+            .insert_agent_deploy(
+                &crate::store::agent_deploys::NewDeploy {
+                    id,
+                    owner_session_id: owner,
+                    idempotency_key: "k",
+                    sha,
+                    fingerprint: crate::store::agent_deploys::deploy_fingerprint_with(
+                        sha, "x", 3600, false,
+                    ),
+                    manifest: &[],
+                    max_wait_secs: 3600,
+                    interrupt_workers: false,
+                },
+                at,
+            )
+            .unwrap();
+        id
+    }
+
+    /// #2202: a daemon that restarts while a deploy is staged restores the hold
+    /// from the durable row before the queue loop starts, so the first admission
+    /// opportunity yields instead of publishing a batch past the drain.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_restart_restores_the_staged_deploy_hold_before_the_queue_admits_a_batch() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let entry = queued(&store, &work, &sha, "k").await;
+        // The deploy was staged long enough ago that the worker-start hold
+        // (600 s) is over: only the whole-deploy queue hold applies (#2190).
+        let staged = Utc::now() - chrono::Duration::minutes(20);
+        let deploy = stage_deploy(&*store.lock().await, staged);
+
+        // The restarted daemon: durable state survives, the in-memory drain does not.
+        let drain = crate::deploy_drain::DeployDrain::new();
+        assert!(
+            !drain.hold_queue_admission(true),
+            "a fresh drain admits a batch: the window the startup order must close"
+        );
+        let config = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        let admitted =
+            crate::deploy::start_admission_after_restore(&store, &drain, &config, || {
+                run_drain_aware_batch(&store, &launcher, 1, &drain)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            admitted.is_empty(),
+            "the first admission after a restart yields to the staged deploy"
+        );
+        assert_eq!(
+            entry_of(&store, entry).await.state,
+            RollingQueueEntryState::Queued
+        );
+        assert_eq!(drain.status().held[0].kind, "queue_batch");
+        assert!(!log.exists(), "the lander never ran");
+
+        // The deploy settles; the restored hold is derived from the row, so the
+        // queue resumes and lands the entry.
+        store
+            .lock()
+            .await
+            .settle_agent_deploy(
+                deploy,
+                rsi_common::agent_deploy::DeployState::Succeeded,
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+        crate::deploy::restore_drain_at_startup(&store, &drain, &config, Utc::now())
+            .await
+            .unwrap();
+        let ran = run_drain_aware_batch(&store, &launcher, 1, &drain)
+            .await
+            .unwrap();
+        assert_eq!(ran.len(), 1);
+        assert_eq!(ran[0].0, entry);
     }
 
     /// A workspace lander that records where and with what build directory it
@@ -3643,42 +6614,37 @@ exit 1
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
         std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
         let (before, note) = dirty_operator(&work);
-        let common = git(
-            &work,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        // Validation passes against the real queue worktree...
-        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
+        // Validation passes against the real queue clone...
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         // ...then the slot is swapped for a symlink to the operator checkout.
         let moved = dir.path().join("moved-queue-worktree");
         std::fs::rename(&slot, &moved).unwrap();
         std::os::unix::fs::symlink(&work, &slot).unwrap();
-        reset_pinned_worktree(&pinned, &head(&work)).unwrap();
+        // The clone's git directory lives in the slot, so a moved slot fails
+        // closed before any git runs.
+        let error = reset_pinned_worktree(&pinned, &head(&work)).unwrap_err();
+        assert!(error.contains("git directory"), "{error}");
         // The symlink target keeps its tracked and untracked edits.
         assert_operator_untouched(&work, &before, &note);
-        // The command ran in the validated worktree instead.
-        assert!(!moved.join("queue-scratch.txt").exists());
-        assert!(moved.join(".git").is_file());
+        assert!(moved.join("queue-scratch.txt").exists());
+        assert!(moved.join(".git").is_dir());
         // A slot that is already a symlink is refused at validation.
-        assert!(pin_queue_worktree(&workspace, &slot, &common).is_err());
+        assert!(pin_queue_worktree(&workspace, &slot).is_err());
     }
 
-    /// #1141 (#1126 F9): the registration (git admin dir) is swapped for a
+    /// #1141 (#1126 F9): the clone's git directory is swapped for a
     /// symlink to the operator checkout's git dir between validation and the
     /// destructive `checkout --force` / `clean`. Git must not follow it: the
     /// command is refused and the operator checkout (HEAD, index, tracked and
     /// untracked edits) is exactly as it was.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn a_registration_swapped_for_a_symlink_cannot_redirect_the_reset() {
+    fn a_git_directory_swapped_for_a_symlink_cannot_redirect_the_reset() {
         let (dir, _origin, work) = repos();
         let workspace = dir.path().join("queue");
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
         std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
-        // The operator checkout moves ahead of the queue worktree's commit.
+        // The operator checkout moves ahead of the queue clone's commit.
         sh(
             &work,
             "echo ahead > ahead.txt && git add ahead.txt && git commit -qm ahead",
@@ -3686,18 +6652,11 @@ exit 1
         let (before, note) = dirty_operator(&work);
         let operator_index = std::fs::read(work.join(".git/index")).unwrap();
         let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
-        let common = git(
-            &work,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
-        // Between the back-pointer check and the destructive command the
-        // registration is replaced by a symlink to the operator's git dir.
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
+        // Between validation and the destructive command the git directory is
+        // replaced by a symlink to the operator's git dir.
         let registration = pinned.admin.clone();
-        let moved = dir.path().join("moved-registration");
+        let moved = dir.path().join("moved-git-directory");
         std::fs::rename(&registration, &moved).unwrap();
         std::os::unix::fs::symlink(work.join(".git"), &registration).unwrap();
         // The queue worktree is not at the tip the operator checkout is at, so a
@@ -3707,7 +6666,7 @@ exit 1
             .trim()
             .to_string();
         let error = reset_pinned_worktree(&pinned, &rev).unwrap_err();
-        assert!(error.contains("registration"), "{error}");
+        assert!(error.contains("git directory"), "{error}");
         assert_operator_untouched(&work, &before, &note);
         assert_eq!(
             std::fs::read(work.join(".git/index")).unwrap(),
@@ -3719,30 +6678,23 @@ exit 1
         );
         // The queue worktree was not reset either: the refusal came first.
         assert!(slot.join("queue-scratch.txt").exists());
-        // A fresh validation refuses the swapped registration too.
-        assert!(pin_queue_worktree(&workspace, &slot, &common).is_err());
+        // A fresh validation refuses the swapped git directory too.
+        assert!(pin_queue_worktree(&workspace, &slot).is_err());
     }
 
-    /// #1141: a registration that is moved (not replaced) is also refused, and
+    /// #1141: a git directory that is moved (not replaced) is also refused, and
     /// git is never run against the moved copy.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn a_moved_registration_is_refused_before_git_runs() {
+    fn a_moved_git_directory_is_refused_before_git_runs() {
         let (dir, _origin, work) = repos();
         let workspace = dir.path().join("queue");
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
         std::fs::write(slot.join("queue-scratch.txt"), "junk").unwrap();
-        let common = git(
-            &work,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common).unwrap();
-        std::fs::rename(&pinned.admin, dir.path().join("moved-registration")).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
+        std::fs::rename(&pinned.admin, dir.path().join("moved-git-directory")).unwrap();
         let error = reset_pinned_worktree(&pinned, &head(&work)).unwrap_err();
-        assert!(error.contains("registration"), "{error}");
+        assert!(error.contains("git directory"), "{error}");
         assert!(slot.join("queue-scratch.txt").exists());
     }
 
@@ -3883,7 +6835,7 @@ exit 1
             let operator_index = std::fs::read(work.join(".git/index")).unwrap();
             let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
             let metadata = (mode_and_mtime(&tracked), mode_and_mtime(&note));
-            let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+            let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
             let moved = dir.path().join("moved-queue-worktree");
             let outcome =
                 reset_with_slot_swapped_in_flight(&pinned, &before, target, &slot, &moved, &work);
@@ -3921,7 +6873,7 @@ exit 1
         let (before, note) = dirty_operator(&work);
         let operator_index = std::fs::read(work.join(".git/index")).unwrap();
         let operator_head = std::fs::read(work.join(".git/HEAD")).unwrap();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         // The directory (device, inode, location) is unchanged; only its index
         // entry now names the operator's index.
         let index = pinned.admin.join("index");
@@ -3973,7 +6925,7 @@ exit 1
             .iter()
             .map(|file| (std::fs::read(file).unwrap(), mode_and_mtime(file)))
             .collect();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let alias = |operator: &Path, name: &Path| {
             let _ = std::fs::remove_file(name);
             std::fs::create_dir_all(name.parent().unwrap()).unwrap();
@@ -4050,7 +7002,7 @@ exit 1
             &work,
             &format!("git config filter.evil.smudge {}", smudge.display()),
         );
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         reset_pinned_worktree(&pinned, &head(&work)).unwrap();
         assert_eq!(
             std::fs::read_to_string(slot.join("a.evil")).unwrap(),
@@ -4171,13 +7123,15 @@ exit 1
             let workspace = dir.path().join("queue");
             prepare_queue_workspace(&workspace).unwrap();
             let slot = worktree_dir(&workspace, &work);
-            // The registration exists, nothing is checked out yet.
-            create_queue_registration(&work, &slot, &before).unwrap();
+            // The clone exists, nothing is checked out yet.
+            let created = create_queue_clone(&workspace, &slot).unwrap();
+            sync_queue_clone(&created, &work, &common_dir(&work)).unwrap();
+            drop(created);
             assert!(
                 slot.join("crates").symlink_metadata().is_err(),
-                "the registration step must not check anything out"
+                "the creation step must not check anything out"
             );
-            let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+            let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
             let moved = dir.path().join("moved-queue-worktree");
             let outcome =
                 reset_with_slot_swapped_in_flight(&pinned, &before, target, &slot, &moved, &work);
@@ -4304,7 +7258,7 @@ exit 1
     ) -> PathBuf {
         let workspace = dir.join("queue");
         let slot = ensure_queue_worktree(&workspace, work).unwrap();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let rev = git(work, &["rev-parse", "origin/rolling"]).unwrap();
         reset_pinned_worktree_with_env(
             &pinned,
@@ -4338,7 +7292,7 @@ exit 1
         let workspace = dir.path().join("queue");
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
         std::fs::write(slot.join("junk.txt"), "junk").unwrap();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let rev = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
         reset_pinned_worktree_with_env(
             &pinned,
@@ -4412,7 +7366,7 @@ exit 1
         let pinned_state = pin_files(&files);
         let trace = slot.join("trace-alias.log");
         alias_file(&operator, &trace);
-        let mut pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let mut pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let var = |name: &str, value: &Path| {
             (
                 std::ffi::OsString::from(name),
@@ -4469,7 +7423,7 @@ exit 1
         let workspace = dir.path().join("queue");
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
         sh(&slot, "git update-index --split-index");
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let shared = std::fs::read_dir(&pinned.admin)
             .unwrap()
             .flatten()
@@ -4496,7 +7450,7 @@ exit 1
         let (dir, _origin, work) = repos();
         let workspace = dir.path().join("queue");
         let slot = ensure_queue_worktree(&workspace, &work).unwrap();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let index = pinned.admin.join("index");
         std::fs::remove_file(&index).unwrap();
         nix::unistd::mkfifo(&index, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
@@ -4529,7 +7483,7 @@ exit 1
         )
         .unwrap();
         std::fs::write(slot.join("excluded-only-by-operator.tmp"), "x").unwrap();
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         reset_pinned_worktree(&pinned, &head(&work)).unwrap();
         assert!(
             slot.join("excluded-only-by-operator.tmp")
@@ -4561,7 +7515,7 @@ exit 1
         ];
         let pinned_state = pin_files(&files);
         let hook = chmod_script(dir.path(), "plant.sh", &victim);
-        let pinned = pin_queue_worktree(&workspace, &slot, &common_dir(&work)).unwrap();
+        let pinned = pin_queue_worktree(&workspace, &slot).unwrap();
         let planted = std::sync::atomic::AtomicBool::new(false);
         let plant = |_command: &str, scratch: &Path| {
             if planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -4710,7 +7664,7 @@ exit 1
         std::fs::create_dir(&slot).unwrap();
         std::fs::write(slot.join("precious.txt"), "keep").unwrap();
         let error = ensure_queue_worktree(&workspace, &work).unwrap_err();
-        assert!(error.contains("not a registered worktree"), "{error}");
+        assert!(error.contains("not a queue clone"), "{error}");
         assert_eq!(
             std::fs::read_to_string(slot.join("precious.txt")).unwrap(),
             "keep"
@@ -4737,9 +7691,237 @@ exit 1
         std::fs::create_dir(&slot).unwrap();
         let path = ensure_queue_worktree(&workspace, &work).unwrap();
         assert_eq!(path, slot);
-        assert!(slot.join(".git").is_file());
+        assert!(slot.join(".git").is_dir());
         // And the healthy worktree is reused on the next call.
         assert_eq!(ensure_queue_worktree(&workspace, &work).unwrap(), slot);
+    }
+
+    /// Every file under `dir` with its length and modification time: what any
+    /// write by the queue, however small, would change.
+    fn tree_state(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                match meta.is_dir() {
+                    true => walk(&path, out),
+                    false => out.push((path, meta.len(), meta.modified().unwrap())),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// #1170: nothing about the queue is written into the source repository: no
+    /// worktree registration, no fetched ref or object, no `FETCH_HEAD`, no
+    /// hook (a `reference-transaction` hook and automatic gc are armed) and no
+    /// config. The queue's fetch lands in its own clone, which reaches the new
+    /// tip while the source's `origin/rolling` stays where it was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_queue_writes_nothing_into_the_source_repository() {
+        let (dir, origin, work) = repos();
+        let marker = dir.path().join("hook-ran");
+        let hook = work.join(".git/hooks/reference-transaction");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho ran >> {}\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        sh(
+            &work,
+            "git config gc.auto 1 && git config gc.autoDetach false",
+        );
+        let other = dir.path().join("other");
+        sh(
+            dir.path(),
+            &format!(
+                "git clone -q {} {} && cd {} && echo n > n.txt && git add n.txt \
+                 && git commit -qm n && git push -q origin HEAD:rolling",
+                origin.display(),
+                other.display(),
+                other.display()
+            ),
+        );
+        let stale_tip = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        let before = tree_state(&work.join(".git"));
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        // A second call (the reuse path) writes nothing there either.
+        assert_eq!(ensure_queue_worktree(&workspace, &work).unwrap(), slot);
+        assert_eq!(tree_state(&work.join(".git")), before, "the source changed");
+        assert!(
+            !work.join(".git/worktrees").exists(),
+            "a registration was written"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).ok(), None, "a hook ran");
+        assert_eq!(
+            git(&work, &["rev-parse", "origin/rolling"]).unwrap(),
+            stale_tip
+        );
+        // The queue's own clone fetched the new tip and holds it.
+        assert_eq!(
+            git(&slot, &["rev-parse", "HEAD"]).unwrap().trim(),
+            head(&other)
+        );
+        assert!(slot.join("n.txt").is_file());
+        let own = |sha: &str| {
+            slot.join(".git/objects")
+                .join(&sha[..2])
+                .join(&sha[2..])
+                .is_file()
+        };
+        assert!(own(&head(&other)), "the fetched commit lives in the clone");
+        // The source is not a linked worktree owner of the slot.
+        let listed = git(&work, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(!listed.contains(&slot.display().to_string()), "{listed}");
+    }
+
+    /// #1170: an unpublished source commit (an accepted session commit) is
+    /// reachable in the queue clone through the read-only alternate, so the
+    /// lander's `git clone --shared --no-checkout` of the clone reaches it, and
+    /// the clone carries the source's origin so the lander can publish.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_unpublished_source_commit_is_reachable_through_the_clone_by_the_lander() {
+        let (dir, origin, work) = repos();
+        let unpublished = commit_file(&work, "a", "a", "a");
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        assert!(source_commit_exists(&slot, &unpublished));
+        let scratch = dir.path().join("lander-clone");
+        sh(
+            dir.path(),
+            &format!(
+                "git clone -q --shared --no-checkout {} {}",
+                slot.display(),
+                scratch.display()
+            ),
+        );
+        assert!(source_commit_exists(&scratch, &unpublished));
+        assert_eq!(
+            git(&slot, &["remote", "get-url", "--push", "origin"])
+                .unwrap()
+                .trim(),
+            origin.display().to_string()
+        );
+        // Detached at the fetched rolling tip, not at the source's HEAD.
+        assert_eq!(
+            head(&slot),
+            git(&work, &["rev-parse", "origin/rolling"]).unwrap().trim()
+        );
+        assert_ne!(head(&slot), unpublished);
+    }
+
+    /// #1170: a worktree an earlier daemon registered in the source repository
+    /// is retired into a queue clone. The source's registration is left exactly
+    /// as it is (git's own `worktree prune` owns it), and nothing else of the
+    /// source changes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_worktree_registered_by_an_earlier_queue_is_replaced_by_a_clone() {
+        let (dir, _origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        prepare_queue_workspace(&workspace).unwrap();
+        let slot = worktree_dir(&workspace, &work);
+        sh(
+            &work,
+            &format!(
+                "git worktree add -q --no-checkout --detach --force {} HEAD",
+                slot.display()
+            ),
+        );
+        assert!(slot.join(".git").is_file());
+        let registrations = tree_state(&work.join(".git/worktrees"));
+        assert!(!registrations.is_empty());
+        let (before, note) = dirty_operator(&work);
+        assert_eq!(ensure_queue_worktree(&workspace, &work).unwrap(), slot);
+        assert!(slot.join(".git").is_dir());
+        assert!(slot.join("crates/rsid-store/src/store/mod.rs").is_file());
+        assert_eq!(tree_state(&work.join(".git/worktrees")), registrations);
+        assert_operator_untouched(&work, &before, &note);
+    }
+
+    /// #1170: with no reachable remote the clone is reset to the source's
+    /// `HEAD` (the lander reports the real error), as the queue always did; the
+    /// source's transport settings that the fetch needs are copied into the
+    /// clone's config, quoted, and a value that cannot be written on one line is
+    /// dropped.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_offline_source_resets_to_its_head_and_transport_settings_are_copied() {
+        let (dir, _origin, work) = repos();
+        let local = commit_file(&work, "a", "a", "a");
+        sh(
+            &work,
+            "git remote set-url origin /nonexistent/origin.git \
+             && git config core.sshCommand 'ssh -i \"/keys/a b\"' \
+             && git config --add credential.helper 'store' \
+             && git config http.proxy 'http://proxy:3128'",
+        );
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        assert_eq!(head(&slot), local);
+        let config = std::fs::read_to_string(slot.join(".git/config")).unwrap();
+        assert!(config.starts_with(QUEUE_CLONE_MARKER), "{config}");
+        assert!(
+            config.contains("url = \"/nonexistent/origin.git\""),
+            "{config}"
+        );
+        assert!(
+            config.contains("sshCommand = \"ssh -i \\\"/keys/a b\\\"\""),
+            "{config}"
+        );
+        assert!(config.contains("helper = \"store\""), "{config}");
+        assert!(config.contains("proxy = \"http://proxy:3128\""), "{config}");
+        assert_eq!(config_quote("a\nb"), None);
+        assert_eq!(config_quote("a\"b\\c").as_deref(), Some("\"a\\\"b\\\\c\""));
+        // The clone's config is the queue's: nothing of the source's other
+        // settings (hooks, filters, includes) is carried over.
+        assert!(!config.contains("hooksPath = /operator"), "{config}");
+    }
+
+    /// #1170: a config planted in the clone's git directory (or any file
+    /// replaced there) is overwritten from the source on the next call, so a
+    /// filter driver or a changed remote cannot persist.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_config_replaced_in_the_clone_is_rewritten_from_the_source() {
+        let (dir, origin, work) = repos();
+        let workspace = dir.path().join("queue");
+        let slot = ensure_queue_worktree(&workspace, &work).unwrap();
+        std::fs::write(
+            slot.join(".git/config"),
+            format!(
+                "{QUEUE_CLONE_MARKER}[filter \"evil\"]\n\tsmudge = /bin/true\n\
+                 [remote \"origin\"]\n\turl = /elsewhere\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            slot.join(".git/objects/info/alternates"),
+            "/elsewhere/objects\n",
+        )
+        .unwrap();
+        assert_eq!(ensure_queue_worktree(&workspace, &work).unwrap(), slot);
+        let config = std::fs::read_to_string(slot.join(".git/config")).unwrap();
+        assert!(
+            !config.contains("evil") && !config.contains("/elsewhere"),
+            "{config}"
+        );
+        assert!(config.contains(&origin.display().to_string()), "{config}");
+        let alternates =
+            std::fs::read_to_string(slot.join(".git/objects/info/alternates")).unwrap();
+        assert_eq!(alternates, format!("{}/objects\n", common_dir(&work)));
+        // A git directory without the queue's marker is not a queue clone.
+        std::fs::write(slot.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+        let error = pin_queue_worktree(&workspace, &slot).err().unwrap();
+        assert!(error.contains("not a queue clone"), "{error}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4761,14 +7943,15 @@ exit 1
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn run_next_passes_the_source_filters_and_the_one_regate_budget() {
+    async fn run_next_passes_the_source_filters_and_the_wall_time_regate_budget() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
         let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
         let launcher = fake_lander(
             dir.path(),
             &format!(
-                "echo \"$@\" > {log}; echo \"$RSI_LANDER_MAX_REGATED_STALE_RETRIES\" >> {log}; \
+                "echo \"$@\" > {log}; echo \"budget=$RSI_LANDER_REGATE_BUDGET_SECS\" >> {log}; \
+                 echo \"count=$RSI_LANDER_MAX_REGATED_STALE_RETRIES\" >> {log}; \
                  echo \"exact=$RSI_LANDER_EXACT_GATE\" >> {log}; \
                  echo 'test rolling_queue::red ... FAILED'; exit 1",
                 log = log.display()
@@ -4785,9 +7968,24 @@ exit 1
             logged.contains("--test-filter rsid=rolling_queue"),
             "{logged}"
         );
+        // #1940: the re-gates are bounded by the wall time the batch has left
+        // (the default gate timeout, an hour), never by a count.
+        let budget: u64 = logged
+            .lines()
+            .find_map(|line| line.strip_prefix("budget="))
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or_default();
         assert!(
-            logged.lines().any(|line| line == "1") && logged.trim_end().ends_with("exact=1"),
-            "the queue runs the lander with one re-gate and the exact gate: {logged}"
+            (3000..=3600).contains(&budget),
+            "the lander gets the batch's remaining wall time: {logged}"
+        );
+        assert!(
+            logged.lines().any(|line| line == "count="),
+            "no fixed count of re-gates: {logged}"
+        );
+        assert!(
+            logged.trim_end().ends_with("exact=1"),
+            "the queue runs the lander with the exact gate: {logged}"
         );
         let entry = store
             .lock()
@@ -4796,6 +7994,61 @@ exit 1
             .unwrap()
             .unwrap();
         assert_eq!(entry.state, RollingQueueEntryState::Refused);
+    }
+
+    /// #2167: an entry's claimed fixes reach the lander as `--fixes-test`
+    /// (never as a filter), and its `claimed_fix_still_red` refusal settles
+    /// the entry with that code and the still-red tests.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_claimed_fix_reaches_the_lander_and_its_refusal_names_the_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let launcher = fake_lander(
+            dir.path(),
+            &format!(
+                "echo \"$@\" > {log}; echo 'publication_status=not_published'; \
+                 echo 'failing_test=demo::red'; \
+                 echo 'rsi-rolling-land: claimed_fix_still_red: demo::red; the claimed fix still fails on the candidate' >&2; exit 1",
+                log = log.display()
+            ),
+        );
+        let commit = "c".repeat(40);
+        let new = crate::store::rolling_queue::NewQueueEntry {
+            project_id: None,
+            repo_path: dir.path().display().to_string(),
+            source_commit: commit.clone(),
+            source_session_id: Uuid::new_v4(),
+            owner_epic_id: None,
+            binding: RollingQueueBinding::Unbound,
+            work_key: None,
+            migration_version: None,
+            hot_files: vec![],
+            test_filters: vec!["rsid=rolling_queue".into()],
+            fixes_tests: vec!["demo::red".into()],
+            idempotency_key: "claimed".into(),
+        };
+        let (entry, _) = store
+            .lock()
+            .await
+            .enqueue_rolling_queue_source(&new, Utc::now())
+            .unwrap();
+        assert_eq!(entry.fixes_tests, vec!["demo::red".to_string()]);
+        assert_eq!(entry.test_filters, vec!["rsid=rolling_queue".to_string()]);
+        let (_, result) = run_next(&store, &launcher).await.unwrap().unwrap();
+        assert_eq!(result.state, RollingQueueEntryState::Refused);
+        assert_eq!(
+            result.outcome.refusal.as_deref(),
+            Some(QUEUE_CLAIMED_FIX_STILL_RED)
+        );
+        assert_eq!(result.outcome.failing_tests, vec!["demo::red"]);
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("--test-filter rsid=rolling_queue --fixes-test demo::red"),
+            "{logged}"
+        );
+        assert!(is_bisectable(&result), "a batch bisects to the claimant");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4810,6 +8063,417 @@ exit 1
         assert_eq!(
             result.outcome.refusal.as_deref(),
             Some("lander_unavailable")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_killed_ancestry_probe_is_unknown_never_a_negative_verdict() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = |code: i32| Ok(std::process::ExitStatus::from_raw(code << 8));
+        assert_eq!(classify_ancestry(status(0)), Ancestry::Ancestor);
+        assert_eq!(classify_ancestry(status(1)), Ancestry::NotAncestor);
+        assert_eq!(classify_ancestry(status(128)), Ancestry::Unknown);
+        // Death by SIGKILL (the shutdown kill of #2595): raw status = signal.
+        assert_eq!(
+            classify_ancestry(Ok(std::process::ExitStatus::from_raw(9))),
+            Ancestry::Unknown
+        );
+        assert_eq!(
+            classify_ancestry(Err(std::io::Error::other("spawn"))),
+            Ancestry::Unknown
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_not_ancestor_is_rechecked_against_the_refetched_tip_before_failing() {
+        let sources = vec!["a".to_string(), "b".to_string()];
+        let calls = std::cell::RefCell::new(Vec::new());
+        let fetches = std::cell::Cell::new(0);
+        let verdicts = verify_ancestry_with(
+            &sources,
+            2,
+            |source| {
+                calls.borrow_mut().push(source.to_string());
+                // `a` is only visible after the second fetch; `b` never lands.
+                match (source, fetches.get()) {
+                    ("a", 2) => Ancestry::Ancestor,
+                    ("b", _) => Ancestry::NotAncestor,
+                    _ => Ancestry::NotAncestor,
+                }
+            },
+            || {
+                fetches.set(fetches.get() + 1);
+                true
+            },
+        );
+        assert_eq!(verdicts, vec![Ancestry::Ancestor, Ancestry::NotAncestor]);
+        assert_eq!(fetches.get(), 2);
+        assert_eq!(*calls.borrow(), vec!["a", "b", "a", "b"]);
+    }
+
+    /// #2599: a failed refresh leaves `origin/rolling` possibly stale, so a "no"
+    /// against it is Unknown, never a verified negative; a "yes" still holds.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_failed_fetch_cannot_produce_a_negative_ancestry_verdict() {
+        let sources = vec!["a".to_string(), "b".to_string()];
+        let verdicts = verify_ancestry_with(
+            &sources,
+            2,
+            |source| match source {
+                "a" => Ancestry::Ancestor,
+                _ => Ancestry::NotAncestor,
+            },
+            || false,
+        );
+        assert_eq!(verdicts, vec![Ancestry::Ancestor, Ancestry::Unknown]);
+    }
+
+    /// #2599: a definite negative from a refreshed attempt survives a later
+    /// attempt whose refresh failed, and a later successful refresh still wins.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_failed_retry_fetch_keeps_a_fresh_negative_and_a_later_fetch_can_confirm() {
+        let sources = vec!["a".to_string()];
+        let fetches = std::cell::Cell::new(0);
+        let verdicts = verify_ancestry_with(
+            &sources,
+            2,
+            |_| Ancestry::NotAncestor,
+            || {
+                fetches.set(fetches.get() + 1);
+                fetches.get() == 1
+            },
+        );
+        assert_eq!(verdicts, vec![Ancestry::NotAncestor]);
+        let fetches = std::cell::Cell::new(0);
+        let verdicts = verify_ancestry_with(
+            &sources,
+            2,
+            |_| {
+                if fetches.get() == 2 {
+                    Ancestry::Ancestor
+                } else {
+                    Ancestry::NotAncestor
+                }
+            },
+            || {
+                fetches.set(fetches.get() + 1);
+                fetches.get() == 2
+            },
+        );
+        assert_eq!(verdicts, vec![Ancestry::Ancestor]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shutdown_killed_ancestry_probe_leaves_the_entry_gating_and_reconcile_publishes_it() {
+        let (_dir, _origin, work) = repos();
+        let source = head(&work);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let id = queued(&store, &work, &source, "1").await;
+        let batch_id = Uuid::new_v4();
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO rolling_queue_batches(id,state,member_ids_json,member_count,created_at,row_version) \
+                     VALUES (?1,'gating','[]',1,'2026-09-29T00:00:00.000000000Z',1)",
+                    [batch_id.to_string()],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state='gating', batch_id=?2 WHERE id=?1",
+                    [id.to_string(), batch_id.to_string()],
+                )
+                .unwrap();
+        }
+        let group = vec![entry_of(&store, id).await];
+        let result = RunResult {
+            state: RollingQueueEntryState::Published,
+            outcome: RollingQueueOutcome {
+                landed_sha: Some(source.clone()),
+                ..RollingQueueOutcome::default()
+            },
+        };
+        let run = GroupRun {
+            result: result.clone(),
+            stdout: String::new(),
+            own_tip: Some(source.clone()),
+            conflict_source: None,
+            log_path: None,
+            cause: None,
+            already_integrated: false,
+        };
+        let mut settled = Vec::new();
+        // The shutdown SIGKILLed git: every probe is a signal exit.
+        publish_group_with(
+            &store,
+            &work,
+            batch_id,
+            &group,
+            &run,
+            &result,
+            &mut settled,
+            |_, sources| vec![Ancestry::Unknown; sources.len()],
+        )
+        .await
+        .unwrap();
+        assert!(settled.is_empty());
+        assert_eq!(
+            entry_of(&store, id).await.state,
+            RollingQueueEntryState::Gating
+        );
+        // Boot recovery re-checks against the remote tip and publishes it.
+        assert_eq!(reconcile_gating(&store).await.unwrap(), (1, 0));
+        let entry = entry_of(&store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Published);
+        assert_eq!(
+            entry.outcome.unwrap().landed_sha.as_deref(),
+            Some(source.as_str())
+        );
+    }
+
+    /// #2698: a gate that publishes over a base red no snapshot record owns
+    /// files one qa Issue (test, shard command, base SHA) and names it in the
+    /// published outcome; a replay or a second gate files nothing more.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_published_gate_over_an_unowned_base_red_files_one_qa_issue_and_names_it() {
+        let (_dir, _origin, work) = repos();
+        let source = head(&work);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let project = Uuid::new_v4();
+        {
+            let now = Utc::now();
+            store
+                .lock()
+                .await
+                .insert_project(&rsi_common::types::Project {
+                    id: project,
+                    name: "base-red".into(),
+                    path: None,
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let id =
+            queued_in_project(&store, &work, &source, "1", Uuid::new_v4(), Some(project)).await;
+        let batch_id = Uuid::new_v4();
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO rolling_queue_batches(id,state,member_ids_json,member_count,created_at,row_version) \
+                     VALUES (?1,'gating','[]',1,'2026-09-29T00:00:00.000000000Z',1)",
+                    [batch_id.to_string()],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state='gating', batch_id=?2 WHERE id=?1",
+                    [id.to_string(), batch_id.to_string()],
+                )
+                .unwrap();
+        }
+        let group = vec![entry_of(&store, id).await];
+        let result = RunResult {
+            state: RollingQueueEntryState::Published,
+            outcome: RollingQueueOutcome {
+                landed_sha: Some(source.clone()),
+                detail: Some("gate_timing=shards=1".into()),
+                ..RollingQueueOutcome::default()
+            },
+        };
+        let base = "b".repeat(40);
+        let run = GroupRun {
+            result: result.clone(),
+            stdout: format!(
+                "fetched_target_id={base}\nbase_red=research_corpus::every_sidecar_validates\n\
+                 base_red=demo::owned\nknown_red=research_corpus::every_sidecar_validates:new\n\
+                 known_red=demo::owned:#77:regression\n\
+                 base_red_command=research_corpus::every_sidecar_validates\tcargo test -p rsi-common --test research_corpus\n"
+            ),
+            own_tip: Some(source.clone()),
+            conflict_source: None,
+            log_path: Some(PathBuf::from("/tmp/gate-2698.log")),
+            cause: None,
+            already_integrated: false,
+        };
+        let mut settled = Vec::new();
+        publish_group_with(
+            &store,
+            &work,
+            batch_id,
+            &group,
+            &run,
+            &result,
+            &mut settled,
+            |_, sources| vec![Ancestry::Ancestor; sources.len()],
+        )
+        .await
+        .unwrap();
+        let detail = settled[0].1.outcome.detail.clone().unwrap();
+        assert!(detail.starts_with("gate_timing=shards=1\n"), "{detail}");
+        assert!(
+            detail.contains(
+                "base_red_issue=#1 test=research_corpus::every_sidecar_validates (filed)"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("demo::owned"), "{detail}");
+        let issues = store
+            .lock()
+            .await
+            .list_issues(&rsi_common::types::IssueFilter {
+                project_id: Some(project),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].labels.contains(&"qa".to_string()));
+        for fact in [
+            "research_corpus::every_sidecar_validates",
+            "cargo test -p rsi-common --test research_corpus",
+            base.as_str(),
+            "/tmp/gate-2698.log",
+        ] {
+            assert!(issues[0].body.contains(fact), "{fact}: {}", issues[0].body);
+        }
+        assert!(!issues[0].body.contains("unrecorded"), "{}", issues[0].body);
+        // A replay (restart) of the same gate dedupes into the open Issue.
+        let lines = gate_base_red::file_base_reds(
+            &store,
+            batch_id,
+            &group,
+            &run.stdout,
+            run.log_path.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            lines,
+            ["base_red_issue=#1 test=research_corpus::every_sidecar_validates (already open)"]
+        );
+    }
+
+    /// #2705 + #2703: a gate that observes an unowned base red (A) and then
+    /// fails on a new candidate red (B) still files exactly one qa Issue, for
+    /// A alone, with the shard command that observed it, and names it in the
+    /// failed outcome.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_gate_over_an_unowned_base_red_files_one_qa_issue_for_the_base_red() {
+        let (dir, _origin, work) = repos();
+        let source = head(&work);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let project = Uuid::new_v4();
+        {
+            let now = Utc::now();
+            store
+                .lock()
+                .await
+                .insert_project(&rsi_common::types::Project {
+                    id: project,
+                    name: "base-red-failed".into(),
+                    path: None,
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let id =
+            queued_in_project(&store, &work, &source, "1", Uuid::new_v4(), Some(project)).await;
+        let batch_id = Uuid::new_v4();
+        {
+            let guard = store.lock().await;
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO rolling_queue_batches(id,state,member_ids_json,member_count,created_at,row_version) \
+                     VALUES (?1,'gating','[]',1,'2026-09-29T00:00:00.000000000Z',1)",
+                    [batch_id.to_string()],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state='gating', batch_id=?2 WHERE id=?1",
+                    [id.to_string(), batch_id.to_string()],
+                )
+                .unwrap();
+        }
+        let group = vec![entry_of(&store, id).await];
+        let mut launcher = fake_lander(
+            dir.path(),
+            r#"printf 'publication_status=not_published\nlanding_outcome=not_published\n'
+printf 'fetched_target_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+printf 'base_red=demo::base_red\nknown_red=demo::base_red:new\n'
+printf 'base_red_command=demo::base_red\tcargo test -p demo --lib\n'
+echo 'candidate_only_failures={"demo::candidate_red"}' >&2
+exit 1"#,
+        );
+        launcher.workspace = Some(dir.path().join("queue"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let run = run_group(&store, &launcher, batch_id, &work, &group, None, deadline).await;
+        assert_ne!(run.result.state, RollingQueueEntryState::Published);
+        let detail = run.result.outcome.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("base_red_issue=#1 test=demo::base_red (filed)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("base_red_issue=#1 test=demo::candidate_red"));
+        let issues = store
+            .lock()
+            .await
+            .list_issues(&rsi_common::types::IssueFilter {
+                project_id: Some(project),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].labels.contains(&"qa".to_string()));
+        for fact in ["demo::base_red", "cargo test -p demo --lib"] {
+            assert!(issues[0].body.contains(fact), "{fact}: {}", issues[0].body);
+        }
+        assert!(
+            !issues[0].body.contains("candidate_red"),
+            "{}",
+            issues[0].body
+        );
+        assert!(!issues[0].body.contains("unrecorded"), "{}", issues[0].body);
+        // #2712: the gate did not publish, so the Issue must not say it did.
+        assert!(
+            !issues[0].body.contains("published its candidate anyway"),
+            "{}",
+            issues[0].body
+        );
+        assert!(
+            issues[0]
+                .body
+                .contains("observed `demo::base_red` red on the base"),
+            "{}",
+            issues[0].body
+        );
+        // A retried run (the next bisect round) dedupes into the open Issue.
+        let again = run_group(&store, &launcher, batch_id, &work, &group, None, deadline).await;
+        let detail = again.result.outcome.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("base_red_issue=#1 test=demo::base_red (already open)"),
+            "{detail}"
         );
     }
 
@@ -5006,6 +8670,104 @@ exit 1
         assert!(!source_is_rust_free(&repo, &"0".repeat(40)));
     }
 
+    /// #2814: a docs-only source with two merge bases (it merged an earlier
+    /// rolling commit that rolling then moved on from) is Rust-free by its
+    /// merge result, not by the merge-base diff that re-counts rolling's Rust.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_source_with_several_merge_bases_is_judged_by_its_merge_result() {
+        let (_dir, repo) = rust_free_repo();
+        let git_in = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        let commit_file = |path: &str, text: &str, message: &str| {
+            let full = repo.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, text).unwrap();
+            git_in(&["add", path]);
+            git_in(&["commit", "-q", "-m", message]);
+        };
+        let rev = |name: &str| git(&repo, &["rev-parse", name]).unwrap().trim().to_string();
+        git_in(&["checkout", "-q", "-b", "worker", "rolling"]);
+        commit_file("lib.rs", "fn a() {}\n", "worker first");
+        let worker_first = rev("HEAD");
+        git_in(&["checkout", "-q", "rolling"]);
+        commit_file("other.rs", "fn b() {}\n", "rolling first");
+        let rolling_first = rev("HEAD");
+        git_in(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "rolling takes worker",
+            &worker_first,
+        ]);
+        git_in(&["checkout", "-q", "worker"]);
+        git_in(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "worker takes rolling",
+            &rolling_first,
+        ]);
+        commit_file("docs/note.md", "# note\n", "worker docs");
+        let source = rev("HEAD");
+        git_in(&["checkout", "-q", "rolling"]);
+        commit_file("lib.rs", "fn a() { let _x = 1; }\n", "rolling moves on");
+        let bases = git(&repo, &["merge-base", "--all", &source, "rolling"]).unwrap();
+        assert_eq!(bases.split_whitespace().count(), 2, "{bases}");
+        assert_eq!(
+            source_changed_paths(&repo, &source),
+            DeltaRead::Paths(vec!["docs/note.md".to_string()])
+        );
+        assert!(source_is_rust_free(&repo, &source));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn derived_filters_come_from_the_checker_normalized_and_fall_back_to_none() {
+        let (_dir, repo) = rust_free_repo();
+        let head = git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        // No checker script: the unfiltered gate.
+        assert!(derive_test_filters(&repo, &head).await.is_empty());
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        let mut suggested: Vec<String> = (0..40).map(|i| format!("rsi=module_{i}")).collect();
+        suggested.push("rsid=shard:store-01:test(same)".into());
+        suggested.push("rsid-store=shard:store-02:test(same)".into());
+        std::fs::write(
+            repo.join("scripts/check-touched-shards"),
+            format!(
+                "import json, sys\nassert '--filters-only' in sys.argv and '--json' in sys.argv\nprint(json.dumps({{'suggested_filters': {}}}))\n",
+                serde_json::to_string(&suggested).unwrap().replace('"', "'")
+            ),
+        )
+        .unwrap();
+        let derived = derive_test_filters(&repo, &head).await;
+        assert_eq!(derived.len(), 41);
+        assert_eq!(derived[40], "rsid=shard:store-01:test(same)");
+        assert!(parse_suggested_filters("not json").is_empty());
+        // One malformed entry voids the whole set (the unfiltered gate).
+        assert!(
+            parse_suggested_filters(r#"{"suggested_filters": ["rsi=a", null, "rsi=b"]}"#)
+                .is_empty()
+        );
+        assert!(parse_suggested_filters(r#"{"suggested_filters": ["rsi=a", "bad"]}"#).is_empty());
+        assert_eq!(
+            parse_suggested_filters(r#"{"suggested_filters": ["rsi=a", "rsi=b"]}"#),
+            vec!["rsi=a", "rsi=b"]
+        );
+    }
+
     fn rust_free_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_path_buf();
@@ -5048,6 +8810,8 @@ exit 1
             migration_version: None,
             hot_files: vec![],
             test_filters: filters.iter().map(|f| (*f).to_string()).collect(),
+            fixes_tests: Vec::new(),
+            filters_state: None,
             state: RollingQueueEntryState::Queued,
             outcome: None,
             enqueued_at: String::new(),
@@ -5095,7 +8859,7 @@ exit 1
     fn merging_lander(dir: &Path, work: &Path, log: &Path, guard: &str) -> LanderLauncher {
         let body = r#"
 echo "run $*" >> @LOG@
-echo "regates $RSI_LANDER_MAX_REGATED_STALE_RETRIES" >> @LOG@
+echo "budget $RSI_LANDER_REGATE_BUDGET_SECS" >> @LOG@
 @GUARD@
 cd @WORK@ || exit 9
 git fetch -q origin rolling
@@ -5235,6 +8999,593 @@ echo published_target_id=$(git rev-parse HEAD)
             .filter(|job| job.name.starts_with("merge-queue-"))
             .count();
         assert_eq!(wakes, 4);
+    }
+
+    /// #2112: the lander reports queue-derived filters as explicit
+    /// (`selection=closure reason=explicit_filters`), so the queue records the
+    /// async full-library obligation itself on publish. Caller-named filters
+    /// stay exempt; an unfiltered gate is left to the lander's own evidence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_derived_filter_publish_owes_the_full_library_run_and_explicit_filters_do_not() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        // `b` was enqueued with operator-named filters; `c` gates unfiltered.
+        note_explicit_filters(ids[1]);
+        store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE rolling_queue_entries SET test_filters_json='[]' WHERE id=?1",
+                [ids[2].to_string()],
+            )
+            .unwrap();
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| r.state == RollingQueueEntryState::Published)
+        );
+        let owed = store.lock().await.bounded_qa_landings().unwrap();
+        assert_eq!(
+            owed.iter().map(|w| w.entry.id).collect::<Vec<_>>(),
+            [ids[0]]
+        );
+        assert_eq!(owed[0].job_id, None, "pending until the QA task dispatches");
+        assert!(
+            !has_explicit_filters(ids[1]),
+            "settled entries are forgotten"
+        );
+    }
+
+    /// A rolling base with two workspace packages, `tui` and `daemon`, where
+    /// `daemon` depends on `common` and `tui` does not; one source per path.
+    fn lane_workspace() -> (tempfile::TempDir, PathBuf, Vec<String>) {
+        let (dir, _origin, work) = repos();
+        sh(
+            &work,
+            "mkdir -p crates/common/src crates/daemon/src crates/tui/src \
+             && printf '[workspace]\\nmembers = []\\n' > Cargo.toml \
+             && printf '[package]\\nname = \"common\"\\n' > crates/common/Cargo.toml \
+             && printf '[package]\\nname = \"daemon\"\\n[dependencies]\\ncommon = { path = \"../common\" }\\n' > crates/daemon/Cargo.toml \
+             && printf '[package]\\nname = \"tui\"\\n' > crates/tui/Cargo.toml \
+             && git add -A && git commit -qm workspace && git push -q origin rolling \
+             && git fetch -q origin rolling",
+        );
+        let mut sources = Vec::new();
+        for (branch, file) in [
+            ("daemon-one", "crates/daemon/src/lib.rs"),
+            ("tui-one", "crates/tui/src/lib.rs"),
+            ("common-one", "crates/common/src/lib.rs"),
+            ("manifest", "crates/tui/Cargo.toml"),
+        ] {
+            sh(
+                &work,
+                &format!(
+                    "git checkout -q -B {branch} origin/rolling && printf '// {branch}\\n' >> {file} \
+                     && git add {file} && git commit -qm {branch}"
+                ),
+            );
+            sources.push(head(&work));
+        }
+        (dir, work, sources)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_disjoint_source_claims_a_second_lane_beside_a_gating_batch_1224() {
+        let (_dir, work, sources) = lane_workspace();
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &sources, None).await;
+        // The daemon source gates first (nothing else is gating: the plain claim).
+        let first = claim_batch_in_lanes(&store, 1).await.unwrap().unwrap();
+        assert_eq!(first.entries[0].id, ids[0]);
+        assert!(!first.parallel_lane);
+        // The TUI source shares no package with it: a second lane.
+        let second = claim_batch_in_lanes(&store, 1).await.unwrap().unwrap();
+        assert_eq!(second.entries[0].id, ids[1]);
+        assert!(second.parallel_lane);
+        // Two lanes at most.
+        assert!(claim_batch_in_lanes(&store, 1).await.unwrap().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_overlapping_or_unattributable_source_waits_for_the_gating_batch_1224() {
+        let (_dir, work, sources) = lane_workspace();
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        // daemon gates; `common` is a dependency of it and `manifest` is a
+        // Cargo.toml change: neither may share the gate, and the manifest
+        // entry behind `common` stays behind it.
+        let queue = [sources[0].clone(), sources[2].clone(), sources[3].clone()];
+        let ids = queue_all(&store, &work, &queue, None).await;
+        let first = claim_batch_in_lanes(&store, 1).await.unwrap().unwrap();
+        assert_eq!(first.entries[0].id, ids[0]);
+        assert!(claim_batch_in_lanes(&store, 1).await.unwrap().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn enqueue_warns_when_the_source_conflicts_with_an_entry_ahead_but_not_a_disjoint_one_2118() {
+        let (_dir, _origin, work) = repos();
+        let ahead = commit_file(&work, "ahead", "shared", "ahead");
+        let disjoint = commit_file(&work, "disjoint", "elsewhere", "x");
+        let conflicting = commit_file(&work, "conflicting", "shared", "other");
+        let queue = [(Uuid::new_v4(), 7, ahead), (Uuid::new_v4(), 8, disjoint)];
+        let warnings = queue_conflict_warnings(&work, &conflicting, &queue);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].code,
+            rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ENTRY
+        );
+        assert_eq!(warnings[0].entry_id, Some(queue[0].0));
+        assert_eq!(warnings[0].entry_sequence, Some(7));
+        assert_eq!(warnings[0].files, ["shared"]);
+        assert!(queue_conflict_warnings(&work, &queue[1].2, &queue[..1]).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn enqueue_warns_when_the_source_conflicts_with_the_rolling_tip_2118() {
+        let (_dir, _origin, work) = repos();
+        let stale = commit_file(&work, "stale", "shared", "stale");
+        sh(
+            &work,
+            "git checkout -q -B advance origin/rolling && printf 'tip\\n' > shared \
+             && git add shared && git commit -qm advance && git push -q origin HEAD:rolling \
+             && git fetch -q origin rolling",
+        );
+        let warnings = queue_conflict_warnings(&work, &stale, &[]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].code,
+            rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ROLLING
+        );
+        assert_eq!(warnings[0].entry_id, None);
+        assert_eq!(warnings[0].files, ["shared"]);
+    }
+
+    /// #3036 (the hub's #3022 case): a refused source that edits files a
+    /// queued entry ahead deletes is held by exactly that entry. A disjoint
+    /// entry, and an entry that only carries a rolling change the source
+    /// conflicts with, hold nothing; a spent budget holds nothing either.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_refused_source_is_held_only_by_an_entry_ahead_whose_own_change_conflicts_3036() {
+        let (_dir, _origin, work) = repos();
+        let advance = |file: &str, content: &str| {
+            sh(
+                &work,
+                &format!(
+                    "git checkout -q -B advance origin/rolling && printf '{content}\\n' > {file} \
+                     && git add {file} && git commit -qm advance && git push -q origin HEAD:rolling \
+                     && git fetch -q origin rolling"
+                ),
+            );
+        };
+        advance("dist", "built");
+        sh(
+            &work,
+            "git checkout -q -B untrack origin/rolling && git rm -q dist && git commit -qm untrack",
+        );
+        let untrack = head(&work);
+        let disjoint = commit_file(&work, "disjoint", "elsewhere", "x");
+        let source = commit_file(&work, "source", "dist", "rebuilt");
+        let stale = commit_file(&work, "stale", "shared", "stale");
+        advance("shared", "tip");
+        let carrier = commit_file(&work, "carrier", "unrelated", "y");
+        let queue = [
+            (Uuid::new_v4(), 1, untrack),
+            (Uuid::new_v4(), 2, disjoint),
+            (Uuid::new_v4(), 3, carrier),
+        ];
+        assert_eq!(
+            conflicting_entries_ahead(&work, &source, &queue, LAND_CONFLICT_SCAN_BUDGET),
+            vec![queue[0].0]
+        );
+        // `stale` conflicts with the rolling tip only; `carrier` carries that
+        // change but does not make it.
+        assert!(
+            conflicting_entries_ahead(&work, &stale, &queue, LAND_CONFLICT_SCAN_BUDGET).is_empty()
+        );
+        assert!(conflicting_entries_ahead(&work, &source, &queue, Duration::ZERO).is_empty());
+    }
+
+    /// #2907: a synthetic queue of 32 entries that all conflict with the new
+    /// source. An unbounded scan runs 32 probes (each several git processes);
+    /// the bounded one stops at its budget and says so.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_conflict_scan_of_a_long_conflicting_queue_stops_at_its_budget_2907() {
+        use rsi_common::rolling_queue::{
+            QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICTS_WITH_ENTRY,
+        };
+        let (_dir, _origin, work) = repos();
+        let queue: Vec<(Uuid, i64, String)> = (0..CONFLICT_PROBE_MAX_ENTRIES)
+            .map(|index| {
+                let sha = commit_file(
+                    &work,
+                    &format!("ahead{index}"),
+                    "shared",
+                    &format!("v{index}"),
+                );
+                (Uuid::new_v4(), i64::try_from(index).unwrap(), sha)
+            })
+            .collect();
+        let source = commit_file(&work, "source", "shared", "mine");
+
+        // Budget spent before the first probe: nothing is probed, the call
+        // returns at once and names the gap.
+        let started = std::time::Instant::now();
+        let warnings = queue_conflict_warnings_within(&work, &source, &queue, Duration::ZERO);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a spent budget must not probe: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, QUEUE_CONFLICT_SCAN_INCOMPLETE);
+        assert!(
+            warnings[0]
+                .detail
+                .contains(&format!("{} probe(s)", queue.len() + 1)),
+            "{}",
+            warnings[0].detail
+        );
+
+        // The production budget bounds the whole scan however slow git is, and
+        // a scan that finished carries no incomplete marker.
+        let started = std::time::Instant::now();
+        let warnings =
+            queue_conflict_warnings_within(&work, &source, &queue, ENQUEUE_CONFLICT_SCAN_BUDGET);
+        assert!(
+            started.elapsed() < ENQUEUE_CONFLICT_SCAN_BUDGET + Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let entry_warnings = warnings
+            .iter()
+            .filter(|warning| warning.code == QUEUE_CONFLICTS_WITH_ENTRY)
+            .count();
+        let incomplete = warnings
+            .iter()
+            .any(|warning| warning.code == QUEUE_CONFLICT_SCAN_INCOMPLETE);
+        assert!(
+            incomplete || entry_warnings == queue.len(),
+            "complete scan names every conflicting entry: {entry_warnings}"
+        );
+    }
+
+    /// #2912: the conflict scan resolves its rolling ref under the scan's
+    /// deadline: a stalled `rev-parse` is killed at the budget and reported as
+    /// an incomplete scan, never as "no rolling ref".
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_stalled_ref_resolve_ends_the_conflict_scan_at_its_budget_2912() {
+        let (_dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "shared", "mine");
+        stall_git(&work, "rev-parse");
+        let budget = Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let warnings = queue_conflict_warnings_within(&work, &source, &[], budget);
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].code,
+            rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE
+        );
+        assert!(
+            stalled_git_was_killed(&work),
+            "the stalled git must be killed"
+        );
+    }
+
+    /// #2912: every git read under `with_git_deadline` (`git` and `git grep`)
+    /// is killed at the deadline and the bound reports that it was hit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn git_reads_under_a_deadline_are_killed_when_it_passes_2912() {
+        let (_dir, _origin, work) = repos();
+        for subcommand in ["cat-file", "diff", "grep"] {
+            stall_git(&work, subcommand);
+            let started = std::time::Instant::now();
+            let ((answer, grep), hit) =
+                with_git_deadline(started + Duration::from_millis(500), || {
+                    (
+                        git(&work, &[subcommand, "-e", "x"]),
+                        git_grep_hits(&work, &["-e", "x"]),
+                    )
+                });
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "{subcommand}: {:?}",
+                started.elapsed()
+            );
+            assert!(hit, "{subcommand}: the deadline hit must be reported");
+            assert_eq!(answer, None, "{subcommand}");
+            assert_eq!(grep, None, "{subcommand}");
+            assert!(
+                stalled_git_was_killed(&work),
+                "{subcommand}: the stalled git must be killed"
+            );
+            std::fs::remove_file(work.join(".rsi-stall")).unwrap();
+        }
+        // No bound, no hit: a read that finishes is never reported as cut short.
+        let (answer, hit) =
+            with_git_deadline(std::time::Instant::now() + Duration::from_secs(30), || {
+                git(&work, &["rev-parse", "HEAD"])
+            });
+        assert!(answer.is_some() && !hit);
+    }
+
+    /// #2912: the rolling tip read behind the derivation wait is part of the
+    /// wait: a stalled `rev-parse` answers "not done" at the bound, killed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_stalled_tip_read_ends_the_derivation_wait_at_its_bound_2912() {
+        let (_dir, _origin, work) = repos();
+        let sha = head(&work);
+        stall_git(&work, "rev-parse");
+        let started = std::time::Instant::now();
+        let answer =
+            derive_test_filters_shared(&work, &sha, Some(Duration::from_millis(500))).await;
+        assert_eq!(
+            answer,
+            SharedDerivation::TipUnreadable,
+            "a stalled tip read is not a derivation in progress (#2993)"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            stalled_git_was_killed(&work),
+            "the stalled git must be killed"
+        );
+    }
+
+    /// #2907: a slow derivation outlives the call that stopped waiting, the
+    /// retry joins it instead of starting another, and a finished one is reused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_slow_filter_derivation_is_joined_by_the_retry_and_runs_once_2907() {
+        let (dir, repo) = rust_free_repo();
+        let head = git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let runs = dir.path().join("derive-runs");
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::write(
+            repo.join("scripts/check-touched-shards"),
+            format!(
+                "import json, time\nopen({runs:?}, 'a').write('x')\ntime.sleep(1.5)\nprint(json.dumps({{'suggested_filters': ['rsi=slow']}}))\n",
+                runs = runs.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let first =
+            derive_test_filters_shared(&repo, &head, Some(Duration::from_millis(200))).await;
+        assert_eq!(
+            first,
+            SharedDerivation::Running,
+            "still deriving at the bound"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "the bound held: {:?}",
+            started.elapsed()
+        );
+        let joined = derive_test_filters_shared(&repo, &head, Some(Duration::from_secs(30))).await;
+        assert_eq!(
+            joined,
+            SharedDerivation::Ready(vec!["rsi=slow".to_string()])
+        );
+        let reused = derive_test_filters_shared(&repo, &head, Some(Duration::from_secs(5))).await;
+        assert_eq!(
+            reused,
+            SharedDerivation::Ready(vec!["rsi=slow".to_string()]),
+            "a finished derivation is reused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runs).unwrap(),
+            "x",
+            "the checker ran once"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_source_git_cannot_probe_yields_no_conflict_warning_2118() {
+        let (_dir, _origin, work) = repos();
+        let sha = commit_file(&work, "solo", "solo", "s");
+        let missing = "0".repeat(40);
+        assert!(queue_conflict_warnings(&work, &sha, &[(Uuid::new_v4(), 1, missing)]).is_empty());
+    }
+
+    /// A source repository with a merge driver configured (config and
+    /// attributes) over `shared`, whose driver writes `marker`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn driver_repo(base: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (dir, origin, work) = repos();
+        let marker = dir.path().join("driver-ran");
+        sh(
+            &work,
+            &format!(
+                "printf '{base}' > shared && git add shared && git commit -qm base \
+                 && git push -q origin HEAD:rolling && git fetch -q origin rolling \
+                 && git config merge.review.driver 'printf invoked > {} ; exit 1' \
+                 && printf 'shared merge=review\\n' > .git/info/attributes \
+                 && printf 'shared merge=review\\n' > .gitattributes",
+                marker.display()
+            ),
+        );
+        (dir, origin, work)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn branch_edit(work: &Path, branch: &str, script: &str) -> String {
+        sh(
+            work,
+            &format!(
+                "git checkout -q -B {branch} origin/rolling && {script} && git add shared && git commit -qm {branch}"
+            ),
+        );
+        head(work)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn status_of(work: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_merge_probe_never_runs_a_configured_merge_driver_on_a_conflict_2706() {
+        let (dir, _origin, work) = driver_repo("one\\n");
+        let a = branch_edit(&work, "a", "printf 'two\\n' > shared");
+        let b = branch_edit(&work, "b", "printf 'three\\n' > shared");
+        let before = status_of(&work);
+        let warnings = queue_conflict_warnings(&work, &b, &[(Uuid::new_v4(), 1, a)]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].files, ["shared"]);
+        assert!(
+            !dir.path().join("driver-ran").exists(),
+            "the configured merge driver ran during the probe"
+        );
+        assert_eq!(status_of(&work), before, "the probe changed the source");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_merge_probe_uses_builtin_semantics_for_a_clean_merge_under_a_driver_2706() {
+        let (dir, _origin, work) = driver_repo("a\\nb\\nc\\nd\\ne\\nf\\ng\\n");
+        let a = branch_edit(&work, "a", "sed -i '1s/a/A/' shared");
+        let b = branch_edit(&work, "b", "sed -i '7s/g/G/' shared");
+        let before = status_of(&work);
+        assert!(queue_conflict_warnings(&work, &b, &[(Uuid::new_v4(), 1, a)]).is_empty());
+        assert!(!dir.path().join("driver-ran").exists());
+        assert_eq!(status_of(&work), before);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_rolling_merge_probe_tells_clean_from_conflict_from_unknown_348() {
+        let (_dir, _origin, work) = repos();
+        let conflicting = commit_file(&work, "a", "shared", "one");
+        let clean = commit_file(&work, "c", "other", "x");
+        sh(
+            &work,
+            "git checkout -q rolling && printf 'two\\n' > shared && git add shared \
+             && git commit -qm advance && git push -q origin rolling && git fetch -q origin",
+        );
+        assert_eq!(
+            rolling_merge_probe(&work, &conflicting),
+            RollingMergeProbe::Conflict(vec!["shared".to_owned()])
+        );
+        assert_eq!(rolling_merge_probe(&work, &clean), RollingMergeProbe::Clean);
+        assert_eq!(
+            rolling_merge_probe(&work, &"0".repeat(40)),
+            RollingMergeProbe::Unknown
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_merge_probe_past_its_timeout_is_killed_and_yields_no_warning_2706() {
+        let (dir, _origin, work) = repos();
+        let a = commit_file(&work, "a", "shared", "one");
+        let b = commit_file(&work, "b", "shared", "two");
+        let pid_file = dir.path().join("probe-pid");
+        let script = format!("echo $$ > {} ; exec sleep 60", pid_file.display());
+        let started = std::time::Instant::now();
+        let paths = merge_conflict_paths_with(
+            &work,
+            &a,
+            &b,
+            &["sh", "-c", &script, "hung-git"],
+            Duration::from_millis(500),
+        );
+        assert_eq!(paths, None, "a timed-out probe is never a verdict");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = unsafe { nix::libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the timed-out probe child was left running");
+    }
+
+    /// #2714: resolving a commit the source lacks must not lazy-fetch from a
+    /// promisor remote, which would run the configured upload-pack helper.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_merge_probe_preflight_never_runs_a_promisor_helper_for_a_missing_commit_2714() {
+        let (dir, _origin, work) = repos();
+        let present = commit_file(&work, "present", "shared", "one");
+        let marker = dir.path().join("helper-ran");
+        let helper = dir.path().join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho ran > {}\nexec sleep 60\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        sh(
+            &work,
+            &format!(
+                "chmod +x {helper} && git config remote.origin.promisor true \
+                 && git config remote.origin.partialclonefilter blob:none \
+                 && git config remote.origin.uploadpack {helper}",
+                helper = helper.display()
+            ),
+        );
+        let missing = "1".repeat(40);
+        let started = std::time::Instant::now();
+        // No launcher is injected: the default `git` runs, so the preflight
+        // reads are the only thing that could reach the helper.
+        let paths =
+            merge_conflict_paths_with(&work, &present, &missing, &["git"], Duration::from_secs(5));
+        assert_eq!(paths, None, "a missing commit is an unrunnable probe");
+        assert!(
+            started.elapsed() < Duration::from_secs(5) + Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            !marker.exists(),
+            "the probe preflight ran the configured upload-pack helper"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5452,6 +9803,281 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect()
     }
 
+    /// A sandbox worktree of `work`'s repository holding one new commit, like
+    /// the per-worker sandbox an Issue worker lands from (#1945).
+    fn sandbox_commit(work: &Path, name: &str) -> (PathBuf, String) {
+        let tree = work.parent().unwrap().join(format!("sandbox-{name}"));
+        sh(
+            work,
+            &format!(
+                "git worktree add -q -b {name} {} origin/rolling",
+                tree.display()
+            ),
+        );
+        sh(
+            &tree,
+            &format!("printf '{name}\\n' > {name} && git add {name} && git commit -qm {name}"),
+        );
+        let sha = head(&tree);
+        (tree, sha)
+    }
+
+    async fn queue_sandboxes(
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        sandboxes: &[(PathBuf, String)],
+        project: Option<Uuid>,
+    ) -> Vec<Uuid> {
+        let mut ids = Vec::new();
+        for (index, (tree, sha)) in sandboxes.iter().enumerate() {
+            ids.push(
+                queued_in_project(
+                    store,
+                    tree,
+                    sha,
+                    &format!("k{index}"),
+                    Uuid::new_v4(),
+                    project,
+                )
+                .await,
+            );
+        }
+        ids
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn sandboxes_of_one_repository_gate_as_one_batch_and_report_its_size() {
+        let (dir, _origin, work) = repos();
+        let sandboxes: Vec<(PathBuf, String)> = ["a", "b", "c"]
+            .iter()
+            .map(|name| sandbox_commit(&work, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(
+            dir.path(),
+            &work,
+            &log,
+            "echo 'gate_timing=shards=1 wall_secs=3'",
+        );
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_sandboxes(&store, &sandboxes, Some(Uuid::from_u128(0x1945))).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        // One gate for three sandboxes, settled in queue order.
+        assert_eq!(results.iter().map(|r| r.0).collect::<Vec<_>>(), ids);
+        let runs = lander_runs(&log);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(log_lines(&log).iter().filter(|l| *l == "push").count(), 1);
+        for (_, sha) in &sandboxes {
+            assert!(
+                runs[0].contains(&format!("--accepted {sha}")),
+                "{}",
+                runs[0]
+            );
+            assert!(is_ancestor_of_origin(&work, sha));
+        }
+        for id in ids {
+            let entry = entry_of(&store, id).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Published);
+            assert_eq!(
+                entry.outcome.unwrap().detail.as_deref(),
+                Some("gate_timing=shards=1 wall_secs=3 batch_size=3")
+            );
+        }
+        let guard = store.lock().await;
+        let members: i64 = guard
+            .conn
+            .query_row("SELECT member_count FROM rolling_queue_batches", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(members, 3);
+        let formed = events_of(&guard, "batch_formed");
+        assert_eq!(formed.len(), 1);
+        assert_eq!(formed[0]["members"], 3);
+        assert_eq!(formed[0]["checkouts"], 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn other_projects_and_other_repositories_never_join_a_batch() {
+        let (dir, _origin, work) = repos();
+        let (_other_dir, _other_origin, other_work) = repos();
+        let (a, b, c) = (
+            sandbox_commit(&work, "a"),
+            sandbox_commit(&work, "b"),
+            sandbox_commit(&work, "c"),
+        );
+        let foreign = commit_file(&other_work, "x", "x", "x");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let (project, other_project) = (Some(Uuid::from_u128(0x1945)), Some(Uuid::from_u128(0x2)));
+        let first = queue_sandboxes(&store, &[a.clone()], project).await[0];
+        let foreign_id =
+            queued_in_project(&store, &other_work, &foreign, "kf", Uuid::new_v4(), project).await;
+        let second = queued_in_project(&store, &b.0, &b.1, "kb", Uuid::new_v4(), project).await;
+        let third =
+            queued_in_project(&store, &c.0, &c.1, "kc", Uuid::new_v4(), other_project).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        // Only the head's project and repository gated together.
+        assert_eq!(
+            results.iter().map(|r| r.0).collect::<Vec<_>>(),
+            [first, second]
+        );
+        let runs = lander_runs(&log);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].contains(&a.1) && runs[0].contains(&b.1));
+        assert!(!runs[0].contains(&c.1) && !runs[0].contains(&foreign));
+        for id in [foreign_id, third] {
+            assert_eq!(
+                entry_of(&store, id).await.state,
+                RollingQueueEntryState::Queued
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_red_sandbox_member_is_isolated_and_the_others_still_publish() {
+        let (dir, _origin, work) = repos();
+        let sandboxes: Vec<(PathBuf, String)> = ["a", "b", "c"]
+            .iter()
+            .map(|name| sandbox_commit(&work, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let guard = red_when_any(&[(sandboxes[1].1.as_str(), "q::red_b")]);
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_sandboxes(&store, &sandboxes, Some(Uuid::from_u128(0x1945))).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3, "every member settles exactly once");
+        assert_isolated_red(&store, ids[1], "q::red_b").await;
+        assert_landed(&store, &work, ids[0], &sandboxes[0].1).await;
+        assert_landed(&store, &work, ids[2], &sandboxes[2].1).await;
+        assert!(!is_ancestor_of_origin(&work, &sandboxes[1].1));
+        assert_eq!(wake_count(&store).await, 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_member_whose_commit_is_gone_is_refused_typed_and_the_rest_gate() {
+        let (dir, _origin, work) = repos();
+        let live = sandbox_commit(&work, "a");
+        let (second_tree, _) = sandbox_commit(&work, "b");
+        let pruned = "1".repeat(40);
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let project = Some(Uuid::from_u128(0x1945));
+        let kept = queued_in_project(&store, &live.0, &live.1, "k0", Uuid::new_v4(), project).await;
+        let gone =
+            queued_in_project(&store, &second_tree, &pruned, "k1", Uuid::new_v4(), project).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 2, "no member is dropped");
+        let refused = entry_of(&store, gone).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let outcome = refused.outcome.unwrap();
+        assert_eq!(outcome.refusal.as_deref(), Some(QUEUE_SOURCE_UNREACHABLE));
+        let detail = outcome.detail.unwrap();
+        assert!(
+            detail.contains(&pruned) && detail.contains("re-enqueue"),
+            "{detail}"
+        );
+        assert_landed(&store, &work, kept, &live.1).await;
+        let runs = lander_runs(&log);
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].contains(&pruned), "{}", runs[0]);
+        assert_eq!(wake_count(&store).await, 2);
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "source_unreachable").len(), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_batch_from_one_checkout_is_left_to_the_lander() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let id = queued(&store, &work, &sha, "k").await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            entry_of(&store, id).await.state,
+            RollingQueueEntryState::Published
+        );
+        let guard = store.lock().await;
+        assert!(events_of(&guard, "batch_formed").is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn checkouts_of_one_repository_share_an_identity_and_a_vanished_one_keeps_its_path() {
+        let (dir, _origin, work) = repos();
+        let (first, _) = sandbox_commit(&work, "a");
+        let (second, _) = sandbox_commit(&work, "b");
+        let (_other_dir, _other_origin, other_work) = repos();
+        let key = |path: &Path| repository_key(&path.display().to_string());
+        assert_eq!(key(&first), key(&second));
+        assert_eq!(key(&first), key(&work));
+        assert_ne!(key(&first), key(&other_work));
+        assert!(key(&first).starts_with("git:"));
+        let gone = dir.path().join("reclaimed");
+        assert_eq!(key(&gone), format!("path:{}", gone.display()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_gate_timing_line_carries_the_batch_size_and_other_details_are_untouched() {
+        let detail = "gate_timing=shards=2 wall_secs=30\nfailing tests: q::red".to_string();
+        assert_eq!(
+            note_batch_size(Some(detail), 4).as_deref(),
+            Some("gate_timing=shards=2 wall_secs=30 batch_size=4\nfailing tests: q::red")
+        );
+        let untimed = "lander refused".to_string();
+        assert_eq!(note_batch_size(Some(untimed.clone()), 4), Some(untimed));
+        assert_eq!(note_batch_size(None, 4), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_batch_workspace_failure_keeps_the_first_checkouts_typed_refusal() {
+        let (dir, _origin, work) = repos();
+        let (first, _) = sandbox_commit(&work, "a");
+        let (second, _) = sandbox_commit(&work, "b");
+        let mut launcher = fake_lander(dir.path(), "exit 0");
+        launcher.workspace = Some(dir.path().join("queue"));
+        launcher.fence_abi = || Ok(2);
+        let checkouts = [first.display().to_string(), second.display().to_string()];
+        let error = queue_repo_for_batch(&launcher, &checkouts)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with(write_fence::UNSUPPORTED_CODE), "{error}");
+    }
+
+    /// A head whose sandbox was reclaimed does not fail the batch: the queue
+    /// checkout is made from the next member's checkout. Skipped on a host
+    /// without the write fence the queue worktree needs (#1160).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_reclaimed_head_checkout_does_not_stop_the_batch_workspace() {
+        if write_fence::require_abi(WriteFence::kernel_abi()).is_err() {
+            return;
+        }
+        let (dir, _origin, work) = repos();
+        let (live, _) = sandbox_commit(&work, "a");
+        let mut launcher = fake_lander(dir.path(), "exit 0");
+        launcher.workspace = Some(dir.path().join("queue"));
+        let gone = dir.path().join("reclaimed-sandbox").display().to_string();
+        let checkouts = [gone, live.display().to_string()];
+        let repo = queue_repo_for_batch(&launcher, &checkouts).await.unwrap();
+        assert!(
+            repo.starts_with(dir.path().join("queue/worktrees")),
+            "{repo:?}"
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_red_gate_event_names_the_failing_tests_and_a_log_that_exists() {
@@ -5533,12 +10159,58 @@ echo published_target_id=$(git rev-parse HEAD)
         for _ in 0..(RUN_LOG_KEEP_FILES + 7) {
             last = write_run_log(dir.path(), batch, "hdr", &big, "err");
         }
-        let count = std::fs::read_dir(dir.path()).unwrap().count();
-        assert_eq!(count, RUN_LOG_KEEP_FILES);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let logs = names.iter().filter(|name| name.ends_with(".log")).count();
+        let sidecars = names
+            .iter()
+            .filter(|name| name.ends_with(".timings.tsv"))
+            .count();
+        assert_eq!((logs, sidecars), (RUN_LOG_KEEP_FILES, RUN_LOG_KEEP_FILES));
         let last = last.unwrap();
         assert!(last.exists(), "the newest log survives rotation");
         let size = std::fs::metadata(&last).unwrap().len() as usize;
         assert!(size < RUN_LOG_STREAM_BYTES + 512, "{size}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn each_gate_receives_a_timing_sidecar_next_to_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = fake_lander(
+            dir.path(),
+            "printf 'candidate-0\\trsid\\ta::test\\t1.234\\tPASS\\n' >> \"$RSI_LANDER_TEST_TIMINGS\"",
+        )
+        .with_workspace(dir.path().join("queue"));
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let run = run_group(
+            &store,
+            &launcher,
+            Uuid::new_v4(),
+            dir.path(),
+            &[],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        let log = run.log_path.unwrap();
+        assert!(log.is_file());
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("timings.tsv")).unwrap(),
+            concat!(
+                "run\tbinary\ttest\tseconds\tstatus\n",
+                "candidate-0\trsid\ta::test\t1.234\tPASS\n"
+            )
+        );
+        assert!(
+            run.result
+                .outcome
+                .detail
+                .unwrap()
+                .contains(&log.display().to_string())
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5605,6 +10277,146 @@ echo published_target_id=$(git rev-parse HEAD)
             .query_row("SELECT state FROM rolling_queue_batches", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "published");
+    }
+
+    /// A batch of four where source `d` is red and the failure output names
+    /// `named` files (rustc `-->` lines). Returns the store, shas, ids, runs.
+    async fn red_naming(
+        named: &[&str],
+    ) -> (
+        Arc<tokio::sync::Mutex<Store>>,
+        Vec<String>,
+        Vec<Uuid>,
+        Vec<usize>,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        red_naming_at(3, named).await
+    }
+
+    /// Like `red_naming`, with member `red` (index) the red one.
+    async fn red_naming_at(
+        red: usize,
+        named: &[&str],
+    ) -> (
+        Arc<tokio::sync::Mutex<Store>>,
+        Vec<String>,
+        Vec<Uuid>,
+        Vec<usize>,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let locations: String = named
+            .iter()
+            .map(|file| format!("echo ' --> {file}:1:1' >&2\n"))
+            .collect();
+        let guard = format!(
+            "case \" $* \" in *\" {} \"*) echo 'error[E0425]: boom' >&2\n{locations}\
+             echo publication_status=not_published; exit 1;; esac",
+            shas[red]
+        );
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 4, "every member settles exactly once");
+        let counts = lander_runs(&log)
+            .iter()
+            .map(|r| r.matches("--accepted").count())
+            .collect();
+        (store, shas, ids, counts, work, dir)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_failure_in_files_only_one_member_changes_refuses_it_and_regates_the_rest_whole() {
+        let (store, shas, ids, counts, work, _dir) = red_naming(&["d"]).await;
+        // batch (red, names only d's file), then [a,b,c] as one batch (green):
+        // that confirms d, and nothing is bisected.
+        assert_eq!(counts, vec![4, 3]);
+        let refused = entry_of(&store, ids[3]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let outcome = refused.outcome.unwrap();
+        assert_eq!(outcome.refusal.as_deref(), Some("gate_failed"));
+        let detail = outcome.detail.unwrap();
+        assert!(
+            detail.contains("outcome_reason=attributed_confirmed"),
+            "{detail}"
+        );
+        assert!(detail.contains("bisect_rounds=1"), "{detail}");
+        for index in 0..3 {
+            assert_landed(&store, &work, ids[index], &shas[index]).await;
+            let detail = entry_of(&store, ids[index]).await.outcome.unwrap().detail;
+            let detail = detail.unwrap();
+            assert!(detail.contains("bisect_rounds=1"), "{detail}");
+            assert!(
+                detail.contains("outcome_reason=published_after_bisect"),
+                "{detail}"
+            );
+        }
+        assert!(!is_ancestor_of_origin(&work, &shas[3]));
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "bisect_attributed").len(), 1);
+        assert_eq!(events_of(&guard, "bisect_attribution_confirmed").len(), 1);
+        assert!(events_of(&guard, "bisect_attribution_rejected").is_empty());
+        assert!(events_of(&guard, "bisect_isolated").is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_wrong_attribution_is_rejected_by_a_red_complement_and_the_member_stays_in_play() {
+        // b is the red source, but the failure output names only d's file.
+        let (store, shas, ids, counts, work, _dir) = red_naming_at(1, &["d"]).await;
+        // batch (red, names d), complement [a,b,c] (red: rejected), then the
+        // halving bisect: [a,b] (red), [a] (green), b isolated, tail [c,d] green.
+        assert_eq!(counts, vec![4, 3, 2, 1, 2]);
+        let refused = entry_of(&store, ids[1]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let detail = refused.outcome.unwrap().detail.unwrap();
+        assert!(
+            detail.contains("outcome_reason=attribution_rejected"),
+            "{detail}"
+        );
+        for index in [0, 2, 3] {
+            assert_landed(&store, &work, ids[index], &shas[index]).await;
+        }
+        // The wrongly attributed member was not refused: it landed.
+        assert!(is_ancestor_of_origin(&work, &shas[3]));
+        assert!(!is_ancestor_of_origin(&work, &shas[1]));
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "bisect_attributed").len(), 1);
+        assert_eq!(events_of(&guard, "bisect_attribution_rejected").len(), 1);
+        assert!(events_of(&guard, "bisect_attribution_confirmed").is_empty());
+        assert_eq!(events_of(&guard, "bisect_isolated").len(), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_failure_naming_files_two_members_change_is_bisected_and_reports_its_rounds() {
+        // The output names a's and d's files: no single member owns it.
+        let (store, shas, ids, counts, work, _dir) = red_naming(&["a", "d"]).await;
+        // batch (red), [a,b] (green), [c] (green), d isolated: the bisect ran.
+        assert_eq!(counts, vec![4, 2, 1]);
+        let refused = entry_of(&store, ids[3]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let detail = refused.outcome.unwrap().detail.unwrap();
+        assert!(
+            detail.contains("outcome_reason=bisect_isolated"),
+            "{detail}"
+        );
+        assert!(detail.contains("bisect_rounds=2"), "{detail}");
+        for index in 0..3 {
+            assert_landed(&store, &work, ids[index], &shas[index]).await;
+        }
+        let guard = store.lock().await;
+        assert!(events_of(&guard, "bisect_attributed").is_empty());
+        assert_eq!(events_of(&guard, "bisect_isolated").len(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5734,7 +10546,7 @@ echo published_target_id=$(git rev-parse HEAD)
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn the_out_of_band_regate_budget_is_spent_once_across_the_whole_bisect() {
+    async fn every_run_of_a_bisect_gets_the_batch_wall_time_not_a_regate_count() {
         let (dir, _origin, work) = repos();
         let shas: Vec<String> = ["a", "b", "c", "d"]
             .iter()
@@ -5750,15 +10562,17 @@ echo published_target_id=$(git rev-parse HEAD)
         let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
         queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
-        let budgets: Vec<String> = log_lines(&log)
-            .into_iter()
-            .filter_map(|line| line.strip_prefix("regates ").map(str::to_string))
-            .collect();
+        // #1940: the tip keeps moving, yet no run is refused for a spent
+        // count: each is given the wall time the one batch deadline has left.
+        let budgets = budgets(&log);
         assert!(budgets.len() >= 3, "{budgets:?}");
-        assert_eq!(budgets[0], "1");
         assert!(
-            budgets[1..].iter().all(|budget| budget == "0"),
-            "the batch has one re-gate in total: {budgets:?}"
+            budgets.iter().all(|secs| (3000..=3600).contains(secs)),
+            "{budgets:?}"
+        );
+        assert!(
+            budgets.windows(2).all(|pair| pair[1] <= pair[0]),
+            "the batch's one deadline only shrinks: {budgets:?}"
         );
     }
 
@@ -6061,46 +10875,121 @@ echo published_target_id=$(git rev-parse HEAD)
         assert_eq!(wake_count(&store).await, 2);
     }
 
+    /// #2023: the red names only b's file, so b is held back and the complement
+    /// [a] is gated. An external fix lands while it gates, so [a] is green on a
+    /// different base than the red: that must not confirm the stale attribution.
+    /// b goes back to pending, is gated on the current tip, and publishes.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn two_external_advances_between_runs_spend_one_regate_then_settle_exhausted() {
+    async fn an_external_fix_during_the_complement_gate_regates_the_attributed_member() {
         let (dir, _origin, work) = repos();
-        let shas: Vec<String> = ["a", "b", "c", "d"]
+        let shas: Vec<String> = ["a", "b"]
             .iter()
             .map(|name| commit_file(&work, name, name, name))
             .collect();
         let log = dir.path().join("lander.log");
-        // Every run is red and someone else pushes right after it, between runs.
         let guard = external_push_guard(
             &work,
             &log,
             &format!(
-                "case \" $* \" in *\" {a} \"*|*\" {d} \"*) echo 'test q::x ... FAILED' >&2; red=1;; esac\n\
-                 if [ $red = 1 ]; then echo fetched_target_id=$(git rev-parse origin/rolling); \
-                 ext e$n; echo publication_status=not_published; exit 1; fi",
-                a = shas[0],
-                d = shas[3]
+                "if ! git cat-file -e origin/rolling:fix 2>/dev/null; then \
+                 case \" $* \" in *\" {b} \"*) echo 'error[E0425]: boom' >&2; \
+                 echo ' --> b:1:1' >&2; red=1;; esac; fi\n\
+                 if [ $n = 2 ]; then ext fix; fi\n\
+                 if [ $red = 1 ]; then echo publication_status=not_published; exit 1; fi",
+                b = shas[1]
             ),
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
         let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
-        assert_eq!(results.len(), 4);
-        assert_eq!(lander_runs(&log).len(), 2, "no unbounded loop");
-        let budgets: Vec<String> = log_lines(&log)
-            .into_iter()
-            .filter_map(|line| line.strip_prefix("regates ").map(str::to_string))
+        assert_eq!(results.len(), 2, "every member settles exactly once");
+        assert_landed(&store, &work, ids[0], &shas[0]).await;
+        assert_landed(&store, &work, ids[1], &shas[1]).await;
+        assert_eq!(lander_runs(&log).len(), 3, "batch, [a], then b re-gated");
+        assert_eq!(wake_count(&store).await, 2);
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "bisect_attributed").len(), 1);
+        assert_eq!(events_of(&guard, "bisect_attribution_stale").len(), 1);
+        assert!(events_of(&guard, "bisect_attribution_confirmed").is_empty());
+        assert!(events_of(&guard, "bisect_isolated").is_empty());
+    }
+
+    /// #2024: the held member itself reaches rolling out of band while the
+    /// complement gates. It settles published, once, and is never refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_held_member_that_lands_out_of_band_during_the_complement_gate_settles_published() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
             .collect();
-        assert_eq!(budgets, vec!["1", "0"]);
-        for id in ids {
-            let entry = entry_of(&store, id).await;
-            assert_eq!(entry.state, RollingQueueEntryState::Refused);
-            assert_eq!(
-                entry.outcome.unwrap().refusal.as_deref(),
-                Some(QUEUE_REGATE_EXHAUSTED)
-            );
+        let log = dir.path().join("lander.log");
+        let guard = external_push_guard(
+            &work,
+            &log,
+            &format!(
+                "case \" $* \" in *\" {b} \"*) echo 'error[E0425]: boom' >&2; \
+                 echo ' --> b:1:1' >&2; red=1;; esac\n\
+                 if [ $n = 2 ]; then ( cd {work} && git fetch -q origin rolling \
+                 && git checkout -q -B ext origin/rolling && git merge -q --no-edit {b} \
+                 && git push -q origin HEAD:rolling ) >/dev/null 2>&1; fi\n\
+                 if [ $red = 1 ]; then echo publication_status=not_published; exit 1; fi",
+                b = shas[1],
+                work = work.display()
+            ),
+        );
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 2, "every member settles exactly once");
+        assert_landed(&store, &work, ids[0], &shas[0]).await;
+        let held = entry_of(&store, ids[1]).await;
+        assert_eq!(held.state, RollingQueueEntryState::Published);
+        assert!(is_ancestor_of_origin(&work, &shas[1]));
+        assert_eq!(wake_count(&store).await, 2);
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "already_landed").len(), 1);
+        assert!(events_of(&guard, "bisect_attribution_confirmed").is_empty());
+    }
+
+    /// #1940: an external push after each of the first two runs no longer
+    /// exhausts a count of one re-gate. Each stale red is gated again within
+    /// the batch's wall time, and the third run, on the final tip, publishes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn two_external_advances_between_runs_are_regated_within_the_wall_time_budget() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        // The first two runs are red and someone else pushes right after each.
+        let guard = external_push_guard(
+            &work,
+            &log,
+            "if [ $n -le 2 ]; then echo 'test q::x ... FAILED' >&2; red=1; fi\n\
+             if [ $red = 1 ]; then echo fetched_target_id=$(git rev-parse origin/rolling); \
+             ext e$n; echo publication_status=not_published; exit 1; fi",
+        );
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(lander_runs(&log).len(), 3, "two stale reds, then green");
+        for (id, sha) in ids.iter().zip(&shas) {
+            assert_landed(&store, &work, *id, sha).await;
         }
+        let budgets = budgets(&log);
+        assert!(
+            budgets.iter().all(|secs| (3000..=3600).contains(secs)),
+            "{budgets:?}"
+        );
         assert_eq!(wake_count(&store).await, 4);
     }
 
@@ -6208,7 +11097,7 @@ echo published_target_id=$(git rev-parse HEAD)
     ) -> LanderLauncher {
         let body = r#"
 echo "run $*" >> @LOG@
-echo "regates $RSI_LANDER_MAX_REGATED_STALE_RETRIES" >> @LOG@
+echo "budget $RSI_LANDER_REGATE_BUDGET_SECS" >> @LOG@
 n=$(grep -c '^run ' @LOG@)
 ext() { ( cd @WORK@ && git fetch -q origin rolling \
     && git checkout -q -B ext origin/rolling && printf x > "$1" && git add "$1" \
@@ -6224,12 +11113,6 @@ git fetch -q origin rolling
 fetched=$(git rev-parse origin/rolling)
 stale=""
 if [ -n "$expected" ] && [ "$expected" != "$fetched" ]; then
-  if [ "$RSI_LANDER_MAX_REGATED_STALE_RETRIES" = 0 ]; then
-    echo 'lander: stale retries exhausted: advanced before the initial fetch' >&2
-    echo publication_status=not_published
-    echo fetched_target_id=$fetched
-    exit 1
-  fi
   stale="stale_retry_1=$expected..$fetched:regated"
 fi
 red=0
@@ -6269,10 +11152,11 @@ exit 0
         fake_lander(dir, &body)
     }
 
-    fn budgets(log: &Path) -> Vec<String> {
+    /// The wall-time re-gate budget (seconds) each lander run was given.
+    fn budgets(log: &Path) -> Vec<u64> {
         log_lines(log)
             .into_iter()
-            .filter_map(|line| line.strip_prefix("regates ").map(str::to_string))
+            .filter_map(|line| line.strip_prefix("budget ")?.parse().ok())
             .collect()
     }
 
@@ -6308,29 +11192,28 @@ exit 0
         assert_landed(&store, &work, ids[0], &shas[0]).await;
         assert_landed(&store, &work, ids[1], &shas[1]).await;
         assert_eq!(lander_runs(&log).len(), 3, "batch, [a], then b re-gated");
-        assert_eq!(
-            budgets(&log),
-            vec!["1", "1", "0"],
-            "the external descendant spent the batch's regate"
+        assert!(
+            budgets(&log).iter().all(|secs| *secs > 0),
+            "the external descendant is re-gated within the wall time"
         );
         assert_eq!(wake_count(&store).await, 2);
     }
 
     /// Finding 3: a push after the queue's probe but before the lander's
-    /// initial fetch is charged through `--expected-tip`. With the budget
-    /// already spent the lander refuses, and the queue settles the remainder
-    /// as `queue_out_of_band_regate_exhausted` instead of gating it.
+    /// initial fetch is reported through `--expected-tip`. #1940: it is gated
+    /// on the fetched tip within the batch's wall time, never refused for a
+    /// spent count, so the green remainder publishes.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_push_between_the_probe_and_the_lander_fetch_spends_the_batch_regate() {
+    async fn a_push_between_the_probe_and_the_lander_fetch_is_regated_not_refused() {
         let (dir, _origin, work) = repos();
         let shas: Vec<String> = ["a", "b", "c"]
             .iter()
             .map(|name| commit_file(&work, name, name, name))
             .collect();
         let log = dir.path().join("lander.log");
-        // Run 2 is hit by a push right after the queue probed (charged, so the
-        // budget is spent); run 4 (`[b, c]`) is hit by a second one.
+        // Run 2 is hit by a push right after the queue probed; run 4
+        // (`[b, c]`) is hit by a second one.
         let launcher = racing_lander(
             dir.path(),
             &work,
@@ -6349,21 +11232,10 @@ exit 0
         for run in &runs[1..] {
             assert!(run.contains("--expected-tip"), "{runs:?}");
         }
-        assert_eq!(
-            budgets(&log),
-            vec!["1", "1", "0", "0"],
-            "the probe-to-fetch push in run 2 spent the regate"
-        );
+        assert!(budgets(&log).iter().all(|secs| *secs > 0));
         assert_isolated_red(&store, ids[0], "q::red").await;
-        for id in &ids[1..] {
-            let entry = entry_of(&store, *id).await;
-            assert_eq!(entry.state, RollingQueueEntryState::Refused);
-            assert_eq!(
-                entry.outcome.unwrap().refusal.as_deref(),
-                Some(QUEUE_REGATE_EXHAUSTED)
-            );
-        }
-        assert!(!is_ancestor_of_origin(&work, &shas[1]));
+        assert_landed(&store, &work, ids[1], &shas[1]).await;
+        assert_landed(&store, &work, ids[2], &shas[2]).await;
     }
 
     /// A provisional source published while an external migration landed
@@ -6497,6 +11369,63 @@ exit 0
                 .detail
                 .unwrap_or_default()
                 .contains("landed outside the queue")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_content_equivalent_source_settles_published_at_the_containing_tip() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "same", "accepted");
+        let tip = commit_file(&work, "equivalent", "same", "accepted");
+        assert_ne!(source, tip);
+        sh(
+            &work,
+            &format!("git push -q origin {tip}:refs/heads/rolling"),
+        );
+        assert_eq!(
+            verify_ancestry(&work, std::slice::from_ref(&source)),
+            vec![Ancestry::NotAncestor]
+        );
+        let launcher = fake_lander(
+            dir.path(),
+            &format!(
+                "echo publication_status=published\necho landing_outcome=already_on_rolling\necho fetched_target_id={tip}\necho candidate_id={tip}\necho published_target_id={tip}\n"
+            ),
+        );
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let id = queued(&store, &work, &source, "already-contained").await;
+        let (settled, result) = run_next(&store, &launcher).await.unwrap().unwrap();
+        assert_eq!(settled, id);
+        assert_eq!(result.state, RollingQueueEntryState::Published);
+        let entry = entry_of(&store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Published);
+        let outcome = entry.outcome.unwrap();
+        assert_eq!(outcome.landed_sha, Some(tip));
+        assert_eq!(outcome.refusal, None);
+        assert!(outcome.detail.unwrap().starts_with("already_on_rolling"));
+        assert_eq!(wake_count(&store).await, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_already_on_rolling_receipt_still_requires_its_tip_on_rolling() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "same", "accepted");
+        let launcher = fake_lander(
+            dir.path(),
+            &format!(
+                "echo publication_status=published\necho landing_outcome=already_on_rolling\necho published_target_id={source}\n"
+            ),
+        );
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let id = queued(&store, &work, &source, "unconfirmed-tip").await;
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        let entry = entry_of(&store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Failed);
+        assert_eq!(
+            entry.outcome.unwrap().refusal.as_deref(),
+            Some(QUEUE_BATCH_ANCESTRY_UNVERIFIED)
         );
     }
 
@@ -6699,7 +11628,12 @@ exit 0
             .collect();
         let log = dir.path().join("lander.log");
         let pid_file = dir.path().join("sleeper.pid");
-        let guard = format!("sleep 60 & echo $! > {pid}; wait", pid = pid_file.display());
+        let term_file = dir.path().join("lander-term");
+        let guard = format!(
+            "trap 'touch {term}; while :; do sleep 1; done' TERM; sleep 60 & echo $! > {pid}; wait",
+            pid = pid_file.display(),
+            term = term_file.display(),
+        );
         let launcher = merging_lander(dir.path(), &work, &log, &guard)
             .with_gate_timeout(Duration::from_secs(2));
         let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
@@ -6727,6 +11661,10 @@ exit 0
             assert!(!is_ancestor_of_origin(&work, sha));
         }
         // The lander's process group, its children included, was stopped.
+        assert!(
+            term_file.exists(),
+            "the lander received SIGTERM before escalation"
+        );
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
         let mut alive = true;
@@ -6737,10 +11675,24 @@ exit 0
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(!alive, "the lander's child outlived the timeout");
+        assert!(!alive, "the lander's child outlived timeout escalation");
         let guard = store.lock().await;
         assert_eq!(events_of(&guard, "gate_timeout").len(), 1);
         drop(guard);
         assert_eq!(wake_count(&store).await, 2);
+    }
+
+    /// #1940: a stuck gate holds the queue for an hour at most by default, and
+    /// the lander learns the batch's remaining wall time as its re-gate budget.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_default_gate_timeout_is_an_hour() {
+        assert_eq!(ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS, 60);
+        let launcher = LanderLauncher::new(PathBuf::from("rsi-rolling-land"));
+        assert_eq!(launcher.gate_timeout(), Duration::from_secs(60 * 60));
+        assert!(
+            ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS as u64
+                >= rsi_common::rolling_queue::ROLLING_QUEUE_MIN_GATE_TIMEOUT_MINS
+        );
     }
 }

@@ -10,8 +10,6 @@ use std::path::Path;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-pub(super) const COMPLETION_GATE_STREAM_EVENT: &str = "completion_gate";
-
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionGateOutcome {
     pub(crate) success: bool,

@@ -7,17 +7,25 @@
 //! Appointment needs an existing live leaf session, so the flow launches
 //! first. A launch that succeeds but whose appointment is refused keeps the
 //! launched session id: Enter retries only the appointment.
+//!
+//! #2237: the form has a Grant field. Enter on it opens the grant editor
+//! (`overlay::grant_editor`) in place of the form: the global seat's launch
+//! allowlist and the policy it saves for its project managers, or a project
+//! manager's own policy. The editor starts from the grant the seat holds (or
+//! the defaults), is checked before submit and goes out with the appointment.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::global_manager::{ConfigureGlobalManagerRequestV1, GlobalManagerGrantV1};
+use rsi_common::harness_manager::HarnessManagerScopeModeV1;
 use rsi_common::harness_manager_presets::ManagerPolicyPreset;
-use rsi_common::harness_manager_v2::ManagerLaunchChoiceV2;
+use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
 use rsi_common::types::{Project, SessionKind, SessionProvider};
 use uuid::Uuid;
 
 use crate::app::App;
 use crate::overlay::global_manager_command::{default_allowed_launches, default_project_policy};
-use crate::types::{ManagerLaunchPlan, ManagerLaunchScope};
+use crate::overlay::grant_editor::{GrantEditor, GrantKey};
+use crate::types::{ManagerAppointment, ManagerLaunchPlan, ManagerLaunchScope};
 
 /// The most projects one global grant may hold (`ConfigureGlobalManager`).
 pub const MAX_SCOPE_PROJECTS: usize = 64;
@@ -40,18 +48,21 @@ pub enum LaunchField {
     Scope,
     /// The project the global seat's session lives in (global role only).
     Host,
+    /// #2237: what the manager may do; Enter opens the grant editor.
+    Grant,
     Prompt,
     Submit,
 }
 
 impl LaunchField {
-    const ORDER: [Self; 8] = [
+    const ORDER: [Self; 9] = [
         Self::Role,
         Self::Provider,
         Self::Model,
         Self::Effort,
         Self::Scope,
         Self::Host,
+        Self::Grant,
         Self::Prompt,
         Self::Submit,
     ];
@@ -65,6 +76,7 @@ impl LaunchField {
             Self::Effort => "Effort",
             Self::Scope => "Scope",
             Self::Host => "Host",
+            Self::Grant => "Grant",
             Self::Prompt => "Prompt",
             Self::Submit => "",
         }
@@ -80,7 +92,7 @@ pub struct ScopeEntry {
 }
 
 /// A validated request, ready to launch and appoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaunchRequest {
     pub role: LaunchRole,
     pub launch: ManagerLaunchChoiceV2,
@@ -90,6 +102,20 @@ pub struct LaunchRequest {
     pub scope: Vec<Uuid>,
     pub prompt: String,
     pub title: String,
+    /// #2237: the grant the operator edited; `None` keeps the grant the seat
+    /// holds (or the defaults), exactly as before the editor existed.
+    pub grant: Option<GrantChoice>,
+}
+
+/// The grant an operator chose in the editor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantChoice {
+    /// The global grant's launch allowlist (a project manager's launches
+    /// live inside `policy`).
+    pub launches: Vec<ManagerLaunchChoiceV2>,
+    /// The policy body: the global grant's `project_policy`, or the project
+    /// manager's own policy.
+    pub policy: ManagerPolicyV2,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +146,43 @@ pub struct LaunchForm {
     /// The tab's project when the form opened: the global seat's home when
     /// it is in scope.
     pub active_project: Option<Uuid>,
+    /// #1902: "Prefilled from grant vN ..." with the diff from defaults when
+    /// the global appointment will start from the last revoked root grant.
+    pub prefill_note: Option<String>,
+    /// #2237: the grant editor for the current seat.
+    pub grant: GrantEditor,
+    /// The editor the global seat starts from (the held grant, else the last
+    /// revoked one, else the defaults), kept so a role round trip returns to
+    /// it instead of the defaults (#2335).
+    global_seed: GrantEditor,
+    /// The grant editor shows in place of the form.
+    pub grant_open: bool,
+    /// The operator opened the editor: its draft is what is granted.
+    pub grant_visited: bool,
+}
+
+/// The editor a seat starts with: the grant the global seat holds (when one
+/// is active), else the defaults; a project manager starts from the defaults.
+fn seed_grant(role: LaunchRole, grant: Option<&GlobalManagerGrantV1>) -> GrantEditor {
+    match role {
+        LaunchRole::Global => match grant.filter(|grant| grant.state == "active") {
+            Some(grant) => GrantEditor::for_global(
+                grant.project_policy.clone(),
+                grant.allowed_launches.clone(),
+                default_allowed_launches(),
+            ),
+            None => GrantEditor::for_global(
+                default_project_policy(),
+                default_allowed_launches(),
+                default_allowed_launches(),
+            ),
+        },
+        LaunchRole::Project(_) => GrantEditor::for_manager(
+            default_project_policy(),
+            HarnessManagerScopeModeV1::Project,
+            default_allowed_launches(),
+        ),
+    }
 }
 
 fn dedup_catalog(
@@ -205,9 +268,72 @@ impl LaunchForm {
             launched: None,
             cap_confirm: false,
             active_project,
+            prefill_note: None,
+            grant: seed_grant(role, grant),
+            global_seed: seed_grant(LaunchRole::Global, grant),
+            grant_open: false,
+            grant_visited: false,
         };
         form.regenerate_prompt();
         form
+    }
+
+    /// Start the global grant editor from `policy` and `launches` (the last
+    /// revoked grant, #1902) instead of the defaults.
+    pub fn reseed_global_grant(
+        &mut self,
+        policy: ManagerPolicyV2,
+        launches: Vec<ManagerLaunchChoiceV2>,
+    ) {
+        self.global_seed = GrantEditor::for_global(policy, launches, default_allowed_launches());
+        if self.role == LaunchRole::Global && !self.grant_visited {
+            self.grant = self.global_seed.clone();
+        }
+    }
+
+    /// The grant to send, once the operator has opened the editor.
+    #[must_use]
+    pub fn grant_choice(&self) -> Option<GrantChoice> {
+        self.grant_visited.then(|| GrantChoice {
+            launches: self.grant.launches().to_vec(),
+            policy: self.grant.finish(),
+        })
+    }
+
+    /// Open the grant editor in place of the form.
+    pub fn open_grant(&mut self) {
+        self.grant_open = true;
+        self.grant_visited = true;
+        self.error = None;
+    }
+
+    /// The seat's grant editor, rebuilt when the seat changes.
+    fn reseed_for_role(&mut self) {
+        self.grant = match self.role {
+            LaunchRole::Global => self.global_seed.clone(),
+            LaunchRole::Project(_) => seed_grant(self.role, None),
+        };
+        self.grant_open = false;
+        self.grant_visited = false;
+    }
+
+    /// One line digest of the grant for the Grant field.
+    #[must_use]
+    pub fn grant_summary(&self) -> String {
+        if self.grant_visited {
+            self.grant.summary()
+        } else {
+            format!("{} (defaults)", self.grant.summary())
+        }
+    }
+
+    /// The project ids the scope currently checks.
+    #[must_use]
+    pub fn checked_projects(&self) -> Vec<Uuid> {
+        self.checked()
+            .iter()
+            .map(|entry| entry.project_id)
+            .collect()
     }
 
     /// The fields shown for the current role (scope is global-only).
@@ -370,6 +496,7 @@ impl LaunchForm {
                 }
                 None => "(no project in scope)".into(),
             },
+            LaunchField::Grant => self.grant_summary(),
             LaunchField::Prompt => self.prompt.clone(),
             LaunchField::Submit => if self.launched.is_some() {
                 "[ Retry the appointment ]"
@@ -392,7 +519,15 @@ impl LaunchForm {
                 }
                 let roles: Vec<LaunchRole> = self.roles.iter().map(|(role, _)| *role).collect();
                 if let Some(role) = step(&roles, &self.role, delta) {
+                    let previous = self.role;
                     self.role = role;
+                    // The grant is per seat: a global grant is not a PM's.
+                    if role != previous
+                        && ((previous == LaunchRole::Global) != (role == LaunchRole::Global)
+                            || self.grant_visited)
+                    {
+                        self.reseed_for_role();
+                    }
                     self.regenerate_prompt();
                 }
             }
@@ -428,6 +563,7 @@ impl LaunchForm {
                     }
                 }
             }
+            LaunchField::Grant => self.open_grant(),
             LaunchField::Prompt | LaunchField::Submit => {}
         }
     }
@@ -498,6 +634,7 @@ impl LaunchForm {
                     scope,
                     prompt,
                     title: "Global manager".into(),
+                    grant: self.grant_choice(),
                 })
             }
             LaunchRole::Project(id) => {
@@ -514,6 +651,7 @@ impl LaunchForm {
                         "Project manager · {}",
                         self.project_name(id).unwrap_or("project")
                     ),
+                    grant: self.grant_choice(),
                 })
             }
         }
@@ -535,6 +673,13 @@ pub enum FormOutcome {
 /// On Prompt, printable keys type and Backspace deletes.
 pub fn handle_form_key(form: &mut LaunchForm, key: KeyEvent) -> FormOutcome {
     let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    if form.grant_open {
+        // The editor takes every key; Esc returns to the form.
+        if form.grant.handle_key(key) == GrantKey::Leave {
+            form.grant_open = false;
+        }
+        return FormOutcome::Stay;
+    }
     if form.cap_confirm {
         // The preview is a modal step: Enter would only repeat the refused
         // request, so only y (confirm), n (back to the form) and Esc act.
@@ -551,6 +696,7 @@ pub fn handle_form_key(form: &mut LaunchForm, key: KeyEvent) -> FormOutcome {
     }
     match key.code {
         KeyCode::Esc => return FormOutcome::Cancel,
+        KeyCode::Enter if form.field == LaunchField::Grant => form.open_grant(),
         KeyCode::Enter => return FormOutcome::Submit,
         KeyCode::Tab | KeyCode::Down => form.move_field(1),
         KeyCode::BackTab | KeyCode::Up => form.move_field(-1),
@@ -646,22 +792,40 @@ pub async fn launch_and_appoint(
                 .get_global_manager()
                 .await
                 .map_err(|error| not_appointed(error.to_string()))?;
+            let revoked = current
+                .as_ref()
+                .is_some_and(|grant| grant.state != "active");
             let active = current.filter(|grant| grant.state == "active");
             let replaced = active
                 .as_ref()
                 .is_some_and(|grant| grant.seat_session_id != session_id);
+            // #1902: after a revoke the new grant starts from the most recent
+            // revoked root grant over the same coverage, not the defaults.
+            let prefill = if request.grant.is_none() && active.is_none() && revoked {
+                crate::overlay::global_manager_command::revoked_prefill(app, &request.scope)
+                    .await
+                    .map_err(not_appointed)?
+            } else {
+                None
+            };
             let grant = app
                 .client
                 .configure_global_manager_confirmed(
                     ConfigureGlobalManagerRequestV1 {
                         session_id,
                         project_ids: request.scope.clone(),
-                        allowed_launches: active
-                            .as_ref()
-                            .map_or_else(default_allowed_launches, |g| g.allowed_launches.clone()),
-                        project_policy: active
-                            .as_ref()
-                            .map_or_else(default_project_policy, |g| g.project_policy.clone()),
+                        allowed_launches: match (&request.grant, &active, &prefill) {
+                            (Some(choice), _, _) => choice.launches.clone(),
+                            (None, Some(g), _) => g.allowed_launches.clone(),
+                            (None, None, Some(p)) => p.allowed_launches.clone(),
+                            (None, None, None) => default_allowed_launches(),
+                        },
+                        project_policy: match (&request.grant, &active, &prefill) {
+                            (Some(choice), _, _) => choice.policy.clone(),
+                            (None, Some(g), _) => g.project_policy.clone(),
+                            (None, None, Some(p)) => p.policy.clone(),
+                            (None, None, None) => default_project_policy(),
+                        },
                         expected_grant_version: active.as_ref().map_or(0, |g| g.grant_version),
                         idempotency_key: Uuid::new_v4().to_string(),
                     },
@@ -685,7 +849,12 @@ pub async fn launch_and_appoint(
                     } else {
                         ""
                     }
-                ),
+                ) + &prefill.as_ref().map_or_else(String::new, |prefill| {
+                    format!(
+                        ". {}",
+                        crate::overlay::global_manager_command::prefill_summary(prefill)
+                    )
+                }),
             ))
         }
         LaunchRole::Project(project_id) => {
@@ -694,11 +863,18 @@ pub async fn launch_and_appoint(
                 scope: ManagerLaunchScope::Project,
                 preset: ManagerPolicyPreset::Execute,
             };
+            let appointment = ManagerAppointment {
+                plan,
+                grant: request.grant.as_ref().map(|choice| choice.policy.clone()),
+            };
             let socket = app.client.socket_path().to_path_buf();
-            let message =
-                crate::overlay::launch_settings::appoint_launched_manager(socket, session_id, plan)
-                    .await
-                    .map_err(|error| format!("Launched session {short}. {error}"))?;
+            let message = crate::overlay::launch_settings::appoint_launched_manager(
+                socket,
+                session_id,
+                appointment,
+            )
+            .await
+            .map_err(|error| format!("Launched session {short}. {error}"))?;
             Ok((session_id, format!("Project manager {short}: {message}")))
         }
     }

@@ -23,7 +23,6 @@ impl RpcServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn fleet_rpc_is_operator_only() {

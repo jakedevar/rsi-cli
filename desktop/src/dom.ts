@@ -17,7 +17,15 @@ export function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 let toastTimer: number | undefined;
+let toastListener: ((msg: string, ok: boolean) => void) | undefined;
+
+/** Hear every toast (the notification browser records them). One listener. */
+export function onToast(cb: (msg: string, ok: boolean) => void): void {
+  toastListener = cb;
+}
+
 export function toast(msg: string, ok = false): void {
+  toastListener?.(msg, ok);
   const t = $('toast');
   t.textContent = msg;
   t.className = ok ? 'toast ok' : 'toast';

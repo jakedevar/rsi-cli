@@ -1705,6 +1705,66 @@ fn non_topology_question_stays_reserved_gate() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
+fn topology_launch_scope_requires_the_daemon_execution_identity() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let epic = lead.parent_id.unwrap();
+    let execution = Uuid::new_v4();
+    let key = format!("topology:{execution}:A:0:1");
+    let actor = json!({"kind":"topology_executor", "execution_id":execution});
+    let record = store
+        .manager_v2_put_topology_decision(
+            &config,
+            &TopologyDecisionRequest {
+                key: key.clone(),
+                epic,
+                question: "May we rent a runner for $25?".into(),
+                context: None,
+                gate: None,
+                source_digest: "spend-request".into(),
+                actor,
+            },
+        )
+        .unwrap();
+    store.manager_v2_decision_gate(&config, epic).unwrap();
+    let scoped = operator_row(&store, &config, &key);
+    assert_eq!(scoped["gate"], "spend");
+    assert_eq!(scoped["answerable_by"], "operator");
+    assert_eq!(scoped["blocks"]["epic_ids"], json!([]));
+    assert_eq!(scoped["blocks"]["execution_ids"], json!([execution]));
+    assert_eq!(
+        refusal(pm_rule(&store, &config, &key, "yes", "scope-spend").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+
+    // A similar key alone, a missing identity, or a mismatched identity must
+    // retain ordinary launch protection. The typed manager mutation cannot
+    // supply the daemon's asked_by identity.
+    let mut version = record.row_version;
+    for asked_by in [
+        json!({"kind":"project_manager", "execution_id":execution}),
+        json!({"kind":"topology_executor"}),
+        json!({"kind":"topology_executor", "execution_id":Uuid::new_v4()}),
+    ] {
+        let mut payload = record.payload.clone();
+        payload["asked_by"] = asked_by;
+        version = store
+            .manager_v2_put_record(&config, "decision", &key, Some(epic), version, &payload)
+            .unwrap()
+            .row_version;
+        assert_eq!(
+            refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
+            "manager_v2_pending_operator_decision"
+        );
+        let ordinary = operator_row(&store, &config, &key);
+        assert_eq!(ordinary["answerable_by"], "operator");
+        assert_eq!(ordinary["blocks"]["epic_ids"], json!([epic]));
+        assert_eq!(ordinary["blocks"]["execution_ids"], json!([]));
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
 fn topology_decision_is_filed_once_and_its_gate_decides_who_may_rule() {
     // #1641 S3c: the daemon files a node's question under a `topology:` key.
     let store = Store::open_in_memory().unwrap();

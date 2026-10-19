@@ -19,6 +19,12 @@
 //! * a topology node launched for a manager or Epic lead waits `Reserved`
 //!   (`Executor::launch_attempt`) and is retried on the executor's next tick.
 //!
+//! Host pressure (#2562, `host_pressure`) holds the same work through the same
+//! queue: a CPU at or above `job_thermal_ceiling_c` (`held {reason: thermal}`) or
+//! free disk below the governor floor (`reason: disk_pressure`) holds it even
+//! when the load hold is disabled; a topology node records it as
+//! `admission_hold{kind}`.
+//!
 //! Both start on their own once the load drops. Held work is released
 //! oldest-first: the claim query orders queued creates by `(not_before, id)`
 //! across every project. Eligible creates and waiting topology nodes share
@@ -39,10 +45,12 @@
 //! They continue work that was already admitted or that the operator asked for,
 //! and holding a lead's recovery under load would strand its Epic.
 //!
-//! The load comes from `/proc/loadavg` on Linux. Any other platform (or an
+//! The load comes from `/proc/loadavg` on Linux and from `getloadavg(3)` on
+//! macOS and other unix systems (#2937). A platform without either (or an
 //! unreadable file) reports unsupported and admits everything.
 
 use crate::config::RuntimeConfig;
+use crate::host_pressure::PressureHold;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::agent_daemon_info::{HOST_LOAD, HeldWorkV1, HostLoadAdmissionV1};
 use std::collections::{HashMap, VecDeque};
@@ -59,6 +67,11 @@ pub const ADMISSION_WINDOW: Duration = Duration::from_secs(60);
 /// from the queue: it ended, was cancelled or became ineligible, and must not keep
 /// younger nodes waiting behind it. The executor asks at least every 30 s.
 const WAITER_STALE: Duration = Duration::from_secs(90);
+
+/// How long a sandbox free-space refusal holds new launches before the next one
+/// tries again (#2920). The retry itself runs the allocator's one reclaim page,
+/// so the hold is a delay between pages, not a permanent block.
+pub const SANDBOX_FREE_SPACE_RETRY: Duration = Duration::from_secs(30);
 
 /// Admissions remembered at most (bounds memory while the hold is disabled).
 const MAX_RECORDED_ADMISSIONS: usize = 4096;
@@ -78,21 +91,18 @@ pub enum LoadReading {
 /// Where the gate reads the host's load from (swapped by tests).
 pub type LoadSource = Arc<dyn Fn() -> LoadReading + Send + Sync>;
 
-/// Read the host's 1-minute load average from `/proc/loadavg`.
-#[cfg(target_os = "linux")]
+/// Read the host's 1-minute load average: `/proc/loadavg` on Linux,
+/// `getloadavg(3)` on macOS and other unix systems (#2937).
+#[cfg(unix)]
 #[must_use]
 pub fn read_host_load() -> LoadReading {
-    std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .as_deref()
-        .and_then(crate::daemon_info::parse_loadavg)
-        .map_or(LoadReading::Unsupported, |load| {
-            LoadReading::Load1(load.one)
-        })
+    crate::daemon_info::load_average().map_or(LoadReading::Unsupported, |load| {
+        LoadReading::Load1(load.one)
+    })
 }
 
 /// No load average here: admit everything.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 #[must_use]
 pub fn read_host_load() -> LoadReading {
     LoadReading::Unsupported
@@ -113,6 +123,44 @@ fn default_source() -> LoadSource {
     }
 }
 
+/// Where the gate reads host pressure (thermal, disk) from (swapped by tests).
+pub type PressureSource = Arc<dyn Fn() -> Option<PressureHold> + Send + Sync>;
+
+/// The pressure source a production daemon uses: the shared thermal and
+/// disk-pressure predicate against the live `min_free_disk_gb` floor (#2562).
+/// Tests never see a hot or full CI host: they default to no pressure.
+fn default_pressure_source(config: &Arc<RuntimeConfig>) -> PressureSource {
+    #[cfg(any(test, feature = "test-seam"))]
+    {
+        let _ = config;
+        Arc::new(|| None)
+    }
+    #[cfg(not(any(test, feature = "test-seam")))]
+    {
+        let config = Arc::clone(config);
+        Arc::new(move || crate::host_pressure::hold_now(config.governor_policy().min_free_disk_gb))
+    }
+}
+
+/// Why a launch is held right now: the host is busy ([`HostLoadHold`]) or hot
+/// or full ([`PressureHold`], #2562).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AdmissionHold {
+    Load(HostLoadHold),
+    Pressure(PressureHold),
+}
+
+impl AdmissionHold {
+    /// The wire `reason`: `host_load`, `thermal`, `disk_pressure` or `sandbox_free_space`.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Load(_) => HOST_LOAD,
+            Self::Pressure(pressure) => pressure.reason(),
+        }
+    }
+}
+
 /// Why a launch is held right now.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostLoadHold {
@@ -126,6 +174,7 @@ pub struct HostLoadHold {
 
 struct Waiter {
     kind: &'static str,
+    hold: AdmissionHold,
     since: DateTime<Utc>,
     seen: Instant,
     session_id: Option<Uuid>,
@@ -143,6 +192,7 @@ struct Look {
     threshold: u32,
     reading: LoadReading,
     recent: u32,
+    pressure: Option<PressureHold>,
 }
 
 impl Look {
@@ -153,6 +203,24 @@ impl Look {
             LoadReading::Load1(load) if self.threshold != 0 => Some(load),
             _ => None,
         }
+    }
+
+    /// The hold in force: host pressure (thermal, disk) first, then load.
+    fn any_hold(self) -> Option<AdmissionHold> {
+        self.pressure
+            .map(AdmissionHold::Pressure)
+            .or_else(|| self.hold().map(AdmissionHold::Load))
+    }
+
+    /// The load hold as it reads now (load enabled and supported).
+    fn load_hold_now(self) -> Option<AdmissionHold> {
+        self.load().map(|load| {
+            AdmissionHold::Load(HostLoadHold {
+                load,
+                threshold: self.threshold,
+                recent_admissions: self.recent,
+            })
+        })
     }
 
     /// `None` admits: disabled, unsupported, or within the threshold.
@@ -170,6 +238,9 @@ impl Look {
 pub struct HostLoadAdmission {
     config: Arc<RuntimeConfig>,
     source: Mutex<LoadSource>,
+    pressure: Mutex<PressureSource>,
+    /// The latest sandbox free-space refusal and when it stops holding (#2920).
+    sandbox_free_space: Mutex<Option<(PressureHold, Instant)>>,
     state: Mutex<State>,
 }
 
@@ -181,11 +252,83 @@ impl HostLoadAdmission {
 
     #[must_use]
     pub fn with_source(config: Arc<RuntimeConfig>, source: LoadSource) -> Self {
+        let pressure = default_pressure_source(&config);
         Self {
             config,
             source: Mutex::new(source),
+            pressure: Mutex::new(pressure),
+            sandbox_free_space: Mutex::new(None),
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Replace the pressure source (tests exercising the thermal and disk holds).
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn set_pressure_source(&self, source: PressureSource) {
+        *self.pressure.lock().unwrap_or_else(PoisonError::into_inner) = source;
+    }
+
+    fn read_pressure(&self) -> Option<PressureHold> {
+        let source = Arc::clone(&self.pressure.lock().unwrap_or_else(PoisonError::into_inner));
+        source().or_else(|| self.sandbox_free_space_hold())
+    }
+
+    /// The sandbox allocator refused a launch for free space (#2920): hold every
+    /// new launch (manager creates and topology nodes) as `sandbox_free_space`
+    /// for [`SANDBOX_FREE_SPACE_RETRY`], then let the next one try again. The
+    /// refused work stays queued and starts on its own once space returns.
+    pub fn note_sandbox_free_space(&self, available_bytes: u64, min_free_bytes: u64) {
+        self.note_sandbox_free_space_for(available_bytes, min_free_bytes, SANDBOX_FREE_SPACE_RETRY);
+    }
+
+    fn note_sandbox_free_space_for(
+        &self,
+        available_bytes: u64,
+        min_free_bytes: u64,
+        retry: Duration,
+    ) {
+        const GIB: u64 = 1 << 30;
+        let hold = PressureHold::SandboxFreeSpace {
+            free_gb: available_bytes as f64 / GIB as f64,
+            min_gb: min_free_bytes.div_ceil(GIB),
+        };
+        *self
+            .sandbox_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((hold, Instant::now() + retry));
+    }
+
+    /// Let the sandbox free-space hold end now (tests; production waits out
+    /// [`SANDBOX_FREE_SPACE_RETRY`]).
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn expire_sandbox_free_space_hold(&self) {
+        *self
+            .sandbox_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn sandbox_free_space_hold(&self) -> Option<PressureHold> {
+        let mut latch = self
+            .sandbox_free_space
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *latch {
+            Some((hold, until)) if Instant::now() < until => Some(hold),
+            Some(_) => {
+                *latch = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// The host-pressure hold in force now (#2562): thermal or disk. A launch
+    /// that bypasses the load queue (an operator's first launch) still waits
+    /// for it.
+    #[must_use]
+    pub fn pressure_now(&self) -> Option<PressureHold> {
+        self.read_pressure()
     }
 
     /// Replace the load source (tests exercising the hold).
@@ -233,6 +376,7 @@ impl HostLoadAdmission {
                 self.read()
             },
             recent,
+            pressure: self.read_pressure(),
         }
     }
 
@@ -253,26 +397,24 @@ impl HostLoadAdmission {
 
     /// Include a queued create's place behind older held work in its receipt.
     #[must_use]
-    pub fn hold_for_create(&self, key: Uuid) -> Option<HostLoadHold> {
+    pub fn hold_for_create(&self, key: Uuid) -> Option<AdmissionHold> {
         let now = Instant::now();
         let mut state = self.state();
         state
             .waiters
             .retain(|_, waiter| now.saturating_duration_since(waiter.seen) < WAITER_STALE);
         let look = self.look(&mut state, now);
-        let load = look.load()?;
-        look.hold().or_else(|| {
-            let waiter = state.waiters.get(&key)?;
-            state
-                .waiters
-                .iter()
-                .any(|(other, older)| (older.since, *other) < (waiter.since, key))
-                .then_some(HostLoadHold {
-                    load,
-                    threshold: look.threshold,
-                    recent_admissions: look.recent,
-                })
-        })
+        if let Some(hold) = look.any_hold() {
+            return Some(hold);
+        }
+        let waiter = state.waiters.get(&key)?;
+        let older = state
+            .waiters
+            .iter()
+            .filter(|(other, older)| (older.since, **other) < (waiter.since, key))
+            .min_by_key(|(other, older)| (older.since, **other))
+            .map(|(_, older)| older.hold)?;
+        Some(look.load_hold_now().unwrap_or(older))
     }
 
     /// The store calls this only for an eligible new create. It shares the
@@ -323,7 +465,7 @@ impl HostLoadAdmission {
         key: Uuid,
         since: DateTime<Utc>,
         session_id: Option<Uuid>,
-    ) -> Option<HostLoadHold> {
+    ) -> Option<AdmissionHold> {
         self.admit_waiter_at(key, since, session_id, Instant::now())
     }
 
@@ -333,7 +475,7 @@ impl HostLoadAdmission {
         since: DateTime<Utc>,
         session_id: Option<Uuid>,
         now: Instant,
-    ) -> Option<HostLoadHold> {
+    ) -> Option<AdmissionHold> {
         self.admit_at(key, since, session_id, "topology_node", now)
     }
 
@@ -344,42 +486,44 @@ impl HostLoadAdmission {
         session_id: Option<Uuid>,
         kind: &'static str,
         now: Instant,
-    ) -> Option<HostLoadHold> {
+    ) -> Option<AdmissionHold> {
         let mut state = self.state();
         state
             .waiters
             .retain(|_, waiter| now.saturating_duration_since(waiter.seen) < WAITER_STALE);
         let look = self.look(&mut state, now);
-        let Some(load) = look.load() else {
-            // Disabled or unsupported: nothing is held and nobody queues.
-            state.waiters.clear();
+        let current = look.any_hold();
+        if current.is_none() && look.load().is_none() && state.waiters.is_empty() {
+            // Disabled or unsupported and nothing queued: admit.
             Self::record_admission(&mut state, now);
             return None;
-        };
-        let load_hold = look.hold();
-        let blocked_by_older = state
+        }
+        let blocker = state
             .waiters
             .iter()
-            .any(|(other, waiter)| *other != key && (waiter.since, *other) < (since, key));
-        if load_hold.is_none() && !blocked_by_older {
+            .filter(|(other, waiter)| **other != key && (waiter.since, **other) < (since, key))
+            .min_by_key(|(other, waiter)| (waiter.since, **other))
+            .map(|(_, waiter)| waiter.hold);
+        if current.is_none() && blocker.is_none() {
             state.waiters.remove(&key);
             Self::record_admission(&mut state, now);
             return None;
         }
+        let hold = current
+            .or_else(|| look.load_hold_now())
+            .or(blocker)
+            .expect("a current hold, the load, or an older waiter explains the hold");
         state.waiters.insert(
             key,
             Waiter {
                 kind,
+                hold,
                 since,
                 seen: now,
                 session_id,
             },
         );
-        Some(load_hold.unwrap_or(HostLoadHold {
-            load,
-            threshold: look.threshold,
-            recent_admissions: look.recent,
-        }))
+        Some(hold)
     }
 
     /// `AgentGetDaemonInfo` status. `queued_creates` are the due, queued
@@ -400,8 +544,11 @@ impl HostLoadAdmission {
             threshold,
             reading,
             recent,
+            pressure: self.read_pressure(),
         };
-        let holding = look.hold().is_some();
+        let current = look.any_hold();
+        let holding = current.is_some();
+        let creates_reason = current.map_or(HOST_LOAD, AdmissionHold::reason);
         let mut held: Vec<(String, HeldWorkV1)> = Vec::new();
         if holding {
             for (target, since) in queued_creates {
@@ -411,7 +558,7 @@ impl HostLoadAdmission {
                         kind: "manager_create_session".to_string(),
                         session_id: *target,
                         since: since.clone(),
-                        reason: HOST_LOAD.to_string(),
+                        reason: creates_reason.to_string(),
                     },
                 ));
             }
@@ -432,7 +579,7 @@ impl HostLoadAdmission {
                     kind: waiter.kind.to_string(),
                     session_id: waiter.session_id,
                     since,
-                    reason: HOST_LOAD.to_string(),
+                    reason: waiter.hold.reason().to_string(),
                 },
             ));
         }
@@ -448,6 +595,10 @@ impl HostLoadAdmission {
             recent_admissions: recent,
             holding,
             held: held.into_iter().map(|(_, item)| item).collect(),
+            build_disk: Some(crate::host_pressure::build_disk_floor(
+                crate::host_pressure::disk_free_gb(),
+                self.config.governor_policy().min_free_disk_gb,
+            )),
         }
     }
 }
@@ -488,6 +639,29 @@ mod tests {
                     &serde_json::json!(threshold),
                 )
                 .unwrap();
+        }
+    }
+
+    /// Install a pressure source the test steers; `None` is a cool, roomy host.
+    fn steer_pressure(f: &Fixture) -> Arc<Mutex<Option<PressureHold>>> {
+        let shared = Arc::new(Mutex::new(None));
+        let source = Arc::clone(&shared);
+        f.gate
+            .set_pressure_source(Arc::new(move || *source.lock().unwrap()));
+        shared
+    }
+
+    fn hot() -> PressureHold {
+        PressureHold::Thermal(rsid_core::thermal_guard::ThermalHold {
+            temperature_c: 93.0,
+            ceiling_c: 85,
+        })
+    }
+
+    fn full_disk() -> PressureHold {
+        PressureHold::DiskPressure {
+            free_gb: 12.0,
+            min_gb: 30,
         }
     }
 
@@ -580,6 +754,28 @@ mod tests {
             "the first admission aged out, the second still counts one"
         );
         assert_eq!(f.gate.hold_at(at(base, 62)), None);
+    }
+
+    /// #163: daemon info names the live build disk floor before any dispatch,
+    /// whatever the launch hold is doing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn status_reports_the_live_build_disk_floor_beside_an_open_launch_gate() {
+        let f = fixture(LoadReading::Load1(1.0));
+        let floor = f.gate.status(&[]).build_disk.expect("a floor is reported");
+        assert_eq!(floor.min_free_gb, 30, "the governor default");
+        f.config
+            .governor_min_free_disk_gb
+            .store(41, Ordering::Relaxed);
+        let status = f.gate.status(&[]);
+        assert!(!status.holding, "an idle host holds no launch");
+        let floor = status.build_disk.expect("a floor is reported");
+        assert_eq!(floor.min_free_gb, 41, "the live setting, not a default");
+        assert_eq!(
+            floor.open,
+            floor.free_gb.is_none_or(|free| free >= 41.0),
+            "open follows the reported margin"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -767,5 +963,125 @@ mod tests {
                 .all(|item| item.kind == "topology_node"),
             "queued creates are listed only while the hold is in force"
         );
+    }
+
+    /// #2920: a sandbox free-space refusal holds every launch as
+    /// `sandbox_free_space` (also topology waiters) until its retry delay ends;
+    /// a real pressure reading outranks it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_sandbox_free_space_refusal_holds_launches_until_the_retry_delay_ends() {
+        let f = fixture(LoadReading::Load1(1.0));
+        f.set_threshold(0);
+        let pressure = steer_pressure(&f);
+        let node = Uuid::new_v4();
+        let gib = 1_u64 << 30;
+        f.gate.note_sandbox_free_space(8 * gib, 30 * gib);
+        let hold = f
+            .gate
+            .admit_waiter(node, since(5), Some(node))
+            .expect("a free-space refusal holds");
+        assert_eq!(hold.reason(), crate::host_pressure::SANDBOX_FREE_SPACE);
+        assert_eq!(
+            hold,
+            AdmissionHold::Pressure(PressureHold::SandboxFreeSpace {
+                free_gb: 8.0,
+                min_gb: 30
+            })
+        );
+        *pressure.lock().unwrap() = Some(hot());
+        assert_eq!(f.gate.pressure_now(), Some(hot()), "real pressure first");
+        *pressure.lock().unwrap() = None;
+        f.gate.expire_sandbox_free_space_hold();
+        assert!(f.gate.admit_waiter(node, since(5), Some(node)).is_none());
+        // The delay lapses by itself.
+        f.gate
+            .note_sandbox_free_space_for(8 * gib, 30 * gib, Duration::ZERO);
+        assert_eq!(f.gate.pressure_now(), None);
+    }
+
+    /// #2562: a hot or full host holds launches even with an idle load and the
+    /// load hold disabled, and releases them oldest-first once it clears.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn pressure_holds_waiters_with_an_idle_load_and_releases_them_oldest_first() {
+        let f = fixture(LoadReading::Load1(1.0));
+        f.set_threshold(0);
+        let pressure = steer_pressure(&f);
+        let base = Instant::now();
+        let (older, younger) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            f.gate
+                .admit_waiter_at(younger, since(30), Some(younger), at(base, 0)),
+            None,
+            "a cool host with nothing queued admits"
+        );
+        *pressure.lock().unwrap() = Some(hot());
+        for (key, age) in [(younger, 30), (older, 10)] {
+            let hold = f
+                .gate
+                .admit_waiter_at(key, since(age), Some(key), at(base, 1))
+                .expect("a hot host holds");
+            assert_eq!(hold.reason(), crate::host_pressure::THERMAL);
+        }
+        let status = f.gate.status(&[]);
+        assert!(status.holding);
+        assert_eq!(
+            status
+                .held
+                .iter()
+                .map(|w| w.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thermal", "thermal"]
+        );
+        // Another kind of pressure is reported as its own reason.
+        *pressure.lock().unwrap() = Some(full_disk());
+        assert_eq!(
+            f.gate
+                .admit_waiter_at(older, since(10), Some(older), at(base, 2))
+                .map(AdmissionHold::reason),
+            Some("disk_pressure")
+        );
+        // The temperature drops and the disk is freed: the oldest goes first.
+        *pressure.lock().unwrap() = None;
+        assert!(
+            f.gate
+                .admit_waiter_at(younger, since(30), Some(younger), at(base, 3))
+                .is_some(),
+            "the younger waiter does not overtake the older one"
+        );
+        assert_eq!(
+            f.gate
+                .admit_waiter_at(older, since(10), Some(older), at(base, 3)),
+            None
+        );
+        assert_eq!(
+            f.gate
+                .admit_waiter_at(younger, since(30), Some(younger), at(base, 4)),
+            None
+        );
+        assert!(f.gate.status(&[]).held.is_empty());
+    }
+
+    /// #2562: the manager-action view names the pressure that holds a create.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_queued_create_reports_the_pressure_hold_and_the_claim_admits_after_it() {
+        let f = fixture(LoadReading::Unsupported);
+        let pressure = steer_pressure(&f);
+        let key = Uuid::new_v4();
+        assert_eq!(f.gate.hold_for_create(key), None);
+        *pressure.lock().unwrap() = Some(hot());
+        assert_eq!(
+            f.gate.hold_for_create(key),
+            Some(AdmissionHold::Pressure(hot()))
+        );
+        assert!(!f.gate.admit_manager_create(key, since(0), None));
+        let queued = [(None, "2026-10-07T00:00:00Z".to_string())];
+        let status = f.gate.status(&queued);
+        assert_eq!(status.held[0].reason, "thermal");
+        *pressure.lock().unwrap() = None;
+        assert!(f.gate.admit_manager_create(key, since(0), None));
+        assert_eq!(f.gate.hold_for_create(key), None);
     }
 }

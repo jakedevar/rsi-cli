@@ -18,9 +18,19 @@
 //!
 //! Trees are cgroups, so measurement is cheap and exact: a session's provider
 //! scope (`rsi-workers.slice/rsi-worker-<invocation>-<n>.scope`, which holds
-//! every command the agent runs) and a job unit (`rsi-job-<id>.service`).
-//! Linux only (`cgroup v2 cpu.stat`); elsewhere the sampler reports
-//! [`ANDON_UNSUPPORTED`] once and the loop ends.
+//! every command the agent runs) and a job unit (`rsi-job-<id>.service`, in
+//! `rsi-build.slice` for cargo units, #2119). `scripts/scoped-test` runs its
+//! build and tests in a nested `rsi-scoped-test-<job id>-<hex>.service` beside
+//! the job unit (a separate cgroup, so the job unit holds only the driver); it
+//! is attributed to that job (#2127).
+//! Linux reads `cgroup v2 cpu.stat`. macOS (#2951) has no cgroups: launchd
+//! owns each job as the service `rsi-job-<id>`, so the sampler lists the
+//! services (`launchctl list`: pid and label), takes each job's root process
+//! and reads its cumulative CPU time from `proc_pid_rusage` (its own plus the
+//! reaped descendants', so a tree of short-lived `rustc` children still
+//! accumulates). Provider scopes are not launchd services and have no
+//! invocation-to-pid map there, so only job trees are sampled on macOS.
+//! Elsewhere the sampler reports [`ANDON_UNSUPPORTED`] once and the loop ends.
 
 use crate::session::SessionManager;
 use crate::store::runaway_process::{RunawayNoticeRoute, RunawayProcessReport};
@@ -39,7 +49,7 @@ const MAX_TREES: usize = 512;
 const DOMINANT_MIN_CORES: f64 = 4.0;
 /// ...and at least this share of the 1-minute load.
 const DOMINANT_LOAD_SHARE: f64 = 0.15;
-/// The explicit refusal on platforms without cgroup CPU accounting.
+/// The explicit refusal on platforms with no tree CPU source.
 pub const ANDON_UNSUPPORTED: &str = "cpu_andon_unsupported";
 
 /// Who owns a sampled tree.
@@ -173,9 +183,22 @@ impl CpuAndon {
     }
 }
 
-/// `rsi-worker-<invocation>-<n>.scope` or `rsi-job-<id>.service`.
+/// `rsi-worker-<invocation>-<n>.scope`, `rsi-job-<id>.service` or, for the
+/// nested unit `scripts/scoped-test` starts beside its job unit (#2127),
+/// `rsi-scoped-test-<job id>-<hex>.service`. Without a job id the scoped-test
+/// unit belongs to an operator run and is no agent tree.
 #[must_use]
 pub fn tree_owner(unit: &str) -> Option<TreeOwner> {
+    if let Some(rest) = unit
+        .strip_prefix("rsi-scoped-test-")
+        .and_then(|rest| rest.strip_suffix(".service"))
+    {
+        let (id, tag) = (rest.get(..36)?, rest.get(36..)?);
+        return (tag.len() > 1 && tag.starts_with('-'))
+            .then(|| Uuid::parse_str(id).ok())
+            .flatten()
+            .map(TreeOwner::Job);
+    }
     if let Some(rest) = unit
         .strip_prefix("rsi-worker-")
         .and_then(|rest| rest.strip_suffix(".scope"))
@@ -216,7 +239,10 @@ pub fn sample_trees() -> Result<(Vec<TreeSample>, Option<f64>), &'static str> {
     let dirs = [
         root.join("rsi.slice")
             .join(crate::process_scope::SCOPE_SLICE),
-        // Transient `systemd-run --user` services land in app.slice.
+        // #2119: cargo build and test job units run in the hub build slice.
+        root.join("rsi.slice").join(rsid_core::build_slice::SLICE),
+        // Other transient `systemd-run --user` services land in app.slice
+        // (and units started before the build slice existed stay there).
         root.join("app.slice"),
         root.clone(),
     ];
@@ -249,19 +275,121 @@ pub fn sample_trees() -> Result<(Vec<TreeSample>, Option<f64>), &'static str> {
             });
         }
     }
-    let load = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .as_deref()
-        .and_then(crate::daemon_info::parse_loadavg)
-        .map(|load| load.one);
+    let load = crate::daemon_info::load_average().map(|load| load.one);
     Ok((samples, load))
 }
 
-/// No cgroup CPU accounting here: the andon is explicitly unsupported.
+/// Running launchd services as `(pid, label)` from `launchctl list` output
+/// (`PID<tab>Status<tab>Label`, `-` for a service with no process).
+#[cfg(any(test, target_os = "macos"))]
+#[must_use]
+fn parse_launchctl_list(output: &str) -> Vec<(i32, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let pid: i32 = fields.next()?.trim().parse().ok()?;
+            let _status = fields.next()?;
+            let label = fields.next()?.trim();
+            (pid > 0 && !label.is_empty()).then(|| (pid, label.to_string()))
+        })
+        .collect()
+}
+
+/// `proc_pid_rusage` reports CPU time in mach absolute-time ticks (1:1 on an
+/// Intel Mac, 125:3 on Apple silicon): microseconds for `ticks` at the given
+/// timebase.
+#[cfg(any(test, target_os = "macos"))]
+#[must_use]
+fn mach_ticks_to_usec(ticks: u64, numer: u32, denom: u32) -> u64 {
+    if denom == 0 {
+        return 0;
+    }
+    let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    u64::try_from(nanos / 1_000).unwrap_or(u64::MAX)
+}
+
+/// Cumulative CPU time of one process and every descendant it has reaped, in
+/// microseconds; `None` when the process is gone or unreadable.
+// libc marks `mach_timebase_info` deprecated in favour of the `mach2` crate;
+// one call is not worth a dependency.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn process_tree_usage_usec(pid: i32) -> Option<u64> {
+    use nix::libc;
+    // SAFETY: an all-zero `rusage_info_v2` is a valid value (plain integers).
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `proc_pid_rusage` fills at most one `rusage_info_v2` through the
+    // pointer for flavor RUSAGE_INFO_V2, and `info` outlives the call.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::addr_of_mut!(info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let mut timebase = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: `timebase` is a valid out-pointer for the call.
+    let rc = unsafe { libc::mach_timebase_info(&mut timebase) };
+    if rc != 0 {
+        return None;
+    }
+    let ticks = info
+        .ri_user_time
+        .saturating_add(info.ri_system_time)
+        .saturating_add(info.ri_child_user_time)
+        .saturating_add(info.ri_child_system_time);
+    Some(mach_ticks_to_usec(ticks, timebase.numer, timebase.denom))
+}
+
+/// Read every agent job tree's CPU time from launchd (#2951). The sampled
+/// unit is named `rsi-job-<id>.service`, the shape [`tree_owner`] reads on
+/// Linux, so the trip routing is shared.
+///
+/// # Errors
+/// [`ANDON_UNSUPPORTED`] when `launchctl` cannot be started. A failed listing
+/// is an empty sample (the next minute retries), not the end of the loop.
+#[cfg(target_os = "macos")]
+pub fn sample_trees() -> Result<(Vec<TreeSample>, Option<f64>), &'static str> {
+    let output = std::process::Command::new("/bin/launchctl")
+        .arg("list")
+        .env_remove("RSI_SESSION_TOKEN")
+        .output()
+        .map_err(|_| ANDON_UNSUPPORTED)?;
+    let mut samples = Vec::new();
+    if output.status.success() {
+        for (pid, label) in parse_launchctl_list(&String::from_utf8_lossy(&output.stdout)) {
+            if samples.len() >= MAX_TREES {
+                break;
+            }
+            let unit = format!("{label}.service");
+            let Some(owner @ TreeOwner::Job(_)) = tree_owner(&unit) else {
+                continue;
+            };
+            let Some(usage_usec) = process_tree_usage_usec(pid) else {
+                continue;
+            };
+            samples.push(TreeSample {
+                unit,
+                owner,
+                usage_usec,
+            });
+        }
+    } else {
+        tracing::debug!(status = %output.status, "launchctl list failed; CPU andon sampled no trees");
+    }
+    let load = crate::daemon_info::load_average().map(|load| load.one);
+    Ok((samples, load))
+}
+
+/// No tree CPU source here: the andon is explicitly unsupported.
 ///
 /// # Errors
 /// Always [`ANDON_UNSUPPORTED`].
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn sample_trees() -> Result<(Vec<TreeSample>, Option<f64>), &'static str> {
     Err(ANDON_UNSUPPORTED)
 }
@@ -379,7 +507,16 @@ pub async fn run_cpu_andon_loop(
         let (samples, load) = match sampled {
             Ok(sampled) => sampled,
             Err(code) => {
-                tracing::info!(code, "CPU andon is unsupported on this host; not sampling");
+                // #2937: a visible state, not silence: this host has no tree
+                // CPU source (no cgroup v2 on Linux without a user manager, no
+                // launchctl on macOS, #2951), so runaway cargo trees are
+                // bounded by the capacity gate (`host_memory`) and the job
+                // timeout instead.
+                tracing::warn!(
+                    code,
+                    "CPU andon is unsupported on this host (no tree CPU source); \
+                     runaway process trees are not sampled"
+                );
                 return;
             }
         };
@@ -417,8 +554,17 @@ mod tests {
             tree_owner(SCOPE),
             Some(TreeOwner::Invocation(Uuid::from_u128(2)))
         );
+        // #2127: a scoped test's nested unit belongs to the job named in it.
+        assert_eq!(
+            tree_owner("rsi-scoped-test-00000000-0000-0000-0000-000000000001-0123abcd.service"),
+            Some(TreeOwner::Job(Uuid::from_u128(1)))
+        );
         for other in [
             "rsi-scoped-test-abc.service",
+            "rsi-scoped-test-0123456789abcdef0123456789abcdef.service",
+            "rsi-scoped-test-00000000-0000-0000-0000-000000000001.service",
+            "rsi-scoped-test-00000000-0000-0000-0000-000000000001-.service",
+            "rsi-scoped-test-nope-0000-0000-0000-0000000000001-ab.service",
             "rsid.scope",
             "rsi-job-nope.service",
             "rsi-worker-x.scope",
@@ -532,9 +678,70 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn other_platforms_are_explicitly_unsupported() {
-        // Linux reads the live cgroup tree; every other platform refuses.
-        #[cfg(not(target_os = "linux"))]
+        // Linux reads the live cgroup tree and macOS asks launchd; every other
+        // platform refuses.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert_eq!(sample_trees().unwrap_err(), ANDON_UNSUPPORTED);
         assert_eq!(ANDON_UNSUPPORTED, "cpu_andon_unsupported");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn launchctl_list_yields_running_services_only() {
+        let listing = "PID\tStatus\tLabel\n\
+-\t0\tcom.apple.SafariHistoryServiceAgent\n\
+965\t0\tcom.apple.progressd\n\
+4242\t-9\trsi-job-00000000-0000-0000-0000-000000000001\n\
+garbage\n\
+0\t0\tcom.example.zero\n";
+        let services = parse_launchctl_list(listing);
+        assert_eq!(
+            services,
+            vec![
+                (965, "com.apple.progressd".to_string()),
+                (
+                    4242,
+                    "rsi-job-00000000-0000-0000-0000-000000000001".to_string()
+                ),
+            ]
+        );
+        // Only a job label is an agent tree; the unit shape is the Linux one.
+        let owned: Vec<_> = services
+            .iter()
+            .filter_map(|(_, label)| tree_owner(&format!("{label}.service")))
+            .collect();
+        assert_eq!(
+            owned,
+            vec![TreeOwner::Job(
+                Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+            )]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn mach_ticks_convert_through_the_timebase() {
+        // Apple silicon: 125/3 ns per tick, so 24 ticks are 1 us.
+        assert_eq!(mach_ticks_to_usec(24, 125, 3), 1);
+        assert_eq!(mach_ticks_to_usec(24_000_000 * 60, 125, 3), 60_000_000);
+        // Intel: 1/1, ticks are nanoseconds.
+        assert_eq!(mach_ticks_to_usec(5_000_000, 1, 1), 5_000);
+        // An unreadable timebase reads zero, never a division by zero.
+        assert_eq!(mach_ticks_to_usec(10, 1, 0), 0);
+    }
+
+    // The live sampler reads this very process through `proc_pid_rusage`.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn macos_reads_this_processs_cpu_time() {
+        let mut burn = 0_u64;
+        for i in 0..20_000_000_u64 {
+            burn = burn.wrapping_add(i ^ (burn >> 3));
+        }
+        assert_ne!(burn, 1);
+        let usec = process_tree_usage_usec(std::process::id() as i32).expect("own rusage");
+        assert!(usec > 0, "usec {usec}");
+        assert!(process_tree_usage_usec(i32::MAX).is_none());
     }
 }

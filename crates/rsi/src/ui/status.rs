@@ -151,11 +151,47 @@ pub(crate) fn render_context_percent_segment_for(
 /// Unknown keys fall back to the raw key rather than being hidden: a provider
 /// that adds a third window should be visible immediately, even unpolished,
 /// rather than silently dropped from the status bar.
-fn rate_limit_window_label(window_key: &str) -> &str {
+fn rate_limit_window_label(window_key: &str) -> String {
     match window_key {
-        "five_hour" => "5h",
-        "seven_day" => "7d",
-        other => other,
+        "five_hour" => "5h".to_string(),
+        "seven_day" => "7d".to_string(),
+        other => {
+            // Codex (#2757) names a window of another length `<mins>m`, and a
+            // non-default bucket prefixes its limit id: `<id>:<mins>m`.
+            let (prefix, base) = match other.rsplit_once(':') {
+                Some((prefix, base)) => (Some(prefix), base),
+                None => (None, other),
+            };
+            let short = base
+                .strip_suffix('m')
+                .and_then(|mins| mins.parse::<u32>().ok())
+                .filter(|mins| *mins > 0)
+                .map(|mins| {
+                    if mins % 1440 == 0 {
+                        format!("{}d", mins / 1440)
+                    } else if mins % 60 == 0 {
+                        format!("{}h", mins / 60)
+                    } else {
+                        format!("{mins}m")
+                    }
+                });
+            match (prefix, short) {
+                (Some(prefix), Some(short)) => format!("{prefix} {short}"),
+                (None, Some(short)) => short,
+                _ => other.to_string(),
+            }
+        }
+    }
+}
+
+/// Color of one window's utilization, on the context segment's thresholds.
+fn rate_limit_color(pct: f64) -> ratatui::style::Color {
+    if pct < 50.0 {
+        theme::green()
+    } else if pct < 80.0 {
+        theme::yellow()
+    } else {
+        theme::peach()
     }
 }
 
@@ -180,22 +216,39 @@ pub(crate) fn render_rate_limit_segment_for(
     let window = snapshot.peak_window()?;
 
     let pct = (window.utilization * 100.0).clamp(0.0, 100.0);
-    let color = if pct < 50.0 {
-        theme::green()
-    } else if pct < 80.0 {
-        theme::yellow()
-    } else {
-        theme::peach()
-    };
-
-    Some(vec![Span::styled(
+    let mut spans = vec![Span::styled(
         format!(
             "{:.0}% {}",
             pct,
             rate_limit_window_label(&window.window_key)
         ),
-        Style::default().fg(color),
-    )])
+        Style::default().fg(rate_limit_color(pct)),
+    )];
+    // One entry per provider window (#2757): the busiest first (above), the
+    // rest after it in the provider's order, each on its own threshold color.
+    for other in snapshot
+        .windows
+        .iter()
+        .filter(|other| other.window_key != window.window_key)
+    {
+        let other_pct = (other.utilization * 100.0).clamp(0.0, 100.0);
+        spans.push(Span::styled(
+            format!(
+                " {:.0}% {}",
+                other_pct,
+                rate_limit_window_label(&other.window_key)
+            ),
+            Style::default().fg(rate_limit_color(other_pct)),
+        ));
+    }
+    // A failed refresh leaves the last known windows on screen: say so.
+    if snapshot.is_stale() {
+        spans.push(Span::styled(
+            " stale",
+            Style::default().fg(theme::dim_metadata()),
+        ));
+    }
+    Some(spans)
 }
 
 #[cfg(test)]
@@ -698,6 +751,7 @@ mod tests {
                     },
                 )
                 .collect(),
+            stale_reason: None,
         }
     }
 
@@ -799,6 +853,44 @@ mod tests {
                 "utilization {utilization} took the wrong threshold branch"
             );
         }
+    }
+
+    #[test]
+    fn renders_every_codex_window_and_marks_a_stale_snapshot() {
+        use rsi_common::types::{ContextUsageConfidence, SessionProvider};
+        let mut app = test_app();
+        let mut session = make_test_session(ContextUsageConfidence::Full);
+        session.provider = SessionProvider::Codex;
+        let id = install_session(&mut app, crate::types::SessionState::new(session));
+        let mut snapshot = rate_limit_snapshot(
+            SessionProvider::Codex,
+            &[
+                ("five_hour", 0.27),
+                ("seven_day", 0.05),
+                ("codex_other:60m", 0.61),
+            ],
+        );
+        app.provider_rate_limits
+            .insert(SessionProvider::Codex, snapshot.clone());
+
+        let text = spans_text(&render_rate_limit_segment_for(&app, id).expect("renders"));
+        assert_eq!(text, "61% codex_other 1h 27% 5h 5% 7d");
+
+        snapshot.stale_reason = Some("probe_timeout".to_string());
+        app.provider_rate_limits
+            .insert(SessionProvider::Codex, snapshot);
+        let text = spans_text(&render_rate_limit_segment_for(&app, id).expect("renders"));
+        assert_eq!(text, "61% codex_other 1h 27% 5h 5% 7d stale");
+    }
+
+    #[test]
+    fn window_labels_read_minute_windows_as_hours_and_days() {
+        assert_eq!(rate_limit_window_label("90m"), "90m");
+        assert_eq!(rate_limit_window_label("60m"), "1h");
+        assert_eq!(rate_limit_window_label("1440m"), "1d");
+        assert_eq!(rate_limit_window_label("codex_other:60m"), "codex_other 1h");
+        assert_eq!(rate_limit_window_label("thirty_day"), "thirty_day");
+        assert_eq!(rate_limit_window_label("primary"), "primary");
     }
 
     #[test]

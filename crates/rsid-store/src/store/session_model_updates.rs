@@ -5,7 +5,7 @@ use super::Store;
 use crate::error::{DaemonError, Result};
 use chrono::{SecondsFormat, Utc};
 use rsi_common::types::{SessionKind, SessionProvider, SessionStatus};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -66,6 +66,7 @@ pub(crate) fn apply_v132_migration(store: &Store) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-migration
 
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: v132-session-model-updates-catalog
 pub(crate) const V132_CATALOG_OBJECTS: [(&str, &str); 3] = [
     ("index", "idx_session_model_updates_one_queued"),
@@ -73,11 +74,6 @@ pub(crate) const V132_CATALOG_OBJECTS: [(&str, &str); 3] = [
     ("table", "session_model_updates"),
 ];
 // RSI-RELEASED-MIGRATION-END: v132-session-model-updates-catalog
-
-pub(crate) fn install_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SESSION_MODEL_UPDATES_SCHEMA)?;
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionModelUpdateReceipt {
@@ -424,6 +420,7 @@ impl Store {
     /// Apply the pending tuple atomically with the model-segment boundary.
     /// A changed invocation marks the request stale and leaves session metadata
     /// untouched.
+    #[cfg(test)]
     pub(crate) fn apply_pending_session_model_update(
         &mut self,
         session_id: Uuid,
@@ -575,7 +572,8 @@ mod tests {
         provider: SessionProvider,
     ) -> (tempfile::TempDir, Store, Uuid, Uuid) {
         let dir = tempfile::tempdir().expect("create temp directory");
-        let store = Store::open(&dir.path().join("model-updates.db")).expect("open test store");
+        let store = Store::open_test_fixture(&dir.path().join("model-updates.db"))
+            .expect("open test store");
         let invocation_id = Uuid::new_v4();
         let mut session = make_test_session();
         session.status = SessionStatus::Running;

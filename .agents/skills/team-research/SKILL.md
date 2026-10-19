@@ -112,7 +112,7 @@ Do not wait for confirmation — proceed immediately after emitting this.
 
 ## Step 3: Worker Dispatch
 
-Spawn all domain workers in a **single message** using the `Agent` tool with `run_in_background: true`.
+Dispatch all domain workers in one batch, following `.claude/commands/_shared/team_dispatch.md`: RSI controls (`rsi_control_spawn` / `AgentSpawnChild`) inside an RSI session, native background agents only outside RSI. With no spawn authority, research the domains yourself in this session and do not claim workers ran.
 
 Name each worker descriptively: `"researcher-tui"`, `"researcher-daemon"`, `"researcher-thoughts"`, etc.
 
@@ -148,7 +148,7 @@ Nothing before it. Nothing after it. The master reads only your report.
 
 <forbidden_content>
 (Extends the shared preamble's forbidden list — role-specific additions only.)
-- Any field that exceeds its max_words / max_items cap — over-budget returns will be rejected and the worker re-dispatched.
+- Any field that exceeds its max_words / max_items cap — over-budget fields are trimmed by the master during synthesis; do not redispatch a completed worker for budget or formatting alone.
 </forbidden_content>
 
 RESEARCH REPORT:
@@ -163,7 +163,7 @@ open_questions: [per schema above]
 
 ## Step 4: Synthesis
 
-After all workers report back via TaskOutput:
+After all workers report back (final messages read per `_shared/team_dispatch.md`):
 
 1. Parse each `RESEARCH REPORT`
 2. Cross-reference findings across domains — note where domain A's findings connect to domain B's
@@ -230,30 +230,33 @@ last_updated_by: claude-team
 **Path handling for thoughts/**: Always remove `searchable/` from paths but preserve all other subdirectories. `thoughts/searchable/allison/notes.md` → `thoughts/allison/notes.md`.
 
 
-## Step 5b: Emit JSON companion + validate (RSI-014)
+## Step 5b: Emit JSON companion + validate (RSI-014, optional)
 
-After the markdown research document is written at `<doc>.md`, resolve `rsi-research-validate` from the active repository root before constructing a sidecar. Never search or build from an absolute RSI checkout and never assume a `crates/` layout.
+The markdown research document is always the authoritative source. Consumer skills can read markdown when no JSON exists or when the markdown declares `json_companion_status: invalid`.
 
-1. **Present/repo-local:** if `target/debug/rsi-research-validate` is executable, select it and require validation.
-2. **Buildable/repo-local:** otherwise run `cargo metadata --no-deps --format-version 1`; if successful metadata contains package `rsi-common` with exact binary target `rsi-research-validate`, run `cargo build -p rsi-common --bin rsi-research-validate --quiet`, select `target/debug/rsi-research-validate`, and require validation. A build failure remains a required-validator failure; it is never `SKIPPED`.
-3. **Present/PATH:** if the repository has no exact buildable target but `command -v rsi-research-validate` resolves an executable, select it and require validation.
-4. **Unavailable:** only if no repository-local executable exists, successful metadata proves the exact package/target absent (or the active repository has no Cargo manifest), and PATH has no executable, report `Validator: SKIPPED — rsi-research-validate unavailable (no executable and no buildable rsi-common target); markdown remains authoritative; continuing.` Do not create a new JSON sidecar, do not set `json_companion_status: invalid`, and do not overwrite, validate, trust, or delete a pre-existing sidecar.
-5. **Probe error:** if the active repository has a Cargo manifest but metadata fails and no executable is available, report the capability-probe error as a failure. It is never `SKIPPED`.
-When a validator is selected, emit a structured JSON sidecar so consumer skills can parse a typed contract instead of grepping markdown. The JSON conforms to the v2 schema enforced by `rsi-research-validate` (source: `crates/rsi-common/src/research_schema/`).
+Generate a typed JSON sidecar ONLY when:
+- The user explicitly requests typed output,
+- OR a downstream consumer explicitly requests the research with `typed: true`,
+- OR you choose to provide it for complex research that will directly feed planning via `satisfies:` linkage.
 
-6. **Construct the JSON object** from the synthesized working set produced in Step 4. Top-level fields:
+When JSON is generated, follow this flow. Never search or build from an absolute RSI checkout and never assume a `crates/` layout.
+
+1. **Probe for validator:** Check if `target/debug/rsi-research-validate` is executable.
+2. **Build if needed/wanted:** If the validator is absent and you choose to generate JSON (per the conditions above), run `cargo metadata --no-deps --format-version 1`; if successful metadata contains package `rsi-common` with exact binary target `rsi-research-validate`, run `cargo build -p rsi-common --bin rsi-research-validate --quiet`, select `target/debug/rsi-research-validate`. A build failure does not block JSON generation (JSON is best-effort when unsolicited); validate later or report the build failure and use markdown fallback.
+3. **PATH fallback:** If a validator is not found locally, skip JSON generation; markdown is authoritative.
+4. **Construct the JSON object** from the synthesized working set produced in Step 4. Top-level fields:
    - `version`: `2` (the constant `RESEARCH_SCHEMA_VERSION`; v2 is a strict superset of v1).
    - `research_question`: the original user question verbatim.
    - `areas`: the list of dispatched-domain names from your Step 2 Domain Decomposition (e.g., `["TUI", "Daemon", "Common types", "Database", "Historical context", "Targeted deep-dive"]`). Must be non-empty.
    - `findings`: aggregate each domain worker's `findings[]` (already returned per `<return_schema role="research">`). For each finding string, emit `{ id: <"F-001", "F-002", …>, summary: <≤25 words>, file_ref: <"path:line" or "path:start-end">, confidence: "medium" }`. **Mint `id` as a stable, monotonic join key** (`F-001`, `F-002`, … assigned across the aggregated set) — this is the provenance anchor `/plan` items reference via `satisfies:` and the cross-stage VERIFY pass checks. If a worker reports more findings than `file_refs`, reuse the worker's first `file_ref` for the trailing entries.
    - `file_refs`: aggregate each worker's `file_refs[]`, deduplicate by `path`, expand each `path:N` into `{ path, lines: [N, N] }` and each `path:start-end` into `{ path, lines: [start, end] }` (start ≤ end).
    - `open_questions`: aggregate each worker's `open_questions[]`. Stamp `blocks_planning: false` for v1 unless a question explicitly names a missing prerequisite.
-7. **Write** the JSON to `<doc>.json` (sibling of the markdown).
-8. **Validate**: run the selected `rsi-research-validate <doc>.json`.
+5. **Write** the JSON to `<doc>.json` (sibling of the markdown).
+6. **Validate (if validator available)**: run `rsi-research-validate <doc>.json --strict`.
    - On exit `0` → proceed to Step 6 (commit/push). Both files are committed together.
-   - On exit `2` (schema rejection) → delete `<doc>.json` (`rm`); insert `json_companion_status: invalid` into the markdown frontmatter (before the closing `---`); proceed to Step 6. The markdown is the authoritative human artifact and must remain committed; consumer skills detect the frontmatter flag and skip the JSON probe.
-   - On exit `1` (I/O error) → same fallback as exit 2; surface the I/O error in your final summary to the user.
-9. The JSON is opaque to daemon pipeline detection (`PIPELINE_PATH_RE` only matches `.md`); no auto-derive double-fire concern. Validator exit failures are never `SKIPPED`.
+   - On exit `2` or `1` → delete `<doc>.json` (`rm`); insert `json_companion_status: invalid` into the markdown frontmatter (before the closing `---`); proceed to Step 6. The markdown is the authoritative human artifact and must remain committed; consumer skills detect the frontmatter flag and skip the JSON probe.
+
+The JSON is opaque to daemon pipeline detection (`PIPELINE_PATH_RE` only matches `.md`); no auto-derive double-fire concern.
 
 
 ## Step 6: Commit and Push — REQUIRED

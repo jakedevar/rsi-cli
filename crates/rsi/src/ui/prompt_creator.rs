@@ -1,6 +1,7 @@
 //! Prompt Creator/Editor UI rendering.
 //!
-//! Full-screen view for managing prompt files stored in `~/.flywheel/prompts/`.
+//! Full-screen view for managing the daemon's prompt files (`~/.rsi/prompts/`,
+//! through the operator prompt-file RPCs).
 //! List mode shows prompt cards; editor mode splits into list + file viewer.
 
 use ratatui::Frame;

@@ -10,18 +10,25 @@ use crate::session::harness::types::ToolResult;
 use crate::store::Store;
 use crate::vault::VaultHandle;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::search::McpToolSearchTool;
 use super::{McpLimits, McpServerSpec, McpToolCallOutput, McpToolInfo, StdioMcpClient};
-use crate::session::harness::tools::DeferredMcpCatalog;
 
 pub(crate) const MAX_MCP_TOOLS_PER_SESSION: usize = 256;
 const MAX_TOOL_NAME_BYTES: usize = 128;
+/// Longest function name the model routes accept: OpenAI Chat Completions and
+/// Inception Mercury both cap it at 64 characters, so the bridge caps every
+/// exposed name there instead of each route doing it (#2253).
+pub(crate) const MAX_EXPOSED_TOOL_NAME_CHARS: usize = 64;
+/// Hex digits of the content hash that make a shortened name unique.
+const SHORTENED_NAME_HASH_CHARS: usize = 8;
+const MAX_SHORTENED_NAME_HASH_CHARS: usize = 32;
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 16;
 const EXTERNAL_TOOL_PREFIX: &str =
@@ -115,16 +122,12 @@ impl McpBridge {
         };
         let client = Arc::new(Mutex::new(client));
         let mut seen = HashSet::new();
-        let mut limit_emitted = false;
         for tool in tools {
             if self.registered >= MAX_MCP_TOOLS_PER_SESSION {
-                if !limit_emitted {
-                    limit_emitted = true;
-                    self.events.push(system_event(
-                        "mcp_tool_limit",
-                        json!({"server_id": id, "limit": MAX_MCP_TOOLS_PER_SESSION}),
-                    ));
-                }
+                self.events.push(system_event(
+                    "mcp_tool_limit",
+                    json!({"server_id": id, "limit": MAX_MCP_TOOLS_PER_SESSION}),
+                ));
                 break;
             }
             if !seen.insert(tool.name.clone()) {
@@ -139,10 +142,24 @@ impl McpBridge {
                 self.push_skipped(id, "invalid_input_schema");
                 continue;
             }
-            let name = format!("mcp__{id}__{}", tool.name);
+            let taken: HashSet<&str> = self.tools.iter().map(|tool| tool.name()).collect();
+            let name = exposed_tool_name(id, &tool.name, &taken);
+            if name != format!("mcp__{id}__{}", tool.name) {
+                self.events.push(system_event(
+                    "mcp_tool_renamed",
+                    json!({
+                        "server_id": id,
+                        "tool_name": tool.name,
+                        "exposed_name": name,
+                        "reason": "name_too_long",
+                    }),
+                ));
+            }
             let input_schema = tool.input_schema.clone().unwrap_or_else(|| json!({}));
             self.tools.push(Arc::new(McpBridgeTool::new(
                 name,
+                id.to_string(),
+                tool.name.clone(),
                 external_description(&tool, limits.max_description_bytes),
                 input_schema,
                 Arc::clone(&client),
@@ -263,6 +280,30 @@ fn valid_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
+/// The name the model sees for a server's tool: `mcp__{server}__{tool}`, or,
+/// when that exceeds [`MAX_EXPOSED_TOOL_NAME_CHARS`], its leading characters, `_`
+/// and a hex digest of the full name (#2253). The digest makes the result
+/// stable across launches and distinct for distinct tools; a collision with a
+/// name already `taken` (astronomically unlikely) takes more digest digits, so
+/// the answer depends only on the registration order. Both inputs are
+/// `[A-Za-z0-9_-]`, so the result is too, and byte slicing is safe.
+pub(super) fn exposed_tool_name(server_id: &str, tool_name: &str, taken: &HashSet<&str>) -> String {
+    let full = format!("mcp__{server_id}__{tool_name}");
+    if full.len() <= MAX_EXPOSED_TOOL_NAME_CHARS {
+        return full;
+    }
+    let digest = hex::encode(Sha256::digest(full.as_bytes()));
+    let mut hash_chars = SHORTENED_NAME_HASH_CHARS;
+    loop {
+        let keep = MAX_EXPOSED_TOOL_NAME_CHARS - 1 - hash_chars;
+        let candidate = format!("{}_{}", &full[..keep], &digest[..hash_chars]);
+        if !taken.contains(candidate.as_str()) || hash_chars >= MAX_SHORTENED_NAME_HASH_CHARS {
+            return candidate;
+        }
+        hash_chars += 4;
+    }
+}
+
 fn valid_schema(tool: &McpToolInfo) -> bool {
     let Some(schema) = tool.input_schema.as_ref() else {
         return false;
@@ -302,7 +343,11 @@ fn external_description(tool: &McpToolInfo, max_bytes: usize) -> String {
 }
 
 struct McpBridgeTool {
+    /// The name the model sees (at most [`MAX_EXPOSED_TOOL_NAME_CHARS`]).
     name: String,
+    server_id: String,
+    /// The server's own tool name, which dispatch calls.
+    tool_name: String,
     description: String,
     input_schema: Value,
     parameters_json: String,
@@ -312,12 +357,16 @@ struct McpBridgeTool {
 impl McpBridgeTool {
     fn new(
         name: String,
+        server_id: String,
+        tool_name: String,
         description: String,
         input_schema: Value,
         client: Arc<Mutex<StdioMcpClient>>,
     ) -> Self {
         Self {
             name,
+            server_id,
+            tool_name,
             description,
             input_schema: input_schema.clone(),
             parameters_json: serde_json::to_string(&input_schema).unwrap_or_else(|_| "{}".into()),
@@ -330,10 +379,7 @@ impl McpBridgeTool {
     }
 
     fn server_id(&self) -> &str {
-        self.name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once("__"))
-            .map_or("", |(server_id, _)| server_id)
+        &self.server_id
     }
 
     fn input_schema(&self) -> Value {
@@ -402,13 +448,8 @@ impl HarnessTool for McpBridgeTool {
         context: &crate::session::harness::tools::ToolContext,
     ) -> ToolResult {
         let mut client = self.client.lock().await;
-        let name = self
-            .name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once("__"))
-            .map_or("", |(_, tool_name)| tool_name);
         let output = client.call_tool_with_cancellation(
-            name,
+            &self.tool_name,
             (!args.is_null()).then_some(args),
             &context.cancel,
         );
@@ -418,13 +459,8 @@ impl HarnessTool for McpBridgeTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let cancellation = CancellationToken::new();
         let mut client = self.client.lock().await;
-        let name = self
-            .name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once("__"))
-            .map_or("", |(_, tool_name)| tool_name);
         let output = client.call_tool_with_cancellation(
-            name,
+            &self.tool_name,
             (!args.is_null()).then_some(args),
             &cancellation,
         );

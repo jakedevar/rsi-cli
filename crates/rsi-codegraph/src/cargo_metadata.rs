@@ -100,12 +100,37 @@ struct MetadataDepKind {
     target: Option<String>,
 }
 
+/// How much of the dependency graph a metadata read resolves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Resolved direct dependencies; needs every locked crate in the offline
+    /// registry cache.
+    Resolved,
+    /// Workspace packages and targets only (`--no-deps`): no dependency
+    /// edges, but it never needs a dependency's source.
+    WorkspaceOnly,
+}
+
 /// Run offline locked Cargo metadata with a hard wall and output cap. Only
 /// workspace manifests and targets under the supplied root enter the result.
 ///
 /// # Errors
 /// Returns visible path, timeout, process, output-bound, or JSON errors.
 pub fn read_workspace(root: &Path) -> Result<CargoWorkspace> {
+    read_workspace_with(root, Resolution::Resolved)
+}
+
+/// The degraded read for a workspace whose locked dependencies are not all
+/// available offline: packages and targets with no dependency edges. Callers
+/// must report the snapshot as partial.
+///
+/// # Errors
+/// Returns the same visible errors as [`read_workspace`].
+pub fn read_workspace_no_deps(root: &Path) -> Result<CargoWorkspace> {
+    read_workspace_with(root, Resolution::WorkspaceOnly)
+}
+
+fn read_workspace_with(root: &Path, resolution: Resolution) -> Result<CargoWorkspace> {
     let root = root.canonicalize().map_err(io_error)?;
     if !root.join("Cargo.toml").is_file() {
         return Err(CodegraphError::InvalidInput(
@@ -114,8 +139,13 @@ pub fn read_workspace(root: &Path) -> Result<CargoWorkspace> {
     }
     let mut stdout = tempfile::tempfile().map_err(io_error)?;
     let mut stderr = tempfile::tempfile().map_err(io_error)?;
-    let mut child = Command::new("cargo")
-        .args(["metadata", "--offline", "--locked", "--format-version", "1"])
+    let mut command = Command::new("cargo");
+    command.args(["metadata", "--offline", "--locked"]);
+    if resolution == Resolution::WorkspaceOnly {
+        command.arg("--no-deps");
+    }
+    let mut child = command
+        .args(["--format-version", "1"])
         .current_dir(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.try_clone().map_err(io_error)?))
@@ -147,11 +177,16 @@ pub fn read_workspace(root: &Path) -> Result<CargoWorkspace> {
     let metadata: Metadata = serde_json::from_slice(&output).map_err(|error| {
         CodegraphError::InvalidInput(format!("invalid cargo metadata JSON: {error}"))
     })?;
-    project_metadata(&root, &output, metadata)
+    project_metadata(&root, &output, metadata, resolution)
 }
 
 #[allow(clippy::too_many_lines)] // Projection validates packages, targets, and resolved edges as one input.
-fn project_metadata(root: &Path, output: &[u8], metadata: Metadata) -> Result<CargoWorkspace> {
+fn project_metadata(
+    root: &Path,
+    output: &[u8],
+    metadata: Metadata,
+    resolution: Resolution,
+) -> Result<CargoWorkspace> {
     let workspace_members = metadata
         .workspace_members
         .into_iter()
@@ -209,11 +244,16 @@ fn project_metadata(root: &Path, output: &[u8], metadata: Metadata) -> Result<Ca
         .map(|package| (package.id.as_str(), package))
         .collect::<HashMap<_, _>>();
     let mut dependencies = Vec::new();
-    for node in metadata
-        .resolve
-        .ok_or_else(|| CodegraphError::InvalidInput("cargo metadata has no resolve graph".into()))?
-        .nodes
-    {
+    let resolve_nodes = match (metadata.resolve, resolution) {
+        (Some(resolve), Resolution::Resolved) => resolve.nodes,
+        (_, Resolution::WorkspaceOnly) => Vec::new(),
+        (None, Resolution::Resolved) => {
+            return Err(CodegraphError::InvalidInput(
+                "cargo metadata has no resolve graph".into(),
+            ));
+        }
+    };
+    for node in resolve_nodes {
         let Some(owner) = package_by_id.get(node.id.as_str()) else {
             continue;
         };
@@ -277,6 +317,9 @@ fn project_metadata(root: &Path, output: &[u8], metadata: Metadata) -> Result<Ca
     let canonical_bytes = canonical_metadata_bytes(root, output)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rsi-codegraph-cargo-metadata-v3");
+    if resolution == Resolution::WorkspaceOnly {
+        hasher.update(b"workspace-only");
+    }
     hasher.update(&canonical_bytes);
     if let Ok(lock) = std::fs::read(root.join("Cargo.lock")) {
         hasher.update(&lock);
@@ -687,7 +730,8 @@ mod tests {
             assert!(output.status.success());
             let raw: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             let parsed: Metadata = serde_json::from_slice(&output.stdout).unwrap();
-            let projected = project_metadata(root, &output.stdout, parsed).unwrap();
+            let projected =
+                project_metadata(root, &output.stdout, parsed, Resolution::Resolved).unwrap();
             (raw, projected)
         };
         let (first_raw, first) = read_at(&root.join("build-a"));
@@ -698,5 +742,28 @@ mod tests {
         );
         assert_ne!(first_raw["build_directory"], second_raw["build_directory"]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)] // Temporary Cargo fixture is a test prerequisite.
+    fn workspace_only_read_survives_an_unavailable_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n\
+             [dependencies]\nabsent-crate-zzz = \"1.2.3\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+
+        assert!(read_workspace(root).is_err());
+        let degraded = read_workspace_no_deps(root).unwrap();
+        assert_eq!(degraded.packages.len(), 1);
+        assert_eq!(degraded.packages[0].name, "fixture");
+        assert_eq!(degraded.packages[0].targets[0].source_path, "src/lib.rs");
+        assert!(degraded.dependencies.is_empty());
+        assert!(!degraded.metadata_digest.is_empty());
     }
 }

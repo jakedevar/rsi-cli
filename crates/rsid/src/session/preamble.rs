@@ -33,8 +33,12 @@ use rsi_common::agent_authority_catalog::{
     AGENT_AUTHORITY_CATALOG_SCHEMA_VERSION_V1, AgentAuthorityCatalogV1,
     AgentAuthorityControlDetailV1, AgentAuthorityControlV1, AgentAuthorityRefusalV1,
 };
-use rsi_common::agent_control_schema::{AgentControlDescriptorV1, AgentControlVerbV1 as Verb};
+#[cfg(test)]
+use rsi_common::agent_control_schema::AgentControlDescriptorV1;
+use rsi_common::agent_control_schema::AgentControlVerbV1 as Verb;
+use rsi_common::manager_operator_delegation::DELEGATED_OPERATOR_INVOCATION;
 use rsi_common::types::{Session, SessionKind};
+#[cfg(test)]
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -50,8 +54,11 @@ const COMMANDS_DIR: &str = ".claude/commands";
 
 /// The shipped contract is compiled into rsid. The source-tree files remain
 /// available as optional project context but are not required at runtime.
+#[cfg(test)]
 pub(crate) const EMBEDDED_GUIDANCE_VERSION: u32 = 1;
+#[cfg(test)]
 const EMBEDDED_ROUTER: &str = include_str!("../../../../.claude/commands/orchestration_router.md");
+#[cfg(test)]
 const EMBEDDED_BASE: &str = include_str!("../../../../.claude/commands/_shared/worker_preamble.md");
 const EMBEDDED_COMMON: &str = include_str!("guidance/common_v1.md");
 const EMBEDDED_WORKER: &str = include_str!("guidance/worker_v1.md");
@@ -61,6 +68,7 @@ const EMBEDDED_REVIEWER: &str = include_str!("guidance/assigned_reviewer_v1.md")
 const EMBEDDED_GLOBAL_MANAGER: &str = include_str!("guidance/global_manager_v1.md");
 const EMBEDDED_PORTFOLIO_MANAGER: &str = include_str!("guidance/portfolio_manager_v1.md");
 
+#[cfg(test)]
 fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
     match kind {
         SessionKind::Bug => Some(include_str!(
@@ -107,6 +115,7 @@ fn check_guidance_ids(projection: &AgentAuthorityProjection) -> Result<()> {
 /// Build one versioned, role-filtered instruction snapshot from the durable
 /// projection. Launch and rotation will consume this after authority publishes;
 /// rendering itself never grants a server-side permission.
+#[cfg(test)]
 pub(crate) fn render_versioned_guidance(
     kind: SessionKind,
     projection: &AgentAuthorityProjection,
@@ -170,6 +179,10 @@ pub(crate) fn render_versioned_guidance(
                     .expect("writing to a String cannot fail");
             }
         }
+        if !projection.delegated_operator_methods.is_empty() {
+            write!(catalog, " {DELEGATED_OPERATOR_INVOCATION}")
+                .expect("writing to a String cannot fail");
+        }
         if !projection.control_actions.is_empty() {
             let actions = manager_action_names(projection)?;
             write!(
@@ -226,7 +239,9 @@ fn discover_harness_root() -> Option<PathBuf> {
         env_root.as_deref(),
         std::env::current_dir().ok().as_deref(),
         exe_dir.as_deref(),
-        Path::new(env!("CARGO_MANIFEST_DIR")),
+        // The crate directory, found at run time (#1741): a compile-time
+        // path would pin the shared artifact to one checkout.
+        Path::new(rsi_common::try_manifest_dir!().unwrap_or("")),
         Some(env!("RSI_BUILD_MAIN_WORKTREE"))
             .filter(|main| !main.is_empty())
             .map(Path::new),
@@ -365,9 +380,10 @@ You are an rsi-managed agent session. Start here: call \
 `mcp__rsi-agent__rsi_control_authority_catalog`; CLI fallback \
 `rsi-rpc AgentGetAuthorityCatalog`). It is your operator's manual: your current \
 roles, the operating rules for those roles, and exactly the controls you may \
-call now. Pass `{\"verb\": \"<name>\"}` for one control alone: its schema, a \
-minimal example request and its refusal codes. Call it again after a role \
-change or an authority refusal. The catalog never grants authority: the \
+call now (each with a one-line description; `{\"fields\": \"full\"}` adds the \
+complete descriptions). Pass `{\"verb\": \"<name>\"}` for one control alone: its \
+schema, a minimal example request and its refusal codes. Call it again after a \
+role change or an authority refusal. The catalog never grants authority: the \
 daemon checks every call.
 
 Prefer the typed `rsi_control_*` tools when your provider exposes them. \
@@ -375,12 +391,12 @@ Prefer the typed `rsi_control_*` tools when your provider exposes them. \
 supplied automatically via `$RSI_SESSION_TOKEN` (transport-only - NEVER pass it \
 in `--params`). Do not invoke any other RPC method as an agent.
 
-`AgentScheduleWake`: `mode` is required. Use `resume` for same-session \
+`AgentScheduleWake`: `mode` and `message` (the prompt to run when the wake fires) are required. Use `resume` for same-session \
 continuation (never `fresh` on your own session), `fresh` only for a \
 best-effort post-terminal root launch that carries no lead authority, \
 `on_terminal` for a child watch, `program_guard` for the unattended-program \
 sentinel, or `when` for a wait the daemon evaluates itself (`when.jobs_terminal` \
-job ids you own, or `when.sha_on_rolling`; optional `timeout_seconds`): submit a \
+job ids you own, `when.sha_on_rolling`, `when.issue_closed` (an Issue number, no SHA needed), `when.todo_closed` (an operator to-do id in your scope; no polling for the operator), `when.topology_execution_settled` (a topology execution id; it succeeded, failed, was cancelled or blocked), `when.settlement_run_settled` (the run id `AgentApplySourceWorktreeCohort` returned; the run finished), or `when.health_anomaly` (a manager seat only: `{}`; the daemon checks health every minute with no model turn and resumes you once per anomaly set, in place of an hourly check-in); optional `timeout_seconds`): submit a \
 batch of `AgentSubmitJob` jobs with `wake:\"none\"` and arm ONE `when` wake, so you \
 are resumed once when the last job ends instead of once per job. An explicit \
 `name` replaces your earlier enabled wake of that name.
@@ -393,6 +409,7 @@ answer or clear them.";
 
 /// Write one catalog entry: method, native tool name, and the canonical
 /// descriptor text (the same text `rsi-rpc agent` and MCP `tools/list` show).
+#[cfg(test)]
 fn write_verb_entry(out: &mut String, descriptor: &AgentControlDescriptorV1) {
     write!(out, "\n- `{}`", descriptor.method).expect("writing to a String cannot fail");
     if let Some(tool) = descriptor.native_tool {
@@ -506,10 +523,12 @@ pub(crate) fn render_authority_catalog(
     // detail; the full list, guidance and manager lists come without `verb`.
     let committed = !projection.pending && control.is_none();
     Ok(AgentAuthorityCatalogV1 {
+        coordinator_budget: None,
         schema_version: AGENT_AUTHORITY_CATALOG_SCHEMA_VERSION_V1,
         session_id,
         authority_revision: projection.revision.clone(),
         pending: projection.pending,
+        view: String::new(),
         roles,
         guidance: if control.is_some() {
             String::new()
@@ -540,6 +559,13 @@ pub(crate) fn render_authority_catalog(
             owned(&projection.delegated_operator_methods)
         } else {
             Vec::new()
+        },
+        delegated_operator_invocation: if committed
+            && !projection.delegated_operator_methods.is_empty()
+        {
+            DELEGATED_OPERATOR_INVOCATION.to_owned()
+        } else {
+            String::new()
         },
         control,
     })
@@ -631,6 +657,55 @@ This worktree is RSI-owned. Your sandbox root is `{}` and its assigned branch is
 
 Do not run `git checkout`, `git switch`, or any command that creates or changes a branch in this worktree. Commit, push, and open a PR from the assigned branch instead. If a named branch is required, stop and request a session allocated on that branch; do not mutate this sandbox's branch.",
         sandbox_root.display()
+    )
+}
+
+/// Render the daemon-resolved identity line for a session (#597).
+///
+/// The router table every worker receives names a model per capability class;
+/// workers copied it as their own identity. The daemon knows the real
+/// provider/model/effort, so it states them here and tells the worker to cite
+/// this line, never the table, for any author/reviewer model field.
+pub(crate) fn session_identity_instruction(
+    provider: rsi_common::types::SessionProvider,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    let model = model.map(str::trim).filter(|m| !m.is_empty()).map_or(
+        "the provider default (not named by the daemon)".to_owned(),
+        |m| format!("`{m}`"),
+    );
+    let effort = effort
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map_or("default".to_owned(), |e| format!("`{e}`"));
+    format!(
+        "\
+## RSI session identity
+
+You are running as provider `{provider:?}`, model {model}, effort {effort}. This daemon-resolved line is your only authoritative model identity. Model names in the orchestration router table describe routing classes, not you: never report them as your own. For any author model or reviewer model field, cite this line or leave the field to the session row."
+    )
+}
+
+/// Join the daemon-resolved identity with the optional custody instruction.
+/// Custody (when present) stays first so its prompt prefix is unchanged.
+pub(super) fn standing_instruction(identity: String, custody: Option<String>) -> Option<String> {
+    Some(match custody {
+        Some(custody) => format!("{custody}\n\n{identity}"),
+        None => identity,
+    })
+}
+
+/// Identity plus custody for a persisted session row (rotation, handoff and
+/// resume paths).
+pub(super) fn standing_instruction_for_session(session: &Session) -> Option<String> {
+    standing_instruction(
+        session_identity_instruction(
+            session.provider,
+            session.model.as_deref(),
+            session.effort.as_deref(),
+        ),
+        sandbox_custody_instruction_for_session(session),
     )
 }
 
@@ -731,6 +806,24 @@ pub fn load(kind: SessionKind, project_dir: &Path) -> Option<String> {
         Some(preamble) => format!("{preamble}\n\n{generic}"),
         None => generic,
     })
+}
+
+/// Startup text parts for a fresh launch or relaunch: the session project's
+/// router and preamble (read from `project_dir`, the session's sandbox root or
+/// working dir) followed by the RSI-generic part. A project without
+/// `.claude/commands` files contributes none of its own. Joined with a blank
+/// line they are the head of a fresh launch's system prompt, which is the text
+/// a `SessionStart` hook carries instead when the operator enables it (hub
+/// #2919, [`crate::session_start_preamble`]).
+pub fn startup_parts(kind: SessionKind, project_dir: &Path) -> Vec<String> {
+    let mut parts = Vec::new();
+    if let Some(router) = load_orchestration_router(project_dir) {
+        parts.push(router);
+    }
+    if let Some(preamble) = load(kind, project_dir) {
+        parts.push(preamble);
+    }
+    parts
 }
 
 /// The one read path for project-part startup text. Canonicalizes the project
@@ -847,7 +940,7 @@ mod tests {
     /// The rsi repository checkout this crate is built from: a session whose
     /// tree is this directory is a session "in the rsi repo".
     fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        Path::new(rsi_common::manifest_dir!())
             .join("../..")
             .canonicalize()
             .expect("repo root")
@@ -951,6 +1044,62 @@ mod tests {
         assert!(permitted.permitted);
     }
 
+    /// #308: the default whole-manual answer for a full manager (every
+    /// guidance section and every control) must stay inlineable by a provider
+    /// (Claude refused a 73 KB answer), keep every control name and the whole
+    /// guidance, and leave `fields: "full"` as the unabridged form.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn summary_catalog_for_a_full_manager_stays_under_the_byte_budget_308() {
+        const BUDGET_BYTES: usize = 50_000;
+        let caller = uuid::Uuid::new_v4();
+        let full = render_authority_catalog(caller, &all_roles_projection(), None).unwrap();
+        let mut summary = full.clone();
+        summary.summarize();
+        let summary_bytes = serde_json::to_vec(&summary).unwrap().len();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        assert!(
+            summary_bytes <= BUDGET_BYTES,
+            "summary catalog is {summary_bytes} bytes (budget {BUDGET_BYTES}, full {full_bytes})"
+        );
+        assert!(
+            summary_bytes + 10_000 < full_bytes,
+            "{summary_bytes} vs {full_bytes}"
+        );
+        assert_eq!(summary.view, "summary");
+        assert_eq!(summary.guidance, full.guidance);
+        assert_eq!(summary.roles, full.roles);
+        assert_eq!(
+            summary.manager_control_actions,
+            full.manager_control_actions
+        );
+        let names = |catalog: &AgentAuthorityCatalogV1| {
+            catalog
+                .controls
+                .iter()
+                .map(|control| (control.method.clone(), control.native_tool.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&summary), names(&full), "every control name is kept");
+        for control in &summary.controls {
+            assert!(
+                !control.description.is_empty()
+                    && control.description.chars().count()
+                        <= rsi_common::agent_authority_catalog::SUMMARY_DESCRIPTION_MAX_CHARS,
+                "{}: {}",
+                control.method,
+                control.description
+            );
+        }
+        // The full form is unabridged and carries no summary marker.
+        assert!(full.view.is_empty());
+        assert!(
+            full.controls
+                .iter()
+                .any(|control| control.description.chars().count() > 300)
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
     fn authority_catalog_verb_response_is_the_compact_envelope_and_one_detail() {
@@ -1031,22 +1180,36 @@ mod tests {
             // manager: reach, deploy, landing queue, succession
             "`manager_v2_leaf_required`",
             "you cannot halt an Epic lead",
-            "before `succeed_manager`, `pause_lead` or lead replacement",
+            // #1861: a manager never ends a turn on a question
+            "Never end a turn on a question.",
+            "`terminal:manager_question_stall`",
+            "pause_lead suspends the lead's resume wakes",
             "`AgentRequestDeploy`",
             "`AgentEnqueueLandingSource`",
+            "`AgentListRollingQueue`",
+            "`AgentCancelRollingQueueEntry {entry_id}`",
             "Batch waits, never landings",
-            "scripts/check-touched-shards --base origin/rolling",
+            "so the merge queue derives the filters",
             "there are no hot-file claims or seals",
             "`topology_bulk_fanout_min_openrouter`",
+            // #2413: a manager's own enqueue gets one outcome wake, so
+            // `sha_on_rolling` is for a dependency it did not enqueue
+            "only for a dependency's landing you did not enqueue",
+            "arm no `sha_on_rolling` or `issue_closed` for your own enqueue",
             // manager: runaway runs and the load rule (#1337)
             "Runaway runs (#1337), every wake: read the top CPU consumers",
             "`runaway_process` notice",
-            "over about 20 minutes, or one that dominates a host load over 40",
+            "Stop stalled, over-broad or unbounded work, or work dominating a host load over 40",
+            "A healthy `scoped_test` making progress within its admitted budget",
+            "its default budget is 60 minutes",
+            "`AgentHalt` stops a provider session, not its detached job",
+            "use `AgentCancelJob` only within its live catalog scope",
+            "a current manager may cancel ordinary test/build jobs in live scope",
+            "but not landing, cloud gate/sweep, release build or automatic full-library QA jobs",
             "`AgentHalt`, then `AgentContinueChild` with a scoped instruction",
             "Report every run you stopped in your handoff",
             "`job_timed_out`",
-            "check `uptime` before you launch build or test work",
-            "queue it while the 1-minute load is above 40",
+            "let admission queue them and do not poll before launching",
             "at most 5 concurrent build-heavy sessions per project",
         ] {
             assert!(guidance.contains(phrase), "guidance lost: {phrase}");
@@ -1067,10 +1230,15 @@ mod tests {
         for phrase in [
             "## Portfolio manager",
             "Runaway runs (#1337): on every wake read the top CPU consumers",
-            "over about 20 minutes, or one that dominates a host load over 40",
-            "(`AgentHalt`, then `AgentContinueChild` with a scoped instruction)",
-            "check `uptime` before launching build or test work",
-            "queue it while the 1-minute load is above 40",
+            "Stop stalled, over-broad or unbounded work, or work dominating a host load over 40",
+            "A healthy `scoped_test` making progress within its admitted budget",
+            "its default budget is 60 minutes",
+            "`AgentHalt` stops a provider session, not its detached job",
+            "use `AgentCancelJob` only within its live catalog scope",
+            "a current manager may cancel ordinary test/build jobs in live scope",
+            "but not landing, cloud gate/sweep, release build or automatic full-library QA jobs",
+            "`AgentHalt`, then `AgentContinueChild` with a scoped instruction",
+            "let admission queue them and do not poll before launching",
             "at most 5 concurrent build-heavy sessions per project",
             "Report every run stopped in your report up and handoff",
         ] {
@@ -1107,6 +1275,12 @@ mod tests {
         assert_eq!(catalog.manager_control_actions, ["create_session"]);
         assert_eq!(catalog.manager_prepared_actions, ["resume_lead"]);
         assert_eq!(catalog.delegated_operator_methods, ["GetSession"]);
+        // #2060: the listing names the one working invocation, not a direct RPC.
+        assert!(
+            catalog
+                .delegated_operator_invocation
+                .contains("`AgentManagerControl` with action `operator_call`")
+        );
         let json = serde_json::to_value(&catalog).unwrap();
         assert_eq!(json["schema_version"], 1);
         assert!(json.get("control").is_none());
@@ -1213,6 +1387,10 @@ mod tests {
         assert!(guidance.contains("`AgentGetStatus` / `rsi_control_status`"));
         assert!(guidance.contains("`AgentCreateIssue` / `rsi_control_create_issue`"));
         assert!(!guidance.contains("`AgentManagerControl`"));
+        // #2124: a worker is told up front that only the manager or an Epic
+        // lead may raise `timeout_minutes`, so it does not meet the refusal.
+        assert!(guidance.contains("Leave `timeout_minutes` out of a worker's test job"));
+        assert!(guidance.contains("`job_timeout_not_authorized`"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -1253,6 +1431,10 @@ mod tests {
         assert!(guidance.contains("## Current Epic lead"));
         assert!(guidance.contains("## Active assigned reviewer"));
         assert!(guidance.contains("never set a reviewer target directory under `/tmp`"));
+        // #2665: the foreground-test minimum yields to a `Test evidence:` policy.
+        assert!(guidance.contains("carries a `Test evidence:` policy"));
+        assert!(guidance.contains("still waits for a build slot after 10 minutes"));
+        assert!(guidance.contains("do not run `scripts/scoped-test`, even with `--dry-run`"));
         assert!(guidance.contains("`AgentSpawnChild` / `rsi_control_spawn`"));
         assert!(
             guidance.contains("`AgentSubmitReviewReceipt` / `rsi_control_submit_review_receipt`")
@@ -1701,6 +1883,41 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]
+    fn session_identity_instruction_states_resolved_provider_model_effort() {
+        use rsi_common::types::SessionProvider;
+        let line = session_identity_instruction(
+            SessionProvider::OpenRouter,
+            Some("z-ai/glm-5.3-flashx"),
+            Some("high"),
+        );
+        assert!(line.contains("provider `OpenRouter`"));
+        assert!(line.contains("model `z-ai/glm-5.3-flashx`"));
+        assert!(line.contains("effort `high`"));
+        assert!(line.contains("router table"));
+
+        let unresolved = session_identity_instruction(SessionProvider::Codex, None, None);
+        assert!(unresolved.contains("provider `Codex`"));
+        assert!(unresolved.contains("provider default"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn standing_instruction_keeps_custody_first_and_identity_for_ordinary_sessions() {
+        use rsi_common::types::SessionProvider;
+        let identity = session_identity_instruction(SessionProvider::Codex, Some("m"), None);
+        assert_eq!(
+            standing_instruction(identity.clone(), None).as_deref(),
+            Some(identity.as_str()),
+            "an unsandboxed launch still states its identity"
+        );
+        let custody = sandbox_custody_instruction(Path::new("/tmp/sandbox"), "rsi/test");
+        let both = standing_instruction(identity.clone(), Some(custody.clone())).unwrap();
+        assert!(both.starts_with(&custody));
+        assert!(both.ends_with(&identity));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
     fn sandbox_custody_instruction_prepends_without_changing_ordinary_prompts() {
         let caller_prompt = Some("caller instructions stay intact".to_string());
         assert_eq!(
@@ -1755,7 +1972,7 @@ mod tests {
             "rsi-rpc AgentGetAuthorityCatalog",
             "{\"verb\": \"<name>\"}",
             "RSI_SESSION_TOKEN",
-            "`mode` is required",
+            "`mode` and `message`",
             "same-session continuation",
             "never `fresh` on your own session",
         ] {
@@ -1917,7 +2134,7 @@ mod tests {
     #[test]
     fn walk_up_finds_repo_root_from_crate_dir() {
         // CARGO_MANIFEST_DIR is crates/rsid; repo root is two levels up.
-        let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = std::path::Path::new(rsi_common::manifest_dir!());
         let found = walk_up_for_claude(crate_dir);
         assert!(
             found.is_some(),

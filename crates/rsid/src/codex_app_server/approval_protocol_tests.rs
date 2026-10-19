@@ -1,15 +1,15 @@
 //! Version-bound, independent generated-schema checks. Fixtures are copied or
-//! narrowly projected from codex-cli 0.153.4; see fixtures/.../provenance.json.
+//! narrowly projected from codex-cli 0.163.0; see fixtures/.../provenance.json.
 use super::*;
 use sha2::{Digest, Sha256};
 
 const COMMAND: &str =
-    include_str!("fixtures/approval-0.153.4/CommandExecutionRequestApprovalResponse.json");
-const FILE: &str = include_str!("fixtures/approval-0.153.4/FileChangeRequestApprovalResponse.json");
-const ID: &str = include_str!("fixtures/approval-0.153.4/RequestId.json");
-const METHODS: &str = include_str!("fixtures/approval-0.153.4/ServerRequest-methods.json");
-const PARAMS: &str = include_str!("fixtures/approval-0.153.4/ApprovalParams-required.json");
-const PROVENANCE: &str = include_str!("fixtures/approval-0.153.4/provenance.json");
+    include_str!("fixtures/approval-0.163.0/CommandExecutionRequestApprovalResponse.json");
+const FILE: &str = include_str!("fixtures/approval-0.163.0/FileChangeRequestApprovalResponse.json");
+const ID: &str = include_str!("fixtures/approval-0.163.0/RequestId.json");
+const METHODS: &str = include_str!("fixtures/approval-0.163.0/ServerRequest-methods.json");
+const PARAMS: &str = include_str!("fixtures/approval-0.163.0/ApprovalParams-required.json");
+const PROVENANCE: &str = include_str!("fixtures/approval-0.163.0/provenance.json");
 
 // Evaluate only the JSON Schema keywords present in these generated response
 // and request-ID fixtures. No production response constants supply this oracle.

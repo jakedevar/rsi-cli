@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rsi_common::harness_manager::HarnessManagerConfigV1;
 use rsi_common::harness_manager_v2::ManagerPolicyV2;
 use rsi_common::types::{Session, SessionKind, SessionProvider, SessionStatus};
@@ -25,6 +25,8 @@ const COHORT_BUDGET: usize = 1024;
 const ROTATION_LIMIT: i64 = 64;
 const SPEND_KIND: &str = "resource_spend";
 const ORIGIN_KIND: &str = "resource_launch_origin";
+/// Re-check delay for an exhausted plan window that reports no reset time.
+const USAGE_WINDOW_UNKNOWN_RESET: chrono::Duration = chrono::Duration::minutes(5);
 
 mod charge;
 mod launch_origin;
@@ -607,9 +609,17 @@ impl Store {
 
     fn manager_v2_ledger_spend(&self, id: Uuid) -> Result<(i64, f64, i64)> {
         let (count, known, unknown): (i64, f64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN estimated_cost_usd>=0 THEN estimated_cost_usd ELSE 0 END),0),
-                COALESCE(SUM(estimated_cost_usd IS NULL OR estimated_cost_usd<0),0)
-             FROM model_invocations WHERE session_id=?1 AND admission_status='admitted'",
+            // Own cost per invocation, not the session running total (#2593).
+            concat!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ci.cost_increment_usd>=0 THEN ci.cost_increment_usd ELSE 0 END),0),
+                COALESCE(SUM(ci.cost_increment_usd IS NULL OR ci.cost_increment_usd<0),0)
+             FROM model_invocations mi
+             JOIN (",
+                // #2939: only this session's invocations, never the whole table.
+                crate::model_control::cost::cost_increment_for_session_sql!(),
+                ") ci ON ci.invocation_id = mi.id
+             WHERE mi.session_id=?1 AND mi.admission_status='admitted'"
+            ),
             [id.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok((
             count,
@@ -671,11 +681,11 @@ impl Store {
              ), ids AS (
                 SELECT DISTINCT id FROM lineage
              ), ledger AS (
-                SELECT i.session_id,COUNT(*) count,
-                  COALESCE(SUM(CASE WHEN i.estimated_cost_usd>=0 THEN i.estimated_cost_usd ELSE 0 END),0) cost,
-                  COALESCE(SUM(i.estimated_cost_usd IS NULL OR i.estimated_cost_usd<0),0) missing
-                FROM model_invocations i JOIN ids ON ids.id=i.session_id
-                WHERE i.admission_status='admitted' GROUP BY i.session_id
+                SELECT ci.session_id,COUNT(*) count,
+                  COALESCE(SUM(CASE WHEN ci.cost_increment_usd>=0 THEN ci.cost_increment_usd ELSE 0 END),0) cost,
+                  COALESCE(SUM(ci.cost_increment_usd IS NULL OR ci.cost_increment_usd<0),0) missing
+                FROM ({cost_increment}) ci
+                WHERE ci.admission_status='admitted' GROUP BY ci.session_id
              ), checkpoints AS (
                 SELECT c.record_key,
                   json_extract(c.payload_json,'$.zero_origin') zero_origin,
@@ -715,7 +725,16 @@ impl Store {
                        missing + (COALESCE(root_zero,checkpoint_zero,0)=0)
                       WHEN count=0 THEN (legacy IS NULL OR (root_zero IS NOT NULL AND root_zero=0))
                       ELSE missing + (COALESCE(root_zero,checkpoint_zero,0)=0) END),0)
-             FROM measured"), // sql-dynamic-ok: static foreign-origin CTE text
+             FROM measured",
+                // Own cost per invocation, not the session running total
+                // (#2593), over the invocations of `ids` only (#2939). The
+                // table already holds exactly the invocations of `ids`, with
+                // their session and admission, so the ledger reads it alone:
+                // a second join of `model_invocations` per invocation pushed
+                // the pass over its per-member bound (#3043, #2494).
+                cost_increment =
+                    crate::model_control::cost::cost_increment_for_ids_sql!()
+            ), // sql-dynamic-ok: static foreign-origin CTE text
             params![serde_json::to_string(&config.epic_ids)?,config.project_id.to_string(),
                 config.manager_session_id.to_string(),config.row_version,ledgers,
                 serde_json::to_string(foreign)?],
@@ -1281,11 +1300,27 @@ impl Store {
     /// it, minus every foreign origin); otherwise the plain cohort snapshot,
     /// which the plain gate reads directly.
     pub fn manager_v2_resource_snapshot(&self, config: &HarnessManagerConfigV1) -> Result<Value> {
+        self.manager_v2_resource_snapshot_in(config, None)
+    }
+
+    /// [`Self::manager_v2_resource_snapshot`] over `config`'s cohort when the
+    /// caller already read it in this pass (#2494).
+    pub(crate) fn manager_v2_resource_snapshot_in(
+        &self,
+        config: &HarnessManagerConfigV1,
+        cohort: Option<&[ManagerCohortMemberV2]>,
+    ) -> Result<Value> {
+        #[cfg(any(test, feature = "test-seam"))]
+        {
+            self.manager_intent_idle
+                .borrow_mut()
+                .snapshot_recomputations += 1;
+        }
         let charge = self.manager_v2_own_charge(config)?;
         if charge.is_plain() {
-            return self.manager_v2_plain_resource_snapshot(config);
+            return self.manager_v2_plain_resource_snapshot(config, cohort);
         }
-        let members = self.manager_v2_charged_members(config, &charge, false)?;
+        let members = self.manager_v2_charged_members(config, &charge, false, cohort)?;
         let mut snapshot = self.manager_v2_plain_resource_snapshot_from(
             config,
             &members.active,
@@ -1299,10 +1334,21 @@ impl Store {
     }
 
     /// The unattributed snapshot of `config`'s own cohort and ledger.
-    fn manager_v2_plain_resource_snapshot(&self, config: &HarnessManagerConfigV1) -> Result<Value> {
-        let cohort = self.manager_v2_cohort(config)?;
-        let rotation = self.manager_v2_resource_reservations(config, &cohort)?;
-        let active = self.manager_v2_active_members(&cohort, &rotation)?;
+    fn manager_v2_plain_resource_snapshot(
+        &self,
+        config: &HarnessManagerConfigV1,
+        cohort: Option<&[ManagerCohortMemberV2]>,
+    ) -> Result<Value> {
+        let read;
+        let cohort = match cohort {
+            Some(cohort) => cohort,
+            None => {
+                read = self.manager_v2_cohort(config)?;
+                &read
+            }
+        };
+        let rotation = self.manager_v2_resource_reservations(config, cohort)?;
+        let active = self.manager_v2_active_members(cohort, &rotation)?;
         let (known, unknown) = self.manager_v2_historical_spend(config)?;
         let mut snapshot =
             self.manager_v2_plain_resource_snapshot_from(config, &active, known, unknown)?;
@@ -1333,7 +1379,16 @@ impl Store {
             ],
             |r| r.get(0),
         )?;
-        let policy = self.get_harness_manager_policy(config.project_id)?;
+        // #1283: the policy of the principal this config is, not the project
+        // manager's: a global seat's caps are its grant's, an area node's its
+        // node grant's.
+        let policy = match self.manager_policy_for_config(config) {
+            Ok(policy) => policy,
+            // An unresolvable node authority has no caps to show, rather than
+            // the project manager's.
+            Err(crate::error::DaemonError::InvalidParam(_)) => None,
+            Err(error) => return Err(error),
+        };
         // #674 K15b: the lifetime creation count the admission gate charges
         // against `max_created_sessions` (reviewer launches and uncreated
         // refusals excluded by K15a).
@@ -1556,7 +1611,7 @@ impl Store {
         existing_session: Option<Uuid>,
         enforce_concurrency: bool,
     ) -> Result<()> {
-        let snapshot = self.manager_v2_plain_resource_snapshot(config)?;
+        let snapshot = self.manager_v2_plain_resource_snapshot(config, None)?;
         let mut active = snapshot["active_sessions"].as_u64().unwrap_or(u64::MAX);
         let mut provider_active = snapshot["active_by_provider"]
             [super::row_mappers::session_provider_to_str(provider)]
@@ -1640,17 +1695,51 @@ impl Store {
     }
 
     fn manager_v2_provider_usage_gate(&self, provider: SessionProvider) -> Result<()> {
-        let now_epoch = Utc::now().timestamp();
-        for snapshot in self.load_provider_rate_limit_snapshots()? {
-            if snapshot.provider == provider
-                && snapshot.windows.iter().any(|w| {
-                    w.utilization >= 1.0 && w.resets_at_epoch.is_none_or(|reset| reset > now_epoch)
-                })
-            {
-                return Err(refused("manager_v2_provider_usage_limit"));
-            }
+        if self
+            .provider_usage_window_hold_until(provider, Utc::now())?
+            .is_some()
+        {
+            return Err(refused(
+                crate::provider_exhaustion::PROVIDER_USAGE_WINDOW_REFUSAL_CODE,
+            ));
         }
         Ok(())
+    }
+
+    /// When the provider's exhausted plan window(s) reset, if any window of
+    /// `provider` is at full utilization and has not reset by `now` (#3066).
+    /// This is the one predicate behind the launch/continuation gate
+    /// (`manager_v2_provider_usage_limit`) and the deadline a wake or node
+    /// launch refused by it is held to. The latest reset wins (every
+    /// exhausted window must clear); a window with no reset time is re-checked
+    /// after `USAGE_WINDOW_UNKNOWN_RESET`.
+    pub fn provider_usage_window_hold_until(
+        &self,
+        provider: SessionProvider,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let now_epoch = now.timestamp();
+        let mut until: Option<DateTime<Utc>> = None;
+        for snapshot in self.load_provider_rate_limit_snapshots()? {
+            if snapshot.provider != provider {
+                continue;
+            }
+            for window in &snapshot.windows {
+                if window.utilization < 1.0
+                    || window
+                        .resets_at_epoch
+                        .is_some_and(|reset| reset <= now_epoch)
+                {
+                    continue;
+                }
+                let reset = window
+                    .resets_at_epoch
+                    .and_then(|reset| DateTime::from_timestamp(reset, 0))
+                    .unwrap_or(now + USAGE_WINDOW_UNKNOWN_RESET);
+                until = Some(until.map_or(reset, |held| held.max(reset)));
+            }
+        }
+        Ok(until)
     }
 
     /// #1274: the caps of every portfolio node covering `project`, for a
@@ -1790,6 +1879,7 @@ impl Store {
         Err(refused("manager_v2_cohort_subdivision_required"))
     }
 
+    #[cfg(test)]
     pub(crate) fn manager_v2_resource_gate_for_session(
         &self,
         session_id: Uuid,

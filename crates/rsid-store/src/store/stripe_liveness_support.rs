@@ -333,7 +333,8 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, Arc<StoreMutex<Store>>) {
         let dir = tempfile::tempdir().expect("store dir");
-        let store = Store::open(&dir.path().join("liveness-support.db")).expect("store");
+        let store =
+            Store::open_test_fixture(&dir.path().join("liveness-support.db")).expect("store");
         (dir, Arc::new(StoreMutex::new(store)))
     }
 

@@ -1,0 +1,2601 @@
+{
+  "brainstorm": {
+    "description": "Sequential idea passes that widen the search before synthesis.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "brief",
+        "source_port": null,
+        "target": "wild",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "wild",
+        "source_port": null,
+        "target": "practical",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "practical",
+        "source_port": null,
+        "target": "stress",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "stress",
+        "source_port": null,
+        "target": "synthesis",
+        "target_port": null
+      }
+    ],
+    "metadata": {},
+    "name": "Brainstorm",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "brief",
+        "inputs": [],
+        "instructions": "Clarify the goal and what counts as a strong idea.",
+        "model_settings": null,
+        "name": "Brief",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "wild",
+        "inputs": [],
+        "instructions": "Generate unconstrained options without filtering.",
+        "model_settings": null,
+        "name": "Wild Ideas",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "practical",
+        "inputs": [],
+        "instructions": "Translate promising wild ideas into realistic options.",
+        "model_settings": null,
+        "name": "Practical Ideas",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "stress",
+        "inputs": [],
+        "instructions": "Pressure-test the practical ideas for failure modes.",
+        "model_settings": null,
+        "name": "Stress Test",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "synthesis",
+        "inputs": [],
+        "instructions": "Combine the strongest ideas into a final set.",
+        "model_settings": null,
+        "name": "Synthesis",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "horizontal": {
+    "description": "Straight-line capture, draft, and review.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "capture",
+        "source_port": null,
+        "target": "draft",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "draft",
+        "source_port": null,
+        "target": "review",
+        "target_port": null
+      }
+    ],
+    "metadata": {},
+    "name": "Pipeline",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "capture",
+        "inputs": [],
+        "instructions": "Collect the request, constraints, and success criteria.",
+        "model_settings": null,
+        "name": "Capture",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "draft",
+        "inputs": [],
+        "instructions": "Produce the first complete pass using the captured context.",
+        "model_settings": null,
+        "name": "Draft",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "review",
+        "inputs": [],
+        "instructions": "Check the draft, tighten gaps, and prepare the final response.",
+        "model_settings": null,
+        "name": "Review",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "hub": {
+    "description": "Router hands work to specialists, then consolidates results.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "router",
+        "source_port": null,
+        "target": "code",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "router",
+        "source_port": null,
+        "target": "tests",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "router",
+        "source_port": null,
+        "target": "docs",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "code",
+        "source_port": null,
+        "target": "merge",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "tests",
+        "source_port": null,
+        "target": "merge",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "docs",
+        "source_port": null,
+        "target": "merge",
+        "target_port": null
+      }
+    ],
+    "metadata": {},
+    "name": "Hub-Spoke",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "router",
+        "inputs": [],
+        "instructions": "Break the request into specialist-sized assignments.",
+        "model_settings": null,
+        "name": "Router",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "code",
+        "inputs": [],
+        "instructions": "Inspect implementation details and code-level risks.",
+        "model_settings": null,
+        "name": "Code Specialist",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "tests",
+        "inputs": [],
+        "instructions": "Look for missing coverage, regressions, and edge cases.",
+        "model_settings": null,
+        "name": "Test Specialist",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "docs",
+        "inputs": [],
+        "instructions": "Check clarity, naming, and user-facing communication.",
+        "model_settings": null,
+        "name": "Docs Specialist",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "merge",
+        "inputs": [],
+        "instructions": "Synthesize specialist findings into a single response.",
+        "model_settings": null,
+        "name": "Merge",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "custody.from=node:router"
+        ],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "instructor_assistant": {
+    "description": "An instructor checks an executor with a visual revise loop.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "goals",
+        "source_port": null,
+        "target": "assistant",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "assistant",
+        "source_port": null,
+        "target": "instructor",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "instructor",
+        "source_port": null,
+        "target": "deliver",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "coach-loop",
+            "kind": "loop_arrow",
+            "label": "revise",
+            "source": "instructor",
+            "source_port": null,
+            "target": "assistant",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "Instructor-Assistant",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "goals",
+        "inputs": [],
+        "instructions": "Define the objective, acceptance criteria, and hard constraints.",
+        "model_settings": null,
+        "name": "Goals",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "assistant",
+        "inputs": [],
+        "instructions": "Carry out the work according to the current instructions.",
+        "model_settings": null,
+        "name": "Assistant",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "instructor",
+        "inputs": [],
+        "instructions": "Review the work, tighten directives, and call for revisions.",
+        "model_settings": null,
+        "name": "Instructor",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "deliver",
+        "inputs": [],
+        "instructions": "Ship the instructor-approved answer.",
+        "model_settings": null,
+        "name": "Deliver",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "master_implement": {
+    "description": "Research -> plan -> implement -> push end-to-end pipeline.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "entry",
+        "source_port": null,
+        "target": "research",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "research",
+        "source_port": null,
+        "target": "plan",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "plan",
+        "source_port": null,
+        "target": "implement",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "implement",
+        "source_port": null,
+        "target": "push",
+        "target_port": null
+      }
+    ],
+    "metadata": {},
+    "name": "Master Implement",
+    "nodes": [
+      {
+        "description": "Type your goal here (press I to edit), then run (r).",
+        "hooks": [],
+        "id": "entry",
+        "inputs": [],
+        "instructions": "PIPELINE GOAL:\nReplace this line with the user's goal.\n\nReply with exactly `PIPELINE ENTRY READY`, then exit. Do not quote, restate, or summarize the goal. Do not start work -- the downstream nodes handle research, planning, and implementation.",
+        "model_settings": null,
+        "name": "Entry",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "pipeline-entry-context"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "research",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: research\n\nThe upstream Context block contains the user's goal. Use the Skill tool to invoke /team_research with that goal as input. Follow the team_research command instructions in full. After the research doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- RESEARCH block defined in /master_implement (Research document path, Research question, Key findings, Codebase areas, Open questions).",
+        "model_settings": null,
+        "name": "Research",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "plan",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: planning\n\nThe upstream Context block contains a PIPELINE HANDOFF -- RESEARCH block with the research document path. Use the Skill tool to invoke /team_plan with that research doc path and the original goal as input. Follow the team_plan command instructions in full. After the plan doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- PLAN block (doc_path, status, optional blocker, optional next_action_hint).",
+        "model_settings": null,
+        "name": "Plan",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "implement",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: implementation\n\nThe upstream Context block contains a PIPELINE HANDOFF -- PLAN block with the plan doc path. Use the Skill tool to invoke /team_implement with that plan doc path as input. Follow the team_implement command instructions in full INCLUDING Step 0 (mandatory EnterWorktree). IMPORTANT: you are in PIPELINE MODE, so SKIP Step 8 (the final git push) -- a downstream node owns the push. Your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- IMPLEMENTATION block (plan doc path, branch name, worktree path, verification checklist, outstanding issues).",
+        "model_settings": null,
+        "name": "Implement",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "push",
+        "inputs": [],
+        "instructions": "The upstream Context block contains a PIPELINE HANDOFF -- IMPLEMENTATION block. Extract the `worktree path` and `branch name` from it. Then run exactly:\ncd <worktree path> && git push -u origin HEAD\nDo NOT merge into main. Report the pushed branch name in your final message and exit. If the handoff block is missing or malformed, fail loudly with the reason -- do not attempt a push from an unknown directory.",
+        "model_settings": null,
+        "name": "Push",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "master_improve": {
+    "description": "Convergence loop: research/plan/implement -> judge -> budget -> push, driver respawns until judge=DONE or safety rail trips.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "entry",
+        "source_port": null,
+        "target": "research",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "research",
+        "source_port": null,
+        "target": "plan",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "plan",
+        "source_port": null,
+        "target": "implement",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "implement",
+        "source_port": null,
+        "target": "judge",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "judge",
+        "source_port": null,
+        "target": "budget",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "budget",
+        "source_port": null,
+        "target": "push",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "improve-loop",
+            "kind": "loop_arrow",
+            "label": "respawn",
+            "source": "budget",
+            "source_port": null,
+            "target": "entry",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "Master Improve",
+    "nodes": [
+      {
+        "description": "Type your goal here (press I to edit), then run (r).",
+        "hooks": [],
+        "id": "entry",
+        "inputs": [],
+        "instructions": "PIPELINE GOAL:\nReplace this line with the user's goal.\n\nReply with exactly `PIPELINE ENTRY READY`, then exit. Do not quote, restate, or summarize the goal. Do not start work -- the downstream nodes handle research, planning, and implementation.",
+        "model_settings": null,
+        "name": "Entry",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "pipeline-entry-context"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "research",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: research\n\nThe upstream Context block contains the user's goal. Use the Skill tool to invoke /team_research with that goal as input. Follow the team_research command instructions in full. After the research doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- RESEARCH block defined in /master_implement (Research document path, Research question, Key findings, Codebase areas, Open questions).",
+        "model_settings": null,
+        "name": "Research",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "plan",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: planning\n\nThe upstream Context block contains a PIPELINE HANDOFF -- RESEARCH block with the research document path. Use the Skill tool to invoke /team_plan with that research doc path and the original goal as input. Follow the team_plan command instructions in full. After the plan doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- PLAN block (doc_path, status, optional blocker, optional next_action_hint).",
+        "model_settings": null,
+        "name": "Plan",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "implement",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: implementation\n\nThe upstream Context block contains a PIPELINE HANDOFF -- PLAN block with the plan doc path. Use the Skill tool to invoke /team_implement with that plan doc path as input. Follow the team_implement command instructions in full INCLUDING Step 0 (mandatory EnterWorktree). IMPORTANT: you are in PIPELINE MODE, so SKIP Step 8 (the final git push) -- a downstream node owns the push. Your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- IMPLEMENTATION block (plan doc path, branch name, worktree path, verification checklist, outstanding issues).",
+        "model_settings": null,
+        "name": "Implement",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "judge",
+        "inputs": [],
+        "instructions": "You are the JUDGE node of the master_improve convergence loop.\n\nYour input (in upstream context as ### content) is the PIPELINE HANDOFF -- IMPLEMENTATION block from this iteration's implement node. It contains:\n- plan doc path (thoughts/shared/plans/YYYY-MM-DD-...md) -- read it to see the original goal and the plan's success-criteria checklist\n- branch name\n- worktree path\n- verification checklist (manual items the implement worker flagged)\n- outstanding issues (what the implement worker could not finish)\n\nYour job: decide whether the implementation HAS FULFILLED THE ORIGINAL GOAL.\n\nRead the plan's 'Success Criteria' section. Read the worktree's git log\n(cd <worktree path> && git log --oneline main..HEAD) to see what was committed.\nYou MAY run `cargo test --workspace 2>&1` in the worktree only if the handoff block analysis is insufficient -- the budget node will run tests for the regression gate regardless.\n\nYour FINAL MESSAGE -- your last assistant message in this session -- MUST BE EXACTLY one of these three forms, with NO other content before or after:\n\nDONE\n\nOR\n\nCONTINUE: <a refined goal that is more specific than the original and addresses the gap you identified>\n\nOR (only if you cannot determine an answer):\n\nCONTINUE: HALT_JUDGE_BLOCKED <reason>\n\nRules for refinement:\n- The CONTINUE goal must be a one-line restatement that the next iteration's research node can act on as its sole input.\n- If the implementation regressed (broke a test that previously passed), say\nCONTINUE: Fix the regression in <test-name> introduced by <commit>.\n- If outstanding issues remain, fold them into the CONTINUE text.\n- If the goal is functionally fulfilled but polish remains (docs, edge cases), prefer DONE over CONTINUE for trivial polish -- convergence loops should converge.",
+        "model_settings": null,
+        "name": "Judge",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "budget",
+        "inputs": [],
+        "instructions": "You are the BUDGET node of the master_improve convergence loop.\n\nYour inputs (in upstream context):\n- The judge's verdict (its final assistant message: DONE or CONTINUE: ...)\n- The implement node's PIPELINE HANDOFF -- IMPLEMENTATION block (worktree path)\n- The entry node's ITERATION CONTEXT preamble (chain_id, iteration_index, cap, pre_failure_count) -- the daemon driver injects this before each iteration; for iteration 0 it is also stamped into entry's instructions\n\nYour job (3 steps, in order):\n\n1. STOP-FILE PRE-FLIGHT: run `test -f ~/.rsi/STOP && echo STOP_PRESENT || echo NO_STOP`. If STOP_PRESENT, your final message MUST be exactly:\nHALT: stop-file\nSkip steps 2 and 3.\n\n2. REGRESSION GATE: parse the worktree path from the implement handoff block. Run `cd <worktree path> && cargo test --workspace 2>&1 | tee /tmp/master_improve_test_output.log`. Tally the total `test result: ... N failed` count across all crates. Call this `post_failure_count`. Read `pre_failure_count` from the ITERATION CONTEXT in upstream. If `post_failure_count > pre_failure_count`, your final message MUST be exactly:\nHALT: regression pre=<pre> post=<post>\nSkip step 3.\nIf `cargo test` itself fails to run (compile error, panic, harness crash), your final message MUST be exactly:\nHALT: error <one-line reason>\n\n3. JUDGE TRANSDUCTION: read the judge's final message from upstream context.\n- If judge said `DONE`, write the full payload `PROCEED: judge=DONE` to `~/.rsi/chain/<chain_id>/iter-<iteration_index>-budget.txt` (create the dir if needed via `mkdir -p`). Then emit final message exactly:\nPROCEED: judge=DONE\n- If judge said `CONTINUE: <text>` (NOT HALT_JUDGE_BLOCKED), write the full payload `PROCEED: judge=CONTINUE refined_goal=<text>` to the same artifact file. Then emit final message exactly:\nPROCEED: judge=CONTINUE refined_goal=<see artifact file path>\nThe driver reads the artifact file when the preview is truncated.\n- If judge said `CONTINUE: HALT_JUDGE_BLOCKED <reason>`, your final message MUST be exactly:\nHALT: judge-blocked <reason>\n- If the judge's message is malformed (matches none of the three forms), your final message MUST be exactly:\nHALT: judge-malformed\n\nThe driver parses your final message via regex; it MUST start with `HALT:` or `PROCEED:` followed by a single space. Do NOT add other content.",
+        "model_settings": null,
+        "name": "Budget",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "push",
+        "inputs": [],
+        "instructions": "The upstream Context block contains a PIPELINE HANDOFF -- IMPLEMENTATION block AND a budget node final message. Read the budget node's last assistant message (in upstream context).\n\nIf it starts with EXACTLY `PROCEED: judge=DONE`, then:\n1. Extract the `worktree path` and `branch name` from the IMPLEMENTATION block.\n2. Run exactly: cd <worktree path> && git push -u origin HEAD\n3. Report the pushed branch name in your final message and exit.\n\nIf the budget message starts with anything else (`PROCEED: judge=CONTINUE ...` or `HALT: ...`), do NOT push. Instead, log the verdict in your final message:\nskip-push: budget said <verdatim budget message line>\nand exit successfully. The chain driver reads the budget output and decides next steps (respawn or halt).",
+        "model_settings": null,
+        "name": "Push",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "master_orchestrate": {
+    "description": "Slice conveyor: research -> plan -> implement -> review -> verify -> docs, with a visual review->implement fix loop.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "entry",
+        "source_port": null,
+        "target": "research",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "research",
+        "source_port": null,
+        "target": "plan",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "plan",
+        "source_port": null,
+        "target": "implement",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "implement",
+        "source_port": null,
+        "target": "review",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "review",
+        "source_port": null,
+        "target": "verify",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "verify",
+        "source_port": null,
+        "target": "docs",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "orchestrate-fix-loop",
+            "kind": "loop_arrow",
+            "label": "fix",
+            "source": "review",
+            "source_port": null,
+            "target": "implement",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "Master Orchestrate",
+    "nodes": [
+      {
+        "description": "Type your goal here (press I to edit), then run (r).",
+        "hooks": [],
+        "id": "entry",
+        "inputs": [],
+        "instructions": "PIPELINE GOAL:\nReplace this line with the user's goal.\n\nReply with exactly `PIPELINE ENTRY READY`, then exit. Do not quote, restate, or summarize the goal. Do not start work -- the downstream nodes handle research, planning, and implementation.",
+        "model_settings": null,
+        "name": "Entry",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "pipeline-entry-context"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "research",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: research\n\nThe upstream Context block contains the user's goal. Use the Skill tool to invoke /team_research with that goal as input. Follow the team_research command instructions in full. After the research doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- RESEARCH block defined in /master_implement (Research document path, Research question, Key findings, Codebase areas, Open questions).",
+        "model_settings": null,
+        "name": "Research",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "plan",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: planning\n\nThe upstream Context block contains a PIPELINE HANDOFF -- RESEARCH block with the research document path. Use the Skill tool to invoke /team_plan with that research doc path and the original goal as input. Follow the team_plan command instructions in full. After the plan doc is committed, your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- PLAN block (doc_path, status, optional blocker, optional next_action_hint).",
+        "model_settings": null,
+        "name": "Plan",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "implement",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: implementation\n\nThe upstream Context block contains a PIPELINE HANDOFF -- PLAN block with the plan doc path. Use the Skill tool to invoke /team_implement with that plan doc path as input. Follow the team_implement command instructions in full INCLUDING Step 0 (mandatory EnterWorktree). IMPORTANT: you are in PIPELINE MODE, so SKIP Step 8 (the final git push) -- the docs node owns the push. Your FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- IMPLEMENTATION block (plan doc path, branch name, worktree path, verification checklist, outstanding issues).",
+        "model_settings": null,
+        "name": "Implement",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "review",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: review\n\nThe upstream Context block contains a PIPELINE HANDOFF -- IMPLEMENTATION block with the worktree path and branch name. Extract the `worktree path`, then review the change on that branch:\ncd <worktree path> && git diff main...HEAD\nUse the Skill tool to invoke /code-review on that diff (or review manually if the skill is unavailable). Focus on correctness bugs and reuse/simplification issues; do NOT expand scope beyond the plan.\n\nYour FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- REVIEW block:\n- doc_path (path to any review notes written, or 'none')\n- branch name\n- worktree path\n- findings_count (integer count of must-fix findings)\n- verdict: EXACTLY `verdict: PASS` if findings_count == 0, otherwise `verdict: FIX` with a one-line summary of the top must-fix items.\n\nA `verdict: FIX` is the cue for the operator to re-run the implement node (the visual `fix` loop arrow) with the review findings folded into its goal. A `verdict: PASS` proceeds to verification.",
+        "model_settings": null,
+        "name": "Review",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "verify",
+        "inputs": [],
+        "instructions": "PIPELINE MODE: true\nPIPELINE STAGE: verify\n\nThe upstream Context block contains a PIPELINE HANDOFF -- IMPLEMENTATION block (worktree path) and a PIPELINE HANDOFF -- REVIEW block (verdict). If the review verdict was `FIX`, STOP: your final message MUST be exactly\nPIPELINE HANDOFF -- VERIFY\nstatus: blocked\nblocker: review verdict FIX -- re-run implement before verifying\nand exit. Do not verify an unreviewed change.\n\nOtherwise, extract the `worktree path` and run the regression gate:\ncd <worktree path> && git diff --check && cargo test --workspace 2>&1\nTally any `test result: ... N failed` across crates.\n\nYour FINAL MESSAGE MUST CONTAIN ONLY the PIPELINE HANDOFF -- VERIFY block:\n- worktree path\n- branch name\n- status: `complete` if tests pass and `git diff --check` is clean, else `blocked`\n- manifest_path (path to any verification manifest, or 'none')\n- blocker (one sentence, only if status is blocked)\n- docs_bearing: `true` if the change touches user-facing behavior, keybindings, RPC surface, or schema (docs node must update docs), else `false`.",
+        "model_settings": null,
+        "name": "Verify",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "docs",
+        "inputs": [],
+        "instructions": "The upstream Context block contains PIPELINE HANDOFF -- VERIFY and -- IMPLEMENTATION blocks. If the VERIFY status is `blocked`, do NOT push. Your final message MUST be exactly\nskip-push: verify blocked -- <verbatim blocker line>\nand exit successfully.\n\nOtherwise:\n1. Extract the `worktree path` and `branch name` from the IMPLEMENTATION block.\n2. If VERIFY `docs_bearing` is `true`, update the relevant docs in the worktree (docs/keybindings.md for keybinding changes, thoughts/shared/reference/* or the top-level AGENTS.md/CLAUDE.md as appropriate) and commit them:\ncd <worktree path> && git add -A && git commit -m 'docs: update for <slice>'\nIf `docs_bearing` is `false`, skip the docs commit.\n3. Push the branch: cd <worktree path> && git push -u origin HEAD\n4. Report the pushed branch name in your final message and exit. Do NOT merge into main. If the handoff blocks are missing or malformed, fail loudly with the reason -- do not push from an unknown directory.",
+        "model_settings": null,
+        "name": "Docs",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "pingpong": {
+    "description": "Proposal and critique stages with a visual revise loop.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "brief",
+        "source_port": null,
+        "target": "proposal",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "proposal",
+        "source_port": null,
+        "target": "critique",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "critique",
+        "source_port": null,
+        "target": "revision",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "revision",
+        "source_port": null,
+        "target": "finalize",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "revise-loop",
+            "kind": "loop_arrow",
+            "label": "iterate",
+            "source": "revision",
+            "source_port": null,
+            "target": "critique",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "Ping-Pong",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "brief",
+        "inputs": [],
+        "instructions": "Summarize the target outcome and the current constraints.",
+        "model_settings": null,
+        "name": "Brief",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "proposal",
+        "inputs": [],
+        "instructions": "Generate the current best attempt for the task.",
+        "model_settings": null,
+        "name": "Proposal",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "critique",
+        "inputs": [],
+        "instructions": "Challenge the proposal and call out weak assumptions.",
+        "model_settings": null,
+        "name": "Critique",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "revision",
+        "inputs": [],
+        "instructions": "Update the proposal using the critique feedback.",
+        "model_settings": null,
+        "name": "Revision",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "finalize",
+        "inputs": [],
+        "instructions": "Condense the strongest revision into a final deliverable.",
+        "model_settings": null,
+        "name": "Finalize",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "rsi_agent_control": {
+    "description": "Learning demo of .claude/skills/rsi-agent-control/SKILL.md. Walk through transport, authority and receipt outcomes; retry arrows are visual only.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "catalog",
+        "source_port": null,
+        "target": "transport",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "transport",
+        "source_port": null,
+        "target": "identity",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "identity",
+        "source_port": null,
+        "target": "request",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "request",
+        "source_port": null,
+        "target": "dispatch",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "dispatch",
+        "source_port": null,
+        "target": "receipt",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": "queued / accepted",
+        "source": "receipt",
+        "source_port": null,
+        "target": "wait",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": "timeout / transport error",
+        "source": "receipt",
+        "source_port": null,
+        "target": "uncertain",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": "stale fence",
+        "source": "receipt",
+        "source_port": null,
+        "target": "stale",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": "authority refusal",
+        "source": "receipt",
+        "source_port": null,
+        "target": "refusal",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "refusal",
+        "source_port": null,
+        "target": "escalate",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "wait",
+        "source_port": null,
+        "target": "confirm",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "uncertain",
+        "source_port": null,
+        "target": "confirm",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "stale",
+        "source_port": null,
+        "target": "confirm",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "escalate",
+        "source_port": null,
+        "target": "confirm",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "control-replay",
+            "kind": "loop_arrow",
+            "label": "same key + content",
+            "source": "uncertain",
+            "source_port": null,
+            "target": "dispatch",
+            "target_port": null
+          },
+          {
+            "id": "control-redecide",
+            "kind": "loop_arrow",
+            "label": "fresh fence + new decision",
+            "source": "stale",
+            "source_port": null,
+            "target": "request",
+            "target_port": null
+          },
+          {
+            "id": "control-authority",
+            "kind": "loop_arrow",
+            "label": "refresh authority",
+            "source": "refusal",
+            "source_port": null,
+            "target": "catalog",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "RSI Agent Control",
+    "nodes": [
+      {
+        "description": "Start with AgentGetAuthorityCatalog {}. Read current roles, authority_revision and permitted controls. The catalog describes authority and grants none. While pending:true, stay within the worker baseline.",
+        "hooks": [],
+        "id": "catalog",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Read Authority Catalog\nStart with AgentGetAuthorityCatalog {}. Read current roles, authority_revision and permitted controls. The catalog describes authority and grants none. While pending:true, stay within the worker baseline.",
+        "model_settings": null,
+        "name": "Read Authority Catalog",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Prefer native rsi_control_* tools, then rsi-rpc with strict typed params. If both are unavailable, authorized leads may use the documented directive fallback. With no control surface, compile the worker prompt for the user.",
+        "hooks": [],
+        "id": "transport",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Choose Transport\nPrefer native rsi_control_* tools, then rsi-rpc with strict typed params. If both are unavailable, authorized leads may use the documented directive fallback. With no control surface, compile the worker prompt for the user.",
+        "model_settings": null,
+        "name": "Choose Transport",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "The daemon derives caller identity from RSI_SESSION_TOKEN, supplied automatically for transport only. Never put tokens in params, files, logs or prompts, and never supply caller or permission fields. Establishment re-mints tokens; a restart requires session re-establishment.",
+        "hooks": [],
+        "id": "identity",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Bind Token Identity\nThe daemon derives caller identity from RSI_SESSION_TOKEN, supplied automatically for transport only. Never put tokens in params, files, logs or prompts, and never supply caller or permission fields. Establishment re-mints tokens; a restart requires session re-establishment.",
+        "model_settings": null,
+        "name": "Bind Token Identity",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Read AgentGetAuthorityCatalog with verb for its schema, example and refusals. Use a permitted control, current observed fences and a stable idempotency_key per intended write effect. Registration alone grants no authority.",
+        "hooks": [],
+        "id": "request",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Read Verb Schema\nRead AgentGetAuthorityCatalog with verb for its schema, example and refusals. Use a permitted control, current observed fences and a stable idempotency_key per intended write effect. Registration alone grants no authority.",
+        "model_settings": null,
+        "name": "Read Verb Schema",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Send the exact typed request through an RSI control surface. Every call rechecks current role, policy, scope and sandbox custody.",
+        "hooks": [],
+        "id": "dispatch",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Dispatch Control\nSend the exact typed request through an RSI control surface. Every call rechecks current role, policy, scope and sandbox custody.",
+        "model_settings": null,
+        "name": "Dispatch Control",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Distinguish queued/accepted, uncertain transport outcome, stale fence and authority refusal. Following paths explain alternatives; the demo visits all.",
+        "hooks": [],
+        "id": "receipt",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Classify Receipt\nDistinguish queued/accepted, uncertain transport outcome, stale fence and authority refusal. Following paths explain alternatives; the demo visits all.",
+        "model_settings": null,
+        "name": "Classify Receipt",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Queued is not delivered and accepted is not done. Dispatch and end the turn; rely on terminal watches, job completion or mail. A self-wake uses resume; a job batch uses one when.jobs_terminal wake. Do not poll.",
+        "hooks": [],
+        "id": "wait",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Wait For Event\nQueued is not delivered and accepted is not done. Dispatch and end the turn; rely on terminal watches, job completion or mail. A self-wake uses resume; a job batch uses one when.jobs_terminal wake. Do not poll.",
+        "model_settings": null,
+        "name": "Wait For Event",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "A timeout may follow a committed write. Read state or replay identical content with the SAME idempotency_key. Exact replay returns the original receipt; changing content under that key conflicts.",
+        "hooks": [],
+        "id": "uncertain",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Resolve Uncertain Write\nA timeout may follow a committed write. Read state or replay identical content with the SAME idempotency_key. Exact replay returns the original receipt; changing content under that key conflicts.",
+        "model_settings": null,
+        "name": "Resolve Uncertain Write",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Re-read progress, Issue or manager state. Adopt the observed cursor or version, then decide whether the action still applies. Never guess a fence or retry stale content unchanged; revised requests use a new key.",
+        "hooks": [],
+        "id": "stale",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Refresh Stale Fence\nRe-read progress, Issue or manager state. Adopt the observed cursor or version, then decide whether the action still applies. Never guess a fence or retry stale content unchanged; revised requests use a new key.",
+        "model_settings": null,
+        "name": "Refresh Stale Fence",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Read the exact code and next_action. Refresh the catalog for that verb, compare schema/example and permitted, then refresh roles and authority_revision after a role, custody, pause or policy change.",
+        "hooks": [],
+        "id": "refusal",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Inspect Refusal\nRead the exact code and next_action. Refresh the catalog for that verb, compare schema/example and permitted, then refresh roles and authority_revision after a role, custody, pause or policy change.",
+        "model_settings": null,
+        "name": "Inspect Refusal",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "If permission is missing, stop retrying. Human approvals, appointment, scope and policy belong to the operator. Uniform refusals hide conditions: do not probe. Report an unknown code with its verb; file defects with AgentCreateIssue.",
+        "hooks": [],
+        "id": "escalate",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Respect Authority Gate\nIf permission is missing, stop retrying. Human approvals, appointment, scope and policy belong to the operator. Uniform refusals hide conditions: do not probe. Report an unknown code with its verb; file defects with AgentCreateIssue.",
+        "model_settings": null,
+        "name": "Respect Authority Gate",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Inspect the resulting session, action or job before reporting an effect. A receipt proves recorded state only. Automatic session retries require explicit policy/budget and respect the live retry kill switch.",
+        "hooks": [],
+        "id": "confirm",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-agent-control. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Confirm Observed Effect\nInspect the resulting session, action or job before reporting an effect. A receipt proves recorded state only. Automatic session retries require explicit policy/budget and respect the live retry kill switch.",
+        "model_settings": null,
+        "name": "Confirm Observed Effect",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "rsi_project_manager": {
+    "description": "Learning demo of .claude/skills/rsi-project-manager/SKILL.md. One manager integration cycle; loop arrows show later cycles without making the DAG cyclic.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "authority",
+        "source_port": null,
+        "target": "inbox",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "authority",
+        "source_port": null,
+        "target": "fleet",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "inbox",
+        "source_port": null,
+        "target": "scope",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "fleet",
+        "source_port": null,
+        "target": "scope",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "scope",
+        "source_port": null,
+        "target": "dispatch",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "dispatch",
+        "source_port": null,
+        "target": "hub",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "dispatch",
+        "source_port": null,
+        "target": "satellite",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "dispatch",
+        "source_port": null,
+        "target": "cloud",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "hub",
+        "source_port": null,
+        "target": "collect",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "satellite",
+        "source_port": null,
+        "target": "collect",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "cloud",
+        "source_port": null,
+        "target": "collect",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "collect",
+        "source_port": null,
+        "target": "review",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "review",
+        "source_port": null,
+        "target": "integrate",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "integrate",
+        "source_port": null,
+        "target": "compile",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "compile",
+        "source_port": null,
+        "target": "tests",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "tests",
+        "source_port": null,
+        "target": "land",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "land",
+        "source_port": null,
+        "target": "qa",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "qa",
+        "source_port": null,
+        "target": "deploy",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "deploy",
+        "source_port": null,
+        "target": "handoff",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "manager-next-batch",
+            "kind": "loop_arrow",
+            "label": "next batch",
+            "source": "qa",
+            "source_port": null,
+            "target": "scope",
+            "target_port": null
+          },
+          {
+            "id": "manager-fix",
+            "kind": "loop_arrow",
+            "label": "fix failures",
+            "source": "tests",
+            "source_port": null,
+            "target": "dispatch",
+            "target_port": null
+          },
+          {
+            "id": "manager-stale-tip",
+            "kind": "loop_arrow",
+            "label": "rolling advanced",
+            "source": "land",
+            "source_port": null,
+            "target": "integrate",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "RSI Project Manager",
+    "nodes": [
+      {
+        "description": "Read AgentGetAuthorityCatalog and AgentManagerInspect. Require your current seat, execute mode, live capabilities and fresh scope/policy fences. Appointment and grants belong to the operator; a prompt grants no authority.",
+        "hooks": [],
+        "id": "authority",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Verify Manager Seat\nRead AgentGetAuthorityCatalog and AgentManagerInspect. Require your current seat, execute mode, live capabilities and fresh scope/policy fences. Appointment and grants belong to the operator; a prompt grants no authority.",
+        "model_settings": null,
+        "name": "Verify Manager Seat",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Drain AgentManagerInbox messages and notices until more_notices is false. Reconstruct current work from Issues, typed daemon results and git.",
+        "hooks": [],
+        "id": "inbox",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Drain Inbox\nDrain AgentManagerInbox messages and notices until more_notices is false. Reconstruct current work from Issues, typed daemon results and git.",
+        "model_settings": null,
+        "name": "Drain Inbox",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Check satellite health, cloud capacity, disk space and spend budget. Keep hub, laptop and approved cloud capacity busy with bounded work.",
+        "hooks": [],
+        "id": "fleet",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Check Fleet\nCheck satellite health, cloud capacity, disk space and spend budget. Keep hub, laptop and approved cloud capacity busy with bounded work.",
+        "model_settings": null,
+        "name": "Check Fleet",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Choose one Issue with stated intent and acceptance criteria. Scope small independent assignments and use engineering judgment.",
+        "hooks": [],
+        "id": "scope",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Choose Issue\nChoose one Issue with stated intent and acceptance criteria. Scope small independent assignments and use engineering judgment.",
+        "model_settings": null,
+        "name": "Choose Issue",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Prepare and commit create_session controls in the owning Epic. Give fresh short-lived workers one Issue and the worker contract. Confirm session_established and arm on_terminal watches; end the turn.",
+        "hooks": [],
+        "id": "dispatch",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Dispatch Workers\nPrepare and commit create_session controls in the owning Epic. Give fresh short-lived workers one Issue and the worker contract. Confirm session_established and arm on_terminal watches; end the turn.",
+        "model_settings": null,
+        "name": "Dispatch Workers",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "A bounded hub worker implements, tests and commits on its assigned sandbox branch, then reports RESULT with an exact SHA. Keep hub concurrency small.",
+        "hooks": [],
+        "id": "hub",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Hub Worker\nA bounded hub worker implements, tests and commits on its assigned sandbox branch, then reports RESULT with an exact SHA. Keep hub concurrency small.",
+        "model_settings": null,
+        "name": "Hub Worker",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Satellite workers and QA share the load. Return exact commits and typed results to the hub integrator; the hub owns satellite health.",
+        "hooks": [],
+        "id": "satellite",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Laptop Worker\nSatellite workers and QA share the load. Return exact commits and typed results to the hub integrator; the hub owns satellite health.",
+        "model_settings": null,
+        "name": "Laptop Worker",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Use approved cloud capacity for heavy test gates and QA with a warm build cache. Respect the spend grant and destroy an idle ephemeral host.",
+        "hooks": [],
+        "id": "cloud",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Cloud Work\nUse approved cloud capacity for heavy test gates and QA with a warm build cache. Respect the spend grant and destroy an idle ephemeral host.",
+        "model_settings": null,
+        "name": "Cloud Work",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Event wakes resume the manager. Recheck the seat, then read final RESULT lines, git diffs and typed job results. A queued receipt is not completion.",
+        "hooks": [],
+        "id": "collect",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Collect Results\nEvent wakes resume the manager. Recheck the seat, then read final RESULT lines, git diffs and typed job results. A queued receipt is not completion.",
+        "model_settings": null,
+        "name": "Collect Results",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Before merge, get one different-family reviewer pass for new migrations and credential, IAM or network exposure changes. Other authority and custody changes get one post-land review.",
+        "hooks": [],
+        "id": "review",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Review If Required\nBefore merge, get one different-family reviewer pass for new migrations and credential, IAM or network exposure changes. Other authority and custody changes get one post-land review.",
+        "model_settings": null,
+        "name": "Review If Required",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Fetch rolling and merge ready commits in a detached integration worktree. Preserve rolling fixes when stale branches conflict. New migrations take the current schema head plus one in landing order.",
+        "hooks": [],
+        "id": "integrate",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Integrate Commits\nFetch rolling and merge ready commits in a detached integration worktree. Preserve rolling fixes when stale branches conflict. New migrations take the current schema head plus one in landing order.",
+        "model_settings": null,
+        "name": "Integrate Commits",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Run cargo check --workspace --all-targets and compile touched rsid shards. Submit long checks as durable jobs with wake:none.",
+        "hooks": [],
+        "id": "compile",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Compile Batch\nRun cargo check --workspace --all-targets and compile touched rsid shards. Submit long checks as durable jobs with wake:none.",
+        "model_settings": null,
+        "name": "Compile Batch",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Choose tests with rsi-test-impact; unset RSI_PROCESS_OWNERSHIP_NAMESPACE. Arm one when.jobs_terminal wake for the job batch and end the turn. Landing gate: no new failures relative to rolling.",
+        "hooks": [],
+        "id": "tests",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Test Touched Modules\nChoose tests with rsi-test-impact; unset RSI_PROCESS_OWNERSHIP_NAMESPACE. Arm one when.jobs_terminal wake for the job batch and end the turn. Landing gate: no new failures relative to rolling.",
+        "model_settings": null,
+        "name": "Test Touched Modules",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Enqueue accepted SHAs with AgentEnqueueLandingSource {derive_filters:true}; the daemon queue gates and publishes them. For queue_disabled, keep the commit pushed and report with AgentReportUp, or AgentReportToHub on a satellite; the operator enables the queue or lands with rsi land or EnqueueRollingQueueSource. Agents never run the lander directly. Confirm each source SHA is an ancestor of origin/rolling; close its Issue.",
+        "hooks": [],
+        "id": "land",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Land On Rolling\nEnqueue accepted SHAs with AgentEnqueueLandingSource {derive_filters:true}; the daemon queue gates and publishes them. For queue_disabled, keep the commit pushed and report with AgentReportUp, or AgentReportToHub on a satellite; the operator enables the queue or lands with rsi land or EnqueueRollingQueueSource. Agents never run the lander directly. Confirm each source SHA is an ancestor of origin/rolling; close its Issue.",
+        "model_settings": null,
+        "name": "Land On Rolling",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "The daemon runs full-library QA after each landing. GREEN is the qa_green SHA AgentListRollingQueue returns; RED files new regression Issues; INCOMPLETE requires reading evidence and resubmitting.",
+        "hooks": [],
+        "id": "qa",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: QA Sweep\nThe daemon runs full-library QA after each landing. GREEN is the qa_green SHA AgentListRollingQueue returns; RED files new regression Issues; INCOMPLETE requires reading evidence and resubmitting.",
+        "model_settings": null,
+        "name": "QA Sweep",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "With the operator's Deploy grant, build the QA-green SHA and request a quiet-point restart. Confirm build_sha and succeeded deployment through AgentGetDaemonInfo. main promotion and releases remain operator-owned.",
+        "hooks": [],
+        "id": "deploy",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Deploy Green SHA\nWith the operator's Deploy grant, build the QA-green SHA and request a quiet-point restart. Confirm build_sha and succeeded deployment through AgentGetDaemonInfo. main promotion and releases remain operator-owned.",
+        "model_settings": null,
+        "name": "Deploy Green SHA",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "Commit a handoff carrying operator directives, exact SHAs, Issues and next actions. Retire enabled resume wakes, fetch fresh authority/custody fences, request succeed_manager, receive the receipt and end the turn.",
+        "hooks": [],
+        "id": "handoff",
+        "inputs": [],
+        "instructions": "Learning demo of rsi-project-manager. Explain this stage using the upstream context and a hypothetical example. Simulate outcomes in your response only; do not run commands, call tools, change files, spawn sessions, or invoke the skill. Every branch is a teaching topic, not a live decision.\n\nStage: Pass Manager Baton\nCommit a handoff carrying operator directives, exact SHAs, Issues and next actions. Retire enabled resume wakes, fetch fresh authority/custody fences, request succeed_manager, receive the receipt and end the turn.",
+        "model_settings": null,
+        "name": "Pass Manager Baton",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "skill-learning-demo"
+        ],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "vertical": {
+    "description": "Source context fans out to parallel workers and then converges.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "source",
+        "source_port": null,
+        "target": "alpha",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "source",
+        "source_port": null,
+        "target": "beta",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "source",
+        "source_port": null,
+        "target": "gamma",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "alpha",
+        "source_port": null,
+        "target": "synthesize",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "beta",
+        "source_port": null,
+        "target": "synthesize",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "gamma",
+        "source_port": null,
+        "target": "synthesize",
+        "target_port": null
+      }
+    ],
+    "metadata": {},
+    "name": "Fan-Out",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "source",
+        "inputs": [],
+        "instructions": "Frame the task so each parallel worker starts from the same context.",
+        "model_settings": null,
+        "name": "Source",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "alpha",
+        "inputs": [],
+        "instructions": "Analyze the task from the first perspective.",
+        "model_settings": null,
+        "name": "Worker Alpha",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "beta",
+        "inputs": [],
+        "instructions": "Analyze the task from a competing perspective.",
+        "model_settings": null,
+        "name": "Worker Beta",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "gamma",
+        "inputs": [],
+        "instructions": "Analyze the task for edge cases and failure modes.",
+        "model_settings": null,
+        "name": "Worker Gamma",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "synthesize",
+        "inputs": [],
+        "instructions": "Combine the worker outputs into a single answer.",
+        "model_settings": null,
+        "name": "Synthesize",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "custody.from=node:alpha"
+        ],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  },
+  "vertical_decision": {
+    "description": "Parallel critics feed a solver with a visual iterate-again cue.",
+    "edges": [
+      {
+        "filter": null,
+        "label": null,
+        "source": "problem",
+        "source_port": null,
+        "target": "critic_a",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "problem",
+        "source_port": null,
+        "target": "critic_b",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "problem",
+        "source_port": null,
+        "target": "critic_c",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "critic_a",
+        "source_port": null,
+        "target": "solver",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "critic_b",
+        "source_port": null,
+        "target": "solver",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "critic_c",
+        "source_port": null,
+        "target": "solver",
+        "target_port": null
+      },
+      {
+        "filter": null,
+        "label": null,
+        "source": "solver",
+        "source_port": null,
+        "target": "polish",
+        "target_port": null
+      }
+    ],
+    "metadata": {
+      "graph_view": {
+        "schema_version": 1.0,
+        "visual_edges": [
+          {
+            "id": "decision-loop",
+            "kind": "loop_arrow",
+            "label": "iterate",
+            "source": "polish",
+            "source_port": null,
+            "target": "problem",
+            "target_port": null
+          }
+        ]
+      }
+    },
+    "name": "Decision Loop",
+    "nodes": [
+      {
+        "description": "",
+        "hooks": [],
+        "id": "problem",
+        "inputs": [],
+        "instructions": "State the target decision, constraints, and success bar.",
+        "model_settings": null,
+        "name": "Problem",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "critic_a",
+        "inputs": [],
+        "instructions": "Evaluate the problem framing from the first angle.",
+        "model_settings": null,
+        "name": "Critic A",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "critic_b",
+        "inputs": [],
+        "instructions": "Evaluate the problem framing from the second angle.",
+        "model_settings": null,
+        "name": "Critic B",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "critic_c",
+        "inputs": [],
+        "instructions": "Evaluate the framing for corner cases and ambiguity.",
+        "model_settings": null,
+        "name": "Critic C",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "solver",
+        "inputs": [],
+        "instructions": "Resolve the critics into the best current answer.",
+        "model_settings": null,
+        "name": "Solver",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [
+          "custody.from=node:critic_a"
+        ],
+        "type": "action",
+        "working_dir": null
+      },
+      {
+        "description": "",
+        "hooks": [],
+        "id": "polish",
+        "inputs": [],
+        "instructions": "Turn the current answer into a concise final form.",
+        "model_settings": null,
+        "name": "Polish",
+        "outputs": [],
+        "pattern": null,
+        "pattern_params": {},
+        "provider": null,
+        "repeat_policy": null,
+        "route_when": null,
+        "sandbox": false,
+        "subgraph": null,
+        "tags": [],
+        "type": "action",
+        "working_dir": null
+      }
+    ],
+    "version": "1.0"
+  }
+}

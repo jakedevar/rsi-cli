@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>M": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "Toggles memory search. MemorySearch {query, max_results: 10, project_id: null} on every edit, like the TUI; rows show path [score] and the snippet. Up/Down or Ctrl-N/Ctrl-P move, Esc closes; j/k/q type into the query (the desktop's single-line field rule, as in the TUI's standard editing; Vim mode in the TUI keeps them as commands)"
+    },
+    "overlay-ref:memory-search": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "MemorySearch {query, max_results: 10, project_id: null} on every edit, like the TUI; rows show path [score] and the snippet. Up/Down or Ctrl-N/Ctrl-P move, Esc closes; j/k/q type into the query (the desktop's single-line field rule, as in the TUI's standard editing; Vim mode in the TUI keeps them as commands)"
+    },
+    "module:ui/overlay/memory_search.rs": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "memory search overlay; see overlay-ref:memory-search"
+    },
+    "overlay-ref:ai-command": {
+      "status": "substitute",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "Ctrl-Alt-A in the message box, the launch and continue prompts and the input modal (plain Ctrl-A stays select-all, as in the TUI's standard editing; Cmd on macOS), or the palette: GenerateText {system, prompt} with the TUI's AI_COMMAND_SYSTEM_PROMPT and INSTRUCTION/SOURCE TEXT layout; typing, Backspace, Enter runs, Esc cancels; the result is a preview (a accepts, d / Esc discard). Substitute for the model: rsid's configured prompt-processor model runs, because the TUI's own prompt_processor choice is TUI state that no RPC serves"
+    },
+    "module:ui/overlay/ai_command.rs": {
+      "status": "substitute",
+      "location": "src/actions/assist.ts, src/assist.ts, src/assist-model.ts",
+      "note": "see overlay-ref:ai-command"
+    },
+    "overlay-ref:ai-chat": {
+      "status": "substitute",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "Ctrl-Shift-A in the message box, the launch and continue prompts and the input modal, or the palette: GenerateText with the TUI's AI_CHAT_SYSTEM_PROMPT and SOURCE TEXT/CONVERSATION layout, multi-turn, errors kept as 'Error: ...' turns; Enter sends, Up/Down scroll, Esc clears then closes, q closes an empty input. Substitute for the model: rsid's configured prompt-processor model (the TUI's own choice is TUI state)"
+    },
+    "module:ui/overlay/ai_chat.rs": {
+      "status": "substitute",
+      "location": "src/actions/assist.ts, src/assist.ts, src/assist-model.ts",
+      "note": "see overlay-ref:ai-chat"
+    },
+    "cmd:card": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": ":card, :card user, :card add <fact>, :card user add <fact> parsed exactly like commands.rs; add reads the card and writes it back with the fact appended (40 max)"
+    },
+    "overlay:card-editor-overlay-card-card-user": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "GetEntityCard/SetEntityCard for the current project (open session's, else the list's project filter) or the user card (self). j/k, g/G, a, e/i/Enter, dd, J/K reorder, Ctrl-S save, Esc/q save and close; edit: Enter commits (empty deletes), Esc cancels (a new empty fact is removed); every change saves the whole card like the TUI; 40-fact cap; Space N / Space ; leave the overlay"
+    },
+    "overlay-ref:card-editor": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "GetEntityCard/SetEntityCard for the current project (open session's, else the list's project filter) or the user card (self). j/k, g/G, a, e/i/Enter, dd, J/K reorder, Ctrl-S save, Esc/q save and close; edit: Enter commits (empty deletes), Esc cancels (a new empty fact is removed); every change saves the whole card like the TUI; 40-fact cap; Space N / Space ; leave the overlay"
+    },
+    "module:ui/overlay/card_editor.rs": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "card editor overlay; see overlay-ref:card-editor"
+    },
+    "cmd:ask": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "QueryMemory {query, project_id, conversation_history} scoped to the current project (else global): Enter sends, s (empty input) toggles the sources, Up/Down scroll, Esc clears then closes, q closes an empty input; :ask <question> fills the input as in the TUI"
+    },
+    "overlay-ref:dialectic": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "QueryMemory {query, project_id, conversation_history} scoped to the current project (else global): Enter sends, s (empty input) toggles the sources, Up/Down scroll, Esc clears then closes, q closes an empty input; :ask <question> fills the input as in the TUI"
+    },
+    "module:ui/overlay/dialectic.rs": {
+      "status": "done",
+      "location": "src/actions/assist.ts, src/actions/assist-run.ts, src/assist.ts, src/assist-model.ts, src-tauri/src/assist.rs",
+      "note": "dialectic overlay; see overlay-ref:dialectic"
+    }
+  }
+}

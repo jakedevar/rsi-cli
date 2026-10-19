@@ -135,6 +135,143 @@ impl ClaudeConfigIsolation {
     }
 }
 
+/// Codex `exec` operator-config isolation policy (#2760, gap G09).
+///
+/// The operator's personal `$CODEX_HOME/config.toml` (model, profile,
+/// `mcp_servers`, hooks, `approval_policy`) and the user/project execpolicy
+/// `.rules` files otherwise layer under every worker, and a required MCP
+/// server that fails to start makes `codex exec` exit with an error. Both
+/// flags below leave auth untouched (`auth still uses CODEX_HOME`), and every
+/// `-c` override RSI passes still applies.
+///
+/// `Off` is the default and emits no flags, keeping the argv byte-identical
+/// to the pre-feature launch path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexConfigIsolation {
+    /// No isolation. Today's behavior, byte-for-byte.
+    Off,
+    /// `--ignore-user-config`: do not load `$CODEX_HOME/config.toml`.
+    User,
+    /// `--ignore-rules`: do not load user or project execpolicy `.rules`.
+    Rules,
+    /// Both `--ignore-user-config` and `--ignore-rules`.
+    All,
+}
+
+impl CodexConfigIsolation {
+    pub(crate) fn cli_arg(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::User => "user",
+            Self::Rules => "rules",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "user" => Some(Self::User),
+            "rules" => Some(Self::Rules),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// Flags this policy appends to the `codex exec` / `codex exec resume`
+    /// argv, in order. `[source]` `codex exec --help` (and `exec resume
+    /// --help`): `--ignore-user-config` "Do not load `$CODEX_HOME/config.toml`;
+    /// auth still uses `CODEX_HOME`", `--ignore-rules` "Do not load user or
+    /// project execpolicy `.rules` files".
+    pub fn cli_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Off => &[],
+            Self::User => &["--ignore-user-config"],
+            Self::Rules => &["--ignore-rules"],
+            Self::All => &["--ignore-user-config", "--ignore-rules"],
+        }
+    }
+}
+
+/// Largest accepted subagent concurrency cap (#2763). Claude Code defaults to
+/// 20 and Codex to its own small default; a cap above this is a typo, not a
+/// governance choice.
+pub const SUBAGENT_CONCURRENCY_MAX: u64 = 100;
+
+/// Longest accepted subagent model identifier.
+const SUBAGENT_MODEL_MAX_LEN: usize = 128;
+
+/// Validate the operator's subagent model for a provider (#2763, gap G12).
+///
+/// Empty (or whitespace) means "unset": the harness keeps its own default, the
+/// subagent inherits the parent's model, and RSI passes nothing. Anything else
+/// must be one identifier a CLI accepts as a model: ASCII letters, digits and
+/// `. _ : / @ + - [ ]` (Claude aliases such as `haiku` or `sonnet[1m]`, full
+/// ids, Bedrock ids with `:0`, Codex slugs). Whitespace, quotes, backslashes,
+/// `=` and control characters are refused, so the value is safe both as an
+/// environment value and inside a TOML basic string passed with `-c`.
+///
+/// # Errors
+/// The text is not an acceptable model identifier.
+pub fn normalize_subagent_model(raw: &str) -> Result<String, String> {
+    let model = raw.trim();
+    if model.len() > SUBAGENT_MODEL_MAX_LEN {
+        return Err(format!(
+            "expected a model name of at most {SUBAGENT_MODEL_MAX_LEN} characters"
+        ));
+    }
+    let allowed = |c: char| c.is_ascii_alphanumeric() || ".:_/@+-[]".contains(c);
+    if !model.chars().all(allowed) {
+        return Err(
+            "expected a model name of letters, digits and . _ : / @ + - [ ] (empty = inherit)"
+                .to_string(),
+        );
+    }
+    Ok(model.to_string())
+}
+
+/// The subagent governance one provider launch runs under (#2763): the model
+/// every subagent uses and the cap on concurrent subagents. `None` is "not
+/// set": nothing is passed and the harness keeps its own default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubagentCaps {
+    /// Subagent model, `None` = subagents inherit the parent's model.
+    pub model: Option<String>,
+    /// Concurrent subagent cap, `None` = the harness default.
+    pub max_concurrent: Option<u32>,
+}
+
+impl SubagentCaps {
+    /// Build from the stored setting values (`""` and `0` are "unset").
+    #[must_use]
+    pub fn from_settings(model: &str, max_concurrent: u32) -> Self {
+        Self {
+            model: (!model.is_empty()).then(|| model.to_string()),
+            max_concurrent: (max_concurrent != 0).then_some(max_concurrent),
+        }
+    }
+
+    /// True when no cap is set, so a launch passes nothing.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.model.is_none() && self.max_concurrent.is_none()
+    }
+
+    /// The one-line record shown on the session: `subagent model haiku,
+    /// at most 4 concurrent`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(model) = &self.model {
+            parts.push(format!("subagent model {model}"));
+        }
+        if let Some(cap) = self.max_concurrent {
+            parts.push(format!("at most {cap} concurrent"));
+        }
+        parts.join(", ")
+    }
+}
+
 /// Decision type for structured approval responses.
 #[derive(Debug, Clone)]
 pub enum ApprovalDecision {

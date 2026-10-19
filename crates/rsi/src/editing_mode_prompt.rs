@@ -369,6 +369,31 @@ impl App {
         self.edit_field_filtered(key, pick, |_| true)
     }
 
+    /// Standard-mode paste into the focused single-line field: replaces the
+    /// selection or inserts at the cursor. Returns `false` (nothing pasted) in
+    /// Vim mode or when `pick` finds no field, so the owner's existing paste
+    /// handling runs unchanged.
+    pub fn paste_field(
+        &mut self,
+        pasted: &str,
+        pick: impl FnOnce(&mut crate::types::OverlayState) -> Option<&mut String>,
+    ) -> bool {
+        if !self.standard_editing() {
+            return false;
+        }
+        let Self {
+            overlay,
+            field_edit,
+            ..
+        } = self;
+        let Some(text) = pick(overlay) else {
+            return false;
+        };
+        field_edit.paste(text, pasted);
+        self.mark_dirty();
+        true
+    }
+
     /// [`edit_field`](Self::edit_field) for fields that only accept some
     /// characters (numeric fields).
     pub fn edit_field_filtered(

@@ -250,7 +250,7 @@ impl ManagerPolicyV2 {
             || self.max_created_sessions > 1024
             || !(1..=100).contains(&self.max_active_sessions)
             || self.provider_limits.len() > 8
-            || self.allowed_launches.len() > 32
+            || self.allowed_launches.len() > crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES
             || self.max_recovery_attempts > 32
             || !(1..=86400).contains(&self.retry_delay_seconds)
             || !(30..=604800).contains(&self.request_timeout_seconds)
@@ -280,6 +280,37 @@ impl ManagerPolicyV2 {
 }
 
 impl ManagerLaunchChoiceV2 {
+    /// An allowlist entry with omitted effort permits every effort the model
+    /// supports. When RSI knows the model's effort ladder
+    /// ([`crate::model_utils::known_effort_ladder`]) an effort off that ladder
+    /// is not admitted, so an any-effort grant never admits a made-up effort
+    /// string; an unknown model keeps admitting every effort (the provider CLI
+    /// validates it). An exact entry admits exactly its own effort and cannot
+    /// grant a child entry that permits every effort.
+    #[must_use]
+    pub fn allows(&self, launch: &Self) -> bool {
+        if self.provider != launch.provider || self.model != launch.model {
+            return false;
+        }
+        match (self.effort.as_deref(), launch.effort.as_deref()) {
+            (Some(granted), Some(requested)) => granted == requested,
+            (Some(_), None) => false,
+            (None, None) => true,
+            (None, Some(requested)) => crate::model_utils::known_effort_ladder(&self.model)
+                .is_none_or(|ladder| ladder.contains(&requested)),
+        }
+    }
+
+    #[must_use]
+    pub fn effort_label(&self) -> &str {
+        self.effort.as_deref().unwrap_or("any effort")
+    }
+
+    #[must_use]
+    pub fn display(&self) -> String {
+        format!("{:?}/{}/{}", self.provider, self.model, self.effort_label())
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         text(&self.model, 256)?;
         if let Some(effort) = &self.effort {
@@ -297,6 +328,60 @@ pub struct ConfigureHarnessManagerPolicyRequestV2 {
     pub expected_policy_version: i64,
     pub idempotency_key: String,
     pub policy: ManagerPolicyV2,
+}
+
+/// #2237 (operator-only): appoint a manager and grant its policy in one
+/// atomic step. The scope save and the policy save share one transaction, so a
+/// refused grant never leaves an appointment without its policy (the two-step
+/// `ConfigureHarnessManager` then `ConfigureHarnessManagerPolicy` flow can).
+/// `policy` replaces the whole draft; the scope fence is `scope.expected_row_version`
+/// and the policy fence is `expected_policy_version` (0 when none is saved).
+/// A revocation (`scope` clearing the appointment) is not a valid request here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigureHarnessManagerWithPolicyRequestV2 {
+    pub scope: crate::harness_manager::ConfigureHarnessManagerRequestV1,
+    pub expected_policy_version: i64,
+    pub idempotency_key: String,
+    pub policy: ManagerPolicyV2,
+}
+
+impl ConfigureHarnessManagerWithPolicyRequestV2 {
+    /// # Errors
+    /// A stable refusal code.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.scope.validate()?;
+        if self.scope.is_revocation()
+            || self.expected_policy_version < 0
+            || self.idempotency_key.trim().is_empty()
+            || self.idempotency_key.len() > 128
+        {
+            return Err("manager_v2_invalid_policy_request");
+        }
+        self.policy.validate()
+    }
+
+    /// The policy half as the two-step flow would send it, fenced to the scope
+    /// version the appointment produced.
+    #[must_use]
+    pub fn policy_request(&self, scope_version: i64) -> ConfigureHarnessManagerPolicyRequestV2 {
+        ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: self.scope.project_id,
+            expected_scope_version: scope_version,
+            expected_policy_version: self.expected_policy_version,
+            idempotency_key: self.idempotency_key.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+/// `ConfigureHarnessManagerWithPolicy` result: the appointment and the grant it
+/// carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigureHarnessManagerWithPolicyResultV2 {
+    pub config: crate::harness_manager::HarnessManagerConfigV1,
+    pub scope_outcome: crate::harness_manager::HarnessManagerPolicyOutcomeV1,
+    pub policy: HarnessManagerPolicyConfigV2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +471,11 @@ const fn page_limit() -> u16 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerInspectRequestV2 {
+    /// Workers only: retain all historical rows in creation order. The default
+    /// actionable view is newest first; recent terminal results have a 7-day
+    /// attention window, while explicit pending work/jobs/landings stay visible.
+    #[serde(default)]
+    pub include_history: bool,
     #[serde(default)]
     pub section: ManagerInspectSectionV2,
     #[serde(default)]
@@ -405,6 +495,7 @@ impl Default for AgentManagerInspectRequestV2 {
     fn default() -> Self {
         Self {
             project_id: None,
+            include_history: false,
             section: ManagerInspectSectionV2::Overview,
             epic_id: None,
             cursor: None,
@@ -428,9 +519,23 @@ impl AgentManagerInspectRequestV2 {
     }
 }
 
+/// Maximum unfinished Work versions returned on an Overview intent row.
+pub const MANAGER_INTENT_WORK_LIMIT: usize = 16;
+
+/// Disjoint states in the Overview intent's `work_summary_v1`. Counts cover
+/// the same retained window as section `work`; retired history is settled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerIntentWorkCountsV1 {
+    pub pending: usize,
+    pub partial: usize,
+    pub accepted: usize,
+    pub integrated: usize,
+    pub retired: usize,
+}
+
 /// Section rows are tagged typed records/projections; absence is not a passed
 /// gate. `complete` describes traversal completeness, never feature completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManagerInspectionV2 {
     pub observed_at: DateTime<Utc>,
     pub scope_version: i64,
@@ -517,6 +622,10 @@ pub struct ManagerSuccessionObservationV2 {
 pub enum ManagerSuccessionDenialReasonV2 {
     CurrentManagerUnavailable,
     CurrentManagerNotParentlessStandard,
+    /// The operator setting `context_rotation_enabled` is off: guarded
+    /// succession refuses (`manager_succession_rotation_disabled`) before any
+    /// queue or reservation, so no fence is published.
+    ContextRotationDisabled,
 }
 
 /// Bounded operator action associated with a succession denial. A denial never
@@ -526,6 +635,9 @@ pub enum ManagerSuccessionDenialReasonV2 {
 pub enum ManagerSuccessionRequiredActionV2 {
     RepairManagerLineage,
     AppointParentlessStandardManager,
+    /// Operator-only: turn `context_rotation_enabled` on. An agent keeps its
+    /// seat, wakes and obligations meanwhile; nothing is cancelled for this.
+    OperatorEnableContextRotation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,6 +662,22 @@ pub enum ManagerSuccessionPreflightV2 {
         current_session_id: Option<Uuid>,
         denial: ManagerSuccessionDenialV2,
     },
+}
+
+impl ManagerSuccessionPreflightV2 {
+    /// The one typed readiness for a disabled `context_rotation_enabled`. The
+    /// Store (persisted setting) and the daemon's Overview overlay (live
+    /// RuntimeConfig value) both build it here, so the denial cannot differ.
+    pub fn rotation_disabled(logical_manager_session_id: Uuid, current_session_id: Uuid) -> Self {
+        Self::Ineligible {
+            logical_manager_session_id,
+            current_session_id: Some(current_session_id),
+            denial: ManagerSuccessionDenialV2 {
+                reason: ManagerSuccessionDenialReasonV2::ContextRotationDisabled,
+                required_action: ManagerSuccessionRequiredActionV2::OperatorEnableContextRotation,
+            },
+        }
+    }
 }
 
 /// Stable, agent-authored portion of a prepared lifecycle action. Mutable
@@ -1340,6 +1468,17 @@ pub struct AgentManagerControlRequestV2 {
 }
 
 impl AgentManagerControlRequestV2 {
+    /// Build a control request while keeping its authority fence, replay key,
+    /// and operation explicit at every call site.
+    pub fn new(fence: ManagerFenceV2, idempotency_key: String, operation: ManagerActionV2) -> Self {
+        Self {
+            fence,
+            idempotency_key,
+            operation,
+            project_id: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         self.fence.validate()?;
         text(&self.idempotency_key, 128)?;
@@ -1479,11 +1618,27 @@ pub struct ManagerActionReceiptV2 {
     /// #1195: the sandbox source of an admitted `create_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_source: Option<ManagerSandboxSourceReceiptV1>,
+    /// #2652: the resume wakes a succeeded `succeed_manager` cancelled with the
+    /// displaced seat. Present only on that action's succeeded receipt and only
+    /// when it cancelled at least one wake; stored in the receipt itself, so
+    /// every later read, refresh and idempotent replay returns the same ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_wakes: Option<ManagerCancelledWakesV1>,
+}
+
+/// Resume wakes retired together with a displaced manager seat. The rows stay,
+/// disabled; the audit event `succession_wakes_settled` records the same ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerCancelledWakesV1 {
+    /// Why they were cancelled (`manager_succession_displaced_seat`).
+    pub reason: String,
+    /// The disabled `scheduled_jobs` ids, sorted.
+    pub job_ids: Vec<Uuid>,
 }
 
 /// #1311: why a queued action has not started yet. Present only while the
 /// action is queued and something holds it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ManagerActionHeldV1 {
     /// `deploy_draining`: a deploy waits for its quiet point and holds new
     /// worker starts. The action runs when the hold releases.
@@ -1494,6 +1649,12 @@ pub struct ManagerActionHeldV1 {
     /// the load drops; held creates are released oldest-first. `load` and
     /// `threshold` are set, `deploy_id` and `release_by` are not (a load hold
     /// has no release time).
+    ///
+    /// `thermal` and `disk_pressure` (#2562): the host CPU is at or above
+    /// `job_thermal_ceiling_c`, or free disk is below the governor floor
+    /// `min_free_disk_gb`; the same predicate holds build/test jobs. The
+    /// `create_session` is queued, never refused, and starts once the
+    /// condition clears, oldest first, sharing one queue with `host_load`.
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<Uuid>,
@@ -1511,6 +1672,18 @@ pub struct ManagerActionHeldV1 {
     /// comparison with `threshold` (`load + recent_admissions > threshold`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_admissions: Option<u32>,
+    /// `thermal` only: the hottest CPU sensor, in degrees Celsius, when last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    /// `thermal` only: the operator's `job_thermal_ceiling_c` the reading met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_c: Option<u32>,
+    /// `disk_pressure` only: free GiB on `/` when last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_disk_gb: Option<f64>,
+    /// `disk_pressure` only: the governor's `min_free_disk_gb` floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_disk_gb: Option<u64>,
 }
 
 /// `AgentManagerGetAction` result: the stored receipt plus, while the action
@@ -1597,6 +1770,21 @@ pub struct ManagerEvidenceV2 {
     pub closure_evidence_id: Option<Uuid>,
 }
 
+/// A terminal verification job the authenticated caller owns, cited by a stage
+/// update (`job_evidence`) instead of a worker session's evidence. Only the
+/// job id and the committed report are supplied: the daemon reads the owner,
+/// terminal state, receipt and tested commit from its own job table, so the
+/// supplied `source_commit` must equal what that receipt records. It names no
+/// session, so it widens no session scope and stands for no worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerJobEvidenceV2 {
+    pub job_id: Uuid,
+    pub source_commit: String,
+    pub artifact_path: String,
+    pub artifact_commit: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagerReviewVerdictV1 {
@@ -1641,6 +1829,58 @@ impl ManagerReviewFindingV1 {
         }
         Ok(())
     }
+}
+
+/// Key prefix of a finding that reports an infrastructure outcome (#2570): a
+/// check the reviewer needed could not run (no build slot, a missing runner),
+/// which says nothing about the code under review.
+pub const REVIEW_INFRASTRUCTURE_FINDING_PREFIX: &str = "infra_";
+
+/// The unsettled reason a topology review reports for a receipt that
+/// [`review_receipt_is_infrastructure_only`] (#2570).
+pub const REVIEW_INFRASTRUCTURE_REASON: &str = "manager_review_infrastructure_unavailable";
+
+/// The unsettled reason a topology review reports for a `blocked` receipt whose
+/// reviewer session a hub deploy (`interrupt_workers`) cut off (#2809). Like
+/// [`REVIEW_INFRASTRUCTURE_REASON`] it is no verdict on the code: the review
+/// ledger does not count the receipt as a spent round and the executor retries
+/// the review as an uncharged infrastructure loss.
+pub const REVIEW_INTERRUPTED_REASON: &str = "manager_review_reviewer_interrupted_by_deploy";
+
+/// Finding keys reviewers used for an unavailable test run before the typed
+/// `infra_` prefix existed. They keep their infrastructure meaning.
+const REVIEW_INFRASTRUCTURE_LEGACY_KEYS: [&str; 4] = [
+    "focused_tests_unavailable",
+    "required_tests_unrun",
+    "tests_unavailable",
+    "tests_unrun",
+];
+
+/// Whether `key` names an infrastructure outcome rather than a code finding.
+#[must_use]
+pub fn review_finding_is_infrastructure(key: &str) -> bool {
+    key.starts_with(REVIEW_INFRASTRUCTURE_FINDING_PREFIX)
+        || REVIEW_INFRASTRUCTURE_LEGACY_KEYS.contains(&key)
+}
+
+/// Whether a non-accepting receipt reports only infrastructure unavailability
+/// (#2570): at least one finding is an infrastructure outcome and every
+/// blocking finding is one. Such a receipt is never a code verdict; the
+/// executor retries the review instead of blocking on it and the review ledger
+/// does not count it as a spent round. `findings` is `(key, blocking)`.
+#[must_use]
+pub fn review_receipt_is_infrastructure_only<'a>(
+    findings: impl IntoIterator<Item = (&'a str, bool)>,
+) -> bool {
+    let mut infrastructure = false;
+    for (key, blocking) in findings {
+        if review_finding_is_infrastructure(key) {
+            infrastructure = true;
+        } else if blocking {
+            return false;
+        }
+    }
+    infrastructure
 }
 
 /// Reviewer-authored content only. The daemon binds the caller, source,
@@ -1704,6 +1944,9 @@ pub enum ManagerUpdateV2 {
         state: ManagerStageStateV2,
         note: String,
         evidence: Option<ManagerEvidenceV2>,
+        // Omitted when absent, so a stored request replays byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_evidence: Option<ManagerJobEvidenceV2>,
     },
     Dependency {
         key: String,
@@ -1887,6 +2130,7 @@ impl AgentManagerUpdateRequestV2 {
                 key,
                 note,
                 evidence,
+                job_evidence,
                 ..
             } => {
                 text(key, 256)?;
@@ -1895,6 +2139,14 @@ impl AgentManagerUpdateRequestV2 {
                     && evidence.source_session_id.is_nil()
                 {
                     return Err("manager_v2_invalid_update");
+                }
+                if let Some(job) = job_evidence {
+                    if evidence.is_some() {
+                        return Err("manager_v2_job_evidence_conflict");
+                    }
+                    if job.job_id.is_nil() {
+                        return Err("manager_v2_invalid_update");
+                    }
                 }
             }
             ManagerUpdateV2::Dependency {
@@ -2306,8 +2558,175 @@ pub fn unique_ids(ids: &[Uuid], max: usize) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// #2570: only a receipt whose blocking findings are all infrastructure
+    /// outcomes (and that names at least one) is an infrastructure outcome.
+    #[test]
+    fn infrastructure_only_receipts_are_typed_by_finding_key() {
+        assert!(review_receipt_is_infrastructure_only([(
+            "infra_tests_unavailable",
+            true
+        )]));
+        assert!(review_receipt_is_infrastructure_only([
+            ("required_tests_unrun", true),
+            ("naming", false),
+        ]));
+        assert!(!review_receipt_is_infrastructure_only([
+            ("infra_tests_unavailable", true),
+            ("missing-test", true),
+        ]));
+        assert!(!review_receipt_is_infrastructure_only([(
+            "missing-test",
+            true
+        )]));
+        assert!(!review_receipt_is_infrastructure_only([]));
+        assert!(!review_receipt_is_infrastructure_only([("naming", false)]));
+    }
+
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn launch_choice_any_effort_matches_only_its_provider_and_model() {
+        let any = ManagerLaunchChoiceV2 {
+            provider: crate::SessionProvider::Codex,
+            model: "gpt-6-astra".into(),
+            effort: None,
+        };
+        assert!(any.allows(&any));
+        for effort in crate::model_utils::effort_ladder(&any.model) {
+            let mut exact = any.clone();
+            exact.effort = Some((*effort).into());
+            assert!(any.allows(&exact), "{effort}");
+            assert!(exact.allows(&exact));
+            assert!(!exact.allows(&any));
+            let mut other = exact.clone();
+            other.effort = Some("another-effort".into());
+            assert!(!exact.allows(&other));
+        }
+        let mut other = any.clone();
+        other.model = "gpt-6-luna".into();
+        assert!(!any.allows(&other));
+        other = any.clone();
+        other.provider = crate::SessionProvider::Claude;
+        assert!(!any.allows(&other));
+        assert_eq!(any.display(), "Codex/gpt-6-astra/any effort");
+    }
+
+    #[test]
+    fn launch_choice_any_effort_admits_only_efforts_on_a_known_model_ladder() {
+        let choice = |provider, model: &str, effort: Option<&str>| ManagerLaunchChoiceV2 {
+            provider,
+            model: model.into(),
+            effort: effort.map(Into::into),
+        };
+        let provider = crate::SessionProvider::Codex;
+        let any = choice(provider, "gpt-6-astra", None);
+        let ladder = crate::model_utils::known_effort_ladder("gpt-6-astra")
+            .expect("gpt-6-astra has a known ladder");
+        assert!(!ladder.is_empty());
+        for effort in ladder {
+            assert!(
+                any.allows(&choice(provider, "gpt-6-astra", Some(effort))),
+                "{effort}"
+            );
+        }
+        // An off-ladder effort is not admitted by an any-effort entry, but an
+        // exact entry still names exactly what the operator wrote.
+        let off_ladder = choice(provider, "gpt-6-astra", Some("ungranted-effort"));
+        assert!(!any.allows(&off_ladder));
+        assert!(off_ladder.allows(&off_ladder));
+        assert!(!off_ladder.allows(&any));
+
+        // A model RSI has no ladder for keeps admitting any effort string.
+        let claude = crate::SessionProvider::Claude;
+        let unknown = choice(claude, "manager-scripted-provider", None);
+        assert!(crate::model_utils::known_effort_ladder(&unknown.model).is_none());
+        assert!(unknown.allows(&choice(
+            claude,
+            "manager-scripted-provider",
+            Some("ungranted-effort")
+        )));
+        assert!(unknown.allows(&choice(claude, "manager-scripted-provider", None)));
+    }
+
+    #[test]
+    fn manager_policy_and_area_grant_accept_64_launches_and_refuse_65() {
+        let mut policy = ManagerPolicyV2::default();
+        policy.allowed_launches = (0..64)
+            .map(|i| ManagerLaunchChoiceV2 {
+                provider: crate::SessionProvider::Claude,
+                model: format!("model-{i}"),
+                effort: None,
+            })
+            .collect();
+        let mut area = crate::manager_nodes::ManagerNodeGrantV1 {
+            capabilities: vec![],
+            allowed_launches: policy.allowed_launches.clone(),
+            allowance: crate::manager_nodes::ManagerNodeAllowanceV1 {
+                max_created_containers: 0,
+                max_created_sessions: 0,
+                max_active_sessions: 1,
+                max_build_slots: 0,
+                max_disk_gib: 0,
+                provider_limits: vec![],
+                max_spend_usd: None,
+            },
+            max_direct_reports: crate::manager_nodes::MANAGER_NODE_DEFAULT_MAX_DIRECT_REPORTS,
+        };
+        assert_eq!(policy.validate(), Ok(()));
+        assert_eq!(area.validate(), Ok(()));
+        let extra = ManagerLaunchChoiceV2 {
+            provider: crate::SessionProvider::Claude,
+            model: "model-64".into(),
+            effort: None,
+        };
+        policy.allowed_launches.push(extra.clone());
+        area.allowed_launches.push(extra);
+        assert_eq!(policy.validate(), Err("manager_v2_invalid_policy"));
+        assert_eq!(area.validate(), Err("manager_node_invalid_grant"));
+    }
+
+    #[test]
+    fn inspection_serializes_any_effort_display_and_round_trips() {
+        let inspection = ManagerInspectionV2 {
+            observed_at: Utc::now(),
+            scope_version: 1,
+            policy: Some(HarnessManagerPolicyConfigV2 {
+                project_id: Uuid::new_v4(),
+                manager_session_id: Uuid::new_v4(),
+                scope_version: 1,
+                row_version: 1,
+                policy: ManagerPolicyV2 {
+                    allowed_launches: vec![ManagerLaunchChoiceV2 {
+                        provider: crate::SessionProvider::Claude,
+                        model: "claude-opus-5-5".into(),
+                        effort: None,
+                    }],
+                    ..Default::default()
+                },
+                updated_at: Utc::now(),
+                revoked: false,
+            }),
+            section: ManagerInspectSectionV2::Overview,
+            rows: vec![],
+            next_cursor: None,
+            complete: true,
+        };
+        let value = serde_json::to_value(&inspection).unwrap();
+        assert_eq!(
+            value["launches_display"][0],
+            "Claude/claude-opus-5-5/any effort"
+        );
+        assert_eq!(
+            value["policy"]["policy"]["allowed_launches"][0]["effort"],
+            json!(null)
+        );
+        let restored: ManagerInspectionV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.policy.unwrap().policy,
+            inspection.policy.unwrap().policy
+        );
+    }
 
     #[test]
     fn tier2_review_policy_and_work_metadata_default_and_round_trip() {
@@ -2440,6 +2859,54 @@ mod tests {
         assert_eq!(current["target_type"], "epic_container");
         assert_eq!(current["result"]["target_state"], "container_committed");
         assert_eq!(current["result"]["lead_state"], "unassigned");
+    }
+
+    /// #2652: the cancelled-wakes field is optional both ways. A receipt without
+    /// it reads and writes exactly as before, one with it round-trips its ids and
+    /// reason, and a metadata refresh never drops it.
+    #[test]
+    fn manager_action_receipt_names_cancelled_wakes_compatibly() {
+        let operation_id = Uuid::new_v4();
+        let legacy = json!({
+            "operation_id": operation_id,
+            "state": "succeeded",
+            "row_version": 4,
+            "target_session_id": null,
+            "outcome": "manager_successor_established",
+            "deduplicated": false
+        });
+        let plain: ManagerActionReceiptV2 = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(plain.cancelled_wakes, None);
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("cancelled_wakes")
+                .is_none(),
+            "an absent field is omitted, not written as null"
+        );
+
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut named = plain.clone();
+        named.cancelled_wakes = Some(ManagerCancelledWakesV1 {
+            reason: "manager_succession_displaced_seat".into(),
+            job_ids: vec![a, b],
+        });
+        let wire = serde_json::to_value(&named).unwrap();
+        assert_eq!(
+            wire["cancelled_wakes"],
+            json!({"reason":"manager_succession_displaced_seat","job_ids":[a,b]})
+        );
+        let mut back: ManagerActionReceiptV2 = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, named);
+
+        let request: AgentManagerControlRequestV2 =
+            serde_json::from_value(root_succession_request()).unwrap();
+        back.refresh_action_metadata(&request.operation);
+        assert_eq!(back.result, Some(ManagerActionResultV2::ManagerPublished));
+        assert_eq!(
+            back.cancelled_wakes, named.cancelled_wakes,
+            "a refresh keeps the cancelled ids"
+        );
     }
 
     fn root_succession_request() -> serde_json::Value {
@@ -2656,6 +3123,27 @@ mod tests {
             serde_json::from_value::<ManagerSuccessionPreflightV2>(ineligible_value.clone())
                 .unwrap(),
             ineligible
+        );
+        let disabled = ManagerSuccessionPreflightV2::Ineligible {
+            logical_manager_session_id: logical,
+            current_session_id: Some(current),
+            denial: ManagerSuccessionDenialV2 {
+                reason: ManagerSuccessionDenialReasonV2::ContextRotationDisabled,
+                required_action: ManagerSuccessionRequiredActionV2::OperatorEnableContextRotation,
+            },
+        };
+        let disabled_value = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(
+            disabled_value["denial"]["reason"],
+            "context_rotation_disabled"
+        );
+        assert_eq!(
+            disabled_value["denial"]["required_action"],
+            "operator_enable_context_rotation"
+        );
+        assert_eq!(
+            serde_json::from_value::<ManagerSuccessionPreflightV2>(disabled_value).unwrap(),
+            disabled
         );
         let mut injected = ineligible_value;
         injected["expected"] = json!({"authority_epoch":7,"custody_generation":3});
@@ -2944,5 +3432,28 @@ mod tests {
             serde_json::from_value::<ManagerSessionPatchV2>(json!({"rating":{"set":3},"x":1}))
                 .is_err()
         );
+    }
+}
+
+impl Serialize for ManagerInspectionV2 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut output = serializer.serialize_struct("ManagerInspectionV2", 8)?;
+        output.serialize_field("observed_at", &self.observed_at)?;
+        output.serialize_field("scope_version", &self.scope_version)?;
+        output.serialize_field("policy", &self.policy)?;
+        output.serialize_field("section", &self.section)?;
+        output.serialize_field("rows", &self.rows)?;
+        output.serialize_field("next_cursor", &self.next_cursor)?;
+        output.serialize_field("complete", &self.complete)?;
+        let launches_display: Vec<_> = self
+            .policy
+            .as_ref()
+            .map_or(&[][..], |grant| grant.policy.allowed_launches.as_slice())
+            .iter()
+            .map(crate::harness_manager_v2::ManagerLaunchChoiceV2::display)
+            .collect();
+        output.serialize_field("launches_display", &launches_display)?;
+        output.end()
     }
 }

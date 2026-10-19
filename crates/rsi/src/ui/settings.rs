@@ -34,15 +34,18 @@ use crate::model_control_stats::{
     StatsGroup, StatsRow, StatsRowAction, StatsTone, stats_rows, status_label,
 };
 use crate::settings::{
-    ActivityIndicatorStyle, DaemonFeatureEntry, DaemonFeatureValue, DetailColumnAlignment,
-    FORMULATION_ANIM_DURATIONS, SystemPromptPreset, UserSettings,
+    DaemonFeatureEntry, DaemonFeatureValue, FORMULATION_ANIM_DURATIONS, SystemPromptPreset,
+    UserSettings,
 };
 use crate::settings_keys::{
     DAEMON_FEATURE_SECTIONS, daemon_feature_rows_for_section, item_count,
     search_match_count_in_section, search_row_matches,
 };
 use crate::settings_registry::{
-    SETTINGS, SettingApply, SettingOwner, SettingSpec, SettingsGroup, SettingsSection,
+    SETTINGS, SettingApply, SettingKind, SettingOwner, SettingSpec, SettingsGroup, SettingsSection,
+};
+use crate::settings_staging::{
+    ACTIVITY_STYLES, DETAIL_ALIGNMENTS, LocalPref, SYSTEM_PROMPT_FIELD, pending_count,
 };
 use crate::types::{NavigatorPreset, SettingsFocus, SettingsRenderedLayout};
 use crate::ui::{glyphs, theme};
@@ -76,23 +79,6 @@ const OPTIONS_LIST_MAX: usize = 16;
 /// The key that activates the selected row (Enter).
 const ENTER_KEY: &str = "↵";
 
-/// Activity indicator styles in `ActivityIndicatorStyle::next` order.
-const ACTIVITY_STYLES: [ActivityIndicatorStyle; 6] = [
-    ActivityIndicatorStyle::Semantic,
-    ActivityIndicatorStyle::RainbowClassic,
-    ActivityIndicatorStyle::RainbowCompact,
-    ActivityIndicatorStyle::RainbowClassicCompact,
-    ActivityIndicatorStyle::SonicSpeedUp,
-    ActivityIndicatorStyle::RainbowStarlight,
-];
-
-/// Detail column alignments in `DetailColumnAlignment::next` order.
-const DETAIL_ALIGNMENTS: [DetailColumnAlignment; 3] = [
-    DetailColumnAlignment::Dynamic,
-    DetailColumnAlignment::Left,
-    DetailColumnAlignment::Center,
-];
-
 // ---------------------------------------------------------------------------
 // Category identity
 // ---------------------------------------------------------------------------
@@ -108,6 +94,7 @@ pub(crate) const fn group_glyph(group: SettingsGroup) -> &'static str {
         SettingsGroup::SafetyAndSpend => "$",
         SettingsGroup::AgentAutomation => "↺",
         SettingsGroup::ProvidersAndSandboxes => "⊡",
+        SettingsGroup::HostAndBuild => "▣",
         SettingsGroup::Integrations => "⇄",
     }
 }
@@ -123,6 +110,7 @@ pub(crate) fn group_color(group: SettingsGroup) -> Color {
         SettingsGroup::SafetyAndSpend => theme::yellow(),
         SettingsGroup::AgentAutomation => theme::green(),
         SettingsGroup::ProvidersAndSandboxes => theme::teal(),
+        SettingsGroup::HostAndBuild => theme::lavender(),
         SettingsGroup::Integrations => theme::sky(),
     }
 }
@@ -137,6 +125,7 @@ pub(crate) const fn group_title(group: SettingsGroup) -> &'static str {
         SettingsGroup::SafetyAndSpend => "Safety & Spend",
         SettingsGroup::AgentAutomation => "Agent Automation",
         SettingsGroup::ProvidersAndSandboxes => "Providers & Sandboxes",
+        SettingsGroup::HostAndBuild => "Host & Build",
         SettingsGroup::Integrations => "Integrations",
     }
 }
@@ -239,6 +228,8 @@ struct SettingsRow {
     destructive: bool,
     /// The change applies only after a daemon restart (`↻` badge).
     restart: bool,
+    /// The value is staged and differs from the live one (dirty marker).
+    pending: bool,
     empty: bool,
     /// Every value a choice row cycles through, with the current one, for
     /// the info card's option list.
@@ -543,7 +534,9 @@ fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("  ›  ", separator),
         Span::styled(section.label(), Style::default().fg(theme::text())),
     ]);
-    let right = Line::from(search_spans(app));
+    let mut right_spans = pending_spans(app);
+    right_spans.extend(search_spans(app));
+    let right = Line::from(right_spans);
     let right_width = u16::try_from(right.width())
         .unwrap_or(u16::MAX)
         .min(area.width);
@@ -560,6 +553,26 @@ fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(right),
         Rect::new(area.x + area.width - right_width, area.y, right_width, 1),
     );
+}
+
+/// `● 3 pending  w apply  Esc discard`: shown while edits are staged.
+fn pending_spans(app: &App) -> Vec<Span<'static>> {
+    let pending = pending_count(app);
+    if pending == 0 {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(
+            format!("● {pending} pending  "),
+            Style::default()
+                .fg(theme::warning_status())
+                .add_modifier(Modifier::BOLD),
+        ),
+        key_cap("w"),
+        Span::styled(" apply  ", dim_style()),
+        key_cap("Esc"),
+        Span::styled(" discard   ", dim_style()),
+    ]
 }
 
 fn search_spans(app: &App) -> Vec<Span<'static>> {
@@ -1256,7 +1269,7 @@ fn render_setting_row(
     if columns.value_width == 0 {
         return;
     }
-    let badge_width = if row.restart { 3 } else { 0 };
+    let badge_width = if row.restart { 3 } else { 0 } + if row.pending { 3 } else { 0 };
     let mut spans = fit_spans(
         widget_spans(row, accent, choice_width),
         usize::from(columns.value_width).saturating_sub(badge_width),
@@ -1264,6 +1277,14 @@ fn render_setting_row(
     if row.restart {
         spans.push(Span::styled(
             "  ↻",
+            Style::default()
+                .fg(theme::warning_status())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if row.pending {
+        spans.push(Span::styled(
+            "  *",
             Style::default()
                 .fg(theme::warning_status())
                 .add_modifier(Modifier::BOLD),
@@ -1714,7 +1735,7 @@ fn action_line(row: &SettingsRow) -> Line<'static> {
 
 /// When a change applies and where it is stored, as two colored chips.
 fn chips_line(spec: &SettingSpec) -> Line<'static> {
-    let (glyph, text, color) = apply_chip(spec.apply);
+    let (glyph, text, color) = apply_chip(spec);
     let (store_glyph, store) = storage_chip(spec.owner);
     Line::from(vec![
         Span::styled(
@@ -1727,8 +1748,16 @@ fn chips_line(spec: &SettingSpec) -> Line<'static> {
     ])
 }
 
-fn apply_chip(apply: SettingApply) -> (&'static str, &'static str, Color) {
-    match apply {
+fn apply_chip(spec: &SettingSpec) -> (&'static str, &'static str, Color) {
+    if spec.kind == SettingKind::Action {
+        return ("▶", "runs when activated", theme::green());
+    }
+    let staged = crate::settings_staging::stages_edit(spec);
+    match spec.apply {
+        SettingApply::OnApply => ("✓", "on apply (w)", theme::green()),
+        SettingApply::Daemon(ApplyClass::Live) if staged => {
+            ("✓", "on apply (w) · no restart", theme::green())
+        }
         SettingApply::Immediate | SettingApply::Daemon(ApplyClass::Live) => {
             ("✓", "applies now", theme::green())
         }
@@ -1793,6 +1822,10 @@ fn footer_hints(app: &App, row: &SettingsRow) -> Vec<(String, String)> {
         ];
     }
     let mut hints = Vec::new();
+    let pending = pending_count(app);
+    if pending > 0 {
+        hints.push(("w".to_string(), format!("apply {pending}")));
+    }
     match state.focus {
         SettingsFocus::Categories => {
             hints.push(hint("j/k", "category"));
@@ -1802,6 +1835,13 @@ fn footer_hints(app: &App, row: &SettingsRow) -> Vec<(String, String)> {
         SettingsFocus::Items => {
             if !row.action.is_empty() {
                 hints.push((ENTER_KEY.to_string(), row.action.clone()));
+            }
+            if matches!(
+                row.widget,
+                ValueWidget::Toggle(_) | ValueWidget::Choice { .. }
+            ) && !row.action.is_empty()
+            {
+                hints.push(hint("-/+", "step"));
             }
             hints.extend(row.keys.iter().map(|key| hint(key.key, key.label)));
             hints.push(hint("j/k", "move"));
@@ -1814,7 +1854,11 @@ fn footer_hints(app: &App, row: &SettingsRow) -> Vec<(String, String)> {
         hints.push(hint("n/N", "next match"));
     }
     hints.push(hint("< >", "resize"));
-    hints.push(hint("q", "close"));
+    if pending > 0 {
+        hints.push(hint("q", "discard & close"));
+    } else {
+        hints.push(hint("q", "close"));
+    }
     hints
 }
 
@@ -1870,7 +1914,7 @@ fn settings_item_count(app: &App) -> usize {
             .unwrap_or(1),
         SettingsSection::Usage => stats_rows(app).len().max(1),
         SettingsSection::Budgets => budget_rows(app).len().max(1),
-        SettingsSection::ProviderKeys => ProviderCredentialSlot::ALL.len(),
+        SettingsSection::ProviderKeys => crate::provider_credential_rows::provider_key_row_count(),
         SettingsSection::McpServers => app
             .cached_mcp_servers
             .as_ref()
@@ -1888,7 +1932,7 @@ fn section_rows(app: &App) -> Vec<SettingsRow> {
     if DAEMON_FEATURE_SECTIONS.contains(&section) {
         let rows: Vec<SettingsRow> = daemon_feature_rows_for_section(app, section)
             .into_iter()
-            .map(|(spec, vec_idx)| daemon_section_row(&app.daemon_features[vec_idx], spec))
+            .map(|(spec, vec_idx)| daemon_section_row(app, &app.daemon_features[vec_idx], spec))
             .collect();
         return if rows.is_empty() {
             vec![daemon_loading_row()]
@@ -1930,6 +1974,7 @@ fn base_row(
         tone: ValueTone::Neutral,
         destructive: false,
         restart: false,
+        pending: false,
         empty: false,
         options: Vec::new(),
         option_index: None,
@@ -2143,6 +2188,24 @@ fn daemon_feature_row(entry: &DaemonFeatureEntry, spec: &SettingSpec) -> Setting
                 ..action_row("Open audit", "", "open the settlement audit")
             }
         }
+        DaemonFeatureValue::Display(value) if entry.field == crate::cold_storage::RUN_NOW_FIELD => {
+            action_row("Run", value, "start a cold-storage pass now")
+        }
+        DaemonFeatureValue::Display(value)
+            if crate::overlay::daemon_text_field(&entry.field).is_some() =>
+        {
+            let spec = crate::overlay::daemon_text_field(&entry.field);
+            let shown = if value.is_empty() {
+                spec.map_or("", |spec| spec.default_label)
+            } else {
+                value.as_str()
+            };
+            action_row(
+                "Edit",
+                shown,
+                spec.map_or("edit the value", |spec| spec.row_action),
+            )
+        }
         DaemonFeatureValue::Display(_) if entry.field == "legacy_scratch_adoption" => SettingsRow {
             tone: ValueTone::Destructive,
             destructive: true,
@@ -2167,9 +2230,30 @@ fn daemon_feature_row(entry: &DaemonFeatureEntry, spec: &SettingSpec) -> Setting
 }
 
 /// A daemon-feature section row: the feature row plus the section's `R`.
-fn daemon_section_row(entry: &DaemonFeatureEntry, spec: &SettingSpec) -> SettingsRow {
-    let mut row = daemon_feature_row(entry, spec);
+fn daemon_section_row(app: &App, entry: &DaemonFeatureEntry, spec: &SettingSpec) -> SettingsRow {
+    let mut row = staged_daemon_feature_row(app, entry, spec);
+    if entry.field == "coordinator_context_cap_tokens" {
+        let explanations = app
+            .coordinator_context_budgets
+            .iter()
+            .map(|seat| format!("Seat {}: {}. ", seat.session_id, seat.budget.summary()))
+            .collect::<String>();
+        row.description = format!("{explanations}{}", row.description);
+    }
     row.keys.push(REFRESH_KEY);
+    row
+}
+
+/// A daemon-feature row as the panel shows it: the staged value when one is
+/// pending, with the dirty marker.
+fn staged_daemon_feature_row(
+    app: &App,
+    entry: &DaemonFeatureEntry,
+    spec: &SettingSpec,
+) -> SettingsRow {
+    let pending = &app.settings_state.pending;
+    let mut row = daemon_feature_row(&pending.entry_view(entry), spec);
+    row.pending = pending.daemon_dirty(entry);
     row
 }
 
@@ -2178,7 +2262,7 @@ fn settings_row(app: &App, idx: usize) -> SettingsRow {
     if DAEMON_FEATURE_SECTIONS.contains(&section) {
         let rows = daemon_feature_rows_for_section(app, section);
         return match rows.get(idx) {
-            Some((spec, vec_idx)) => daemon_section_row(&app.daemon_features[*vec_idx], spec),
+            Some((spec, vec_idx)) => daemon_section_row(app, &app.daemon_features[*vec_idx], spec),
             None => daemon_loading_row(),
         };
     }
@@ -2193,7 +2277,21 @@ fn settings_row(app: &App, idx: usize) -> SettingsRow {
 }
 
 fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> SettingsRow {
-    let settings = &app.settings;
+    // Local rows show staged preferences; nothing is live until applied.
+    let view = app.settings_state.pending.view_settings(&app.settings);
+    let settings = &*view;
+    let mut row = local_settings_row_for(app, settings, section, idx);
+    row.pending = LocalPref::at(settings, section, idx)
+        .is_some_and(|pref| app.settings_state.pending.local_dirty(pref, &app.settings));
+    row
+}
+
+fn local_settings_row_for(
+    app: &App,
+    settings: &UserSettings,
+    section: SettingsSection,
+    idx: usize,
+) -> SettingsRow {
     match section {
         SettingsSection::Screen => match idx {
             0 => bool_row(
@@ -2305,7 +2403,7 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
         },
         SettingsSection::ApiProviders => match settings.custom_providers.get(idx) {
             Some(entry) => {
-                let has_key = !entry.api_key.is_empty();
+                let has_key = entry.api_key_set;
                 let text = if entry.base_url.is_empty() {
                     if has_key { "key set" } else { "no key" }.to_string()
                 } else {
@@ -2371,7 +2469,7 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
                     .iter()
                     .find(|entry| entry.field == "satellite_polling_enabled"),
             ) {
-                (Some(spec), Some(entry)) => daemon_feature_row(entry, spec),
+                (Some(spec), Some(entry)) => staged_daemon_feature_row(app, entry, spec),
                 _ => daemon_loading_row(),
             },
             _ => unknown_row(),
@@ -2389,19 +2487,38 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
             _ => unknown_row(),
         },
         SettingsSection::SystemPrompt => match idx {
-            0 => SettingsRow {
-                action: "next preset".to_string(),
-                ..options_row(
-                    "System prompt preset",
-                    SystemPromptPreset::ALL
-                        .iter()
-                        .map(|preset| preset.label().to_string())
-                        .collect(),
-                    index_of(SystemPromptPreset::ALL, &settings.system_prompt_preset),
-                    settings.system_prompt_preset.label(),
-                    "System-prompt preset applied to launches: Default, Concise, Code Only or Caveman.",
-                )
-            },
+            0 => {
+                // The daemon owns the preset; a staged choice shows until it
+                // is applied.
+                let live_entry = app
+                    .daemon_features
+                    .iter()
+                    .find(|entry| entry.field == SYSTEM_PROMPT_FIELD);
+                let preset = live_entry
+                    .map(|entry| app.settings_state.pending.entry_view(entry))
+                    .and_then(|entry| match entry.value {
+                        DaemonFeatureValue::Cycle { options, current } => options
+                            .get(current)
+                            .map(|slug| SystemPromptPreset::from_slug(slug)),
+                        _ => None,
+                    })
+                    .unwrap_or(settings.system_prompt_preset);
+                SettingsRow {
+                    action: "next preset".to_string(),
+                    pending: live_entry
+                        .is_some_and(|entry| app.settings_state.pending.daemon_dirty(entry)),
+                    ..options_row(
+                        "System prompt preset",
+                        SystemPromptPreset::ALL
+                            .iter()
+                            .map(|preset| preset.label().to_string())
+                            .collect(),
+                        index_of(SystemPromptPreset::ALL, &preset),
+                        preset.label(),
+                        "System-prompt preset applied to launches: Default, Concise, Code Only or Caveman.",
+                    )
+                }
+            }
             _ => unknown_row(),
         },
         SettingsSection::ClaudeHooks => match app.cached_hook_rows.get(idx) {
@@ -2530,6 +2647,59 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
                         )
                     }
                 }
+                // #2755: the contract rows after the login rows.
+                (Some((label, value)), None)
+                    if idx >= crate::provider_credential_rows::login_row_end() =>
+                {
+                    let contract_index =
+                        idx.saturating_sub(crate::provider_credential_rows::login_row_end());
+                    let (glyph, color) = contract_badge(
+                        crate::provider_credential_rows::contract_row_state(app, contract_index),
+                    );
+                    SettingsRow {
+                        keys: vec![key_hint("c", "check now"), REFRESH_KEY],
+                        tone: if value == "loading…" {
+                            ValueTone::Muted
+                        } else {
+                            ValueTone::Neutral
+                        },
+                        ..base_row(
+                            label,
+                            ValueWidget::Badge {
+                                glyph,
+                                color,
+                                text: value,
+                            },
+                            "check contract",
+                            "Provider CLI contract canary on the daemon host (no model turn): hook trust, flags and handshake still match what RSI relies on. Degraded shows a reason code; only an untrusted Codex custody hook refuses Codex launches (setting codex_refuse_untrusted_custody_hook). c runs the check again.",
+                        )
+                    }
+                }
+                // #2753: the login rows after the slot rows.
+                (Some((label, value)), None) => {
+                    let login_index = idx.saturating_sub(ProviderCredentialSlot::ALL.len());
+                    let (glyph, color) = login_badge(
+                        crate::provider_credential_rows::login_row_state(app, login_index),
+                    );
+                    SettingsRow {
+                        keys: vec![key_hint("c", "probe now"), REFRESH_KEY],
+                        tone: if value == "loading…" {
+                            ValueTone::Muted
+                        } else {
+                            ValueTone::Neutral
+                        },
+                        ..base_row(
+                            label,
+                            ValueWidget::Badge {
+                                glyph,
+                                color,
+                                text: value,
+                            },
+                            "probe login",
+                            "Provider CLI login on the daemon host (read-only status probe). A logged-out CLI refuses launches with provider_login_required; unknown never does. Fix on the host, then c probes again.",
+                        )
+                    }
+                }
                 _ => unknown_row(),
             }
         }
@@ -2567,13 +2737,26 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
         }
         SettingsSection::EditingMode
         | SettingsSection::ModelControl
+        | SettingsSection::CloudSpend
         | SettingsSection::RetriesRecovery
+        | SettingsSection::ContextRotation
         | SettingsSection::StallDetection
         | SettingsSection::MemoryDreaming
-        | SettingsSection::Orchestration
+        | SettingsSection::Scheduling
+        | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
         | SettingsSection::ProviderIsolation
-        | SettingsSection::SandboxStorage => daemon_loading_row(),
+        | SettingsSection::ProviderSubagents
+        | SettingsSection::ProviderSkills
+        | SettingsSection::ApiRoutes
+        | SettingsSection::HarnessTools
+        | SettingsSection::ResourceLimits
+        | SettingsSection::BuildGovernor
+        | SettingsSection::MergeQueue
+        | SettingsSection::SandboxStorage
+        | SettingsSection::ColdStorage
+        | SettingsSection::BuildCache
+        | SettingsSection::AgentBuilds => daemon_loading_row(),
     }
 }
 
@@ -2655,7 +2838,7 @@ fn session_list_row(settings: &UserSettings, idx: usize) -> SettingsRow {
                     .collect(),
                 index_of(&NavigatorPreset::ALL, &settings.navigator_preset),
                 settings.navigator_preset.label(),
-                "Cycle Dense / Operations / Cost; applies immediately.",
+                "Cycle Dense / Operations / Cost; takes effect when applied (w).",
             )
         };
     }
@@ -2810,6 +2993,32 @@ fn message_bridge_row(
     }
 }
 
+/// Badge of a provider CLI contract row (#2755).
+fn contract_badge(
+    state: Option<rsi_common::provider_contract::ProviderContractState>,
+) -> (&'static str, Color) {
+    use rsi_common::provider_contract::ProviderContractState;
+    match state {
+        Some(ProviderContractState::Ok) => ("●", theme::green()),
+        Some(ProviderContractState::Degraded) => ("✗", theme::red()),
+        Some(ProviderContractState::Unchecked) => ("?", theme::yellow()),
+        None => ("◌", theme::overlay0()),
+    }
+}
+
+/// Badge of a provider CLI login row (#2753).
+fn login_badge(
+    state: Option<rsi_common::provider_login::ProviderLoginState>,
+) -> (&'static str, Color) {
+    use rsi_common::provider_login::ProviderLoginState;
+    match state {
+        Some(ProviderLoginState::LoggedIn) => ("●", theme::green()),
+        Some(ProviderLoginState::LoggedOut) => ("✗", theme::red()),
+        Some(ProviderLoginState::Unknown) => ("?", theme::yellow()),
+        None => ("◌", theme::overlay0()),
+    }
+}
+
 /// State dot of a provider key slot.
 fn credential_badge(app: &App, slot: ProviderCredentialSlot) -> (&'static str, Color) {
     match crate::provider_credential_rows::credential_metadata(app, slot).map(|meta| meta.state) {
@@ -2888,7 +3097,7 @@ fn settings_contract(app: &App, section: SettingsSection, idx: usize) -> Setting
         SettingOwner::File(path) => path.to_string(),
     };
     let restart = match spec.apply {
-        SettingApply::Immediate => "not required",
+        SettingApply::Immediate | SettingApply::OnApply => "not required",
         SettingApply::BridgeRestart => "bridge process only",
         SettingApply::Daemon(ApplyClass::DaemonRestart) => "required",
         SettingApply::Daemon(ApplyClass::LiveOffRestartOn) => "on enable only",
@@ -2901,7 +3110,7 @@ fn settings_contract(app: &App, section: SettingsSection, idx: usize) -> Setting
         scope,
         owner: spec.owner.label(),
         persistence,
-        apply: spec.apply.label().to_string(),
+        apply: spec.apply_label().to_string(),
         restart: restart.to_string(),
     }
 }
@@ -3039,7 +3248,14 @@ mod tests {
         // Pane (0,0,200,58): list panel (32,1,103,56), tabs on its first
         // inner row.
         let tabs_row = buffer_row(&buffer, 2);
-        for section in SettingsGroup::AgentAutomation.sections() {
+        // The category has more tabs than one row holds, so the strip shows a
+        // window around the active tab (`‹` / `›` mark the rest): the active
+        // tab and its neighbours are always in it.
+        for section in [
+            SettingsSection::ContextRotation,
+            SettingsSection::StallDetection,
+            SettingsSection::MemoryDreaming,
+        ] {
             assert!(
                 tabs_row.contains(section.label()),
                 "tab {} in {tabs_row}",
@@ -3199,6 +3415,57 @@ mod tests {
         assert_eq!(buffer[(x, y)].fg, theme::yellow());
     }
 
+    #[test]
+    fn context_settings_render_the_authoritative_coordinator_budget() {
+        use rsi_common::coordinator_budget::{CoordinatorBudgetV1, CoordinatorSeatBudgetV1};
+        let mut app = settings_app(SettingsSection::ContextRotation, SettingsFocus::Items);
+        let window = rsi_common::ResolvedContextBudget::new(
+            258_400,
+            Default::default(),
+            rsi_common::CapabilityEvidence::legacy_unverified(),
+        )
+        .unwrap();
+        let budget = CoordinatorBudgetV1 {
+            provider: rsi_common::SessionProvider::Codex,
+            model: Some("gpt-6.1-sol".into()),
+            window,
+            measured_window_tokens: None,
+            coordinator_cap: 40,
+            coordinator_cap_unit: "percent".into(),
+            coordinator_cap_source: "coordinator_context_cap_tokens".into(),
+            coordinator_cap_tokens: Some(103_360),
+            succession_pct: 53.0,
+            succession_source: "context_rotation_global_pct".into(),
+            rotation_enabled: true,
+            effective_tokens: Some(103_360),
+            effective_pct: Some(40.0),
+            binding_limit: Some("coordinator_context_cap_tokens".into()),
+        };
+        let seats = vec![CoordinatorSeatBudgetV1 {
+            session_id: uuid::Uuid::new_v4(),
+            budget,
+        }];
+        app.apply_authoritative_daemon_config(
+            &serde_json::json!({"coordinator_context_budgets": seats}),
+        );
+        assert_eq!(app.coordinator_context_budgets, seats);
+        let (spec, index) = daemon_feature_rows_for_section(&app, SettingsSection::ContextRotation)
+            .into_iter()
+            .find(|(_, i)| app.daemon_features[*i].field == "coordinator_context_cap_tokens")
+            .unwrap();
+        let row = daemon_section_row(&app, &app.daemon_features[index], spec);
+        assert!(row.description.contains("Codex/gpt-6.1-sol"));
+        assert!(row.description.contains("103360 tokens (40.00%)"));
+        assert!(
+            row.description
+                .contains("succession 53.00% [context_rotation_global_pct]")
+        );
+        assert!(
+            row.description
+                .contains("binds coordinator_context_cap_tokens")
+        );
+    }
+
     /// (c) acceptance: `every_rendered_row_comes_from_settings_registry`.
     /// Every fixed-count section's rendered row labels are exactly the
     /// registry's row labels for that section, in the registry's order —
@@ -3220,12 +3487,25 @@ mod tests {
             SettingsSection::Satellites,
             SettingsSection::Remote,
             SettingsSection::ModelControl,
+            SettingsSection::CloudSpend,
             SettingsSection::RetriesRecovery,
+            SettingsSection::ContextRotation,
             SettingsSection::StallDetection,
-            SettingsSection::Orchestration,
+            SettingsSection::Scheduling,
+            SettingsSection::RecursiveDag,
             SettingsSection::CodeIntelligence,
             SettingsSection::ProviderIsolation,
+            SettingsSection::ProviderSubagents,
+            SettingsSection::ProviderSkills,
+            SettingsSection::ApiRoutes,
+            SettingsSection::HarnessTools,
+            SettingsSection::ResourceLimits,
+            SettingsSection::BuildGovernor,
+            SettingsSection::MergeQueue,
             SettingsSection::SandboxStorage,
+            SettingsSection::ColdStorage,
+            SettingsSection::BuildCache,
+            SettingsSection::AgentBuilds,
             SettingsSection::MemoryDreaming,
         ];
         for section in fixed_sections {
@@ -3270,6 +3550,34 @@ mod tests {
         assert!(row.keys.contains(&REFRESH_KEY));
     }
 
+    /// #3141 (f): the per-provider fallback rows render in the API routes
+    /// section with their own summary, and the screen shows both labels.
+    #[test]
+    fn per_provider_route_fallback_rows_render_in_the_api_routes_section() {
+        let mut app = settings_app(SettingsSection::ApiRoutes, SettingsFocus::Items);
+        let ids = [
+            SettingId::ApiRouteFallbackOpenRouter,
+            SettingId::ApiRouteFallbackBedrock,
+        ];
+        let mut text = String::new();
+        for id in ids {
+            let spec = SETTINGS.iter().find(|spec| spec.id == id).unwrap();
+            assert_eq!(spec.section, SettingsSection::ApiRoutes);
+            let index = SETTINGS
+                .iter()
+                .filter(|spec| spec.section == SettingsSection::ApiRoutes)
+                .position(|spec| spec.id == id)
+                .unwrap();
+            app.settings_state.selected_index = index;
+            let row = settings_row(&app, index);
+            assert_eq!(row.label, spec.label);
+            assert_eq!(row.description, spec.summary);
+            text.push_str(&buffer_text(&rendered_settings(&app, 200, 58)));
+        }
+        assert!(text.contains("OpenRouter Codex fallback"), "{text}");
+        assert!(text.contains("Bedrock Codex fallback"), "{text}");
+    }
+
     #[test]
     fn restart_badges_match_live_and_restart_only_consumers() {
         for (id, expected) in [
@@ -3286,10 +3594,10 @@ mod tests {
             let spec = SETTINGS.iter().find(|spec| spec.id == id).unwrap();
             assert_eq!(restart_badge(spec), expected, "{id:?}");
         }
-        let mut app = settings_app(SettingsSection::Orchestration, SettingsFocus::Items);
+        let mut app = settings_app(SettingsSection::ResourceLimits, SettingsFocus::Items);
         app.settings_state.selected_index = SETTINGS
             .iter()
-            .filter(|spec| spec.section == SettingsSection::Orchestration)
+            .filter(|spec| spec.section == SettingsSection::ResourceLimits)
             .position(|spec| spec.id == SettingId::RsidScopeMemoryHigh)
             .unwrap();
         let text = buffer_text(&rendered_settings(&app, 200, 58));
@@ -3483,7 +3791,7 @@ mod tests {
             "OPTIONS",
             "● Semantic",
             "○ Rainbow Starlight",
-            "✓ applies now",
+            "✓ on apply (w)",
             "⌂ state.json",
         ] {
             assert!(
@@ -3505,6 +3813,95 @@ mod tests {
         assert!(
             text.contains("Plain Enter submits multiline text"),
             "{text}"
+        );
+    }
+
+    /// #2241: a staged row shows its staged value with a dirty marker, the
+    /// title bar and footer count what is pending, and stepping the row home
+    /// clears the marker.
+    #[test]
+    fn staged_rows_carry_the_dirty_marker_and_the_panel_counts_them() {
+        use crate::settings_staging::Step;
+
+        let mut app = settings_app(SettingsSection::InputPrompts, SettingsFocus::Items);
+        app.settings_state.selected_index = 0;
+        let live = app.settings.submit_on_enter;
+        assert!(!settings_row(&app, 0).pending);
+
+        assert!(crate::settings_keys::stage_selected_row(
+            &mut app,
+            Step::Activate
+        ));
+        let row = settings_row(&app, 0);
+        assert!(row.pending, "the staged row is marked");
+        assert_eq!(
+            row.widget,
+            ValueWidget::Toggle(!live),
+            "the row shows the staged value, not the live one"
+        );
+        assert_eq!(
+            app.settings.submit_on_enter, live,
+            "the live value is untouched"
+        );
+        let buffer = rendered_settings(&app, 120, 40);
+        let title = buffer_row(&buffer, 0);
+        assert!(
+            title.contains("● 1 pending"),
+            "title counts pending: {title}"
+        );
+        assert!(title.contains("w apply"), "title offers apply: {title}");
+        let footer = buffer_row(&buffer, 39);
+        assert!(
+            footer.contains("w apply 1"),
+            "footer offers apply: {footer}"
+        );
+        let text = buffer_text(&buffer);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("Submit on Enter") && line.contains('*')),
+            "the staged row carries the dirty marker:\n{text}"
+        );
+
+        assert!(crate::settings_keys::stage_selected_row(
+            &mut app,
+            Step::Activate
+        ));
+        assert!(
+            !settings_row(&app, 0).pending,
+            "stepping home clears the marker"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+    }
+
+    /// #2241: a daemon row shows its staged choice while the cached live value
+    /// is unchanged.
+    #[test]
+    fn a_staged_daemon_choice_renders_in_the_row_and_marks_it_dirty() {
+        use crate::settings_staging::Step;
+
+        let mut app = settings_app(SettingsSection::SandboxStorage, SettingsFocus::Items);
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        let rows = daemon_feature_rows_for_section(&app, SettingsSection::SandboxStorage);
+        let Some(index) = rows.iter().position(|(_, vec_idx)| {
+            app.daemon_features[*vec_idx].field == "sandbox_max_source_roots"
+        }) else {
+            panic!("sandbox_max_source_roots is a Sandbox Storage row");
+        };
+        app.settings_state.selected_index = index;
+        let before = settings_row(&app, index).widget.plain();
+
+        assert!(crate::settings_keys::stage_selected_row(
+            &mut app,
+            Step::Previous
+        ));
+        let row = settings_row(&app, index);
+        assert!(row.pending);
+        assert_ne!(row.widget.plain(), before, "the row shows the lower value");
+        assert_eq!(
+            row.option_index,
+            Some(2),
+            "512, 1024, [2048]: one below 4096"
         );
     }
 
@@ -3555,12 +3952,12 @@ mod tests {
     }
 
     #[test]
-    fn rsid_scope_controls_render_in_orchestration() {
+    fn rsid_scope_controls_render_in_resource_limits() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
-        app.settings_state.section = SettingsSection::Orchestration;
+        app.settings_state.section = SettingsSection::ResourceLimits;
         let rows: Vec<String> = SETTINGS
             .iter()
-            .filter(|spec| spec.section == SettingsSection::Orchestration)
+            .filter(|spec| spec.section == SettingsSection::ResourceLimits)
             .enumerate()
             .map(|(idx, _spec)| settings_row(&app, idx).label)
             .collect();
@@ -3616,17 +4013,200 @@ mod tests {
     }
 
     #[test]
-    fn provider_keys_row_count_is_the_fixed_slot_count() {
+    fn provider_keys_row_count_is_the_slots_plus_the_cli_login_and_contract_rows() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         app.settings_state.section = SettingsSection::ProviderKeys;
-        assert_eq!(settings_item_count(&app), ProviderCredentialSlot::ALL.len());
+        assert_eq!(
+            settings_item_count(&app),
+            ProviderCredentialSlot::ALL.len()
+                + rsi_common::provider_login::PROVIDER_LOGIN_NAMES.len()
+                + rsi_common::provider_contract::PROVIDER_CONTRACT_NAMES.len()
+        );
+        // The login rows follow the slots and probe on `c`.
+        let login = settings_row(&app, ProviderCredentialSlot::ALL.len());
+        assert_eq!(login.label, "claude login");
+        assert!(login.keys.contains(&key_hint("c", "probe now")));
+        // The contract rows (#2755) follow the login rows and check on `c`.
+        let first_contract = crate::provider_credential_rows::login_row_end();
+        let claude = settings_row(&app, first_contract);
+        assert_eq!(claude.label, "claude contract");
+        assert!(claude.keys.contains(&key_hint("c", "check now")));
+        assert_eq!(
+            settings_row(&app, first_contract + 1).label,
+            "codex contract"
+        );
+    }
+
+    #[test]
+    fn a_degraded_contract_row_shows_the_reason_version_and_the_launch_consequence() {
+        use rsi_common::provider_contract::{
+            ProviderContractRowV1, ProviderContractState, ProviderContractStateResultV1,
+            ProviderContractV1,
+        };
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        let at = chrono::Utc::now() - chrono::Duration::minutes(4);
+        app.cached_provider_contract = Some(ProviderContractStateResultV1 {
+            generated_at: chrono::Utc::now(),
+            canary_enabled: true,
+            codex_refuse_untrusted_custody_hook: true,
+            providers: vec![
+                ProviderContractRowV1 {
+                    provider: "claude".into(),
+                    contract: ProviderContractV1 {
+                        contract_state: ProviderContractState::Ok,
+                        reason: None,
+                        cli_version: Some("2.1.301 (Claude Code)".into()),
+                        detail: None,
+                        checked_at: Some(at),
+                        catalog: None,
+                    },
+                },
+                ProviderContractRowV1 {
+                    provider: "codex".into(),
+                    contract: ProviderContractV1 {
+                        contract_state: ProviderContractState::Degraded,
+                        reason: Some("codex_hook_untrusted".into()),
+                        cli_version: Some("codex-cli 0.164.0".into()),
+                        detail: None,
+                        checked_at: Some(at),
+                        catalog: None,
+                    },
+                },
+            ],
+        });
+        let first = crate::provider_credential_rows::login_row_end();
+        let claude = settings_row(&app, first);
+        assert_eq!(claude.label, "claude contract");
+        let value = claude.widget.plain();
+        assert!(
+            value.starts_with("ok  2.1.301 (Claude Code)  checked 4m ago"),
+            "{value}"
+        );
+        assert!(matches!(
+            claude.widget,
+            ValueWidget::Badge { glyph: "●", .. }
+        ));
+        let codex = settings_row(&app, first + 1);
+        let value = codex.widget.plain();
+        assert!(
+            value.starts_with("degraded  reason:codex_hook_untrusted  codex-cli 0.164.0"),
+            "{value}"
+        );
+        assert!(value.contains("Codex launches are refused"), "{value}");
+        assert!(matches!(
+            codex.widget,
+            ValueWidget::Badge { glyph: "✗", .. }
+        ));
+        // The refusal setting off says the launches run without custody.
+        if let Some(result) = app.cached_provider_contract.as_mut() {
+            result.codex_refuse_untrusted_custody_hook = false;
+        }
+        let value = settings_row(&app, first + 1).widget.plain();
+        assert!(
+            value.contains("Codex launches run without custody"),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn a_degraded_contract_row_shows_the_detail_line() {
+        use rsi_common::provider_contract::{
+            ProviderContractRowV1, ProviderContractState, ProviderContractStateResultV1,
+            ProviderContractV1,
+        };
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        app.cached_provider_contract = Some(ProviderContractStateResultV1 {
+            generated_at: chrono::Utc::now(),
+            canary_enabled: true,
+            codex_refuse_untrusted_custody_hook: true,
+            providers: vec![ProviderContractRowV1 {
+                provider: "claude".into(),
+                contract: ProviderContractV1 {
+                    contract_state: ProviderContractState::Degraded,
+                    reason: Some("claude_contract_shape".into()),
+                    cli_version: Some("2.1.292 (Claude Code)".into()),
+                    detail: Some(
+                        "probe=initialize element=capabilities expected=array observed=object"
+                            .into(),
+                    ),
+                    ..ProviderContractV1::default()
+                },
+            }],
+        });
+        let first = crate::provider_credential_rows::login_row_end();
+        let value = settings_row(&app, first).widget.plain();
+        assert!(
+            value.starts_with(
+                "degraded  reason:claude_contract_shape  detail:probe=initialize \
+                 element=capabilities expected=array observed=object  2.1.292 (Claude Code)"
+            ),
+            "{value}"
+        );
+    }
+
+    #[test]
+    fn the_codex_contract_row_shows_the_catalog_trust_and_reason() {
+        use rsi_common::provider_contract::{
+            ProviderCatalogTrust, ProviderCatalogTrustV1, ProviderContractRowV1,
+            ProviderContractState, ProviderContractStateResultV1, ProviderContractV1,
+        };
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ProviderKeys;
+        let catalog = |trust, reason: &str| ProviderCatalogTrustV1 {
+            trust,
+            reason: reason.into(),
+            cli_version: "codex-cli 0.163.0".into(),
+            content_digest: "sha256:abc".into(),
+            reviewed_digest: false,
+            model_count: 11,
+            unknown_fields: Vec::new(),
+            observed_at: chrono::Utc::now(),
+        };
+        let result = |catalog| ProviderContractStateResultV1 {
+            generated_at: chrono::Utc::now(),
+            canary_enabled: true,
+            codex_refuse_untrusted_custody_hook: true,
+            providers: vec![ProviderContractRowV1 {
+                provider: "codex".into(),
+                contract: ProviderContractV1 {
+                    contract_state: ProviderContractState::Ok,
+                    cli_version: Some("codex-cli 0.163.0".into()),
+                    catalog: Some(catalog),
+                    ..ProviderContractV1::default()
+                },
+            }],
+        };
+        let codex_row = crate::provider_credential_rows::login_row_end() + 1;
+        app.cached_provider_contract = Some(result(catalog(
+            ProviderCatalogTrust::Trusted,
+            "structural_validation",
+        )));
+        let value = settings_row(&app, codex_row).widget.plain();
+        assert!(
+            value.contains("catalog:trusted reason:structural_validation"),
+            "{value}"
+        );
+        app.cached_provider_contract = Some(result(catalog(
+            ProviderCatalogTrust::DiscoveryOnly,
+            "catalog_field_missing:context_window",
+        )));
+        let value = settings_row(&app, codex_row).widget.plain();
+        assert!(
+            value.contains("catalog:discovery_only reason:catalog_field_missing:context_window"),
+            "{value}"
+        );
     }
 
     #[test]
     fn provider_keys_section_renders_slots_and_set_key_hint() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         app.settings_state.section = SettingsSection::ProviderKeys;
-        assert_eq!(settings_item_count(&app), ProviderCredentialSlot::ALL.len());
+        assert_eq!(
+            settings_item_count(&app),
+            crate::provider_credential_rows::provider_key_row_count()
+        );
         let row = settings_row(&app, 0);
         assert_eq!(row.label, ProviderCredentialSlot::ALL[0].as_str());
         assert!(row.keys.contains(&key_hint("s", "set")));

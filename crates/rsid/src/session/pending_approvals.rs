@@ -260,6 +260,7 @@ pub(crate) fn remote_selected_native_approval(
 
 /// Reobserve after Store work, with no overlapping lock. Equality reports
 /// only no bounded change; a missing or replaced witness is always changed.
+#[cfg(test)]
 pub(super) fn remote_selected_native_approval_recheck(
     before: &crate::remote_read::NativeRuntimeApprovalSnapshot,
 ) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalRecheckObservation> {
@@ -687,7 +688,11 @@ impl SessionManager {
             if !runtime.live.load(Ordering::SeqCst) {
                 continue;
             }
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "pending_approvals::retry_appserver_approval_closures",
+            )
+            .await;
             for key in keys {
                 let entry = pending.get_mut(&key).unwrap();
                 let (event, resolution) = entry.resolution.as_ref().unwrap();
@@ -791,7 +796,9 @@ impl SessionManager {
         if !runtime.live.load(Ordering::SeqCst) {
             return Err(refused("manager_v2_approval_writer_unavailable"));
         }
-        let store = self.store.lock().await;
+        let store =
+            crate::store_lock::lock(&self.store, "pending_approvals::deliver_native_approval")
+                .await;
         let started = match &delivery {
             ApprovalAnswerDelivery::Manager(delivery) => {
                 ApprovalAnswerDelivery::Manager(store.manager_v2_set_decision_delivery(

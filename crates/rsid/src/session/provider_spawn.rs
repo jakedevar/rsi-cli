@@ -162,6 +162,29 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
     ) {
         return Err(DaemonError::PolicyDenied(reason));
     }
+    // #2759: the turn the topology executor opened to obtain a node's handoff
+    // carries the handoff schema, on the CLIs that take one (Claude
+    // `--json-schema`, Codex `--output-schema`). Every other launch, and every
+    // other provider, is unchanged.
+    let structured_config;
+    let config = if matches!(
+        provider,
+        SessionProvider::Claude
+            | SessionProvider::Codex
+            | SessionProvider::Pioneer
+            | SessionProvider::CodexAppServer
+    ) && config
+        .rsi_session_id
+        .is_some_and(crate::structured_handoff::take_for_launch)
+    {
+        structured_config = LaunchConfig {
+            structured_handoff: true,
+            ..config.clone()
+        };
+        &structured_config
+    } else {
+        config
+    };
     // #792: a session with a tool policy may only run on the Harness loop.
     let guarded = ToolPolicyGuard { inner, provider };
     let launcher = &guarded;
@@ -221,11 +244,7 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
                     Ok(())
                 };
                 if let Err(cause) = preflight {
-                    if !launcher
-                        .runtime_config()
-                        .api_route_fallback
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if !launcher.runtime_config().bedrock_fallback_enabled() {
                         return Err(DaemonError::InvalidParam(format!(
                             "Bedrock harness route preflight: {cause}"
                         )));
@@ -253,35 +272,43 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
                 .model
                 .as_deref()
                 .unwrap_or(crate::openrouter::OPENROUTER_DEFAULT_MODEL);
-            if launcher.runtime_config().openrouter_route_for(model)
-                == crate::config::OpenRouterRoute::CodexCli
-            {
+            let (route, source) = launcher.runtime_config().openrouter_route_resolution(model);
+            let selection = |engine, fallback_cause| crate::api_route_selection::RouteSelection {
+                engine,
+                configured_route: route.as_str(),
+                source: source.as_str(),
+                fallback_cause,
+            };
+            // The operator's explicit `codex_cli` route (global or per model) is
+            // an opt-in, not a fallback; it is recorded with its source.
+            if route == crate::config::OpenRouterRoute::CodexCli {
                 let (p, rx) = launcher.launch_codex(
                     config,
                     admission_permit.claim_cli_execution(RuntimeExecutionRoute::CodexCli)?,
                 )?;
+                note_route_selection(config, selection("codex_cli", None));
                 return Ok((ProviderProcess::Codex(p), rx));
             }
             let preflight =
                 openrouter_harness_preflight(model, launcher.openrouter_credential_available());
             if let Err(cause) = preflight {
-                if !launcher
-                    .runtime_config()
-                    .api_route_fallback
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
+                // #3141: a failed Harness preflight is a loud typed refusal
+                // unless the operator opted into the Codex CLI fallback.
+                if !launcher.runtime_config().openrouter_fallback_enabled() {
                     return Err(DaemonError::OpenRouterRoutePreflight { cause });
                 }
                 let (p, rx) = launcher.launch_codex(
                     config,
                     admission_permit.claim_cli_execution(RuntimeExecutionRoute::CodexCli)?,
                 )?;
+                note_route_selection(config, selection("codex_cli", Some(cause)));
                 return Ok((
                     ProviderProcess::Codex(p),
                     prepend_fallback_events(rx, cause),
                 ));
             }
             let (p, rx) = launcher.launch_harness(config)?;
+            note_route_selection(config, selection("harness", None));
             Ok((ProviderProcess::Harness(p), rx))
         }
         // Local is an in-process OpenAI-compatible HTTP task, not a CLI child.
@@ -320,6 +347,76 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
         other => Err(DaemonError::InvalidParam(format!(
             "unsupported provider for spawn: {other:?}"
         ))),
+    }
+}
+
+/// #3141: the cause of a refused OpenRouter Harness preflight, if `error` is one.
+pub(super) fn openrouter_preflight_cause(error: &DaemonError) -> Option<&'static str> {
+    match error {
+        DaemonError::OpenRouterRoutePreflight { cause } => Some(cause),
+        _ => None,
+    }
+}
+
+/// #3141: end an existing session whose continuation or rotation resume was
+/// refused by the OpenRouter Harness preflight. Writes the terminal reason
+/// (`openrouter_harness_preflight:<cause>`) and one visible `System` row;
+/// the caller has already marked the session `Failed`.
+pub(super) async fn record_route_preflight_failure(
+    store: &Arc<Mutex<Store>>,
+    session_id: Uuid,
+    cause: &'static str,
+) {
+    let code = crate::error::openrouter_preflight_code(cause);
+    let explanation = format!(
+        "OpenRouter Harness preflight failed ({cause}); the session was not started on the Codex CLI. Set up the Harness route, or opt in to the fallback with api_route.fallback.openrouter."
+    );
+    if let Err(error) =
+        store
+            .lock()
+            .await
+            .replace_session_failure_cause(session_id, &code, &explanation)
+    {
+        tracing::warn!(%session_id, %error, "route preflight failure cause not recorded");
+    }
+}
+
+/// #3141: [`record_route_preflight_failure`] for a session held as a completed
+/// entry: also marks the entry and the stored row `Failed` with the same code
+/// as its stop reason, so the runtime and the store agree on how it ended.
+pub(super) async fn fail_completed_session_for_route_preflight(
+    persistence: &super::PersistenceHandle,
+    store: &Arc<Mutex<Store>>,
+    entry: &mut CompletedSession,
+    cause: &'static str,
+) {
+    let code = crate::error::openrouter_preflight_code(cause);
+    let session_id = entry.session.id;
+    entry.session.status = rsi_common::types::SessionStatus::Failed;
+    entry.session.stop_reason = Some(code.clone());
+    entry.session.terminal_reason = Some(code.clone());
+    entry.session.updated_at = chrono::Utc::now();
+    if let Err(error) = persistence
+        .update_terminal_status(session_id, rsi_common::types::SessionStatus::Failed, code)
+        .await
+    {
+        tracing::warn!(%session_id, %error, "route preflight terminal status not persisted");
+    }
+    // The cause is written only on a row that is already terminal: wait for the
+    // queued status write to commit first.
+    if let Err(error) = persistence.barrier().await {
+        tracing::warn!(%session_id, %error, "route preflight persistence barrier failed");
+    }
+    record_route_preflight_failure(store, session_id, cause).await;
+}
+
+/// #3141: record the route an OpenRouter launch took for its session's monitor.
+fn note_route_selection(
+    config: &LaunchConfig,
+    selection: crate::api_route_selection::RouteSelection,
+) {
+    if let Some(session_id) = config.rsi_session_id {
+        crate::api_route_selection::note_selected(session_id, selection);
     }
 }
 
@@ -377,6 +474,17 @@ pub(super) trait ProviderLauncher {
     fn session_tool_policy(&self) -> Option<&rsi_common::harness_tool_policy::HarnessToolPolicy> {
         None
     }
+    /// #2755: the refusal of a Codex CLI launch that would run without the
+    /// sandbox custody hook because the installed codex-cli does not trust it,
+    /// or `None`. The default asks the process-wide canary; a launcher that
+    /// owns a private service overrides it.
+    fn codex_custody_refusal(&self, config: &LaunchConfig) -> Option<String> {
+        codex_custody_refusal_with(
+            crate::provider_contract::ProviderContractService::global(),
+            self.runtime_config(),
+            config,
+        )
+    }
     fn bedrock_credential_available(&self) -> bool {
         crate::vault::global().resolvable(crate::vault::Slot::Bedrock)
     }
@@ -412,10 +520,14 @@ pub(super) trait ProviderLauncher {
     ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)>;
 }
 
-/// #792: wraps a launcher so a session carrying a Harness tool policy can only
-/// start a Harness process. Every CLI or local route (including a route
-/// fallback from Harness to the Codex CLI) is refused before any effect,
-/// because a provider outside the Harness loop cannot enforce the policy.
+/// #792, #2758: wraps a launcher so a session under a tool policy only starts a
+/// process that can enforce every field the policy sets. The Harness loop
+/// enforces the Harness fields; the Claude and Codex CLIs enforce `cli_access`
+/// (the guard hands them a config that carries the resolved policy, so a
+/// continue, rotation or retry maps it exactly like a fresh launch); every other
+/// route (Local, Antigravity, a Harness -> Codex CLI fallback of a restricted
+/// session) is refused before any effect with
+/// `tool_policy_unsupported_for_provider:<what>`.
 struct ToolPolicyGuard<'a, L> {
     inner: &'a L,
     /// The session's provider, needed to decide whether the daemon-wide
@@ -424,25 +536,92 @@ struct ToolPolicyGuard<'a, L> {
 }
 
 impl<L: ProviderLauncher> ToolPolicyGuard<'_, L> {
-    fn refuse_if_policy(&self) -> Result<()> {
-        if self
-            .inner
+    fn under_policy(&self) -> bool {
+        self.inner
             .runtime_config()
             .session_is_under_tool_policy(self.provider, self.inner.session_tool_policy())
-        {
-            return Err(DaemonError::PolicyDenied(format!(
-                "{}: this session has a Harness tool policy and can only run on the Harness \
-                 loop; the selected provider route cannot enforce it",
-                rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_PROVIDER
+    }
+
+    fn refusal(refusal: &str) -> DaemonError {
+        DaemonError::PolicyDenied(format!(
+            "{refusal}: this session's tool policy cannot be enforced on the selected provider \
+             route"
+        ))
+    }
+
+    /// The launch config a Claude or Codex CLI process starts with: the same
+    /// config carrying the session's resolved policy, or a refusal when the CLI
+    /// cannot express every field of it. A session under no policy keeps
+    /// `config` untouched, so its argv is exactly what it was.
+    fn cli_config<'c>(
+        &self,
+        config: &'c LaunchConfig,
+    ) -> Result<std::borrow::Cow<'c, LaunchConfig>> {
+        if !self.under_policy() {
+            return Ok(std::borrow::Cow::Borrowed(config));
+        }
+        let stored = self.inner.session_tool_policy();
+        // The daemon-wide Harness defaults are never stored and no CLI enforces
+        // them, so a Harness-loop session they restrict cannot take a CLI route.
+        let defaults_restrict =
+            rsi_common::harness_tool_policy::provider_runs_harness_loop(self.provider)
+                && !self
+                    .inner
+                    .runtime_config()
+                    .harness_tool_policy_defaults()
+                    .is_default();
+        let unsupported = if defaults_restrict || stored.is_none() {
+            Some("daemon_defaults")
+        } else {
+            stored
+                .and_then(rsi_common::harness_tool_policy::HarnessToolPolicy::cli_unsupported_field)
+        };
+        if let Some(what) = unsupported {
+            return Err(Self::refusal(&format!(
+                "{}:{}:{what}",
+                rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER,
+                rsi_common::harness_tool_policy::provider_label(self.provider)
+            )));
+        }
+        let mut resolved = config.clone();
+        resolved.tool_policy = stored.cloned();
+        Ok(std::borrow::Cow::Owned(resolved))
+    }
+
+    /// A route that enforces no part of a policy (Local, Antigravity).
+    fn refuse_if_policy(&self) -> Result<()> {
+        if self.under_policy() {
+            return Err(Self::refusal(&format!(
+                "{}:{}",
+                rsi_common::harness_tool_policy::TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER,
+                rsi_common::harness_tool_policy::provider_label(self.provider)
             )));
         }
         Ok(())
     }
 }
 
+/// #2755: refuse a Codex CLI launch that installs the sandbox custody hook
+/// (a session launch with an installed `rsi-rpc` sibling; the same condition as
+/// `CodexClient::build_cmd_with_custom_provider`) while the contract canary
+/// found the installed codex-cli does not trust that hook and the operator
+/// setting `codex_refuse_untrusted_custody_hook` is on. A launch with no
+/// session identity installs no hook and is never refused.
+pub(super) fn codex_custody_refusal_with(
+    service: &crate::provider_contract::ProviderContractService,
+    runtime_config: &crate::config::RuntimeConfig,
+    config: &LaunchConfig,
+) -> Option<String> {
+    config.rsi_session_id?;
+    service.codex_custody_refusal(runtime_config.codex_refuse_untrusted_custody_hook_enabled())
+}
+
 impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
     fn runtime_config(&self) -> &crate::config::RuntimeConfig {
         self.inner.runtime_config()
+    }
+    fn codex_custody_refusal(&self, config: &LaunchConfig) -> Option<String> {
+        self.inner.codex_custody_refusal(config)
     }
     fn session_tool_policy(&self) -> Option<&rsi_common::harness_tool_policy::HarnessToolPolicy> {
         self.inner.session_tool_policy()
@@ -461,16 +640,20 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
-        self.refuse_if_policy()?;
-        self.inner.launch_claude(config, execution)
+        let config = self.cli_config(config)?;
+        self.inner.launch_claude(&config, execution)
     }
     fn launch_codex(
         &self,
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
-        self.refuse_if_policy()?;
-        self.inner.launch_codex(config, execution)
+        let config = self.cli_config(config)?;
+        if let Some(refusal) = self.inner.codex_custody_refusal(&config) {
+            tracing::warn!("Codex launch refused: the custody hook is not trusted (#2755)");
+            return Err(DaemonError::PolicyDenied(refusal));
+        }
+        self.inner.launch_codex(&config, execution)
     }
     fn launch_local(
         &self,
@@ -492,6 +675,14 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         &self,
         config: &LaunchConfig,
     ) -> Result<(HarnessProcess, mpsc::Receiver<StreamEvent>)> {
+        // The Harness loop has no read-only CLI sandbox to apply; a policy that
+        // asks for one must not start here and run unrestricted.
+        if let Some(refusal) = rsi_common::harness_tool_policy::provider_policy_refusal(
+            SessionProvider::Harness,
+            self.inner.session_tool_policy(),
+        ) {
+            return Err(Self::refusal(&refusal));
+        }
         self.inner.launch_harness(config)
     }
 }
@@ -538,6 +729,13 @@ pub(super) struct HarnessLaunchCtx {
 impl ProviderLauncher for CachedLauncher<'_> {
     fn runtime_config(&self) -> &crate::config::RuntimeConfig {
         &self.mgr.runtime_config
+    }
+    fn codex_custody_refusal(&self, config: &LaunchConfig) -> Option<String> {
+        codex_custody_refusal_with(
+            &self.mgr.provider_contract,
+            &self.mgr.runtime_config,
+            config,
+        )
     }
     fn launch_claude(
         &self,
@@ -671,6 +869,9 @@ pub(super) struct ResumedLauncher<'a> {
 impl ProviderLauncher for ResumedLauncher<'_> {
     fn runtime_config(&self) -> &crate::config::RuntimeConfig {
         self.base.runtime_config()
+    }
+    fn codex_custody_refusal(&self, config: &LaunchConfig) -> Option<String> {
+        self.base.codex_custody_refusal(config)
     }
 
     fn launch_claude(
@@ -981,12 +1182,30 @@ mod route_tests {
     use rsi_common::types::ControllerConfirmationKindV1;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn route_child() -> std::io::Result<tokio::process::Child> {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30").kill_on_drop(true);
+        // The real CLI has its own process group. Give the double the same
+        // containment so force-stop reaps it instead of waiting for sleep.
+        #[cfg(unix)]
+        command.process_group(0);
+        command.spawn()
+    }
+
     struct RouteLauncher {
         runtime: Arc<crate::config::RuntimeConfig>,
         credential_available: bool,
         codex_starts: AtomicUsize,
         harness_starts: AtomicUsize,
         policy: Option<rsi_common::harness_tool_policy::HarnessToolPolicy>,
+        /// The `tool_policy` each CLI launch actually received, by route.
+        cli_seen: std::sync::Mutex<
+            Vec<(
+                &'static str,
+                Option<rsi_common::harness_tool_policy::HarnessToolPolicy>,
+            )>,
+        >,
+        contract: Arc<crate::provider_contract::ProviderContractService>,
     }
 
     impl RouteLauncher {
@@ -1005,7 +1224,17 @@ mod route_tests {
                 codex_starts: AtomicUsize::new(0),
                 harness_starts: AtomicUsize::new(0),
                 policy: None,
+                cli_seen: std::sync::Mutex::new(Vec::new()),
+                contract: crate::provider_contract::ProviderContractService::for_manager(),
             }
+        }
+
+        fn with_stored(
+            mut self,
+            policy: rsi_common::harness_tool_policy::HarnessToolPolicy,
+        ) -> Self {
+            self.policy = Some(policy);
+            self
         }
     }
 
@@ -1018,6 +1247,9 @@ mod route_tests {
         ) -> Option<&rsi_common::harness_tool_policy::HarnessToolPolicy> {
             self.policy.as_ref()
         }
+        fn codex_custody_refusal(&self, config: &LaunchConfig) -> Option<String> {
+            codex_custody_refusal_with(&self.contract, &self.runtime, config)
+        }
         fn openrouter_credential_available(&self) -> bool {
             self.credential_available
         }
@@ -1029,18 +1261,27 @@ mod route_tests {
         }
         fn launch_claude(
             &self,
-            _: &LaunchConfig,
+            config: &LaunchConfig,
             _: CliExecutionCapability,
         ) -> Result<(crate::claude::ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
-            unreachable!()
+            self.cli_seen
+                .lock()
+                .unwrap()
+                .push(("claude", config.tool_policy.clone()));
+            // No real Claude binary here: the recorded config is the assertion.
+            Err(DaemonError::Process("route test: claude reached".into()))
         }
         fn launch_codex(
             &self,
-            _: &LaunchConfig,
+            config: &LaunchConfig,
             _: CliExecutionCapability,
         ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+            self.cli_seen
+                .lock()
+                .unwrap()
+                .push(("codex", config.tool_policy.clone()));
             self.codex_starts.fetch_add(1, Ordering::SeqCst);
-            let child = tokio::process::Command::new("sleep").arg("30").spawn()?;
+            let child = route_child()?;
             let (_, rx) = mpsc::channel(1);
             Ok((CodexProcess::from_child_for_route_test(child), rx))
         }
@@ -1124,6 +1365,7 @@ mod route_tests {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 
@@ -1190,6 +1432,95 @@ mod route_tests {
         process.kill().await.unwrap();
     }
 
+    /// #2755: the provider-level chokepoint (fresh launches, continuations and
+    /// rotations) refuses a Codex CLI launch with the typed hook reason before
+    /// any process exists when the canary found the custody hook untrusted and
+    /// the setting is on, and only then: no session identity (no hook installed),
+    /// the setting off, an `ok`/`unchecked` result and a non-custody failure all
+    /// admit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn provider_spawn_refuses_a_codex_launch_whose_custody_hook_is_untrusted() {
+        use crate::provider_contract::ContractProvider;
+        use rsi_common::provider_contract::ProviderContractState as State;
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let mut config = route_config("gpt-6-astra".to_string());
+        config.rsi_session_id = Some(Uuid::new_v4());
+        let spawn = |provider| {
+            spawn_provider_process(
+                provider,
+                &config,
+                &launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard,
+            )
+        };
+
+        launcher.contract.seed_for_test(
+            ContractProvider::Codex,
+            State::Degraded,
+            Some("codex_hook_hash_mismatch"),
+        );
+        for provider in [SessionProvider::Codex, SessionProvider::Pioneer] {
+            let Err(DaemonError::PolicyDenied(reason)) = spawn(provider) else {
+                panic!("{provider:?}: an untrusted custody hook must refuse the launch");
+            };
+            assert!(
+                reason.starts_with("codex_hook_hash_mismatch:"),
+                "{provider:?}: {reason}"
+            );
+        }
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+
+        // The setting off launches without custody.
+        runtime
+            .update_field(
+                "codex_refuse_untrusted_custody_hook",
+                &serde_json::json!(false),
+            )
+            .unwrap();
+        let (mut process, _) = spawn(SessionProvider::Codex).expect("setting off admits");
+        process.kill().await.unwrap();
+        runtime
+            .update_field(
+                "codex_refuse_untrusted_custody_hook",
+                &serde_json::json!(true),
+            )
+            .unwrap();
+
+        // No session identity: Codex installs no hook, so there is no custody
+        // to lose and nothing to refuse.
+        let anonymous = LaunchConfig {
+            rsi_session_id: None,
+            ..config.clone()
+        };
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::Codex,
+            &anonymous,
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .expect("no hook installed, nothing to refuse");
+        process.kill().await.unwrap();
+
+        // `ok`, `unchecked` and a non-custody degradation all admit.
+        for (state, reason) in [
+            (State::Ok, None),
+            (State::Unchecked, Some("canary_failed")),
+            (State::Degraded, Some("codex_handshake_failed")),
+        ] {
+            launcher
+                .contract
+                .seed_for_test(ContractProvider::Codex, state, reason);
+            let (mut process, _) =
+                spawn(SessionProvider::Codex).unwrap_or_else(|e| panic!("{state:?}: {e}"));
+            process.kill().await.unwrap();
+        }
+    }
+
     /// Issue #1407: the provider-level backstop applies the operator provider
     /// profile: under `aws_only` no provider process starts for a non-Bedrock
     /// launch; `all` lets the same launch run.
@@ -1242,6 +1573,10 @@ mod route_tests {
         runtime
             .update_field("api_route.openrouter", &serde_json::json!("harness"))
             .unwrap();
+        // The opt-in fallback is what the policy guard must still refuse.
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
+            .unwrap();
         let config = route_config(format!("vendor/policy-{}", Uuid::new_v4()));
 
         // The Harness route runs and enforces the policy.
@@ -1269,7 +1604,10 @@ mod route_tests {
         let Err(DaemonError::PolicyDenied(reason)) = refused else {
             panic!("fallback must be refused");
         };
-        assert!(reason.starts_with("tool_policy_unsupported_provider"));
+        assert!(
+            reason.starts_with("tool_policy_unsupported_for_provider:openrouter:web_access"),
+            "{reason}"
+        );
         assert_eq!(fallback.codex_starts.load(Ordering::SeqCst), 0);
 
         // A CLI provider is refused outright, before any process effect.
@@ -1287,6 +1625,116 @@ mod route_tests {
         assert_eq!(codex.codex_starts.load(Ordering::SeqCst), 0);
     }
 
+    /// #2758: a read-only policy is enforced by the Claude and Codex CLIs, so the
+    /// guard lets those launch and hands them the resolved policy (a continue or
+    /// rotation carries it on the launcher, not on the config); a policy field a
+    /// CLI cannot express, or a route that enforces nothing, is refused typed
+    /// before any process effect; the Harness loop refuses the CLI-only field.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_read_only_policy_reaches_the_cli_routes_and_nothing_else() {
+        use rsi_common::harness_tool_policy::{CliAccessMode, HarnessToolPolicy, WebAccessMode};
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        let config = route_config(format!("vendor/read-only-{}", Uuid::new_v4()));
+        let read_only = HarnessToolPolicy {
+            cli_access: Some(CliAccessMode::ReadOnly),
+            ..HarnessToolPolicy::default()
+        };
+        let permit = AdmissionPermit::for_route_dispatch_test;
+
+        // Codex, Pioneer: allowed; the launch config carries the stored policy.
+        for provider in [SessionProvider::Codex, SessionProvider::Pioneer] {
+            let launcher =
+                RouteLauncher::new(Arc::clone(&runtime), true).with_stored(read_only.clone());
+            let (mut process, _) =
+                spawn_provider_process(provider, &config, &launcher, &permit(), &guard)
+                    .unwrap_or_else(|error| panic!("{provider:?}: {error}"));
+            process.kill().await.unwrap();
+            assert_eq!(
+                launcher.cli_seen.lock().unwrap().as_slice(),
+                [("codex", Some(read_only.clone()))],
+                "{provider:?}"
+            );
+        }
+        // Claude: allowed (the test launcher stops after recording the config).
+        let launcher =
+            RouteLauncher::new(Arc::clone(&runtime), true).with_stored(read_only.clone());
+        let reached = spawn_provider_process(
+            SessionProvider::Claude,
+            &config,
+            &launcher,
+            &permit(),
+            &guard,
+        );
+        assert!(
+            matches!(&reached, Err(DaemonError::Process(text)) if text.contains("claude reached")),
+            "{:?}",
+            reached.err()
+        );
+        assert_eq!(
+            launcher.cli_seen.lock().unwrap().as_slice(),
+            [("claude", Some(read_only.clone()))]
+        );
+        // No policy: the config reaches the launcher untouched.
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let _ = spawn_provider_process(
+            SessionProvider::Claude,
+            &config,
+            &launcher,
+            &permit(),
+            &guard,
+        );
+        assert_eq!(
+            launcher.cli_seen.lock().unwrap().as_slice(),
+            [("claude", None)]
+        );
+
+        // A field a CLI cannot express is refused, never dropped.
+        let mixed = HarnessToolPolicy {
+            web_access: Some(WebAccessMode::Disabled),
+            ..read_only.clone()
+        };
+        for (provider, what) in [
+            (SessionProvider::Claude, "claude:web_access"),
+            (SessionProvider::Codex, "codex:web_access"),
+        ] {
+            let launcher =
+                RouteLauncher::new(Arc::clone(&runtime), true).with_stored(mixed.clone());
+            let refused = spawn_provider_process(provider, &config, &launcher, &permit(), &guard);
+            let Err(DaemonError::PolicyDenied(reason)) = refused else {
+                panic!("{provider:?}: an inexpressible field must be refused");
+            };
+            assert!(
+                reason.starts_with(&format!("tool_policy_unsupported_for_provider:{what}")),
+                "{reason}"
+            );
+            assert!(launcher.cli_seen.lock().unwrap().is_empty());
+        }
+
+        // The Harness loop has no CLI sandbox: it must not run a read-only policy
+        // unrestricted.
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true).with_stored(read_only);
+        let refused = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &launcher,
+            &permit(),
+            &guard,
+        );
+        let Err(DaemonError::PolicyDenied(reason)) = refused else {
+            panic!("a Harness launch must refuse cli_access");
+        };
+        assert!(
+            reason.starts_with("tool_policy_unsupported_for_provider:harness:cli_access"),
+            "{reason}"
+        );
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 0);
+    }
+
     /// The daemon-wide defaults are never stored, so a default-only restriction
     /// must bind the route guard too: a Harness-loop session it restricts cannot
     /// fall back to the Codex CLI. With all-default config the fallback stays.
@@ -1300,6 +1748,9 @@ mod route_tests {
         let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
         runtime
             .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
             .unwrap();
         runtime
             .update_field("harness_web_access", &serde_json::json!("disabled"))
@@ -1316,7 +1767,10 @@ mod route_tests {
         let Err(DaemonError::PolicyDenied(reason)) = refused else {
             panic!("a default-restricted session must not fall back to the Codex CLI");
         };
-        assert!(reason.starts_with("tool_policy_unsupported_provider"));
+        assert!(
+            reason.starts_with("tool_policy_unsupported_for_provider:openrouter:daemon_defaults"),
+            "{reason}"
+        );
         assert_eq!(fallback.codex_starts.load(Ordering::SeqCst), 0);
 
         // The Harness route itself still runs under the defaults.
@@ -1345,10 +1799,13 @@ mod route_tests {
         assert!(matches!(process, ProviderProcess::Codex(_)));
         process.kill().await.unwrap();
 
-        // All-default config: the preflight fallback behaves exactly as before.
+        // With the operator opt-in and no restriction, the preflight fallback runs.
         let plain = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
         plain
             .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        plain
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
             .unwrap();
         let fallback = RouteLauncher::new(plain, false);
         let (mut process, _) = spawn_provider_process(
@@ -1386,6 +1843,10 @@ mod route_tests {
         assert_eq!(harness_launcher.harness_starts.load(Ordering::SeqCst), 1);
         process.kill().await.unwrap();
 
+        // The Codex fallback is an operator opt-in (default off, #3141).
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
+            .unwrap();
         let fallback_launcher = RouteLauncher::new(Arc::clone(&runtime), false);
         let (mut process, mut events) = spawn_provider_process(
             SessionProvider::OpenRouter,
@@ -1404,7 +1865,7 @@ mod route_tests {
         process.kill().await.unwrap();
 
         runtime
-            .update_field("api_route.fallback", &serde_json::json!(false))
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(false))
             .unwrap();
         let refusing_launcher = RouteLauncher::new(Arc::clone(&runtime), false);
         assert!(matches!(
@@ -1440,7 +1901,7 @@ mod route_tests {
         ));
         assert_eq!(no_tools_launcher.codex_starts.load(Ordering::SeqCst), 0);
         runtime
-            .update_field("api_route.fallback", &serde_json::json!(true))
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
             .unwrap();
         let no_tools_fallback = RouteLauncher::new(Arc::clone(&runtime), true);
         let (mut process, mut events) = spawn_provider_process(
@@ -1475,13 +1936,234 @@ mod route_tests {
         process.kill().await.unwrap();
     }
 
+    /// #3141 (a): with the default config (Harness route, OpenRouter fallback
+    /// off) a failed Harness preflight refuses the launch with the typed error
+    /// and never starts the Codex CLI, for a fresh launch, a continuation (a
+    /// resumed provider thread) and a rotation (a continued-from child). All
+    /// four spawn sites, through `CachedLauncher` and `FreshLauncher`, reach
+    /// this one chokepoint; no `credential_cli_exposure` event exists either.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn openrouter_preflight_failure_with_fallback_off_refuses_every_launch_shape() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        assert!(!runtime.openrouter_fallback_enabled());
+
+        let mut fresh = route_config(format!("vendor/refuse-{}", Uuid::new_v4()));
+        fresh.rsi_session_id = Some(Uuid::new_v4());
+        let mut continuation = fresh.clone();
+        continuation.rsi_session_id = Some(Uuid::new_v4());
+        continuation.resume_session_id = Some("provider-thread".into());
+        let mut rotation = fresh.clone();
+        rotation.rsi_session_id = Some(Uuid::new_v4());
+        rotation.continued_from = Some(Uuid::new_v4());
+        let mut unsupported = fresh.clone();
+        unsupported.rsi_session_id = Some(Uuid::new_v4());
+        unsupported.model = Some("not-a-vendor-model".into());
+
+        for (shape, config, credential, cause) in [
+            ("fresh", &fresh, false, "missing_credential"),
+            ("continuation", &continuation, false, "missing_credential"),
+            ("rotation", &rotation, false, "missing_credential"),
+            ("unsupported model", &unsupported, true, "unsupported_model"),
+        ] {
+            let launcher = RouteLauncher::new(Arc::clone(&runtime), credential);
+            let refused = spawn_provider_process(
+                SessionProvider::OpenRouter,
+                config,
+                &launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard,
+            );
+            let Err(error) = refused else {
+                panic!("{shape}: a failed preflight must refuse the launch");
+            };
+            assert!(
+                matches!(&error, DaemonError::OpenRouterRoutePreflight { cause: c } if *c == cause),
+                "{shape}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("openrouter_harness_preflight:{cause}:")),
+                "{shape}: the message leads with the stable code: {error}"
+            );
+            assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0, "{shape}");
+            assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 0, "{shape}");
+            assert_eq!(
+                crate::api_route_selection::take_selected(config.rsi_session_id.unwrap()),
+                None,
+                "{shape}: a refused launch records no engine"
+            );
+        }
+    }
+
+    /// #3141 (b) and the effective-route record: with the operator's opt-in
+    /// `api_route.fallback.openrouter` the fallback still works, tagged with its
+    /// cause, and every launch notes the engine it took and the source of the
+    /// route (default, global setting, model override).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn openrouter_opt_in_fallback_works_and_every_launch_records_its_engine_and_source() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        let mut config = route_config(format!("vendor/record-{}", Uuid::new_v4()));
+        let session_id = Uuid::new_v4();
+        config.rsi_session_id = Some(session_id);
+
+        // Default route (no operator choice): Harness, source `default`.
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Harness(_)));
+        process.kill().await.unwrap();
+        assert_eq!(
+            crate::api_route_selection::take_selected(session_id),
+            Some(crate::api_route_selection::RouteSelection {
+                engine: "harness",
+                configured_route: "harness",
+                source: "default",
+                fallback_cause: None,
+            })
+        );
+
+        // The operator's global setting is recorded as such.
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        process.kill().await.unwrap();
+        assert_eq!(
+            crate::api_route_selection::take_selected(session_id).map(|selection| selection.source),
+            Some("global_setting")
+        );
+
+        // The opt-in fallback: Codex runs, with its cause and events.
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
+            .unwrap();
+        let broken = RouteLauncher::new(Arc::clone(&runtime), false);
+        let (mut process, mut events) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &broken,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        assert_eq!(broken.codex_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(events.recv().await.unwrap().event_type, "route_fallback");
+        assert_eq!(
+            events.recv().await.unwrap().event_type,
+            "credential_cli_exposure"
+        );
+        process.kill().await.unwrap();
+        assert_eq!(
+            crate::api_route_selection::take_selected(session_id),
+            Some(crate::api_route_selection::RouteSelection {
+                engine: "codex_cli",
+                configured_route: "harness",
+                source: "global_setting",
+                fallback_cause: Some("missing_credential"),
+            })
+        );
+
+        // An explicit per-model `codex_cli` override is an opt-in, not a
+        // fallback: it records its source and no cause.
+        runtime
+            .update_field(
+                &format!("api_route.openrouter.{}", config.model.as_deref().unwrap()),
+                &serde_json::json!("codex_cli"),
+            )
+            .unwrap();
+        let codex = RouteLauncher::new(Arc::clone(&runtime), true);
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &codex,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        process.kill().await.unwrap();
+        assert_eq!(
+            crate::api_route_selection::take_selected(session_id),
+            Some(crate::api_route_selection::RouteSelection {
+                engine: "codex_cli",
+                configured_route: "codex_cli",
+                source: "model_override",
+                fallback_cause: None,
+            })
+        );
+    }
+
+    /// #3141 (c): Bedrock is unchanged under the defaults (fallback on), and
+    /// neither the OpenRouter opt-in nor its legacy-key write can change it
+    /// except through the Bedrock value.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn bedrock_fallback_is_unchanged_under_defaults_and_independent_of_openrouter() {
+        let mut config = route_config("global.openai.gpt-5.6-sol".into());
+        config.provider = Some(SessionProvider::Bedrock);
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("api_route.bedrock", &serde_json::json!("harness"))
+            .unwrap();
+        assert!(runtime.bedrock_fallback_enabled());
+        assert!(!runtime.openrouter_fallback_enabled());
+
+        // Defaults: a failed Bedrock preflight still falls back to Codex.
+        let broken = RouteLauncher::new(Arc::clone(&runtime), false);
+        let (mut process, mut events) = spawn_provider_process(
+            SessionProvider::Bedrock,
+            &config,
+            &broken,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Codex(_)));
+        assert_eq!(events.recv().await.unwrap().event_type, "route_fallback");
+        process.kill().await.unwrap();
+
+        // Turning the OpenRouter opt-in on or off does not touch Bedrock.
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(false))
+            .unwrap();
+        assert!(runtime.bedrock_fallback_enabled());
+
+        // Only the Bedrock key (or its legacy alias) refuses Bedrock.
+        runtime
+            .update_field("api_route.fallback", &serde_json::json!(false))
+            .unwrap();
+        let refusing = RouteLauncher::new(Arc::clone(&runtime), false);
+        assert!(matches!(
+            spawn_provider_process(SessionProvider::Bedrock, &config, &refusing, &AdmissionPermit::for_route_dispatch_test(), &guard),
+            Err(DaemonError::InvalidParam(message)) if message.contains("missing_credential")
+        ));
+        assert_eq!(refusing.codex_starts.load(Ordering::SeqCst), 0);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn openrouter_controller_and_rotation_witness_accepts_each_installed_route() {
-        let child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let child = route_child().unwrap();
         let mut codex = ProviderProcess::Codex(CodexProcess::from_child_for_route_test(child));
         assert_eq!(
             installed_provider_confirmation(SessionProvider::OpenRouter, &mut codex),

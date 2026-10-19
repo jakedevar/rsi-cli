@@ -25,6 +25,17 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread"
 uuid = { version = "1", features = ["v4"] }
 pulldown-cmark = "0.13"
 ammonia = "4"
+# The terminal overlay's PTY (ConPTY on Windows); same version as the TUI (crates/rsi).
+portable-pty = "0.8.1"
+# Graph review (hub #3013): the TUI's starter templates and executable-workflow
+# preflight are client-side Rust in rsi-graph (no daemon RPC serves them), so
+# the desktop links the same crate instead of re-implementing them.
+rsi-graph = { path = "../../crates/rsi-graph" }
+# rsi-common (already linked through rsi-graph): gap sweep G3's manager commands
+# build and check the TUI's typed requests (rsi_common::global_manager,
+# portfolio_nodes, manager_nodes, harness_manager_presets), and G4's New session
+# prompt builds its manager appointment with the same preset code.
+rsi-common = { path = "../../crates/rsi-common" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -77,6 +77,36 @@ fn repos() -> Repos {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 fn provisional_fixture(root: &Path, scenario: &str) -> serde_json::Value {
+    provisional_fixture_seeded(root, scenario, "0")
+}
+
+/// Builds a provisional-migration fixture repository under `root`. The fixture's
+/// Git helper (`scripts/scratch_git.py`) refuses a scratch directory inside the
+/// working tree around its current directory, and a test's temporary directory can
+/// sit under a repository that has nothing to do with it: a QA job's private
+/// `TMPDIR` is under the operator's home directory, which is itself a repository
+/// (#2612). The fixture root is the top of what its Git may see, so the ceiling
+/// is its parent; Git, and the helper, look no further up.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn provisional_fixture_seeded(root: &Path, scenario: &str, seed: &str) -> serde_json::Value {
+    let output = provisional_fixture_output(root, scenario, seed, root.parent());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Runs the fixture builder with `GIT_CEILING_DIRECTORIES` set to `ceiling`, or
+/// removed when `None` (whatever the test process inherited is never passed on).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn provisional_fixture_output(
+    root: &Path,
+    scenario: &str,
+    seed: &str,
+    ceiling: Option<&Path>,
+) -> std::process::Output {
     const BUILD: &str = r#"import importlib.util, json, pathlib, shutil, sys, types
 spec = importlib.util.spec_from_file_location('renumber_tests', sys.argv[1])
 module = importlib.util.module_from_spec(spec)
@@ -100,7 +130,14 @@ if sys.argv[3] == 'same':
     tracked = renumber.guard.tracked_source_paths(renumber.revision_inventory(t.repo, source))
     files = {name: (worktree / name).read_text() for name in tracked}
     files[catalog] = (worktree / catalog).read_text()
-    t.write(worktree, renumber.MANIFEST, json.dumps(renumber.guard.inventory(files), indent=2) + '\n')
+    accepted_inventory = renumber.guard.inventory(files)
+    # Fix the accepted inventory's section order (the generator's set order
+    # varies with the hash seed): the other sections sorted, the accepted
+    # alpha-catalog section last.
+    accepted_sections = accepted_inventory['protected_sections']
+    accepted_inventory['protected_sections'] = dict(
+        sorted(accepted_sections.items(), key=lambda item: ('alpha-catalog' in item[0], item[0])))
+    t.write(worktree, renumber.MANIFEST, json.dumps(accepted_inventory, indent=2) + '\n')
     t.git(worktree, 'add', 'docs/accepted.txt', catalog, renumber.MANIFEST)
     t.git(worktree, 'commit', '-q', '-m', 'accepted document')
     source = t.git(worktree, 'rev-parse', 'HEAD')
@@ -126,19 +163,15 @@ if sys.argv[3] == 'same':
     t.git(t.repo, 'switch', '--detach', descendant)
     t.git(t.repo, 'revert', '-m', '1', '--no-edit', candidate)
     merge_reverted = t.git(t.repo, 'rev-parse', 'HEAD')
-    # The lander regenerates the inventory from a Python set, so its section
-    # order varies per process (hash randomization). Re-emit the landed
-    # inventory with the same JSON content in an order that always differs from
-    # the landed one: sorted, or reverse-sorted when the landed order already
-    # is sorted (otherwise the transform is a no-op and there is nothing to
-    # commit).
+    # Re-emit the landed inventory with the same JSON content but the accepted
+    # alpha-catalog section moved from last to first. The accepted inventory
+    # order is fixed above, so the move is the same at every hash seed and the
+    # source-to-target line diff cannot map the accepted lines.
     t.git(t.repo, 'switch', '--detach', candidate)
     manifest = json.loads(renumber.show(t.repo, candidate, renumber.MANIFEST).decode())
     landed = list(manifest['protected_sections'].items())
-    reordered = sorted(landed)
-    if reordered == landed:
-        reordered = sorted(landed, reverse=True)
-    assert reordered != landed, 'the fixture needs at least two protected sections'
+    reordered = sorted(landed, key=lambda item: ('alpha-catalog' not in item[0], item[0]))
+    assert len(landed) >= 2 and any('alpha-catalog' in name for name, _ in landed)
     manifest['protected_sections'] = dict(reordered)
     t.write(t.repo, renumber.MANIFEST, json.dumps(manifest, indent=2) + '\n')
     t.git(t.repo, 'add', renumber.MANIFEST)
@@ -179,13 +212,20 @@ else:
                       'fake_l': fake_l, 'old': unit['old_version'],
                       'assigned': unit['new_version']}))
 "#;
-    let file = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/tests/test_rolling_migration_renumber.py"
-    );
-    let output = Command::new("python3")
+    let file = rsi_common::manifest_dir!("/../../scripts/tests/test_rolling_migration_renumber.py");
+    let mut command = Command::new("python3");
+    command
+        .env("PYTHONHASHSEED", seed)
+        .env_remove("GIT_CEILING_DIRECTORIES");
+    if let Some(ceiling) = ceiling {
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
+    command
+        // -I would ignore PYTHONHASHSEED; the neutral cwd keeps the empty
+        // sys.path entry of `-c` away from repository modules.
+        .current_dir(root)
         .args([
-            "-I",
+            "-s",
             "-B",
             "-c",
             BUILD,
@@ -194,18 +234,85 @@ else:
             scenario,
         ])
         .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+        .unwrap()
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 fn fixture_string(fixture: &serde_json::Value, key: &str) -> String {
     fixture[key].as_str().unwrap().to_owned()
+}
+
+/// A QA job's private `TMPDIR` (`<jobs>/<id>.tmp`) lies under the operator's home
+/// directory, which is itself a repository (#2612). `enclosing` plays that
+/// repository (no commits, so any change to it is visible); the returned paths
+/// are the job's private TMPDIR and a fixture root below it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn enclosing_repository_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let enclosing = tempfile::tempdir().unwrap();
+    git(enclosing.path(), &["init", "-q", "-b", "home"]);
+    let job_tmp = enclosing.path().join("jobs").join("job-1.tmp");
+    let root = job_tmp.join(".tmpFixture");
+    std::fs::create_dir_all(&root).unwrap();
+    (enclosing, job_tmp, root)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+fn assert_enclosing_repository_untouched(enclosing: &Path) {
+    assert_eq!(git(enclosing, &["rev-list", "--all", "--count"]), "0");
+    assert_eq!(git(enclosing, &["for-each-ref"]), "");
+    assert_eq!(git(enclosing, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(git(enclosing, &["symbolic-ref", "HEAD"]), "refs/heads/home");
+}
+
+/// The provisional-migration fixtures the `accepted_content_*` tests build run
+/// green with their `TMPDIR` under an enclosing repository once the unit declares
+/// the job ceiling (`GIT_CEILING_DIRECTORIES=<private TMPDIR>`, `agent_jobs`), and
+/// every Git command the fixture ran acted on the fixture's own repository.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn accepted_content_fixtures_build_under_a_tmpdir_inside_an_enclosing_repository() {
+    for scenario in ["same", "renumber"] {
+        let (enclosing, job_tmp, root) = enclosing_repository_fixture();
+        let output = provisional_fixture_output(&root, scenario, "0", Some(&job_tmp));
+        assert!(
+            output.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fixture: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for key in ["base", "source", "candidate"] {
+            assert_eq!(fixture_string(&fixture, key).len(), 40, "{scenario} {key}");
+        }
+        let repo = root.join("repo");
+        assert_eq!(
+            Path::new(&git(&repo, &["rev-parse", "--show-toplevel"]))
+                .canonicalize()
+                .unwrap(),
+            repo.canonicalize().unwrap()
+        );
+        assert_eq!(
+            git(
+                &repo,
+                &["cat-file", "-t", &fixture_string(&fixture, "candidate")]
+            ),
+            "commit"
+        );
+        assert_enclosing_repository_untouched(enclosing.path());
+    }
+}
+
+/// The #2571 fail-closed rule still holds end to end: with no ceiling declared the
+/// fixture's Git helper cannot tell the enclosing repository from an assigned
+/// sandbox, refuses the scratch directory and never runs Git there.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[test]
+fn accepted_content_fixture_refuses_an_enclosing_repository_without_a_ceiling() {
+    let (enclosing, _job_tmp, root) = enclosing_repository_fixture();
+    let output = provisional_fixture_output(&root, "same", "0", None);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("inside protected root"), "{stderr}");
+    assert_enclosing_repository_untouched(enclosing.path());
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -226,36 +333,38 @@ async fn expect_accepted_content_error(
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
 async fn accepted_content_proves_same_version_transform_at_landing_and_descendant() {
-    let dir = tempfile::tempdir().unwrap();
-    let fixture = provisional_fixture(dir.path(), "same");
-    let repo = dir.path().join("repo");
-    let base = fixture_string(&fixture, "base");
-    let source = fixture_string(&fixture, "source");
-    let landing = fixture_string(&fixture, "candidate");
-    let descendant = fixture_string(&fixture, "descendant");
-    let reordered = fixture_string(&fixture, "reordered");
-    assert_eq!(fixture["old"], fixture["assigned"]);
-    // The accepted source's attributable paths, exactly as accepted_content selects them.
-    let changed = git(&repo, &["diff", "--name-only", "-z", &base, &source]);
-    let paths: Vec<&[u8]> = changed
-        .as_bytes()
-        .split(|byte: &u8| *byte == 0)
-        .filter(|path: &&[u8]| !path.is_empty())
-        .collect();
-    // Like #884: the regenerated inventory reorders accepted entries, so the
-    // unmapped line check alone refuses; the proven mapping accepts.
-    let error = git::verify_content_paths(&repo, &base, &source, &reordered, &paths)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("manager_v2_accepted_content_lost"),
-        "expected unmapped refusal, got {error}"
-    );
-    for target in [&landing, &descendant, &reordered] {
-        git::accepted_content(&repo, &base, &source, target)
+    for seed in ["0", "1", "2", "3", "42", "12345"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = provisional_fixture_seeded(dir.path(), "same", seed);
+        let repo = dir.path().join("repo");
+        let base = fixture_string(&fixture, "base");
+        let source = fixture_string(&fixture, "source");
+        let landing = fixture_string(&fixture, "candidate");
+        let descendant = fixture_string(&fixture, "descendant");
+        let reordered = fixture_string(&fixture, "reordered");
+        assert_eq!(fixture["old"], fixture["assigned"]);
+        // The accepted source's attributable paths, exactly as accepted_content selects them.
+        let changed = git(&repo, &["diff", "--name-only", "-z", &base, &source]);
+        let paths: Vec<&[u8]> = changed
+            .as_bytes()
+            .split(|byte: &u8| *byte == 0)
+            .filter(|path: &&[u8]| !path.is_empty())
+            .collect();
+        // Like #884: the regenerated inventory reorders accepted entries, so the
+        // unmapped line check alone refuses; the proven mapping accepts.
+        let error = git::verify_content_paths(&repo, &base, &source, &reordered, &paths)
             .await
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("manager_v2_accepted_content_lost"),
+            "seed {seed}: expected unmapped refusal, got {error}"
+        );
+        for target in [&landing, &descendant, &reordered] {
+            git::accepted_content(&repo, &base, &source, target)
+                .await
+                .unwrap();
+        }
     }
 }
 

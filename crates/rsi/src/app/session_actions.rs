@@ -36,18 +36,22 @@ pub(crate) struct LaunchOptions {
     pub tags: Vec<String>,
     pub workflow_id: Option<Uuid>,
     pub workflow_id_override: Option<Uuid>,
+    /// #2758: the operator-only CLI access mode (`tool_policy.cli_access`).
+    /// `None` is today's launch. A provider that cannot enforce it is refused by
+    /// the daemon with `tool_policy_unsupported_for_provider:<what>`.
+    pub cli_access: Option<rsi_common::harness_tool_policy::CliAccessMode>,
 }
 
 /// A fully owned launch request that can move onto a short-lived client task.
-/// Inline credentials are deliberately not `Debug` so task diagnostics cannot
-/// accidentally expose them.
+/// A custom-provider launch names the provider; the daemon resolves its key
+/// from the vault (hub #3039), so no request here carries a credential.
 #[derive(Clone)]
 pub(crate) enum OwnedLaunchRequest {
     Standard(LaunchOptions),
     CustomSimple {
         options: LaunchOptions,
         base_url: String,
-        api_key: String,
+        custom_provider_id: Uuid,
     },
 }
 
@@ -63,7 +67,7 @@ impl OwnedLaunchRequest {
         client.connect().await.map_err(|error| error.to_string())?;
         match self {
             Self::Standard(options) => client
-                .launch_session_with_opts_response(
+                .launch_session_with_opts_access_response(
                     &options.query,
                     options.title.as_deref(),
                     options.working_dir.as_deref(),
@@ -79,13 +83,14 @@ impl OwnedLaunchRequest {
                     &options.tags,
                     options.workflow_id,
                     options.workflow_id_override,
+                    options.cli_access,
                 )
                 .await
                 .map_err(|error| error.to_string()),
             Self::CustomSimple {
                 options,
                 base_url,
-                api_key,
+                custom_provider_id,
             } => client
                 .launch_session_custom_provider_response(
                     &options.query,
@@ -96,7 +101,7 @@ impl OwnedLaunchRequest {
                     options.system_prompt.as_deref(),
                     options.project_id,
                     &base_url,
-                    &api_key,
+                    custom_provider_id,
                     options.workflow_id,
                     options.effort.as_deref(),
                     &options.tags,
@@ -303,7 +308,17 @@ impl App {
             tags: vec![PHASE1_PLACEHOLDER_TAG.to_string()],
             workflow_id,
             workflow_id_override: None,
+            cli_access: self.launch_cli_access(),
         }
+    }
+
+    /// The CLI access mode a new session launches under: read-only while the
+    /// operator's `launch_read_only` toggle is on, else today's behavior.
+    pub(crate) fn launch_cli_access(
+        &self,
+    ) -> Option<rsi_common::harness_tool_policy::CliAccessMode> {
+        self.launch_read_only
+            .then_some(rsi_common::harness_tool_policy::CliAccessMode::ReadOnly)
     }
 
     fn begin_interactive_launch(
@@ -324,7 +339,7 @@ impl App {
         request: OwnedLaunchRequest,
         origin: InteractiveLaunchOrigin,
         placement: LaunchPlacement,
-        manager: Option<crate::types::ManagerLaunchPlan>,
+        manager: Option<crate::types::ManagerAppointment>,
     ) -> Result<(), String> {
         if self.interactive_launch_pending.is_some() {
             let error = "A session launch is awaiting daemon acceptance; draft preserved";
@@ -332,6 +347,15 @@ impl App {
             return Err(error.to_string());
         }
         let options = request.options();
+        if options.cli_access.is_some()
+            && matches!(request, OwnedLaunchRequest::CustomSimple { .. })
+        {
+            // A custom-provider launch carries no tool policy, so it would run
+            // unrestricted; refuse instead of widening.
+            let error = "Custom-provider launches cannot be read-only; press R in the launch form to clear it";
+            self.notify_error(error);
+            return Err(error.to_string());
+        }
         if let Some(reason) = self.launch_prerequisite_error(options.provider) {
             self.notify_error(reason.clone());
             return Err(reason);
@@ -359,11 +383,11 @@ impl App {
         self.interactive_launch_handle = Some(runtime.spawn(async move {
             let accepted = request.execute(socket_path.clone()).await;
             let manager = match (&accepted, manager) {
-                (Ok(session_id), Some(plan)) => Some(
+                (Ok(session_id), Some(appointment)) => Some(
                     crate::overlay::launch_settings::appoint_launched_manager(
                         socket_path,
                         *session_id,
-                        plan,
+                        appointment,
                     )
                     .await,
                 ),
@@ -414,7 +438,7 @@ impl App {
             OwnedLaunchRequest::CustomSimple {
                 options,
                 base_url: entry.base_url.clone(),
-                api_key: entry.api_key.clone(),
+                custom_provider_id: entry.id,
             }
         } else {
             OwnedLaunchRequest::Standard(options)
@@ -431,7 +455,7 @@ impl App {
         provider_override: Option<SessionProvider>,
         custom_provider_index: Option<usize>,
         sandbox: Option<SandboxSpec>,
-        manager: Option<crate::types::ManagerLaunchPlan>,
+        manager: Option<crate::types::ManagerAppointment>,
         origin: InteractiveLaunchOrigin,
         placement: LaunchPlacement,
     ) -> bool {
@@ -460,6 +484,7 @@ impl App {
             tags: vec![PHASE1_PLACEHOLDER_TAG.to_string()],
             workflow_id: None,
             workflow_id_override: None,
+            cli_access: self.launch_cli_access(),
         };
         let request = if let Some(entry) =
             self.custom_provider_for_modal_launch(provider_override, custom_provider_index)
@@ -470,7 +495,7 @@ impl App {
             OwnedLaunchRequest::CustomSimple {
                 options,
                 base_url: entry.base_url.clone(),
-                api_key: entry.api_key.clone(),
+                custom_provider_id: entry.id,
             }
         } else {
             OwnedLaunchRequest::Standard(options)
@@ -516,6 +541,7 @@ impl App {
             tags: vec![PHASE1_PLACEHOLDER_TAG.to_string()],
             workflow_id: None,
             workflow_id_override: None,
+            cli_access: self.launch_cli_access(),
         };
         let request = if let Some(entry) =
             self.custom_provider_for_modal_launch(provider_override, custom_provider_index)
@@ -526,7 +552,7 @@ impl App {
             OwnedLaunchRequest::CustomSimple {
                 options,
                 base_url: entry.base_url.clone(),
-                api_key: entry.api_key.clone(),
+                custom_provider_id: entry.id,
             }
         } else {
             OwnedLaunchRequest::Standard(options)
@@ -1441,6 +1467,58 @@ impl App {
         }
     }
 
+    /// #2750: replace the selected session's project manager seat, whose
+    /// provider is down, with a successor on another provider. The first call
+    /// asks for confirmation; the same command for the same session within 10
+    /// seconds sends it.
+    pub async fn reseat_focused_manager(&mut self, args: Option<String>) {
+        let session_id = match self.focused_pane().cloned() {
+            Some(Pane::SessionDetail { session_id }) => Some(session_id),
+            _ => self.selected_session_id(),
+        };
+        let Some(session_id) = session_id else {
+            self.notify("No session selected");
+            return;
+        };
+        let (provider, model, reason) = match crate::commands::parse_reseat_args(args.as_deref()) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.notify_error(message);
+                return;
+            }
+        };
+        let Some(project_id) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.session.project_id)
+        else {
+            self.notify_error("The selected session belongs to no project");
+            return;
+        };
+        let pending = Some(format!("reseat:{}", args.unwrap_or_default()));
+        if !self.confirm_rotation_abandon(session_id, pending, std::time::Instant::now()) {
+            self.notify("Reseat launches a new manager on another provider and moves this project's appointment to it. Run the same :manager-reseat again within 10 seconds to confirm.");
+            return;
+        }
+        let params = rsi_common::manager_reseat::ReseatHarnessManagerParams {
+            project_id,
+            provider,
+            model,
+            effort: None,
+            reason,
+            // The operator asked for the reseat, so a stopped seat is taken as
+            // down; a running one is still refused by the daemon.
+            provider_unavailable: true,
+        };
+        match self.client.reseat_harness_manager(params).await {
+            Ok(result) => self.notify(format!(
+                "Manager reseated: {} replaces {}",
+                result.successor_session_id, result.predecessor_session_id
+            )),
+            Err(error) => self.notify_error(format!("Reseat failed: {error}")),
+        }
+    }
+
     /// Interrupt the selected session, including the selected list row in detail view.
     pub async fn interrupt_focused_session(&mut self, hard: bool) {
         if let Some(session_id) = self.selected_session_id_for_lifecycle_action() {
@@ -1594,14 +1672,16 @@ mod tests {
                 id: Uuid::new_v4(),
                 name: "Global custom".to_string(),
                 base_url: "https://global.example/v1".to_string(),
-                api_key: "global-key".to_string(),
+                api_key_set: true,
+                api_key_fingerprint: None,
                 default_model: "global-model".to_string(),
             },
             CustomProviderEntry {
                 id: Uuid::new_v4(),
                 name: "Modal custom".to_string(),
                 base_url: "https://modal.example/v1".to_string(),
-                api_key: "modal-key".to_string(),
+                api_key_set: true,
+                api_key_fingerprint: None,
                 default_model: "modal-model".to_string(),
             },
         ];

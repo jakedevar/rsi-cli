@@ -36,7 +36,7 @@ pub const PROVIDERS: [SessionProvider; 9] = [
     SessionProvider::CodexAppServer,
     SessionProvider::Harness,
 ];
-const CAPABILITIES: [ManagerCapabilityV2; 15] = [
+pub(crate) const CAPABILITIES: [ManagerCapabilityV2; 15] = [
     ManagerCapabilityV2::WorkPlan,
     ManagerCapabilityV2::LeadControl,
     ManagerCapabilityV2::Topology,
@@ -201,7 +201,7 @@ pub const fn numeric_bounds(field: Field) -> Option<(u32, u32)> {
 const MAX_PAUSED_EPICS: usize = 32;
 /// Daemon bound on provider limit entries (`ManagerPolicyV2::validate`).
 const MAX_PROVIDER_LIMITS: usize = 8;
-const MAX_LAUNCHES: usize = 32;
+const MAX_LAUNCHES: usize = rsi_common::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES;
 
 /// Display value of a scalar policy field (the saved side of a marker).
 fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
@@ -232,20 +232,26 @@ fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
     })
 }
 
-/// Display and edit text of one allowlisted setting's bound: `min-max`, or
-/// `not adjustable` when the operator has not bounded the key (the default).
+/// Display and edit text of one allowlisted setting's bound: `min-max` for an
+/// operator bound, `off` for the explicit disable entry (#1997), `default
+/// min-max` while a key's built-in default bounds apply, else `not adjustable`.
 fn setting_bound_text(p: &ManagerPolicyV2, i: usize) -> String {
-    let key = MANAGER_ADJUSTABLE_DAEMON_SETTINGS[i].key;
-    p.daemon_setting_bounds
+    let setting = &MANAGER_ADJUSTABLE_DAEMON_SETTINGS[i];
+    match p
+        .daemon_setting_bounds
         .iter()
-        .find(|b| b.key == key)
-        .map_or_else(
+        .find(|b| b.key == setting.key)
+    {
+        Some(b) if b.is_disabled() => "off".into(),
+        Some(b) => format!("{}-{}", b.min, b.max),
+        None => setting.default_bounds.map_or_else(
             || "not adjustable".into(),
-            |b| format!("{}-{}", b.min, b.max),
-        )
+            |(min, max)| format!("default {min}-{max}"),
+        ),
+    }
 }
 
-const fn capability_description(capability: ManagerCapabilityV2) -> &'static str {
+pub(crate) const fn capability_description(capability: ManagerCapabilityV2) -> &'static str {
     match capability {
         ManagerCapabilityV2::WorkPlan => {
             "Record work, stages, evidence and request DB-native reviews"
@@ -283,7 +289,7 @@ const fn capability_description(capability: ManagerCapabilityV2) -> &'static str
 
 /// Row label after "Grant ". Existing grants keep their wire names; K14's
 /// grant reads as the operator-facing phrase "Operator delegation".
-fn capability_label(capability: ManagerCapabilityV2) -> String {
+pub(crate) fn capability_label(capability: ManagerCapabilityV2) -> String {
     match capability {
         ManagerCapabilityV2::OperatorDelegation => "Operator delegation".into(),
         ManagerCapabilityV2::StorageControl => "Storage control".into(),
@@ -429,10 +435,7 @@ impl PolicyState {
                 &format!("Launch {} · {:?}/{}", i + 1, choice.provider, choice.model),
                 format!(
                     "{} · {} · Enter catalog",
-                    choice
-                        .effort
-                        .as_deref()
-                        .unwrap_or("Default (no explicit effort)"),
+                    choice.effort_label(),
                     self.choice_status(choice)
                 ),
                 "Enter opens the provider/model catalog for this choice",
@@ -467,7 +470,7 @@ impl PolicyState {
         push(
             section,
             Field::Advanced,
-            "Exact launch tuples",
+            "Launch allowlist entries",
             if self.advanced_open {
                 "Expanded · Enter collapse"
             } else {
@@ -496,8 +499,8 @@ impl PolicyState {
                     section,
                     Field::LaunchEffort(i),
                     &format!("Launch {} effort", i + 1),
-                    choice.effort.clone().unwrap_or_else(|| "default".into()),
-                    "Exact effort; blank means the provider default",
+                    choice.effort_label().into(),
+                    "Exact effort; blank means any effort",
                 );
             }
             push(
@@ -605,10 +608,17 @@ impl PolicyState {
                 Field::SettingBound(i),
                 &format!("Manager may set {}", setting.label),
                 setting_bound_text(d, i),
-                &format!(
-                    "Enter MIN-MAX ({}-{} allowed) to let a manager with Grant Daemon settings change this setting inside it; blank means not adjustable",
-                    setting.hard_min, setting.hard_max
-                ),
+                &if setting.default_bounds.is_some() {
+                    format!(
+                        "Enter MIN-MAX ({}-{} allowed) to let a manager with Grant Daemon settings change this setting inside it; blank restores the built-in default bounds; off makes it not adjustable",
+                        setting.hard_min, setting.hard_max
+                    )
+                } else {
+                    format!(
+                        "Enter MIN-MAX ({}-{} allowed) to let a manager with Grant Daemon settings change this setting inside it; blank means not adjustable",
+                        setting.hard_min, setting.hard_max
+                    )
+                },
             );
         }
 
@@ -792,8 +802,8 @@ impl PolicyState {
                 return;
             }
             Field::AddLaunch => {
-                if self.draft.allowed_launches.len() >= 32 {
-                    self.error = Some("At most 32 allowed launch choices.".into());
+                if self.draft.allowed_launches.len() >= MAX_LAUNCHES {
+                    self.error = Some(format!("At most {MAX_LAUNCHES} allowed launch choices."));
                     return;
                 }
                 self.picker = Some(ManagerLaunchPickerState::new(None, None));
@@ -830,8 +840,8 @@ impl PolicyState {
                 self.draft.allowed_launches.remove(i);
             }
             Field::AddRawLaunch => {
-                if self.draft.allowed_launches.len() >= 32 {
-                    self.error = Some("At most 32 allowed launch choices.".into());
+                if self.draft.allowed_launches.len() >= MAX_LAUNCHES {
+                    self.error = Some(format!("At most {MAX_LAUNCHES} allowed launch choices."));
                     return;
                 }
                 self.draft.allowed_launches.push(ManagerLaunchChoiceV2 {
@@ -864,6 +874,8 @@ impl PolicyState {
                         "not adjustable",
                     ]
                     .contains(&value.as_str())
+                        || (matches!(field, Field::SettingBound(_))
+                            && value.starts_with("default "))
                     {
                         String::new()
                     } else {
@@ -944,12 +956,23 @@ impl PolicyState {
                 self.draft
                     .daemon_setting_bounds
                     .retain(|b| b.key != setting.key);
-                if !value.is_empty() {
+                if setting.default_bounds.is_some() && value.eq_ignore_ascii_case("off") {
+                    self.draft
+                        .daemon_setting_bounds
+                        .push(ManagerDaemonSettingBoundV2::disabled(setting.key));
+                } else if !value.is_empty() {
                     let bound = parse_setting_bound(setting.key, value).ok_or_else(|| {
-                        format!(
-                            "Enter MIN-MAX inside {}-{}; blank means not adjustable.",
-                            setting.hard_min, setting.hard_max
-                        )
+                        if setting.default_bounds.is_some() {
+                            format!(
+                                "Enter MIN-MAX inside {}-{}, off to disable, or blank for the default.",
+                                setting.hard_min, setting.hard_max
+                            )
+                        } else {
+                            format!(
+                                "Enter MIN-MAX inside {}-{}; blank means not adjustable.",
+                                setting.hard_min, setting.hard_max
+                            )
+                        }
                     })?;
                     bound.validate().map_err(|_| {
                         format!(
@@ -1210,10 +1233,10 @@ impl PolicyState {
         let before = self.draft.clone();
         if let Some(i) = row {
             self.draft.allowed_launches[i] = choice.clone();
-        } else if self.draft.allowed_launches.len() < 32 {
+        } else if self.draft.allowed_launches.len() < MAX_LAUNCHES {
             self.draft.allowed_launches.push(choice.clone());
         } else {
-            return Err("At most 32 allowed launch choices.".into());
+            return Err(format!("At most {MAX_LAUNCHES} allowed launch choices."));
         }
         self.record_edit(before, Field::AddLaunch);
         self.choice_labels

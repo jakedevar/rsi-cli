@@ -5,13 +5,12 @@ use crate::model_control::registry::RuntimeExecutionRoute;
 use crate::process_control::{
     BoundedLineError, BoundedLines, CaptureLimits, PROVIDER_MAX_LINE_BYTES,
     PROVIDER_MAX_STDERR_BYTES, ProcessContainment, capture_bounded_with_stdin,
-    configure_tokio_process_group, terminate_process_group,
+    configure_tokio_process_group,
 };
 use crate::sandbox::execution_scratch::SandboxExecutionScratch;
 pub(crate) use crate::store_support::provider_defaults::claude_effort_level;
 pub use crate::store_support::provider_settings::ClaudeConfigIsolation;
 use rsi_common::model_control::{InvocationOwner, ModelInvocationPurpose};
-use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -19,7 +18,7 @@ use std::sync::Arc;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-mod model_discovery;
+pub(crate) mod model_discovery;
 pub(crate) mod turn_spool;
 
 /// Configuration for launching a Claude session.
@@ -55,9 +54,9 @@ pub struct LaunchConfig {
     /// `SessionManager::launch_session` alongside `rsi_session_id`/
     /// `rsi_socket`; stamped into the provider env (`RSI_SESSION_TOKEN`) for
     /// Claude + agy today. Never persisted into `Session` — only the
-    /// in-memory `token -> session_id` map in `SessionManager` and the
+    /// redacting in-memory registry in `SessionManager` and the
     /// spawned process's environment carry it.
-    pub rsi_session_token: Option<String>,
+    pub rsi_session_token: Option<rsi_common::rpc::AgentTransportBearer>,
     /// Parent session ID for context rotation chains.
     pub continued_from: Option<uuid::Uuid>,
     /// Override base URL for OpenAI-compatible providers (from custom provider config).
@@ -164,6 +163,12 @@ pub struct LaunchConfig {
     /// K1-only immutable source/correlation selector. `None` preserves the
     /// ordinary launch path byte-for-byte.
     pub closure_selector: Option<crate::closure_kernel::ClosureLaunchSelectorV1>,
+    /// #2759: this launch is the turn the daemon opened to obtain a node's
+    /// handoff, so the harness validates the handoff's shape (Claude
+    /// `--json-schema`; Codex `--output-schema` + `-o`). Set at the provider
+    /// spawn chokepoint from `crate::structured_handoff`, never by a caller;
+    /// `false` leaves every argv exactly as it was.
+    pub structured_handoff: bool,
 }
 
 /// MCP server name for the agent-control gateway. Claude lists its tools as
@@ -175,6 +180,112 @@ const CLAUDE_DISALLOWED_TOOLS_ARG: &str =
     "--disallowedTools=ScheduleWakeup,CronCreate,CronDelete,CronList";
 
 pub(crate) const AGENT_MCP_SERVER_NAME: &str = "rsi-agent";
+
+/// #2758: the tool arguments of a read-only Claude session, in `=` form because
+/// both flags are variadic. `--tools` names the built-in tools that exist at all
+/// (no shell, no edit tool); it does not filter MCP tools, so the `rsi-agent`
+/// server stays. `dontAsk` denies a tool that is not pre-approved, so
+/// `--allowedTools` approves the same built-ins and the whole `rsi-agent`
+/// server (`mcp__rsi-agent` is the server-wide rule). The `--settings` hooks
+/// (custody `PreToolUse`, mail `PostToolUse`) are added separately and stay.
+/// `[observed]` claude 2.1.301 `system/init`: `tools` lists the built-ins named
+/// here plus `mcp__<server>__*`, and an MCP call without the allow rule is
+/// denied in don't-ask mode.
+fn claude_read_only_tool_args() -> [String; 2] {
+    let tools = rsi_common::harness_tool_policy::CLAUDE_READ_ONLY_TOOLS.join(",");
+    [
+        format!("--tools={tools}"),
+        format!("--allowedTools={tools},mcp__{AGENT_MCP_SERVER_NAME}"),
+    ]
+}
+
+/// Every flag a Claude launch ([`ClaudeClient::launch_inner`]) and the model
+/// discovery probe ([`model_discovery::PROBE_ARGS`]) pass, as passed. The
+/// provider contract canary (#2755) asks the installed CLI whether it still
+/// knows each: `claude --help` is not exhaustive (it omits `--max-turns`), so a
+/// flag absent from the help text is checked with an `unknown option` probe.
+/// Add a flag here in the same change that passes it; the test
+/// `launch_flag_list_covers_the_derived_flags` pins the flags derived from
+/// other constants. `--bare` is deliberately absent and pinned absent: RSI
+/// authenticates through the ambient OAuth login, which `--bare` never reads.
+pub(crate) const CLAUDE_LAUNCH_FLAGS: &[&str] = &[
+    "-p",
+    "--output-format",
+    "--input-format",
+    "--verbose",
+    "--permission-mode",
+    "--disallowedTools",
+    "--tools",
+    "--allowedTools",
+    "--setting-sources",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "--settings",
+    "--model",
+    "--max-turns",
+    "--system-prompt",
+    "--resume",
+    "--effort",
+    "--fallback-model",
+    "--max-budget-usd",
+    "--no-session-persistence",
+    "--disable-slash-commands",
+    "--plugin-dir",
+    // #2759: only on a topology node's handoff turn.
+    "--json-schema",
+];
+
+/// The `--json-schema=<schema>` argument of a handoff turn (#2759).
+pub(crate) fn structured_handoff_flag() -> String {
+    format!(
+        "--json-schema={}",
+        rsi_common::structured_handoff::structured_handoff_schema_text()
+    )
+}
+
+/// Claude Code environment variable that pins every subagent's model.
+pub(crate) const CLAUDE_SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
+/// Claude Code environment variable that caps concurrent subagents.
+pub(crate) const CLAUDE_MAX_CONCURRENT_SUBAGENTS_ENV: &str = "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS";
+
+/// The environment a Claude launch adds for the operator's subagent caps
+/// (#2763, `[source]` Claude Code sub-agents docs). Empty for the defaults.
+pub(crate) fn claude_subagent_env(
+    caps: &crate::store_support::provider_settings::SubagentCaps,
+) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if let Some(model) = &caps.model {
+        env.push((CLAUDE_SUBAGENT_MODEL_ENV, model.clone()));
+    }
+    if let Some(cap) = caps.max_concurrent {
+        env.push((CLAUDE_MAX_CONCURRENT_SUBAGENTS_ENV, cap.to_string()));
+    }
+    env
+}
+
+/// Whether two Claude model names are the same model: case-insensitive, and a
+/// context-variant tag (`claude-opus-5[1m]`) does not make a different model.
+pub(crate) fn same_claude_model(a: &str, b: &str) -> bool {
+    use rsi_common::claude_catalog::strip_context_variant_suffix;
+    strip_context_variant_suffix(a).eq_ignore_ascii_case(strip_context_variant_suffix(b))
+}
+
+/// The `--fallback-model` chain a Claude CLI launch of `model` passes (#2762):
+/// the operator's `claude_fallback_models` without the session's own model
+/// (the CLI refuses a fallback equal to the main model and would not start),
+/// and empty for a Bedrock-routed model, whose names live in another
+/// namespace. Also the set of models whose appearance next to the session's
+/// own in a result's `modelUsage` means a fallback ran.
+pub(crate) fn claude_fallback_chain_for(model: Option<&str>, chain: &[String]) -> Vec<String> {
+    if model.and_then(crate::bedrock::bedrock_vendor).is_some() {
+        return Vec::new();
+    }
+    chain
+        .iter()
+        .filter(|candidate| model.is_none_or(|own| !same_claude_model(own, candidate)))
+        .cloned()
+        .collect()
+}
 
 /// The `rsi-agent-mcp` binary installed next to the running daemon.
 fn daemon_sibling_agent_mcp_path() -> Option<PathBuf> {
@@ -206,7 +317,7 @@ pub(crate) fn stamp_execution_environment(
         cmd.env(identity::ENV_SOCKET, socket_path.as_os_str());
     }
     if let Some(token) = &config.rsi_session_token {
-        cmd.env(identity::ENV_SESSION_TOKEN, token);
+        cmd.env(identity::ENV_SESSION_TOKEN, token.expose_for_transport());
     }
     if let Some(role) = config.session_kind.and_then(claude_agent_role_for_kind) {
         cmd.env(identity::ENV_CLAUDE_AGENT_ROLE, role);
@@ -265,6 +376,76 @@ pub(crate) fn apply_bedrock_launch_env(
         rsi_common::provider_credentials::CliExposureReason::Route,
     );
     Ok(())
+}
+
+/// hub #2919: the `--system-prompt` value of one Claude launch.
+///
+/// Without a `SessionStart` hook (`session_start_hook` false, the default
+/// `provider_lifecycle_hooks`) this is exactly `config.system_prompt`. With one,
+/// a prompt that starts with the session's startup preamble
+/// ([`crate::session::preamble::startup_parts`] for its kind and working
+/// directory, the head a fresh launch composes) passes the rest only and
+/// defers the preamble to the hook, when it fits the hook's cap. A prompt that
+/// carries the preamble but is too long keeps it. Any other launch (a resumed
+/// turn) puts back a preamble the hook never delivered, in front of its prompt,
+/// unless the prompt already starts with it.
+pub(crate) fn claude_launch_system_prompt(
+    config: &LaunchConfig,
+    session_start_hook: bool,
+) -> Option<String> {
+    let Some(session_id) = config.rsi_session_id else {
+        return config.system_prompt.clone();
+    };
+    let prompt = config.system_prompt.as_deref();
+    if session_start_hook && let Some(split) = split_startup_preamble(config, prompt) {
+        return deferred_or_kept(session_id, prompt, split);
+    }
+    let Some(preamble) = crate::session_start_preamble::take_undelivered(session_id) else {
+        return config.system_prompt.clone();
+    };
+    if prompt.is_some_and(|prompt| prompt.starts_with(&preamble)) {
+        return config.system_prompt.clone();
+    }
+    tracing::warn!(%session_id, "SessionStart hook did not deliver the preamble; it goes back in the prompt");
+    Some(match prompt {
+        Some(prompt) => format!("{preamble}\n\n{prompt}"),
+        None => preamble,
+    })
+}
+
+/// `(preamble, rest)` when `prompt` starts with the session's startup preamble.
+fn split_startup_preamble(
+    config: &LaunchConfig,
+    prompt: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let prompt = prompt?;
+    let parts = crate::session::preamble::startup_parts(
+        config.session_kind.unwrap_or_default(),
+        config.working_dir.as_deref()?,
+    );
+    if parts.is_empty() {
+        return None;
+    }
+    let preamble = parts.join("\n\n");
+    if prompt == preamble {
+        return Some((preamble, None));
+    }
+    let rest = prompt.strip_prefix(&format!("{preamble}\n\n"))?.to_string();
+    Some((preamble, Some(rest)))
+}
+
+fn deferred_or_kept(
+    session_id: uuid::Uuid,
+    prompt: Option<&str>,
+    (preamble, rest): (String, Option<String>),
+) -> Option<String> {
+    if !crate::session_start_preamble::fits(&preamble) {
+        tracing::info!(%session_id, chars = preamble.chars().count(), "preamble over the SessionStart context cap; it stays in the prompt");
+        crate::session_start_preamble::forget(session_id);
+        return prompt.map(str::to_string);
+    }
+    crate::session_start_preamble::defer(session_id, preamble);
+    rest
 }
 
 /// The `rsi-rpc` binary installed next to the running daemon: the only
@@ -363,36 +544,33 @@ impl crate::vault::LaunchCredentialInputs for LaunchConfig {
     }
 }
 
-/// Raw event from Claude's stream-json output.
-/// Parsed from NDJSON lines.
-#[derive(Debug, Clone, Deserialize)]
-pub struct StreamEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    #[serde(flatten)]
-    pub data: Value,
-}
+/// Raw event from Claude's stream-json output (defined in `rsid-harness`, #2616,
+/// because the harness tool context carries it).
+pub use rsid_harness::stream::StreamEvent;
 
 /// Wraps a running Claude CLI process (without the event receiver).
 /// The receiver is returned separately to avoid lock contention.
 pub struct CliTurnProcess {
     child: Option<Child>,
+    stop: crate::process_control::WorkerStopHandle,
     pub(crate) detached: Option<turn_spool::DetachedTurn>,
 }
 
 pub type ClaudeProcess = CliTurnProcess;
 
 impl CliTurnProcess {
-    pub(crate) fn direct(child: Child) -> Self {
+    pub(crate) fn direct(child: Child, stop: crate::process_control::WorkerStopHandle) -> Self {
         Self {
             child: Some(child),
+            stop,
             detached: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_child_for_route_test(child: Child) -> Self {
-        Self::direct(child)
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), None);
+        Self::direct(child, stop)
     }
 
     #[cfg(test)]
@@ -401,7 +579,9 @@ impl CliTurnProcess {
     }
 
     pub(crate) fn detached_child(child: Child, turn: turn_spool::DetachedTurn) -> Self {
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), None);
         Self {
+            stop,
             child: Some(child),
             detached: Some(turn),
         }
@@ -438,19 +618,25 @@ impl CliTurnProcess {
             }
             .await;
             match stop {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // The shim only signals its own process group; escaped
+                    // descendants die with the recorded scope (#2007).
+                    turn.kill_recorded_scope();
+                    return Ok(());
+                }
                 Err(error) => {
                     // Shutdown may hand custody off while this bounded stop
                     // awaits identity or exit. Its new owner must not be killed.
                     if turn.is_handed_off() {
                         return Ok(());
                     }
-                    tracing::warn!(%error, "Turn shim stop failed; killing the owned child process group")
+                    tracing::warn!(%error, "Turn shim stop failed; killing the owned child process group");
+                    turn.kill_recorded_scope();
                 }
             }
         }
         if let Some(child) = self.child.as_mut() {
-            crate::process_scope::kill_worker_child(child).await
+            crate::process_scope::kill_worker_child(child, &self.stop).await
         } else {
             Err(DaemonError::Process(
                 "adopted turn could not be stopped safely".into(),
@@ -461,7 +647,7 @@ impl CliTurnProcess {
     /// Wait for the process to exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
         if let Some(child) = self.child.as_mut() {
-            return Ok(child.wait().await?);
+            return Ok(self.stop.wait(child).await?);
         }
         loop {
             if let Some(status) = self.try_wait()? {
@@ -482,7 +668,7 @@ impl CliTurnProcess {
     /// Check if the process is still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(child) = self.child.as_mut() {
-            return Ok(child.try_wait()?);
+            return Ok(self.stop.try_wait(child)?);
         }
         self.detached
             .as_ref()
@@ -493,8 +679,15 @@ impl CliTurnProcess {
     pub(crate) fn adopt(turn: turn_spool::DetachedTurn) -> Self {
         Self {
             child: None,
+            stop: crate::process_control::WorkerStopHandle::new(None, None),
             detached: Some(turn),
         }
+    }
+}
+
+impl Drop for CliTurnProcess {
+    fn drop(&mut self) {
+        self.stop.release();
     }
 }
 
@@ -536,17 +729,69 @@ pub struct ClaudeClient {
 /// (`validated_codex_reasoning_effort`), and keeps the two providers
 /// symmetric. Silently dropping the flag was rejected as a fix: it reproduces
 /// the same "record and behavior disagree" defect one layer up.
-fn validated_claude_effort(config: &LaunchConfig) -> Result<Option<&'static str>> {
+///
+/// #2768: `ladder` is the model's own ladder from the CLI's `initialize`
+/// reply ([`model_discovery::known_effort_ladder`]). When it is known it is
+/// the whole truth: a level it omits (`max` on a smaller model) is refused and
+/// a level it lists is passed, `ultracode` included. When it is unknown (no
+/// probe yet, or the reply did not describe the model) the compiled
+/// `low..max` list applies, and `ultracode` is refused because the CLI has not
+/// reported it for this model.
+fn validated_claude_effort(
+    config: &LaunchConfig,
+    ladder: Option<&[String]>,
+) -> Result<Option<String>> {
     let Some(raw_effort) = config.effort.as_deref() else {
         return Ok(None);
     };
+    let model = config.model.as_deref().unwrap_or("the default model");
+    if let Some(ladder) = ladder {
+        return ladder_effort(raw_effort, model, ladder).map(Some);
+    }
     claude_effort_level(Some(raw_effort))
-        .map(Some)
+        .map(|effort| Some(effort.to_string()))
         .ok_or_else(|| {
             DaemonError::InvalidParam(format!(
-                "unsupported Claude effort '{raw_effort}' (valid: low, medium, high, xhigh, max)"
+                "unsupported Claude effort '{raw_effort}' for {model} (valid: low, medium, high, \
+                 xhigh, max; {CLAUDE_ULTRACODE_EFFORT} only when the Claude CLI reports it for the \
+                 model)"
             ))
         })
+}
+
+/// The `ultracode` effort level: valid only for a model whose live ladder
+/// lists it (#2768).
+pub(crate) const CLAUDE_ULTRACODE_EFFORT: &str = "ultracode";
+
+/// #289: the live ladder the store's successor-seat check reads: the last
+/// good probe of the Claude binary a launch would use, or `None`.
+fn live_effort_ladder_for_store(model: &str) -> Option<Vec<String>> {
+    let binary_path = crate::provider_cli::resolve("claude")?;
+    model_discovery::known_effort_ladder(&binary_path, Some(model))
+}
+
+/// #289: let rsid-store judge a successor seat's Claude effort by the live
+/// ladder, as [`validated_claude_effort`] does. Called once at daemon start.
+pub fn install_live_effort_ladder_source() {
+    crate::store_support::provider_defaults::install_claude_effort_ladder_source(
+        live_effort_ladder_for_store,
+    );
+}
+
+/// `raw_effort` checked against a model's live ladder.
+fn ladder_effort(raw_effort: &str, model: &str, ladder: &[String]) -> Result<String> {
+    if ladder.iter().any(|level| level == raw_effort) {
+        return Ok(raw_effort.to_string());
+    }
+    if ladder.is_empty() {
+        return Err(DaemonError::InvalidParam(format!(
+            "Claude model {model} supports no effort selection; omit effort '{raw_effort}'"
+        )));
+    }
+    Err(DaemonError::InvalidParam(format!(
+        "unsupported Claude effort '{raw_effort}' for {model} (valid for this model: {})",
+        ladder.join(", ")
+    )))
 }
 
 impl ClaudeClient {
@@ -638,6 +883,24 @@ impl ClaudeClient {
         )
     }
 
+    /// #2766: the lifecycle hooks the operator enabled, read at each launch.
+    /// No runtime config (a test client) installs none.
+    fn lifecycle_hooks(&self) -> rsi_common::provider_lifecycle_hooks::LifecycleHookSet {
+        self.runtime_config
+            .as_ref()
+            .map(|runtime_config| runtime_config.provider_lifecycle_hooks())
+            .unwrap_or_default()
+    }
+
+    /// #2767: whether this launch delivers its repository skills explicitly
+    /// (`provider_skill_delivery = explicit`). `false` for the default `ambient`
+    /// and for no runtime config (a test client): argv unchanged.
+    fn skill_delivery_explicit(&self) -> bool {
+        self.runtime_config
+            .as_ref()
+            .is_some_and(|runtime_config| runtime_config.provider_skill_delivery().is_explicit())
+    }
+
     /// Resolve the operator's configured isolation policy for this spawn.
     ///
     /// Read fresh on every launch so an `UpdateDaemonConfig` mutation applies
@@ -651,6 +914,15 @@ impl ClaudeClient {
         // unparseable value should never reach here. Failing to `Off` keeps a
         // corrupted setting from silently changing launch behavior.
         ClaudeConfigIsolation::parse(&raw).unwrap_or(ClaudeConfigIsolation::Off)
+    }
+
+    /// The operator's subagent governance for this spawn, read fresh so an
+    /// `UpdateDaemonConfig` mutation applies to the next launch (#2763).
+    fn subagent_caps(&self) -> crate::store_support::provider_settings::SubagentCaps {
+        self.runtime_config
+            .as_ref()
+            .map(|runtime_config| runtime_config.claude_subagent_caps())
+            .unwrap_or_default()
     }
 
     /// Check if the Claude binary is available without creating a client.
@@ -667,15 +939,40 @@ impl ClaudeClient {
     /// un-attributed invocation and must not come back. A successful probe is
     /// cached for [`model_discovery::CACHE_TTL`]; a failed one falls back to
     /// the last good probe and then to the compiled catalog.
-    pub async fn discover_models(&self) -> Result<Vec<(String, String)>> {
+    ///
+    /// #2768: the catalog also carries each described model's effort ladder,
+    /// and a probe refreshes the ladders the launch validates `--effort`
+    /// against. This item stays the registered catalog-only probe owner
+    /// (`claude_catalog` in the model-control registry).
+    pub async fn discover_models(&self) -> Result<model_discovery::ClaudeCatalog> {
         Ok(
             model_discovery::cached_or_probe(&self.binary_path, || self.probe_cli_model_catalog())
                 .await,
         )
     }
 
+    /// #2768: an effort outside the compiled list (`ultracode`) is valid only
+    /// for a model whose live ladder lists it. A daemon that has not probed
+    /// this binary since it started knows no ladder and would refuse such an
+    /// effort, so read the ladders once first (one unbilled `initialize`
+    /// probe, cached like the picker's). A compiled-list effort, no effort or
+    /// an already probed binary costs nothing; a failed probe leaves the
+    /// compiled fallback in force.
+    pub(crate) async fn ensure_effort_ladders_for(&self, effort: Option<&str>) {
+        let Some(effort) = effort else {
+            return;
+        };
+        if claude_effort_level(Some(effort)).is_some() {
+            return;
+        }
+        if model_discovery::has_probed(&self.binary_path) {
+            return;
+        }
+        let _ = self.discover_models().await;
+    }
+
     /// Run one bounded `initialize` probe against the Claude CLI.
-    async fn probe_cli_model_catalog(&self) -> Result<Vec<(String, String)>> {
+    async fn probe_cli_model_catalog(&self) -> Result<model_discovery::ClaudeCatalog> {
         let mut command = Command::new(&self.binary_path);
         command
             .args(model_discovery::PROBE_ARGS)
@@ -725,24 +1022,47 @@ impl ClaudeClient {
     ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
         let invocation_id = execution.invocation_id();
         let mut cmd = Command::new(&self.binary_path);
+        let read_only = config
+            .tool_policy
+            .as_ref()
+            .and_then(|policy| policy.cli_access)
+            == Some(rsi_common::harness_tool_policy::CliAccessMode::ReadOnly);
         cmd.args([
             "-p",
             "--output-format",
             "stream-json",
             "--verbose",
             "--permission-mode",
-            "bypassPermissions",
+            // #2758: a read-only policy runs `dontAsk` (the tools below are the
+            // only ones allowed; the rest are denied, never prompted) instead
+            // of today's `bypassPermissions`.
+            if read_only {
+                rsi_common::harness_tool_policy::CLAUDE_READ_ONLY_PERMISSION_MODE
+            } else {
+                "bypassPermissions"
+            },
             // #1549: print-mode sessions are headless, so Claude Code's own
             // wake/cron tools never fire and a worker that arms one ends its
             // turn and is never resumed. Only RSI's `schedule_wake` and
             // `AgentSubmitJob` are real. `=` form: the flag is variadic.
             CLAUDE_DISALLOWED_TOOLS_ARG,
         ]);
+        if read_only {
+            cmd.args(claude_read_only_tool_args());
+        }
 
         // RSI settles the entire CLI process group at each print-mode turn.
         // Claude background tasks cannot survive that boundary; restoring their
         // stopped-task notifications can abort the next --resume before a reply.
         cmd.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+
+        // #2763: subagent governance. Each variable is set only when the
+        // operator chose a value, so the defaults leave the environment exactly
+        // as it was (the CLI keeps its own model inheritance and its default
+        // of 20 concurrent subagents).
+        for (name, value) in claude_subagent_env(&self.subagent_caps()) {
+            cmd.env(name, value);
+        }
 
         // SECURITY: optionally stop this session from executing the working
         // directory's own Claude configuration. `Off` (the default) appends
@@ -769,14 +1089,43 @@ impl ClaudeClient {
         // #1049: deliver mail at tool boundaries. Only sessions rsid launches
         // with its own attribution token get the per-session `--settings`
         // PostToolUse hook; the operator's global settings are never touched.
-        if config.rsi_session_token.is_some()
-            && let Some(command) =
-                boundary_mail_hook_command(self.boundary_mail_hook_path.as_deref(), &[])
-        {
+        let lifecycle = self.lifecycle_hooks();
+        let hook_command = config
+            .rsi_session_token
+            .as_ref()
+            .and_then(|_| boundary_mail_hook_command(self.boundary_mail_hook_path.as_deref(), &[]));
+        if let Some(command) = hook_command.as_deref() {
+            // #2766: plus the operator's lifecycle hooks; an empty set (the
+            // default) is exactly the custody and mail hooks.
             cmd.arg("--settings")
-                .arg(rsi_common::boundary_mail_hook::claude_settings_json(
-                    &command,
+                .arg(rsi_common::provider_lifecycle_hooks::claude_settings_json(
+                    command, lifecycle,
                 ));
+        }
+        // hub #2919: the session's `SessionStart` hook carries the preamble.
+        let session_start_hook = hook_command.is_some()
+            && lifecycle
+                .contains(rsi_common::provider_lifecycle_hooks::LifecycleHookEvent::SessionStart);
+
+        // #2767: explicit skills delivery. The repository's `.claude/skills`
+        // become one content-addressed plugin (`rsi-skills`) named by the launch,
+        // so the skill set does not depend on the cwd's own settings, the
+        // operator's home or a `--bare` default. Absent under `ambient`.
+        //
+        // #2923: naming the plugin is not enough, the CLI still loads the user's
+        // `~/.claude/skills`, the working directory's `.claude/skills` and every
+        // settings-enabled plugin. Explicit delivery therefore also passes an
+        // empty `--setting-sources` (after any isolation value, so it wins),
+        // which leaves only the CLI's bundled skills and the delivered plugin.
+        // A plugin that cannot be built delivers nothing; it never falls back
+        // to ambient skills.
+        if self.skill_delivery_explicit() {
+            cmd.args(rsi_common::provider_skill_delivery::CLAUDE_AMBIENT_SUPPRESS_ARGS);
+            if let Some(plugin_dir) =
+                crate::skill_delivery::claude_plugin_dir_for_launch(config.working_dir.as_deref())
+            {
+                cmd.arg("--plugin-dir").arg(plugin_dir);
+            }
         }
 
         // Set working directory
@@ -797,8 +1146,9 @@ impl ClaudeClient {
             cmd.args([format!("--max-turns={max}")]);
         }
 
-        // Optional system prompt
-        if let Some(prompt) = &config.system_prompt {
+        // Optional system prompt. hub #2919: without a `SessionStart` hook
+        // this is exactly `config.system_prompt`.
+        if let Some(prompt) = claude_launch_system_prompt(config, session_start_hook) {
             cmd.args([format!("--system-prompt={prompt}")]);
         }
 
@@ -809,8 +1159,48 @@ impl ClaudeClient {
 
         // Optional effort level (Claude Code 1.0.33+), validated against the
         // values the CLI actually accepts — see `validated_claude_effort`.
-        if let Some(effort) = validated_claude_effort(config)? {
+        let ladder =
+            model_discovery::known_effort_ladder(&self.binary_path, config.model.as_deref());
+        if let Some(effort) = validated_claude_effort(config, ladder.as_deref())? {
             cmd.args([format!("--effort={effort}")]);
+        }
+
+        // #2759: a topology node's handoff turn has the harness validate the
+        // handoff's shape (`structured_output` on the result event). `=` form,
+        // like the other value flags, so the JSON never reads as an option.
+        if config.structured_handoff {
+            cmd.arg(structured_handoff_flag());
+        }
+
+        // #2762: operator-set fallback chain and per-session spend cap. Both
+        // default off (no flag, argv unchanged); read per spawn so an
+        // `UpdateDaemonConfig` applies to the next session.
+        if let Some(runtime_config) = self.runtime_config.as_ref() {
+            let chain = claude_fallback_chain_for(
+                config.model.as_deref(),
+                &runtime_config.claude_fallback_models(),
+            );
+            if !chain.is_empty() {
+                cmd.args([format!("--fallback-model={}", chain.join(","))]);
+            }
+            if let Some(usd) = runtime_config.claude_max_budget_usd() {
+                cmd.args([format!("--max-budget-usd={usd}")]);
+            }
+        }
+
+        // hub #2765: the operator's allowlisted extra launch options, after
+        // every flag RSI sets (validated at write time, so none of them
+        // overlaps an RSI flag or widens privilege). Empty adds nothing.
+        if let Some(applied) = self.runtime_config.as_deref().and_then(|runtime| {
+            crate::provider_launch_overrides::resolve(
+                &runtime.provider_launch_overrides(),
+                rsi_common::provider_launch_overrides::OverrideProvider::Claude,
+            )
+        }) {
+            cmd.args(&applied.args);
+            if let Some(session_id) = config.rsi_session_id {
+                crate::provider_launch_overrides::note_applied(session_id, applied);
+            }
         }
 
         apply_bedrock_launch_env(&mut cmd, config, &crate::vault::global())?;
@@ -818,30 +1208,36 @@ impl ClaudeClient {
 
         cmd.arg("--").arg(&config.query);
 
-        if let Some(shim) =
+        let detached = if let Some(shim) =
             turn_spool::available_shim(config, self.runtime_config.as_deref(), shim_override)
         {
-            return turn_spool::launch(
+            let (wrapped, turn) = turn_spool::prepare_command(
                 &cmd,
                 config,
-                execution,
-                RuntimeExecutionRoute::ClaudeCli,
+                invocation_id,
                 &shim,
                 turn_spool::TurnOutput::Claude,
                 None,
-            );
-        }
+            )?;
+            cmd = wrapped;
+            Some(turn)
+        } else {
+            cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
 
-        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
+            None
+        };
 
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        configure_tokio_process_group(&mut cmd, ProcessContainment::Group)?;
-
+        let scope = crate::process_scope::command_scope(&cmd);
         let mut child = execution
             .bind_command(RuntimeExecutionRoute::ClaudeCli, cmd)
             .spawn()?;
-        let child_pid = child.id();
+        let stop = crate::process_control::WorkerStopHandle::new(child.id(), scope);
+        if let Some(turn) = detached {
+            return Ok(turn.into_process(child));
+        }
         let stdout = child
             .stdout
             .take()
@@ -853,6 +1249,7 @@ impl ClaudeClient {
 
         // Spawn task to read and parse NDJSON from stdout
         let stderr_tx = event_tx.clone();
+        let reader_stop = stop.clone();
         tokio::spawn(async move {
             let mut lines = BoundedLines::new(stdout, PROVIDER_MAX_LINE_BYTES);
 
@@ -879,9 +1276,7 @@ impl ClaudeClient {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
-                        if let Some(pid) = child_pid {
-                            terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                        }
+                        let _ = reader_stop.terminate("provider pipe read failed");
                         let _ = event_tx.try_send(StreamEvent {
                             event_type: "process_error".to_string(),
                             data: serde_json::json!({
@@ -923,6 +1318,7 @@ impl ClaudeClient {
 
         // Spawn task to capture stderr and surface errors as synthetic events
         if let Some(stderr) = stderr {
+            let reader_stop = stop.clone();
             tokio::spawn(async move {
                 let mut lines = BoundedLines::new(stderr, PROVIDER_MAX_LINE_BYTES);
                 let mut stderr_lines = Vec::new();
@@ -933,9 +1329,7 @@ impl ClaudeClient {
                         Ok(Some(line)) => line,
                         Ok(None) => break,
                         Err(error) => {
-                            if let Some(pid) = child_pid {
-                                terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                            }
+                            let _ = reader_stop.terminate("provider pipe read failed");
                             let error_class = if matches!(error, BoundedLineError::Exceeded { .. })
                             {
                                 "provider_output_overflow"
@@ -961,9 +1355,7 @@ impl ClaudeClient {
                             .saturating_add(separator)
                             .saturating_add(line.len());
                         if next_bytes > PROVIDER_MAX_STDERR_BYTES {
-                            if let Some(pid) = child_pid {
-                                terminate_process_group(nix::unistd::Pid::from_raw(pid as i32));
-                            }
+                            let _ = reader_stop.terminate("provider pipe read failed");
                             let _ = stderr_tx.try_send(StreamEvent {
                                 event_type: "process_error".to_string(),
                                 data: serde_json::json!({
@@ -998,13 +1390,7 @@ impl ClaudeClient {
             });
         }
 
-        Ok((
-            ClaudeProcess {
-                child: Some(child),
-                detached: None,
-            },
-            event_rx,
-        ))
+        Ok((ClaudeProcess::direct(child, stop), event_rx))
     }
 }
 
@@ -1067,6 +1453,7 @@ mod tests {
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 
@@ -1229,6 +1616,33 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
+    fn agent_transport_bearer_launch_debug_redacts_and_env_stays_compatible() {
+        let marker = format!("synthetic-bearer-{}", uuid::Uuid::new_v4());
+        let mut config = launch_config_for_provider_test("transport privacy");
+        config.rsi_session_token = Some(marker.clone().into());
+        let diagnostic = format!("{:?}", Err::<(), _>(Some(config.clone())));
+        assert!(
+            !diagnostic.contains(&marker),
+            "launch error diagnostics exposed a credential"
+        );
+        assert!(diagnostic.contains("AgentTransportBearer(<redacted>)"));
+        let mut cmd = Command::new("provider");
+        stamp_execution_environment(&mut cmd, &config, uuid::Uuid::new_v4()).unwrap();
+        let env = command_environment(&cmd);
+        assert!(
+            env.get(rsi_common::identity::ENV_SESSION_TOKEN) == Some(&marker),
+            "provider environment changed the transport credential"
+        );
+        assert!(
+            cmd.as_std()
+                .get_args()
+                .all(|arg| !arg.to_string_lossy().contains(&marker)),
+            "provider arguments exposed a credential"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
     fn test_claude_agent_role_for_kind_maps_implementer_kinds() {
         use rsi_common::types::SessionKind;
 
@@ -1294,6 +1708,35 @@ mod tests {
         }
     }
 
+    /// Build a client whose daemon-global settings pin the subagent model and
+    /// concurrency cap (#2763); `None` leaves the setting at its default.
+    fn test_client_with_subagents(
+        binary_path: PathBuf,
+        model: Option<&str>,
+        cap: Option<u64>,
+    ) -> ClaudeClient {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        runtime
+            .turn_detach_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(model) = model {
+            runtime
+                .update_field("claude_subagent_model", &serde_json::json!(model))
+                .expect("valid model");
+        }
+        if let Some(cap) = cap {
+            runtime
+                .update_field("claude_max_concurrent_subagents", &serde_json::json!(cap))
+                .expect("valid cap");
+        }
+        ClaudeClient {
+            binary_path,
+            runtime_config: Some(runtime),
+            agent_mcp_path: None,
+            boundary_mail_hook_path: None,
+        }
+    }
+
     #[cfg(unix)]
     fn install_fake_claude(dir: &Path) -> (PathBuf, PathBuf) {
         let binary_path = dir.join("claude");
@@ -1309,6 +1752,7 @@ for arg in "$@"; do
 done
 printf '%s|%s|%s|%s|%s' "${CARGO_TARGET_DIR:-}" "${TMPDIR:-}" "${RSI_PROCESS_OWNERSHIP_NAMESPACE:-}" "${RSI_SESSION_ID:-}" "${RSI_MODEL_INVOCATION_ID:-}" > "$(dirname "$0")/claude_exec_env.txt"
 printf '%s' "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS:-}" > "$(dirname "$0")/claude_background_tasks_env.txt"
+printf '%s|%s' "${CLAUDE_CODE_SUBAGENT_MODEL-UNSET}" "${CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS-UNSET}" > "$(dirname "$0")/claude_subagent_env.txt"
 printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
 "#,
         )
@@ -1326,6 +1770,20 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
             .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8(arg.to_vec()).expect("utf8 arg"))
             .collect()
+    }
+
+    /// [`read_nul_args`] that keeps an empty argument (`--setting-sources ""`).
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    fn read_nul_args_keeping_empty(path: &Path) -> Vec<String> {
+        let bytes = fs::read(path).expect("read captured args");
+        let mut args: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .map(|arg| String::from_utf8(arg.to_vec()).expect("utf8 arg"))
+            .collect();
+        // Every argument ends in a NUL, so the split leaves one empty tail.
+        args.pop();
+        args
     }
 
     #[cfg(unix)]
@@ -1603,6 +2061,7 @@ worker prompt body\n\
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         };
         assert_eq!(config.query, "Hello");
         assert_eq!(config.max_turns, Some(5));
@@ -1707,6 +2166,89 @@ worker prompt body\n\
         }
     }
 
+    /// #2763: subagent governance reaches the Claude process as environment.
+    /// The defaults add nothing (the child sees exactly the environment the
+    /// daemon had, and the argv is the historical one); a chosen model and cap
+    /// become `CLAUDE_CODE_SUBAGENT_MODEL` and
+    /// `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` on fresh and resumed turns.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn claude_launch_passes_subagent_governance_only_when_set() {
+        let ambient = |name: &str| std::env::var(name).unwrap_or_else(|_| "UNSET".to_string());
+        let default_env = format!(
+            "{}|{}",
+            ambient("CLAUDE_CODE_SUBAGENT_MODEL"),
+            ambient("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS")
+        );
+        let cases: [(Option<&str>, Option<u64>, String); 4] = [
+            (None, None, default_env.clone()),
+            (
+                Some("haiku"),
+                None,
+                format!("haiku|{}", ambient("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS")),
+            ),
+            (
+                None,
+                Some(4),
+                format!("{}|4", ambient("CLAUDE_CODE_SUBAGENT_MODEL")),
+            ),
+            (
+                Some("claude-haiku-4-5"),
+                Some(2),
+                "claude-haiku-4-5|2".to_string(),
+            ),
+        ];
+        let mut baseline_args = None;
+        for (model, cap, expected) in cases {
+            for resume_session_id in [None, Some("previous-turn".to_string())] {
+                let tmp = TempDir::new().expect("tempdir");
+                let (binary_path, args_path) = install_fake_claude(tmp.path());
+                let client = test_client_with_subagents(binary_path, model, cap);
+                let mut config = launch_config_for_provider_test("test query");
+                config.resume_session_id = resume_session_id.clone();
+                let (mut process, _rx) = client
+                    .launch(
+                        &config,
+                        CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                    )
+                    .expect("launch fake claude");
+                assert!(process.wait().await.expect("wait fake claude").success());
+                assert_eq!(
+                    fs::read_to_string(tmp.path().join("claude_subagent_env.txt"))
+                        .expect("read subagent environment"),
+                    expected,
+                    "model {model:?} cap {cap:?} resume {resume_session_id:?}"
+                );
+                // Environment only: the argv never changes.
+                if resume_session_id.is_none() {
+                    let args = read_nul_args(&args_path);
+                    assert_eq!(
+                        baseline_args.get_or_insert_with(|| args.clone()),
+                        &args,
+                        "subagent governance must not touch argv"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #2763: the pure env mapping. Defaults map to nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn claude_subagent_env_maps_only_chosen_values() {
+        use crate::store_support::provider_settings::SubagentCaps;
+        assert!(claude_subagent_env(&SubagentCaps::default()).is_empty());
+        assert!(claude_subagent_env(&SubagentCaps::from_settings("", 0)).is_empty());
+        assert_eq!(
+            claude_subagent_env(&SubagentCaps::from_settings("haiku", 4)),
+            vec![
+                ("CLAUDE_CODE_SUBAGENT_MODEL", "haiku".to_string()),
+                ("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", "4".to_string()),
+            ]
+        );
+    }
+
     /// #1049: an rsid-launched session (it carries its own attribution token)
     /// gets the per-session PostToolUse boundary-mail hook; a launch without
     /// one keeps the argv it always had, and the token itself is never in argv.
@@ -1722,7 +2264,7 @@ worker prompt body\n\
             std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
             client.boundary_mail_hook_path = Some(rsi_rpc);
             let mut config = launch_config_for_provider_test("q");
-            config.rsi_session_token = token.map(str::to_string);
+            config.rsi_session_token = token.map(Into::into);
             let (mut process, _rx) = client
                 .launch(
                     &config,
@@ -1763,11 +2305,244 @@ worker prompt body\n\
                 .ends_with("boundary-mail-hook"),
             "{pre}"
         );
+        // Hub #1161: and answers a headless AskUserQuestion with the typed
+        // undeliverable notice at PreToolUse.
+        let ask = &settings["hooks"]["PreToolUse"][1];
+        assert_eq!(ask["matcher"], "AskUserQuestion");
+        assert_eq!(ask["hooks"][0]["command"], hook["command"]);
         assert!(
             !with.iter().any(|arg| arg.contains("s3cr3t-token-value")),
             "the session token must never be in argv"
         );
         assert_prompt_is_final_verbatim(&with, "q");
+    }
+
+    /// #2766: the default (empty) lifecycle set leaves the `--settings`
+    /// byte-identical to the custody and mail hooks; enabled events add their
+    /// groups running the same command.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_installs_exactly_the_enabled_lifecycle_hooks() {
+        async fn settings(lifecycle: Option<&str>) -> (String, String) {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let mut client = test_client_with_isolation(binary_path, "off");
+            if let Some(value) = lifecycle {
+                client
+                    .runtime_config
+                    .as_ref()
+                    .expect("runtime config")
+                    .update_field("provider_lifecycle_hooks", &serde_json::json!(value))
+                    .expect("valid lifecycle set");
+            }
+            let rsi_rpc = tmp.path().join("rsi-rpc");
+            std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+            client.boundary_mail_hook_path = Some(rsi_rpc.clone());
+            let mut config = launch_config_for_provider_test("q");
+            config.rsi_session_token = Some("token".into());
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            let args = read_nul_args(&args_path);
+            let position = args
+                .iter()
+                .position(|arg| arg == "--settings")
+                .expect("--settings present");
+            let command = boundary_mail_hook_command(Some(&rsi_rpc), &[]).expect("hook command");
+            (args[position + 1].clone(), command)
+        }
+
+        let (default, command) = settings(None).await;
+        assert_eq!(
+            default,
+            rsi_common::boundary_mail_hook::claude_settings_json(&command),
+            "empty set: byte-identical to the custody and mail hooks"
+        );
+        let (none, command) = settings(Some("none")).await;
+        assert_eq!(
+            none,
+            rsi_common::boundary_mail_hook::claude_settings_json(&command)
+        );
+
+        let (both, command) = settings(Some("StopFailure,PreCompact")).await;
+        let value: serde_json::Value = serde_json::from_str(&both).expect("settings json");
+        for event in ["StopFailure", "PreCompact"] {
+            let handler = &value["hooks"][event][0]["hooks"][0];
+            assert_eq!(handler["command"], command.as_str(), "{event}");
+            assert!(handler.get("onFailure").is_none(), "{event}");
+        }
+        assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(value["hooks"]["PostToolUse"][0]["matcher"], "*");
+    }
+
+    /// hub #2919: one fake-Claude launch of a tokened session in a project
+    /// that ships a router and a worker preamble; returns its argv and the
+    /// startup preamble a fresh launch composes for that project.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    async fn session_start_launch(
+        lifecycle: Option<&str>,
+        sibling: bool,
+        session_id: uuid::Uuid,
+        system_prompt: impl FnOnce(&str) -> Option<String>,
+    ) -> (Vec<String>, String) {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        let mut client = test_client_with_isolation(binary_path, "off");
+        if let Some(value) = lifecycle {
+            client
+                .runtime_config
+                .as_ref()
+                .expect("runtime config")
+                .update_field("provider_lifecycle_hooks", &serde_json::json!(value))
+                .expect("valid lifecycle set");
+        }
+        let rsi_rpc = tmp.path().join("rsi-rpc");
+        std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+        client.boundary_mail_hook_path = sibling.then_some(rsi_rpc);
+        let project = tmp.path().join("project");
+        let shared = project.join(".claude/commands/_shared");
+        std::fs::create_dir_all(&shared).expect("commands dir");
+        std::fs::create_dir_all(project.join(".git")).expect("git marker");
+        std::fs::write(
+            project.join(".claude/commands/orchestration_router.md"),
+            "ROUTER",
+        )
+        .expect("router");
+        std::fs::write(shared.join("worker_preamble.md"), "WORKER PREAMBLE").expect("preamble");
+        let preamble = crate::session::preamble::startup_parts(
+            rsi_common::types::SessionKind::Standard,
+            &project,
+        )
+        .join("\n\n");
+        let mut config = launch_config_for_provider_test("q");
+        config.rsi_session_token = Some("token".into());
+        config.rsi_session_id = Some(session_id);
+        config.working_dir = Some(project);
+        config.system_prompt = system_prompt(&preamble);
+        let (mut process, _rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+            )
+            .expect("launch fake claude");
+        process.wait().await.expect("wait fake claude");
+        (read_nul_args(&args_path), preamble)
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    fn system_prompt_arg(args: &[String]) -> Option<String> {
+        args.iter()
+            .find_map(|arg| arg.strip_prefix("--system-prompt="))
+            .map(str::to_string)
+    }
+
+    /// hub #2919: with `SessionStart` on, the fresh launch's system prompt no
+    /// longer starts with the preamble, the `SessionStart` hook is installed,
+    /// and the hook's daemon claim returns exactly the preamble left out.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn a_session_start_launch_moves_the_preamble_from_the_system_prompt_to_the_hook() {
+        let session = uuid::Uuid::new_v4();
+        let rest = "## RSI session identity\nYou are running as provider `Claude`.";
+        let (args, preamble) = session_start_launch(Some("SessionStart"), true, session, |p| {
+            Some(format!("{p}\n\n{rest}"))
+        })
+        .await;
+        assert!(
+            preamble.starts_with("ROUTER\n\nWORKER PREAMBLE"),
+            "{preamble}"
+        );
+        assert_eq!(system_prompt_arg(&args).as_deref(), Some(rest));
+        let position = args.iter().position(|arg| arg == "--settings").unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&args[position + 1]).unwrap();
+        let handler = &settings["hooks"]["SessionStart"][0]["hooks"][0];
+        assert!(
+            handler["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("boundary-mail-hook"),
+            "{settings}"
+        );
+        assert_eq!(
+            crate::session_start_preamble::claim_for_hook(session, "startup"),
+            Some(preamble)
+        );
+        assert_prompt_is_final_verbatim(&args, "q");
+        crate::session_start_preamble::forget(session);
+    }
+
+    /// hub #2919: a preamble the hook never claimed goes back in front of the
+    /// next turn's system prompt, once.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn a_missed_claude_session_start_hook_falls_back_to_the_system_prompt() {
+        let session = uuid::Uuid::new_v4();
+        let (first, preamble) =
+            session_start_launch(Some("SessionStart"), true, session, |p| Some(p.to_string()))
+                .await;
+        assert_eq!(
+            system_prompt_arg(&first),
+            None,
+            "the whole prompt was the preamble"
+        );
+        let (resumed, _) = session_start_launch(Some("SessionStart"), true, session, |_| {
+            Some("CONTEXT".to_string())
+        })
+        .await;
+        assert_eq!(
+            system_prompt_arg(&resumed),
+            Some(format!("{preamble}\n\nCONTEXT"))
+        );
+        assert_eq!(
+            crate::session_start_preamble::claim_for_hook(session, "resume"),
+            None
+        );
+        let (again, _) = session_start_launch(Some("SessionStart"), true, session, |_| {
+            Some("CONTEXT".to_string())
+        })
+        .await;
+        assert_eq!(system_prompt_arg(&again).as_deref(), Some("CONTEXT"));
+    }
+
+    /// hub #2919: the default `none` (and `SessionStart` with no hook able to
+    /// run) passes the composed system prompt byte-for-byte and installs no
+    /// `SessionStart` hook.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn without_a_session_start_hook_the_system_prompt_is_unchanged() {
+        for (lifecycle, sibling) in [
+            (None, true),
+            (Some("none"), true),
+            (Some("StopFailure,PreCompact"), true),
+            (Some("SessionStart"), false),
+        ] {
+            let session = uuid::Uuid::new_v4();
+            let mut composed = String::new();
+            let (args, _) = session_start_launch(lifecycle, sibling, session, |p| {
+                composed = format!("{p}\n\nREST");
+                Some(composed.clone())
+            })
+            .await;
+            assert_eq!(system_prompt_arg(&args), Some(composed), "{lifecycle:?}");
+            assert!(
+                args.iter().all(|arg| !arg.contains("\"SessionStart\"")),
+                "{lifecycle:?}: {args:?}"
+            );
+            assert_eq!(
+                crate::session_start_preamble::claim_for_hook(session, "startup"),
+                None
+            );
+        }
     }
 
     /// #1183 review: a tokened launch with no trusted absolute `rsi-rpc`
@@ -1787,7 +2562,7 @@ worker prompt body\n\
             let mut client = test_client(binary_path);
             client.boundary_mail_hook_path = path.clone();
             let mut config = launch_config_for_provider_test("q");
-            config.rsi_session_token = Some("tok".to_string());
+            config.rsi_session_token = Some("tok".into());
             let (mut process, _rx) = client
                 .launch(
                     &config,
@@ -1802,6 +2577,116 @@ worker prompt body\n\
             );
         }
         assert_eq!(boundary_mail_hook_command(None, &[]), None);
+    }
+
+    /// #2758: a read-only policy swaps `bypassPermissions` for `dontAsk` with an
+    /// explicit read-only tool allowlist, keeps the `rsi-agent` MCP server and
+    /// its allow rule and the custody/mail `--settings` hooks, and a launch with
+    /// no policy keeps the historical permission flags.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn a_read_only_policy_maps_to_dont_ask_with_a_read_only_tool_allowlist() {
+        use rsi_common::harness_tool_policy::{CliAccessMode, HarnessToolPolicy};
+        async fn argv(dir: &Path, policy: Option<HarnessToolPolicy>) -> Vec<String> {
+            let (binary_path, args_path) = install_fake_claude(dir);
+            let mut client = test_client(binary_path);
+            let rsi_rpc = dir.join("rsi-rpc");
+            std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+            let mcp = dir.join("rsi-agent-mcp");
+            std::fs::write(&mcp, b"").expect("fake rsi-agent-mcp");
+            client.boundary_mail_hook_path = Some(rsi_rpc);
+            client.agent_mcp_path = Some(mcp);
+            let mut config = launch_config_for_provider_test("q");
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            config.rsi_session_token = Some("tok".into());
+            config.tool_policy = policy;
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            read_nul_args(&args_path)
+        }
+
+        let tmp = TempDir::new().expect("tempdir");
+        let plain = argv(tmp.path(), None).await;
+        assert_arg_pair(&plain, "--permission-mode", "bypassPermissions");
+        assert!(
+            !plain
+                .iter()
+                .any(|arg| arg.starts_with("--tools") || arg.starts_with("--allowedTools")),
+            "{plain:?}"
+        );
+        // A policy that sets no CLI access is also today's argv.
+        assert_eq!(
+            argv(tmp.path(), Some(HarnessToolPolicy::default())).await,
+            plain
+        );
+
+        let read_only = argv(
+            tmp.path(),
+            Some(HarnessToolPolicy {
+                cli_access: Some(CliAccessMode::ReadOnly),
+                ..HarnessToolPolicy::default()
+            }),
+        )
+        .await;
+        assert_arg_pair(&read_only, "--permission-mode", "dontAsk");
+        assert!(
+            !read_only.iter().any(|arg| arg == "bypassPermissions"),
+            "{read_only:?}"
+        );
+        assert!(
+            read_only.iter().any(|arg| arg == "--tools=Read,Grep,Glob"),
+            "{read_only:?}"
+        );
+        assert!(
+            read_only
+                .iter()
+                .any(|arg| arg == "--allowedTools=Read,Grep,Glob,mcp__rsi-agent"),
+            "{read_only:?}"
+        );
+        assert!(
+            !read_only.iter().any(|arg| arg.contains("Bash")
+                && (arg.starts_with("--tools") || arg.starts_with("--allowedTools"))),
+            "a read-only session has no shell: {read_only:?}"
+        );
+        // The wake/cron denial, the rsi-agent MCP server and both hooks stay.
+        assert!(
+            read_only
+                .iter()
+                .any(|arg| arg == CLAUDE_DISALLOWED_TOOLS_ARG)
+        );
+        let mcp_at = read_only
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("rsi-agent MCP config kept");
+        assert!(read_only[mcp_at + 1].contains(AGENT_MCP_SERVER_NAME));
+        let settings_at = read_only
+            .iter()
+            .position(|arg| arg == "--settings")
+            .expect("hook settings kept");
+        let settings: serde_json::Value =
+            serde_json::from_str(&read_only[settings_at + 1]).expect("settings json");
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert!(settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"].is_string());
+        assert_prompt_is_final_verbatim(&read_only, "q");
+        // Everything outside the permission flags is unchanged.
+        let strip = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|arg| {
+                    !arg.starts_with("--tools")
+                        && !arg.starts_with("--allowedTools")
+                        && *arg != "dontAsk"
+                        && *arg != "bypassPermissions"
+                })
+                .cloned()
+                .collect()
+        };
+        assert_eq!(strip(&read_only), strip(&plain));
     }
 
     /// Capture the argv `launch()` actually emits for `policy`.
@@ -1915,7 +2800,7 @@ worker prompt body\n\
 
         let mut config = launch_config_for_provider_test("test query");
         config.rsi_session_id = Some(uuid::Uuid::new_v4());
-        config.rsi_session_token = Some("tok-secret-sentinel".to_string());
+        config.rsi_session_token = Some("tok-secret-sentinel".into());
         let (mut process, _rx) = client
             .launch(
                 &config,
@@ -2250,6 +3135,396 @@ with open(folder + '/alive.lock', 'w') as lock:
         assert!(args.contains(&"--max-turns=7".to_string()));
     }
 
+    /// #2755: every flag a full Claude launch passes is in
+    /// [`CLAUDE_LAUNCH_FLAGS`] (so the contract canary asks the installed CLI
+    /// about it), and `--bare` is never passed: RSI authenticates through the
+    /// ambient OAuth login and keeps its hooks and CLAUDE.md, which `--bare`
+    /// drops.
+    /// hub #2765: golden argv. An empty override list leaves the launch argv
+    /// exactly as it was; allowlisted Claude overrides are appended as
+    /// `--flag=value`, in order, after every RSI flag and before `--`, and the
+    /// launch notes what it applied for the session record.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn operator_launch_overrides_render_golden_argv_and_empty_changes_nothing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        let client = test_client_with_isolation(binary_path, "off");
+        let session_id = uuid::Uuid::new_v4();
+        let mut config = launch_config_for_provider_test("q");
+        config.rsi_session_id = Some(session_id);
+        config.model = Some("claude-opus-5".into());
+        config.effort = Some("high".into());
+        async fn launch_args(
+            client: &ClaudeClient,
+            config: &LaunchConfig,
+            args_path: &Path,
+        ) -> Vec<String> {
+            let (mut process, _rx) = client
+                .launch(
+                    config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            read_nul_args(args_path)
+        }
+
+        let baseline = launch_args(&client, &config, &args_path).await;
+        assert_eq!(
+            crate::provider_launch_overrides::take_applied(session_id),
+            None,
+            "an empty list records nothing"
+        );
+        let runtime = client.runtime_config.as_deref().expect("runtime config");
+        runtime
+            .update_field(
+                rsi_common::provider_launch_overrides::FIELD,
+                &serde_json::json!({
+                    "claude": ["--append-system-prompt=Be terse.", "--betas=b1,b2"],
+                    "codex": ["model_verbosity=low"],
+                }),
+            )
+            .expect("allowed overrides");
+        let with = launch_args(&client, &config, &args_path).await;
+        let separator = with.iter().position(|arg| arg == "--").expect("--");
+        assert_eq!(
+            with[separator - 2..separator],
+            ["--append-system-prompt=Be terse.", "--betas=b1,b2"]
+        );
+        let mut without: Vec<String> = with.clone();
+        without.drain(separator - 2..separator);
+        assert_eq!(without, baseline, "only the overrides were added");
+        let applied =
+            crate::provider_launch_overrides::take_applied(session_id).expect("applied note");
+        assert_eq!(
+            applied.entries,
+            vec!["--append-system-prompt=Be terse.", "--betas=b1,b2"]
+        );
+
+        runtime
+            .update_field(
+                rsi_common::provider_launch_overrides::FIELD,
+                &serde_json::json!("clear"),
+            )
+            .expect("clear");
+        assert_eq!(launch_args(&client, &config, &args_path).await, baseline);
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_flag_list_covers_every_flag_a_full_launch_passes_and_never_bare() {
+        for policy in ["off", "settings", "strict"] {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let mut client = test_client_with_isolation(binary_path, policy);
+            let rsi_rpc = tmp.path().join("rsi-rpc");
+            std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+            client.boundary_mail_hook_path = Some(rsi_rpc);
+            let mcp = tmp.path().join("rsi-agent-mcp");
+            std::fs::write(&mcp, b"").expect("fake mcp");
+            client.agent_mcp_path = Some(mcp);
+            let mut config = launch_config_for_provider_test("q");
+            config.rsi_session_token = Some("token-value".into());
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            config.model = Some("claude-opus-5".into());
+            config.max_turns = Some(3);
+            config.system_prompt = Some("system".into());
+            config.resume_session_id = Some("resume-id".into());
+            config.effort = Some("high".into());
+            client
+                .runtime_config
+                .as_ref()
+                .expect("runtime config")
+                .update_field(
+                    "claude_fallback_models",
+                    &serde_json::json!("claude-sonnet-5-5"),
+                )
+                .expect("fallback chain");
+            client
+                .runtime_config
+                .as_ref()
+                .expect("runtime config")
+                .update_field("claude_max_budget_usd", &serde_json::json!(5))
+                .expect("budget cap");
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            let args = read_nul_args(&args_path);
+            let flags: Vec<&str> = args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .filter(|arg| arg.starts_with('-'))
+                .map(|arg| arg.split('=').next().unwrap_or(arg))
+                .collect();
+            for flag in &flags {
+                assert!(
+                    CLAUDE_LAUNCH_FLAGS.contains(flag),
+                    "{policy}: launch passes {flag}, which CLAUDE_LAUNCH_FLAGS does not list: {args:?}"
+                );
+            }
+            for expected in [
+                "--max-turns",
+                "--mcp-config",
+                "--settings",
+                "--effort",
+                "--fallback-model",
+                "--max-budget-usd",
+            ] {
+                assert!(
+                    flags.contains(&expected),
+                    "{policy}: {expected} in {args:?}"
+                );
+            }
+            assert!(!flags.contains(&"--bare"), "{policy}: {args:?}");
+        }
+        // The probe's own argv and the isolation flags are covered too.
+        for flag in crate::claude::model_discovery::PROBE_ARGS
+            .iter()
+            .filter(|arg| arg.starts_with('-'))
+        {
+            assert!(CLAUDE_LAUNCH_FLAGS.contains(flag), "probe flag {flag}");
+            assert_ne!(*flag, "--bare");
+        }
+        assert!(
+            CLAUDE_LAUNCH_FLAGS.contains(
+                &CLAUDE_DISALLOWED_TOOLS_ARG
+                    .split('=')
+                    .next()
+                    .expect("flag name")
+            )
+        );
+        for policy in [
+            ClaudeConfigIsolation::Off,
+            ClaudeConfigIsolation::Settings,
+            ClaudeConfigIsolation::Strict,
+        ] {
+            for flag in policy.cli_flags().iter().filter(|f| f.starts_with('-')) {
+                assert!(CLAUDE_LAUNCH_FLAGS.contains(flag), "isolation flag {flag}");
+            }
+        }
+        assert!(!CLAUDE_LAUNCH_FLAGS.contains(&"--bare"));
+    }
+
+    /// #2759: the handoff turn of a `structured_handoff` node passes
+    /// `--json-schema=<the handoff schema>` before the `--` separator, once;
+    /// every other launch passes no such flag.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn structured_handoff_turn_passes_json_schema_and_no_other_turn_does() {
+        for structured in [false, true] {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let client = test_client(binary_path);
+            let mut config = launch_config_for_provider_test("repeat your handoff");
+            config.resume_session_id = Some("resume-id".into());
+            config.structured_handoff = structured;
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            let args = read_nul_args(&args_path);
+            let separator = args.iter().position(|arg| arg == "--").expect("separator");
+            let schema_args: Vec<&String> = args[..separator]
+                .iter()
+                .filter(|arg| arg.starts_with("--json-schema"))
+                .collect();
+            if structured {
+                assert_eq!(schema_args.len(), 1, "{args:?}");
+                let schema: serde_json::Value =
+                    serde_json::from_str(&schema_args[0]["--json-schema=".len()..])
+                        .expect("schema argument is JSON");
+                assert_eq!(
+                    schema,
+                    rsi_common::structured_handoff::structured_handoff_schema()
+                );
+                assert_eq!(args[separator + 1], "repeat your handoff");
+            } else {
+                assert!(schema_args.is_empty(), "{args:?}");
+            }
+        }
+    }
+
+    /// #2762: a non-empty `claude_fallback_models` adds `--fallback-model=a,b`
+    /// and a non-zero `claude_max_budget_usd` adds `--max-budget-usd=<n>`; with
+    /// both at their defaults the argv carries neither; a fallback equal to the
+    /// session's own model is dropped (the CLI refuses it); a Bedrock-routed
+    /// model gets no chain.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_passes_fallback_chain_and_budget_cap_only_when_configured() {
+        async fn argv(model: &str, chain: &str, budget: serde_json::Value) -> Vec<String> {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let client = test_client_with_isolation(binary_path, "off");
+            let runtime = client.runtime_config.as_ref().expect("runtime config");
+            runtime
+                .update_field("claude_fallback_models", &serde_json::json!(chain))
+                .expect("chain");
+            runtime
+                .update_field("claude_max_budget_usd", &budget)
+                .expect("budget");
+            let mut config = launch_config_for_provider_test("q");
+            config.model = Some(model.to_string());
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            read_nul_args(&args_path)
+        }
+        let flag = |args: &[String], prefix: &str| {
+            args.iter().find(|arg| arg.starts_with(prefix)).cloned()
+        };
+
+        let off = argv("claude-opus-5", "", serde_json::json!(0)).await;
+        assert_eq!(flag(&off, "--fallback-model"), None, "{off:?}");
+        assert_eq!(flag(&off, "--max-budget-usd"), None, "{off:?}");
+
+        let on = argv(
+            "claude-opus-5",
+            "claude-sonnet-5-5, claude-haiku-4-5",
+            serde_json::json!(2.5),
+        )
+        .await;
+        assert_eq!(
+            flag(&on, "--fallback-model").as_deref(),
+            Some("--fallback-model=claude-sonnet-5-5,claude-haiku-4-5")
+        );
+        assert_eq!(
+            flag(&on, "--max-budget-usd").as_deref(),
+            Some("--max-budget-usd=2.5")
+        );
+
+        // The session's own model is not a fallback for itself.
+        let own = argv(
+            "claude-opus-5",
+            "claude-opus-5[1m],claude-haiku-4-5",
+            serde_json::json!(5),
+        )
+        .await;
+        assert_eq!(
+            flag(&own, "--fallback-model").as_deref(),
+            Some("--fallback-model=claude-haiku-4-5")
+        );
+        assert_eq!(
+            flag(&own, "--max-budget-usd").as_deref(),
+            Some("--max-budget-usd=5")
+        );
+
+        // A Bedrock-routed model takes no chain.
+        let bedrock = claude_fallback_chain_for(
+            Some("us.anthropic.claude-opus-5-5-v1:0"),
+            &["claude-haiku-4-5".to_string()],
+        );
+        assert!(bedrock.is_empty());
+    }
+
+    /// #2767 golden argv: `ambient` (the default) passes no `--plugin-dir`;
+    /// `explicit` passes exactly one, naming the content-addressed `rsi-skills`
+    /// plugin built from the repository's `.claude/skills`; two sandboxes with
+    /// the same skills get the same plugin directory; a repository with no
+    /// skills passes none.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_passes_the_skill_plugin_only_with_explicit_delivery() {
+        async fn argv(mode: &str, working_dir: &Path) -> Vec<String> {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let client = test_client_with_isolation(binary_path, "off");
+            client
+                .runtime_config
+                .as_ref()
+                .expect("runtime config")
+                .update_field("provider_skill_delivery", &serde_json::json!(mode))
+                .expect("mode");
+            let mut config = launch_config_for_provider_test("q");
+            config.working_dir = Some(working_dir.to_path_buf());
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            read_nul_args_keeping_empty(&args_path)
+        }
+        let plugin_dirs = |args: &[String]| -> Vec<String> {
+            args.windows(2)
+                .filter(|pair| pair[0] == "--plugin-dir")
+                .map(|pair| pair[1].clone())
+                .collect()
+        };
+        let one = crate::skill_delivery::tests::repo_with_skills(
+            rsi_common::provider_skill_delivery::CLAUDE_SKILLS_DIR,
+            &["alpha", "beta"],
+        );
+        let two = crate::skill_delivery::tests::repo_with_skills(
+            rsi_common::provider_skill_delivery::CLAUDE_SKILLS_DIR,
+            &["beta", "alpha"],
+        );
+
+        let ambient = argv("ambient", one.path()).await;
+        assert!(plugin_dirs(&ambient).is_empty(), "{ambient:?}");
+
+        let explicit = argv("explicit", one.path()).await;
+        let delivered = plugin_dirs(&explicit);
+        assert_eq!(delivered.len(), 1, "{explicit:?}");
+        let plugin = Path::new(&delivered[0]);
+        assert!(plugin.starts_with(crate::skill_delivery::plugin_store_dir()));
+        assert!(plugin.join(".claude-plugin/plugin.json").is_file());
+        assert!(plugin.join("skills/alpha/SKILL.md").is_file());
+        // #2923: explicit delivery also suppresses every ambient source with an
+        // empty `--setting-sources`; the plugin flag and that pair are the only
+        // differences from the ambient argv, and the ambient argv has neither.
+        let has_suppress = |args: &[String]| {
+            args.windows(2)
+                .any(|pair| pair[0] == "--setting-sources" && pair[1].is_empty())
+        };
+        assert!(!has_suppress(&ambient), "{ambient:?}");
+        assert!(has_suppress(&explicit), "{explicit:?}");
+        let mut without = Vec::new();
+        let mut index = 0;
+        while index < explicit.len() {
+            let pair_is_ours = explicit[index] == "--plugin-dir"
+                || (explicit[index] == "--setting-sources"
+                    && explicit.get(index + 1).is_some_and(String::is_empty));
+            if pair_is_ours {
+                index += 2;
+            } else {
+                without.push(explicit[index].clone());
+                index += 1;
+            }
+        }
+        assert_eq!(without, ambient);
+
+        // The same skills in another sandbox: the same delivered plugin.
+        assert_eq!(plugin_dirs(&argv("explicit", two.path()).await), delivered);
+
+        let bare = crate::skill_delivery::tests::repo_with_skills(
+            rsi_common::provider_skill_delivery::CLAUDE_SKILLS_DIR,
+            &[],
+        );
+        let bare_argv = argv("explicit", bare.path()).await;
+        assert!(plugin_dirs(&bare_argv).is_empty());
+        // Nothing to deliver still means no ambient skills.
+        assert!(has_suppress(&bare_argv), "{bare_argv:?}");
+    }
+
     /// V-006: `ultra` is in RSI's vocabulary but not the CLI's. The CLI would
     /// warn and silently run at the DEFAULT effort while RSI kept recording
     /// `ultra`, so the launch is rejected instead — the same treatment the
@@ -2279,6 +3554,212 @@ with open(folder + '/alive.lock', 'w') as lock:
         assert!(
             !args_path.exists(),
             "no provider process may be spawned for a rejected effort"
+        );
+    }
+
+    /// Seed the ladder index for `binary_path` from a stub `initialize`
+    /// reply listing `models`, through the real probe cache.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    async fn seed_stub_ladders(binary_path: &Path, models: serde_json::Value) {
+        let stdout = serde_json::json!({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": model_discovery::PROBE_REQUEST_ID,
+                         "response": {"models": models}}
+        })
+        .to_string();
+        let catalog =
+            model_discovery::parse_initialize_models(stdout.as_bytes()).expect("stub parses");
+        let seeded = model_discovery::cached_or_probe(binary_path, || async { Ok(catalog) }).await;
+        assert!(!seeded.efforts.is_empty(), "stub ladders are cached");
+    }
+
+    /// Launch `model` at `effort` against the fake CLI; the argv on success.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    async fn launch_with_effort(
+        client: &ClaudeClient,
+        args_path: &Path,
+        model: Option<&str>,
+        effort: &str,
+    ) -> Result<Vec<String>> {
+        let _ = std::fs::remove_file(args_path);
+        let mut config = launch_config_for_provider_test("ladder probe");
+        config.model = model.map(str::to_string);
+        config.effort = Some(effort.to_string());
+        let (mut process, _rx) = client.launch(
+            &config,
+            CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+        )?;
+        let status = process.wait().await.expect("wait fake claude");
+        assert!(status.success(), "fake claude failed: {status}");
+        Ok(read_nul_args(args_path))
+    }
+
+    /// #2768: a model whose live ladder stops at `xhigh` refuses `max` (which
+    /// the compiled list would pass) and still passes the levels it lists; a
+    /// model whose ladder includes `max` passes it.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn live_ladder_decides_max_per_model() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        seed_stub_ladders(
+            &binary_path,
+            serde_json::json!([
+                {"value":"sonnet","resolvedModel":"claude-sonnet-9","displayName":"Sonnet 9",
+                 "supportedEffortLevels":["low","medium","high","xhigh"]},
+                {"value":"opus","resolvedModel":"claude-opus-9","displayName":"Opus 9",
+                 "supportedEffortLevels":["low","medium","high","xhigh","max"]}
+            ]),
+        )
+        .await;
+        let client = test_client(binary_path);
+
+        let refused = launch_with_effort(&client, &args_path, Some("claude-sonnet-9"), "max")
+            .await
+            .expect_err("max is not on this model's ladder");
+        assert!(
+            matches!(refused, DaemonError::InvalidParam(ref message)
+                if message.contains("'max'") && message.contains("low, medium, high, xhigh")),
+            "expected the model's own ladder in the refusal, got: {refused}"
+        );
+        let args = launch_with_effort(&client, &args_path, Some("claude-sonnet-9"), "xhigh")
+            .await
+            .expect("xhigh is on the ladder");
+        assert!(args.contains(&"--effort=xhigh".to_string()), "{args:?}");
+        let args = launch_with_effort(&client, &args_path, Some("claude-opus-9[1m]"), "max")
+            .await
+            .expect("max is on opus's ladder");
+        assert!(args.contains(&"--effort=max".to_string()), "{args:?}");
+        let args = launch_with_effort(&client, &args_path, Some("opus"), "max")
+            .await
+            .expect("the alias finds the ladder of the model it resolves to");
+        assert!(args.contains(&"--effort=max".to_string()), "{args:?}");
+    }
+
+    /// #2768: `ultracode` reaches the CLI only for a model whose live ladder
+    /// lists it, including the default model when no model is named.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn ultracode_is_accepted_only_when_the_cli_reports_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        seed_stub_ladders(
+            &binary_path,
+            serde_json::json!([
+                {"value":"default","resolvedModel":"claude-opus-9","displayName":"Default (recommended)",
+                 "supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]},
+                {"value":"sonnet","resolvedModel":"claude-sonnet-9","displayName":"Sonnet 9",
+                 "supportedEffortLevels":["low","medium","high","xhigh","max"]}
+            ]),
+        )
+        .await;
+        let client = test_client(binary_path);
+
+        let args = launch_with_effort(&client, &args_path, Some("claude-opus-9"), "ultracode")
+            .await
+            .expect("the CLI reports ultracode for opus");
+        assert!(args.contains(&"--effort=ultracode".to_string()), "{args:?}");
+        let args = launch_with_effort(&client, &args_path, None, "ultracode")
+            .await
+            .expect("the default model's ladder lists ultracode");
+        assert!(args.contains(&"--effort=ultracode".to_string()), "{args:?}");
+
+        let refused = launch_with_effort(&client, &args_path, Some("claude-sonnet-9"), "ultracode")
+            .await
+            .expect_err("sonnet's ladder does not list ultracode");
+        assert!(
+            matches!(refused, DaemonError::InvalidParam(ref message)
+                if message.contains("'ultracode'") && message.contains("xhigh, max")),
+            "got: {refused}"
+        );
+    }
+
+    /// #2768: after a restart no probe has run, so the launch path reads the
+    /// ladders once before an `ultracode` launch and the CLI's report decides.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn an_unprobed_binary_is_probed_once_before_an_ultracode_launch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let binary_path = tmp.path().join("claude");
+        let args_path = tmp.path().join("claude_args.bin");
+        let reply = serde_json::json!({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": model_discovery::PROBE_REQUEST_ID,
+                         "response": {"models": [
+                {"value":"default","resolvedModel":"claude-opus-9","displayName":"Default",
+                 "supportedEffortLevels":["low","high","ultracode"]}
+            ]}}
+        });
+        fs::write(
+            &binary_path,
+            format!(
+                r#"#!/usr/bin/env bash
+d="$(dirname "$0")"
+case " $* " in
+  *" --disable-slash-commands "*) echo probe >> "$d/probes"; cat > /dev/null; printf '%s\n' '{reply}'; exit 0 ;;
+esac
+: > "$d/claude_args.bin"
+for arg in "$@"; do printf '%s\0' "$arg" >> "$d/claude_args.bin"; done
+printf '{{"type":"result","subtype":"turn_completed","usage":{{"input_tokens":0,"output_tokens":0}}}}\n'
+"#
+            ),
+        )
+        .expect("write fake claude");
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let client = test_client(binary_path.clone());
+        let probes = || {
+            fs::read_to_string(tmp.path().join("probes"))
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+
+        client.ensure_effort_ladders_for(Some("high")).await;
+        assert_eq!(probes(), 0, "a compiled-list effort needs no probe");
+        client.ensure_effort_ladders_for(Some("ultracode")).await;
+        assert_eq!(probes(), 1);
+        client.ensure_effort_ladders_for(Some("ultracode")).await;
+        assert_eq!(probes(), 1, "a probed binary is not probed again");
+
+        let args = launch_with_effort(&client, &args_path, None, "ultracode")
+            .await
+            .expect("the default model reports ultracode");
+        assert!(args.contains(&"--effort=ultracode".to_string()), "{args:?}");
+    }
+
+    /// #2768: a model no probe described falls back to the compiled
+    /// `low..max` list, which passes `max` and refuses `ultracode`.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn unknown_model_falls_back_to_the_compiled_effort_list() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        seed_stub_ladders(
+            &binary_path,
+            serde_json::json!([
+                {"value":"opus","resolvedModel":"claude-opus-9","displayName":"Opus 9",
+                 "supportedEffortLevels":["low","ultracode"]}
+            ]),
+        )
+        .await;
+        let client = test_client(binary_path);
+
+        let args = launch_with_effort(&client, &args_path, Some("claude-fable-9"), "max")
+            .await
+            .expect("the compiled list passes max for an undescribed model");
+        assert!(args.contains(&"--effort=max".to_string()), "{args:?}");
+        let refused = launch_with_effort(&client, &args_path, Some("claude-fable-9"), "ultracode")
+            .await
+            .expect_err("ultracode is not reported for this model");
+        assert!(
+            matches!(refused, DaemonError::InvalidParam(ref message)
+                if message.contains("'ultracode'") && message.contains("low, medium, high, xhigh, max")),
+            "got: {refused}"
         );
     }
 
@@ -2328,7 +3809,8 @@ mod model_discovery_tests {
         let discovered = client
             .discover_models()
             .await
-            .expect("a failed probe falls back instead of erroring");
+            .expect("a failed probe falls back instead of erroring")
+            .models;
 
         let expected: Vec<(String, String)> = rsi_common::claude_catalog::CLAUDE_MODEL_MENU
             .iter()
@@ -2350,7 +3832,12 @@ mod model_discovery_tests {
             .await
             .expect("live initialize probe succeeds");
         println!("{models:#?}");
-        assert!(!models.is_empty());
-        assert!(models.iter().all(|(id, _)| id.starts_with("claude-")));
+        assert!(!models.models.is_empty());
+        assert!(
+            models
+                .models
+                .iter()
+                .all(|(id, _)| id.starts_with("claude-"))
+        );
     }
 }

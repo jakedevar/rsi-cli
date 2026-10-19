@@ -30,6 +30,12 @@ impl SessionManager {
             Err(error) if error.to_string().contains("provider_model_unknown") => {
                 Err(DaemonError::PolicyDenied(error.to_string()))
             }
+            Ok(()) => {
+                // #2735/#2752: the same typed `model_unavailable` the launch
+                // chokepoint raises, ahead of any candidate session.
+                self.enforce_launch_model_available(provider, Some(model))
+                    .await
+            }
             result => result,
         }
     }
@@ -41,7 +47,7 @@ impl SessionManager {
         match provider {
             SessionProvider::Claude => {
                 let client = crate::claude::ClaudeClient::for_discovery()?;
-                client.discover_models().await
+                Ok(client.discover_models().await?.models)
             }
             SessionProvider::Codex | SessionProvider::CodexAppServer => {
                 self.discover_codex_models(
@@ -72,6 +78,30 @@ impl SessionManager {
     }
 }
 
+/// The scripted test models fixtures launch by name (#1545, #2537). Each is an
+/// exact, registered entry: a lookalike such as `manager-scripted-provider-x`
+/// is NOT exempt and goes through the catalog like any other model.
+#[cfg(test)]
+pub(crate) const SCRIPTED_TEST_MODEL: &str = "manager-scripted-provider";
+/// The second allowed launch of the capacity-relaunch fixtures.
+#[cfg(test)]
+pub(crate) const SCRIPTED_TEST_SECOND_MODEL: &str = "manager-scripted-provider-second";
+/// The reseeded Pilot default of the reseed regression.
+#[cfg(test)]
+pub(crate) const SCRIPTED_TEST_RESEEDED_MODEL: &str = "manager-scripted-provider-reseeded";
+
+#[cfg(test)]
+const SCRIPTED_TEST_MODELS: &[&str] = &[
+    SCRIPTED_TEST_MODEL,
+    SCRIPTED_TEST_SECOND_MODEL,
+    SCRIPTED_TEST_RESEEDED_MODEL,
+];
+
+#[cfg(test)]
+fn is_registered_scripted_test_model(model: &str) -> bool {
+    SCRIPTED_TEST_MODELS.contains(&model)
+}
+
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
@@ -99,7 +129,7 @@ pub(super) async fn validate(
     // The scripted test provider is not in any real catalog; the manager-action
     // fixtures launch it by name (#1506 made that launch path validate models).
     #[cfg(test)]
-    if model == "manager-scripted-provider" {
+    if is_registered_scripted_test_model(model) {
         return Ok(());
     }
     let key = (provider, model.to_owned());
@@ -233,6 +263,28 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn only_registered_scripted_models_skip_the_catalog() {
+        for model in [
+            SCRIPTED_TEST_MODEL,
+            SCRIPTED_TEST_SECOND_MODEL,
+            SCRIPTED_TEST_RESEEDED_MODEL,
+        ] {
+            assert!(is_registered_scripted_test_model(model), "{model}");
+        }
+        for model in [
+            "manager-scripted-provider-unregistered",
+            "manager-scripted-provider-",
+            "manager-scripted",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "",
+        ] {
+            assert!(!is_registered_scripted_test_model(model), "{model}");
+        }
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[test]

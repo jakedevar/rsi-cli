@@ -13,25 +13,32 @@
 //! picker never goes empty. That catalog stays the source of context windows
 //! and of the labels for models it knows; the probe decides which models are
 //! offered.
+//!
+//! Each model entry also names its effort ladder (`supportedEffortLevels`,
+//! #2768). The ladders of the last good probe per binary are kept in a
+//! synchronous index ([`known_effort_ladder`]) so the launch can validate
+//! `--effort` against the model's own ladder; a model the probe did not
+//! describe falls back to the compiled `low..max` list.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use rsi_common::model_utils::ModelEffortCapabilities;
 use serde_json::Value;
 
 use crate::error::{DaemonError, Result};
 
 /// Request id stamped on the probe's control request and matched on the reply.
-pub(super) const PROBE_REQUEST_ID: &str = "rsi-model-discovery";
+pub(crate) const PROBE_REQUEST_ID: &str = "rsi-model-discovery";
 
 /// Argv after the binary. `-p` with stream-json input reads control requests
 /// from stdin and exits at EOF without a turn. The remaining flags keep the
 /// probe cheap and side-effect free: no MCP server connections, no session
 /// transcript on disk, no skill loading. `--bare` is deliberately absent: it
 /// skips OAuth, and the account's login is what decides the model list.
-pub(super) const PROBE_ARGS: &[&str] = &[
+pub(crate) const PROBE_ARGS: &[&str] = &[
     "-p",
     "--input-format",
     "stream-json",
@@ -48,7 +55,7 @@ pub(super) const PROBE_ARGS: &[&str] = &[
 pub(super) const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// One NDJSON `initialize` control request, newline-terminated.
-pub(super) fn probe_request() -> Vec<u8> {
+pub(crate) fn probe_request() -> Vec<u8> {
     let mut request = serde_json::json!({
         "type": "control_request",
         "request_id": PROBE_REQUEST_ID,
@@ -60,10 +67,42 @@ pub(super) fn probe_request() -> Vec<u8> {
     request
 }
 
+/// The alias the CLI uses for the account's default model. A launch with no
+/// `--model` runs it, so its ladder is the one such a launch is checked
+/// against.
+const DEFAULT_ALIAS: &str = "default";
+
+/// Bound on one effort token taken from the reply.
+const MAX_EFFORT_TOKEN_BYTES: usize = 32;
+
+/// One probe's answer: the picker rows plus each described model's ladder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeCatalog {
+    pub(crate) models: Vec<(String, String)>,
+    /// One entry per picker model whose reply named its ladder
+    /// (`supportedEffortLevels`, or `supportsEffort: false` for an empty
+    /// one). A model with neither is absent: its ladder is unknown.
+    pub(crate) efforts: Vec<ModelEffortCapabilities>,
+    /// Lookup key ([`ladder_key`] of the resolved id and of the alias
+    /// `value`) to that model's ladder.
+    ladders: HashMap<String, Vec<String>>,
+}
+
+impl ClaudeCatalog {
+    /// The compiled catalog as picker entries, in catalog order, with no
+    /// ladder: every model falls back to the compiled effort list.
+    fn compiled() -> Self {
+        Self {
+            models: catalog_models(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Last successful probe for one binary.
 struct CachedModels {
     observed_at: Instant,
-    models: Vec<(String, String)>,
+    catalog: ClaudeCatalog,
 }
 
 /// Keyed by the binary the probe ran. Held across a probe so concurrent
@@ -71,41 +110,71 @@ struct CachedModels {
 static CACHE: LazyLock<tokio::sync::Mutex<HashMap<PathBuf, CachedModels>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
-/// Return the cached list when fresh, else run `probe` once and cache its
-/// result. A failed probe answers with the last good list for this binary
+/// The ladders of the last good probe per binary, readable from the
+/// synchronous launch path. Written only with [`CACHE`] held.
+static LADDERS: LazyLock<StdMutex<HashMap<PathBuf, HashMap<String, Vec<String>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Return the cached catalog when fresh, else run `probe` once and cache its
+/// result. A failed probe answers with the last good catalog for this binary
 /// (however old) and then with the compiled catalog.
-pub(super) async fn cached_or_probe<F, Fut>(binary_path: &Path, probe: F) -> Vec<(String, String)>
+pub(super) async fn cached_or_probe<F, Fut>(binary_path: &Path, probe: F) -> ClaudeCatalog
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<(String, String)>>>,
+    Fut: std::future::Future<Output = Result<ClaudeCatalog>>,
 {
     let mut cache = CACHE.lock().await;
     if let Some(cached) = cache.get(binary_path)
         && cached.observed_at.elapsed() < CACHE_TTL
     {
-        return cached.models.clone();
+        return cached.catalog.clone();
     }
     match probe().await {
-        Ok(models) => {
+        Ok(catalog) => {
+            LADDERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(binary_path.to_path_buf(), catalog.ladders.clone());
             cache.insert(
                 binary_path.to_path_buf(),
                 CachedModels {
                     observed_at: Instant::now(),
-                    models: models.clone(),
+                    catalog: catalog.clone(),
                 },
             );
-            models
+            catalog
         }
         Err(error) => {
-            let stale = cache.get(binary_path).map(|cached| cached.models.clone());
+            let stale = cache.get(binary_path).map(|cached| cached.catalog.clone());
             tracing::warn!(
                 error = %error,
                 using_last_probe = stale.is_some(),
                 "Claude CLI model probe failed; using the last probe or the compiled catalog",
             );
-            stale.unwrap_or_else(catalog_models)
+            stale.unwrap_or_else(ClaudeCatalog::compiled)
         }
     }
+}
+
+/// The effort ladder the last good probe of `binary_path` reported for
+/// `model` (`None` = the CLI default model), or `None` when no probe of that
+/// binary described the model: the caller then uses the compiled list.
+pub(crate) fn known_effort_ladder(binary_path: &Path, model: Option<&str>) -> Option<Vec<String>> {
+    let key = ladder_key(model.unwrap_or(DEFAULT_ALIAS));
+    LADDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(binary_path)?
+        .get(&key)
+        .cloned()
+}
+
+/// Whether some probe of `binary_path` has succeeded since the daemon started.
+pub(crate) fn has_probed(binary_path: &Path) -> bool {
+    LADDERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(binary_path)
 }
 
 /// The compiled catalog as picker entries, in catalog order.
@@ -116,15 +185,52 @@ pub(super) fn catalog_models() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Extract the picker list from the probe's stdout.
+/// A model id or alias as a ladder lookup key: trimmed, context-variant tag
+/// (`[1m]`) dropped, lowercased.
+fn ladder_key(model: &str) -> String {
+    rsi_common::claude_catalog::strip_context_variant_suffix(model.trim()).to_ascii_lowercase()
+}
+
+/// The ladder one model entry reports: its `supportedEffortLevels` (unusable
+/// tokens dropped), an empty ladder for `supportsEffort: false`, else `None`
+/// (the reply does not say, so the ladder stays unknown).
+fn entry_ladder(entry: &Value) -> Option<Vec<String>> {
+    if let Some(levels) = entry.get("supportedEffortLevels").and_then(Value::as_array) {
+        return Some(levels.iter().filter_map(effort_token).collect());
+    }
+    if entry.get("supportsEffort").and_then(Value::as_bool) == Some(false) {
+        return Some(Vec::new());
+    }
+    None
+}
+
+/// One effort token as it may reach `--effort=`: a short lowercase word
+/// (a letter, then letters, digits, `-` or `_`).
+fn effort_token(level: &Value) -> Option<String> {
+    let token = level.as_str()?.trim();
+    let usable = token.len() <= MAX_EFFORT_TOKEN_BYTES
+        && token
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && token.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    usable.then(|| token.to_string())
+}
+
+/// Extract the picker list and the effort ladders from the probe's stdout.
 ///
 /// Reads NDJSON lines until the `control_response` for [`PROBE_REQUEST_ID`];
 /// other lines (and unparseable ones) are ignored. Each model's id is its
 /// `resolvedModel`, falling back to `value`, so aliases such as `opus` become
 /// the concrete id they point at and collapse into that id's entry. Only
 /// `claude-*` ids are kept: bare aliases the CLI did not resolve are not
-/// stable ids, and the TUI routes `claude-*` ids to this provider.
-pub(super) fn parse_initialize_models(stdout: &[u8]) -> Result<Vec<(String, String)>> {
+/// stable ids, and the TUI routes `claude-*` ids to this provider. Every
+/// entry's ladder is indexed under its alias `value` as well, so a launch
+/// naming `opus` or no model (`default`) finds the ladder of the model the
+/// alias resolves to.
+pub(super) fn parse_initialize_models(stdout: &[u8]) -> Result<ClaudeCatalog> {
     let text = String::from_utf8_lossy(stdout);
     let response = text
         .lines()
@@ -157,8 +263,10 @@ pub(super) fn parse_initialize_models(stdout: &[u8]) -> Result<Vec<(String, Stri
         })?;
 
     let mut models: Vec<(String, String)> = Vec::new();
+    let mut ladders: HashMap<String, Vec<String>> = HashMap::new();
     let mut default_entries = Vec::new();
     for entry in entries {
+        index_ladder(&mut ladders, entry);
         // The `default` alias is labelled "Default (recommended)", which is
         // not a model name. Take its label from any other entry for the same
         // id, and only fall back to it when nothing else names that model.
@@ -179,7 +287,44 @@ pub(super) fn parse_initialize_models(stdout: &[u8]) -> Result<Vec<(String, Stri
     // Keep the picker's family grouping (the first entry is the TUI's default
     // selection); within a family keep the CLI's own order, newest first.
     models.sort_by_key(|(id, _)| family_rank(id));
-    Ok(models)
+    let efforts = models
+        .iter()
+        .filter_map(|(id, _)| {
+            let supported_efforts = ladders.get(&ladder_key(id))?.clone();
+            Some(ModelEffortCapabilities {
+                model: id.clone(),
+                supported_efforts,
+                // The reply names no per-model default effort.
+                default_effort: None,
+            })
+        })
+        .collect();
+    Ok(ClaudeCatalog {
+        models,
+        efforts,
+        ladders,
+    })
+}
+
+/// Index `entry`'s ladder under its resolved id and its alias `value`. The
+/// first entry naming a key wins, matching the picker's first-entry rule.
+fn index_ladder(ladders: &mut HashMap<String, Vec<String>>, entry: &Value) {
+    let Some(ladder) = entry_ladder(entry) else {
+        return;
+    };
+    for key in ["resolvedModel", "value"] {
+        let Some(name) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        ladders
+            .entry(ladder_key(name))
+            .or_insert_with(|| ladder.clone());
+    }
 }
 
 fn push_entry(models: &mut Vec<(String, String)>, entry: &Value, is_default_alias: bool) {
@@ -268,7 +413,7 @@ mod tests {
     fn observed_reply_becomes_resolved_ids_grouped_by_family() {
         let models = parse_initialize_models(&observed_stdout()).expect("parses");
         assert_eq!(
-            pairs(&models),
+            pairs(&models.models),
             vec![
                 ("claude-fable-5-1", "Fable 5.1 (1M)"),
                 ("claude-fable-5", "Fable 5"),
@@ -295,7 +440,7 @@ mod tests {
         })
         .to_string();
         let models = parse_initialize_models(stdout.as_bytes()).expect("parses");
-        assert_eq!(pairs(&models), vec![("claude-sonnet-9", "Sonnet 9")]);
+        assert_eq!(pairs(&models.models), vec![("claude-sonnet-9", "Sonnet 9")]);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -310,7 +455,7 @@ mod tests {
         .to_string();
         let models = parse_initialize_models(stdout.as_bytes()).expect("parses");
         assert_eq!(
-            pairs(&models),
+            pairs(&models.models),
             vec![("claude-fable-5-1[1m]", "Fable 5.1 (1M)")]
         );
     }
@@ -362,25 +507,126 @@ mod tests {
         // Unique path so parallel tests sharing the process-wide cache cannot
         // collide with this binary key.
         let binary = PathBuf::from(format!("/nonexistent/claude-{}", uuid::Uuid::new_v4()));
-        let probed = vec![("claude-opus-9".to_string(), "Opus 9".to_string())];
+        let probed = parse_initialize_models(&stub_stdout(&[serde_json::json!(
+            {"value":"claude-opus-9","displayName":"Opus 9","supportedEffortLevels":["low","high"]}
+        )]))
+        .expect("parses");
 
-        // Failure with no prior probe for this binary: compiled catalog.
+        // Failure with no prior probe for this binary: compiled catalog, no
+        // ladder known for any model.
         let fallback = cached_or_probe(&binary, || async {
             Err(DaemonError::Process("boom".to_string()))
         })
         .await;
-        assert_eq!(fallback, catalog_models());
+        assert_eq!(fallback.models, catalog_models());
+        assert_eq!(fallback.efforts, Vec::new());
+        assert_eq!(known_effort_ladder(&binary, Some("claude-opus-9")), None);
 
         let first = cached_or_probe(&binary, || async { Ok(probed.clone()) }).await;
         assert_eq!(first, probed);
+        assert_eq!(
+            known_effort_ladder(&binary, Some("claude-opus-9")),
+            Some(vec!["low".to_string(), "high".to_string()])
+        );
 
         // Fresh cache: the probe must not run.
         let second = cached_or_probe(&binary, || async {
             panic!("fresh cache must not re-probe");
             #[allow(unreachable_code)]
-            Ok(Vec::new())
+            Ok(ClaudeCatalog::default())
         })
         .await;
         assert_eq!(second, probed);
+    }
+
+    /// One initialize reply carrying `models`.
+    fn stub_stdout(models: &[Value]) -> Vec<u8> {
+        serde_json::json!({
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": PROBE_REQUEST_ID, "response": {"models": models}}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// #2768: each model keeps the ladder the CLI reported, findable by its
+    /// resolved id, its alias and (for the `default` alias) by no model.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn reply_ladders_are_kept_per_model_and_found_by_id_alias_and_default() {
+        let catalog = parse_initialize_models(&stub_stdout(&[
+            serde_json::json!({"value":"default","resolvedModel":"claude-opus-9","displayName":"Default (recommended)","description":"Opus 9 · Best","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max","ultracode"]}),
+            serde_json::json!({"value":"sonnet","resolvedModel":"claude-sonnet-9","displayName":"Sonnet 9","supportsEffort":true,"supportedEffortLevels":["low","medium","high"]}),
+            serde_json::json!({"value":"haiku","resolvedModel":"claude-haiku-9","displayName":"Haiku 9","supportsEffort":false}),
+            serde_json::json!({"value":"claude-fable-9[1m]","resolvedModel":"claude-fable-9","displayName":"Fable 9"}),
+        ]))
+        .expect("parses");
+        let ladder = |key: &str| catalog.ladders.get(&ladder_key(key)).cloned();
+        let words = |levels: &[&str]| levels.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ladder("claude-opus-9"),
+            Some(words(&[
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultracode"
+            ]))
+        );
+        assert_eq!(ladder("default"), ladder("claude-opus-9"));
+        assert_eq!(ladder("sonnet"), Some(words(&["low", "medium", "high"])));
+        assert_eq!(
+            ladder("claude-sonnet-9[1m]"),
+            Some(words(&["low", "medium", "high"]))
+        );
+        assert_eq!(ladder("claude-haiku-9"), Some(Vec::new()));
+        assert_eq!(ladder("claude-fable-9"), None);
+        assert_eq!(
+            catalog.efforts,
+            vec![
+                ModelEffortCapabilities {
+                    model: "claude-opus-9".into(),
+                    supported_efforts: words(&[
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max",
+                        "ultracode"
+                    ]),
+                    default_effort: None,
+                },
+                ModelEffortCapabilities {
+                    model: "claude-sonnet-9".into(),
+                    supported_efforts: words(&["low", "medium", "high"]),
+                    default_effort: None,
+                },
+                ModelEffortCapabilities {
+                    model: "claude-haiku-9".into(),
+                    supported_efforts: Vec::new(),
+                    default_effort: None,
+                },
+            ]
+        );
+    }
+
+    /// Only short lowercase words reach `--effort=`; anything else the reply
+    /// carries in a ladder is dropped.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn ladder_tokens_are_short_lowercase_words() {
+        let catalog = parse_initialize_models(&stub_stdout(&[serde_json::json!(
+            {"value":"claude-opus-9","supportedEffortLevels":["high"," max ","--evil","Upper",7,"x".repeat(40),"ultracode"]}
+        )]))
+        .expect("parses");
+        assert_eq!(
+            catalog.ladders.get("claude-opus-9"),
+            Some(&vec![
+                "high".to_string(),
+                "max".to_string(),
+                "ultracode".to_string()
+            ])
+        );
     }
 }

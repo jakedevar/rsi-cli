@@ -69,6 +69,7 @@ fn appoint_request(target: AppointChildTargetV1, key: &str) -> AgentManagerAppoi
         query: "You manage your coverage. Call AgentGetAuthorityCatalog {} first.".into(),
         idempotency_key: key.into(),
         sandbox: Some(false),
+        handoff: None,
     }
 }
 
@@ -651,6 +652,215 @@ fn a_replaced_child_seat_loses_authority_and_the_node_keeps_its_ledger() {
     );
 }
 
+fn self_handoff(
+    node: &PortfolioNodeV1,
+    key: &str,
+    handoff: &str,
+) -> AgentManagerAppointChildRequestV1 {
+    let mut request = appoint_request(seat_target(node.node_id), key);
+    if let AppointChildTargetV1::Portfolio {
+        expected_grant_version,
+        ..
+    } = &mut request.target
+    {
+        *expected_grant_version = Some(node.grant.grant_version);
+    }
+    request.handoff = Some(handoff.into());
+    request
+}
+
+/// #2021: a node's own seat hands the seat to the session it launches. The
+/// node keeps its grant content, epoch and ledger principal; the old seat is
+/// refused at once; the handoff (old seat, new seat, path) is recorded and
+/// shown on the node's workspace. Operator-granted and node-granted nodes
+/// alike.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_portfolio_seat_hands_its_own_seat_on() {
+    let store = Store::open_in_memory().unwrap();
+    let (a, b, c) = (
+        project(&store, "A"),
+        project(&store, "B"),
+        project(&store, "C"),
+    );
+    let (global, old_seat) = operator_node(&store, "global", &[a, b, c], None, 0);
+    let (child, child_seat) = appoint_child(&store, old_seat, "area", &[b, c], 1);
+    let before = principal(&store, old_seat, a).unwrap();
+    assert!(
+        store
+            .last_seat_handoff_of(global.node_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let request = self_handoff(
+        &global,
+        "hand-global",
+        "thoughts/shared/handoffs/general/g.md",
+    );
+    let (appointment, versions) = appoint(&store, old_seat, &request).unwrap();
+    let new_seat = appointment.session_id;
+    let handed = store.get_portfolio_node(global.node_id).unwrap().unwrap();
+    assert_eq!(handed.grant.seat_session_id, new_seat);
+    assert_eq!(handed.authority_epoch, global.authority_epoch);
+    assert_eq!(handed.grant.project_ids, global.grant.project_ids);
+    assert_eq!(handed.grant.allowed_launches, global.grant.allowed_launches);
+    assert_eq!(handed.grant.project_policy, global.grant.project_policy);
+    assert_eq!(handed.grantor, "operator");
+    assert_eq!(
+        versions,
+        (handed.authority_epoch, handed.grant.grant_version)
+    );
+    assert!(handed.grant.grant_version > global.grant.grant_version);
+    assert_eq!(principal(&store, new_seat, a).unwrap(), before);
+    assert_eq!(
+        refusal(store.resolve_manager_caller(old_seat, Some(a))),
+        "manager_node_custody_changed"
+    );
+    assert_eq!(
+        refusal(store.begin_child_appointment(
+            old_seat,
+            &appoint_request(child_target("late", &[a], 1), "late")
+        )),
+        GLOBAL_MANAGER_NOT_SEAT
+    );
+    // The completion the launch published is returned to the old seat's call,
+    // not refused as a lost seat.
+    assert_eq!(
+        store
+            .finish_portfolio_appointment(old_seat, &request, &appointment)
+            .unwrap(),
+        versions
+    );
+    // The child the old seat appointed stays, under the same grantor node.
+    assert_eq!(
+        store
+            .get_portfolio_node(child.node_id)
+            .unwrap()
+            .unwrap()
+            .grant
+            .seat_session_id,
+        child_seat
+    );
+    let shown = store.last_seat_handoff_of(global.node_id).unwrap().unwrap();
+    assert_eq!(shown.old_seat, old_seat);
+    assert_eq!(shown.new_seat, new_seat);
+    assert_eq!(
+        shown.handoff.as_deref(),
+        Some("thoughts/shared/handoffs/general/g.md")
+    );
+    // The new seat can hand on again, and the child (granted by the node)
+    // hands its own seat on too.
+    let again = self_handoff(&handed, "hand-again", "abc1234");
+    let (second, _) = appoint(&store, new_seat, &again).unwrap();
+    assert_eq!(
+        store
+            .last_seat_handoff_of(global.node_id)
+            .unwrap()
+            .unwrap()
+            .new_seat,
+        second.session_id
+    );
+    let request = self_handoff(&child, "hand-area", "h.md");
+    let (third, _) = appoint(&store, child_seat, &request).unwrap();
+    let area = store.get_portfolio_node(child.node_id).unwrap().unwrap();
+    assert_eq!(area.grant.seat_session_id, third.session_id);
+    assert_eq!(area.grantor, child.grantor);
+    assert_eq!(area.parent_node_id, child.parent_node_id);
+}
+
+/// #2021: a self-handoff stays inside the node's own allowance and fences on
+/// the grant. A launch outside `allowed_launches`, a stale grant version and a
+/// handoff reference on any other target are refused before any session or
+/// appointment row exists; an operator re-seat between admission and the
+/// handoff wins.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_self_handoff_is_fenced_and_stays_inside_the_node() {
+    let store = Store::open_in_memory().unwrap();
+    let (a, b) = (project(&store, "A"), project(&store, "B"));
+    let (global, seat) = operator_node(&store, "global", &[a, b], None, 0);
+    let before = (
+        count(&store, "sessions"),
+        count(&store, "manager_portfolio_appointments"),
+    );
+    let mut disallowed = self_handoff(&global, "launch", "h.md");
+    disallowed.launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Codex,
+        model: "gpt-6-astra".into(),
+        effort: None,
+    };
+    let mut stale = self_handoff(&global, "stale", "h.md");
+    if let AppointChildTargetV1::Portfolio {
+        expected_grant_version,
+        ..
+    } = &mut stale.target
+    {
+        *expected_grant_version = Some(global.grant.grant_version + 1);
+    }
+    let mut outside = self_handoff(&global, "outside", "h.md");
+    if let AppointChildTargetV1::Portfolio {
+        launch_project_id, ..
+    } = &mut outside.target
+    {
+        *launch_project_id = Some(Uuid::new_v4());
+    }
+    let mut on_a_pm = appoint_request(AppointChildTargetV1::Project { project_id: a }, "pm");
+    on_a_pm.handoff = Some("h.md".into());
+    for (request, expected) in [
+        (disallowed, GLOBAL_LAUNCH_NOT_ALLOWED),
+        (stale, MANAGER_NODE_STALE),
+        (outside, MANAGER_PROJECT_NOT_IN_SCOPE),
+        (on_a_pm, "portfolio_invalid_request"),
+    ] {
+        assert_eq!(
+            refusal(store.begin_child_appointment(seat, &request)),
+            expected
+        );
+    }
+    assert_eq!(
+        before,
+        (
+            count(&store, "sessions"),
+            count(&store, "manager_portfolio_appointments")
+        )
+    );
+    // A seat that is not the node's seat has no node to hand on.
+    assert_eq!(
+        refusal(store.begin_child_appointment(
+            session(&store, None),
+            &self_handoff(&global, "stranger", "h.md")
+        )),
+        GLOBAL_MANAGER_NOT_SEAT
+    );
+    // An operator re-seat between admission and the handoff wins: the
+    // handoff is refused and the node stays with the operator's seat.
+    let request = self_handoff(&global, "race", "h.md");
+    let appointment = store.begin_child_appointment(seat, &request).unwrap();
+    launched(
+        &store,
+        appointment.session_id,
+        appointment.launch_project_id,
+    );
+    let operator_seat = session(&store, None);
+    let mut regrant = edit_of(&global, "operator-reseat");
+    regrant.seat_session_id = operator_seat;
+    let reseated = create(&store, &regrant).unwrap();
+    assert_eq!(
+        refusal(store.finish_portfolio_appointment(seat, &request, &appointment)),
+        GLOBAL_MANAGER_NOT_SEAT
+    );
+    let node = store.get_portfolio_node(global.node_id).unwrap().unwrap();
+    assert_eq!(node.grant.seat_session_id, operator_seat);
+    assert_eq!(node.grant.grant_version, reseated.grant.grant_version);
+    assert!(
+        store
+            .last_seat_handoff_of(global.node_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// An operator re-grant of the grantor between admission and appointment
 /// refuses the appointment; a context-cap successor of the same epoch
 /// finishes it.
@@ -1069,7 +1279,10 @@ fn an_inherited_pm_without_ancestors_fails_closed() {
     );
     assert_eq!(
         refusal(store.manager_launch_policy_gate(&independent, &[], &launch())),
-        "manager_v2_launch_not_granted: allowed_launches=[]"
+        format!(
+            "manager_v2_launch_not_granted: allowed_launches=[]; {}",
+            rsi_common::satellite_manager_policy::NO_LAUNCH_CHOICES_HINT
+        )
     );
     store
         .manager_launch_policy_gate(&independent, &[launch()], &launch())
@@ -1095,7 +1308,19 @@ fn an_inherited_pm_without_ancestors_fails_closed() {
     assert_eq!(store.manager_effective_launches(&pm, &[]).unwrap(), vec![]);
     assert_eq!(
         refusal(store.manager_launch_policy_gate(&pm, &[], &launch())),
-        "manager_v2_launch_not_granted: allowed_launches=[]"
+        format!(
+            "manager_v2_launch_not_granted: allowed_launches=[]; {}",
+            rsi_common::satellite_manager_policy::NO_LAUNCH_CHOICES_HINT
+        )
+    );
+    assert_eq!(
+        store
+            .satellite_manager_launches()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.project_id == a)
+            .map(|row| row.launches),
+        Some(0)
     );
     assert_eq!(
         refusal(store.manager_ancestor_launch_gate(&pm, &launch())),
@@ -1542,9 +1767,10 @@ fn assert_refused_before_any_effect(
         count(store, "sessions"),
         count(store, "manager_portfolio_appointments"),
     );
-    assert_eq!(
-        refusal(store.begin_child_appointment(caller, request)),
-        expected
+    let actual = refusal(store.begin_child_appointment(caller, request));
+    assert!(
+        actual == expected || actual.starts_with(&format!("{expected}:")),
+        "expected refusal prefix {expected}, got {actual}"
     );
     assert_eq!(
         (
@@ -2192,4 +2418,440 @@ fn the_resource_snapshot_reports_the_gates_charged_usage() {
         .unwrap();
     assert_eq!(agrees(root_seat, 2), (Some(5.0), 0));
     assert_eq!(agrees(child_seat, 1), (Some(2.5), 0));
+}
+
+/// #1905: a wildcard effort reaches PM admission, inspection and live ancestry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_no_effort_grant_admits_every_pm_effort_and_intersects_exact_choices() {
+    let store = Store::open_in_memory().unwrap();
+    let project_id = project(&store, "P");
+    let (node, seat) = operator_node(&store, "global", &[project_id], None, 0);
+    let mut edit = edit_of(&node, "any-effort");
+    edit.allowed_launches[0].effort = None;
+    let any = edit.allowed_launches[0].clone();
+    let node = create(&store, &edit).unwrap();
+    appoint(
+        &store,
+        seat,
+        &appoint_request(
+            AppointChildTargetV1::Project { project_id },
+            "pm-any-effort",
+        ),
+    )
+    .unwrap();
+    let pm = store.get_harness_manager(project_id).unwrap().unwrap();
+    for effort in rsi_common::model_utils::effort_ladder(&any.model) {
+        let exact = ManagerLaunchChoiceV2 {
+            effort: Some((*effort).into()),
+            ..any.clone()
+        };
+        Store::global_launch_allowed(&node.grant, &exact).unwrap();
+        store.manager_launch_policy_gate(&pm, &[], &exact).unwrap();
+        store.manager_ancestor_launch_gate(&pm, &exact).unwrap();
+        assert_eq!(
+            store
+                .manager_effective_launches(&pm, &[exact.clone()])
+                .unwrap(),
+            vec![exact]
+        );
+    }
+    let other = ManagerLaunchChoiceV2 {
+        model: "another-model".into(),
+        ..any.clone()
+    };
+    assert!(Store::global_launch_allowed(&node.grant, &other).is_err());
+    assert!(store.manager_launch_policy_gate(&pm, &[], &other).is_err());
+    assert!(store.manager_ancestor_launch_gate(&pm, &other).is_err());
+    let inspection = store
+        .manager_v2_inspect(
+            pm.manager_session_id,
+            &rsi_common::harness_manager_v2::AgentManagerInspectRequestV2::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&inspection).unwrap()["launches_display"][0],
+        any.display()
+    );
+    assert_eq!(
+        inspection.policy.unwrap().policy.allowed_launches,
+        vec![any.clone()]
+    );
+    let mut exact_edit = edit_of(&node, "exact-effort");
+    exact_edit.allowed_launches[0].effort = Some("high".into());
+    create(&store, &exact_edit).unwrap();
+    let high = exact_edit.allowed_launches[0].clone();
+    assert_eq!(
+        store
+            .manager_effective_launches(&pm, &[any.clone()])
+            .unwrap(),
+        vec![high.clone()]
+    );
+    store
+        .manager_launch_policy_gate(&pm, &[any.clone()], &high)
+        .unwrap();
+    let low = ManagerLaunchChoiceV2 {
+        effort: Some("low".into()),
+        ..any
+    };
+    assert!(store.manager_launch_policy_gate(&pm, &[], &low).is_err());
+    assert!(store.manager_ancestor_launch_gate(&pm, &low).is_err());
+}
+
+/// #2494: VM instructions `work` runs on `store`'s connection.
+fn vm_ops(store: &Store, work: impl FnOnce()) -> u64 {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let counter = Arc::new(AtomicU64::new(0));
+    let handle = Arc::clone(&counter);
+    store.conn.progress_handler(
+        1,
+        Some(move || {
+            handle.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    );
+    work();
+    store.conn.progress_handler(1, None::<fn() -> bool>);
+    counter.load(Ordering::Relaxed)
+}
+
+/// A project manager with a portfolio node above it and `members` running
+/// workers (each with ten admitted invocations, half of them created by the
+/// node) under its Epic: the shape of an idle hub whose launches are charged
+/// to a node at its cap.
+fn busy_project_2494(
+    store: &Store,
+    members: usize,
+) -> (
+    rsi_common::harness_manager::HarnessManagerConfigV1,
+    rsi_common::types::Session,
+) {
+    let (config, lead) = crate::store::manager_coordinator::tests::fixture(
+        store,
+        ManagerPolicyV2 {
+            mode: ManagerOperatingModeV2::Execute,
+            max_active_sessions: 100,
+            max_created_sessions: 1000,
+            max_created_containers: 60,
+            ..ManagerPolicyV2::default()
+        },
+    );
+    let (_node, seat) = node_with(store, "root", &[config.project_id], None, 0, |p| {
+        p.max_active_sessions = 100;
+    });
+    let node_config = node_authority(store, seat, config.project_id).config;
+    for n in 0..members {
+        let mut child = lead.clone();
+        child.id = Uuid::new_v4();
+        child.session_kind = SessionKind::Task;
+        child.status = SessionStatus::Running;
+        child.cost_usd = Some(0.25);
+        child.lead_session_id = None;
+        store.insert_session(&child).unwrap();
+        for _ in 0..10 {
+            crate::store::manager_resources::tests::admitted(store, &child);
+        }
+        if n % 2 == 0 {
+            store
+                .seed_manager_action_for_test(
+                    &node_config,
+                    rsi_common::harness_manager_v2::ManagerActionV2::CreateSession {
+                        parent_id: lead.parent_id.unwrap(),
+                        kind: SessionKind::Task,
+                        query: "worker".into(),
+                        launch: launch(),
+                        sandbox_source: None,
+                    },
+                    rsi_common::harness_manager_v2::ManagerActionStateV2::Succeeded,
+                    Some(child.id),
+                )
+                .unwrap();
+        }
+    }
+    (config, lead)
+}
+
+/// #2494: what one coordinator pass reads per managed project grows with the
+/// members it manages at a bounded rate. Counted in SQLite VM instructions
+/// (deterministic), as the extra instructions per added member. Before the
+/// pass shared one cohort read and skipped members with nothing to refresh, a
+/// reconcile cost about 4,400 per member, the question refresh alone 2,200.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_manager_pass_costs_a_bounded_number_of_instructions_per_member_2494() {
+    const MEMBERS: u64 = 40;
+    let mut cost = Vec::new();
+    for members in [0, MEMBERS as usize] {
+        let store = Store::open_in_memory().unwrap();
+        let (config, _) = busy_project_2494(&store, members);
+        let project = config.project_id;
+        let snapshot = vm_ops(&store, || {
+            store.manager_v2_resource_snapshot(&config).unwrap();
+        });
+        let questions = vm_ops(&store, || {
+            store
+                .manager_v2_refresh_question_decisions(&config)
+                .unwrap();
+        });
+        let gate = vm_ops(&store, || {
+            store
+                .manager_v2_own_charged_usage_for_test(&config, SessionProvider::Codex)
+                .unwrap();
+        });
+        // The first pass writes the projections; the second still reads
+        // everything (the idle memo needs a quiet third).
+        store.reconcile_manager_intent(project, true).unwrap();
+        let reconcile = vm_ops(&store, || {
+            store.reconcile_manager_intent(project, true).unwrap();
+        });
+        cost.push((snapshot, questions, gate, reconcile));
+    }
+    let per_member = |pick: fn(&(u64, u64, u64, u64)) -> u64| {
+        pick(&cost[1]).saturating_sub(pick(&cost[0])) / MEMBERS
+    };
+    let (snapshot, questions, gate, reconcile) = (
+        per_member(|c| c.0),
+        per_member(|c| c.1),
+        per_member(|c| c.2),
+        per_member(|c| c.3),
+    );
+    eprintln!(
+        "issue2494_cost per member: snapshot={snapshot} question_refresh={questions} charged_usage={gate} reconcile_pass={reconcile}; base: {:?}",
+        cost[0]
+    );
+    assert!(snapshot <= 2_000, "snapshot {snapshot}/member");
+    assert!(questions <= 800, "question refresh {questions}/member");
+    assert!(gate <= 2_000, "charged usage {gate}/member");
+    assert!(reconcile <= 2_400, "reconcile pass {reconcile}/member");
+}
+
+/// #2494: skipping members with nothing to refresh must not skip a member that
+/// has something: a pending question still gets its decision, and the
+/// projection of one that is gone still resolves.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_pass_still_projects_the_one_member_holding_a_question_2494() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = busy_project_2494(&store, 12);
+    crate::store::manager_coordinator::tests::raise_question(&store, lead.id, 1);
+    assert_eq!(
+        store
+            .manager_v2_refresh_question_decisions(&config)
+            .unwrap(),
+        1
+    );
+    let key = format!("question:{}", lead.id);
+    let record = store
+        .manager_v2_record(&config, "decision", &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.payload["status"], "pending");
+    // Only the questioned member has a question projection.
+    let projected: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_manager_v2_records
+             WHERE project_id=?1 AND record_key LIKE 'question:%' AND kind IN ('decision','intent')",
+            [config.project_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(projected, 1);
+    // The question goes away: its projection resolves although no member holds it.
+    store
+        .update_session_pending_question_json(lead.id, None)
+        .unwrap();
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let record = store
+        .manager_v2_record(&config, "decision", &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.payload["status"], "resolved_externally");
+}
+
+/// #2494: the tag and summary hydration behind every session list prepares
+/// one statement for any batch size and still returns each session's tags.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn session_list_hydration_uses_one_cached_statement_for_any_batch_2494() {
+    let store = Store::open_in_memory().unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..300 {
+        let row = test_session(Uuid::new_v4(), PathBuf::from("/tmp/portfolio"));
+        store.insert_session(&row).unwrap();
+        ids.push(row.id);
+    }
+    for (n, tag) in [(3usize, "beta"), (3, "alpha"), (250, "gamma")] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO session_tags(session_id,tag) VALUES(?1,?2)",
+                params![ids[n].to_string(), tag],
+            )
+            .unwrap();
+    }
+    let sessions = store.load_sessions().unwrap();
+    assert_eq!(sessions.len(), 300);
+    let tags = |id: Uuid| sessions.iter().find(|s| s.id == id).unwrap().tags.clone();
+    assert_eq!(tags(ids[3]), vec!["alpha".to_string(), "beta".to_string()]);
+    assert_eq!(tags(ids[250]), vec!["gamma".to_string()]);
+    assert!(tags(ids[0]).is_empty());
+    assert_eq!(
+        sessions.iter().find(|s| s.id == ids[3]).unwrap().tag,
+        "alpha"
+    );
+    // A second load reuses the prepared statements: the parse of a 300-way
+    // placeholder list is gone, so it costs a bounded number of instructions
+    // per session (about 190 measured at the time of the change).
+    let ops = vm_ops(&store, || {
+        store.load_sessions().unwrap();
+    });
+    eprintln!("issue2494_cost load_sessions 300 sessions VM ops={ops}");
+    assert!(ops <= 300 * 400, "load_sessions {ops} ops");
+}
+
+/// #2494: seed `held` queued creates under the project manager.
+fn queue_creates_2494(
+    store: &Store,
+    config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    parent: Uuid,
+    held: usize,
+) {
+    for n in 0..held {
+        store
+            .seed_manager_action_with_context_for_test(
+                config,
+                rsi_common::harness_manager_v2::ManagerActionV2::CreateSession {
+                    parent_id: parent,
+                    kind: SessionKind::Task,
+                    query: format!("held {n}"),
+                    launch: launch(),
+                    sandbox_source: None,
+                },
+                rsi_common::harness_manager_v2::ManagerActionStateV2::Queued,
+                None,
+                config.manager_session_id,
+            )
+            .unwrap();
+    }
+}
+
+/// #2494: a backlog of creates the host-admission gate holds is looked at on
+/// every tick of the manager action loop. The first tick scans the queue (about
+/// 1,600 VM instructions per held create); while nothing is written, every
+/// later tick only asks the gate about the oldest create again, whatever the
+/// backlog, and the gate is still asked once per tick.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_held_create_backlog_costs_a_constant_number_of_instructions_per_tick_2494() {
+    const HELD: u64 = 64;
+    const TICKS: u64 = 10;
+    let mut cost = Vec::new();
+    for held in [1, HELD as usize] {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = busy_project_2494(&store, 0);
+        queue_creates_2494(&store, &config, lead.parent_id.unwrap(), held);
+        let boot = Uuid::new_v4();
+        let changes = store.conn.total_changes();
+        let asked = std::cell::Cell::new(0u64);
+        let tick = || {
+            let claim = store
+                .claim_manager_action_with_create_admission(boot, false, &|_, _, _| {
+                    asked.set(asked.get() + 1);
+                    false
+                })
+                .unwrap();
+            assert!(claim.is_none(), "a held create must stay queued");
+        };
+        let first = vm_ops(&store, tick);
+        let reuses = store.manager_intent_idle.borrow().held_claim_reuses;
+        let later = vm_ops(&store, || {
+            for _ in 0..TICKS {
+                tick();
+            }
+        });
+        assert_eq!(
+            store.manager_intent_idle.borrow().held_claim_reuses - reuses,
+            TICKS,
+            "every quiet tick reuses the held claim"
+        );
+        assert_eq!(store.conn.total_changes(), changes, "a held tick writes");
+        // The gate is asked about the oldest create on every tick.
+        assert_eq!(asked.get(), TICKS + 1);
+        eprintln!(
+            "issue2494_cost held creates={held}: first tick={first} ops, quiet tick={} ops",
+            later / TICKS
+        );
+        cost.push((first, later / TICKS));
+    }
+    assert!(cost[1].0 <= 3_000 * HELD, "scan {} ops", cost[1].0);
+    assert!(cost[1].1 <= 400, "a quiet tick costs {} ops", cost[1].1);
+    assert!(
+        cost[1].1 <= cost[0].1 + 50,
+        "quiet tick grows with the backlog: {} -> {}",
+        cost[0].1,
+        cost[1].1
+    );
+}
+
+/// #2494: the memo never outlives what it observed: a write, an admission that
+/// lets the create go, or a claim of the create itself ends it, and the gate is
+/// asked exactly once for a create it admits.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_held_claim_is_reconsidered_after_a_write_or_an_admission_2494() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = busy_project_2494(&store, 0);
+    queue_creates_2494(&store, &config, lead.parent_id.unwrap(), 3);
+    let boot = Uuid::new_v4();
+    let asked = std::cell::Cell::new(0u64);
+    let hold = |_: Uuid, _: chrono::DateTime<chrono::Utc>, _: Option<Uuid>| {
+        asked.set(asked.get() + 1);
+        false
+    };
+    for _ in 0..3 {
+        assert!(
+            store
+                .claim_manager_action_with_create_admission(boot, false, &hold)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(store.manager_intent_idle.borrow().held_claim_reuses, 2);
+    // A later write (here: another queued create) is rescanned, not reused.
+    queue_creates_2494(&store, &config, lead.parent_id.unwrap(), 1);
+    assert!(
+        store
+            .claim_manager_action_with_create_admission(boot, false, &hold)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.manager_intent_idle.borrow().held_claim_reuses, 2);
+    // The gate lets the oldest create go: it is claimed after one question.
+    let before = asked.get();
+    let admit_once = |_: Uuid, _: chrono::DateTime<chrono::Utc>, _: Option<Uuid>| {
+        asked.set(asked.get() + 1);
+        true
+    };
+    let claim = store
+        .claim_manager_action_with_create_admission(boot, false, &admit_once)
+        .unwrap()
+        .expect("an admitted create is claimed");
+    assert_eq!(asked.get() - before, 1, "the gate is asked once, not twice");
+    assert!(claim.operation.is_new_worker_create());
+    // The claimed create leaves nothing to reuse.
+    assert!(
+        store
+            .manager_intent_idle
+            .borrow()
+            .held_claim(
+                store.manager_intent_observation_version().unwrap().unwrap(),
+                false,
+                chrono::Utc::now()
+            )
+            .is_none()
+    );
 }

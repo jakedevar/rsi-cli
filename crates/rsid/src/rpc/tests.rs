@@ -2,6 +2,51 @@ use super::*;
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
+async fn agent_schema_refusal_includes_nested_limit_without_changing_rpc_code() {
+    let fixture = recursive_dag_rpc_fixture();
+    let caller = Uuid::new_v4();
+    fixture
+        .manager
+        .store()
+        .lock()
+        .await
+        .insert_session(&mk_agent_test_session(
+            caller,
+            rsi_common::types::SessionKind::Task,
+            None,
+            None,
+        ))
+        .unwrap();
+    fixture
+        .manager
+        .register_agent_token(
+            "5ee5de3acc60f194d78d4e131df481629346120b4b011aa04b82edf4746a0d8a".into(),
+            caller,
+        )
+        .await;
+    let mut request = RpcRequest::new(
+        "AgentSubmitJob",
+        serde_json::json!({
+            "kind":"test", "params":{"package":"rsi","timeout_minutes":181}
+        }),
+    );
+    request.session_token =
+        Some("5ee5de3acc60f194d78d4e131df481629346120b4b011aa04b82edf4746a0d8a".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    let error = response.error.expect("request refused");
+    assert_eq!(error.code, INVALID_PARAMS);
+    let detail = error.data.expect("schema diagnostics");
+    assert_eq!(detail["path"], "params.params.timeout_minutes");
+    assert_eq!(detail["constraint"], "maximum 180");
+    assert_eq!(detail["value"], 181);
+    assert_eq!(detail["field"], "params");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
 async fn remote_operator_info_uses_socket_dispatch_and_agent_token_is_denied() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -82,9 +127,14 @@ fn satellite_operator_methods_stay_out_of_agent_catalogs() {
         "PutSatellitePeerScope",
         "GetSatelliteInboundPolicy",
         "PutSatelliteInboundPolicy",
+        "GetSatelliteScopeStatus",
         "DeliverHubMessage",
         "FetchHubReports",
         "RequestHubDeploy",
+        "RequestHubManagerPolicy",
+        "RequestHubManagerReseat",
+        "ReseatHarnessManager",
+        "RequestHubQaRun",
     ] {
         assert!(!agent_gate::AGENT_VERBS.contains(&method));
         assert!(!agent_gate::READ_VERBS.contains(&method));
@@ -443,7 +493,12 @@ fn codegraph_operator_reads_stay_outside_attributed_agent_surface() {
 #[test]
 fn claim_boundary_mail_is_hook_only_not_cataloged() {
     // #1183: the hook's confirmation verb has the same audience.
-    for verb in ["ClaimBoundaryMail", "ConfirmBoundaryMail"] {
+    // #2766: the lifecycle hook's record verb has the same audience.
+    for verb in [
+        "ClaimBoundaryMail",
+        "ConfirmBoundaryMail",
+        "RecordProviderLifecycleEvent",
+    ] {
         assert!(agent_gate::is_allowed_for_attributed_caller(verb));
         assert!(!agent_gate::AGENT_VERBS.contains(&verb));
         assert!(!agent_gate::READ_VERBS.contains(&verb));
@@ -553,7 +608,7 @@ fn recursive_dag_rpc_fixture() -> RecursiveDagRpcFixture {
 
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("rsi.db");
-    let store = Store::open(&db_path).expect("open store");
+    let store = Store::open_test_fixture(&db_path).expect("open store");
     store
         .insert_project(&rsi_common::types::Project {
             id: issue_rpc_project_id(),
@@ -642,6 +697,34 @@ async fn call_rpc(server: &RpcServer, method: &str, mut params: serde_json::Valu
         panic!("expected response");
     };
     response
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn resource_governor_rpc_stays_responsive_during_store_stall() {
+    let fixture = recursive_dag_rpc_fixture();
+    let store = fixture.manager.store().clone();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _guard = store.blocking_lock();
+        let _ = locked_tx.send(());
+        std::thread::sleep(std::time::Duration::from_millis(1_000));
+    });
+    locked_rx.await.expect("store lock acquired");
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        call_rpc(
+            &fixture.server,
+            "GetResourceGovernor",
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("governor RPC must not wait for the persistence Store lock");
+    assert!(response.error.is_none(), "governor snapshot should succeed");
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
 }
 
 async fn seed_active_model_invocation(
@@ -1980,6 +2063,7 @@ fn test_launch_session_params_mapping() {
         parent_id: None,
         openai_base_url: None,
         openai_api_key: None,
+        custom_provider_id: None,
         workflow_id: None,
         max_retries: None,
         group_id: None,
@@ -2041,6 +2125,7 @@ fn test_launch_session_params_mapping() {
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     };
 
     assert_eq!(config.query, "Hello");
@@ -2136,7 +2221,7 @@ async fn recursive_dag_rpc_read_only_inspection_dispatches() {
 
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("rsi.db");
-    let store = Store::open(&db_path).expect("open store");
+    let store = Store::open_test_fixture(&db_path).expect("open store");
     let config = Config::from_env();
     let runtime_config = RuntimeConfig::from_config(&config);
     let bus = std::sync::Arc::new(EventBus::new(16));
@@ -4609,6 +4694,22 @@ fn mk_agent_test_session(
     }
 }
 
+/// #2060: every delegated operator method the authority catalog lists is
+/// reachable only through the `operator_call` manager action; a session token
+/// calling it directly is refused, so the catalog must name that path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn delegated_operator_methods_are_not_direct_session_rpc_methods() {
+    use rsi_common::manager_operator_delegation::DELEGABLE_OPERATOR_METHODS;
+    assert!(!DELEGABLE_OPERATOR_METHODS.is_empty());
+    for method in DELEGABLE_OPERATOR_METHODS {
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method} is listed as delegated but would also be a direct agent verb"
+        );
+    }
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn agent_gate_attributed_call_to_unlisted_method_is_denied() {
@@ -4616,7 +4717,7 @@ async fn agent_gate_attributed_call_to_unlisted_method_is_denied() {
     let fixture = recursive_dag_rpc_fixture();
     for method in ["LaunchSession", "SetEpicLead"] {
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response");
@@ -4648,11 +4749,13 @@ async fn manager_rpc_appointment_is_operator_only() {
         "RevokeManagerNode",
         "GetHarnessManagerPolicy",
         "ConfigureHarnessManagerPolicy",
+        "ConfigureHarnessManagerWithPolicy",
         "GetHarnessManagerState",
         "AnswerHarnessManagerDecision",
         "ConfigureGlobalManager",
         "GetGlobalManager",
         "GetGlobalManagerWorkspace",
+        "GetGlobalManagerBudget",
         "GetManagerNodeWorkspace",
         "GetFleetOverview",
         "RevokeGlobalManager",
@@ -4682,6 +4785,83 @@ async fn manager_rpc_appointment_is_operator_only() {
                 .contains("not available to session-attributed callers")
         );
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_rpc_appoints_a_manager_with_its_policy_atomically() {
+    use rsi_common::harness_manager_v2::{
+        ConfigureHarnessManagerWithPolicyResultV2, ManagerCapabilityV2, ManagerOperatingModeV2,
+        ManagerPolicyV2,
+    };
+    use rsi_common::types::SessionKind;
+    let fixture = recursive_dag_rpc_fixture();
+    let project = issue_rpc_project_id();
+    let seat = Uuid::new_v4();
+    {
+        let store = fixture.manager.store().lock().await;
+        let mut session = mk_agent_test_session(seat, SessionKind::Standard, None, None);
+        session.project_id = Some(project);
+        store.insert_session(&session).unwrap();
+    }
+    // A refused grant (a Group that does not exist) leaves no appointment.
+    let refused = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerWithPolicy",
+        serde_json::json!({
+            "scope": {"project_id": project, "session_id": seat, "expected_row_version": 0},
+            "expected_policy_version": 0,
+            "idempotency_key": "appoint-refused",
+            "policy": ManagerPolicyV2 { group_ids: vec![Uuid::new_v4()], ..Default::default() },
+        }),
+    )
+    .await;
+    assert!(refused.error.is_some(), "{:?}", refused.result);
+    let none = call_rpc(
+        &fixture.server,
+        "GetHarnessManager",
+        serde_json::json!({"project_id": project}),
+    )
+    .await;
+    assert!(none.error.is_none(), "{:?}", none.error);
+    assert!(none.result.as_ref().is_some_and(serde_json::Value::is_null));
+    // The accepted call saves the appointment and its live grant together.
+    let policy = ManagerPolicyV2 {
+        mode: ManagerOperatingModeV2::Execute,
+        capabilities: vec![
+            ManagerCapabilityV2::WorkPlan,
+            ManagerCapabilityV2::SessionCreate,
+        ],
+        max_created_sessions: 9,
+        ..Default::default()
+    };
+    let appointed = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerWithPolicy",
+        serde_json::json!({
+            "scope": {"project_id": project, "session_id": seat, "expected_row_version": 0},
+            "expected_policy_version": 0,
+            "idempotency_key": "appoint-with-grant",
+            "policy": policy,
+        }),
+    )
+    .await;
+    assert!(appointed.error.is_none(), "{:?}", appointed.error);
+    let result: ConfigureHarnessManagerWithPolicyResultV2 =
+        serde_json::from_value(appointed.result.unwrap()).unwrap();
+    assert_eq!(result.config.manager_session_id, seat);
+    assert_eq!(result.policy.scope_version, result.config.row_version);
+    assert!(!result.policy.revoked);
+    let stored = call_rpc(
+        &fixture.server,
+        "GetHarnessManagerPolicy",
+        serde_json::json!({"project_id": project}),
+    )
+    .await;
+    assert!(stored.error.is_none(), "{:?}", stored.error);
+    let stored = stored.result.unwrap();
+    assert_eq!(stored["policy"]["max_created_sessions"], 9);
+    assert_eq!(stored["revoked"], false);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4817,7 +4997,10 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
 
     fixture
         .manager
-        .register_agent_token("area-delegator-token".into(), owner)
+        .register_agent_token(
+            "ebab1168826a0c3e4bceb6c03cc5921f8b789bd069e0ea81d5c3dc63339926a5".into(),
+            owner,
+        )
         .await;
     let mut delegated_request = serde_json::to_value(request).unwrap();
     delegated_request
@@ -4826,7 +5009,8 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
         .remove("project_id");
     delegated_request["idempotency_key"] = "area-delegated".into();
     let mut rpc = RpcRequest::new("AgentManagerDelegateNode", delegated_request);
-    rpc.session_token = Some("area-delegator-token".into());
+    rpc.session_token =
+        Some("ebab1168826a0c3e4bceb6c03cc5921f8b789bd069e0ea81d5c3dc63339926a5".into());
     let HandleResult::Response(delegated) = fixture.server.handle_request_inner(&rpc).await else {
         panic!("expected delegation response");
     };
@@ -4835,7 +5019,10 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
     assert_eq!(delegated["parent_node_id"], root_id.to_string());
     fixture
         .manager
-        .register_agent_token("area-escalator-token".into(), area_seat)
+        .register_agent_token(
+            "de08940a07b092bcd9c8eb719d6168383be6551d57d610a35100379e97673389".into(),
+            area_seat,
+        )
         .await;
     let mut escalate = RpcRequest::new(
         "AgentManagerEscalate",
@@ -4849,7 +5036,8 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
             "expected_target_session_id":owner,"idempotency_key":"area-escalate"
         }),
     );
-    escalate.session_token = Some("area-escalator-token".into());
+    escalate.session_token =
+        Some("de08940a07b092bcd9c8eb719d6168383be6551d57d610a35100379e97673389".into());
     let HandleResult::Response(escalated) = fixture.server.handle_request_inner(&escalate).await
     else {
         panic!("expected escalation response");
@@ -4857,7 +5045,8 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
     assert!(escalated.error.is_none(), "{:?}", escalated.error);
     let escalation = escalated.result.unwrap();
     let mut list = RpcRequest::new("AgentManagerListEscalations", serde_json::json!({}));
-    list.session_token = Some("area-delegator-token".into());
+    list.session_token =
+        Some("ebab1168826a0c3e4bceb6c03cc5921f8b789bd069e0ea81d5c3dc63339926a5".into());
     let HandleResult::Response(listed) = fixture.server.handle_request_inner(&list).await else {
         panic!("expected escalation list");
     };
@@ -4873,7 +5062,8 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
             "idempotency_key":"area-ruling"
         }),
     );
-    resolve.session_token = Some("area-delegator-token".into());
+    resolve.session_token =
+        Some("ebab1168826a0c3e4bceb6c03cc5921f8b789bd069e0ea81d5c3dc63339926a5".into());
     let HandleResult::Response(resolved) = fixture.server.handle_request_inner(&resolve).await
     else {
         panic!("expected escalation ruling");
@@ -4881,7 +5071,8 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
     assert!(resolved.error.is_none(), "{:?}", resolved.error);
     assert_eq!(resolved.result.unwrap()["state"], "ruled");
     let mut sent = RpcRequest::new("AgentManagerListEscalations", serde_json::json!({}));
-    sent.session_token = Some("area-escalator-token".into());
+    sent.session_token =
+        Some("de08940a07b092bcd9c8eb719d6168383be6551d57d610a35100379e97673389".into());
     let HandleResult::Response(sent) = fixture.server.handle_request_inner(&sent).await else {
         panic!("expected sent escalation list");
     };
@@ -4917,7 +5108,10 @@ async fn manager_rpc_v2_operator_policy_board_and_exact_answer_flow() {
     }
     fixture
         .manager
-        .register_agent_token("manager-v2-pilot".into(), owner)
+        .register_agent_token(
+            "046b9016d645c4bcc6c585c1546dd08bad25ccea1be84b340f282e793577d1b8".into(),
+            owner,
+        )
         .await;
     let appointed = call_rpc(
         &fixture.server,
@@ -4975,7 +5169,8 @@ async fn manager_rpc_v2_operator_policy_board_and_exact_answer_flow() {
     assert_eq!(policy.result.unwrap()["policy"]["mode"], "monitor");
     async fn agent(server: &RpcServer, method: &str, params: serde_json::Value) -> RpcResponse {
         let mut request = RpcRequest::new(method, params);
-        request.session_token = Some("manager-v2-pilot".into());
+        request.session_token =
+            Some("046b9016d645c4bcc6c585c1546dd08bad25ccea1be84b340f282e793577d1b8".into());
         let HandleResult::Response(response) = server.handle_request_inner(&request).await else {
             panic!("expected response")
         };
@@ -5089,18 +5284,24 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     }
     fixture
         .manager
-        .register_agent_token("manager-pilot".into(), manager_id)
+        .register_agent_token(
+            "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3".into(),
+            manager_id,
+        )
         .await;
     for (index, lead) in leads.iter().enumerate() {
         fixture
             .manager
-            .register_agent_token(format!("lead-{index}"), *lead)
+            .register_agent_token(
+                crate::test_support::agent_token(&format!("lead-{index}")),
+                *lead,
+            )
             .await;
     }
     assert!(
         invoke(
             &fixture.server,
-            "manager-pilot",
+            "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
             "AgentManagerProgress",
             serde_json::json!({})
         )
@@ -5120,6 +5321,11 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     let config: HarnessManagerConfigV1 =
         serde_json::from_value(appointment.result.unwrap()).unwrap();
     assert_eq!(config.current_session_id, Some(manager_id));
+    // Overview readiness honours the live rotation choice (#155).
+    fixture
+        .runtime_config
+        .update_field("context_rotation_enabled", &serde_json::json!(true))
+        .unwrap();
     let mut native_inspection = execute_manager_tool(
         &fixture.manager.agent_control(),
         manager_id,
@@ -5130,7 +5336,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     .unwrap();
     let rpc_inspection = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentManagerInspect",
         serde_json::json!({}),
     )
@@ -5170,7 +5376,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     );
     let progress = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentManagerProgress",
         serde_json::json!({}),
     )
@@ -5182,7 +5388,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     assert!(progress.rows.iter().any(|row| row.title == "Feature 1"));
     let status = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentGetStatus",
         serde_json::json!({"session_id": leads[0]}),
     )
@@ -5197,7 +5403,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     );
     let denied = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentHalt",
         serde_json::json!({"session_id": leads[0]}),
     )
@@ -5228,7 +5434,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     assert!(granted.error.is_none(), "{:?}", granted.error);
     let status = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentGetStatus",
         serde_json::json!({"session_id": leads[0]}),
     )
@@ -5247,19 +5453,25 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
         let params = serde_json::json!({"epic_id":epics[index], "message":"Readiness with evidence?", "idempotency_key":format!("request-{index}")});
         let sent = invoke(
             &fixture.server,
-            "manager-pilot",
+            "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
             "AgentManagerSend",
             params.clone(),
         )
         .await;
         let receipt: HarnessManagerMessageReceiptV1 =
             serde_json::from_value(sent.result.unwrap()).unwrap();
-        let replay = invoke(&fixture.server, "manager-pilot", "AgentManagerSend", params).await;
+        let replay = invoke(
+            &fixture.server,
+            "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
+            "AgentManagerSend",
+            params,
+        )
+        .await;
         let replay: HarnessManagerMessageReceiptV1 =
             serde_json::from_value(replay.result.unwrap()).unwrap();
         assert_eq!(replay.message_id, receipt.message_id);
         assert!(replay.deduplicated);
-        let token = format!("lead-{index}");
+        let token = crate::test_support::agent_token(&format!("lead-{index}"));
         let inbox = invoke(
             &fixture.server,
             &token,
@@ -5288,7 +5500,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     .unwrap();
     let rpc = invoke(
         &fixture.server,
-        "manager-pilot",
+        "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
         "AgentManagerInbox",
         serde_json::json!({}),
     )
@@ -5311,7 +5523,7 @@ async fn manager_rpc_two_epic_exchange_matches_native_tools_and_revokes_pending_
     assert!(
         invoke(
             &fixture.server,
-            "manager-pilot",
+            "6fa44c456ae8eefda589ddb3426e6145d5a093c7ca112a7da7ed3d18e09534e3",
             "AgentGetStatus",
             serde_json::json!({"session_id": leads[0]}),
         )
@@ -5450,9 +5662,18 @@ async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
             .unwrap();
     }
     for (token, id) in [
-        ("work-view-manager", manager_id),
-        ("work-view-worker", worker_id),
-        ("work-view-sibling", sibling_id),
+        (
+            "315b575cc0a98969f68f327cf79b87e867a911be6d47398052dbd6308fa1cafa",
+            manager_id,
+        ),
+        (
+            "7116c71fe81f05e04fe30b41ac83b2a54845d6655af9df729709fc29fa6106b9",
+            worker_id,
+        ),
+        (
+            "4f7ebd59fdee54dea4fc8ded50a5d8b302c49ebe5cb7b84767b6a4047c6ec2bf",
+            sibling_id,
+        ),
     ] {
         fixture.manager.register_agent_token(token.into(), id).await;
     }
@@ -5496,7 +5717,7 @@ async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
     ] {
         let response = invoke(
             &fixture.server,
-            "work-view-manager",
+            "315b575cc0a98969f68f327cf79b87e867a911be6d47398052dbd6308fa1cafa",
             "AgentManagerUpdate",
             update(key, change),
         )
@@ -5505,7 +5726,7 @@ async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
     }
     let response = invoke(
         &fixture.server,
-        "work-view-worker",
+        "7116c71fe81f05e04fe30b41ac83b2a54845d6655af9df729709fc29fa6106b9",
         "AgentManagerWorkView",
         serde_json::json!({}),
     )
@@ -5520,7 +5741,7 @@ async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
     );
     let refused = invoke(
         &fixture.server,
-        "work-view-sibling",
+        "4f7ebd59fdee54dea4fc8ded50a5d8b302c49ebe5cb7b84767b6a4047c6ec2bf",
         "AgentManagerWorkView",
         serde_json::json!({}),
     )
@@ -5532,7 +5753,7 @@ async fn manager_rpc_work_view_serves_created_worker_and_refuses_sibling() {
     );
     let spoofed = invoke(
         &fixture.server,
-        "work-view-sibling",
+        "4f7ebd59fdee54dea4fc8ded50a5d8b302c49ebe5cb7b84767b6a4047c6ec2bf",
         "AgentManagerWorkView",
         serde_json::json!({"session_id": worker_id}),
     )
@@ -5594,10 +5815,22 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
             .unwrap();
     }
     for (token, id) in [
-        ("manager-notify", manager_id),
-        ("lead-notify", lead_id),
-        ("other-lead-notify", other_lead_id),
-        ("worker-notify", worker_id),
+        (
+            "05dd8bde1b57f395eb438ad36560e99369bf3edb42ef2deb36a53d0e547ecc82",
+            manager_id,
+        ),
+        (
+            "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
+            lead_id,
+        ),
+        (
+            "e0a2b3d1cdc699c04c3e3b108ee1660afb8f50a002f5d68a7eb7725e0d7613ca",
+            other_lead_id,
+        ),
+        (
+            "a5e33d87daf9b6906701b70a4cb62cc1720f0c0f62363012c1c2574936186bde",
+            worker_id,
+        ),
     ] {
         fixture.manager.register_agent_token(token.into(), id).await;
     }
@@ -5609,7 +5842,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     let params = serde_json::json!({"message":"Checks passed; commit abc123","idempotency_key":"notify-one"});
     let sent = invoke(
         &fixture.server,
-        "lead-notify",
+        "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
         "AgentManagerNotify",
         params.clone(),
     )
@@ -5620,7 +5853,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     assert_eq!(receipt.request_id, None);
     let replay = invoke(
         &fixture.server,
-        "lead-notify",
+        "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
         "AgentManagerNotify",
         params.clone(),
     )
@@ -5631,7 +5864,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     assert_eq!(replay.message_id, receipt.message_id);
     let inbox = invoke(
         &fixture.server,
-        "manager-notify",
+        "05dd8bde1b57f395eb438ad36560e99369bf3edb42ef2deb36a53d0e547ecc82",
         "AgentManagerInbox",
         serde_json::json!({}),
     )
@@ -5644,9 +5877,18 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     assert_eq!(inbox.messages[0].message, "Checks passed; commit abc123");
 
     for (token, expected) in [
-        ("manager-notify", "manager_notice_requires_feature_lead"),
-        ("worker-notify", "manager_scope_denied"),
-        ("other-lead-notify", "manager_scope_denied"),
+        (
+            "05dd8bde1b57f395eb438ad36560e99369bf3edb42ef2deb36a53d0e547ecc82",
+            "manager_notice_requires_feature_lead",
+        ),
+        (
+            "a5e33d87daf9b6906701b70a4cb62cc1720f0c0f62363012c1c2574936186bde",
+            "manager_scope_denied",
+        ),
+        (
+            "e0a2b3d1cdc699c04c3e3b108ee1660afb8f50a002f5d68a7eb7725e0d7613ca",
+            "manager_scope_denied",
+        ),
     ] {
         let refused = invoke(&fixture.server, token, "AgentManagerNotify", params.clone()).await;
         assert!(
@@ -5660,7 +5902,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     }
     let changed = invoke(
         &fixture.server,
-        "lead-notify",
+        "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
         "AgentManagerNotify",
         serde_json::json!({"message":"changed","idempotency_key":"notify-one"}),
     )
@@ -5674,7 +5916,13 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     for field in ["epic_id", "caller_session_id", "sender_session_id"] {
         let mut forged = params.clone();
         forged[field] = serde_json::json!(Uuid::new_v4());
-        let refused = invoke(&fixture.server, "lead-notify", "AgentManagerNotify", forged).await;
+        let refused = invoke(
+            &fixture.server,
+            "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
+            "AgentManagerNotify",
+            forged,
+        )
+        .await;
         assert!(
             refused
                 .error
@@ -5684,7 +5932,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     }
     let inbox = invoke(
         &fixture.server,
-        "manager-notify",
+        "05dd8bde1b57f395eb438ad36560e99369bf3edb42ef2deb36a53d0e547ecc82",
         "AgentManagerInbox",
         serde_json::json!({}),
     )
@@ -5709,7 +5957,7 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     }
     let stale = invoke(
         &fixture.server,
-        "lead-notify",
+        "2bc705dc1a65fa91e3c53bd4b213dfa04cd8d4cae1ae7ccb535da2fdd1270ac3",
         "AgentManagerNotify",
         serde_json::json!({"message":"late","idempotency_key":"notify-late"}),
     )
@@ -5729,7 +5977,10 @@ async fn manager_rpc_requires_transport_identity_and_redacts_invalid_params() {
     let fixture = recursive_dag_rpc_fixture();
     fixture
         .manager
-        .register_agent_token("manager-live-token".into(), Uuid::new_v4())
+        .register_agent_token(
+            "d81fa1a9ddb95e164edec08bc79e3220a1c07d3eaa1ce22a22238dcced764838".into(),
+            Uuid::new_v4(),
+        )
         .await;
     for (method, valid) in [
         ("AgentManagerProgress", serde_json::json!({})),
@@ -5802,7 +6053,7 @@ async fn manager_rpc_requires_transport_identity_and_redacts_invalid_params() {
             ),
         ] {
             let mut request = RpcRequest::new(method, valid.clone());
-            request.session_token = token.map(str::to_string);
+            request.session_token = token.map(Into::into);
             let HandleResult::Response(response) =
                 fixture.server.handle_request_inner(&request).await
             else {
@@ -5819,7 +6070,8 @@ async fn manager_rpc_requires_transport_identity_and_redacts_invalid_params() {
         forged["sender_session_id"] = serde_json::json!("/private/value token=secret");
         for malformed in [forged, serde_json::json!([]), serde_json::Value::Null] {
             let mut request = RpcRequest::new(method, malformed);
-            request.session_token = Some("manager-live-token".into());
+            request.session_token =
+                Some("d81fa1a9ddb95e164edec08bc79e3220a1c07d3eaa1ce22a22238dcced764838".into());
             let HandleResult::Response(response) =
                 fixture.server.handle_request_inner(&request).await
             else {
@@ -5833,7 +6085,9 @@ async fn manager_rpc_requires_transport_identity_and_redacts_invalid_params() {
                 error.message,
                 DaemonError::InvalidParam("manager_invalid_request".into()).to_string()
             );
-            assert!(error.data.is_none());
+            let diagnostic = error.data.expect("schema diagnostics");
+            assert!(diagnostic["path"].as_str().unwrap().starts_with("params"));
+            assert!(diagnostic["constraint"].is_string());
         }
     }
 }
@@ -5868,7 +6122,7 @@ async fn provider_credential_methods_are_operator_only_and_attributed_denied() {
             method,
             serde_json::json!({"slot": "openrouter", "secret": "sk-test-rpc-tokened"}),
         );
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -5929,7 +6183,7 @@ async fn verify_bedrock_setup_is_operator_only_and_attributed_denied() {
             method,
             serde_json::json!({"model": "bedrock-api-key-rpc-canary"}),
         );
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -5977,7 +6231,7 @@ async fn mcp_configuration_methods_are_operator_only_and_attributed_denied() {
             method,
             serde_json::json!({"id": "docs", "secret": "mcp-test-rpc-tokened"}),
         );
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -6052,6 +6306,339 @@ async fn mcp_configuration_methods_are_operator_only_and_attributed_denied() {
     );
 }
 
+/// hub #3039: the operator configuration family (hooks, custom providers,
+/// bridges) is operator-only. This is its operator-only fence: every method
+/// is absent from `AGENT_VERBS`, `READ_VERBS`, the attributed-caller allow
+/// list, the agent CLI catalog and the native tools, and a tokened call is
+/// refused without echoing its params. The operator path stores a custom
+/// provider key that no response or event carries, and the daemon resolves it
+/// for a request that names only the provider id.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_config_methods_are_operator_only_and_keys_never_leave_the_daemon() {
+    use rsi_common::operator_config as oc;
+    const KEY: &str = "fake-key-3039-rpc-not-a-real-credential";
+    let mut fixture = recursive_dag_rpc_fixture();
+    let root = tempfile::tempdir().unwrap();
+    fixture
+        .server
+        .set_operator_config_paths(crate::operator_config::OperatorConfigPaths::under(
+            root.path(),
+        ));
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    let native_sources = [
+        include_str!("../tool_registry.rs").to_ascii_lowercase(),
+        include_str!("../session/harness/tools/rsi_control.rs").to_ascii_lowercase(),
+    ];
+    assert_eq!(oc::OPERATOR_METHODS.len(), 13);
+    for method in oc::OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::UNSCOPED_READ_VERBS.contains(&method),
+            "{method}"
+        );
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::manager_operator_delegation::DELEGABLE_OPERATOR_METHODS.contains(&method),
+            "{method}"
+        );
+        for descriptor in catalog {
+            assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+        }
+        for source in &native_sources {
+            assert!(
+                !source.contains(&method.to_ascii_lowercase()),
+                "native tool registry names {method}"
+            );
+        }
+        let mut request = RpcRequest::new(
+            method,
+            serde_json::json!({"name": "x", "base_url": "https://x.invalid", "api_key": {"action": "set", "secret": KEY}}),
+        );
+        request.session_token = Some("some-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        assert!(response.result.is_none(), "{method}");
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("attributed call to {method} must be denied"));
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+        assert!(
+            !serde_json::to_string(&error).unwrap().contains(KEY),
+            "{method}"
+        );
+    }
+
+    let mut events = fixture.manager.event_bus().subscribe();
+    let created = call_rpc(
+        &fixture.server,
+        oc::METHOD_PUT_CUSTOM_PROVIDER,
+        serde_json::json!({
+            "name": "RPC provider",
+            "base_url": "https://api.example.invalid/v1",
+            "api_key": {"action": "set", "secret": KEY},
+        }),
+    )
+    .await;
+    let summary: oc::CustomProviderSummary =
+        serde_json::from_value(created.result.clone().expect("operator put succeeds")).unwrap();
+    assert_eq!(summary.api_key.state, oc::CustomProviderKeyState::Set);
+    let listed = call_rpc(
+        &fixture.server,
+        oc::METHOD_LIST_CUSTOM_PROVIDERS,
+        serde_json::Value::Null,
+    )
+    .await;
+    let list: oc::ListCustomProvidersResult =
+        serde_json::from_value(listed.result.clone().expect("operator list succeeds")).unwrap();
+    assert_eq!(list.providers.len(), 1);
+    assert_eq!(list.providers[0].id, summary.id);
+    // The stored route is readable per role, key metadata only.
+    let unrouted = call_rpc(
+        &fixture.server,
+        oc::METHOD_LIST_CUSTOM_PROVIDER_ROUTES,
+        serde_json::Value::Null,
+    )
+    .await;
+    let unrouted_view: oc::ListCustomProviderRoutesResult =
+        serde_json::from_value(unrouted.result.clone().expect("route read succeeds")).unwrap();
+    assert_eq!(
+        unrouted_view.routes.len(),
+        oc::CustomProviderRole::ALL.len()
+    );
+    assert!(unrouted_view.routes.iter().all(|route| route.id.is_none()));
+    let routed = call_rpc(
+        &fixture.server,
+        oc::METHOD_SET_CUSTOM_PROVIDER_ROUTE,
+        serde_json::json!({"role": "dream_model", "id": summary.id}),
+    )
+    .await;
+    assert!(routed.result.is_some());
+    let routes = call_rpc(
+        &fixture.server,
+        oc::METHOD_LIST_CUSTOM_PROVIDER_ROUTES,
+        serde_json::Value::Null,
+    )
+    .await;
+    let routes_view: oc::ListCustomProviderRoutesResult =
+        serde_json::from_value(routes.result.clone().expect("route read succeeds")).unwrap();
+    let dream = routes_view
+        .routes
+        .iter()
+        .find(|route| route.role == oc::CustomProviderRole::DreamModel)
+        .expect("dream_model entry");
+    assert_eq!(dream.id, Some(summary.id));
+    assert_eq!(dream.name.as_deref(), Some("RPC provider"));
+    let metadata = dream.api_key.as_ref().expect("routed key metadata");
+    assert_eq!(metadata.state, oc::CustomProviderKeyState::Set);
+    assert!(metadata.fingerprint.is_some());
+    assert_eq!(
+        routes_view
+            .routes
+            .iter()
+            .filter(|route| route.id.is_some())
+            .count(),
+        1
+    );
+    let daemon_config = call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null).await;
+    for response in [&created, &listed, &routes, &daemon_config] {
+        assert!(response.result.is_some());
+        assert!(!serde_json::to_string(response).unwrap().contains(KEY));
+    }
+    while let Ok(event) = events.try_recv() {
+        assert!(!format!("{event:?}").contains(KEY), "event carries the key");
+    }
+
+    // A request that names only the provider id gets the daemon-held key.
+    let (mut base_url, mut api_key) = (None, None);
+    fixture
+        .server
+        .resolve_custom_provider(Some(summary.id), &mut base_url, &mut api_key)
+        .await
+        .unwrap();
+    assert_eq!(base_url.as_deref(), Some("https://api.example.invalid/v1"));
+    assert_eq!(api_key.as_deref(), Some(KEY));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn agent_settlement_rpc_is_token_bound_capability_gated_and_scope_closed() {
+    use rsi_common::agent_control_schema::AgentControlVerbV1 as Verb;
+    use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+    use rsi_common::harness_manager_v2::{
+        ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerOperatingModeV2,
+        ManagerPolicyV2,
+    };
+    let fixture = recursive_dag_rpc_fixture();
+    let caller = Uuid::new_v4();
+    {
+        let store = fixture.manager.store().lock().await;
+        let mut row =
+            mk_agent_test_session(caller, rsi_common::types::SessionKind::Standard, None, None);
+        row.project_id = Some(issue_rpc_project_id());
+        store.insert_session(&row).unwrap();
+    }
+    let token = fixture.manager.remint_session_token(caller).await;
+    for verb in [
+        Verb::ListSourceWorktreeCohorts,
+        Verb::AuditSourceWorktreeCohort,
+        Verb::ApplySourceWorktreeCohort,
+    ] {
+        assert!(agent_gate::AGENT_VERBS.contains(&verb.descriptor().method));
+        let request = RpcRequest::new(verb.descriptor().method, verb.example());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        assert!(
+            response.error.is_some(),
+            "unattributed Agent verb requires a token"
+        );
+        let mut request = request;
+        request.session_token = Some(token.clone());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        assert_eq!(
+            response.error.unwrap().data.unwrap()["code"],
+            "storage_control_not_authorized"
+        );
+    }
+    {
+        let store = fixture.manager.store().lock().await;
+        let config = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: issue_rpc_project_id(),
+                session_id: caller,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: 0,
+            })
+            .unwrap();
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: issue_rpc_project_id(),
+                expected_scope_version: config.row_version,
+                expected_policy_version: 0,
+                idempotency_key: "agent-settlement-rpc:grant".into(),
+                policy: ManagerPolicyV2 {
+                    mode: ManagerOperatingModeV2::Execute,
+                    capabilities: vec![ManagerCapabilityV2::StorageControl],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+    }
+    for verb in [
+        Verb::ListSourceWorktreeCohorts,
+        Verb::AuditSourceWorktreeCohort,
+        Verb::ApplySourceWorktreeCohort,
+    ] {
+        let mut request = RpcRequest::new(verb.descriptor().method, verb.example());
+        request.session_token = Some(token.clone());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        if verb == Verb::ListSourceWorktreeCohorts {
+            assert_eq!(response.result.unwrap(), serde_json::json!([]));
+        } else {
+            assert_eq!(
+                response.error.unwrap().data.unwrap()["code"],
+                "storage_control_not_in_scope"
+            );
+        }
+        // Neither transport can accept caller-supplied identity or coverage.
+        let mut params = verb.example();
+        params["project_id"] = serde_json::json!(Uuid::new_v4());
+        let mut request = RpcRequest::new(verb.descriptor().method, params);
+        request.session_token = Some(token.clone());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        assert!(response.error.is_some());
+    }
+    // Operator settings and history stay default-denied to tokened agents.
+    for (method, params) in [
+        ("ListSourceWorktreeSettlementRuns", serde_json::json!({})),
+        (
+            "UpdateDaemonConfig",
+            serde_json::json!({"field":"disk_pressure_min_free_gb","value":20}),
+        ),
+        (
+            "UpdateDaemonConfig",
+            serde_json::json!({"field":"source_worktree_auto_settlement_enabled","value":false}),
+        ),
+    ] {
+        let mut request = RpcRequest::new(method, params);
+        request.session_token = Some(token.clone());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        let error = response.error.expect("operator-only method must be denied");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers")
+        );
+    }
+    for (field, value) in [
+        (
+            "source_worktree_auto_settlement_enabled",
+            serde_json::json!(false),
+        ),
+        ("disk_pressure_min_free_gb", serde_json::json!(20)),
+    ] {
+        let request = RpcRequest::new(
+            "UpdateDaemonConfig",
+            serde_json::json!({"field":field,"value":value}),
+        );
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("response");
+        };
+        assert!(response.error.is_none(), "{field}: {:?}", response.error);
+        assert_eq!(fixture.server.runtime_config.to_json()[field], value);
+    }
+    let request = RpcRequest::new("ListSourceWorktreeSettlementRuns", serde_json::json!({}));
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("response");
+    };
+    assert_eq!(response.result.unwrap(), serde_json::json!([]));
+    // RpcRequest defaults omitted params to null. The empty list schema also
+    // accepts that spelling, while audit/apply still require their fields.
+    let mut request = RpcRequest::new("AgentListSourceWorktreeCohorts", serde_json::Value::Null);
+    request.session_token = Some(token);
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("response");
+    };
+    assert!(
+        response.error.is_none(),
+        "null-params list with the granted caller's token: {:?}",
+        response.error
+    );
+    assert_eq!(response.result.unwrap(), serde_json::json!([]));
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn source_worktree_settlement_surface_is_strict_and_attributed_denied() {
@@ -6061,11 +6648,12 @@ async fn source_worktree_settlement_surface_is_strict_and_attributed_denied() {
         "AuditSourceWorktreeCohort",
         "ApplySourceWorktreeCohort",
         "GetSourceWorktreeSettlementRun",
+        "ListSourceWorktreeSettlementRuns",
     ] {
         assert!(!agent_gate::AGENT_VERBS.contains(&method));
         assert!(!agent_gate::READ_VERBS.contains(&method));
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -6128,11 +6716,17 @@ async fn agent_archive_child_rpc_is_strict_token_bound_and_preserves_refusal() {
     }
     fixture
         .manager
-        .register_agent_token("archive-lead".into(), lead)
+        .register_agent_token(
+            "b20b7203b3b6a678cc2cb6920d575e25f419cc627c13a6fc7eabc7509fa8e069".into(),
+            lead,
+        )
         .await;
     fixture
         .manager
-        .register_agent_token("archive-other".into(), other)
+        .register_agent_token(
+            "a62b131cf1c11af0c055b4ac3964980a311a3a32fb9fc545179a5af562f8c258".into(),
+            other,
+        )
         .await;
 
     let params = serde_json::json!({
@@ -6142,22 +6736,28 @@ async fn agent_archive_child_rpc_is_strict_token_bound_and_preserves_refusal() {
     });
     let invoke = |token: Option<&str>, params: serde_json::Value| {
         let mut request = RpcRequest::new("AgentArchiveChild", params);
-        request.session_token = token.map(str::to_owned);
+        request.session_token = token.map(Into::into);
         request
     };
     for (malformed, token) in [
-        (serde_json::Value::Null, "archive-lead"),
-        (serde_json::json!([]), "archive-lead"),
+        (
+            serde_json::Value::Null,
+            "b20b7203b3b6a678cc2cb6920d575e25f419cc627c13a6fc7eabc7509fa8e069",
+        ),
+        (
+            serde_json::json!([]),
+            "b20b7203b3b6a678cc2cb6920d575e25f419cc627c13a6fc7eabc7509fa8e069",
+        ),
         (
             serde_json::json!({"target_session_id":child}),
-            "archive-lead",
+            "b20b7203b3b6a678cc2cb6920d575e25f419cc627c13a6fc7eabc7509fa8e069",
         ),
         (
             serde_json::json!({
                 "target_session_id":child, "expected_tip_session_id":child,
                 "expected_event_sequence":0, "caller_session_id":lead
             }),
-            "archive-other",
+            "a62b131cf1c11af0c055b4ac3964980a311a3a32fb9fc545179a5af562f8c258",
         ),
     ] {
         let HandleResult::Response(response) = fixture
@@ -6185,7 +6785,10 @@ async fn agent_archive_child_rpc_is_strict_token_bound_and_preserves_refusal() {
 
     let HandleResult::Response(response) = fixture
         .server
-        .handle_request_inner(&invoke(Some("archive-other"), params.clone()))
+        .handle_request_inner(&invoke(
+            Some("a62b131cf1c11af0c055b4ac3964980a311a3a32fb9fc545179a5af562f8c258"),
+            params.clone(),
+        ))
         .await
     else {
         panic!("expected response");
@@ -6199,7 +6802,10 @@ async fn agent_archive_child_rpc_is_strict_token_bound_and_preserves_refusal() {
 
     let HandleResult::Response(response) = fixture
         .server
-        .handle_request_inner(&invoke(Some("archive-lead"), params))
+        .handle_request_inner(&invoke(
+            Some("b20b7203b3b6a678cc2cb6920d575e25f419cc627c13a6fc7eabc7509fa8e069"),
+            params,
+        ))
         .await
     else {
         panic!("expected response");
@@ -6314,6 +6920,22 @@ async fn archive_session_rpc_reaches_private_cleanup_and_replays_one_projection(
         serde_json::json!({"session_id": session_id}),
     )
     .await;
+    // macOS has no `/proc/self/mountinfo` or `llistxattr` quarantine proof
+    // (`settlement mount inventory read failed`), so the private cleanup
+    // cannot prove its quarantine there. The explicit macOS outcome is the
+    // retryable `proof_unavailable` refusal; the rest of the flow is Linux only.
+    if cfg!(target_os = "macos") {
+        let error = response
+            .error
+            .as_ref()
+            .expect("macOS archive proof is unavailable");
+        assert_eq!(error.code, -32071, "{error:?}");
+        assert_eq!(error.message, "archive_cleanup_proof_unavailable");
+        let data = error.data.as_ref().expect("typed archive error data");
+        assert_eq!(data["safe_code"], "proof_unavailable");
+        assert_eq!(data["retryable"], true);
+        return;
+    }
     assert!(
         response.error.is_none(),
         "RPC archive error: {:?}",
@@ -6360,7 +6982,7 @@ async fn archive_cleanup_surface_is_strict_operator_only_and_undiscoverable_to_a
         assert!(!agent_gate::is_allowed_for_attributed_caller(method));
         let mut request =
             RpcRequest::new(method, serde_json::json!({ "session_id": Uuid::new_v4() }));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -6439,7 +7061,7 @@ async fn efficiency_metrics_rpc_is_operator_only_and_not_agent_cataloged() {
             "group_by": "day",
         }),
     );
-    request.session_token = Some("some-token".to_string());
+    request.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response for GetEfficiencyMetrics");
@@ -6453,6 +7075,216 @@ async fn efficiency_metrics_rpc_is_operator_only_and_not_agent_cataloged() {
             .message
             .contains("not available to session-attributed callers")
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn daemon_info_rpc_serves_operator_identity_and_refuses_attributed_callers() {
+    assert!(!agent_gate::is_allowed_for_attributed_caller(
+        "GetDaemonInfo"
+    ));
+    let fixture = recursive_dag_rpc_fixture();
+    let value = call_rpc(&fixture.server, "GetDaemonInfo", serde_json::json!({})).await;
+    let info: rsi_common::agent_daemon_info::DaemonInfoV1 =
+        serde_json::from_value(value.result.unwrap()).unwrap();
+    assert_eq!(info.build_sha, crate::daemon_info::BUILD_SHA);
+    let mut request = RpcRequest::new("GetDaemonInfo", serde_json::json!({}));
+    request.session_token = Some("synthetic-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn provider_rate_limits_rpc_is_operator_only_and_lists_claude_and_codex_alike() {
+    use rsi_common::rpc::{
+        GetProviderRateLimitsResponse, ProviderRateLimitSnapshot, ProviderRateLimitWindow,
+    };
+    use rsi_common::types::SessionProvider;
+    assert!(!agent_gate::AGENT_VERBS.contains(&"GetProviderRateLimits"));
+    assert!(!agent_gate::READ_VERBS.contains(&"GetProviderRateLimits"));
+    assert!(!agent_gate::is_allowed_for_attributed_caller(
+        "GetProviderRateLimits"
+    ));
+
+    let fixture = recursive_dag_rpc_fixture();
+    let snapshot = |provider, key: &str, utilization| ProviderRateLimitSnapshot {
+        provider,
+        status: Some("allowed".into()),
+        rate_limit_type: Some(key.into()),
+        overage_status: None,
+        is_using_overage: false,
+        observed_at: chrono::Utc::now(),
+        windows: vec![ProviderRateLimitWindow {
+            window_key: key.into(),
+            utilization,
+            resets_at_epoch: Some(1_788_402_000),
+        }],
+        stale_reason: None,
+    };
+    {
+        let store = fixture.server.session_manager.store().clone();
+        let store = store.lock().await;
+        for snapshot in [
+            snapshot(SessionProvider::Claude, "five_hour", 0.4),
+            snapshot(SessionProvider::Codex, "five_hour", 0.27),
+        ] {
+            store
+                .upsert_provider_rate_limit_snapshot(&snapshot, None)
+                .unwrap();
+        }
+    }
+
+    let ask = |params: serde_json::Value| {
+        let server = &fixture.server;
+        async move {
+            let request = RpcRequest::new("GetProviderRateLimits", params);
+            let HandleResult::Response(response) = server.handle_request_inner(&request).await
+            else {
+                panic!("expected response for GetProviderRateLimits");
+            };
+            let result = response.result.expect("operator call answers");
+            serde_json::from_value::<GetProviderRateLimitsResponse>(result).unwrap()
+        }
+    };
+    let all = ask(serde_json::Value::Null).await;
+    let mut providers: Vec<_> = all.rate_limits.iter().map(|s| s.provider).collect();
+    providers.sort_by_key(|provider| format!("{provider:?}"));
+    assert_eq!(providers, [SessionProvider::Claude, SessionProvider::Codex]);
+    assert_eq!(
+        all.polls.len(),
+        1,
+        "the Codex poll status rides along with the windows"
+    );
+    assert_eq!(all.polls[0].provider, SessionProvider::Codex);
+
+    let codex_only = ask(serde_json::json!({"provider": "Codex"})).await;
+    assert_eq!(codex_only.rate_limits.len(), 1);
+    assert_eq!(codex_only.rate_limits[0].provider, SessionProvider::Codex);
+    assert_eq!(codex_only.rate_limits[0].windows[0].utilization, 0.27);
+
+    let claude_only = ask(serde_json::json!({"provider": "Claude"})).await;
+    assert_eq!(claude_only.rate_limits.len(), 1);
+    assert!(
+        claude_only.polls.is_empty(),
+        "Claude windows have no poll to report"
+    );
+
+    let mut attributed = RpcRequest::new("GetProviderRateLimits", serde_json::Value::Null);
+    attributed.session_token = Some("some-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
+    else {
+        panic!("expected response for GetProviderRateLimits");
+    };
+    let error = response
+        .error
+        .expect("attributed rate-limit call must be denied");
+    assert_eq!(error.code, INVALID_PARAMS);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn rotate_session_rpc_preserves_a_blocked_transferred_custody_rotation() {
+    use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
+    use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionKind, SessionStatus};
+    let fixture = recursive_dag_rpc_fixture();
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let custody_id = Uuid::new_v4();
+    let mut parent = mk_agent_test_session(parent_id, SessionKind::Task, None, None);
+    parent.status = SessionStatus::Completed;
+    parent.working_dir = fixture._dir.path().to_path_buf();
+    parent.sandbox_kind = Some(SandboxKind::GitWorktree);
+    parent.sandbox_root = Some(fixture._dir.path().join("blocked-sandbox"));
+    parent.sandbox_branch = Some("rsi/blocked-rpc".into());
+    parent.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+    let mut child = parent.clone();
+    child.id = child_id;
+    child.continued_from = Some(parent_id);
+    child.status = SessionStatus::Failed;
+    {
+        let mut store = fixture.manager.store().lock().await;
+        store
+            .insert_session_with_custody(
+                &parent,
+                SessionCustodyBinding::New(NewCustodyRoot {
+                    custody_id,
+                    canonical_repo_dir: parent.working_dir.display().to_string(),
+                    sandbox_root: parent.sandbox_root.as_ref().unwrap().display().to_string(),
+                    sandbox_branch: parent.sandbox_branch.clone().unwrap(),
+                    repository_identity: "blocked-rpc-repository".into(),
+                    source_commit: "a".repeat(40),
+                    cause: CustodyCause::FreshLaunch,
+                }),
+            )
+            .unwrap();
+        store
+            .insert_session_with_custody(
+                &child,
+                SessionCustodyBinding::Transfer {
+                    custody_id,
+                    from_session_id: parent_id,
+                    generation: 1,
+                    cause: CustodyCause::Rotation,
+                    origin_session_id: Some(parent_id),
+                    scheduled_job_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .record_completed_trigger_intent(parent_id, "blocked-rpc-rotation", "manual_triggered")
+            .unwrap();
+        store
+            .insert_rotation_event(
+                parent_id,
+                "blocked-rpc-rotation",
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({"successor_id":child_id}).to_string()),
+            )
+            .unwrap();
+        store
+            .record_rotation_recovery_blocked(parent_id, "blocked-rpc-rotation", child_id)
+            .unwrap();
+    }
+    let request = RpcRequest::new("RotateSession", serde_json::json!({"session_id":parent_id}));
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected rotation response");
+    };
+    let error = response
+        .error
+        .expect("operator rotate is refused before dispatch");
+    assert_eq!(error.code, INVALID_PARAMS);
+    let data = error.data.expect("typed rotation refusal");
+    assert_eq!(data["code"], "rotation_blocked_on_transferred_custody");
+    assert_eq!(data["rotation_id"], "blocked-rpc-rotation");
+    assert_eq!(data["successor_id"], child_id.to_string());
+    assert_eq!(
+        data["recovery_verbs"],
+        serde_json::json!(["ContinueSession", "AbandonBlockedRotation"])
+    );
+    assert!(error.message.contains("Continue"));
+    assert!(error.message.contains(":rotation-abandon"));
+    let store = fixture.manager.store().lock().await;
+    let blocked = store
+        .blocked_rotation_of(parent_id)
+        .unwrap()
+        .expect("original block retained");
+    assert_eq!(blocked.rotation_id, "blocked-rpc-rotation");
+    assert_eq!(blocked.successor, child_id);
+    let entered: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM rotation_events WHERE session_id=?1 AND event_type='entered'",
+            [parent_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(entered, 1);
 }
 
 /// #1176: abandoning a blocked rotation moves custody and a seat, so it is an
@@ -6486,7 +7318,7 @@ async fn abandon_blocked_rotation_is_operator_only_and_dispatched_for_the_operat
         "idempotency_key": "rpc-1176",
     });
     let mut attributed = RpcRequest::new("AbandonBlockedRotation", params.clone());
-    attributed.session_token = Some("some-token".to_string());
+    attributed.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
     else {
         panic!("expected response for an attributed AbandonBlockedRotation");
@@ -6527,20 +7359,42 @@ fn agent_job_verbs_are_agent_cataloged_and_not_read_verbs() {
     }
 }
 
+/// #2310: the landing-candidate check is a catalogued agent verb with a native
+/// tool, and (like the other agent verbs) is not a session-scoped read verb.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn check_landing_candidate_is_agent_cataloged_with_a_native_tool() {
+    assert!(agent_gate::AGENT_VERBS.contains(&"AgentCheckLandingCandidate"));
+    assert!(!agent_gate::READ_VERBS.contains(&"AgentCheckLandingCandidate"));
+    let descriptor = rsi_common::agent_control_schema::agent_control_catalog_v1()
+        .iter()
+        .find(|descriptor| descriptor.method == "AgentCheckLandingCandidate")
+        .expect("cataloged");
+    assert_eq!(
+        descriptor.native_tool.map(|tool| tool.name()),
+        Some("rsi_control_check_landing_candidate")
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_only() {
     // The enqueue verb is the only agent-facing queue method.
     assert!(agent_gate::AGENT_VERBS.contains(&"AgentEnqueueLandingSource"));
     assert!(!agent_gate::READ_VERBS.contains(&"AgentEnqueueLandingSource"));
-    for operator in ["GetRollingQueue", "GetDaemonConfig", "UpdateDaemonConfig"] {
+    for operator in [
+        "GetRollingQueue",
+        "EnqueueRollingQueueSource",
+        "GetDaemonConfig",
+        "UpdateDaemonConfig",
+    ] {
         assert!(!agent_gate::AGENT_VERBS.contains(&operator), "{operator}");
         assert!(!agent_gate::READ_VERBS.contains(&operator), "{operator}");
         assert!(!agent_gate::is_allowed_for_attributed_caller(operator));
     }
     let fixture = recursive_dag_rpc_fixture();
     let mut attributed = RpcRequest::new("GetRollingQueue", serde_json::json!({}));
-    attributed.session_token = Some("some-token".to_string());
+    attributed.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
     else {
         panic!("expected response for GetRollingQueue");
@@ -6553,18 +7407,46 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
             .contains("not available to session-attributed callers")
     );
 
+    // #2055: the operator enqueue is refused to a session-attributed caller
+    // too, and no agent catalog, native tool or CLI listing offers it.
+    let mut attributed = RpcRequest::new(
+        "EnqueueRollingQueueSource",
+        serde_json::json!({"branch": "rsi/x", "dry_run": true}),
+    );
+    attributed.session_token = Some("some-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
+    else {
+        panic!("expected response for EnqueueRollingQueueSource");
+    };
+    assert!(
+        response
+            .error
+            .expect("attributed operator enqueue must be denied")
+            .message
+            .contains("not available to session-attributed callers")
+    );
+    assert!(
+        rsi_common::agent_control_schema::AgentControlVerbV1::from_method_name(
+            "EnqueueRollingQueueSource"
+        )
+        .is_none()
+    );
+    assert!(
+        !rsi_common::agent_control_schema::agent_control_catalog_v1()
+            .iter()
+            .any(|descriptor| descriptor.method.contains("EnqueueRollingQueueSource"))
+    );
+
     // The operator surface round-trips the queue settings.
     let initial = call_rpc(&fixture.server, "GetRollingQueue", serde_json::Value::Null).await;
     let initial = initial.result.expect("operator queue read");
     assert_eq!(initial["enabled"], false);
     assert_eq!(initial["batch_size"], 4);
-    assert_eq!(initial["speculation_depth"], 1);
-    assert_eq!(initial["gate_timeout_mins"], 360);
+    assert_eq!(initial["gate_timeout_mins"], 60);
     assert_eq!(initial["entries"], serde_json::json!([]));
     for (field, value) in [
         ("rolling_queue_enabled", serde_json::json!(true)),
         ("rolling_queue_batch_size", serde_json::json!(8)),
-        ("rolling_queue_speculation_depth", serde_json::json!(2)),
         ("rolling_queue_gate_timeout_mins", serde_json::json!(120)),
     ] {
         let response = call_rpc(
@@ -6579,12 +7461,11 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
     let updated = updated.result.expect("operator queue read");
     assert_eq!(updated["enabled"], true);
     assert_eq!(updated["batch_size"], 8);
-    assert_eq!(updated["speculation_depth"], 2);
     assert_eq!(updated["gate_timeout_mins"], 120);
     for (field, value) in [
         ("rolling_queue_batch_size", serde_json::json!(0)),
         ("rolling_queue_batch_size", serde_json::json!(9)),
-        ("rolling_queue_speculation_depth", serde_json::json!(3)),
+        ("rolling_queue_speculation_depth", serde_json::json!(1)),
         ("rolling_queue_gate_timeout_mins", serde_json::json!(10)),
         ("rolling_queue_enabled", serde_json::json!("on")),
     ] {
@@ -6600,6 +7481,76 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
             "{field}"
         );
     }
+}
+
+/// #2373: the stored ToolResult cap is an operator setting with an RPC
+/// surface: it defaults to 32 KiB, round-trips through
+/// UpdateDaemonConfig/GetDaemonConfig, persists, takes effect on the event
+/// writer at once, refuses values outside 0 or 4-1024 and stays out of the
+/// agent surface.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn tool_result_storage_cap_round_trips_through_the_operator_rpc_inside_its_bounds() {
+    for operator in ["GetDaemonConfig", "UpdateDaemonConfig"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&operator), "{operator}");
+        assert!(!agent_gate::READ_VERBS.contains(&operator), "{operator}");
+    }
+    let fixture = recursive_dag_rpc_fixture();
+    let read = || async {
+        call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null)
+            .await
+            .result
+            .expect("config read")
+    };
+    assert_eq!(read().await["tool_result_storage_cap_kib"], 32);
+    for value in [64_u32, 0, 1024] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": "tool_result_storage_cap_kib", "value": value}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{value}: {:?}", response.error);
+        assert_eq!(read().await["tool_result_storage_cap_kib"], value);
+        assert_eq!(rsid_core::tool_result_cap::current_cap_kib(), value);
+    }
+    let store = fixture.manager.store.lock().await;
+    assert_eq!(
+        store
+            .get_daemon_setting("tool_result_storage_cap_kib")
+            .unwrap()
+            .as_deref(),
+        Some("1024")
+    );
+    drop(store);
+    for value in [
+        serde_json::json!(1),
+        serde_json::json!(3),
+        serde_json::json!(1025),
+        serde_json::json!(-1),
+        serde_json::json!("32"),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": "tool_result_storage_cap_kib", "value": value}),
+        )
+        .await;
+        assert_eq!(
+            response.error.expect("rejected").code,
+            INVALID_PARAMS,
+            "{value}"
+        );
+    }
+    assert_eq!(read().await["tool_result_storage_cap_kib"], 1024);
+    let restored = call_rpc(
+        &fixture.server,
+        "UpdateDaemonConfig",
+        serde_json::json!({"field": "tool_result_storage_cap_kib", "value": 32}),
+    )
+    .await;
+    assert!(restored.error.is_none(), "{:?}", restored.error);
+    assert_eq!(rsid_core::tool_result_cap::current_cap_kib(), 32);
 }
 
 /// #1254: the worker baton cap is an operator setting with an RPC surface:
@@ -6684,6 +7635,152 @@ async fn worker_context_cap_round_trips_through_the_operator_rpc_inside_its_boun
     assert_eq!(read().await["worker_context_cap_tokens"], 250_000);
 }
 
+/// The operator RPC carries the same policy as the coordinator seat projection.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_context_settings_expose_resolved_coordinator_budget() {
+    let fixture = recursive_dag_rpc_fixture();
+    let id = Uuid::new_v4();
+    {
+        let store = fixture.manager.store().lock().await;
+        let mut seat = make_recursive_dag_test_session(id);
+        seat.project_id = Some(issue_rpc_project_id());
+        seat.context_window = Some(258_400);
+        let mut evidence = rsi_common::CapabilityEvidence::legacy_unverified();
+        evidence.source = rsi_common::CapabilitySource::RuntimeTelemetry;
+        evidence.confidence = rsi_common::CapabilityConfidence::Authoritative;
+        seat.resolved_context_budget = Some(
+            rsi_common::ResolvedContextBudget::new(258_400, Default::default(), evidence).unwrap(),
+        );
+        store.insert_session(&seat).unwrap();
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: issue_rpc_project_id(),
+                    session_id: id,
+                    epic_ids: None,
+                    group_ids: vec![],
+                    expected_row_version: 0,
+                },
+            )
+            .unwrap();
+    }
+    fixture
+        .runtime_config
+        .update_field("context_rotation_enabled", &serde_json::json!(true))
+        .unwrap();
+    fixture
+        .runtime_config
+        .update_field("coordinator_context_cap_tokens", &serde_json::json!(40))
+        .unwrap();
+    fixture
+        .runtime_config
+        .update_field("context_rotation_global_pct", &serde_json::json!(53))
+        .unwrap();
+    let expected = fixture
+        .manager
+        .agent_control()
+        .coordinator_budgets()
+        .await
+        .unwrap();
+    let result = call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null)
+        .await
+        .result
+        .unwrap();
+    let budgets: Vec<rsi_common::coordinator_budget::CoordinatorSeatBudgetV1> =
+        serde_json::from_value(result["coordinator_context_budgets"].clone()).unwrap();
+    assert_eq!(budgets, expected);
+    assert_eq!(budgets[0].session_id, id);
+    assert_eq!(budgets[0].budget.coordinator_cap, 40);
+    assert_eq!(budgets[0].budget.effective_tokens, Some(103_360));
+    assert_eq!(result["coordinator_context_cap_tokens"], 40);
+}
+
+/// #1158: the coordinator cap is an operator setting with an RPC surface:
+/// it round-trips through UpdateDaemonConfig/GetDaemonConfig with its
+/// overrides, persists, refuses values outside its two ranges and stays out
+/// of the agent surface.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn coordinator_context_cap_round_trips_through_the_operator_rpc_inside_its_bounds() {
+    for operator in ["GetDaemonConfig", "UpdateDaemonConfig"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&operator), "{operator}");
+        assert!(!agent_gate::READ_VERBS.contains(&operator), "{operator}");
+    }
+    let fixture = recursive_dag_rpc_fixture();
+    let read = || async {
+        call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null)
+            .await
+            .result
+            .expect("config read")
+    };
+    assert_eq!(read().await["coordinator_context_cap_tokens"], 60);
+    for (field, value) in [
+        ("coordinator_context_cap_tokens", serde_json::json!(50)),
+        ("coordinator_context_cap_tokens", serde_json::json!(250_000)),
+        ("coordinator_context_cap.Claude", serde_json::json!(70)),
+        (
+            "coordinator_context_cap.Codex/gpt-6-astra",
+            serde_json::json!(0),
+        ),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": field, "value": value}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{field}: {:?}", response.error);
+    }
+    let config = read().await;
+    assert_eq!(config["coordinator_context_cap_tokens"], 250_000);
+    assert_eq!(config["coordinator_context_cap.Claude"], 70);
+    assert_eq!(config["coordinator_context_cap.Codex/gpt-6-astra"], 0);
+    let store = fixture.manager.store.lock().await;
+    assert_eq!(
+        store
+            .get_daemon_setting("coordinator_context_cap_tokens")
+            .unwrap()
+            .as_deref(),
+        Some("250000")
+    );
+    assert_eq!(
+        store
+            .get_daemon_setting("coordinator_context_cap.Claude")
+            .unwrap()
+            .as_deref(),
+        Some("70")
+    );
+    drop(store);
+    assert_eq!(
+        fixture.runtime_config.coordinator_context_cap(
+            rsi_common::types::SessionProvider::Claude,
+            Some("claude-opus-5-5"),
+            1_000_000
+        ),
+        Some(700_000)
+    );
+    for value in [
+        serde_json::json!(101),
+        serde_json::json!(31_999),
+        serde_json::json!(2_000_001),
+        serde_json::json!("sixty"),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": "coordinator_context_cap_tokens", "value": value}),
+        )
+        .await;
+        assert_eq!(
+            response.error.expect("rejected").code,
+            INVALID_PARAMS,
+            "{value}"
+        );
+    }
+    assert_eq!(read().await["coordinator_context_cap_tokens"], 250_000);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn harness_tool_policy_launch_param_is_validated_and_defaults_round_trip() {
@@ -6703,7 +7800,52 @@ async fn harness_tool_policy_launch_param_is_validated_and_defaults_round_trip()
     .await;
     let error = response.error.expect("claude cannot enforce a tool policy");
     assert_eq!(error.code, INVALID_PARAMS, "{}", error.message);
-    assert!(error.message.contains("tool_policy_unsupported_provider"));
+    assert!(
+        error
+            .message
+            .contains("tool_policy_unsupported_for_provider:claude:web_access"),
+        "{}",
+        error.message
+    );
+    // #2758: every combination a provider cannot enforce is refused typed, not
+    // widened: a Harness field on the other CLIs, any policy on a provider with
+    // no policy support, and the CLI-only `cli_access` on the Harness loop.
+    for (provider, policy, expected) in [
+        (
+            "Codex",
+            serde_json::json!({"denied_tools": ["shell"]}),
+            "tool_policy_unsupported_for_provider:codex:denied_tools",
+        ),
+        (
+            "Claude",
+            serde_json::json!({"cli_access": "read_only", "budgets": {"max_search_calls": 1}}),
+            "tool_policy_unsupported_for_provider:claude:budgets",
+        ),
+        (
+            "Local",
+            serde_json::json!({"cli_access": "read_only"}),
+            "tool_policy_unsupported_for_provider:local",
+        ),
+        (
+            "Antigravity",
+            serde_json::json!({"cli_access": "read_only"}),
+            "tool_policy_unsupported_for_provider:antigravity",
+        ),
+        (
+            "Harness",
+            serde_json::json!({"cli_access": "read_only"}),
+            "tool_policy_unsupported_for_provider:harness:cli_access",
+        ),
+    ] {
+        let response = call_rpc(&fixture.server, "LaunchSession", launch(provider, policy)).await;
+        let error = response.error.expect("policy must be refused");
+        assert_eq!(error.code, INVALID_PARAMS, "{provider}: {}", error.message);
+        assert!(
+            error.message.contains(expected),
+            "{provider}: {}",
+            error.message
+        );
+    }
     // A malformed name is refused by validation; an unknown field or mode
     // fails typed decoding. Neither reaches a launch.
     let response = call_rpc(
@@ -6944,7 +8086,7 @@ async fn child_autonomy_settings_round_trip_and_the_hold_read_is_operator_only()
     }
     let fixture = recursive_dag_rpc_fixture();
     let mut attributed = RpcRequest::new("ListScheduledJobHolds", serde_json::json!({}));
-    attributed.session_token = Some("some-token".to_string());
+    attributed.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
     else {
         panic!("expected response");
@@ -7014,6 +8156,152 @@ async fn child_autonomy_settings_round_trip_and_the_hold_read_is_operator_only()
             "{field}"
         );
     }
+}
+
+/// #2236: the Settings page applies every staged row as ONE `UpdateDaemonConfig`
+/// carrying `updates`; the daemon publishes and persists the set together.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn update_daemon_config_batch_applies_and_persists_every_field_together() {
+    let fixture = recursive_dag_rpc_fixture();
+    let response = call_rpc(
+        &fixture.server,
+        "UpdateDaemonConfig",
+        serde_json::json!({"updates": [
+            {"field": "program_hold_while_children_run", "value": false},
+            {"field": "child_keepalive_enabled", "value": true},
+            {"field": "child_keepalive_window_secs", "value": 600},
+            // The watermark pair moves together, in either order.
+            {"field": "sandbox_build_cache_reclaim_high_watermark_pct", "value": 30},
+            {"field": "sandbox_build_cache_reclaim_low_watermark_pct", "value": 10},
+            {"field": "completed_transcript_cache_max_bytes", "value": 8_388_608},
+        ]}),
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.expect("batch result");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["count"], 6);
+
+    let updated = call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null).await;
+    let updated = updated.result.expect("daemon config");
+    assert_eq!(updated["program_hold_while_children_run"], false);
+    assert_eq!(updated["child_keepalive_enabled"], true);
+    assert_eq!(updated["child_keepalive_window_secs"], 600);
+    let cache = fixture
+        .runtime_config
+        .sandbox_build_cache_reclaim_snapshot();
+    assert_eq!(
+        (cache.high_watermark_pct, cache.low_watermark_pct),
+        (30, 10)
+    );
+    assert_eq!(
+        fixture
+            .runtime_config
+            .completed_transcript_cache_max_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        8_388_608
+    );
+    let store = fixture.manager.store().lock().await;
+    for (field, expected) in [
+        ("program_hold_while_children_run", "false"),
+        ("child_keepalive_enabled", "true"),
+        ("child_keepalive_window_secs", "600"),
+        ("sandbox_build_cache_reclaim_high_watermark_pct", "30"),
+        ("sandbox_build_cache_reclaim_low_watermark_pct", "10"),
+        ("completed_transcript_cache_max_bytes", "8388608"),
+    ] {
+        assert_eq!(
+            store.get_daemon_setting(field).unwrap().as_deref(),
+            Some(expected),
+            "{field} is durable"
+        );
+    }
+}
+
+/// #2236: all-or-nothing. One invalid value, an unknown or repeated field, an
+/// invalid combination or an empty list refuses the request, names the
+/// problem, and leaves every field (live and durable) as it was.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn update_daemon_config_batch_refuses_everything_when_any_part_is_invalid() {
+    let fixture = recursive_dag_rpc_fixture();
+    let keepalive_on = serde_json::json!({"field": "child_keepalive_enabled", "value": true});
+    for (label, updates, named) in [
+        (
+            "a value out of range",
+            serde_json::json!([
+                keepalive_on,
+                {"field": "child_keepalive_window_secs", "value": 299}
+            ]),
+            "child_keepalive_window_secs",
+        ),
+        (
+            "an unknown field",
+            serde_json::json!([keepalive_on, {"field": "no_such_setting", "value": 1}]),
+            "no_such_setting",
+        ),
+        (
+            "a repeated field",
+            serde_json::json!([keepalive_on, keepalive_on]),
+            "child_keepalive_enabled",
+        ),
+        (
+            "a low watermark above the high one",
+            serde_json::json!([
+                keepalive_on,
+                {"field": "sandbox_build_cache_reclaim_high_watermark_pct", "value": 40},
+                {"field": "sandbox_build_cache_reclaim_low_watermark_pct", "value": 60}
+            ]),
+            "watermark",
+        ),
+        ("an empty list", serde_json::json!([]), "at least one"),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({ "updates": updates }),
+        )
+        .await;
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("{label} must be refused"));
+        assert_eq!(error.code, INVALID_PARAMS, "{label}: {}", error.message);
+        assert!(
+            error.message.contains(named),
+            "{label}: the refusal names {named}: {}",
+            error.message
+        );
+    }
+    // One request holds either a single field or a list, never both.
+    let response = call_rpc(
+        &fixture.server,
+        "UpdateDaemonConfig",
+        serde_json::json!({
+            "field": "child_keepalive_enabled",
+            "value": true,
+            "updates": [keepalive_on],
+        }),
+    )
+    .await;
+    assert_eq!(
+        response.error.expect("ambiguous request refused").code,
+        INVALID_PARAMS
+    );
+
+    assert!(
+        !fixture
+            .runtime_config
+            .child_keepalive_enabled
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "no refused request moved a live value"
+    );
+    let store = fixture.manager.store().lock().await;
+    assert_eq!(
+        store.get_daemon_setting("child_keepalive_enabled").unwrap(),
+        None,
+        "no refused request wrote a durable row"
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -7332,7 +8620,7 @@ async fn agent_gate_attributed_call_to_issue_verbs_is_denied() {
         "LinkIssueToIdea",
     ] {
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7398,14 +8686,14 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
             })
             .unwrap()
     };
-    let token = "agent-issue-lead-token".to_string();
+    let token = "098c043b4f88efc52f4ece49c60b65c58ec093113c32a25973ac9e4536fd9787".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
         .await;
 
     let mut guarded = RpcRequest::new("AgentGetIssue", serde_json::json!({"issue_id":issue.id}));
-    guarded.session_token = Some(token.clone());
+    guarded.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&guarded).await
     else {
         panic!("expected AgentGetIssue response");
@@ -7421,7 +8709,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         "AgentGetIssue",
         serde_json::json!({"issue_id":issue.id,"project_id":project.id}),
     );
-    own_project.session_token = Some(token.clone());
+    own_project.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&own_project).await
     else {
         panic!("expected own-project AgentGetIssue response");
@@ -7435,7 +8723,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         "AgentGetIssue",
         serde_json::json!({"issue_id":issue.id,"project_id":Uuid::new_v4()}),
     );
-    spoofed.session_token = Some(token.clone());
+    spoofed.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&spoofed).await
     else {
         panic!("expected spoofed AgentGetIssue response");
@@ -7488,7 +8776,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         ("AgentRestoreIssue", serde_json::json!([])),
     ] {
         let mut request = RpcRequest::new(method, params);
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected malformed mutation response for {method}");
@@ -7502,6 +8790,26 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
             serde_json::json!("invalid_request"),
             "method: {method}"
         );
+    }
+    // #1750: `handoff` is an allowed AgentUpdateIssue field on the RPC/CLI
+    // transport. A lead is not an Issue-bound worker, so the request clears the
+    // decoder and is refused by authority, never as an unknown field.
+    {
+        let mut request = RpcRequest::new(
+            "AgentUpdateIssue",
+            serde_json::json!({
+                "display_number": issue.display_number,
+                "expected_row_version": initial_row_version,
+                "idempotency_key": "handoff-by-lead",
+                "handoff": "complete handoff",
+            }),
+        );
+        request.session_token = Some(token.clone().into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected handoff AgentUpdateIssue response");
+        };
+        assert_agent_issue_error_code(&response, "authority_denied");
     }
     {
         let store = fixture.manager.store().lock().await;
@@ -7529,7 +8837,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         "AgentGetIssue",
         serde_json::json!({"issue_id":Uuid::new_v4()}),
     );
-    missing.session_token = Some(token.clone());
+    missing.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&missing).await
     else {
         panic!("expected missing AgentGetIssue response");
@@ -7541,7 +8849,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
 
     let mut unknown_token =
         RpcRequest::new("AgentGetIssue", serde_json::json!({"issue_id":issue.id}));
-    unknown_token.session_token = Some("unknown-token".to_string());
+    unknown_token.session_token = Some("unknown-token".into());
     let HandleResult::Response(response) =
         fixture.server.handle_request_inner(&unknown_token).await
     else {
@@ -7553,7 +8861,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
     );
 
     let mut generic = RpcRequest::new("GetIssue", serde_json::json!({"issue_id":issue.id}));
-    generic.session_token = Some(token);
+    generic.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&generic).await
     else {
         panic!("expected generic GetIssue response");
@@ -7563,7 +8871,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
-async fn agent_issue_rpc_all_seven_decoders_emit_only_bounded_validation_hints() {
+async fn agent_issue_rpc_all_seven_decoders_preserve_hints_and_add_schema_diagnostics() {
     use rsi_common::rpc::{
         AgentIssueErrorCodeV1, AgentIssueErrorV1, AgentIssueValidationClassV1 as Class,
         AgentIssueValidationFieldV1 as Field,
@@ -7571,7 +8879,7 @@ async fn agent_issue_rpc_all_seven_decoders_emit_only_bounded_validation_hints()
 
     let fixture = recursive_dag_rpc_fixture();
     let caller = Uuid::new_v4();
-    let token = "all-agent-issue-validation-kinds".to_string();
+    let token = "645a6e7881b5b4ca0034f1b398e3cd0f5b962c6a0a4ae755d99af77eb5c603b2".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller)
@@ -7634,9 +8942,9 @@ async fn agent_issue_rpc_all_seven_decoders_emit_only_bounded_validation_hints()
         ),
     ];
 
-    for (method, params, expected_class, expected_field) in cases {
+    for (method, params, expected_class, expected_field) in cases.clone() {
         let mut request = RpcRequest::new(method, params);
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7650,30 +8958,53 @@ async fn agent_issue_rpc_all_seven_decoders_emit_only_bounded_validation_hints()
         let validation = envelope.validation.expect("bounded validation hint");
         assert_eq!(validation.class, expected_class, "method: {method}");
         assert_eq!(validation.field, expected_field, "method: {method}");
-        assert!(!data.to_string().contains("rogue/secret"));
-        assert!(!data.to_string().contains("never"));
+        assert!(data["path"].as_str().unwrap().starts_with("params"));
+        assert!(data["constraint"].is_string());
+        if method == "AgentGetIssue" {
+            assert_eq!(data["path"], "params[\"rogue/secret\"]");
+            assert_eq!(data["constraint"], "additionalProperties false");
+            assert_eq!(data["value"], "never");
+        }
     }
 
-    let mut unauthenticated = RpcRequest::new(
-        "AgentGetIssue",
-        serde_json::json!({"rogue/secret": "never"}),
-    );
-    unauthenticated.session_token = Some("unknown-token".to_string());
-    let HandleResult::Response(response) =
-        fixture.server.handle_request_inner(&unauthenticated).await
-    else {
-        panic!("expected authority response");
-    };
-    let envelope: AgentIssueErrorV1 = serde_json::from_value(
-        response
-            .error
-            .expect("unknown token must fail")
-            .data
-            .expect("typed Issue envelope"),
-    )
-    .unwrap();
-    assert_eq!(envelope.code, AgentIssueErrorCodeV1::AuthorityDenied);
-    assert_eq!(envelope.validation, None);
+    fixture
+        .manager
+        .agent_tokens
+        .write()
+        .await
+        .revoke_session(caller);
+    let unregistered = crate::test_support::agent_token("unregistered-issue-rpc");
+    // Every decoder route retains its typed authority refusal at the earlier
+    // admission gate. Invalid params must not add schema diagnostics before
+    // authentication, including for a well-shaped unknown or revoked bearer.
+    for (method, params, _, _) in cases {
+        for denied_token in ["unknown-token", unregistered.as_str(), token.as_str()] {
+            let mut unauthenticated = RpcRequest::new(method, params.clone());
+            unauthenticated.session_token = Some(denied_token.into());
+            let HandleResult::Response(response) =
+                fixture.server.handle_request_inner(&unauthenticated).await
+            else {
+                panic!("expected authority response for {method}");
+            };
+            let error = response.error.expect("unauthenticated caller must fail");
+            assert_eq!(error.code, INVALID_PARAMS, "{method}");
+            assert_eq!(error.message, "agent_issue_authority_denied", "{method}");
+            let data = error.data.expect("typed Issue envelope");
+            let envelope: AgentIssueErrorV1 = serde_json::from_value(data.clone()).unwrap();
+            assert_eq!(envelope.code, AgentIssueErrorCodeV1::AuthorityDenied);
+            assert_eq!(envelope.validation, None);
+            assert_eq!(
+                data,
+                serde_json::to_value(crate::error::agent_issue_error_envelope(
+                    AgentIssueErrorCodeV1::AuthorityDenied,
+                    None,
+                    None,
+                ))
+                .unwrap(),
+                "{method}: admission returns only the safe authority envelope",
+            );
+        }
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -7790,7 +9121,7 @@ async fn closure_k1_rpc_surface_is_operator_only_and_k2_k3_remain_unrouted() {
         assert!(!agent_gate::AGENT_VERBS.contains(&method));
         assert!(!agent_gate::READ_VERBS.contains(&method));
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7836,7 +9167,7 @@ async fn agent_gate_attributed_call_to_model_control_verbs_is_denied() {
         "CancelModelInvocation",
     ] {
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7874,7 +9205,7 @@ async fn agent_gate_attributed_call_to_daemon_config_verbs_is_denied() {
                 "value": "ultra",
             }),
         );
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7905,7 +9236,10 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
     let worker = Uuid::new_v4();
     fixture
         .manager
-        .register_agent_token("topology-worker-token".into(), worker)
+        .register_agent_token(
+            "d0b85bd71e1494ae657dbe9d754736854797677aff92e202fb3a62cbb0aae1ed".into(),
+            worker,
+        )
         .await;
     let id = Uuid::new_v4();
     let digest = format!("sha256:{}", "a".repeat(64));
@@ -7918,6 +9252,7 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
             }),
         ),
         ("AgentTopologyList", serde_json::json!({})),
+        ("AgentTopologyGet", serde_json::json!({"name":"t4-rpc"})),
         (
             "AgentTopologyExecute",
             serde_json::json!({
@@ -7945,10 +9280,10 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
         for token in [
             None,
             Some("unknown-topology-token"),
-            Some("topology-worker-token"),
+            Some("d0b85bd71e1494ae657dbe9d754736854797677aff92e202fb3a62cbb0aae1ed"),
         ] {
             let mut request = RpcRequest::new(method, params.clone());
-            request.session_token = token.map(str::to_owned);
+            request.session_token = token.map(Into::into);
             let HandleResult::Response(response) =
                 fixture.server.handle_request_inner(&request).await
             else {
@@ -7965,7 +9300,8 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
         let mut spoofed = params.clone();
         spoofed["caller_session_id"] = serde_json::json!(worker);
         let mut request = RpcRequest::new(method, spoofed);
-        request.session_token = Some("topology-worker-token".into());
+        request.session_token =
+            Some("d0b85bd71e1494ae657dbe9d754736854797677aff92e202fb3a62cbb0aae1ed".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -7995,7 +9331,10 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
     }
     fixture
         .manager
-        .register_agent_token("topology-lead-token".into(), lead)
+        .register_agent_token(
+            "aa8eb5295d6c3b75f77093e8da1a17be4a77b6e7ceea3175e9d85909a4899d13".into(),
+            lead,
+        )
         .await;
     let mut request = RpcRequest::new(
         "AgentTopologyUpsert",
@@ -8004,7 +9343,8 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
             "definition":{"nodes":[],"edges":[]}
         }),
     );
-    request.session_token = Some("topology-lead-token".into());
+    request.session_token =
+        Some("aa8eb5295d6c3b75f77093e8da1a17be4a77b6e7ceea3175e9d85909a4899d13".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected upsert response");
@@ -8019,7 +9359,8 @@ async fn agent_topology_verbs_are_token_bound_writes_and_operator_topology_stays
         "AgentTopologyList",
         serde_json::json!({"include_executions": true}),
     );
-    request.session_token = Some("topology-lead-token".into());
+    request.session_token =
+        Some("aa8eb5295d6c3b75f77093e8da1a17be4a77b6e7ceea3175e9d85909a4899d13".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected list response");
@@ -8153,7 +9494,7 @@ async fn resolve_topology_attempt_is_operator_only() {
             "idempotency_key": "k",
         }),
     );
-    request.session_token = Some("some-token".to_string());
+    request.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response for {method}");
@@ -8193,7 +9534,7 @@ async fn archived_sandbox_purge_rpc_is_operator_only_and_dry_run_reports() {
         method,
         serde_json::json!({ "dry_run": true, "max_count": 5 }),
     );
-    request.session_token = Some("some-token".to_string());
+    request.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response for {method}");
@@ -8231,6 +9572,845 @@ async fn archived_sandbox_purge_rpc_is_operator_only_and_dry_run_reports() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn cold_archive_rpcs_are_operator_only_report_status_and_refuse_when_turned_off() {
+    let fixture = recursive_dag_rpc_fixture();
+    for method in [
+        "GetColdArchiveStatus",
+        "RunColdArchiveNow",
+        "GetColdSessionStorage",
+        "RestoreColdSession",
+    ] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            rsi_common::agent_control_schema::agent_control_catalog_v1()
+                .iter()
+                .all(|descriptor| descriptor.method != method),
+            "{method} is absent from the agent CLI catalog"
+        );
+        assert_eq!(
+            rsi_common::agent_control_schema::AgentControlVerbV1::from_method_name(method),
+            None,
+            "{method} is not a native agent tool"
+        );
+        let mut request = RpcRequest::new(method, serde_json::json!({}));
+        request.session_token = Some("some-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        let error = response.error.expect("attributed call must be denied");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+
+    let status = call_rpc(
+        &fixture.server,
+        "GetColdArchiveStatus",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(status.error.is_none(), "{status:?}");
+    let status = status.result.expect("status result");
+    assert_eq!(
+        status["settings"]["enabled"], true,
+        "the archive ships on (S5): nothing in this fixture wrote the setting"
+    );
+    assert_eq!(status["settings"]["after_days"], 14);
+    assert_eq!(status["running"], false);
+    assert_eq!(status["totals"]["staged_sessions"], 0);
+    assert_eq!(status["totals"]["cold_sessions"], 0);
+    assert!(status["archives"].as_array().expect("archives").is_empty());
+    assert!(status["errors"].as_array().expect("errors").is_empty());
+    assert!(status["last_run"].is_null());
+    assert_eq!(status["compaction"]["available"], true);
+    assert_eq!(status["compaction"]["pending"], false);
+
+    // An operator who turns the archive off gets the typed refusal for every mode.
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(false))
+        .unwrap();
+    let disabled = call_rpc(&fixture.server, "RunColdArchiveNow", serde_json::json!({})).await;
+    let error = disabled
+        .error
+        .expect("run-now is refused while the setting is off");
+    assert_eq!(error.code, INVALID_PARAMS);
+    assert!(
+        error.message.contains("cold_archive_disabled"),
+        "{}",
+        error.message
+    );
+    for mode in ["move", "compact", "verify"] {
+        let refused = call_rpc(
+            &fixture.server,
+            "RunColdArchiveNow",
+            serde_json::json!({ "mode": mode }),
+        )
+        .await;
+        let error = refused
+            .error
+            .expect("every mode is refused while the setting is off");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(
+            error.message.contains("cold_archive_disabled"),
+            "{mode}: {}",
+            error.message
+        );
+    }
+    for params in [
+        serde_json::json!({ "mode": "everything" }),
+        serde_json::json!({ "mode": "stage", "unknown": 1 }),
+    ] {
+        let refused = call_rpc(&fixture.server, "RunColdArchiveNow", params).await;
+        assert_eq!(refused.error.expect("invalid params").code, INVALID_PARAMS);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
+async fn run_cold_archive_now_stages_old_sessions_in_the_background_and_reports_status() {
+    let fixture = recursive_dag_rpc_fixture();
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(true))
+        .unwrap();
+    let old = (chrono::Utc::now() - chrono::Duration::days(61))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let session_id = {
+        let store = fixture.manager.store().lock().await;
+        let mut session = rsid_store::test_support::make_test_session();
+        session.status = rsi_common::types::SessionStatus::Archived;
+        session.created_at = chrono::Utc::now() - chrono::Duration::days(62);
+        store.insert_session(&session).unwrap();
+        for (sequence, event_type, role) in [
+            (1, "Message", Some("User")),
+            (2, "System", None),
+            (3, "ToolResult", None),
+            (4, "Message", Some("Assistant")),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO conversation_events(session_id, sequence, event_type, role,
+                        content, created_at) VALUES (?1, ?2, ?3, ?4, 'body', ?5)",
+                    params![session.id.to_string(), sequence, event_type, role, old],
+                )
+                .unwrap();
+        }
+        session.id
+    };
+
+    // One pass at a time.
+    fixture
+        .manager
+        .cold_archive_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let busy = call_rpc(&fixture.server, "RunColdArchiveNow", serde_json::json!({})).await;
+    let error = busy.error.expect("a running pass refuses another");
+    assert!(
+        error.message.contains("cold_archive_running"),
+        "{}",
+        error.message
+    );
+    fixture
+        .manager
+        .cold_archive_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let wait_for_run = |expected_run: String| {
+        let server = &fixture.server;
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let status = call_rpc(server, "GetColdArchiveStatus", serde_json::json!({})).await;
+                let status = status.result.expect("status");
+                let settled = status["running"] == false
+                    && status["last_run"]["run_id"] == expected_run.as_str()
+                    && status["last_run"]["outcome"] != "running";
+                if settled {
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pass did not finish: {status}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    let started = call_rpc(
+        &fixture.server,
+        "RunColdArchiveNow",
+        serde_json::json!({ "mode": "stage" }),
+    )
+    .await;
+    assert!(started.error.is_none(), "{started:?}");
+    let started = started.result.expect("run-now result");
+    assert_eq!(started["mode"], "stage");
+    let run_id = started["run_id"].as_str().expect("run id").to_string();
+    let status = wait_for_run(run_id).await;
+    assert_eq!(status["last_run"]["outcome"], "completed", "{status}");
+    assert_eq!(status["last_run"]["mode"], "stage");
+    assert_eq!(status["last_run"]["trigger"], "run_now");
+    assert_eq!(status["last_run"]["sessions_staged"], 1);
+    assert_eq!(status["last_run"]["sessions_moved"], 0);
+    assert_eq!(status["totals"]["staged_sessions"], 1);
+    assert_eq!(status["totals"]["verified_sessions"], 1);
+    assert_eq!(
+        status["totals"]["archived_events"], 1,
+        "only the ToolResult moves; the System row stays in the live tail"
+    );
+    assert!(status["errors"].as_array().unwrap().is_empty(), "{status}");
+    let archives = status["archives"].as_array().expect("archives");
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0]["chunk_count"].as_i64().unwrap() >= 1);
+    assert!(
+        std::path::Path::new(archives[0]["path"].as_str().unwrap()).is_file(),
+        "the archive file is on disk"
+    );
+    {
+        let store = fixture.manager.store().lock().await;
+        let live: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_events WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 4, "slice S1 deletes nothing from the live database");
+    }
+
+    let started = call_rpc(
+        &fixture.server,
+        "RunColdArchiveNow",
+        serde_json::json!({ "mode": "verify" }),
+    )
+    .await;
+    let run_id = started.result.expect("verify run-now result")["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = wait_for_run(run_id).await;
+    assert_eq!(status["last_run"]["mode"], "verify");
+    assert_eq!(status["last_run"]["outcome"], "completed", "{status}");
+    assert_eq!(
+        status["last_run"]["sessions_staged"], 1,
+        "one session verified"
+    );
+    assert!(status["archives"][0]["last_verified_at"].is_string());
+
+    // Turning the setting off refuses the next run again.
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(false))
+        .unwrap();
+    let off = call_rpc(&fixture.server, "RunColdArchiveNow", serde_json::json!({})).await;
+    assert!(off.error.unwrap().message.contains("cold_archive_disabled"));
+}
+
+/// Waits until the newest cold-archive run is `run_id` and settled.
+async fn wait_for_cold_archive_run(server: &RpcServer, run_id: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = call_rpc(server, "GetColdArchiveStatus", serde_json::json!({}))
+            .await
+            .result
+            .expect("status");
+        if status["running"] == false
+            && status["last_run"]["run_id"] == run_id
+            && status["last_run"]["outcome"] != "running"
+        {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pass did not finish: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_scheduled_cold_archive_pass_is_due_only_after_the_interval_since_the_last_start() {
+    use crate::session::cold_archive::{COLD_ARCHIVE_INTERVAL, cold_archive_pass_due};
+    let now = chrono::Utc::now();
+    let interval = chrono::Duration::from_std(COLD_ARCHIVE_INTERVAL).unwrap();
+    assert!(cold_archive_pass_due(None, now), "never started: due");
+    assert!(!cold_archive_pass_due(Some(now), now));
+    assert!(!cold_archive_pass_due(
+        Some(now - interval + chrono::Duration::seconds(5)),
+        now
+    ));
+    assert!(cold_archive_pass_due(Some(now - interval), now));
+    assert!(cold_archive_pass_due(
+        Some(now - interval - chrono::Duration::hours(1)),
+        now
+    ));
+    // The clock moved back: a start a little ahead holds the schedule, one more
+    // than an interval ahead cannot hold it for longer than one interval.
+    assert!(!cold_archive_pass_due(
+        Some(now + chrono::Duration::minutes(10)),
+        now
+    ));
+    assert!(cold_archive_pass_due(
+        Some(now + interval + chrono::Duration::hours(1)),
+        now
+    ));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
+async fn the_cold_archive_schedule_survives_a_daemon_restart() {
+    use crate::session::cold_archive::ColdArchiveTick;
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = &fixture.manager;
+    let now = chrono::Utc::now();
+    // The archive ships on (S5); an operator who turned it off gets no pass.
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(false))
+        .unwrap();
+    assert_eq!(
+        manager.cold_archive_tick(now).await,
+        ColdArchiveTick::Disabled,
+        "the setting is off"
+    );
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(true))
+        .unwrap();
+
+    let insert_run =
+        |mode: &'static str, trigger: &'static str, at: chrono::DateTime<chrono::Utc>| {
+            let started = at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let manager = std::sync::Arc::clone(manager);
+            async move {
+                let store = manager.store().lock().await;
+                store
+                .conn
+                .execute(
+                    "INSERT INTO cold_archive_runs(run_id, trigger, mode, started_at, finished_at,
+                        outcome) VALUES (?1, ?2, ?3, ?4, ?4, 'completed')",
+                    params![run_id, trigger, mode, started],
+                )
+                .unwrap();
+                run_id
+            }
+        };
+    let run_count = || async {
+        let store = manager.store().lock().await;
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM cold_archive_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+
+    // The previous daemon incarnation started a stage pass an hour ago. This
+    // one has just started (a restart): it must not run another yet.
+    insert_run("stage", "scheduled", now - chrono::Duration::minutes(60)).await;
+    assert_eq!(
+        manager.cold_archive_tick(now).await,
+        ColdArchiveTick::NotDue,
+        "a restart does not reset the interval"
+    );
+    assert_eq!(run_count().await, 1, "no run row was opened");
+
+    assert_eq!(
+        manager
+            .cold_archive_tick(now + chrono::Duration::hours(2))
+            .await,
+        ColdArchiveTick::NotDue
+    );
+
+    // Past the interval since that stage start the pass is due and starts.
+    let later = now + chrono::Duration::hours(6);
+    let ColdArchiveTick::Started(run_id) = manager.cold_archive_tick(later).await else {
+        panic!("a pass is due six hours after the last stage start");
+    };
+    let status = wait_for_cold_archive_run(&fixture.server, &run_id.to_string()).await;
+    assert_eq!(status["last_run"]["trigger"], "scheduled");
+    assert_eq!(
+        status["last_run"]["mode"], "move",
+        "slice S4: the scheduled pass moves"
+    );
+    assert_eq!(run_count().await, 2);
+
+    // That start now holds the schedule in turn, for the next interval.
+    assert_eq!(
+        manager.cold_archive_tick(chrono::Utc::now()).await,
+        ColdArchiveTick::NotDue
+    );
+    assert_eq!(run_count().await, 2);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn a_cold_archive_clock_rollback_runs_one_replacement_pass_not_one_per_tick_2449() {
+    use crate::session::cold_archive::ColdArchiveTick;
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = &fixture.manager;
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(true))
+        .unwrap();
+    let now = chrono::Utc::now();
+    let run_count = || async {
+        let store = manager.store().lock().await;
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM cold_archive_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    // A stage run recorded a day ahead; the clock was then corrected.
+    {
+        let store = manager.store().lock().await;
+        store
+            .conn
+            .execute(
+                "INSERT INTO cold_archive_runs(run_id, trigger, mode, started_at, finished_at,
+                    outcome) VALUES (?1, 'scheduled', 'stage', ?2, ?2, 'completed')",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    (now + chrono::Duration::hours(24))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+    }
+    let ColdArchiveTick::Started(run_id) = manager.cold_archive_tick(now).await else {
+        panic!("a start far in the future is treated as due once");
+    };
+    let _ = wait_for_cold_archive_run(&fixture.server, &run_id.to_string()).await;
+    assert_eq!(run_count().await, 2);
+
+    // The replacement pass holds the schedule; the old future row does not.
+    for minutes in [10, 20, 30, 120, 300] {
+        assert_eq!(
+            manager
+                .cold_archive_tick(now + chrono::Duration::minutes(minutes))
+                .await,
+            ColdArchiveTick::NotDue,
+            "tick at +{minutes} minutes is inside the six-hour interval"
+        );
+    }
+    assert_eq!(run_count().await, 2, "no further run was opened");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn a_cold_archive_pass_refuses_a_directory_that_resolves_into_the_sandbox_base() {
+    let fixture = recursive_dag_rpc_fixture();
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(true))
+        .unwrap();
+    // The fixture's sandbox base is `<dir>/sandboxes`. The setting's own check
+    // is exercised in the store crate; here the daemon's pass-time check must
+    // hold even for a value that reached the field another way.
+    let sandboxes = fixture._dir.path().join("sandboxes");
+    let inside = sandboxes.join("s1").join("archive");
+    std::fs::create_dir_all(sandboxes.join("s1")).unwrap();
+    *fixture.runtime_config.cold_archive_dir.write() = inside.display().to_string();
+
+    let started = call_rpc(&fixture.server, "RunColdArchiveNow", serde_json::json!({})).await;
+    let run_id = started.result.expect("the run starts")["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = wait_for_cold_archive_run(&fixture.server, &run_id).await;
+    assert_eq!(status["last_run"]["outcome"], "failed", "{status}");
+    assert_eq!(
+        status["last_run"]["error_code"], "cold_archive_dir_forbidden",
+        "{status}"
+    );
+    assert!(
+        !inside.exists(),
+        "the refused pass created nothing inside the sandbox base"
+    );
+}
+
+/// An old session with the seven rows of the cold-archive RPC tests (tool rows
+/// among them), inserted into `store`. The session is 62 days old, so it is a
+/// cold candidate when its status allows.
+fn seed_old_session(
+    store: &crate::store::Store,
+    status: rsi_common::types::SessionStatus,
+) -> uuid::Uuid {
+    let old = (chrono::Utc::now() - chrono::Duration::days(61))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let mut session = rsid_store::test_support::make_test_session();
+    session.status = status;
+    session.created_at = chrono::Utc::now() - chrono::Duration::days(62);
+    store.insert_session(&session).unwrap();
+    for (sequence, event_type, role) in [
+        (1, "Message", Some("User")),
+        (2, "System", None),
+        (3, "ToolUse", Some("Assistant")),
+        (4, "ToolResult", None),
+        (5, "ToolUse", Some("Assistant")),
+        (6, "ToolResult", None),
+        (7, "Message", Some("Assistant")),
+    ] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO conversation_events(session_id, sequence, event_type, role,
+                    content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session.id.to_string(),
+                    sequence,
+                    event_type,
+                    role,
+                    format!("{event_type} {sequence}"),
+                    old
+                ],
+            )
+            .unwrap();
+    }
+    session.id
+}
+
+/// An old session with tool rows, enabled for the archive but not yet staged:
+/// the pre-move state of a cold candidate. Returns its id.
+async fn seed_cold_candidate(
+    fixture: &RecursiveDagRpcFixture,
+    status: rsi_common::types::SessionStatus,
+) -> uuid::Uuid {
+    fixture
+        .runtime_config
+        .update_field("cold_archive_enabled", &serde_json::json!(true))
+        .unwrap();
+    let store = fixture.manager.store().lock().await;
+    seed_old_session(&store, status)
+}
+
+/// Stages every candidate with the real stage pass (through `RunColdArchiveNow`)
+/// and moves `session_id` with the test-only move seam.
+async fn stage_and_move_cold_session(fixture: &RecursiveDagRpcFixture, session_id: uuid::Uuid) {
+    let started = call_rpc(&fixture.server, "RunColdArchiveNow", serde_json::json!({})).await;
+    let run_id = started.result.expect("the stage run starts")["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = wait_for_cold_archive_run(&fixture.server, &run_id).await;
+    assert_eq!(status["last_run"]["outcome"], "completed", "{status}");
+    let store = fixture.manager.store().lock().await;
+    let outcome = store.cold_move_session_for_test(session_id).unwrap();
+    assert!(
+        matches!(outcome, crate::store::cold_archive::MoveOutcome::Moved(_)),
+        "{outcome:?}"
+    );
+}
+
+/// An old `Archived` session with tool rows, staged by the real stage pass (through
+/// `RunColdArchiveNow`) and moved by the test-only move seam. Returns its id and
+/// its transcript as the daemon served it before the move.
+async fn moved_cold_session(
+    fixture: &RecursiveDagRpcFixture,
+    status: rsi_common::types::SessionStatus,
+) -> (uuid::Uuid, serde_json::Value) {
+    let session_id = seed_cold_candidate(fixture, status).await;
+    let before = serde_json::to_value(
+        fixture
+            .manager
+            .get_conversation_since(session_id, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(before.as_array().unwrap().len(), 7);
+    stage_and_move_cold_session(fixture, session_id).await;
+    (session_id, before)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
+async fn a_cold_session_is_served_whole_and_restore_flips_the_tier() {
+    let fixture = recursive_dag_rpc_fixture();
+    let (session_id, before) =
+        moved_cold_session(&fixture, rsi_common::types::SessionStatus::Archived).await;
+    let ask = serde_json::json!({ "session_id": session_id });
+
+    let storage = call_rpc(&fixture.server, "GetColdSessionStorage", ask.clone())
+        .await
+        .result
+        .expect("storage");
+    assert_eq!(storage["tier"], "cold", "{storage}");
+    assert_eq!(storage["archived_events"], 4, "{storage}");
+    assert!(
+        storage["file"]
+            .as_str()
+            .is_some_and(|file| file.ends_with(".sqlite"))
+    );
+
+    // The daemon's transcript paths return the pre-move transcript, whole.
+    let manager = &fixture.manager;
+    let cold = serde_json::to_value(
+        manager
+            .get_conversation_since(session_id, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cold, before, "GetConversation serves the same events");
+    let since = serde_json::to_value(
+        manager
+            .get_conversation_since(session_id, Some(4))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(since, serde_json::json!(before.as_array().unwrap()[4..]));
+
+    let restored = call_rpc(&fixture.server, "RestoreColdSession", ask.clone()).await;
+    let restored = restored.result.expect("restore result");
+    assert_eq!(restored["outcome"], "restored", "{restored}");
+    assert_eq!(restored["events"], 4);
+    let again = call_rpc(&fixture.server, "RestoreColdSession", ask.clone())
+        .await
+        .result
+        .expect("a second restore is success");
+    assert_eq!(again["outcome"], "already_hot", "{again}");
+    let storage = call_rpc(&fixture.server, "GetColdSessionStorage", ask)
+        .await
+        .result
+        .expect("storage");
+    assert_eq!(storage["tier"], "restored", "{storage}");
+    let live = serde_json::to_value(
+        manager
+            .get_conversation_since(session_id, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live, before, "the restored rows are the same events");
+
+    // Unknown sessions and bad params are refused.
+    let missing = call_rpc(
+        &fixture.server,
+        "RestoreColdSession",
+        serde_json::json!({ "session_id": uuid::Uuid::new_v4() }),
+    )
+    .await;
+    assert!(missing.error.is_some());
+    let bad = call_rpc(
+        &fixture.server,
+        "GetColdSessionStorage",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(bad.error.expect("params are required").code, INVALID_PARAMS);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn a_missing_archive_is_cold_archive_unavailable_on_every_daemon_read() {
+    let fixture = recursive_dag_rpc_fixture();
+    let (session_id, _before) =
+        moved_cold_session(&fixture, rsi_common::types::SessionStatus::Archived).await;
+    let file = {
+        let store = fixture.manager.store().lock().await;
+        store.cold_archive_files().unwrap().remove(0).path
+    };
+    std::fs::remove_file(&file).unwrap();
+
+    let error = fixture
+        .manager
+        .get_conversation_since(session_id, None)
+        .await
+        .expect_err("the transcript is unavailable, not a short transcript");
+    assert!(
+        crate::store::cold_archive::is_unavailable_error(&error),
+        "{error}"
+    );
+    let restore = call_rpc(
+        &fixture.server,
+        "RestoreColdSession",
+        serde_json::json!({ "session_id": session_id }),
+    )
+    .await;
+    let error = restore.error.expect("restore refuses");
+    assert!(
+        error.message.contains("cold_archive_unavailable"),
+        "{}",
+        error.message
+    );
+    let storage = call_rpc(
+        &fixture.server,
+        "GetColdSessionStorage",
+        serde_json::json!({ "session_id": session_id }),
+    )
+    .await
+    .result
+    .expect("storage");
+    assert_eq!(storage["tier"], "cold", "a refused restore changes nothing");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn unarchive_and_undelete_restore_a_cold_session_before_the_status_flip() {
+    use rsi_common::types::SessionStatus;
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = &fixture.manager;
+
+    // Guard 3: the status flip alone is refused while the rows are archived.
+    let (archived, before) = moved_cold_session(&fixture, SessionStatus::Archived).await;
+    {
+        let store = manager.store().lock().await;
+        let refused = store
+            .conn
+            .execute(
+                "UPDATE sessions SET status = 'Completed' WHERE id = ?1",
+                [archived.to_string()],
+            )
+            .expect_err("a cold session cannot leave Archived by itself");
+        assert!(
+            refused
+                .to_string()
+                .contains("cold_session_restore_required"),
+            "{refused}"
+        );
+    }
+
+    let session = manager
+        .unarchive_session(archived)
+        .await
+        .expect("unarchive");
+    assert_eq!(session.status, SessionStatus::Completed);
+    let storage = manager.cold_session_storage(archived).await.unwrap();
+    assert_eq!(storage.tier, "restored");
+    let events = serde_json::to_value(
+        manager
+            .get_conversation_since(archived, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(events, before, "unarchive hands back the whole transcript");
+
+    // A cold Deleted session restores the same way.
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = &fixture.manager;
+    let (deleted, before) = moved_cold_session(&fixture, SessionStatus::Deleted).await;
+    let session = manager.undelete_session(deleted).await.expect("undelete");
+    assert_eq!(session.status, SessionStatus::Completed);
+    assert_eq!(
+        manager.cold_session_storage(deleted).await.unwrap().tier,
+        "restored"
+    );
+    let events =
+        serde_json::to_value(manager.get_conversation_since(deleted, None).await.unwrap()).unwrap();
+    assert_eq!(events, before);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn concurrent_restore_and_unarchive_restore_exactly_once() {
+    use rsi_common::types::SessionStatus;
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = std::sync::Arc::clone(&fixture.manager);
+    let (session_id, before) = moved_cold_session(&fixture, SessionStatus::Archived).await;
+
+    let restoring = {
+        let manager = std::sync::Arc::clone(&manager);
+        tokio::spawn(async move { manager.restore_cold_session(session_id).await })
+    };
+    let unarchiving = {
+        let manager = std::sync::Arc::clone(&manager);
+        tokio::spawn(async move { manager.unarchive_session(session_id).await })
+    };
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), restoring)
+        .await
+        .expect("no deadlock")
+        .unwrap()
+        .expect("restore");
+    let unarchived = tokio::time::timeout(std::time::Duration::from_secs(30), unarchiving)
+        .await
+        .expect("no deadlock")
+        .unwrap()
+        .expect("unarchive");
+    assert_eq!(unarchived.status, SessionStatus::Completed);
+    assert!(
+        matches!(receipt.outcome, "restored" | "already_hot"),
+        "{receipt:?}"
+    );
+
+    // Exactly one of the two did the restore: the rows are back once, not twice.
+    let live: i64 = {
+        let store = manager.store().lock().await;
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_events WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(live, 7);
+    let events = serde_json::to_value(
+        manager
+            .get_conversation_since(session_id, None)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(events, before);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+async fn continuing_a_cold_session_restores_it_under_its_own_guard_without_deadlock() {
+    use rsi_common::types::SessionStatus;
+    let fixture = recursive_dag_rpc_fixture();
+    let manager = std::sync::Arc::clone(&fixture.manager);
+    let (session_id, _before) = moved_cold_session(&fixture, SessionStatus::Archived).await;
+    // The continuation is refused later (an archived session, no provider), but
+    // only after it restored the rows under the guard it took itself.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        manager.continue_session(session_id, "carry on".to_string()),
+    )
+    .await
+    .expect("continue_session must not deadlock on its own spawn guard");
+    let _ = outcome;
+    assert_eq!(
+        manager.cold_session_storage(session_id).await.unwrap().tier,
+        "restored"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
 #[allow(
     clippy::await_holding_lock,
     clippy::expect_used,
@@ -8253,7 +10433,7 @@ async fn sandbox_storage_rpc_is_operator_only_and_dry_run_is_structured() {
             serde_json::json!({ "dry_run": true })
         };
         let mut request = RpcRequest::new(method, params);
-        request.session_token = Some("some-token".to_string());
+        request.session_token = Some("some-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -8463,6 +10643,15 @@ fn operator_daemon_config_is_absent_from_every_agent_surface() {
             descriptor.parameters_json()
         )
         .to_ascii_lowercase();
+        // #2145: `AgentManagerControl`'s `ProposeDaemonSetting` key is the
+        // closed curated allowlist, so it names exactly those registry keys.
+        // That is the operator-bounded manager path (#1046), not a daemon
+        // config verb; every other descriptor still must not name them.
+        let manager_allowlist: Vec<&str> =
+            rsi_common::manager_daemon_settings::MANAGER_ADJUSTABLE_DAEMON_SETTINGS
+                .iter()
+                .map(|setting| setting.key)
+                .collect();
         for forbidden in [
             "daemon_config",
             "daemonconfig",
@@ -8476,6 +10665,10 @@ fn operator_daemon_config_is_absent_from_every_agent_surface() {
             "sandbox_max_source_roots",
             "sandbox_min_free_gib",
         ] {
+            if descriptor.method == "AgentManagerControl" && manager_allowlist.contains(&forbidden)
+            {
+                continue;
+            }
             assert!(
                 !haystack.contains(forbidden),
                 "agent CLI descriptor {} exposed operator-only surface {forbidden:?}",
@@ -8862,8 +11055,11 @@ async fn resource_governor_rpcs_grant_report_and_release_a_slot() {
     )
     .await;
     let view = view.result.unwrap();
-    assert_eq!(view["policy"]["build_slots"], 4);
-    assert_eq!(view["policy"]["lander_slots"], 5);
+    // The view reports the platform's seeded policy: the Linux hub policy
+    // (4 build, 5 lander slots) or the macOS 16 GB satellite policy.
+    let expected_policy = crate::governor::GovernorPolicy::platform_default();
+    assert_eq!(view["policy"]["build_slots"], expected_policy.build_slots);
+    assert_eq!(view["policy"]["lander_slots"], expected_policy.lander_slots);
 
     let released = call_rpc(
         &fixture.server,
@@ -8889,18 +11085,76 @@ async fn resource_governor_rpcs_grant_report_and_release_a_slot() {
 #[tokio::test]
 async fn agent_gate_attributed_call_to_allowlisted_method_is_allowed() {
     let fixture = recursive_dag_rpc_fixture();
+    let caller_id = Uuid::new_v4();
+    fixture
+        .manager
+        .store()
+        .lock()
+        .await
+        .insert_session(&mk_agent_test_session(
+            caller_id,
+            rsi_common::types::SessionKind::Task,
+            None,
+            None,
+        ))
+        .expect("insert caller");
+    let token = fixture.manager.remint_session_token(caller_id).await;
     let mut request = RpcRequest::new("GetHealthStatus", serde_json::Value::Null);
-    request.session_token = Some("some-token".to_string());
+    request.session_token = Some(token);
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
     };
-    // Passes the gate; any error here would be from the handler itself,
-    // never the "not available to session-attributed callers" gate error.
+    // A registered caller may use an allowlisted read through RPC admission.
     assert!(
         response.error.is_none(),
         "unexpected error: {:?}",
         response.error
+    );
+    let health: rsi_common::rpc::HealthStatusResponse =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(health.daemon_pid, Some(std::process::id()));
+    assert_eq!(
+        health.daemon_started_at.as_deref(),
+        Some(
+            crate::daemon_info::DaemonInfoService::global()
+                .started_at_rfc3339()
+                .as_str()
+        )
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn unscoped_health_identifies_the_replying_process_and_stable_startup() {
+    let fixture = recursive_dag_rpc_fixture();
+    // No session token or manager/lead authority is needed by an installer.
+    let first = call_rpc(&fixture.server, "GetHealthStatus", serde_json::Value::Null).await;
+    assert!(first.error.is_none(), "{:?}", first.error);
+    let first: rsi_common::rpc::HealthStatusResponse =
+        serde_json::from_value(first.result.unwrap()).unwrap();
+    let second = call_rpc(&fixture.server, "GetHealthStatus", serde_json::Value::Null).await;
+    assert!(second.error.is_none(), "{:?}", second.error);
+    let second: rsi_common::rpc::HealthStatusResponse =
+        serde_json::from_value(second.result.unwrap()).unwrap();
+    assert_eq!(first.daemon_pid, Some(std::process::id()));
+    assert_eq!(second.daemon_pid, first.daemon_pid);
+    assert_eq!(second.daemon_started_at, first.daemon_started_at);
+    let started = first.daemon_started_at.unwrap();
+    assert_eq!(
+        started,
+        crate::daemon_info::DaemonInfoService::global().started_at_rfc3339()
+    );
+    let parsed = chrono::DateTime::parse_from_rfc3339(&started).unwrap();
+    assert_eq!(parsed.offset().local_minus_utc(), 0);
+    assert_eq!(
+        started
+            .split('.')
+            .nth(1)
+            .unwrap()
+            .trim_end_matches('Z')
+            .len(),
+        9
     );
 }
 
@@ -8970,14 +11224,14 @@ async fn agent_get_progress_defaults_to_cohort_and_rejects_malformed_or_identity
             )
             .expect("insert out-of-cohort sandboxed child");
     }
-    let token = "progress-token".to_string();
+    let token = "6d94c563cb7c9de737fe4b657abb02e3f4ddafcf59c4d8a13c1fc3daf055200f".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
         .await;
 
     let mut request = RpcRequest::new("AgentGetProgress", serde_json::Value::Null);
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -8997,7 +11251,7 @@ async fn agent_get_progress_defaults_to_cohort_and_rejects_malformed_or_identity
         serde_json::json!({ "session_ids": [outside_id] }),
     ] {
         let mut request = RpcRequest::new("AgentGetProgress", params);
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response");
@@ -9016,7 +11270,7 @@ async fn agent_get_progress_defaults_to_cohort_and_rejects_malformed_or_identity
         "AgentGetProgress",
         serde_json::json!({ "session_ids": vec![child_id; 257] }),
     );
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -9058,7 +11312,7 @@ async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
             ))
             .expect("insert child");
     }
-    let token = "send-token".to_string();
+    let token = "85db1657a3d9476cdd07babfbd470539a1dc03a213f6b496d3ae0e1a3bfd995c".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -9110,7 +11364,7 @@ async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
         }),
     ] {
         let mut request = RpcRequest::new("AgentSendMessage", params.clone());
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response");
@@ -9143,7 +11397,7 @@ async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
             "idempotency_key": "k-ok",
         }),
     );
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -9164,7 +11418,7 @@ async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
             "idempotency_key": "k-self",
         }),
     );
-    denied.session_token = Some(token);
+    denied.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&denied).await
     else {
         panic!("expected response");
@@ -9263,7 +11517,7 @@ async fn agent_gate_attributed_subscribe_is_denied() {
     // gated — the gate runs *before* the Subscribe special-case.
     let fixture = recursive_dag_rpc_fixture();
     let mut request = RpcRequest::new("Subscribe", serde_json::json!({}));
-    request.session_token = Some("some-token".to_string());
+    request.session_token = Some("some-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected a denied Response, not a Subscribe transition");
@@ -9307,7 +11561,7 @@ async fn agent_spawn_child_lead_guard_epic_lead_succeeds_non_lead_rejected() {
             ))
             .expect("insert lead");
     }
-    let lead_token = "lead-token".to_string();
+    let lead_token = "77397eac29d6fa481b20083bc1a9f7fd40e703503bd7312203d55f888c81b072".to_string();
     fixture
         .manager
         .register_agent_token(lead_token.clone(), lead_id)
@@ -9317,7 +11571,7 @@ async fn agent_spawn_child_lead_guard_epic_lead_succeeds_non_lead_rejected() {
         "AgentSpawnChild",
         serde_json::json!({ "kind": "Task", "query": "do the thing", "idempotency_key": "lead-spawn" }),
     );
-    request.session_token = Some(lead_token);
+    request.session_token = Some(lead_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -9345,7 +11599,8 @@ async fn agent_spawn_child_lead_guard_epic_lead_succeeds_non_lead_rejected() {
             ))
             .expect("insert non-lead");
     }
-    let non_lead_token = "non-lead-token".to_string();
+    let non_lead_token =
+        "9bbfd02aff468b22b4b3d97d4b054396a775d228f190ebf0b89e97e9b42d6e58".to_string();
     fixture
         .manager
         .register_agent_token(non_lead_token.clone(), non_lead_id)
@@ -9355,7 +11610,7 @@ async fn agent_spawn_child_lead_guard_epic_lead_succeeds_non_lead_rejected() {
         "AgentSpawnChild",
         serde_json::json!({ "kind": "Task", "query": "do the thing", "idempotency_key": "non-lead-spawn" }),
     );
-    request.session_token = Some(non_lead_token);
+    request.session_token = Some(non_lead_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -9397,7 +11652,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
             ))
             .expect("insert lead");
     }
-    let lead_token = "reserve-successor-lead-token".to_string();
+    let lead_token = "69a5b8c849208d076401ffd782c4c00f8baa9dc5f8da0e5950398927e241dc0f".to_string();
     fixture
         .manager
         .register_agent_token(lead_token.clone(), lead_id)
@@ -9409,7 +11664,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
         "idempotency_key": "turnover-1"
     });
     let mut request = RpcRequest::new("AgentReserveSuccessor", params.clone());
-    request.session_token = Some(lead_token.clone());
+    request.session_token = Some(lead_token.clone().into());
     let HandleResult::Response(first) = fixture.server.handle_request_inner(&request).await else {
         panic!("expected response");
     };
@@ -9421,7 +11676,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
     assert_eq!(first["deduplicated"], false);
 
     let mut replay = RpcRequest::new("AgentReserveSuccessor", params);
-    replay.session_token = Some(lead_token.clone());
+    replay.session_token = Some(lead_token.clone().into());
     let HandleResult::Response(replay) = fixture.server.handle_request_inner(&replay).await else {
         panic!("expected replay response");
     };
@@ -9442,7 +11697,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
             "idempotency_key": "turnover-1"
         }),
     );
-    changed.session_token = Some(lead_token.clone());
+    changed.session_token = Some(lead_token.clone().into());
     let HandleResult::Response(changed) = fixture.server.handle_request_inner(&changed).await
     else {
         panic!("expected changed-replay response");
@@ -9465,7 +11720,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
             "predecessor_session_id": lead_id
         }),
     );
-    spoofed.session_token = Some(lead_token);
+    spoofed.session_token = Some(lead_token.into());
     let HandleResult::Response(spoofed) = fixture.server.handle_request_inner(&spoofed).await
     else {
         panic!("expected spoof response");
@@ -9487,7 +11742,8 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
             ))
             .expect("insert non-lead");
     }
-    let non_lead_token = "reserve-successor-non-lead-token".to_string();
+    let non_lead_token =
+        "ed5d5c5568f1c2a4ae93e9659a3f398c9e0dfa865a7138dee0cdcb1b8254edfc".to_string();
     fixture
         .manager
         .register_agent_token(non_lead_token.clone(), non_lead_id)
@@ -9500,7 +11756,7 @@ async fn agent_reserve_successor_is_attributed_replay_safe_and_lead_only() {
             "idempotency_key": "turnover-denied"
         }),
     );
-    denied.session_token = Some(non_lead_token);
+    denied.session_token = Some(non_lead_token.into());
     let HandleResult::Response(denied) = fixture.server.handle_request_inner(&denied).await else {
         panic!("expected denied response");
     };
@@ -9526,7 +11782,8 @@ fn successor_unix_socket_daemon_fixture(
     use crate::prompt_compile::CompileEngine;
     use crate::store::Store;
 
-    let store = Store::open(&root.join("rsi.db")).expect("open successor fixture store");
+    let store =
+        Store::open_test_fixture(&root.join("rsi.db")).expect("open successor fixture store");
     let runtime_config = RuntimeConfig::from_config(&Config::from_env());
     let bus = std::sync::Arc::new(EventBus::new(16));
     let manager = std::sync::Arc::new(
@@ -9638,7 +11895,8 @@ async fn agent_identity_in_process_rpc_server_unix_socket_restart_fixture() {
             ))
             .expect("insert identity lead");
     }
-    let first_token = "identity-restart-first-token".to_string();
+    let first_token =
+        "cacdcea342ffa2bdcce8086a163a2f601bb9617b4e31d61341416697083bd0d8".to_string();
     first_daemon
         .manager
         .register_agent_token(first_token.clone(), lead_id)
@@ -9651,7 +11909,7 @@ async fn agent_identity_in_process_rpc_server_unix_socket_restart_fixture() {
         "idempotency_key": "identity-restart-first"
     });
     let mut first_request = RpcRequest::new("AgentSpawnChild", first_params.clone());
-    first_request.session_token = Some(first_token);
+    first_request.session_token = Some(first_token.into());
     let first = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&first_daemon.server),
         root.path(),
@@ -9696,14 +11954,15 @@ async fn agent_identity_in_process_rpc_server_unix_socket_restart_fixture() {
 
     drop(first_daemon);
     let restarted_daemon = successor_unix_socket_daemon_fixture(root.path());
-    let restarted_token = "identity-restart-reminted-token".to_string();
+    let restarted_token =
+        "6e574954a5cae2413e0b4ffa6153f3f436df2cfbd75c3a8e8f6ac885d0d323d8".to_string();
     restarted_daemon
         .manager
         .register_agent_token(restarted_token.clone(), lead_id)
         .await;
 
     let mut replay_request = RpcRequest::new("AgentSpawnChild", first_params);
-    replay_request.session_token = Some(restarted_token.clone());
+    replay_request.session_token = Some(restarted_token.clone().into());
     let replay = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&restarted_daemon.server),
         root.path(),
@@ -9733,7 +11992,7 @@ async fn agent_identity_in_process_rpc_server_unix_socket_restart_fixture() {
             "idempotency_key": "identity-restart-next"
         }),
     );
-    next_request.session_token = Some(restarted_token);
+    next_request.session_token = Some(restarted_token.into());
     let next = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&restarted_daemon.server),
         root.path(),
@@ -9936,9 +12195,9 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
     let group_b = Uuid::new_v4();
     let epic_b = Uuid::new_v4();
     let lead_b = Uuid::new_v4();
-    let worker_token = "isolated-worker-token";
-    let lead_token = "isolated-lead-token";
-    let other_lead_token = "isolated-other-lead-token";
+    let worker_token = "08550f03ab94c22502683f2b63ecb91126d144ce9cf58de52f60340ce1b8cc1e";
+    let lead_token = "e30d3f558579e5a77d2f4d65fcb258bfa41d17013ee77132648bd46fd66e07ad";
+    let other_lead_token = "85ec07f8c6523de2136ada5b941f8e21c8dc4b60d010ab78dac40d5df687210f";
 
     let fixture = successor_unix_socket_daemon_fixture(&root);
     {
@@ -10064,9 +12323,10 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
         malformed_envelope.validation.unwrap().class,
         rsi_common::rpc::AgentIssueValidationClassV1::UnknownField
     );
-    let encoded = serde_json::to_string(&malformed).unwrap();
-    assert!(!encoded.contains("project_id/secret"));
-    assert!(!encoded.contains("never-echo-this"));
+    let diagnostic = malformed_error.data.as_ref().unwrap();
+    assert_eq!(diagnostic["path"], "params[\"project_id/secret\"]");
+    assert_eq!(diagnostic["constraint"], "additionalProperties false");
+    assert_eq!(diagnostic["value"], "never-echo-this");
 
     let update_params = serde_json::json!({
         "issue_id":issue_id,"expected_row_version":1,
@@ -10081,7 +12341,10 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
         update_params.clone(),
     )
     .await;
-    assert_eq!(updated.result.as_ref().unwrap()["issue"]["row_version"], 2);
+    assert_eq!(updated.result.as_ref().unwrap()["row_version"], 2);
+    assert_eq!(updated.result.as_ref().unwrap()["sequence"], 2);
+    assert!(updated.result.as_ref().unwrap().get("event").is_none());
+    assert!(updated.result.as_ref().unwrap().get("issue").is_none());
     let stale = call_real_rsi_rpc_subprocess(
         &binary,
         &socket_path,
@@ -10117,7 +12380,7 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
         "AgentUpdateIssueStatus",
         serde_json::json!({
             "issue_id":issue_id,"status":"InProgress","expected_row_version":2,
-            "idempotency_key":"smoke-in-progress"
+            "idempotency_key":"smoke-in-progress","include_issue":true
         }),
     )
     .await;
@@ -10125,6 +12388,11 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
         in_progress.result.as_ref().unwrap()["issue"]["row_version"],
         3
     );
+    assert_eq!(
+        in_progress.result.as_ref().unwrap()["issue"]["title"],
+        "CLI-updated title"
+    );
+    assert!(in_progress.result.as_ref().unwrap().get("event").is_none());
     let closed = call_real_rsi_rpc_subprocess(
         &binary,
         &socket_path,
@@ -10137,7 +12405,7 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
         }),
     )
     .await;
-    assert_eq!(closed.result.as_ref().unwrap()["issue"]["row_version"], 4);
+    assert_eq!(closed.result.as_ref().unwrap()["row_version"], 4);
     let archived = call_real_rsi_rpc_subprocess(
         &binary,
         &socket_path,
@@ -10251,7 +12519,7 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
     drop(fixture);
 
     let restarted = successor_unix_socket_daemon_fixture(&root);
-    let reminted_lead_token = "isolated-reminted-lead-token";
+    let reminted_lead_token = "28c56808e027e24a6ff1387ae94ae7e4503208eeb153ba80e89ad8f9310d4b79";
     restarted
         .manager
         .register_agent_token(reminted_lead_token.to_string(), lead_a)
@@ -10281,11 +12549,8 @@ async fn agent_issue_in_process_rpc_server_unix_socket_rsi_rpc_restart_fixture()
     )
     .await;
     assert_eq!(replay.result.as_ref().unwrap()["deduplicated"], true);
-    assert_eq!(replay.result.as_ref().unwrap()["issue"]["row_version"], 2);
-    assert_eq!(
-        replay.result.as_ref().unwrap()["issue"]["title"],
-        "CLI-updated title"
-    );
+    assert_eq!(replay.result.as_ref().unwrap()["row_version"], 2);
+    assert!(replay.result.as_ref().unwrap().get("issue").is_none());
     let final_history = call_real_rsi_rpc_subprocess(
         &binary,
         &socket_path,
@@ -10340,7 +12605,7 @@ async fn assert_successor_rpc_authority_plane(
             "idempotency_key": format!("baton-candidate-{phase}")
         }),
     );
-    candidate_spawn.session_token = Some(candidate_token.to_string());
+    candidate_spawn.session_token = Some(candidate_token.to_string().into());
     let candidate_spawned = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10365,7 +12630,7 @@ async fn assert_successor_rpc_authority_plane(
             "idempotency_key": format!("baton-predecessor-{phase}")
         }),
     );
-    predecessor_spawn.session_token = Some(predecessor_token.to_string());
+    predecessor_spawn.session_token = Some(predecessor_token.to_string().into());
     let predecessor_denied = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10385,7 +12650,7 @@ async fn assert_successor_rpc_authority_plane(
         "AgentGetStatus",
         serde_json::json!({ "session_id": predecessor_id }),
     );
-    candidate_status.session_token = Some(candidate_token.to_string());
+    candidate_status.session_token = Some(candidate_token.to_string().into());
     let candidate_status = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10406,7 +12671,7 @@ async fn assert_successor_rpc_authority_plane(
         "AgentGetStatus",
         serde_json::json!({ "session_id": candidate_id }),
     );
-    predecessor_status.session_token = Some(predecessor_token.to_string());
+    predecessor_status.session_token = Some(predecessor_token.to_string().into());
     let predecessor_status = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10450,7 +12715,7 @@ async fn assert_successor_rpc_authority_plane(
         "AgentHalt",
         serde_json::json!({ "session_id": halt_target_id }),
     );
-    candidate_halt.session_token = Some(candidate_token.to_string());
+    candidate_halt.session_token = Some(candidate_token.to_string().into());
     let candidate_halt = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10472,7 +12737,7 @@ async fn assert_successor_rpc_authority_plane(
         "AgentHalt",
         serde_json::json!({ "session_id": halt_target_id }),
     );
-    predecessor_halt.session_token = Some(predecessor_token.to_string());
+    predecessor_halt.session_token = Some(predecessor_token.to_string().into());
     let predecessor_halt = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10537,7 +12802,7 @@ async fn assert_successor_rpc_authority_plane(
             "idempotency_key": format!("baton-candidate-message-{phase}")
         }),
     );
-    candidate_send.session_token = Some(candidate_token.to_string());
+    candidate_send.session_token = Some(candidate_token.to_string().into());
     let candidate_send = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10562,7 +12827,7 @@ async fn assert_successor_rpc_authority_plane(
             "idempotency_key": format!("baton-predecessor-message-{phase}")
         }),
     );
-    predecessor_send.session_token = Some(predecessor_token.to_string());
+    predecessor_send.session_token = Some(predecessor_token.to_string().into());
     let predecessor_send = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&fixture.server),
         root,
@@ -10680,7 +12945,8 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
             .insert_session(&predecessor)
             .expect("insert predecessor lead");
     }
-    let predecessor_token = "baton-integration-predecessor-token".to_string();
+    let predecessor_token =
+        "45a667d620148c42563ab9a8b8df5ca375210d0eb8bb02733da0de119ad4ef3f".to_string();
     first_daemon
         .manager
         .register_agent_token(predecessor_token.clone(), predecessor_id)
@@ -10693,7 +12959,7 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
         "idempotency_key": "baton-integration-v1"
     });
     let mut reserve = RpcRequest::new("AgentReserveSuccessor", params.clone());
-    reserve.session_token = Some(predecessor_token.clone());
+    reserve.session_token = Some(predecessor_token.clone().into());
     let reserved = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&first_daemon.server),
         root.path(),
@@ -10714,7 +12980,7 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
     assert_eq!(reserved["state"], "reserved");
 
     let mut replay = RpcRequest::new("AgentReserveSuccessor", params.clone());
-    replay.session_token = Some(predecessor_token.clone());
+    replay.session_token = Some(predecessor_token.clone().into());
     let replay = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&first_daemon.server),
         root.path(),
@@ -10736,7 +13002,7 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
             "idempotency_key": "baton-integration-v1"
         }),
     );
-    changed.session_token = Some(predecessor_token.clone());
+    changed.session_token = Some(predecessor_token.clone().into());
     let changed = call_serialized_rpc_over_unix_socket(
         std::sync::Arc::clone(&first_daemon.server),
         root.path(),
@@ -10890,7 +13156,8 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
         Some(predecessor_id),
         "the injected failure must leave the runtime projection stale"
     );
-    let candidate_token = "baton-integration-candidate-token".to_string();
+    let candidate_token =
+        "7ed14346e095679c6a46760894160ff0ff3e8e222b015ade4cc835ecc38e8399".to_string();
     assert_successor_rpc_authority_plane(
         &restarted_daemon,
         root.path(),
@@ -11051,7 +13318,7 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
             ))
             .expect("insert lead");
     }
-    let lead_token = "spawn-then-status-lead-token".to_string();
+    let lead_token = "cd0b8c5b09518e3a3af2d1b3e6c19567f4819db4aa3cb3e75766098876639b81".to_string();
     fixture
         .manager
         .register_agent_token(lead_token.clone(), lead_id)
@@ -11062,7 +13329,7 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
         "AgentSpawnChild",
         serde_json::json!({ "kind": "Task", "query": "do the thing", "idempotency_key": "spawn-status-halt" }),
     );
-    request.session_token = Some(lead_token.clone());
+    request.session_token = Some(lead_token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11101,7 +13368,7 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
         "AgentGetStatus",
         serde_json::json!({ "session_id": child_id }),
     );
-    request.session_token = Some(lead_token.clone());
+    request.session_token = Some(lead_token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11116,7 +13383,7 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
     assert_eq!(session.id, child_id);
 
     let mut request = RpcRequest::new("AgentHalt", serde_json::json!({ "session_id": child_id }));
-    request.session_token = Some(lead_token);
+    request.session_token = Some(lead_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11151,7 +13418,8 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
             ))
             .expect("insert stranger");
     }
-    let stranger_token = "spawn-then-status-stranger-token".to_string();
+    let stranger_token =
+        "fd91b173e586b48f6926869ba8df9aa6b8364953a76a6ea998c24c434150ad65".to_string();
     fixture
         .manager
         .register_agent_token(stranger_token.clone(), stranger_id)
@@ -11161,7 +13429,7 @@ async fn agent_spawn_child_then_get_status_and_halt_authorized_for_lead_denied_f
         "AgentGetStatus",
         serde_json::json!({ "session_id": child_id }),
     );
-    request.session_token = Some(stranger_token);
+    request.session_token = Some(stranger_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11190,14 +13458,14 @@ async fn agent_get_status_and_halt_use_resolved_caller_session_when_unspecified(
             ))
             .expect("insert caller session");
     }
-    let token = "caller-token".to_string();
+    let token = "42759dabeaa13003b4a08844d414105fbbe66726b223dccb182613678f2c0d1a".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
         .await;
 
     let mut request = RpcRequest::new("AgentGetStatus", serde_json::json!({}));
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11231,14 +13499,14 @@ async fn agent_get_authority_catalog_serves_the_token_bound_callers_manual() {
             ))
             .expect("insert caller session");
     }
-    let token = "catalog-token".to_string();
+    let token = "f76a3eb47f12277be83761eed6ebaf95bfc554bc09ce3ef58f0899fb8d950b75".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
         .await;
     let call = |params: serde_json::Value| {
         let mut request = RpcRequest::new("AgentGetAuthorityCatalog", params);
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         request
     };
 
@@ -11368,7 +13636,7 @@ async fn agent_get_status_null_params_self_targets_but_malformed_params_error() 
             ))
             .expect("insert caller session");
     }
-    let token = "null-params-token".to_string();
+    let token = "be1e6a8aaec3c963ce196ddef4d03c8407a8842c8365baa9bbe3f3aa1a600bce".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -11377,7 +13645,7 @@ async fn agent_get_status_null_params_self_targets_but_malformed_params_error() 
     // `Value::Null` (equivalent to `rsi-rpc AgentGetStatus` with no
     // `--params` at all) must still resolve to the caller's own status.
     let mut request = RpcRequest::new("AgentGetStatus", serde_json::Value::Null);
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11394,7 +13662,7 @@ async fn agent_get_status_null_params_self_targets_but_malformed_params_error() 
     // A malformed (wrong-typed) session_id must be a hard error, never
     // silently redirected to the caller's own session.
     let mut request = RpcRequest::new("AgentGetStatus", serde_json::json!({ "session_id": 12345 }));
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11413,7 +13681,7 @@ async fn agent_get_status_null_params_self_targets_but_malformed_params_error() 
         "AgentHalt",
         serde_json::json!({ "session_id": "not-a-uuid" }),
     );
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11468,7 +13736,7 @@ async fn agent_verb_with_superseded_token_is_rejected() {
             ))
             .expect("insert caller session");
     }
-    let old_token = "superseded-token".to_string();
+    let old_token = "7f64724ef08376bf42dd498b70bdd057d183281f53fbf87bb1c6b8c2fd87be36".to_string();
     fixture
         .manager
         .register_agent_token(old_token.clone(), caller_id)
@@ -11478,7 +13746,7 @@ async fn agent_verb_with_superseded_token_is_rejected() {
     let new_token = fixture.manager.remint_session_token(caller_id).await;
 
     let mut request = RpcRequest::new("AgentGetStatus", serde_json::json!({}));
-    request.session_token = Some(old_token);
+    request.session_token = Some(old_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11495,7 +13763,7 @@ async fn agent_verb_with_superseded_token_is_rejected() {
 
     // The freshly minted token resolves to the caller's own row.
     let mut request = RpcRequest::new("AgentGetStatus", serde_json::json!({}));
-    request.session_token = Some(new_token);
+    request.session_token = Some(new_token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11531,7 +13799,7 @@ async fn agent_schedule_wake_binds_wake_session_id_from_token_ignoring_params() 
             ))
             .expect("insert caller session");
     }
-    let token = "schedule-wake-token".to_string();
+    let token = "331b73051528ee3723fdcb7be56e3b6538ff5f48632922d0e6c3cca8683484c6".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -11549,7 +13817,7 @@ async fn agent_schedule_wake_binds_wake_session_id_from_token_ignoring_params() 
             "wake_session_id": smuggled_id,
         }),
     );
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11591,7 +13859,7 @@ async fn agent_schedule_wake_fresh_persists_bound_origin() {
             ))
             .expect("insert caller session");
     }
-    let token = "schedule-wake-fresh-token".to_string();
+    let token = "9a3a188e872c0cbd03a1401607452db89c029ddf718e11e05aa9e49041857cc8".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -11606,7 +13874,7 @@ async fn agent_schedule_wake_fresh_persists_bound_origin() {
             "wake_session_id": smuggled_id,
         }),
     );
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -11636,7 +13904,16 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
 
     let fixture = recursive_dag_rpc_fixture();
     let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
-    for (id, token) in [(alice, "cancel-wake-alice"), (bob, "cancel-wake-bob")] {
+    for (id, token) in [
+        (
+            alice,
+            "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
+        ),
+        (
+            bob,
+            "26bdf830014e16e6667400f1e777561a82c2bca1157a979a5f804d8109952099",
+        ),
+    ] {
         {
             let store = fixture.manager.store().lock().await;
             store
@@ -11652,7 +13929,7 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
         let server = &fixture.server;
         async move {
             let mut request = RpcRequest::new(method, params);
-            request.session_token = Some(token.to_string());
+            request.session_token = Some(token.to_string().into());
             let HandleResult::Response(response) = server.handle_request_inner(&request).await
             else {
                 panic!("expected response");
@@ -11686,14 +13963,22 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
     };
 
     // One enabled job per explicit name per session.
-    let first = call("cancel-wake-alice", "AgentScheduleWake", wake(Some("net")))
-        .await
-        .result
-        .expect("first named wake");
-    let second = call("cancel-wake-alice", "AgentScheduleWake", wake(Some("net")))
-        .await
-        .result
-        .expect("second named wake");
+    let first = call(
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
+        "AgentScheduleWake",
+        wake(Some("net")),
+    )
+    .await
+    .result
+    .expect("first named wake");
+    let second = call(
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
+        "AgentScheduleWake",
+        wake(Some("net")),
+    )
+    .await
+    .result
+    .expect("second named wake");
     assert_eq!(
         second["replaced_job_ids"],
         serde_json::json!([first["job_id"]])
@@ -11701,36 +13986,44 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
     assert_eq!(enabled_named(alice, "net").await, 1);
     // Unnamed wakes keep coexisting; another session's same name is untouched.
     for _ in 0..2 {
-        call("cancel-wake-alice", "AgentScheduleWake", wake(None))
-            .await
-            .result
-            .expect("unnamed wake");
-    }
-    assert_eq!(enabled_named(alice, "agent-wake").await, 2);
-    let bobs = call("cancel-wake-bob", "AgentScheduleWake", wake(Some("net")))
+        call(
+            "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
+            "AgentScheduleWake",
+            wake(None),
+        )
         .await
         .result
-        .expect("bob wake");
+        .expect("unnamed wake");
+    }
+    assert_eq!(enabled_named(alice, "agent-wake").await, 2);
+    let bobs = call(
+        "26bdf830014e16e6667400f1e777561a82c2bca1157a979a5f804d8109952099",
+        "AgentScheduleWake",
+        wake(Some("net")),
+    )
+    .await
+    .result
+    .expect("bob wake");
     assert_eq!(enabled_named(alice, "net").await, 1);
     assert_eq!(enabled_named(bob, "net").await, 1);
 
     // Another session cannot cancel Alice's job; a smuggled owner is rejected.
     let refused = call(
-        "cancel-wake-bob",
+        "26bdf830014e16e6667400f1e777561a82c2bca1157a979a5f804d8109952099",
         "AgentCancelWake",
         serde_json::json!({"job_id": second["job_id"]}),
     )
     .await;
     assert!(refused.error.is_some(), "{refused:?}");
     let spoofed = call(
-        "cancel-wake-bob",
+        "26bdf830014e16e6667400f1e777561a82c2bca1157a979a5f804d8109952099",
         "AgentCancelWake",
         serde_json::json!({"name": "net", "wake_session_id": alice}),
     )
     .await;
     assert!(spoofed.error.is_some(), "{spoofed:?}");
     let neither = call(
-        "cancel-wake-alice",
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
         "AgentCancelWake",
         serde_json::json!({}),
     )
@@ -11740,7 +14033,7 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
 
     // The owner cancels by id, then by name; other sessions are unaffected.
     let by_id = call(
-        "cancel-wake-alice",
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
         "AgentCancelWake",
         serde_json::json!({"job_id": second["job_id"]}),
     )
@@ -11752,8 +14045,19 @@ async fn agent_cancel_wake_and_named_replace_are_scoped_to_the_caller() {
         serde_json::json!([second["job_id"]])
     );
     assert_eq!(enabled_named(alice, "net").await, 0);
+    // #1632: a repeat names the refusal instead of a silent zero.
+    let repeat = call(
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
+        "AgentCancelWake",
+        serde_json::json!({"job_id": second["job_id"]}),
+    )
+    .await;
+    assert!(
+        format!("{:?}", repeat.error).contains("wake_already_disabled"),
+        "{repeat:?}"
+    );
     let by_name = call(
-        "cancel-wake-alice",
+        "c3251443168e4eff9df8f1a7f724851cbcf68cf76041e7462750727b58fe4fb4",
         "AgentCancelWake",
         serde_json::json!({"name": "agent-wake"}),
     )
@@ -11773,7 +14077,16 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
 
     let fixture = recursive_dag_rpc_fixture();
     let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
-    for (id, token) in [(alice, "list-wakes-alice"), (bob, "list-wakes-bob")] {
+    for (id, token) in [
+        (
+            alice,
+            "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
+        ),
+        (
+            bob,
+            "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
+        ),
+    ] {
         {
             let store = fixture.manager.store().lock().await;
             store
@@ -11789,7 +14102,7 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
         let server = &fixture.server;
         async move {
             let mut request = RpcRequest::new(method, params);
-            request.session_token = Some(token.to_string());
+            request.session_token = Some(token.to_string().into());
             let HandleResult::Response(response) = server.handle_request_inner(&request).await
             else {
                 panic!("expected response");
@@ -11803,21 +14116,33 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
         })
     };
     for name in ["a", "b", "c"] {
-        call("list-wakes-alice", "AgentScheduleWake", wake(name))
-            .await
-            .result
-            .expect("alice wake");
-    }
-    let bobs = call("list-wakes-bob", "AgentScheduleWake", wake("bobs"))
+        call(
+            "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
+            "AgentScheduleWake",
+            wake(name),
+        )
         .await
         .result
-        .expect("bob wake");
+        .expect("alice wake");
+    }
+    let bobs = call(
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
+        "AgentScheduleWake",
+        wake("bobs"),
+    )
+    .await
+    .result
+    .expect("bob wake");
 
     // Alice sees exactly her own three jobs with the documented fields.
-    let listed = call("list-wakes-alice", "AgentListWakes", serde_json::json!({}))
-        .await
-        .result
-        .expect("list wakes");
+    let listed = call(
+        "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
+        "AgentListWakes",
+        serde_json::json!({}),
+    )
+    .await
+    .result
+    .expect("list wakes");
     assert_eq!(listed["count"], 3);
     assert_eq!(listed["truncated"], false);
     let wakes = listed["wakes"].as_array().expect("wakes array");
@@ -11827,6 +14152,9 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
     for wake in wakes {
         assert_eq!(wake["mode"], "resume");
         assert_eq!(wake["enabled"], true);
+        assert_eq!(wake["protected"], false);
+        assert!(wake["pending_message"].is_null());
+        assert!(wake.get("when").is_none() && wake.get("deadline").is_none());
         assert!(wake["job_id"].is_string());
         assert!(wake["next_fire_at"].is_string());
         assert!(wake["created_at"].is_string());
@@ -11835,7 +14163,7 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
 
     // Bounded: a smaller limit reports truncation.
     let page = call(
-        "list-wakes-alice",
+        "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
         "AgentListWakes",
         serde_json::json!({"limit": 2}),
     )
@@ -11847,20 +14175,24 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
 
     // A cancelled job leaves the default list but stays visible on request.
     call(
-        "list-wakes-alice",
+        "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
         "AgentCancelWake",
         serde_json::json!({"name": "a"}),
     )
     .await
     .result
     .expect("cancel a");
-    let active = call("list-wakes-alice", "AgentListWakes", serde_json::json!({}))
-        .await
-        .result
-        .expect("active list");
+    let active = call(
+        "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
+        "AgentListWakes",
+        serde_json::json!({}),
+    )
+    .await
+    .result
+    .expect("active list");
     assert_eq!(active["count"], 2);
     let all = call(
-        "list-wakes-alice",
+        "4688f453198ba3fb2a97e4f5f30953f71d2af9291ae9fb7a98cf2b55c1e159e8",
         "AgentListWakes",
         serde_json::json!({"include_disabled": true}),
     )
@@ -11877,21 +14209,50 @@ async fn agent_list_wakes_returns_only_the_callers_own_jobs_bounded() {
     assert_eq!(disabled, 1);
 
     // Bob's view is his own single job; a smuggled owner or bad limit is refused.
-    let bobs_list = call("list-wakes-bob", "AgentListWakes", serde_json::json!({}))
-        .await
-        .result
-        .expect("bob list");
+    let bobs_list = call(
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
+        "AgentListWakes",
+        serde_json::json!({}),
+    )
+    .await
+    .result
+    .expect("bob list");
     assert_eq!(bobs_list["count"], 1);
     assert_eq!(bobs_list["wakes"][0]["job_id"], bobs["job_id"]);
     let spoofed = call(
-        "list-wakes-bob",
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
         "AgentListWakes",
         serde_json::json!({"wake_session_id": alice}),
     )
     .await;
     assert!(spoofed.error.is_some(), "{spoofed:?}");
+    // #2418: naming another session is refused unless the roster scope covers
+    // it (bob launched nothing); naming himself is the same own read.
+    let foreign = call(
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
+        "AgentListWakes",
+        serde_json::json!({"session_id": alice}),
+    )
+    .await;
+    let refusal = format!(
+        "{:?}",
+        foreign.error.as_ref().expect("foreign read refused")
+    );
+    assert!(
+        refusal.contains("list_wakes_target_not_authorized"),
+        "{refusal}"
+    );
+    let own_by_id = call(
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
+        "AgentListWakes",
+        serde_json::json!({"session_id": bob}),
+    )
+    .await
+    .result
+    .expect("bob lists himself by id");
+    assert_eq!(own_by_id["wakes"][0]["job_id"], bobs["job_id"]);
     let zero = call(
-        "list-wakes-bob",
+        "c13a954a8fc887e961565763686bea79c980286836c314c13d26adde9af9027b",
         "AgentListWakes",
         serde_json::json!({"limit": 0}),
     )
@@ -11917,7 +14278,7 @@ async fn agent_schedule_wake_omitted_or_unknown_mode_rejects_without_insert() {
             ))
             .expect("insert caller session");
     }
-    let token = "schedule-wake-default-fresh-token".to_string();
+    let token = "e918e935af948a87951ad68a7581e099d7ce18f6bf4a9b6ab307c910792dd81b".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -11932,7 +14293,7 @@ async fn agent_schedule_wake_omitted_or_unknown_mode_rejects_without_insert() {
         }),
     ] {
         let mut request = RpcRequest::new("AgentScheduleWake", params);
-        request.session_token = Some(token.clone());
+        request.session_token = Some(token.clone().into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response");
@@ -12010,7 +14371,7 @@ async fn agent_schedule_wake_rpc_and_harness_tool_produce_equivalent_jobs() {
             .insert_session(&session)
             .expect("insert caller session");
     }
-    let token = "equivalence-token".to_string();
+    let token = "e1c854b3f5d8876da0ecdec5ca350e5d2d3269c98308eb640368ce45cee18641".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -12020,7 +14381,7 @@ async fn agent_schedule_wake_rpc_and_harness_tool_produce_equivalent_jobs() {
 
     // RPC path.
     let mut request = RpcRequest::new("AgentScheduleWake", args.clone());
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -12094,7 +14455,7 @@ async fn program_guard_rpc_and_native_paths_share_one_caller_bound_row() {
         session.model = Some("claude-sonnet-5".into());
         store.insert_session(&session).expect("insert caller");
     }
-    let token = "program-guard-equivalence-token".to_string();
+    let token = "0d16cd07138da19987d2910ad19481639c4ee3189029bb2de8eab7a98427caac".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -12108,7 +14469,7 @@ async fn program_guard_rpc_and_native_paths_share_one_caller_bound_row() {
     });
 
     let mut request = RpcRequest::new("AgentScheduleWake", args.clone());
-    request.session_token = Some(token);
+    request.session_token = Some(token.into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -12645,7 +15006,7 @@ async fn arm_watch(
         }
     }
     let mut request = RpcRequest::new("AgentScheduleWake", args);
-    request.session_token = Some(token.to_string());
+    request.session_token = Some(token.to_string().into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -12697,7 +15058,7 @@ async fn watch_arm_authz_scope_and_dedup() {
             ))
             .expect("insert stranger");
     }
-    let token = "watch-arm-token".to_string();
+    let token = "34ac5cb384eb9dd1b7e90edfaa85a65d0b4a4d004f19855831830e96cb2c1a82".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -12751,7 +15112,7 @@ async fn watch_arm_authz_scope_and_dedup() {
             "watch_session_id": child_id.to_string(),
         }),
     );
-    request.session_token = Some(token.clone());
+    request.session_token = Some(token.clone().into());
     let HandleResult::Response(resp) = fixture.server.handle_request_inner(&request).await else {
         panic!("expected response");
     };
@@ -12876,7 +15237,7 @@ async fn watch_arm_per_master_cap_rejects_beyond_64() {
             store.insert_scheduled_job(&job).expect("insert watch");
         }
     }
-    let token = "watch-cap-token".to_string();
+    let token = "48ff9196966f74d20899d659f357b2a814b55419266a7e40837921ffa094394a".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -12928,7 +15289,7 @@ async fn arm_on_already_terminal_child_persists_watch_without_scheduler() {
         child.status = SessionStatus::Completed;
         store.insert_session(&child).expect("insert child");
     }
-    let token = "watch-terminal-arm-token".to_string();
+    let token = "bdd2968cc2dccb66f9170b386cf597dbc1a0c8e175643208f83f60a297a0262e".to_string();
     fixture
         .manager
         .register_agent_token(token.clone(), caller_id)
@@ -15572,6 +17933,45 @@ fn claude_config_isolation_is_a_persisted_daemon_setting() {
     assert!(crate::config::PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"claude_config_isolation"));
 }
 
+/// #2760: `codex_config_isolation` is validated on write (every accepted
+/// value round-trips, anything else is refused and leaves the value alone),
+/// defaults to `off` and is persisted.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn update_daemon_config_round_trips_codex_config_isolation() {
+    let rc = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+    let read = |rc: &crate::config::RuntimeConfig| {
+        rc.to_json()
+            .get("codex_config_isolation")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    assert_eq!(read(&rc).as_deref(), Some("off"));
+    for good in ["user", "rules", "all", "off"] {
+        assert!(
+            rc.update_field("codex_config_isolation", &serde_json::json!(good))
+                .unwrap()
+        );
+        assert_eq!(read(&rc).as_deref(), Some(good));
+    }
+    rc.update_field("codex_config_isolation", &serde_json::json!("all"))
+        .unwrap();
+    for bad in [
+        serde_json::json!("settings"),
+        serde_json::json!("strict"),
+        serde_json::json!("on"),
+        serde_json::json!(""),
+        serde_json::json!(true),
+    ] {
+        assert!(
+            rc.update_field("codex_config_isolation", &bad).is_err(),
+            "{bad:?} must be rejected"
+        );
+    }
+    assert_eq!(read(&rc).as_deref(), Some("all"));
+    assert!(crate::config::PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"codex_config_isolation"));
+}
+
 /// RSI-022: invalid `codex_sandbox_mode` values must round-trip into the
 /// same `Err` branch that `handle_update_daemon_config` returns as
 /// `InvalidParam`.
@@ -15880,7 +18280,48 @@ async fn codegraph_capabilities_report_actual_service_and_closed_request_shape()
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn codegraph_snapshot_rpc_pages_ready_history_and_checks_scope() {
-    use crate::codegraph::{IndexRuntime, RegisteredWorkspace};
+    // Repeat the complete RPC contract with independent indexers in the same
+    // CPU-bounded scoped-test job, rather than checking one lucky completion.
+    const REPETITIONS: usize = 10;
+    for repetition in 1..=REPETITIONS {
+        codegraph_snapshot_rpc_fixture_once().await;
+        eprintln!("codegraph snapshot RPC repetition {repetition}/{REPETITIONS} passed");
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+async fn codegraph_snapshot_rpc_fixture_once() {
+    use crate::codegraph::{IndexHandle, IndexPhase, IndexRuntime, RegisteredWorkspace};
+
+    async fn settled_snapshot(
+        handle: &IndexHandle,
+        workspace_id: Uuid,
+        after_generation: Option<i64>,
+    ) -> rsi_codegraph::ReadySnapshot {
+        // Observe the manager's completed pass, not a database opened while its
+        // blocking writer is still running. The deadline is a hang guard; only
+        // settled state and generation advancement determine success.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let status = handle.status(workspace_id).expect("registered workspace");
+                if status.phase == IndexPhase::Ready
+                    && !status.pending_rescan
+                    && let Some(ready) = status.ready
+                    && after_generation.is_none_or(|generation| ready.generation > generation)
+                {
+                    return ready;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        result.unwrap_or_else(|_| {
+            panic!(
+                "indexer did not settle after generation {after_generation:?}: workspace={workspace_id}, status={:?}",
+                handle.status(workspace_id)
+            )
+        })
+    }
 
     let mut fixture = recursive_dag_rpc_fixture();
     let root = tempfile::tempdir().unwrap();
@@ -15927,34 +18368,18 @@ async fn codegraph_snapshot_rpc_pages_ready_history_and_checks_scope() {
     )
     .await;
     assert_eq!(capabilities.result.unwrap()["available"], true);
-    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(store) = rsi_codegraph::CodegraphStore::open(&db, project.id)
-                && let Ok(snapshot) = store.current_ready(workspace.workspace_id())
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let first = settled_snapshot(&handle, workspace.workspace_id(), None).await;
+    assert_eq!(
+        rsi_codegraph::CodegraphStore::open(&db, project.id)
+            .unwrap()
+            .current_ready(workspace.workspace_id())
+            .unwrap(),
+        first
+    );
 
     std::fs::write(root.path().join("lib.rs"), "pub fn second() {}\n").unwrap();
     handle.request(workspace.workspace_id()).unwrap();
-    let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(store) = rsi_codegraph::CodegraphStore::open(&db, project.id)
-                && let Ok(snapshot) = store.current_ready(workspace.workspace_id())
-                && snapshot.generation > first.generation
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let second = settled_snapshot(&handle, workspace.workspace_id(), Some(first.generation)).await;
     let scope =
         serde_json::json!({"project_id": project.id, "workspace_id": workspace.workspace_id()});
     let exact = call_rpc(
@@ -16029,19 +18454,7 @@ async fn codegraph_snapshot_rpc_pages_ready_history_and_checks_scope() {
 
     std::fs::write(root.path().join("lib.rs"), "pub fn third() {}\n").unwrap();
     handle.request(workspace.workspace_id()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let Ok(store) = rsi_codegraph::CodegraphStore::open(&db, project.id)
-                && let Ok(snapshot) = store.current_ready(workspace.workspace_id())
-                && snapshot.generation > second.generation
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    settled_snapshot(&handle, workspace.workspace_id(), Some(second.generation)).await;
     let service = crate::codegraph::CodegraphReadService::new(&handle);
     let bound = crate::codegraph::BoundCodegraphScope::from_daemon_identity(
         project.id,
@@ -16108,7 +18521,8 @@ async fn sandbox_allocation_config_rpc_persists_and_restores_after_restart() {
         );
     }
 
-    let reopened = crate::store::Store::open(&fixture._dir.path().join("rsi.db")).unwrap();
+    let reopened =
+        crate::store::Store::open_test_fixture(&fixture._dir.path().join("rsi.db")).unwrap();
     let restarted = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
     crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted).unwrap();
     assert_eq!(restarted.to_json()["sandbox_max_source_roots"], 512);
@@ -16189,7 +18603,8 @@ async fn codegraph_daemon_config_rpc_round_trip_controls_shared_indexer_and_pers
         .current_ready(workspace.workspace_id())
         .unwrap();
 
-    let reopened = crate::store::Store::open(&fixture._dir.path().join("rsi.db")).unwrap();
+    let reopened =
+        crate::store::Store::open_test_fixture(&fixture._dir.path().join("rsi.db")).unwrap();
     let restarted = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
     crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted).unwrap();
     assert_eq!(restarted.to_json()["codegraph_indexing_enabled"], true);
@@ -16468,7 +18883,7 @@ async fn update_daemon_config_target_cache_first_high_seeds_restartable_pair() {
         .await
         .expect("first high-watermark update");
 
-    let reopened = crate::store::Store::open(&fixture._dir.path().join("rsi.db"))
+    let reopened = crate::store::Store::open_test_fixture(&fixture._dir.path().join("rsi.db"))
         .expect("reopen durable settings");
     let restarted = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
     crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
@@ -16504,7 +18919,7 @@ async fn update_daemon_config_target_cache_first_low_seeds_restartable_pair() {
         .await
         .expect("first low-watermark update");
 
-    let reopened = crate::store::Store::open(&fixture._dir.path().join("rsi.db"))
+    let reopened = crate::store::Store::open_test_fixture(&fixture._dir.path().join("rsi.db"))
         .expect("reopen durable settings");
     let restarted = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
     crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
@@ -16563,7 +18978,7 @@ async fn update_daemon_config_target_cache_concurrent_watermarks_persist_publish
         .runtime_config
         .sandbox_build_cache_reclaim_snapshot();
     assert_eq!((live.high_watermark_pct, live.low_watermark_pct), (90, 70));
-    let reopened = crate::store::Store::open(&fixture._dir.path().join("rsi.db"))
+    let reopened = crate::store::Store::open_test_fixture(&fixture._dir.path().join("rsi.db"))
         .expect("reopen durable settings");
     let restarted = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
     crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
@@ -16835,7 +19250,7 @@ async fn get_idea_rpc_missing_malformed_and_attributed_calls_fail_closed() -> an
 
     let mut attributed =
         RpcRequest::new("GetIdea", serde_json::json!({ "idea_id": Uuid::new_v4() }));
-    attributed.session_token = Some("some-token".to_string());
+    attributed.session_token = Some("some-token".into());
     let response = match fixture.server.handle_request_inner(&attributed).await {
         HandleResult::Response(response) => response,
         HandleResult::Subscribe { .. } => {
@@ -17608,10 +20023,89 @@ async fn issue_workspace_rpc_operator_surface_round_trips_visible_identity_and_e
     .unwrap();
 }
 
+/// #2420: a handoff published with `AgentUpdateIssue {handoff}` is stored in
+/// `issue_handoffs` and the operator `ListIssueHandoffs` read returns it; an
+/// attributed (agent) caller is refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn list_issue_handoffs_returns_stored_records_to_the_operator_only() {
+    let fixture = recursive_dag_rpc_fixture();
+    let project_id = issue_rpc_project_id();
+    let created = call_rpc(
+        &fixture.server,
+        "CreateIssueV2",
+        serde_json::json!({
+            "project_id": project_id,
+            "title": "Issue with a stored handoff",
+            "idempotency_key": "rpc-handoffs-create"
+        }),
+    )
+    .await;
+    let created: rsi_common::issue_workspace::OperatorIssueMutationResultV1 =
+        serde_json::from_value(created.result.unwrap()).unwrap();
+    let author = Uuid::new_v4();
+    {
+        let store = fixture.server.session_manager.store().lock().await;
+        store
+            .conn
+            .execute(
+                "INSERT INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key,
+                      body, created_at)
+                 VALUES (?1, 1, ?2, ?3, 'rpc-handoff-1', 'RESULT abc123 slice done',
+                         '2026-10-15T09:00:00.000000000Z')",
+                rusqlite::params![
+                    created.issue.id.to_string(),
+                    project_id.to_string(),
+                    author.to_string()
+                ],
+            )
+            .unwrap();
+    }
+    let response = call_rpc(
+        &fixture.server,
+        "ListIssueHandoffs",
+        serde_json::json!({"project_id": project_id, "issue_id": created.issue.id}),
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let page: rsi_common::issue_workspace::ListIssueHandoffsResultV1 =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.handoffs.len(), 1);
+    assert_eq!(page.handoffs[0].sequence, 1);
+    assert_eq!(page.handoffs[0].author_session_id, author);
+    assert_eq!(page.handoffs[0].body, "RESULT abc123 slice done");
+
+    // An unknown field is refused, not ignored.
+    let strict = call_rpc(
+        &fixture.server,
+        "ListIssueHandoffs",
+        serde_json::json!({
+            "project_id": project_id,
+            "issue_id": created.issue.id,
+            "session_id": author
+        }),
+    )
+    .await;
+    assert!(strict.error.is_some());
+
+    let mut attributed = RpcRequest::new(
+        "ListIssueHandoffs",
+        serde_json::json!({"project_id": project_id, "issue_id": created.issue.id}),
+    );
+    attributed.session_token = Some("transport-only-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
+    else {
+        panic!("ListIssueHandoffs unexpectedly subscribed");
+    };
+    assert!(response.error.is_some(), "agents read via AgentGetIssue");
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn issue_workspace_rpc_rejects_present_null_and_all_methods_remain_operator_only() {
-    const METHODS: [&str; 11] = [
+    const METHODS: [&str; 12] = [
         "CreateIssueV2",
         "GetIssueInProject",
         "ListIssuesPage",
@@ -17621,6 +20115,7 @@ async fn issue_workspace_rpc_rejects_present_null_and_all_methods_remain_operato
         "AddIssueDependency",
         "RemoveIssueDependency",
         "ListIssueEventsV2",
+        "ListIssueHandoffs",
         "ArchiveIssue",
         "RestoreIssue",
     ];
@@ -17656,7 +20151,7 @@ async fn issue_workspace_rpc_rejects_present_null_and_all_methods_remain_operato
         "ListIssuesPage",
         serde_json::json!({"project_id": issue_rpc_project_id()}),
     );
-    attributed.session_token = Some("transport-only-token".to_string());
+    attributed.session_token = Some("transport-only-token".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
     else {
         panic!("Issue workspace request unexpectedly subscribed");
@@ -17821,7 +20316,10 @@ async fn read_scope_fixture() -> ReadScopeFixture {
     for (token, id) in [("wa", f.wa), ("la", f.la), ("mgr", f.mgr)] {
         f.rpc
             .manager
-            .register_agent_token(format!("read-scope-{token}"), id)
+            .register_agent_token(
+                crate::test_support::agent_token(&format!("read-scope-{token}")),
+                id,
+            )
             .await;
     }
     f
@@ -17869,7 +20367,8 @@ async fn tokened_read(
     params: serde_json::Value,
 ) -> RpcResponse {
     let mut request = RpcRequest::new(method, params);
-    request.session_token = Some(format!("read-scope-{caller}"));
+    request.session_token =
+        Some(crate::test_support::agent_token(&format!("read-scope-{caller}")).into());
     let HandleResult::Response(response) = f.rpc.server.handle_request_inner(&request).await else {
         panic!("expected response");
     };
@@ -18244,7 +20743,10 @@ async fn agent_read_scope_nested_worker_reads_owning_epic_and_group_but_not_inte
     let f = read_scope_fixture().await;
     f.rpc
         .manager
-        .register_agent_token("read-scope-ca".into(), f.ca)
+        .register_agent_token(
+            "747db27aef11105112644697ab5806a5b8bdc9abdec9c5c4ce1f5bfab5809a83".into(),
+            f.ca,
+        )
         .await;
     // ca -> wa -> epic_a -> group: the owning Epic and its Group are
     // readable metadata.
@@ -18305,7 +20807,10 @@ async fn agent_read_scope_parent_cycle_denies_on_caller_and_target_side() {
     .await;
     f.rpc
         .manager
-        .register_agent_token("read-scope-c1".into(), c1)
+        .register_agent_token(
+            "ab1f63ace1e73dff090cab3595190aea99299595977ddb47ada398fbb047762f".into(),
+            c1,
+        )
         .await;
     for (label, target) in [
         ("caller cycle: successor", succ),
@@ -18357,7 +20862,10 @@ async fn agent_read_scope_continued_from_cycle_denies_on_caller_and_target_side(
     .await;
     f.rpc
         .manager
-        .register_agent_token("read-scope-k1".into(), k1)
+        .register_agent_token(
+            "a82f51e29427bf2a4a4ce96442279256dee57b16029c61339734f84b8e830e87".into(),
+            k1,
+        )
         .await;
     assert_denied_for_every_scoped_verb(&f, "k1", q, "caller lineage cycle: child").await;
     assert_denied_for_every_scoped_verb(&f, "k1", k2, "caller lineage cycle: predecessor").await;
@@ -18415,7 +20923,10 @@ async fn agent_read_scope_depth_overflow_denies_on_caller_and_target_side() {
     }
     f.rpc
         .manager
-        .register_agent_token("read-scope-deep".into(), lineage[0])
+        .register_agent_token(
+            "aba8921f92b930f93b9d811ef2378461cb04816b8056fd0c8484235a04c0d70a".into(),
+            lineage[0],
+        )
         .await;
     assert_denied_for_every_scoped_verb(&f, "deep", x, "caller lineage overflow: child").await;
     assert_denied_for_every_scoped_verb(&f, "wa", y, "target lineage overflow: child").await;
@@ -18466,6 +20977,7 @@ fn every_non_agent_dispatch_arm_has_its_frozen_audience() {
         ("GetTurnMetrics", RpcVerbAudience::Read),
         ("ClaimBoundaryMail", RpcVerbAudience::Hook),
         ("ConfirmBoundaryMail", RpcVerbAudience::Hook),
+        ("RecordProviderLifecycleEvent", RpcVerbAudience::Hook),
     ];
     let arms = dispatch_arm_methods();
     for (method, _) in FROZEN {
@@ -18683,6 +21195,9 @@ async fn operator_rpc_manager_tree_snapshots_pages_and_reports_counts() {
                 effort: Some("high".into()),
             }],
             "project_policy": ManagerPolicyV2::default(),
+            // The default policy lowers the root's active-session cap from 8
+            // to 4, which the operator must acknowledge.
+            "confirm_cap_reductions": true,
             "expected_grant_version": 0,
             "idempotency_key": "tree-global",
         }),
@@ -18922,7 +21437,7 @@ async fn portfolio_node_methods_are_operator_only_and_attributed_denied() {
             method,
             serde_json::json!({"node_id": null, "tier_label": "global"}),
         );
-        request.session_token = Some("manager-token".to_string());
+        request.session_token = Some("manager-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -18978,7 +21493,7 @@ async fn tier_routing_operator_methods_and_human_answers_are_attributed_denied()
             method,
             serde_json::json!({"hop_id": Uuid::new_v4(), "ruling": "yes", "idempotency_key": "k"}),
         );
-        request.session_token = Some("manager-token".to_string());
+        request.session_token = Some("manager-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -19000,6 +21515,233 @@ async fn tier_routing_operator_methods_and_human_answers_are_attributed_denied()
         assert!(agent_gate::AGENT_VERBS.contains(&method), "{method}");
         assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
     }
+}
+
+/// #1747 pin: the operator's to-do RPCs are operator-only (absent from every
+/// agent-facing catalog, native tool and the CLI, refused to a tokened
+/// caller); the two agent verbs are write verbs, never read verbs.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_todo_methods_are_operator_only_and_agent_verbs_are_write_verbs() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in rsi_common::operator_todos::OPERATOR_TODO_OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::rpc_verb_registry::cli_verb_methods().contains(&method),
+            "{method}"
+        );
+        assert!(!catalog.iter().any(|entry| entry.method == method));
+        let mut request = RpcRequest::new(method, serde_json::json!({}));
+        request.session_token = Some("manager-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        let error = response.error.expect("attributed call must be denied");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    for method in ["AgentOperatorTodoUpsert", "AgentOperatorTodoClose"] {
+        assert!(agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(catalog.iter().any(|entry| entry.method == method));
+    }
+}
+
+/// #2950: an operator (no session token) adds, closes and then undoes a to-do
+/// over the RPC; the reopened item is a new open row and a repeat is a replay.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_todo_reopen_undoes_an_operator_close_over_rpc() {
+    let fixture = recursive_dag_rpc_fixture();
+    async fn call(
+        fixture: &RecursiveDagRpcFixture,
+        method: &str,
+        params: serde_json::Value,
+    ) -> RpcResponse {
+        let request = RpcRequest::new(method, params);
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        response
+    }
+    let added = call(
+        &fixture,
+        "OperatorTodoAdd",
+        serde_json::json!({"title": "Undo me", "how": "rsi phone on", "idempotency_key": "undo-1"}),
+    )
+    .await;
+    let id = added.result.expect("add result")["todo"]["id"]
+        .as_str()
+        .expect("todo id")
+        .to_string();
+    let closed = call(
+        &fixture,
+        "OperatorTodoClose",
+        serde_json::json!({"todo_id": id, "status": "done"}),
+    )
+    .await;
+    assert!(closed.error.is_none(), "{:?}", closed.error);
+
+    let reopened = call(
+        &fixture,
+        "OperatorTodoReopen",
+        serde_json::json!({"todo_id": id}),
+    )
+    .await;
+    let result = reopened.result.expect("reopen result");
+    assert_eq!(result["deduplicated"], false);
+    assert_eq!(result["todo"]["status"], "open");
+    assert_eq!(result["todo"]["title"], "Undo me");
+    assert_ne!(result["todo"]["id"].as_str(), Some(id.as_str()));
+    let replay = call(
+        &fixture,
+        "OperatorTodoReopen",
+        serde_json::json!({"todo_id": id}),
+    )
+    .await;
+    assert_eq!(replay.result.expect("replay")["deduplicated"], true);
+
+    let list = call(&fixture, "OperatorTodoList", serde_json::json!({})).await;
+    let list = list.result.expect("list result");
+    assert_eq!(list["open"].as_array().map(Vec::len), Some(1));
+
+    let missing = call(
+        &fixture,
+        "OperatorTodoReopen",
+        serde_json::json!({"todo_id": uuid::Uuid::new_v4()}),
+    )
+    .await;
+    assert!(
+        missing
+            .error
+            .expect("unknown item is refused")
+            .message
+            .contains("operator_todo_not_found")
+    );
+}
+
+/// #2649 pin: the operator's standing-directive RPCs are operator-only (absent
+/// from every agent-facing catalog, native tool and the CLI, refused to a
+/// tokened caller); `AgentStandingDirective` is a write verb, never a read verb.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn standing_directive_methods_are_operator_only_and_the_agent_verb_is_a_write_verb() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in rsi_common::standing_directives::STANDING_DIRECTIVE_OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::rpc_verb_registry::cli_verb_methods().contains(&method),
+            "{method}"
+        );
+        assert!(!catalog.iter().any(|entry| entry.method == method));
+        let mut request = RpcRequest::new(method, serde_json::json!({}));
+        request.session_token = Some("manager-token".into());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        let error = response.error.expect("attributed call must be denied");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    let method = "AgentStandingDirective";
+    assert!(agent_gate::AGENT_VERBS.contains(&method), "{method}");
+    assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+    assert!(catalog.iter().any(|entry| entry.method == method));
+}
+
+/// #2649: the operator sets, lists and clears a directive over RPC; it is
+/// delivered while active and kept as history once cleared.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_sets_lists_and_clears_a_standing_directive_over_rpc() {
+    let fixture = recursive_dag_rpc_fixture();
+    let project = {
+        let store = fixture.server.session_manager.store();
+        let guard = store.lock().await;
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        guard
+            .insert_project(&rsi_common::types::Project {
+                id,
+                name: "Directive project".into(),
+                path: None,
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        id
+    };
+    let call = |method: &'static str, params: serde_json::Value| {
+        let server = &fixture.server;
+        async move {
+            let request = RpcRequest::new(method, params);
+            let HandleResult::Response(response) = server.handle_request_inner(&request).await
+            else {
+                panic!("expected response for {method}");
+            };
+            assert!(response.error.is_none(), "{method}: {:?}", response.error);
+            response.result.unwrap()
+        }
+    };
+    let scope = serde_json::json!({"kind": "project", "project_id": project});
+    let set = call(
+        "StandingDirectiveSet",
+        serde_json::json!({
+            "scope": scope, "text": "Send ONE morning summary.",
+            "expires_in_secs": 3600, "idempotency_key": "rpc-1"
+        }),
+    )
+    .await;
+    let id = set["directive"]["id"].as_str().unwrap().to_string();
+    assert_eq!(set["directive"]["author"], "operator");
+    let listed = call("StandingDirectiveList", serde_json::json!({"scope": scope})).await;
+    assert_eq!(listed["directives"][0]["text"], "Send ONE morning summary.");
+    let cleared = call(
+        "StandingDirectiveClear",
+        serde_json::json!({"directive_id": id}),
+    )
+    .await;
+    assert_eq!(cleared["directive"]["cleared_by"], "operator");
+    let active = call("StandingDirectiveList", serde_json::json!({"scope": scope})).await;
+    assert!(active["directives"].as_array().unwrap().is_empty());
+    let history = call(
+        "StandingDirectiveList",
+        serde_json::json!({"scope": scope, "include_inactive": true}),
+    )
+    .await;
+    assert_eq!(history["directives"].as_array().unwrap().len(), 1);
 }
 
 /// #1333 pin: `ListFrictionRollup` is operator-only (absent from every
@@ -19032,7 +21774,7 @@ async fn friction_rollup_is_operator_only_and_out_of_agent_catalogs() {
         );
         assert!(!catalog.iter().any(|entry| entry.method == method));
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("manager-token".to_string());
+        request.session_token = Some("manager-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -19079,7 +21821,7 @@ async fn stale_decision_methods_are_operator_only_and_reachable_by_the_operator(
         );
         assert!(!catalog.iter().any(|entry| entry.method == method));
         let mut request = RpcRequest::new(method, serde_json::json!({}));
-        request.session_token = Some("manager-token".to_string());
+        request.session_token = Some("manager-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -19147,13 +21889,17 @@ async fn refused_agent_verbs_record_friction_the_operator_rolls_up() {
     let caller = Uuid::new_v4();
     fixture
         .manager
-        .register_agent_token("friction-caller-token".into(), caller)
+        .register_agent_token(
+            "73bd9309518813ab99687489cfa91370c946cc615836f769b3ef5bc852d016b0".into(),
+            caller,
+        )
         .await;
     let mut request = RpcRequest::new(
         "AgentGetIssue",
         serde_json::json!({"display_number": 999_999}),
     );
-    request.session_token = Some("friction-caller-token".to_string());
+    request.session_token =
+        Some("73bd9309518813ab99687489cfa91370c946cc615836f769b3ef5bc852d016b0".into());
     let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
     else {
         panic!("expected response");
@@ -19221,7 +21967,7 @@ async fn manager_node_workspace_is_operator_only_and_the_overview_is_an_agent_ve
             }
         }
         let mut request = RpcRequest::new(method, params.clone());
-        request.session_token = Some("manager-token".to_string());
+        request.session_token = Some("manager-token".into());
         let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
         else {
             panic!("expected response for {method}");
@@ -19376,6 +22122,42 @@ async fn operator_rpc_portfolio_nodes_round_trip_and_global_shims() {
     let root_c: PortfolioNodeV1 = serde_json::from_value(created.result.unwrap()).unwrap();
     assert_eq!(root_c.grant.project_ids, [c]);
     assert_eq!(root_c.parent_node_id, None);
+
+    // #2103: one launch is added without re-typing the grant, CAS on the version.
+    let extra = serde_json::json!({
+        "provider": "Claude", "model": "claude-sonnet-5-5", "effort": "high",
+    });
+    let edited = call_rpc(
+        &fixture.server,
+        "ConfigurePortfolioNodeLaunches",
+        serde_json::json!({
+            "node_id": root_c.node_id,
+            "add": [extra],
+            "expected_node_grant_version": root_c.grant.grant_version,
+            "idempotency_key": "root-c-launch",
+        }),
+    )
+    .await;
+    assert!(edited.error.is_none(), "{:?}", edited.error);
+    let edited: PortfolioNodeV1 = serde_json::from_value(edited.result.unwrap()).unwrap();
+    assert_eq!(
+        edited.grant.allowed_launches.len(),
+        root_c.grant.allowed_launches.len() + 1
+    );
+    assert_eq!(edited.grant.project_ids, root_c.grant.project_ids);
+    let stale = call_rpc(
+        &fixture.server,
+        "ConfigurePortfolioNodeLaunches",
+        serde_json::json!({
+            "node_id": root_c.node_id,
+            "remove": [extra],
+            "expected_node_grant_version": root_c.grant.grant_version,
+            "idempotency_key": "root-c-launch-stale",
+        }),
+    )
+    .await;
+    assert!(stale.error.unwrap().message.contains("manager_node_stale"));
+    let root_c = edited;
 
     let overlap = call_rpc(
         &fixture.server,
@@ -19671,7 +22453,10 @@ async fn five_tier_authority_by_role(labels: [&str; 3]) -> Vec<String> {
     for (role, seat) in roles {
         fixture
             .manager
-            .register_agent_token(format!("token-{role}"), seat)
+            .register_agent_token(
+                crate::test_support::agent_token(&format!("token-{role}")),
+                seat,
+            )
             .await;
     }
     let outcome = |result: std::result::Result<serde_json::Value, String>| match result {
@@ -19683,7 +22468,7 @@ async fn five_tier_authority_by_role(labels: [&str; 3]) -> Vec<String> {
     };
     let mut results = Vec::new();
     for (role, _) in roles {
-        let token = format!("token-{role}");
+        let token = crate::test_support::agent_token(&format!("token-{role}"));
         for (name, project) in [("a", a), ("b", b), ("c", c)] {
             // The portfolio levels name the project; the project and area
             // tiers name it only when it is not their own.
@@ -19776,4 +22561,128 @@ fn project_created_reaches_every_session_stream() {
     };
     assert_eq!(event_type_str(&event), "project_created");
     assert!(event_matches_session(&event, Uuid::new_v4()));
+}
+
+mod cold_s3;
+mod cold_s4;
+mod connection_drain;
+mod input_assets;
+mod project_files;
+mod prompt_files;
+mod transport_admission;
+
+/// hub #2765: `provider_launch_overrides` is an operator-only
+/// `UpdateDaemonConfig` field. Defaults are empty; an allowed write is stored
+/// and read back; a denied key and an unknown key are refused at write time
+/// with their typed codes and change nothing (single and batch form); a
+/// session-attributed caller is refused before any validation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn provider_launch_overrides_write_is_operator_only_validated_and_typed() {
+    use rsi_common::provider_launch_overrides as overrides;
+    for operator in ["GetDaemonConfig", "UpdateDaemonConfig"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&operator), "{operator}");
+        assert!(!agent_gate::READ_VERBS.contains(&operator), "{operator}");
+        assert!(!agent_gate::is_allowed_for_attributed_caller(operator));
+    }
+    assert!(
+        !rsi_common::agent_control_schema::agent_control_catalog_v1()
+            .iter()
+            .any(|entry| entry.method == "UpdateDaemonConfig")
+    );
+    let fixture = recursive_dag_rpc_fixture();
+    let field = overrides::FIELD;
+    assert_eq!(
+        fixture.server.runtime_config.to_json()[field],
+        serde_json::json!({})
+    );
+    let call = |params: serde_json::Value, token: Option<&str>| {
+        let mut request = RpcRequest::new("UpdateDaemonConfig", params);
+        request.session_token = token.map(Into::into);
+        request
+    };
+    let allowed = serde_json::json!({"codex": ["model_reasoning_summary=concise"]});
+
+    let HandleResult::Response(response) = fixture
+        .server
+        .handle_request_inner(&call(
+            serde_json::json!({"field": field, "value": allowed}),
+            Some("some-token"),
+        ))
+        .await
+    else {
+        panic!("response");
+    };
+    assert!(
+        response
+            .error
+            .expect("attributed write must be denied")
+            .message
+            .contains("not available to session-attributed callers")
+    );
+    assert_eq!(
+        fixture.server.runtime_config.to_json()[field],
+        serde_json::json!({})
+    );
+
+    let HandleResult::Response(response) = fixture
+        .server
+        .handle_request_inner(&call(
+            serde_json::json!({"field": field, "value": allowed}),
+            None,
+        ))
+        .await
+    else {
+        panic!("response");
+    };
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(fixture.server.runtime_config.to_json()[field], allowed);
+    // #281: no codex-cli can answer in a unit test, so the write is accepted on
+    // the static allowlist alone and the response says the check was degraded.
+    let result = response.result.expect("result");
+    assert_eq!(result["launch_override_check"]["codex"], "degraded");
+    assert_eq!(
+        result["launch_override_check"]["degraded_reason"],
+        "codex_cli_unavailable"
+    );
+
+    for (value, code) in [
+        (
+            serde_json::json!({"claude": ["--dangerously-skip-permissions"]}),
+            overrides::CODE_DENIED,
+        ),
+        (
+            serde_json::json!({"codex": ["sandbox_mode=danger-full-access"]}),
+            overrides::CODE_DENIED,
+        ),
+        (
+            serde_json::json!({"claude": ["permissions.allow=Bash(*)"]}),
+            overrides::CODE_DENIED,
+        ),
+        (
+            serde_json::json!({"codex": ["no_such_key=1"]}),
+            overrides::CODE_UNKNOWN_KEY,
+        ),
+    ] {
+        for params in [
+            serde_json::json!({"field": field, "value": value}),
+            serde_json::json!({"updates": [{"field": field, "value": value}]}),
+        ] {
+            let HandleResult::Response(response) = fixture
+                .server
+                .handle_request_inner(&call(params.clone(), None))
+                .await
+            else {
+                panic!("response");
+            };
+            let error = response.error.expect("refused");
+            assert_eq!(error.code, INVALID_PARAMS, "{params}");
+            assert!(error.message.contains(code), "{params}: {}", error.message);
+        }
+        assert_eq!(
+            fixture.server.runtime_config.to_json()[field],
+            allowed,
+            "a refused write changes nothing"
+        );
+    }
 }

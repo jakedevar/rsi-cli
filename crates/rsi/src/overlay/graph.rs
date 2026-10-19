@@ -1246,7 +1246,7 @@ pub(crate) async fn run_topology_command(app: &mut App, args: &str) {
     };
     match app
         .client
-        .execute_topology(
+        .execute_topology_receipt(
             topology.id,
             Some(issue.project_id),
             serde_json::json!({ "issue": issue.display_number }),
@@ -1254,34 +1254,29 @@ pub(crate) async fn run_topology_command(app: &mut App, args: &str) {
         )
         .await
     {
-        Ok(execution_id) => {
+        Ok((execution_id, workflow_id)) => {
             app.notify_success(format!(
                 "Started {} on #{} (exec {execution_id})",
                 topology.name, issue.display_number
             ));
-            open_topology_run_view(app, execution_id, &topology.name, issue.project_id).await;
+            // #1753: bind by the receipt's workflow id (the topology's own
+            // bridged workflow), never by title.
+            if let Some(workflow_id) = workflow_id {
+                open_topology_run_view(app, execution_id, workflow_id, issue.project_id).await;
+            }
         }
         Err(error) => app.notify_error(explain_execute_topology_error(&error.to_string())),
     }
 }
 
-/// Open the graph review on the started execution so its run view shows.
+/// Open the graph review on the started execution so its run view shows. The
+/// workflow is the one the execute receipt names (#1753).
 async fn open_topology_run_view(
     app: &mut App,
     execution_id: Uuid,
-    topology_name: &str,
+    workflow_id: Uuid,
     project_id: Uuid,
 ) {
-    let workflow_id = match app.client.list_workflows(Some(project_id)).await {
-        Ok(workflows) => workflows
-            .into_iter()
-            .find(|workflow| workflow.title == topology_name)
-            .map(|workflow| workflow.id),
-        Err(_) => None,
-    };
-    let Some(workflow_id) = workflow_id else {
-        return;
-    };
     let draft_id = load_saved_workflow_draft(app, workflow_id, Some(project_id)).await;
     if let Some(draft) = app.graph_draft_mut(&draft_id) {
         draft.last_execution_id = Some(execution_id);

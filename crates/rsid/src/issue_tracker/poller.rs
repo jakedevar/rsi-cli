@@ -98,6 +98,26 @@ pub trait SessionLauncher: Send + Sync {
     /// heal wake. The lifecycle owner checks live state under the spawn guard.
     async fn reconcile_transient_heal_after_resume(&self, _target: Uuid) {}
 
+    /// #2528: true once the daemon has decided to restart (an operator DRAIN, a
+    /// deploy restart or a stop signal). The scheduler then fires nothing: every
+    /// due job stays pending, untouched, and fires on the next incarnation. A
+    /// wake delivered after the decision would start a turn the restart then has
+    /// to wait on or interrupt.
+    fn restart_draining(&self) -> bool {
+        false
+    }
+
+    /// #2747: what only the live daemon can read for a `health_anomaly` wake
+    /// scoped to `scope`: each PM seat's context fill against its rotation
+    /// threshold, and each satellite's reported disk and provider faults.
+    /// Nothing here may start a model turn. The default reports nothing.
+    async fn health_live_inputs(
+        &self,
+        _scope: &crate::health_anomaly::Scope,
+    ) -> crate::health_anomaly::LiveHealthInputs {
+        crate::health_anomaly::LiveHealthInputs::default()
+    }
+
     /// #1073: true while a waiting deploy holds a scheduled resume of
     /// `target` (a child session). The wake stays due and is retried next tick.
     async fn deploy_holds_resume(&self, _target: Uuid) -> bool {
@@ -368,6 +388,7 @@ pub async fn tick(
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         };
 
         match session_launcher.launch(launch_config).await {
@@ -542,7 +563,7 @@ mod tests {
     async fn tick_dispatches_up_to_max_concurrent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
+        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
         let event_bus = EventBus::new(16);
 
         let tracker = MockTracker {
@@ -627,7 +648,7 @@ mod tests {
     async fn tick_reconciles_terminal_issues() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
+        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
         let event_bus = EventBus::new(16);
 
         // Pre-populate running state
@@ -676,7 +697,7 @@ mod tests {
     async fn tick_with_zero_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open(&db_path).unwrap()));
+        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
         let event_bus = EventBus::new(16);
 
         let tracker = MockTracker {

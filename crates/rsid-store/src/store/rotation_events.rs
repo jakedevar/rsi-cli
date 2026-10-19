@@ -112,6 +112,109 @@ pub struct OpenRotationIntent {
 }
 
 impl Store {
+    /// Open rotations whose single reserved successor, or an abandon
+    /// replacement in its lineage, owns the transferred custody. Resolve the
+    /// holder exactly as Continue/abandon do, including the live-root fence.
+    fn open_transferred_custody_rotations(
+        &self,
+        predecessor: Option<Uuid>,
+    ) -> Result<Vec<(BlockedRotation, SessionStatus)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT e.session_id, e.rotation_id, s.id FROM rotation_events e
+             JOIN rotation_events reserved ON reserved.session_id=e.session_id
+               AND reserved.rotation_id=e.rotation_id
+               AND reserved.event_type='successor_reserved' AND json_valid(reserved.metadata)
+             JOIN sessions s ON s.id=CASE WHEN json_valid(reserved.metadata)
+               THEN json_extract(reserved.metadata,'$.successor_id') END
+               AND s.continued_from=e.session_id
+             WHERE (?1 IS NULL OR e.session_id=?1) AND e.event_type='entered'
+               AND e.phase IN ('writing_handoff','pending_interrupt','completed_trigger')
+               AND (SELECT COUNT(DISTINCT json_extract(candidate.metadata,'$.successor_id'))
+                 FROM rotation_events candidate WHERE candidate.session_id=e.session_id
+                   AND candidate.rotation_id=e.rotation_id
+                   AND candidate.event_type='successor_reserved' AND json_valid(candidate.metadata))=1
+               AND NOT EXISTS(SELECT 1 FROM rotation_events terminal
+                 WHERE terminal.session_id=e.session_id AND terminal.rotation_id=e.rotation_id
+                   AND (terminal.event_type IN ('completed','suppressed_final_handoff','aborted_empty_session')
+                     OR terminal.event_type LIKE 'refused:%' OR terminal.phase='depth_limit_hit'))
+             ORDER BY e.id",
+        )?;
+        let reserved = statement
+            .query_map([predecessor.map(|id| id.to_string())], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut blocked = Vec::new();
+        for (predecessor, rotation_id, reserved) in reserved {
+            if let Some((holder, status)) = self.blocked_rotation_holder(parse_uuid(&reserved)?)? {
+                blocked.push((
+                    BlockedRotation {
+                        predecessor: parse_uuid(&predecessor)?,
+                        rotation_id,
+                        successor: holder,
+                    },
+                    status,
+                ));
+            }
+        }
+        Ok(blocked)
+    }
+
+    /// An open rotation whose reserved successor or abandon replacement
+    /// owns the predecessor's transferred custody. Read all open intents,
+    /// including ones whose recovery-blocked write failed, before admitting
+    /// a new trigger that could hide Continue/abandon/recovery's intent.
+    pub fn rotation_transferred_custody_blocker(
+        &self,
+        predecessor: Uuid,
+    ) -> Result<Option<BlockedRotation>> {
+        Ok(self
+            .rotation_transferred_custody_blocker_with_status(predecessor)?
+            .map(|(blocked, _)| blocked))
+    }
+
+    /// As [`Self::rotation_transferred_custody_blocker`], with the holder's
+    /// status, so a caller can tell a holder that is still running (an abandon
+    /// replacement that has not published) from one that needs the operator.
+    pub fn rotation_transferred_custody_blocker_with_status(
+        &self,
+        predecessor: Uuid,
+    ) -> Result<Option<(BlockedRotation, SessionStatus)>> {
+        Ok(self
+            .open_transferred_custody_rotations(Some(predecessor))?
+            .into_iter()
+            .next())
+    }
+
+    /// Refuse before any new rotation event or interrupt can obscure a
+    /// transferred-custody recovery intent (#2223).
+    pub fn ensure_rotation_not_blocked_on_transferred_custody(
+        &self,
+        predecessor: Uuid,
+    ) -> Result<()> {
+        let Some(blocked) = self.rotation_transferred_custody_blocker(predecessor)? else {
+            return Ok(());
+        };
+        Err(DaemonError::StructuredRpc {
+            rpc_code: rsi_common::rpc::INVALID_PARAMS,
+            message: format!(
+                "rotation_blocked_on_transferred_custody: rotation {} of {} is blocked; Continue {} or use :rotation-abandon on {}",
+                blocked.rotation_id, predecessor, blocked.successor, predecessor
+            ),
+            data: serde_json::json!({
+                "code": "rotation_blocked_on_transferred_custody",
+                "rotation_id": blocked.rotation_id,
+                "predecessor_id": predecessor,
+                "successor_id": blocked.successor,
+                "recovery_verbs": ["ContinueSession", "AbandonBlockedRotation"],
+            }),
+        })
+    }
+
     pub fn insert_rotation_event(
         &self,
         session_id: Uuid,
@@ -467,6 +570,27 @@ impl Store {
         ids.iter().map(|id| parse_uuid(id)).collect()
     }
 
+    /// Open intents whose reserved successor or abandon replacement is
+    /// failed and owns transferred custody. Their predecessor may already be
+    /// `Completed`, even when the rotation started with a handoff turn, so
+    /// restore need not reconcile it from a live status before recovery takes
+    /// ownership (#2215).
+    ///
+    /// # Errors
+    /// Returns an error when the query fails or a stored id is malformed.
+    pub fn open_transferred_custody_rotation_sessions(&self) -> Result<Vec<Uuid>> {
+        let mut ids: Vec<_> = self
+            .open_transferred_custody_rotations(None)?
+            .into_iter()
+            .filter_map(|(blocked, status)| {
+                (status == SessionStatus::Failed).then_some(blocked.predecessor)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Whether restart recovery has claimed the still-open intent of
     /// `rotation_id`: it, not the cap pass, then owns the request's effect.
     ///
@@ -519,8 +643,8 @@ impl Store {
     }
 
     /// Predecessors whose recovery-claimed rotation has no terminal decision.
-    /// Unclaimed legacy intents are deliberately excluded: only rows restore
-    /// reconciled from a live status enter recovery for the first time.
+    /// Unclaimed intents are discovered separately through live-status
+    /// reconciliation, completed triggers or transferred custody.
     ///
     /// # Errors
     /// Returns an error when the query fails or a stored id is malformed.

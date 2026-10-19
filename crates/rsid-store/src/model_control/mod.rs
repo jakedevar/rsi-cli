@@ -736,6 +736,7 @@ pub fn classify_error_class(error: &DaemonError) -> String {
         DaemonError::ExecutionScratchUnavailable(_) => "execution_scratch_unavailable".to_string(),
         DaemonError::StreamFallbackRequired(_) => "stream_fallback_required".to_string(),
         DaemonError::Process(_) => "process".to_string(),
+        DaemonError::QuarantineProofDeferred => "quarantine_proof_deferred".to_string(),
         DaemonError::CodexResumeToolHistory(_) => "codex_resume_tool_history_invalid".to_string(),
         DaemonError::CodexResumeTornTail => "codex_resume_rollout_torn_tail".to_string(),
         DaemonError::StartupProviderInventory(_) => "startup_provider_inventory".to_string(),

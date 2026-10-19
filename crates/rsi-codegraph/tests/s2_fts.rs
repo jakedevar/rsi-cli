@@ -46,6 +46,7 @@ fn facts(path: &str, name: &str) -> PerFileFacts {
         relations: vec![],
         unresolved_references: vec![],
         diagnostic: FileDiagnostic::Parsed,
+        scope: rsi_codegraph::scope::RustScope::default(),
     }
 }
 fn manifest() -> StagedExtraction {
@@ -180,11 +181,13 @@ fn forward_v4_migration_backfills_ready_v3_nodes_without_rewriting_history() {
     let ready = store.publish_staged(&run, PublishFault::None).unwrap();
     drop(store);
     let conn = Connection::open(&database).unwrap();
+    // Restore a populated v8 database, then lower it to v3 as this test always did.
+    conn.execute_batch(include_str!("fixtures/downgrade-to-v8.sql"))
+        .unwrap();
     conn.execute_batch(
         "DROP TABLE cg_retained_relations;
         DROP TABLE cg_retained_nodes;
         DROP TABLE cg_generation_detail;
-        DROP TABLE cg_index_manifest;
         DROP TABLE cg_index_runs;
         DROP TABLE cg_index_state;
         DROP TABLE cg_fts_nodes;
@@ -206,7 +209,7 @@ fn forward_v4_migration_backfills_ready_v3_nodes_without_rewriting_history() {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 10);
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM cg_fts_nodes", [], |row| row.get(0))
         .unwrap();

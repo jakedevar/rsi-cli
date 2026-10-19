@@ -2,9 +2,12 @@
 
 use crate::app::App;
 use crate::types::{
-    IssueEditorMode, IssueWorkspaceDataKind, IssueWorkspaceLoadState, IssueWorkspaceState,
-    IssueWorkspaceTab,
+    IssueEditorMode, IssueWorkspaceDataKind, IssueWorkspaceFocus, IssueWorkspaceLoadState,
+    IssueWorkspaceState, IssueWorkspaceTab,
 };
+use crate::ui::issue_detail::{self, operator_kind, priority_mark, status_mark};
+use crate::ui::navigator_layout::{display_width, truncate_cells_with_ellipsis};
+use crate::ui::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -19,11 +22,20 @@ pub fn render_issue_workspace(
     app: &App,
 ) {
     let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
-    let active = |tab| {
-        if state.active_tab == tab {
-            Modifier::BOLD | Modifier::UNDERLINED
+    let tab = |label: &'static str, which: IssueWorkspaceTab| -> Span<'static> {
+        if state.active_tab == which {
+            // Brackets and underline mark the active tab without colour.
+            Span::styled(
+                format!("[{label}]"),
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )
         } else {
-            Modifier::empty()
+            Span::styled(
+                format!(" {label} "),
+                Style::default().fg(theme::dim_metadata()),
+            )
         }
     };
     let project = state
@@ -31,25 +43,31 @@ pub fn render_issue_workspace(
         .and_then(|id| app.projects.iter().find(|project| project.id == id))
         .map(|project| project.name.as_str())
         .unwrap_or("No project");
+    // The breadcrumb of #2237's workspace: where this view sits, then its tabs.
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" Issues ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                "Local",
-                Style::default().add_modifier(active(IssueWorkspaceTab::Local)),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                "Dispatched",
-                Style::default().add_modifier(active(IssueWorkspaceTab::Dispatched)),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                "Sync",
-                Style::default().add_modifier(active(IssueWorkspaceTab::Sync)),
-            ),
-            Span::raw(format!("  {project}")),
-        ])),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    project.to_string(),
+                    Style::default()
+                        .fg(theme::green())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" / ", Style::default().fg(theme::overlay1())),
+                Span::styled(
+                    "Issues",
+                    Style::default()
+                        .fg(theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                tab("Local", IssueWorkspaceTab::Local),
+                tab("Dispatched", IssueWorkspaceTab::Dispatched),
+                tab("Sync", IssueWorkspaceTab::Sync),
+            ]),
+            issue_signal_line(state),
+        ]),
         chunks[0],
     );
     if state.project_id.is_none() {
@@ -119,6 +137,18 @@ fn render_local(
         rsi_common::types::IssueArchiveFilterV1::Archived => "Archived",
         rsi_common::types::IssueArchiveFilterV1::All => "All",
     };
+    let search = state
+        .local
+        .filters
+        .query
+        .as_deref()
+        .map(|query| format!(" · search {query}"))
+        .unwrap_or_default();
+    let operator = if state.local.filters.operator_only() {
+        " · ◆ operator only"
+    } else {
+        ""
+    };
     let confirmation = state
         .transient
         .cancel_confirmation
@@ -150,7 +180,7 @@ fn render_local(
         .unwrap_or_default();
     let block = Block::default()
         .title(format!(
-            " Local [{} · {} · {archive}]{}{confirmation}{retry}{mutation_failure} ",
+            " Local [{} · {} · {archive}{search}{operator}]{}{confirmation}{retry}{mutation_failure} ",
             load_label(load_state),
             state
                 .local
@@ -194,27 +224,19 @@ fn render_local(
         render_local_side(frame, regions[1], state, app);
         return;
     }
-    let geometry = local_table_geometry(table_area.width);
-    let rows = page
-        .rows
-        .iter()
-        .skip(state.local.scroll_offset)
-        .map(|row| {
-            let selected = state.local.selected_issue_id == Some(row.issue.id);
-            let cells = local_row_cells(row, selected, &geometry);
-            debug_assert_eq!(cells.len(), geometry.headers.len());
-            Row::new(cells).style(if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            })
-        })
-        .collect::<Vec<_>>();
-    debug_assert_eq!(geometry.headers.len(), geometry.widths.len());
-    let table = Table::new(rows, geometry.widths)
-        .header(Row::new(geometry.headers))
-        .block(block);
-    frame.render_widget(table, table_area);
+    let geometry = local_table_geometry(table_area.width.saturating_sub(2));
+    let mut lines = vec![local_header_line(&geometry)];
+    lines.extend(
+        page.rows
+            .iter()
+            .skip(state.local.scroll_offset)
+            .take(viewport_rows.max(1))
+            .map(|row| {
+                let selected = state.local.selected_issue_id == Some(row.issue.id);
+                local_row_line(row, selected, focused, &geometry)
+            }),
+    );
+    frame.render_widget(Paragraph::new(lines).block(block), table_area);
     render_local_side(frame, regions[1], state, app);
 }
 
@@ -231,6 +253,10 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
         frame.render_widget(Paragraph::new("No issue selected"), area);
         return;
     };
+    if state.transient.detail_cursor_issue != Some(issue_id) {
+        state.transient.detail_cursor_issue = Some(issue_id);
+        state.transient.detail_cursor = 0;
+    }
     if state.transient.missing_selected_issue_id == Some(issue_id) {
         frame.render_widget(
             Paragraph::new(
@@ -273,33 +299,16 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
         .current_page
         .as_ref()
         .and_then(|page| page.rows.iter().find(|row| row.issue.id == issue.id))
-        .map(|row| {
-            format!(
-                "{:?} ({} open blockers)",
-                row.readiness, row.open_blocker_count
-            )
+        .map(|row| match row.readiness {
+            rsi_common::issue_workspace::IssueWorkspaceReadinessV1::Ready => "● Ready".to_string(),
+            rsi_common::issue_workspace::IssueWorkspaceReadinessV1::Blocked => {
+                format!("× Blocked by {} open", row.open_blocker_count)
+            }
+            rsi_common::issue_workspace::IssueWorkspaceReadinessV1::NotEligible => {
+                "— Not eligible".to_string()
+            }
         })
         .unwrap_or_else(|| "Loading".to_string());
-    let deps = |kind: IssueWorkspaceDataKind,
-                target: Option<uuid::Uuid>,
-                page: &Option<rsi_common::issue_workspace::IssueDependencyPageV1>| {
-        page.as_ref()
-            .filter(|_| target == Some(issue_id))
-            .map(|page| {
-                page.items
-                    .iter()
-                    .map(|item| {
-                        format!(
-                            "#{} {}",
-                            item.related_issue.display_number, item.related_issue.title
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| state.data_error(kind).unwrap_or("loading").to_string())
-    };
     let issue_id_string = issue.id.to_string();
     let mut associated = app
         .sessions
@@ -349,21 +358,6 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
     } else {
         events
     };
-    let cursor_state =
-        |target: Option<uuid::Uuid>,
-         page: &Option<rsi_common::issue_workspace::IssueDependencyPageV1>| {
-            (target == Some(issue_id))
-                .then(|| page.as_ref())
-                .flatten()
-                .map(|page| {
-                    format!(
-                        "prev={} next={}",
-                        page.previous_cursor.is_some(),
-                        page.next_cursor.is_some()
-                    )
-                })
-                .unwrap_or_else(|| "loading".to_string())
-        };
     let (events_after_sequence, events_next_after_sequence) =
         if state.transient.events_target == Some(issue_id) {
             (
@@ -373,45 +367,15 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
         } else {
             (None, None)
         };
-    let text = format!(
-        "UUID: {}\nProject: {}\nNumber: #{}\nTitle: {}\nBody: {}\nStatus: {}\nPriority: {}\nArchive: {}\nReadiness: {}\nLabels: {}\nAssignee: {}\nBlocked by [{}]: {}\nBlocks [{}]: {}\nInspector page: {:?} · Tab section · PageUp/PageDown bounded pages\nCreator session: {}\nLinked idea: {}\nSource event: {}\nSource finding: {}\nCreated: {}\nUpdated: {}\nClosed: {}\nArchived: {}\nRow version: {}\nAssociated sessions: {}\nEvents [after={:?} next={:?}]:\n{}",
+    let tail = format!(
+        "UUID: {}\nProject: {}\nArchive: {}\nInspector page: {:?} · Tab section · PageUp/PageDown bounded pages\nCreator session: {}\nLinked idea: {}\nSource event: {}\nSource finding: {}\nCreated: {}\nUpdated: {}\nClosed: {}\nArchived: {}\nRow version: {}\nAssociated sessions: {}\nEvents [after={:?} next={:?}]:\n{}",
         issue.id,
         issue.project_id,
-        issue.display_number,
-        issue.title,
-        issue.body,
-        issue_status_label(issue.status),
-        issue
-            .priority
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "—".into()),
         if issue.archived_at.is_some() {
             "ARCHIVED"
         } else {
             "Active"
         },
-        readiness,
-        if issue.labels.is_empty() {
-            "none".to_string()
-        } else {
-            issue.labels.join(", ")
-        },
-        issue.assignee.as_deref().unwrap_or("unassigned"),
-        cursor_state(
-            state.transient.blocked_by_target,
-            &state.transient.blocked_by,
-        ),
-        deps(
-            IssueWorkspaceDataKind::BlockedBy,
-            state.transient.blocked_by_target,
-            &state.transient.blocked_by,
-        ),
-        cursor_state(state.transient.blocks_target, &state.transient.blocks),
-        deps(
-            IssueWorkspaceDataKind::Blocks,
-            state.transient.blocks_target,
-            &state.transient.blocks,
-        ),
         state.local.inspector_section,
         issue
             .created_by_session_id
@@ -450,22 +414,66 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
         events_next_after_sequence,
         events,
     );
+    let number = issue.display_number;
+    let (blocked_by, blocks) = issue_detail::state_dep_lists(state, issue_id);
+    let expanded = |index: usize| state.transient.detail_expanded.contains(&(issue_id, index));
+    let handoffs = issue_detail::state_handoffs(state, issue_id);
+    let model = issue_detail::build(&issue_detail::DetailInput {
+        issue,
+        readiness,
+        age: issue_age(issue.updated_at),
+        blocked_by,
+        blocks,
+        handoffs,
+        handoffs_total: if handoffs.is_empty() {
+            0
+        } else {
+            state.transient.handoffs_total
+        },
+        handoffs_error: state
+            .data_error(IssueWorkspaceDataKind::Handoffs)
+            .map(str::to_string),
+        cursor: state.transient.detail_cursor,
+        expanded: &expanded,
+        width: usize::from(area.width.saturating_sub(2)),
+        tail,
+    });
     let viewport_rows = area.height.saturating_sub(2) as usize;
     state.transient.inspector_viewport_rows = viewport_rows;
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    let line_count = paragraph.line_count(area.width.saturating_sub(2));
+    let line_count = model.lines.len();
+    // A key moved the cursor: bring its item into view.
+    if std::mem::take(&mut state.transient.detail_follow)
+        && let Some(&line) = model.item_lines.get(state.transient.detail_cursor)
+    {
+        let offset = state.local.inspector_scroll_offset;
+        if line < offset {
+            state.local.inspector_scroll_offset = line;
+        } else if line + 2 > offset + viewport_rows {
+            state.local.inspector_scroll_offset = (line + 3).saturating_sub(viewport_rows);
+        }
+    }
     state.local.inspector_scroll_offset = bounded_scroll_offset(
         state.local.inspector_scroll_offset,
         line_count,
         viewport_rows,
     );
+    let border = if state.focus == IssueWorkspaceFocus::Inspector {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     frame.render_widget(
-        paragraph
+        Paragraph::new(model.lines)
             .scroll((
                 state.local.inspector_scroll_offset.min(u16::MAX as usize) as u16,
                 0,
             ))
-            .block(Block::default().title(" Inspector ").borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title(format!(" Inspector · #{number} "))
+                    .borders(Borders::ALL)
+                    .border_style(border),
+            ),
         area,
     );
 }
@@ -765,7 +773,7 @@ fn issue_projection(issue: &rsi_common::types::Issue) -> String {
     )
 }
 
-fn issue_age(updated_at: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn issue_age(updated_at: chrono::DateTime<chrono::Utc>) -> String {
     let seconds = chrono::Utc::now()
         .signed_duration_since(updated_at)
         .num_seconds()
@@ -1095,89 +1103,329 @@ fn manual_poll_projection(state: &IssueWorkspaceState) -> String {
     format!("{poll}{error}")
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// The columns of the Local list, in screen order. Optional ones drop from the
+/// right as the terminal narrows; the number, state and title always stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalColumn {
+    Number,
+    State,
+    Priority,
+    Ready,
+    Labels,
+    Title,
+    Owner,
+    Age,
+}
+
+impl LocalColumn {
+    fn header(self, compact_state: bool) -> &'static str {
+        match self {
+            Self::Number => "#",
+            Self::State if compact_state => "S",
+            Self::State => "STATE",
+            Self::Priority => "P",
+            Self::Ready => "READY",
+            Self::Labels => "LABELS",
+            Self::Title => "TITLE",
+            Self::Owner => "OWNER",
+            Self::Age => "AGE",
+        }
+    }
+
+    /// Width in cells; the title takes whatever is left.
+    fn width(self, compact_state: bool) -> usize {
+        match self {
+            Self::Number => 7,
+            Self::State if compact_state => 1,
+            Self::State => 13,
+            Self::Priority => 2,
+            Self::Ready => 14,
+            Self::Labels => 18,
+            Self::Title => 0,
+            Self::Owner => 12,
+            Self::Age => 4,
+        }
+    }
+}
+
+/// Cells before the first column: the selection rail, the operator marker and a gap.
+const LOCAL_LEAD_WIDTH: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalTableGeometry {
-    show_priority: bool,
-    show_owner: bool,
-    show_age: bool,
-    headers: Vec<&'static str>,
-    widths: Vec<Constraint>,
+    columns: Vec<LocalColumn>,
+    compact_state: bool,
+    title_width: usize,
 }
 
 fn local_table_geometry(width: u16) -> LocalTableGeometry {
-    let show_priority = width >= 72;
-    let show_owner = width >= 100;
-    let show_age = width >= 120;
-    let mut headers = vec!["#"];
-    let mut widths = vec![Constraint::Length(8)];
-    if show_priority {
-        headers.push("P");
-        widths.push(Constraint::Length(3));
+    let width = usize::from(width);
+    let compact_state = width < 44;
+    let mut columns = vec![LocalColumn::Number, LocalColumn::State];
+    if width >= 44 {
+        columns.push(LocalColumn::Priority);
     }
-    headers.extend(["STATE", "READY", "TITLE"]);
-    widths.extend([
-        Constraint::Length(18),
-        Constraint::Length(15),
-        Constraint::Min(12),
-    ]);
-    if show_owner {
-        headers.push("OWNER");
-        widths.push(Constraint::Length(14));
+    if width >= 84 {
+        columns.push(LocalColumn::Ready);
     }
-    if show_age {
-        headers.push("AGE");
-        widths.push(Constraint::Length(8));
+    if width >= 104 {
+        columns.push(LocalColumn::Labels);
     }
+    columns.push(LocalColumn::Title);
+    if width >= 130 {
+        columns.push(LocalColumn::Owner);
+    }
+    if width >= 60 {
+        columns.push(LocalColumn::Age);
+    }
+    let fixed = LOCAL_LEAD_WIDTH
+        + columns.len().saturating_sub(1)
+        + columns
+            .iter()
+            .map(|column| column.width(compact_state))
+            .sum::<usize>();
     LocalTableGeometry {
-        show_priority,
-        show_owner,
-        show_age,
-        headers,
-        widths,
+        columns,
+        compact_state,
+        title_width: width.saturating_sub(fixed).max(8),
     }
 }
 
-fn local_row_cells(
+impl LocalTableGeometry {
+    fn width_of(&self, column: LocalColumn) -> usize {
+        match column {
+            LocalColumn::Title => self.title_width,
+            other => other.width(self.compact_state),
+        }
+    }
+}
+
+/// `text` cut to `width` cells with a trailing `…`, then padded to exactly `width`.
+fn fit(text: &str, width: usize) -> String {
+    let cut = truncate_cells_with_ellipsis(text, width);
+    let pad = width.saturating_sub(display_width(&cut));
+    format!("{cut}{}", " ".repeat(pad))
+}
+
+fn local_header_line(geometry: &LocalTableGeometry) -> Line<'static> {
+    let style = Style::default()
+        .fg(theme::table_header_text())
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::raw(" ".repeat(LOCAL_LEAD_WIDTH))];
+    for (index, column) in geometry.columns.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            fit(
+                column.header(geometry.compact_state),
+                geometry.width_of(*column),
+            ),
+            style,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One Issue's list row: selection rail, operator marker, then the aligned
+/// cells. Every colour sits beside a glyph or a word, so nothing is colour-only.
+fn local_row_line(
     row: &rsi_common::issue_workspace::IssueWorkspaceRowV1,
     selected: bool,
+    focused: bool,
     geometry: &LocalTableGeometry,
-) -> Vec<Cell<'static>> {
-    let mut cells = vec![Cell::from(format!(
-        "{}#{}",
-        if selected { ">" } else { " " },
-        row.issue.display_number
-    ))];
-    if geometry.show_priority {
-        cells.push(Cell::from(
-            row.issue
-                .priority
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "—".to_string()),
+) -> Line<'static> {
+    use rsi_common::issue_workspace::IssueWorkspaceReadinessV1 as Readiness;
+    let issue = &row.issue;
+    let bg = selected.then(theme::selected_row_bg);
+    let on = |style: Style| bg.map_or(style, |bg| style.bg(bg));
+    let rail = match (selected, focused) {
+        (true, true) => "▌",
+        (true, false) => "│",
+        _ => " ",
+    };
+    let mut spans = vec![Span::styled(
+        rail,
+        on(Style::default()
+            .fg(theme::active_row_rail())
+            .add_modifier(Modifier::BOLD)),
+    )];
+    // The number leads every row, bold, so it can be found at a glance (#2381).
+    // An operator request or decision also carries a marker glyph.
+    spans.push(match operator_kind(&issue.labels) {
+        Some(kind) => Span::styled(
+            kind.glyph(),
+            on(Style::default()
+                .fg(theme::warning_status())
+                .add_modifier(Modifier::BOLD)),
+        ),
+        None => Span::styled(" ", on(Style::default())),
+    });
+    spans.push(Span::styled(" ", on(Style::default())));
+    let (glyph, word, status_color) = status_mark(issue.status);
+    let finished = matches!(
+        issue.status,
+        rsi_common::types::IssueStatus::Closed | rsi_common::types::IssueStatus::Cancelled
+    );
+    for (index, column) in geometry.columns.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" ", on(Style::default())));
+        }
+        let width = geometry.width_of(*column);
+        let (text, style) = match column {
+            LocalColumn::Number => (
+                format!("#{}", issue.display_number),
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            LocalColumn::State => {
+                let glyph = if issue.archived_at.is_some() {
+                    crate::ui::glyphs::ARCHIVING
+                } else {
+                    glyph
+                };
+                let text = if geometry.compact_state {
+                    glyph.to_string()
+                } else {
+                    format!("{glyph} {word}")
+                };
+                (text, Style::default().fg(status_color))
+            }
+            LocalColumn::Priority => {
+                let (text, color) = priority_mark(issue.priority);
+                (text, Style::default().fg(color))
+            }
+            LocalColumn::Ready => match row.readiness {
+                Readiness::Ready => (
+                    "● Ready".to_string(),
+                    Style::default().fg(theme::status_running()),
+                ),
+                Readiness::Blocked => (
+                    "× Blocked".to_string(),
+                    Style::default().fg(theme::error_status()),
+                ),
+                Readiness::NotEligible => (
+                    "— Not eligible".to_string(),
+                    Style::default().fg(theme::dim_metadata()),
+                ),
+            },
+            LocalColumn::Labels => {
+                let mut labels = issue.labels.clone();
+                // The operator labels come first so they survive truncation.
+                labels.sort_by_key(|label| {
+                    !(label == crate::types::OPERATOR_REQUEST_LABEL
+                        || label == crate::types::OPERATOR_DECISION_LABEL)
+                });
+                let color = if operator_kind(&issue.labels).is_some() {
+                    theme::warning_status()
+                } else {
+                    theme::count_text()
+                };
+                (labels.join(" "), Style::default().fg(color))
+            }
+            LocalColumn::Title => {
+                let mut style = Style::default().fg(if finished {
+                    theme::dim_metadata()
+                } else {
+                    theme::text()
+                });
+                if selected {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                (issue.title.clone(), style)
+            }
+            LocalColumn::Owner => (
+                issue.assignee.clone().unwrap_or_else(|| "—".to_string()),
+                Style::default().fg(theme::dim_metadata()),
+            ),
+            LocalColumn::Age => (
+                issue_age(issue.updated_at),
+                Style::default().fg(theme::time_text()),
+            ),
+        };
+        spans.push(Span::styled(fit(&text, width), on(style)));
+    }
+    let line = Line::from(spans);
+    match bg {
+        Some(bg) => line.style(Style::default().bg(bg)),
+        None => line,
+    }
+}
+
+/// The second header row: how many Issues this page holds and how many of them
+/// the operator asked for, each count beside its glyph and word.
+fn issue_signal_line(state: &IssueWorkspaceState) -> Line<'static> {
+    use rsi_common::issue_workspace::IssueWorkspaceReadinessV1 as Readiness;
+    let dim = Style::default().fg(theme::dim_metadata());
+    let Some(page) = state
+        .transient
+        .current_page
+        .as_ref()
+        .filter(|_| state.active_tab == IssueWorkspaceTab::Local)
+    else {
+        return Line::default();
+    };
+    let count = |kind| {
+        page.rows
+            .iter()
+            .filter(|row| operator_kind(&row.issue.labels) == Some(kind))
+            .count()
+    };
+    let requests = count(issue_detail::OperatorKind::Request);
+    let decisions = count(issue_detail::OperatorKind::Decision);
+    let blocked = page
+        .rows
+        .iter()
+        .filter(|row| row.readiness == Readiness::Blocked)
+        .count();
+    let hot = Style::default()
+        .fg(theme::warning_status())
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            page.rows.len().to_string(),
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" on this page", dim),
+    ];
+    if requests > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!(
+                "{} {requests} operator request{}",
+                issue_detail::OperatorKind::Request.glyph(),
+                if requests == 1 { "" } else { "s" }
+            ),
+            hot,
         ));
     }
-    cells.push(Cell::from(if row.issue.archived_at.is_some() {
-        format!("{} ARCHIVED", issue_status_label(row.issue.status))
-    } else {
-        issue_status_label(row.issue.status).to_string()
-    }));
-    cells.push(Cell::from(match row.readiness {
-        rsi_common::issue_workspace::IssueWorkspaceReadinessV1::Ready => "● Ready",
-        rsi_common::issue_workspace::IssueWorkspaceReadinessV1::Blocked => "× Blocked",
-        rsi_common::issue_workspace::IssueWorkspaceReadinessV1::NotEligible => "— Not eligible",
-    }));
-    cells.push(Cell::from(row.issue.title.clone()));
-    if geometry.show_owner {
-        cells.push(Cell::from(
-            row.issue
-                .assignee
-                .clone()
-                .unwrap_or_else(|| "unassigned".to_string()),
+    if decisions > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!(
+                "{} {decisions} operator decision{}",
+                issue_detail::OperatorKind::Decision.glyph(),
+                if decisions == 1 { "" } else { "s" }
+            ),
+            hot,
         ));
     }
-    if geometry.show_age {
-        cells.push(Cell::from(issue_age(row.issue.updated_at)));
+    if blocked > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!("× {blocked} blocked"),
+            Style::default().fg(theme::error_status()),
+        ));
     }
-    cells
+    if state.local.filters.operator_only() {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled("◆ operator only", hot));
+    }
+    Line::from(spans)
 }
 
 fn selection_scroll_offset(
@@ -1288,22 +1536,28 @@ mod tests {
             open_blocker_count: 0,
             dependent_count: 0,
         };
-        for (width, expected_headers) in [
-            (70, vec!["#", "STATE", "READY", "TITLE"]),
-            (80, vec!["#", "P", "STATE", "READY", "TITLE"]),
-            (110, vec!["#", "P", "STATE", "READY", "TITLE", "OWNER"]),
+        use LocalColumn::*;
+        for (width, expected) in [
+            (40, vec![Number, State, Title]),
+            (50, vec![Number, State, Priority, Title]),
+            (70, vec![Number, State, Priority, Title, Age]),
+            (90, vec![Number, State, Priority, Ready, Title, Age]),
             (
-                130,
-                vec!["#", "P", "STATE", "READY", "TITLE", "OWNER", "AGE"],
+                110,
+                vec![Number, State, Priority, Ready, Labels, Title, Age],
+            ),
+            (
+                140,
+                vec![Number, State, Priority, Ready, Labels, Title, Owner, Age],
             ),
         ] {
             let geometry = local_table_geometry(width);
-            assert_eq!(geometry.headers, expected_headers);
-            assert_eq!(geometry.widths.len(), geometry.headers.len());
-            assert_eq!(
-                local_row_cells(&row, true, &geometry).len(),
-                geometry.headers.len()
-            );
+            assert_eq!(geometry.columns, expected, "width {width}");
+            let header = local_header_line(&geometry);
+            let line = local_row_line(&row, true, true, &geometry);
+            // Header and row are the same width, and both fit the terminal.
+            assert_eq!(line.width(), header.width(), "width {width}");
+            assert!(header.width() <= usize::from(width), "width {width}");
         }
     }
 
@@ -1353,11 +1607,16 @@ mod tests {
         let narrow = render_text(&app, &state, 70);
         assert!(narrow.contains("#184"));
         assert!(narrow.contains("STATE"));
-        assert!(narrow.contains("READY"));
         assert!(narrow.contains("TITLE"));
-        assert!(narrow.contains("In progress"));
+        assert!(narrow.contains("AGE"));
+        assert!(narrow.contains("◐ In progress"));
         assert!(narrow.contains("Recurring"));
-        assert!(narrow.contains("● Ready"));
+        let medium = render_text(&app, &state, 100);
+        assert!(medium.contains("READY"));
+        assert!(medium.contains("● Ready"));
+        let very_narrow = render_text(&app, &state, 36);
+        assert!(very_narrow.contains("#184"));
+        assert!(very_narrow.contains("Recurring"));
     }
 
     #[test]
@@ -1719,7 +1978,7 @@ mod tests {
         });
         let archived = render_text(&app, &state, 120);
         assert!(archived.contains("Local [Fresh · Custom · All]"));
-        assert!(archived.contains("Closed ARCHIVED"));
+        assert!(archived.contains("▽ Closed"));
         assert!(archived.contains("Recurring jobs skip cadence"));
 
         state.transient.editor = Some(crate::types::IssueEditorState {
@@ -1815,6 +2074,7 @@ mod tests {
             assignee: Some("jake".to_string()),
             unassigned: false,
             labels_all: vec!["daemon".to_string()],
+            labels_any: Vec::new(),
             provenance: vec![rsi_common::issue_workspace::IssueWorkspaceProvenanceV1::Operator],
             query: Some("scheduler".to_string()),
             archive: rsi_common::types::IssueArchiveFilterV1::All,
@@ -1963,6 +2223,7 @@ mod tests {
                     issue_id,
                     expected_row_version: 6,
                     status: IssueStatus::InProgress,
+                    note: None,
                 },
             ),
             issue: selected,
@@ -1981,7 +2242,9 @@ mod tests {
             .data_state_mut(IssueWorkspaceDataKind::LocalPage)
             .load_state = IssueWorkspaceLoadState::Fresh;
         let text = render_text(&app, &state, 190);
-        assert!(text.contains("Blocked by [prev=false next=false]: #185 Matching blocker"));
+        assert!(text.contains("Blocked by"));
+        assert!(text.contains("#185"));
+        assert!(text.contains("Matching blocker"));
         assert!(text.contains("17 StatusUpdated Operator"));
         assert!(text.contains("Associated sessions: >"));
         assert!(text.contains(&session_id.to_string()));
@@ -2036,8 +2299,9 @@ mod tests {
 
         let rendered = render_text(&app, &state, 190);
         assert!(rendered.contains(&replacement_id.to_string()));
-        assert!(rendered.contains("Blocked by [loading]: loading"));
-        assert!(rendered.contains("Blocks [loading]: loading"));
+        assert!(rendered.contains("Blocked by"));
+        assert!(rendered.contains("Blocks"));
+        assert!(rendered.contains("loading"));
         assert!(rendered.contains("Events [after=None next=None]:"));
     }
 
@@ -2235,7 +2499,8 @@ mod tests {
         assert!(wrapped.contains('界'));
         state.local.inspector_scroll_offset = 0;
         let dependency = render_text_mut(&app, &mut state, 86, 60);
-        assert!(dependency.contains("#265 Dependency identity"));
+        assert!(dependency.contains("#265"));
+        assert!(dependency.contains("Dependency identity"));
     }
 
     #[test]

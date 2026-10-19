@@ -1,5 +1,6 @@
 [features]
 code_mode_host = true
+api_key_model_discovery = true
 
 [mcp_servers.rust-analyzer]
 command = "rust-analyzer-mcp"

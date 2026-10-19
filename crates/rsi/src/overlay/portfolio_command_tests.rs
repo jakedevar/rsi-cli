@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::client::DaemonClient;
 use rsi_common::global_manager::GlobalManagerGrantV1;
+use rsi_common::types::SessionProvider;
 use serde_json::{Value, json};
 
 type Calls = Arc<Mutex<Vec<(String, Value)>>>;
@@ -273,6 +274,59 @@ async fn portfolio_appoint_defaults_to_uncovered_projects() {
     );
 }
 
+/// #1902: a new root after a revoke starts from the most recent revoked root
+/// grant over the same coverage; other coverage starts from the defaults.
+#[tokio::test]
+async fn portfolio_appoint_prefills_from_the_last_revoked_root_grant() {
+    use rsi_common::harness_manager_v2::ManagerCapabilityV2;
+    let (rsi, notes) = (project("Rsi"), project("Notes"));
+    let mut revoked = node("global", Uuid::new_v4(), 8, 3, vec![rsi.id]);
+    revoked.state = "revoked".into();
+    revoked.grant.state = "revoked".into();
+    revoked.max_direct_reports = 12;
+    revoked.grant.project_policy.max_active_sessions = 20;
+    revoked.grant.project_policy.capabilities = vec![ManagerCapabilityV2::Deploy];
+    let launches = revoked.grant.allowed_launches.len();
+    let saved = node("global", Uuid::new_v4(), 1, 1, vec![rsi.id]);
+    let (listed, saved) = (
+        serde_json::to_value(vec![revoked.clone()]).unwrap(),
+        serde_json::to_value(saved).unwrap(),
+    );
+    let (mut app, calls, _dir) = fake_daemon(move |method, _| match method {
+        "ListPortfolioNodes" => Ok(json!({ "nodes": listed.clone() })),
+        "ConfigurePortfolioNode" => Ok(saved.clone()),
+        other => Err(format!("unexpected {other}")),
+    })
+    .await;
+    app.projects = vec![rsi.clone(), notes.clone()];
+
+    let message = run(&mut app, "appoint global Rsi").await.unwrap();
+    let sent = params_of(&calls, "ConfigurePortfolioNode");
+    assert_eq!(sent["policy"]["max_active_sessions"], 20);
+    assert_eq!(sent["policy"]["capabilities"], json!(["deploy"]));
+    assert_eq!(sent["max_direct_reports"], 12);
+    assert_eq!(sent["allowed_launches"].as_array().unwrap().len(), launches);
+    assert!(message.contains("Prefilled from grant v8"), "{message}");
+    assert!(message.contains("+deploy"), "{message}");
+
+    // Other coverage shares no project with the revoked grant: defaults.
+    let message = run(&mut app, "appoint global Notes").await.unwrap();
+    let sent = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "ConfigurePortfolioNode")
+        .map(|(_, params)| params.clone())
+        .expect("the second appointment");
+    assert_eq!(
+        sent["policy"],
+        serde_json::to_value(default_project_policy()).unwrap()
+    );
+    assert_eq!(sent["max_direct_reports"], 5);
+    assert!(!message.contains("Prefilled"), "{message}");
+}
+
 /// #1237: `appoint <label> --adopt <node,...>` appoints a manager above the
 /// adopted roots: it covers their projects plus the named ones, sits where
 /// they sat, and every adopted node narrows its grant.
@@ -327,4 +381,89 @@ async fn portfolio_appoint_adopt_sends_a_grant_every_adopted_node_narrows() {
             child.tier_label
         );
     }
+}
+
+#[test]
+fn portfolio_launch_command_parses_provider_model_and_effort() {
+    let fable = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-fable-5-1".into(),
+        effort: Some("max".into()),
+    };
+    assert_eq!(
+        parse("launch add global Claude/claude-fable-5-1/max"),
+        Ok(PortfolioCommand::Launch {
+            add: true,
+            node: "global".into(),
+            launches: vec![fable.clone()],
+        })
+    );
+    assert_eq!(
+        parse("launch remove 1234abcd claude/claude-fable-5-1/max codex/gpt-6-astra"),
+        Ok(PortfolioCommand::Launch {
+            add: false,
+            node: "1234abcd".into(),
+            launches: vec![
+                fable,
+                ManagerLaunchChoiceV2 {
+                    provider: SessionProvider::Codex,
+                    model: "gpt-6-astra".into(),
+                    effort: None,
+                },
+            ],
+        })
+    );
+    // A trailing segment that is not an effort belongs to the model id.
+    assert_eq!(
+        parse_launch("OpenRouter/anthropic/claude-x").unwrap().model,
+        "anthropic/claude-x"
+    );
+    assert!(parse("launch add global").is_err());
+    assert!(parse("launch add global nonsense").is_err());
+    assert!(parse("launch grant global Claude/m").is_err());
+}
+
+/// #2103: one launch is added through `ConfigurePortfolioNodeLaunches` at the
+/// node's current grant version, never by re-typing the grant.
+#[tokio::test]
+async fn portfolio_launch_add_sends_one_cas_fenced_launch_edit() {
+    let seat = Uuid::new_v4();
+    let current = node("global", seat, 13, 4, vec![]);
+    let node_id = current.node_id;
+    let mut saved = current.clone();
+    saved.grant.grant_version = 14;
+    let (listed, got, saved) = (
+        serde_json::to_value(vec![current.clone()]).unwrap(),
+        serde_json::to_value(current).unwrap(),
+        serde_json::to_value(saved).unwrap(),
+    );
+    let (mut app, calls, _dir) = fake_daemon(move |method, _| match method {
+        "ListPortfolioNodes" => Ok(json!({ "nodes": listed.clone() })),
+        "GetPortfolioNode" => Ok(got.clone()),
+        "ConfigurePortfolioNodeLaunches" => Ok(saved.clone()),
+        other => Err(format!("unexpected {other}")),
+    })
+    .await;
+    let message = run(&mut app, "launch add global Claude/claude-fable-5-1/max")
+        .await
+        .unwrap();
+    assert!(
+        message.starts_with("Portfolio launches updated"),
+        "{message}"
+    );
+    let sent = params_of(&calls, "ConfigurePortfolioNodeLaunches");
+    assert_eq!(sent["node_id"], node_id.to_string());
+    assert_eq!(sent["expected_node_grant_version"], 13);
+    assert_eq!(
+        sent["add"],
+        json!([{"provider": "Claude", "model": "claude-fable-5-1", "effort": "max"}])
+    );
+    assert_eq!(sent["remove"], json!([]));
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(method, _)| method != "ConfigurePortfolioNode")
+    );
 }

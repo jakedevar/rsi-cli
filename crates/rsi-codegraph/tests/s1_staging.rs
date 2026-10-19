@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)] // Focused acceptance fixture.
 
 use rsi_codegraph::extract::extract_file;
-use rsi_codegraph::staged::PARSER_MAX_FILE_BYTES;
+use rsi_codegraph::staged::{
+    MAX_STAGED_FILES, MAX_STAGED_TOTAL_PAYLOAD_BYTES, PARSER_MAX_FILE_BYTES,
+};
 use rsi_codegraph::{
     CodegraphError, CodegraphStore, EvidenceFact, ExtractionContract, ExtractionMode,
     ExtractorIdentity, FactKey, FactProvenance, FileDiagnostic, NodeFact, NodeIdentity, NodeKind,
@@ -68,6 +70,7 @@ fn file(path: &str, name: &str, bytes: usize) -> PerFileFacts {
         relations: Vec::new(),
         unresolved_references: Vec::new(),
         diagnostic: FileDiagnostic::Parsed,
+        scope: rsi_codegraph::scope::RustScope::default(),
     }
 }
 
@@ -390,6 +393,7 @@ fn zero_fact_parse_errors_require_exact_source_and_count() {
         relations: Vec::new(),
         unresolved_references: Vec::new(),
         diagnostic: broken.diagnostic.clone(),
+        scope: rsi_codegraph::scope::RustScope::default(),
     };
     let run = store
         .begin_staged(
@@ -427,7 +431,10 @@ fn bounds_and_missing_cross_file_endpoint_fail_visibly_without_head_change() {
     let large = file("src/too-large.rs", "large", 8 * 1024 * 1024 + 1);
     assert!(matches!(
         store.stage_file(&run, &large),
-        Err(CodegraphError::LimitExceeded { .. })
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "file source bytes",
+            ..
+        })
     ));
     let mut one = file("src/one.rs", "one", 8);
     one.relations.push(RelationFact {
@@ -743,7 +750,10 @@ fn diagnostic_variants_and_elapsed_time_limit_are_visible() {
         [scope.workspace_id().to_string()]).unwrap();
     assert!(matches!(
         store.stage_file(&stale, &file("src/new.rs", "new", 8)),
-        Err(CodegraphError::LimitExceeded { .. })
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "run seconds",
+            ..
+        })
     ));
     assert_eq!(
         store
@@ -755,7 +765,7 @@ fn diagnostic_variants_and_elapsed_time_limit_are_visible() {
 }
 
 #[test]
-fn aggregate_source_fact_and_file_caps_reject_new_owner() {
+fn aggregate_source_and_file_caps_reject_new_owner_naming_the_quantity() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("graph.sqlite");
     let mut store = CodegraphStore::open(&database, Uuid::nil()).unwrap();
@@ -784,33 +794,20 @@ fn aggregate_source_fact_and_file_caps_reject_new_owner() {
     let new_owner = file("src/new.rs", "new", 8);
     assert!(matches!(
         store.stage_file(&run, &new_owner),
-        Err(CodegraphError::LimitExceeded { .. })
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "source bytes",
+            ..
+        })
     ));
     connection
         .execute(
-            "UPDATE cg_stage_files SET source_bytes=0,fact_count=1000000 WHERE path='synthetic.rs'",
+            "UPDATE cg_stage_files SET source_bytes=0 WHERE path='synthetic.rs'",
             [],
         )
         .unwrap();
     connection
         .execute(
-            "UPDATE cg_stage_runs SET source_bytes=0,fact_count=1000000 WHERE workspace_id=?1",
-            [workspace.as_str()],
-        )
-        .unwrap();
-    assert!(matches!(
-        store.stage_file(&run, &new_owner),
-        Err(CodegraphError::LimitExceeded { .. })
-    ));
-    connection
-        .execute(
-            "UPDATE cg_stage_files SET fact_count=0 WHERE path='synthetic.rs'",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE cg_stage_runs SET fact_count=0 WHERE workspace_id=?1",
+            "UPDATE cg_stage_runs SET source_bytes=0 WHERE workspace_id=?1",
             [workspace.as_str()],
         )
         .unwrap();
@@ -819,26 +816,156 @@ fn aggregate_source_fact_and_file_caps_reject_new_owner() {
         let mut insert = transaction
             .prepare("INSERT INTO cg_stage_files VALUES (?1,?2,'hash',0,0,'{}')")
             .unwrap();
-        for index in 0..9_999 {
+        for index in 0..(MAX_STAGED_FILES - 1) {
             insert
-                .execute(params![workspace, format!("fake/{index:04}.rs")])
+                .execute(params![workspace, format!("fake/{index:05}.rs")])
                 .unwrap();
         }
     }
     transaction
         .execute(
-            "UPDATE cg_stage_runs SET file_count=10000 WHERE workspace_id=?1",
-            [workspace.as_str()],
+            "UPDATE cg_stage_runs SET file_count=?2 WHERE workspace_id=?1",
+            params![workspace, MAX_STAGED_FILES],
         )
         .unwrap();
     transaction.commit().unwrap();
     assert!(matches!(
         store.stage_file(&run, &new_owner),
-        Err(CodegraphError::LimitExceeded { .. })
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "files",
+            ..
+        })
     ));
     assert!(matches!(
         store.current_ready(scope.workspace_id()),
         Err(CodegraphError::NoReadySnapshot)
+    ));
+}
+
+/// #2323: the RSI workspace staged 4,635 of 9,063 files, reached 1,004,998
+/// facts and failed the whole run on a repository-total fact ceiling of
+/// 1,000,000. The total is a statistic, not a bound: per-file ceilings bound
+/// memory and publication reads one file at a time. The seeded counters stand
+/// in for a million staged facts without building them.
+#[test]
+fn repository_total_facts_above_the_old_million_cap_stage_and_publish() {
+    const OLD_TOTAL_FACT_CAP: i64 = 1_000_000;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = CodegraphStore::open(&database, Uuid::nil()).unwrap();
+    let scope = store.scope(WorkspaceInstanceKey::Primary);
+    let seed = file("src/seed.rs", "seed", 8);
+    let late = file("src/late.rs", "late", 8);
+    let run = store
+        .begin_staged(&scope, &manifest(), &[version(&seed), version(&late)])
+        .unwrap();
+    store.stage_file(&run, &seed).unwrap();
+    let workspace = scope.workspace_id().to_string();
+    let connection = Connection::open(&database).unwrap();
+    let seeded = OLD_TOTAL_FACT_CAP + 4_998;
+    connection
+        .execute(
+            "UPDATE cg_stage_files SET fact_count=?1 WHERE path='src/seed.rs'",
+            [seeded],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE cg_stage_runs SET fact_count=?2 WHERE workspace_id=?1",
+            params![workspace, seeded],
+        )
+        .unwrap();
+    store.stage_file(&run, &late).unwrap();
+    let staged: i64 = connection
+        .query_row(
+            "SELECT fact_count FROM cg_stage_runs WHERE workspace_id=?1",
+            [workspace.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(staged > OLD_TOTAL_FACT_CAP + 4_998, "late file adds facts");
+    let ready = store.publish_staged(&run, PublishFault::None).unwrap();
+    assert_eq!(ready.generation, 1);
+    let completeness = store.current_completeness(scope.workspace_id()).unwrap();
+    assert_eq!(
+        (completeness.total_files, completeness.parsed_files),
+        (2, 2),
+        "both owners publish"
+    );
+}
+
+/// #2323: the total payload ceiling is sized from the source ceiling, not the
+/// old fixed 512 MiB, and names itself when it is reached.
+#[test]
+fn total_payload_ceiling_is_sized_from_the_source_ceiling() {
+    const OLD_TOTAL_PAYLOAD_CAP: i64 = 512 * 1024 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("graph.sqlite");
+    let mut store = CodegraphStore::open(&database, Uuid::nil()).unwrap();
+    let scope = store.scope(WorkspaceInstanceKey::Primary);
+    let owner = file("src/new.rs", "new", 8);
+    let run = store
+        .begin_staged(&scope, &manifest(), &[version(&owner)])
+        .unwrap();
+    let connection = Connection::open(&database).unwrap();
+    let workspace = scope.workspace_id().to_string();
+    connection
+        .execute(
+            "UPDATE cg_stage_runs SET payload_bytes=?2 WHERE workspace_id=?1",
+            params![
+                workspace,
+                i64::try_from(MAX_STAGED_TOTAL_PAYLOAD_BYTES).unwrap()
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.stage_file(&run, &owner),
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "total payload bytes",
+            maximum,
+            ..
+        }) if maximum == MAX_STAGED_TOTAL_PAYLOAD_BYTES
+    ));
+    assert!(
+        i64::try_from(MAX_STAGED_TOTAL_PAYLOAD_BYTES).unwrap() > OLD_TOTAL_PAYLOAD_CAP,
+        "ceiling grew past the old fixed 512 MiB"
+    );
+    connection
+        .execute(
+            "UPDATE cg_stage_runs SET payload_bytes=?2 WHERE workspace_id=?1",
+            params![workspace, OLD_TOTAL_PAYLOAD_CAP + 1],
+        )
+        .unwrap();
+    store.stage_file(&run, &owner).unwrap();
+}
+
+/// #2323: the RSI workspace declares about 9,000 owners; the inventory ceiling
+/// is above the old 10,000 and names itself when it is reached.
+#[test]
+fn inventory_above_the_old_ten_thousand_file_cap_begins_a_run() {
+    let owners = |count: usize| {
+        (0..count)
+            .map(|index| {
+                let path = format!("src/owner-{index:05}.rs");
+                SourceVersion {
+                    source_digest: blake3::hash(path.as_bytes()).to_hex().to_string(),
+                    relative_path: path,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let (_dir, mut store) = store();
+    let scope = store.scope(WorkspaceInstanceKey::Primary);
+    store
+        .begin_staged(&scope, &manifest(), &owners(10_001))
+        .unwrap();
+    assert!(matches!(
+        store.begin_staged(&scope, &manifest(), &owners(MAX_STAGED_FILES + 1)),
+        Err(CodegraphError::StageCeilingExceeded {
+            quantity: "files",
+            maximum,
+            ..
+        }) if maximum == MAX_STAGED_FILES
     ));
 }
 
@@ -894,13 +1021,17 @@ fn populated_v2_database_migrates_forward_and_keeps_ready_head() {
         .id;
     drop(store);
     let connection = Connection::open(&path).unwrap();
+    // Restore a populated v8 database from the shared store, then remove the
+    // later-version tables below to reach v2.
+    connection
+        .execute_batch(include_str!("fixtures/downgrade-to-v8.sql"))
+        .unwrap();
     connection
         .execute_batch(
             "DROP TABLE cg_fts_nodes;
         DROP TABLE cg_retained_relations;
         DROP TABLE cg_retained_nodes;
         DROP TABLE cg_generation_detail;
-        DROP TABLE cg_index_manifest;
         DROP TABLE cg_index_runs;
         DROP TABLE cg_index_state;
         DROP TABLE cg_file_diagnostics;
@@ -942,6 +1073,45 @@ fn populated_v2_database_migrates_forward_and_keeps_ready_head() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        10
     );
+}
+
+#[test]
+fn v7_database_migrates_through_the_target_index_to_shared_storage_schema_9() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("graph.sqlite");
+    let project = Uuid::from_u128(0x2244);
+    drop(CodegraphStore::open(&path, project).unwrap());
+    let legacy = Connection::open(&path).unwrap();
+    legacy
+        .execute_batch(include_str!("fixtures/downgrade-to-v8.sql"))
+        .unwrap();
+    legacy
+        .execute_batch("DROP INDEX cg_relations_target; PRAGMA user_version = 7;")
+        .unwrap();
+    drop(legacy);
+
+    drop(CodegraphStore::open(&path, project).unwrap());
+    let migrated = Connection::open(&path).unwrap();
+    let version: i64 = migrated
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 10);
+    let indexes: i64 = migrated
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='cg_block_relations_target'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexes, 1);
+    drop(migrated);
+
+    // A binary that predates V9 cannot read the shared block store, so a
+    // newer database must be refused rather than fail mid-query.
+    let future = Connection::open(&path).unwrap();
+    future.execute_batch("PRAGMA user_version = 11;").unwrap();
+    drop(future);
+    assert!(CodegraphStore::open(&path, project).is_err());
 }

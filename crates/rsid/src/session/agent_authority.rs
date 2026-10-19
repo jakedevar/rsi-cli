@@ -92,6 +92,19 @@ mod tests {
     #[test]
     fn worker_baseline_and_role_specific_catalog_are_positive() {
         assert!(permitted_verb(Verb::GetStatus, &VerbRights::default()));
+        // #2267: every live leaf may validate a topology definition; the rest of
+        // the topology family stays with a lead or an Automation manager.
+        assert!(is_baseline_verb(Verb::TopologyUpsert));
+        for verb in [
+            Verb::TopologyList,
+            Verb::TopologyGet,
+            Verb::TopologyExecute,
+            Verb::TopologyGetExecution,
+            Verb::TopologyInterrupt,
+            Verb::TopologyResolveAttempt,
+        ] {
+            assert!(!is_baseline_verb(verb), "{verb:?}");
+        }
         assert!(permitted_verb(
             Verb::SpawnChild,
             &VerbRights {
@@ -129,11 +142,12 @@ mod tests {
         };
         assert!(permitted_verb(Verb::UpdateIssue, &bound_writer));
         assert!(permitted_verb(Verb::GetIssue, &bound_writer));
+        assert!(permitted_verb(Verb::ListIssues, &bound_writer));
         for verb in [
             Verb::UpdateIssueStatus,
             Verb::ArchiveIssue,
             Verb::RestoreIssue,
-            Verb::ListIssues,
+            Verb::ListIssueEvents,
         ] {
             assert!(!permitted_verb(verb, &bound_writer), "{verb:?}");
         }

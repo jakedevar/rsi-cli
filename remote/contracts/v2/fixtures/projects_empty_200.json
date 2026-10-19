@@ -1,0 +1,20 @@
+{
+  "name": "projects_empty_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/projects"
+  },
+  "response": {
+    "body": {
+      "messages_enabled": false,
+      "projects": []
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

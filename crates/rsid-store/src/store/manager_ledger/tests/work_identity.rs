@@ -644,6 +644,7 @@ fn stale_revoked_or_out_of_scope_seats_are_refused_exactly() {
                     state: ManagerStageStateV2::Partial,
                     note: "not mine".into(),
                     evidence: None,
+                    job_evidence: None,
                 },
                 "foreign-stage",
                 &config_b,

@@ -259,6 +259,38 @@ pub(super) async fn load_completed_events_from_store(
     .map_err(|e| DaemonError::Store(e.to_string()))?
 }
 
+/// The first sequence number no row of `session_id`'s transcript uses, given
+/// its in-memory transcript (#62).
+///
+/// The in-memory transcript is not the whole transcript: the finalizer's
+/// terminal sandbox observation, a health fact or a rotation notice is written
+/// straight to SQLite (`MAX(sequence)+1`) and never reaches the completed map.
+/// A resumed turn numbered from the memory copy alone reused such a row's
+/// sequence, and the TUI reads a transcript incrementally by `sequence > last
+/// seen`, so the resumed turn's first assistant message was never shown until
+/// a full reload. Numbering from the larger of the two keeps every sequence
+/// unique and increasing. A store that cannot be read falls back to the memory
+/// copy, as before.
+pub(super) async fn next_transcript_sequence(
+    store: &tokio::sync::Mutex<crate::store::Store>,
+    session_id: Uuid,
+    cached: &[ConversationEvent],
+) -> i32 {
+    let from_memory = cached.last().map_or(0, |event| event.sequence + 1);
+    let stored = store.lock().await.conversation_max_sequence(session_id);
+    match stored {
+        Ok(max) => from_memory.max(i32::try_from(max.saturating_add(1)).unwrap_or(i32::MAX)),
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "stored transcript sequence unreadable; numbering from the in-memory transcript"
+            );
+            from_memory
+        }
+    }
+}
+
 impl SessionManager {
     /// Copy bounded selected detail under one nonblocking runtime map guard.
     /// This precedes the Store miss and the later scalar reread.
@@ -499,6 +531,7 @@ impl SessionManager {
     /// lock. The generation is an exact slot fence, never an occurrence ID.
     /// The caller releases this observation before Store reads and then uses
     /// the recheck below; absence/replacement cannot become a tombstone.
+    #[cfg(test)]
     pub(crate) fn remote_selected_question_slot(
         &self,
         project: Uuid,
@@ -602,6 +635,7 @@ impl SessionManager {
 
     /// A matching post-Store slot proves only that no bounded change was
     /// observed. The caller still reports source coverage, not a frozen view.
+    #[cfg(test)]
     pub(crate) fn remote_selected_question_slot_recheck(
         &self,
         before: &crate::remote_read::RuntimeQuestionSlotSnapshot,
@@ -1064,6 +1098,13 @@ impl SessionManager {
             return Err(DaemonError::Rpc("Session is currently active".to_string()));
         }
 
+        // #2384: a cold session's rows come back before its status changes (the
+        // status guard refuses the flip while they are archived), under the
+        // session's spawn guard so a resume, a twin restore or the archiver's move
+        // cannot interleave. The guard is released after the status flip.
+        let restore_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+        self.ensure_session_hot(&restore_guard, session_id).await?;
+
         let store = self.store.clone();
         let archived = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
@@ -1135,6 +1176,7 @@ impl SessionManager {
                 .await?
                 .ok_or(DaemonError::SessionNotFound(session_id))?
         };
+        drop(restore_guard);
         session.context_fill_pct = super::monitor::context_fill_pct_from_persisted(&session);
 
         // Load events and turn_metrics from database
@@ -1150,7 +1192,9 @@ impl SessionManager {
         .map_err(|e| DaemonError::Store(e.to_string()))??;
 
         // Insert into completed map
-        self.completed.write().await.insert(
+        super::cohort_settlement::publish_completed_from_store(
+            &self.completed,
+            &self.store,
             session_id,
             CompletedSession {
                 session: session.clone(),
@@ -1160,8 +1204,10 @@ impl SessionManager {
                 retry_fired_at: None,
                 superseded_by_retry: None,
                 events_hydrated: true,
+                store_writes: Default::default(),
             },
-        );
+        )
+        .await;
 
         if session.session_kind == rsi_common::types::SessionKind::Epic
             && session.lead_session_id.is_some()
@@ -1197,11 +1243,16 @@ impl SessionManager {
             return Err(DaemonError::Rpc("Session is currently active".to_string()));
         }
 
+        // #2384: restore a cold session's rows before the status flip, under its
+        // spawn guard (see `unarchive_session`).
+        let restore_guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+        self.ensure_session_hot(&restore_guard, session_id).await?;
         let mut session = self
             .persistence
             .undelete_session(session_id)
             .await?
             .ok_or(DaemonError::SessionNotFound(session_id))?;
+        drop(restore_guard);
         session.context_fill_pct = super::monitor::context_fill_pct_from_persisted(&session);
 
         // Load events and turn_metrics from database
@@ -1216,7 +1267,9 @@ impl SessionManager {
         .await
         .map_err(|e| DaemonError::Store(e.to_string()))??;
 
-        self.completed.write().await.insert(
+        super::cohort_settlement::publish_completed_from_store(
+            &self.completed,
+            &self.store,
             session_id,
             CompletedSession {
                 session: session.clone(),
@@ -1226,8 +1279,10 @@ impl SessionManager {
                 retry_fired_at: None,
                 superseded_by_retry: None,
                 events_hydrated: true,
+                store_writes: Default::default(),
             },
-        );
+        )
+        .await;
 
         if session.session_kind == rsi_common::types::SessionKind::Epic
             && session.lead_session_id.is_some()
@@ -1261,7 +1316,15 @@ impl SessionManager {
             (None, Vec::new())
         };
 
+        // #2757: windows the Codex poll could not refresh read as stale.
+        let mut rate_limits = rate_limits;
+        crate::codex_rate_limits::tracker().apply(&mut rate_limits);
+
         rsi_common::rpc::HealthStatusResponse {
+            daemon_pid: Some(std::process::id()),
+            daemon_started_at: Some(
+                crate::daemon_info::DaemonInfoService::global().started_at_rfc3339(),
+            ),
             persistence_queue_depth: self.persistence.pending.load(Ordering::Relaxed),
             persistence_queue_capacity: self.persistence.capacity,
             last_command_duration_ms: self
@@ -1301,6 +1364,11 @@ impl SessionManager {
             process_memory: crate::process_memory::report(),
             provider_credentials: Some(crate::vault::global().health_summary()),
             supervisor_mode: crate::daemon_info::supervisor_mode(),
+            codegraph_unhealthy: self
+                .codegraph_handle
+                .as_ref()
+                .map(|handle| handle.unhealthy_notices(chrono::Utc::now()))
+                .unwrap_or_default(),
         }
     }
 

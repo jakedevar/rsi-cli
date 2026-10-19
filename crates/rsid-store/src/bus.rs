@@ -4,10 +4,10 @@ use rsi_common::types::{
     SessionKind, SessionStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -351,79 +351,71 @@ pub enum DaemonEvent {
     },
 }
 
+impl DaemonEvent {
+    /// The bus event type string of this variant: a closed set of static names,
+    /// so it is safe as a bounded metrics key (no payload, no session identity).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DaemonEvent::SessionCreated { .. } => "session_created",
+            DaemonEvent::SessionQuestionRaised { .. } => "session_question_raised",
+            DaemonEvent::ManagerNoticeQueued { .. } => "manager_notice_queued",
+            DaemonEvent::SessionStatusChanged { .. } => "session_status_changed",
+            DaemonEvent::ConversationEvent { .. } => "conversation_event",
+            DaemonEvent::GraphExecution { .. } => GRAPH_EXECUTION_EVENT,
+            DaemonEvent::CodegraphIndexStatus { .. } => "codegraph.index.status",
+            DaemonEvent::AgentMessageState { .. } => AGENT_MESSAGE_STATE_EVENT,
+            DaemonEvent::SystemMessage { .. } => "system_message",
+            DaemonEvent::SessionDeleted { .. } => "session_deleted",
+            DaemonEvent::SessionArchived { .. } => "session_archived",
+            DaemonEvent::SessionUnarchived { .. } => "session_unarchived",
+            DaemonEvent::SessionMetadataChanged { .. } => "session_metadata_changed",
+            DaemonEvent::MemoryIndexUpdated { .. } => "memory_index_updated",
+            DaemonEvent::SessionRetrying { .. } => "session_retrying",
+            DaemonEvent::SessionHealScheduled { .. } => "session_heal_scheduled",
+            DaemonEvent::ContextUsageUpdated { .. } => "context_usage_updated",
+            DaemonEvent::ProviderRateLimitUpdated { .. } => "provider_rate_limit_updated",
+            DaemonEvent::SessionStalled { .. } => "session_stalled",
+            DaemonEvent::SessionClassified { .. } => "session_classified",
+            DaemonEvent::QueueTaskCompleted { .. } => "queue_task_completed",
+            DaemonEvent::QueueTaskFailed { .. } => "queue_task_failed",
+            DaemonEvent::SessionSummaryUpdated { .. } => "session_summary_updated",
+            DaemonEvent::ObservationsExtracted { .. } => "observations_extracted",
+            DaemonEvent::SessionReconciled { .. } => "session_reconciled",
+            DaemonEvent::DreamStarted => "dream_started",
+            DaemonEvent::DreamCompleted { .. } => "dream_completed",
+            DaemonEvent::IssueDispatched { .. } => "issue_dispatched",
+            DaemonEvent::IssueTrackerPolled { .. } => "issue_tracker_polled",
+            DaemonEvent::IssueReconciled { .. } => "issue_reconciled",
+            DaemonEvent::ScheduledJobFired { .. } => "scheduled_job_fired",
+            DaemonEvent::CompilePromptChunk { .. } => "compile_prompt_chunk",
+            DaemonEvent::CompilePromptCompleted { .. } => "compile_prompt_completed",
+            DaemonEvent::CompilePromptFailed { .. } => "compile_prompt_failed",
+            DaemonEvent::SandboxOrphanCleaned { .. } => "sandbox_orphan_cleaned",
+            DaemonEvent::ChildSpawned { .. } => "child_spawned",
+            DaemonEvent::ProjectCreated { .. } => "project_created",
+            DaemonEvent::HaltDirective { .. } => "halt_directive",
+            DaemonEvent::SessionSpawnDeduped { .. } => "session_spawn_deduped",
+            DaemonEvent::ModelInvocationAdmitted { .. } => "model_invocation_admitted",
+            DaemonEvent::ModelInvocationDenied { .. } => "model_invocation_denied",
+            DaemonEvent::ModelBudgetNearLimit { .. } => "model_budget_near_limit",
+            DaemonEvent::ModelControlModeChanged { .. } => "model_control_mode_changed",
+            DaemonEvent::ModelControlCircuitChanged { .. } => "model_control_circuit_changed",
+            DaemonEvent::ModelInvocationCancellationRequested { .. } => {
+                "model_invocation_cancellation_requested"
+            }
+            DaemonEvent::ModelInvocationCancellationSkipped { .. } => {
+                "model_invocation_cancellation_skipped"
+            }
+            DaemonEvent::ModelInvocationCancelled { .. } => "model_invocation_cancelled",
+            DaemonEvent::ModelInvocationCompleted { .. } => "model_invocation_completed",
+        }
+    }
+}
+
 impl From<DaemonEvent> for rsi_common::rpc::BusEvent {
     fn from(event: DaemonEvent) -> Self {
         Self {
-            event_type: match &event {
-                DaemonEvent::SessionCreated { .. } => "session_created".to_string(),
-                DaemonEvent::SessionQuestionRaised { .. } => "session_question_raised".to_string(),
-                DaemonEvent::ManagerNoticeQueued { .. } => "manager_notice_queued".to_string(),
-                DaemonEvent::SessionStatusChanged { .. } => "session_status_changed".to_string(),
-                DaemonEvent::ConversationEvent { .. } => "conversation_event".to_string(),
-                DaemonEvent::GraphExecution { .. } => GRAPH_EXECUTION_EVENT.to_string(),
-                DaemonEvent::CodegraphIndexStatus { .. } => "codegraph.index.status".to_string(),
-                DaemonEvent::AgentMessageState { .. } => AGENT_MESSAGE_STATE_EVENT.to_string(),
-                DaemonEvent::SystemMessage { .. } => "system_message".to_string(),
-                DaemonEvent::SessionDeleted { .. } => "session_deleted".to_string(),
-                DaemonEvent::SessionArchived { .. } => "session_archived".to_string(),
-                DaemonEvent::SessionUnarchived { .. } => "session_unarchived".to_string(),
-                DaemonEvent::SessionMetadataChanged { .. } => {
-                    "session_metadata_changed".to_string()
-                }
-                DaemonEvent::MemoryIndexUpdated { .. } => "memory_index_updated".to_string(),
-                DaemonEvent::SessionRetrying { .. } => "session_retrying".to_string(),
-                DaemonEvent::SessionHealScheduled { .. } => "session_heal_scheduled".to_string(),
-                DaemonEvent::ContextUsageUpdated { .. } => "context_usage_updated".to_string(),
-                DaemonEvent::ProviderRateLimitUpdated { .. } => {
-                    "provider_rate_limit_updated".to_string()
-                }
-                DaemonEvent::SessionStalled { .. } => "session_stalled".to_string(),
-                DaemonEvent::SessionClassified { .. } => "session_classified".to_string(),
-                DaemonEvent::QueueTaskCompleted { .. } => "queue_task_completed".to_string(),
-                DaemonEvent::QueueTaskFailed { .. } => "queue_task_failed".to_string(),
-                DaemonEvent::SessionSummaryUpdated { .. } => "session_summary_updated".to_string(),
-                DaemonEvent::ObservationsExtracted { .. } => "observations_extracted".to_string(),
-                DaemonEvent::SessionReconciled { .. } => "session_reconciled".to_string(),
-                DaemonEvent::DreamStarted => "dream_started".to_string(),
-                DaemonEvent::DreamCompleted { .. } => "dream_completed".to_string(),
-                DaemonEvent::IssueDispatched { .. } => "issue_dispatched".to_string(),
-                DaemonEvent::IssueTrackerPolled { .. } => "issue_tracker_polled".to_string(),
-                DaemonEvent::IssueReconciled { .. } => "issue_reconciled".to_string(),
-                DaemonEvent::ScheduledJobFired { .. } => "scheduled_job_fired".to_string(),
-                DaemonEvent::CompilePromptChunk { .. } => "compile_prompt_chunk".to_string(),
-                DaemonEvent::CompilePromptCompleted { .. } => {
-                    "compile_prompt_completed".to_string()
-                }
-                DaemonEvent::CompilePromptFailed { .. } => "compile_prompt_failed".to_string(),
-                DaemonEvent::SandboxOrphanCleaned { .. } => "sandbox_orphan_cleaned".to_string(),
-                DaemonEvent::ChildSpawned { .. } => "child_spawned".to_string(),
-                DaemonEvent::ProjectCreated { .. } => "project_created".to_string(),
-                DaemonEvent::HaltDirective { .. } => "halt_directive".to_string(),
-                DaemonEvent::SessionSpawnDeduped { .. } => "session_spawn_deduped".to_string(),
-                DaemonEvent::ModelInvocationAdmitted { .. } => {
-                    "model_invocation_admitted".to_string()
-                }
-                DaemonEvent::ModelInvocationDenied { .. } => "model_invocation_denied".to_string(),
-                DaemonEvent::ModelBudgetNearLimit { .. } => "model_budget_near_limit".to_string(),
-                DaemonEvent::ModelControlModeChanged { .. } => {
-                    "model_control_mode_changed".to_string()
-                }
-                DaemonEvent::ModelControlCircuitChanged { .. } => {
-                    "model_control_circuit_changed".to_string()
-                }
-                DaemonEvent::ModelInvocationCancellationRequested { .. } => {
-                    "model_invocation_cancellation_requested".to_string()
-                }
-                DaemonEvent::ModelInvocationCancellationSkipped { .. } => {
-                    "model_invocation_cancellation_skipped".to_string()
-                }
-                DaemonEvent::ModelInvocationCancelled { .. } => {
-                    "model_invocation_cancelled".to_string()
-                }
-                DaemonEvent::ModelInvocationCompleted { .. } => {
-                    "model_invocation_completed".to_string()
-                }
-            },
+            event_type: event.kind().to_string(),
             timestamp: chrono::Utc::now(),
             // Unwrap the `#[serde(tag = "type", content = "data")]` envelope so
             // consumers see the variant payload directly at `BusEvent.data.*`
@@ -438,9 +430,59 @@ impl From<DaemonEvent> for rsi_common::rpc::BusEvent {
     }
 }
 
+/// Aggregate bus counters (#332). Keys are `DaemonEvent::kind()` names, a closed
+/// set of static strings, so memory is bounded by the number of event variants.
+/// Nothing here holds an event payload, a session id or a timestamp per event.
+struct BusCounters {
+    started: Instant,
+    kinds: RwLock<BTreeMap<&'static str, KindCounters>>,
+    lagged: AtomicU64,
+    lag_events: AtomicU64,
+}
+
+#[derive(Default)]
+struct KindCounters {
+    emitted: AtomicU64,
+    delivered: AtomicU64,
+}
+
+impl BusCounters {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            kinds: RwLock::new(BTreeMap::new()),
+            lagged: AtomicU64::new(0),
+            lag_events: AtomicU64::new(0),
+        }
+    }
+
+    fn record_emit(&self, kind: &'static str, delivered: u64) {
+        let bump = |counters: &KindCounters| {
+            counters.emitted.fetch_add(1, Ordering::Relaxed);
+            counters.delivered.fetch_add(delivered, Ordering::Relaxed);
+        };
+        {
+            let kinds = self
+                .kinds
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(counters) = kinds.get(kind) {
+                bump(counters);
+                return;
+            }
+        }
+        let mut kinds = self
+            .kinds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bump(kinds.entry(kind).or_default());
+    }
+}
+
 pub struct EventBus {
     sender: broadcast::Sender<Arc<DaemonEvent>>,
     subscriber_count: AtomicUsize,
+    counters: BusCounters,
     archive_projection_in_flight: Arc<Mutex<HashSet<Uuid>>>,
 }
 
@@ -470,6 +512,7 @@ impl EventBus {
         Self {
             sender,
             subscriber_count: AtomicUsize::new(0),
+            counters: BusCounters::new(),
             archive_projection_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -494,11 +537,50 @@ impl EventBus {
     }
 
     /// Publish an event to all subscribers.
-    /// If there are no subscribers, the event is dropped silently.
+    /// If there are no subscribers, the event is dropped silently (and still
+    /// counted as emitted, delivered to nobody).
     pub fn publish(&self, event: DaemonEvent) {
+        let kind = event.kind();
+        let mut delivered = 0_u64;
         if self.subscriber_count.load(Ordering::Relaxed) > 0 {
-            // Ignore send errors (subscribers may have been dropped)
-            let _ = self.sender.send(Arc::new(event));
+            // A send error means every subscriber was dropped: delivered to 0.
+            delivered = self.sender.send(Arc::new(event)).map_or(0, |n| n as u64);
+        }
+        self.counters.record_emit(kind, delivered);
+    }
+
+    /// A receiver observed `RecvError::Lagged(missed)`: it skipped `missed`
+    /// events. The channel does not name their kinds, so this is one aggregate.
+    pub fn record_lagged(&self, missed: u64) {
+        self.counters.lag_events.fetch_add(1, Ordering::Relaxed);
+        self.counters.lagged.fetch_add(missed, Ordering::Relaxed);
+    }
+
+    /// Bounded aggregate counters since this bus was created (#332).
+    pub fn stats(&self) -> rsi_common::agent_daemon_info::BusStatsV1 {
+        use rsi_common::agent_daemon_info::{BusKindStatsV1, BusStatsV1};
+        let kinds = self
+            .counters
+            .kinds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // BTreeMap iteration is sorted by kind, so the snapshot is stable.
+        let by_kind: Vec<BusKindStatsV1> = kinds
+            .iter()
+            .map(|(kind, counters)| BusKindStatsV1 {
+                kind: (*kind).to_string(),
+                emitted: counters.emitted.load(Ordering::Relaxed),
+                delivered: counters.delivered.load(Ordering::Relaxed),
+            })
+            .collect();
+        BusStatsV1 {
+            window_secs: self.counters.started.elapsed().as_secs(),
+            subscribers: self.subscriber_count() as u64,
+            emitted_total: by_kind.iter().map(|k| k.emitted).sum(),
+            delivered_total: by_kind.iter().map(|k| k.delivered).sum(),
+            lagged_total: self.counters.lagged.load(Ordering::Relaxed),
+            lag_events_total: self.counters.lag_events.load(Ordering::Relaxed),
+            by_kind,
         }
     }
 
@@ -601,6 +683,77 @@ mod tests {
                 .is_empty(),
             "completed delivery retains no daemon-lifetime projection history"
         );
+        bus.unsubscribe();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn bus_stats_count_emitted_delivered_and_lagged_by_kind_332() {
+        let bus = EventBus::new(2);
+        // No subscriber: emitted, delivered to nobody.
+        bus.publish(DaemonEvent::DreamStarted);
+        let first = bus.stats();
+        assert_eq!(first.emitted_total, 1);
+        assert_eq!(first.delivered_total, 0);
+        assert_eq!(first.subscribers, 0);
+
+        let mut a = bus.subscribe();
+        let mut b = bus.subscribe();
+        bus.publish(DaemonEvent::DreamStarted);
+        bus.publish(DaemonEvent::SessionDeleted {
+            session_id: Uuid::new_v4(),
+        });
+        let stats = bus.stats();
+        assert_eq!(stats.subscribers, 2);
+        assert_eq!(stats.emitted_total, 3);
+        assert_eq!(stats.delivered_total, 4, "two events x two receivers");
+        let kinds: Vec<(&str, u64, u64)> = stats
+            .by_kind
+            .iter()
+            .map(|k| (k.kind.as_str(), k.emitted, k.delivered))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![("dream_started", 2, 2), ("session_deleted", 1, 2)],
+            "sorted by kind, one row per kind, never per session"
+        );
+
+        // A third event overruns the capacity-2 channel for the idle receivers.
+        bus.publish(DaemonEvent::DreamStarted);
+        let Err(broadcast::error::TryRecvError::Lagged(missed)) = a.try_recv() else {
+            panic!("receiver a must have lagged");
+        };
+        bus.record_lagged(missed);
+        let Err(broadcast::error::TryRecvError::Lagged(missed_b)) = b.try_recv() else {
+            panic!("receiver b must have lagged");
+        };
+        bus.record_lagged(missed_b);
+        let stats = bus.stats();
+        assert_eq!(stats.lag_events_total, 2);
+        assert_eq!(stats.lagged_total, missed + missed_b);
+        assert_eq!(stats.lagged_total, 2);
+        bus.unsubscribe();
+        bus.unsubscribe();
+        assert_eq!(bus.stats().subscribers, 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn bus_stats_memory_is_bounded_by_kinds_not_traffic_332() {
+        let bus = EventBus::new(4);
+        let mut rx = bus.subscribe();
+        for _ in 0..1000 {
+            bus.publish(DaemonEvent::SessionDeleted {
+                session_id: Uuid::new_v4(),
+            });
+            let _ = rx.try_recv();
+        }
+        let stats = bus.stats();
+        assert_eq!(stats.by_kind.len(), 1, "1000 distinct session ids, one key");
+        assert_eq!(stats.emitted_total, 1000);
+        assert_eq!(stats.delivered_total, 1000);
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(!json.contains("session_id"), "no identity in the snapshot");
         bus.unsubscribe();
     }
 

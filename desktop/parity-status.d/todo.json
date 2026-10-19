@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>dt": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Shows or hides the right-hand panel, remembered. OperatorTodoList {closed_since} every 5 s; open items most urgent then newest, NEW and closed-since-last-visit highlights from the remembered last visit, the open/hidden choice and the visit kept in localStorage; a ☐ N todo +new ✓closed badge in the top bar (click toggles). The desktop shows the panel whenever it is open (its detail pane is always on screen)"
+    },
+    "key:<Space>dj": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Next item; a hidden panel opens first, as in the TUI"
+    },
+    "key:<Space>dk": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Previous item; a hidden panel opens first"
+    },
+    "key:<Space>do": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs, src-tauri/src/nav.rs",
+      "note": "issue:#N opens the Issues workspace at that Issue, session:<uuid> opens the session (switching to Archived when needed), an http(s) URL opens in the system browser (open_url, G2), falling back to the clipboard when no opener runs"
+    },
+    "key:<Space>dd": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Opens the pop-up on its y/n prompt; y/Enter sends OperatorTodoClose {todo_id, status: done, note: null}, the item leaves at once and <Space>du undoes it for 60 s"
+    },
+    "key:<Space>dx": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Opens the pop-up on its y/n prompt; y/Enter sends OperatorTodoClose with status dismissed; undoable for 60 s"
+    },
+    "key:<Space>dy": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Copies the item's command text verbatim; the toast is the TUI's 'Copied to-do command: …'"
+    },
+    "key:<Space>dc": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Same action as <Space>dy"
+    },
+    "key:<Space>dv": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Opens the selected item in the pop-up"
+    },
+    "key:<Space>du": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "OperatorTodoReopen {todo_id} for the latest close inside 60 s; the restored item is selected and a read that started before it is dropped"
+    },
+    "key:<Space>da": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Caught up: clears the highlights and moves the baseline to now"
+    },
+    "cmd:todo": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Same as <Space>dt"
+    },
+    "overlay-ref:to-do-pop-up": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "Full title, priority, source, age, link and the complete command; y yank, d done?, x dismiss?, u undo, o open link, n/p next/previous, j/k and Up/Down scroll, Ctrl-D/Ctrl-U ten rows, g/Home top, q/Esc close; at the prompt y/Enter confirm, n/Esc/q cancel; Space N / Space ; leave it"
+    },
+    "module:ui/overlay/todo_popup.rs": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "to-do pop-up; see overlay-ref:to-do-pop-up"
+    },
+    "module:ui/todo_panel.rs": {
+      "status": "done",
+      "location": "src/actions/todo.ts, src/actions/todo-run.ts, src/todo.ts, src/todo-model.ts, src-tauri/src/todo.rs",
+      "note": "OperatorTodoList {closed_since} every 5 s; open items most urgent then newest, NEW and closed-since-last-visit highlights from the remembered last visit, the open/hidden choice and the visit kept in localStorage; a ☐ N todo +new ✓closed badge in the top bar (click toggles). The desktop shows the panel whenever it is open (its detail pane is always on screen)"
+    }
+  }
+}

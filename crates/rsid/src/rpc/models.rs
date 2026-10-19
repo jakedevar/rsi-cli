@@ -8,6 +8,26 @@ pub struct DiscoverModelsParams {
     pub include_capabilities: bool,
 }
 
+/// #2494: how long a `GetEfficiencyMetrics` answer is reused. The metrics scan
+/// every session row and a day of invocations and user messages, and an
+/// open Stats view asks again and again; a day-grained figure that is 15 s
+/// old is as good. Tests read live (zero).
+const EFFICIENCY_METRICS_TTL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_secs(15)
+};
+
+/// The last answer per (store, request): bounded by the distinct requests one
+/// daemon sees (a store, a day, a grouping), so it is one or a few entries.
+type EfficiencyCache =
+    std::sync::Mutex<Vec<(usize, String, std::time::Instant, serde_json::Value)>>;
+
+fn efficiency_cache() -> &'static EfficiencyCache {
+    static CACHE: std::sync::OnceLock<EfficiencyCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 impl RpcServer {
     #[cfg(test)]
     pub(crate) fn model_control_runtime_for_tests(
@@ -61,16 +81,60 @@ impl RpcServer {
                 .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?
         };
 
-        let store = self.session_manager.store().clone();
         let project_id = params.project_id.map(|id| id.to_string());
-        let stats = tokio::task::spawn_blocking(move || {
+        // #333: the aggregate sorts the cost window of every counted session
+        // (hundreds of ms on a 70k-invocation hub) and the TUI re-requests it on
+        // every model-invocation event, so it reads on its own connection
+        // instead of holding the shared Store lock.
+        let stats = self
+            .session_manager
+            .read_aggregate_off_store_lock(move |store| store.usage_stats(project_id.as_deref()))
+            .await?;
+
+        Ok(serde_json::to_value(stats)?)
+    }
+
+    /// #2757 — account-level plan windows for every provider that reports
+    /// them, with the Codex poll's status. Read-only: the poll loop is the only
+    /// writer of Codex rows, so this never spawns a provider process.
+    pub(super) async fn handle_get_provider_rate_limits(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::rpc::GetProviderRateLimitsParams = if request.params.is_null() {
+            rsi_common::rpc::GetProviderRateLimitsParams::default()
+        } else {
+            serde_json::from_value(request.params.clone())
+                .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?
+        };
+        let store = self.session_manager.store().clone();
+        let mut rate_limits = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
-            store.usage_stats(project_id.as_deref())
+            store.load_provider_rate_limit_snapshots()
         })
         .await
         .map_err(|e| DaemonError::Process(format!("Task join error: {}", e)))??;
-
-        Ok(serde_json::to_value(stats)?)
+        let tracker = crate::codex_rate_limits::tracker();
+        tracker.apply(&mut rate_limits);
+        let mut polls = Vec::new();
+        if params
+            .provider
+            .is_none_or(|provider| provider == rsi_common::types::SessionProvider::Codex)
+        {
+            polls.push(
+                tracker.status(
+                    self.runtime_config
+                        .codex_rate_limit_poll_secs
+                        .load(Ordering::Relaxed),
+                ),
+            );
+        }
+        if let Some(provider) = params.provider {
+            rate_limits.retain(|snapshot| snapshot.provider == provider);
+        }
+        Ok(serde_json::to_value(
+            rsi_common::rpc::GetProviderRateLimitsResponse { rate_limits, polls },
+        )?)
     }
 
     pub(super) async fn handle_get_efficiency_metrics(
@@ -81,6 +145,22 @@ impl RpcServer {
             serde_json::from_value(request.params.clone())
                 .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
         let store = self.session_manager.store().clone();
+        let cache_key = (
+            std::sync::Arc::as_ptr(&store) as usize,
+            serde_json::to_string(&request.params).unwrap_or_default(),
+        );
+        if let Some(value) = efficiency_cache().lock().ok().and_then(|cache| {
+            cache
+                .iter()
+                .find(|(ptr, key, at, _)| {
+                    *ptr == cache_key.0
+                        && *key == cache_key.1
+                        && at.elapsed() < EFFICIENCY_METRICS_TTL
+                })
+                .map(|(_, _, _, value)| value.clone())
+        }) {
+            return Ok(value);
+        }
         let project_repo = self.session_manager.workspace_roots().first().cloned();
         let response = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
@@ -88,7 +168,19 @@ impl RpcServer {
         })
         .await
         .map_err(|e| DaemonError::Process(format!("Task join error: {}", e)))??;
-        Ok(serde_json::to_value(response)?)
+        let value = serde_json::to_value(response)?;
+        if !EFFICIENCY_METRICS_TTL.is_zero()
+            && let Ok(mut cache) = efficiency_cache().lock()
+        {
+            cache.retain(|(_, _, at, _)| at.elapsed() < EFFICIENCY_METRICS_TTL);
+            cache.push((
+                cache_key.0,
+                cache_key.1,
+                std::time::Instant::now(),
+                value.clone(),
+            ));
+        }
+        Ok(value)
     }
 
     pub(super) async fn handle_get_model_control_status(
@@ -438,9 +530,15 @@ impl RpcServer {
         &self,
         request: &RpcRequest,
     ) -> Result<serde_json::Value> {
-        let params: rsi_common::rpc::CompilePromptParams =
+        let mut params: rsi_common::rpc::CompilePromptParams =
             serde_json::from_value(request.params.clone())
                 .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
+        self.resolve_custom_provider(
+            params.custom_provider_id,
+            &mut params.base_url,
+            &mut params.api_key,
+        )
+        .await?;
 
         let resp = Arc::clone(&self.compile_engine)
             .compile(
@@ -459,9 +557,15 @@ impl RpcServer {
         &self,
         request: &RpcRequest,
     ) -> Result<serde_json::Value> {
-        let params: rsi_common::rpc::GenerateTextParams =
+        let mut params: rsi_common::rpc::GenerateTextParams =
             serde_json::from_value(request.params.clone())
                 .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
+        self.resolve_custom_provider(
+            params.custom_provider_id,
+            &mut params.base_url,
+            &mut params.api_key,
+        )
+        .await?;
 
         let model = params.model.unwrap_or_else(|| {
             self.runtime_config
@@ -625,6 +729,8 @@ impl RpcServer {
         let provider = params
             .provider
             .unwrap_or(rsi_common::types::SessionProvider::Claude);
+        let mut codex_discovery: Option<crate::codex::CodexDiscovery> = None;
+        let mut claude_efforts = Vec::new();
         let models = match provider {
             rsi_common::types::SessionProvider::Claude => {
                 let claude_client = match crate::claude::ClaudeClient::for_discovery() {
@@ -636,12 +742,19 @@ impl RpcServer {
                         )));
                     }
                 };
-                claude_client.discover_models().await?
+                // #2768: the same probe names each model's effort ladder.
+                let catalog = claude_client.discover_models().await?;
+                claude_efforts = catalog.efforts;
+                catalog.models
             }
             rsi_common::types::SessionProvider::Codex => {
-                self.session_manager
-                    .discover_codex_models(CatalogRefreshReason::ExplicitDiscovery)
-                    .await?
+                let discovery = self
+                    .session_manager
+                    .discover_codex_catalog(CatalogRefreshReason::ExplicitDiscovery)
+                    .await?;
+                let models = discovery.models.clone();
+                codex_discovery = Some(discovery);
+                models
             }
             rsi_common::types::SessionProvider::Pioneer => {
                 crate::pioneer::discover_pioneer_models()
@@ -675,33 +788,154 @@ impl RpcServer {
             }
             rsi_common::types::SessionProvider::CodexAppServer => {
                 // Reuse Codex model list for app-server mode
-                self.session_manager
-                    .discover_codex_models(CatalogRefreshReason::ExplicitDiscovery)
-                    .await?
+                let discovery = self
+                    .session_manager
+                    .discover_codex_catalog(CatalogRefreshReason::ExplicitDiscovery)
+                    .await?;
+                let models = discovery.models.clone();
+                codex_discovery = Some(discovery);
+                models
             }
             rsi_common::types::SessionProvider::Harness => crate::session::harness::models::harness_models(),
             _ => Vec::new(),
         };
         if params.include_capabilities {
-            let effort_capabilities = if matches!(
-                provider,
+            let effort_capabilities = match provider {
+                rsi_common::types::SessionProvider::Claude => claude_efforts,
                 rsi_common::types::SessionProvider::Codex
-                    | rsi_common::types::SessionProvider::CodexAppServer
-            ) {
-                crate::provider_capabilities::provider_capabilities()
-                    .cached_codex_catalog()
-                    .map(|snapshot| snapshot.effort_capabilities())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
+                | rsi_common::types::SessionProvider::CodexAppServer => merge_effort_capabilities(
+                    codex_discovery
+                        .as_ref()
+                        .map(|discovery| discovery.view.effort_capabilities())
+                        .unwrap_or_default(),
+                    crate::provider_capabilities::provider_capabilities()
+                        .cached_codex_catalog()
+                        .map(|snapshot| snapshot.effort_capabilities())
+                        .unwrap_or_default(),
+                ),
+                _ => Vec::new(),
             };
-            return Ok(serde_json::to_value(
-                rsi_common::model_utils::DiscoveredModels {
-                    models,
-                    effort_capabilities,
-                },
-            )?);
+            let response =
+                discovered_models_response(models, effort_capabilities, codex_discovery.as_ref());
+            return Ok(serde_json::to_value(response)?);
         }
         Ok(serde_json::to_value(&models)?)
+    }
+}
+
+/// Codex ladders for `DiscoverModels` (#2768): the login's live list decides
+/// every model it describes; the bundled catalog fills in the rest.
+fn merge_effort_capabilities(
+    live: Vec<rsi_common::model_utils::ModelEffortCapabilities>,
+    bundled: Vec<rsi_common::model_utils::ModelEffortCapabilities>,
+) -> Vec<rsi_common::model_utils::ModelEffortCapabilities> {
+    let mut merged = live;
+    for entry in bundled {
+        if merged
+            .iter()
+            .any(|live| live.model.eq_ignore_ascii_case(&entry.model))
+        {
+            continue;
+        }
+        merged.push(entry);
+    }
+    merged
+}
+
+/// The opt-in `DiscoverModels` response. A Codex discovery adds the catalog
+/// provenance (#2752): `source`, `fetched_at`, `degraded` + reason, and the
+/// menu models a fresh live list omits as `available: false`.
+fn discovered_models_response(
+    models: Vec<(String, String)>,
+    effort_capabilities: Vec<rsi_common::model_utils::ModelEffortCapabilities>,
+    codex: Option<&crate::codex::CodexDiscovery>,
+) -> rsi_common::model_utils::DiscoveredModels {
+    let mut response = rsi_common::model_utils::DiscoveredModels {
+        models,
+        effort_capabilities,
+        ..Default::default()
+    };
+    if let Some(discovery) = codex {
+        response.source = Some(discovery.view.source.as_str().to_string());
+        response.fetched_at = discovery
+            .view
+            .fetched_at
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+        response.degraded = discovery.view.degraded;
+        response.degraded_reason = discovery.view.degraded_reason.clone();
+        response.unavailable = discovery
+            .unavailable
+            .iter()
+            .map(|model| rsi_common::model_utils::ModelAvailability {
+                model: model.clone(),
+                available: false,
+                reason: "absent_from_live_catalog".to_string(),
+            })
+            .collect();
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::CodexDiscovery;
+    use crate::codex_live_catalog::{CatalogSource, CatalogView, LiveModel};
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn codex_discovery_response_carries_source_age_degraded_and_unavailable() {
+        let fetched_at = chrono::Utc::now();
+        let live = CodexDiscovery {
+            models: vec![("gpt-6-astra".into(), "GPT-6 Astra".into())],
+            view: CatalogView {
+                source: CatalogSource::Live,
+                fetched_at: Some(fetched_at),
+                degraded: false,
+                degraded_reason: None,
+                models: vec![LiveModel {
+                    id: "gpt-6-sol".into(),
+                    display_name: None,
+                    hidden: false,
+                    efforts: None,
+                    default_effort: None,
+                }],
+            },
+            unavailable: vec!["gpt-6-astra".into()],
+        };
+        let response = discovered_models_response(live.models.clone(), Vec::new(), Some(&live));
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["source"], "live");
+        assert!(json["fetched_at"].is_string());
+        assert_eq!(json["unavailable"][0]["model"], "gpt-6-astra");
+        assert_eq!(json["unavailable"][0]["available"], false);
+        assert!(json.get("degraded").is_none());
+
+        let degraded = CodexDiscovery {
+            models: Vec::new(),
+            view: CatalogView::disabled(),
+            unavailable: Vec::new(),
+        };
+        let mut degraded = degraded;
+        degraded.view.degraded = true;
+        degraded.view.degraded_reason = Some("probe_timeout".into());
+        let json = serde_json::to_value(discovered_models_response(
+            Vec::new(),
+            Vec::new(),
+            Some(&degraded),
+        ))
+        .unwrap();
+        assert_eq!(json["source"], "bundled");
+        assert_eq!(json["degraded"], true);
+        assert_eq!(json["degraded_reason"], "probe_timeout");
+
+        // A provider with no live catalog keeps the legacy shape.
+        let plain = serde_json::to_value(discovered_models_response(
+            vec![("m".into(), "M".into())],
+            Vec::new(),
+            None,
+        ))
+        .unwrap();
+        assert!(plain.get("source").is_none());
     }
 }

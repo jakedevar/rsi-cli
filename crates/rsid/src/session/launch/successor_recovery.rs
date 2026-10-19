@@ -48,6 +48,7 @@ fn uncertain_clock_offsets() -> &'static std::sync::Mutex<std::collections::Hash
 
 /// Simulate wall time elapsed since a reservation became `Uncertain`
 /// (`updated_at` is trigger-protected against backdating).
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 pub(super) fn advance_uncertain_clock_for_test(reservation_id: Uuid, seconds: i64) {
     uncertain_clock_offsets()
@@ -86,6 +87,7 @@ impl SessionManager {
     /// was never committed. D00 retains that allocation; a reservation and a
     /// path are not authority to adopt it or mint a replacement generation.
     /// Settle the nonrestorable obligation, never fabricate a new invocation.
+    #[cfg_attr(not(target_os = "linux"), allow(unreachable_code, unused_variables))]
     pub(super) async fn settle_unpublished_agent_successor(
         &self,
         reservation: &AgentSuccessorReservation,
@@ -181,7 +183,7 @@ impl SessionManager {
                 .agent_tokens
                 .read()
                 .await
-                .token_for_session(id)
+                .binding_for_session(id)
                 .is_some()
         {
             return Err(DaemonError::PolicyDenied(

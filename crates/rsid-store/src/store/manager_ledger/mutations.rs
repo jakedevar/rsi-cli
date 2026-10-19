@@ -489,6 +489,7 @@ impl Store {
                                 note: String::new(),
                                 evidence: None,
                                 admission: None,
+                                job_evidence: None,
                                 updated_at: now(),
                             })
                             .collect()
@@ -540,9 +541,33 @@ impl Store {
                 state,
                 note,
                 evidence,
+                job_evidence,
             } => {
                 if note.len() > 2048 || note.contains('\0') {
                     return Err(refused("manager_v2_invalid_note"));
+                }
+                // The cited job was read by the daemon from its own table; the
+                // supplied reference only selects it. Its owner is the caller,
+                // its outcome must describe the stage state, and the Work's
+                // recorded source (if any) must be the commit it tested.
+                if job_evidence.is_some() != observed.job_evidence.is_some() {
+                    return Err(refused("manager_v2_job_evidence_unobserved"));
+                }
+                if let Some(job) = &observed.job_evidence {
+                    if job.owner_session_id != caller {
+                        return Err(refused("manager_v2_job_evidence_owner"));
+                    }
+                    if !job.outcome.describes(*state) {
+                        return Err(refused("manager_v2_job_evidence_state_mismatch"));
+                    }
+                    if context
+                        .work
+                        .as_ref()
+                        .and_then(|work| work.source_commit.as_ref())
+                        .is_some_and(|recorded| *recorded != job.source_commit)
+                    {
+                        return Err(refused("manager_v2_source_changed"));
+                    }
                 }
                 if *stage == ManagerWorkStageV2::Integration
                     && *state == ManagerStageStateV2::Passed
@@ -580,6 +605,7 @@ impl Store {
                     note: note.clone(),
                     evidence: evidence.clone(),
                     admission: observed.evidence.clone(),
+                    job_evidence: observed.job_evidence.clone(),
                     updated_at: now(),
                 };
                 work.acceptance = None;
@@ -1442,43 +1468,6 @@ impl Store {
         blockers.dedup();
         Ok(blockers)
     }
-}
-#[cfg(any(test, feature = "test-seam"))]
-pub(super) fn dependency_blockers(
-    works: &std::collections::BTreeMap<String, WorkRecord>,
-    edges: &[Dependency],
-    key: &str,
-) -> Vec<String> {
-    let mut blockers = Vec::new();
-    let mut todo = vec![key.to_string()];
-    let mut seen = HashSet::new();
-    while let Some(at) = todo.pop() {
-        if !seen.insert(at.clone()) {
-            continue;
-        }
-        if seen.len() > MANAGER_V2_MAX_WORK {
-            blockers.push("dependency_budget_exceeded".into());
-            break;
-        }
-        for d in edges.iter().filter(|d| d.enabled && d.work_key == at) {
-            let satisfied = works.get(&d.prerequisite).is_some_and(|w| {
-                w.acceptance.as_ref().is_some_and(|a| {
-                    a.spec_revision == w.spec_revision
-                        && Some(&a.source_commit) == w.source_commit.as_ref()
-                }) && (!d.require_integrated
-                    || w.integration
-                        .as_ref()
-                        .is_some_and(|i| Some(&i.source_commit) == w.source_commit.as_ref()))
-            });
-            if !satisfied {
-                blockers.push(d.prerequisite.clone());
-            }
-            todo.push(d.prerequisite.clone());
-        }
-    }
-    blockers.sort();
-    blockers.dedup();
-    blockers
 }
 
 const fn is_terminal_request_state(state: ManagerRequestStateV2) -> bool {

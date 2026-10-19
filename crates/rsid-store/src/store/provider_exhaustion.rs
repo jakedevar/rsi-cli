@@ -12,7 +12,7 @@ use crate::provider_exhaustion::{UsageLimitHold, hold_until};
 use crate::store_support::provider_defaults::CODEX_USAGE_LIMIT_STOP_REASON;
 
 /// Failures older than this are never consulted for a hold.
-const HOLD_LOOKBACK: Duration = Duration::days(8);
+pub(crate) const HOLD_LOOKBACK: Duration = Duration::days(8);
 /// Recent exhausted sessions considered per check.
 const MAX_CANDIDATES: i64 = 20;
 /// Failure count window used to grow the backoff floor.
@@ -20,7 +20,7 @@ const ATTEMPT_WINDOW: Duration = Duration::hours(24);
 /// Cap on the counted failures (the backoff cap is reached well before).
 const MAX_COUNTED_ATTEMPTS: i64 = 16;
 
-fn day_prefix(at: DateTime<Utc>) -> String {
+pub(crate) fn day_prefix(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d").to_string()
 }
 

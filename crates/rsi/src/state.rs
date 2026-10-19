@@ -496,6 +496,16 @@ pub struct PersistedState {
     /// File explorer drawer width chosen with its resize keys.
     #[serde(default)]
     pub file_explorer_width: Option<u16>,
+
+    /// Operator to-do panel (#1747): the operator hid it. Stored as "hidden"
+    /// so the default (no state file, or an old one) shows the list.
+    #[serde(default)]
+    pub todo_panel_hidden: bool,
+
+    /// Operator to-do panel (#1747): the last time the panel was in view, the
+    /// next run's catch-up baseline.
+    #[serde(default)]
+    pub todo_last_visit: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PersistedState {
@@ -527,6 +537,8 @@ impl PersistedState {
             modal_geometries: app.modal_geometries.clone(),
             modal_defaults: app.modal_defaults.clone(),
             file_explorer_width: app.file_explorer_width,
+            todo_panel_hidden: !app.todo_panel.open,
+            todo_last_visit: app.todo_panel.last_visit,
         }
     }
 
@@ -1116,6 +1128,8 @@ mod tests {
             modal_geometries: HashMap::new(),
             modal_defaults: ModalDefaults::default(),
             file_explorer_width: Some(64),
+            todo_panel_hidden: true,
+            todo_last_visit: Some(chrono::DateTime::UNIX_EPOCH),
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -1128,6 +1142,8 @@ mod tests {
         assert_eq!(restored.selected_model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(restored.theme_flavor.as_deref(), Some("latte"));
         assert_eq!(restored.file_explorer_width, Some(64));
+        assert!(restored.todo_panel_hidden);
+        assert_eq!(restored.todo_last_visit, Some(chrono::DateTime::UNIX_EPOCH));
     }
 
     #[test]
@@ -1137,6 +1153,9 @@ mod tests {
         let state: PersistedState = serde_json::from_str(json).unwrap();
 
         assert!(state.file_explorer_width.is_none());
+        // The to-do panel is shown unless the operator hid it.
+        assert!(!state.todo_panel_hidden);
+        assert!(state.todo_last_visit.is_none());
         assert!(state.session_jumplist.is_empty());
         assert_eq!(state.jumplist_cursor, 0);
         assert!(state.tabs.is_empty());

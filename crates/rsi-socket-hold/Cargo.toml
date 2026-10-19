@@ -9,6 +9,7 @@ repository.workspace = true
 nix = { workspace = true, features = ["socket"] }
 
 [dev-dependencies]
+rsi-common = { path = "../rsi-common" }
 tempfile = "3"
 
 [lints]

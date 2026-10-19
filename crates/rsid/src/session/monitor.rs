@@ -208,6 +208,7 @@ async fn persist_detached_batch(
 /// gone quiet" rather than "we're between prompt-cache boundaries" (the
 /// Anthropic prompt cache TTL is ~5 min).
 const USAGE_STALENESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
 const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 
 pub(super) fn no_idle_outcome_owns_capacity_c5(
@@ -465,6 +466,7 @@ fn parse_rate_limit_event(
             .unwrap_or(false),
         observed_at: chrono::Utc::now(),
         windows,
+        stale_reason: None,
     })
 }
 
@@ -523,6 +525,16 @@ const NON_CONVERSATION_STREAM_EVENTS: &[&str] = &[
     "rate_limit_event",
     // Codex context-window usage, consumed by `extract_codex_context_usage`.
     "codex_token_count",
+    // hub #2913: the Claude Code CLI's `tool_progress` frame (`tool_use_id`,
+    // `tool_name`, `parent_tool_use_id`, `elapsed_time_seconds`, optional
+    // `task_id`/`heartbeat`/`subagent_type`/`subagent_retry`). No tool row
+    // carries an elapsed or progress field, so it is a known no-op; the raw
+    // event DEBUG line above the converter still records it.
+    "tool_progress",
+    // hub #2913: the Harness loop's `provider_error` event. The stream loop's
+    // `StreamHealth::observe` turns it into the typed `provider_health` row
+    // (`provider_stream_health::PROVIDER_ERROR`), so the converter maps none.
+    "provider_error",
 ];
 
 /// Ceiling on distinct unrecognized types diagnosed by one monitor run.
@@ -906,6 +918,7 @@ fn cache_read_metadata_changed(current: Option<u64>, last_persisted: Option<u64>
 }
 
 /// Keep #61's baseline and between-report estimator out of raw occupancy display.
+#[cfg(test)]
 fn rotation_context_pct(tracked: &TrackedSession, display_pct: f64) -> f64 {
     if is_codex_context_provider(tracked.session.provider) && has_codex_context_observation(tracked)
     {
@@ -931,6 +944,7 @@ fn rotation_context_pct(tracked: &TrackedSession, display_pct: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn codex_context_pct_used(context_tokens: u64, context_window: u64) -> f64 {
     if context_window <= CODEX_CONTEXT_BASELINE_TOKENS {
         return 100.0;
@@ -1040,7 +1054,9 @@ pub(super) fn context_fill_pct_from_persisted(session: &Session) -> Option<f64> 
     context_fill_pct_formula(numerator, budget.active_tokens)
 }
 
-fn live_context_state(tracked: &TrackedSession) -> (u64, f64, ContextUsageConfidence, u64, u64) {
+pub(super) fn live_context_state(
+    tracked: &TrackedSession,
+) -> (u64, f64, ContextUsageConfidence, u64, u64) {
     let context_window = tracked.context_budget().active_tokens;
     let daemon_total = tracked.daemon_input_tokens + tracked.daemon_output_tokens;
 
@@ -1268,13 +1284,16 @@ async fn advance_coordinator_context_cap(
         && runtime_config
             .context_rotation_enabled
             .load(std::sync::atomic::Ordering::Relaxed);
+    let (measured_tokens, _, _, _, context_window) = live_context_state(tracked);
     let cap = rotation_on
         .then(|| {
-            runtime_config
-                .coordinator_context_cap(tracked.session.provider, tracked.session.model.as_deref())
+            runtime_config.coordinator_context_cap(
+                tracked.session.provider,
+                tracked.session.model.as_deref(),
+                context_window,
+            )
         })
         .flatten();
-    let (measured_tokens, _, _, _, context_window) = live_context_state(tracked);
     let worker_cap = runtime_config.worker_context_cap(
         tracked.session.provider,
         tracked.session.model.as_deref(),
@@ -1422,6 +1441,15 @@ fn inactive_rotation_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600)
 }
 
+pub(super) fn request_harness_rotation(
+    store: &Store,
+    session_id: Uuid,
+    rotation: &mut super::rotation_coordinator::RotationCoordinator,
+) -> crate::error::Result<RotationAction> {
+    store.ensure_rotation_not_blocked_on_transferred_custody(session_id)?;
+    Ok(rotation.advance(RotationEvent::ManualTrigger))
+}
+
 fn current_rotation_deadline(tracked: Option<&TrackedSession>) -> tokio::time::Instant {
     tracked
         .and_then(|session| session.rotation.current_deadline())
@@ -1535,6 +1563,32 @@ pub(super) fn bounded_stop_reason_detail(text: &str) -> Option<String> {
     Some(truncated)
 }
 
+/// Whether a session stop reason is one of the authentication classes the
+/// login probe follows (#2753).
+fn is_auth_stop_reason(reason: &str) -> bool {
+    use crate::store_support::provider_defaults::{
+        PROVIDER_AUTH_INVALID_STOP_REASON, PROVIDER_LOGIN_REQUIRED_STOP_REASON,
+    };
+    reason == PROVIDER_AUTH_INVALID_STOP_REASON || reason == PROVIDER_LOGIN_REQUIRED_STOP_REASON
+}
+
+/// A provider session stopped on an authentication class (#2753): probe that
+/// provider's CLI login again now, in the background, so the login state and
+/// launch admission follow the failure instead of waiting for the TTL.
+fn note_provider_auth_stop(
+    provider: rsi_common::types::SessionProvider,
+    model: Option<&str>,
+    stop_reason: &str,
+) {
+    if !is_auth_stop_reason(stop_reason) {
+        return;
+    }
+    if let Some(login_provider) = crate::provider_login::LoginProvider::for_launch(provider, model)
+    {
+        crate::provider_login::ProviderLoginService::global().note_auth_stop(login_provider);
+    }
+}
+
 /// Map provider terminal failures into durable Session stop reasons.
 ///
 /// Closed daemon-owned classifications (usage limit, storage full, ...) are
@@ -1582,15 +1636,29 @@ fn terminal_provider_stop_reason(stream_event: &StreamEvent) -> Option<Cow<'stat
     if !is_terminal_provider_error(stream_event) {
         return None;
     }
-    if data
+    if let Some(model) = data
         .get("error")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(crate::store_support::provider_defaults::is_provider_auth_failure_text)
+        .and_then(crate::store_support::provider_defaults::model_unavailable_in_text)
     {
-        // An auth rejection is a credential fault, not a task fault (#1610).
-        return Some(Cow::Borrowed(
-            crate::store_support::provider_defaults::PROVIDER_AUTH_INVALID_STOP_REASON,
+        // The provider withdrew the model (Codex 400 "not supported when using
+        // Codex with a ChatGPT account", #2735): a typed `model_unavailable`,
+        // not a generic provider error, so launch admission, the reviewer
+        // fallback and the manager notice can act on it. The per-login live
+        // catalog is read again once (#2752): it should now omit the model.
+        crate::codex_live_catalog::request_refresh();
+        return Some(Cow::Owned(
+            crate::store_support::provider_defaults::model_unavailable_stop_reason(&model),
         ));
+    }
+    if let Some(class) = data
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::store_support::provider_defaults::classify_provider_auth_text)
+    {
+        // An auth rejection is a credential fault, not a task fault (#1610);
+        // a missing login is its own typed class (#2753).
+        return Some(Cow::Borrowed(class.stop_reason()));
     }
     if data.get("source").and_then(serde_json::Value::as_str) == Some("codex_event")
         && let Some(detail) = data
@@ -1648,6 +1716,19 @@ pub(super) fn terminal_decision(evidence: TerminalEvidence) -> TerminalDecision 
         return TerminalDecision::Finalize(TerminalFinalizeDecision::failed(
             AutofileCause::StallTimeout,
         ));
+    }
+    // Hub #3029: the reconciler stopped the monitor only because the provider
+    // child had exited. A final successful result event followed by exit code 0
+    // is a finished turn, not a cut-off. Anything else (no result event, a
+    // non-zero exit or signal, a halt, a deploy drain or any other recorded
+    // source) keeps the interrupt below.
+    if evidence.provider_exit_stop
+        && !evidence.interrupt_requested
+        && !evidence.process_alive
+        && evidence.exit_code == Some(0)
+        && matches!(evidence.current_result, TerminalResult::Success)
+    {
+        return TerminalDecision::Finalize(TerminalFinalizeDecision::completed());
     }
     if evidence.interrupt_requested
         || matches!(evidence.break_reason, MonitorBreakReason::Interrupted)
@@ -2057,6 +2138,14 @@ impl SessionManager {
         // #1484: set when Claude Code rejects the selected model on stderr, so
         // the later `result` frame cannot relabel the exit as `success`.
         let mut rejected_model_notice: Option<String> = None;
+        // #31: the last provider output of the turn was a rejected tool call.
+        let mut tool_rejection_last = false;
+        // #2753: the auth class a Claude `system/api_retry` named
+        // (`authentication_failed`, `account_on_hold`, `billing_error`); it
+        // types the error result that ends the retries.
+        let mut api_retry_class: Option<
+            crate::store_support::provider_defaults::ProviderAuthClass,
+        > = None;
         let mut current_result = if let Some(turn) = &detached_turn {
             match turn.consumed_terminal_event().await {
                 Ok(Some(event)) if event.event_type == "result" => result_evidence(&event),
@@ -2104,6 +2193,12 @@ impl SessionManager {
         // B1: one unrecognized-type diagnostic per distinct type, per run.
         // Stack-local, so it is scoped to this session and freed with it.
         let mut unrecognized_stream_events = UnrecognizedStreamEvents::default();
+        // #2756: the Claude `system/init` health fields (a worker without its
+        // `rsi-agent` tools) and the `system/api_retry` category counts.
+        let mut stream_health = crate::provider_stream_health::StreamHealth::default();
+        // #2758: the effective access mode row (and, hub #2765, the applied
+        // operator launch overrides) is written on the run's first event.
+        let mut access_policy_noted = false;
         let mut snapshot_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         snapshot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_snapshot_tokens: u64 = 0;
@@ -2179,11 +2274,9 @@ impl SessionManager {
             }
         }
 
-        // Persist status change to Running
-        if let Err(e) = persistence
-            .update_status(session_id, SessionStatus::Running)
-            .await
-        {
+        // Persist status change to Running. The write is queued; a row that
+        // another writer ended before it lands keeps its terminal status (#277).
+        if let Err(e) = persistence.mark_running(session_id).await {
             tracing::error!(
                 error = %e,
                 session_id = %session_id,
@@ -2229,27 +2322,46 @@ impl SessionManager {
                     if let Some(turn) = &detached_turn { turn.wait_for_handoff().await; }
                     else { std::future::pending::<()>().await; }
                 } => return,
-                _ = stop_rx.recv() => {
+                stop = stop_rx.recv() => {
                     tracing::debug!(session_id = %session_id, "Received stop signal");
                     // Distinguish user interrupt from rotation interrupt:
                     // A user interrupt (interrupt_requested=true) always wins,
                     // even if rotation was in progress.
-                    let break_reason = {
+                    let (break_reason, unrecorded_stop) = {
                         let active_guard = active.read().await;
                         let tracked = active_guard.get(&session_id);
                         let user_interrupted = tracked.map(|t| t.interrupt_requested).unwrap_or(false);
                         let stall_interrupted = tracked.map(|t| t.stall_interrupted).unwrap_or(false);
                         let is_rotation = tracked.map(|t| t.rotation.is_rotating()).unwrap_or(false);
                         if stall_interrupted {
-                            MonitorBreakReason::StallTimeout
+                            (MonitorBreakReason::StallTimeout, false)
                         } else if user_interrupted {
-                            MonitorBreakReason::Interrupted
+                            (MonitorBreakReason::Interrupted, false)
                         } else if is_rotation {
-                            MonitorBreakReason::Rotation
+                            (MonitorBreakReason::Rotation, false)
                         } else {
-                            MonitorBreakReason::Interrupted
+                            (MonitorBreakReason::Interrupted, true)
                         }
                     };
+                    if unrecorded_stop {
+                        // Nothing recorded why the monitor was stopped. Name
+                        // this writer so the Interrupted row is traceable (#2514).
+                        let writer = if stop.is_some() {
+                            "monitor_stop_signal"
+                        } else {
+                            "monitor_stop_channel_closed"
+                        };
+                        tracing::warn!(
+                            session_id = %session_id,
+                            writer,
+                            "Monitor stopped with no recorded interrupt intent"
+                        );
+                        if let Some(tracked) = active.write().await.get_mut(&session_id)
+                            && tracked.spawn_generation == expected_generation
+                        {
+                            tracked.interrupt_evidence.writer.get_or_insert(writer);
+                        }
+                    }
                     terminal_reason = Some(break_reason);
                     terminal_deadline = None;
                     if !stream_drained {
@@ -2633,6 +2745,9 @@ impl SessionManager {
                                 let mut active_guard = active.write().await;
                                 if let Some(tracked) = active_guard.get_mut(&session_id) {
                                     tracked.last_event_at = chrono::Utc::now();
+                                    // Open and closed tool calls of this turn, read by the
+                                    // operator DRAIN wait (#2353).
+                                    tracked.turn_tools.observe_stream(&stream_event.event_type, &stream_event.data);
                                 }
                             }
 
@@ -2774,6 +2889,11 @@ impl SessionManager {
                                         {
                                             tracked.session.stop_reason =
                                                 Some(stop_reason.to_string());
+                                            note_provider_auth_stop(
+                                                tracked.session.provider,
+                                                tracked.session.model.as_deref(),
+                                                &stop_reason,
+                                            );
                                         }
                                         // #572: one durable, operator-visible
                                         // condition with the exact provider text;
@@ -3341,6 +3461,10 @@ impl SessionManager {
                                 }
                             }
 
+                            if let Some(seen) = monitor::tool_rejection_transition(&stream_event) {
+                                tool_rejection_last = seen;
+                            }
+
                             // Daemon token counting for user events (tool results) and
                             // OpenAI-compat content_block_delta streaming chunks.
                             match stream_event.event_type.as_str() {
@@ -3350,11 +3474,13 @@ impl SessionManager {
                                         active_guard.get_mut(&session_id)
                                         && tracked.spawn_generation == expected_generation
                                     {
-                                        match tracked
-                                            .rotation
-                                            .advance(RotationEvent::ManualTrigger)
-                                        {
-                                            RotationAction::InterruptForRotation => {
+                                        // Recheck queued requests before advancing state or
+                                        // interrupting: custody may have moved since the tool ran.
+                                        let action = request_harness_rotation(
+                                            &*store.lock().await, session_id, &mut tracked.rotation,
+                                        );
+                                        match action {
+                                            Ok(RotationAction::InterruptForRotation) => {
                                                 if let Some(ref process) = tracked.process
                                                     && let Err(error) = process.interrupt()
                                                 {
@@ -3366,12 +3492,19 @@ impl SessionManager {
                                                 }
                                                 let _ = tracked.stop_tx.try_send(());
                                             }
-                                            action => {
+                                            Ok(action) => {
                                                 tracing::warn!(
                                                     session_id = %session_id,
                                                     ?action,
                                                     "Harness fresh-window rotation was not started"
                                                 );
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%session_id, %error, "Harness rotation request refused");
+                                                event_bus.publish(DaemonEvent::SystemMessage {
+                                                    level: "warn".into(),
+                                                    message: error.to_string(),
+                                                });
                                             }
                                         }
                                     }
@@ -3565,6 +3698,9 @@ impl SessionManager {
                                 data = %stream_event.data,
                                 "Raw stream event from Claude CLI"
                             );
+                            if let Some(class) = monitor::api_retry_auth_class(&stream_event) {
+                                api_retry_class = Some(class);
+                            }
 
                             // Convert to ConversationEvent(s), store and publish.
                             //
@@ -3601,6 +3737,183 @@ impl SessionManager {
                                 }
                                 extra.append(&mut converted);
                                 converted = extra;
+                            }
+                            // #2756: typed rows for a worker whose `rsi-agent` MCP
+                            // server did not connect, failed plugins and the
+                            // retry categories, plus one manager notice per
+                            // finding that needs the manager.
+                            if !access_policy_noted {
+                                access_policy_noted = true;
+                                // #3141: which engine an OpenRouter launch took
+                                // and why (default, global setting, override).
+                                if let Some(selection) =
+                                    crate::api_route_selection::take_selected(session_id)
+                                {
+                                    converted.push(
+                                        crate::provider_stream_health::api_route_event(
+                                            session_id,
+                                            &mut sequence,
+                                            &selection,
+                                        ),
+                                    );
+                                }
+                                // hub #2765: record on the session the operator
+                                // launch overrides this run's CLI was started with.
+                                if let Some(applied) =
+                                    crate::provider_launch_overrides::take_applied(session_id)
+                                {
+                                    converted.push(
+                                        crate::provider_stream_health::launch_overrides_event(
+                                            session_id,
+                                            &mut sequence,
+                                            &applied,
+                                        ),
+                                    );
+                                }
+                                let provider = active
+                                    .read()
+                                    .await
+                                    .get(&session_id)
+                                    .map(|tracked| tracked.session.provider);
+                                if let Some(provider) = provider.filter(|provider| {
+                                    rsi_common::harness_tool_policy::provider_runs_policy_cli(*provider)
+                                }) {
+                                    let access = store
+                                        .lock()
+                                        .await
+                                        .resolve_session_tool_policy(session_id)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|policy| policy.cli_access);
+                                    if let Some(mode) = access {
+                                        converted.push(
+                                            crate::provider_stream_health::access_policy_event(
+                                                session_id,
+                                                &mut sequence,
+                                                provider,
+                                                mode,
+                                            ),
+                                        );
+                                    }
+                                    // #2763: the effective subagent caps, when set.
+                                    let caps = match provider {
+                                        rsi_common::types::SessionProvider::Claude => {
+                                            Some(runtime_config.claude_subagent_caps())
+                                        }
+                                        rsi_common::types::SessionProvider::Codex
+                                        | rsi_common::types::SessionProvider::Pioneer => {
+                                            Some(runtime_config.codex_subagent_caps())
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(event) = caps.and_then(|caps| {
+                                        crate::provider_stream_health::subagent_caps_event(
+                                            session_id,
+                                            &mut sequence,
+                                            provider,
+                                            &caps,
+                                        )
+                                    }) {
+                                        converted.push(event);
+                                    }
+                                }
+                            }
+                            {
+                                // #2767: an explicit skills delivery with skills
+                                // to deliver expects the init to list the plugin.
+                                if stream_health.wants_expectation(&stream_event) {
+                                    let working_dir = active
+                                        .read()
+                                        .await
+                                        .get(&session_id)
+                                        .map(|tracked| tracked.session.working_dir.clone());
+                                    stream_health.expect_skill_plugin(
+                                        runtime_config.provider_skill_delivery().is_explicit()
+                                            && working_dir.as_deref().is_some_and(
+                                                crate::skill_delivery::claude_skills_expected,
+                                            ),
+                                    );
+                                }
+                                let expects_agent_mcp = stream_health
+                                    .wants_expectation(&stream_event)
+                                    && agent_tokens
+                                        .read()
+                                        .await
+                                        .binding_for_session(session_id)
+                                        .is_some();
+                                let observed = stream_health.observe(
+                                    &stream_event,
+                                    session_id,
+                                    &mut sequence,
+                                    expects_agent_mcp,
+                                );
+                                converted.extend(observed.events);
+                                // #2762: a result whose `modelUsage` shows a
+                                // member of the operator's fallback chain next
+                                // to the session's own model records which
+                                // model actually ran.
+                                if stream_event.event_type == "result" {
+                                    let (session_model, provider) = active
+                                        .read()
+                                        .await
+                                        .get(&session_id)
+                                        .map_or((None, None), |tracked| {
+                                            (
+                                                tracked.session.model.clone(),
+                                                Some(tracked.session.provider),
+                                            )
+                                        });
+                                    if provider == Some(rsi_common::types::SessionProvider::Claude) {
+                                        let chain = crate::claude::claude_fallback_chain_for(
+                                            session_model.as_deref(),
+                                            &runtime_config.claude_fallback_models(),
+                                        );
+                                        let fallback = monitor::model_fallback_used(
+                                            &stream_event,
+                                            session_model.as_deref(),
+                                            &chain,
+                                        );
+                                        converted.extend(stream_health.observe_model_fallback(
+                                            fallback,
+                                            session_id,
+                                            &mut sequence,
+                                        ));
+                                    }
+                                }
+                                if !observed.notices.is_empty() {
+                                    let project_id = active
+                                        .read()
+                                        .await
+                                        .get(&session_id)
+                                        .and_then(|tracked| tracked.session.project_id);
+                                    for finding in observed.notices {
+                                        tracing::warn!(
+                                            session_id = %session_id,
+                                            kind = finding.kind,
+                                            names = ?finding.names,
+                                            "Claude session health finding"
+                                        );
+                                        let Some(project_id) = project_id else { continue };
+                                        if let Err(error) = store
+                                            .lock()
+                                            .await
+                                            .record_provider_session_health_notice(
+                                                project_id,
+                                                session_id,
+                                                finding.kind,
+                                                &finding.names,
+                                                &finding.content,
+                                                chrono::Utc::now(),
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                session_id = %session_id,
+                                                error = %error,
+                                                "Failed to record session health notice"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             if let Some(cursor) = spool_cursor {
                                 if let Err(error) = persist_detached_batch(&active, &store, session_id, expected_generation,
@@ -4096,18 +4409,40 @@ impl SessionManager {
                                     }
                                 }
                                 let result = result_evidence(&stream_event);
-                                let session_model = active
+                                let (session_model, session_provider) = active
                                     .read()
                                     .await
                                     .get(&session_id)
                                     .filter(|tracked| {
                                         tracked.spawn_generation == expected_generation
                                     })
-                                    .and_then(|tracked| tracked.session.model.clone());
-                                let meta = monitor::extract_result_metadata(
+                                    .map_or((None, None), |tracked| {
+                                        (
+                                            tracked.session.model.clone(),
+                                            Some(tracked.session.provider),
+                                        )
+                                    });
+                                // One computation, every stop-reason adjustment
+                                // applied (#2824): the login-probe note below and
+                                // the tracked-session write read the same value.
+                                let meta = monitor::extract_adjusted_result_metadata(
                                     &stream_event,
                                     session_model.as_deref(),
+                                    monitor::ResultContext {
+                                        provider_error: matches!(
+                                            result,
+                                            TerminalResult::ProviderError
+                                        ),
+                                        api_retry_class,
+                                        tool_rejection_last,
+                                        rejected_model: rejected_model_notice.is_some(),
+                                    },
                                 );
+                                if let (Some(provider), Some(reason)) =
+                                    (session_provider, meta.stop_reason.as_deref())
+                                {
+                                    note_provider_auth_stop(provider, session_model.as_deref(), reason);
+                                }
                                 let runtime_budget_changed = if let Some(ctx_window) =
                                     meta.context_window
                                 {
@@ -4158,15 +4493,6 @@ impl SessionManager {
                                     let mut active_guard = active.write().await;
                                     let mut wd: Option<std::path::PathBuf> = None;
                                     if let Some(tracked) = active_guard.get_mut(&session_id) {
-                                        // The session's own model selects the
-                                        // right `modelUsage` entry: a turn that
-                                        // ran a subagent reports one entry per
-                                        // model, and picking the wrong one binds
-                                        // the wrong context window (G-005).
-                                        let meta = monitor::extract_result_metadata(
-                                            &stream_event,
-                                            tracked.session.model.as_deref(),
-                                        );
                                         if let Some(duration) = meta.duration_ms {
                                             tracked.session.duration_ms = Some(duration);
                                         }
@@ -4199,12 +4525,6 @@ impl SessionManager {
                                         if let Some(reason) = meta.stop_reason {
                                             tracked.session.stop_reason = Some(reason);
                                         }
-                                        if rejected_model_notice.is_some() {
-                                            tracked.session.stop_reason = Some(
-                                                monitor::PROVIDER_MODEL_UNRECOGNIZED_REASON
-                                                    .to_string(),
-                                            );
-                                        }
                                         // V99/P1-C: richer usage capture. Each
                                         // field is applied only when the result
                                         // actually reported it, so an absent
@@ -4233,12 +4553,6 @@ impl SessionManager {
                                         }
                                         if let Some(reason) = meta.terminal_reason {
                                             tracked.session.terminal_reason = Some(reason);
-                                        }
-                                        if rejected_model_notice.is_some() {
-                                            tracked.session.terminal_reason = Some(
-                                                monitor::PROVIDER_MODEL_UNRECOGNIZED_REASON
-                                                    .to_string(),
-                                            );
                                         }
                                         wd = Some(tracked.session.working_dir.clone());
                                     }
@@ -4737,8 +5051,8 @@ impl SessionManager {
                         .process
                         .as_mut()
                         .is_some_and(super::types::ProviderProcess::is_alive);
-                    if !process_alive && let Some(process) = t.process.as_mut() {
-                        t.exit_code = process.try_exit_status();
+                    if !process_alive {
+                        t.record_provider_exit();
                     }
                     exit_code_for_retry = t.exit_code;
                     let action = t
@@ -4771,6 +5085,8 @@ impl SessionManager {
                         stall_interrupted: t.stall_interrupted,
                         interrupt_requested: t.interrupt_requested,
                         pending_question: t.pending_question.is_some(),
+                        provider_exit_stop: t.interrupt_source
+                            == Some(crate::terminal_cause::InterruptSource::ProviderExit),
                         rotation_action,
                     };
                     (action, rid, evidence)
@@ -4801,6 +5117,7 @@ impl SessionManager {
                             stall_interrupted: false,
                             interrupt_requested: false,
                             pending_question: false,
+                            provider_exit_stop: false,
                             rotation_action: TerminalRotationAction::None,
                         },
                     )
@@ -4809,8 +5126,7 @@ impl SessionManager {
         };
         let mut c5_disposition =
             crate::store::daemon_settings::RecoveryDisposition::NoRecoverySource;
-        let mut no_result_verdict = super::worker_result_guard::NoResultVerdict::NotApplicable;
-        let finalize_decision = match terminal_decision(evidence) {
+        let (finalize_decision, no_result_verdict) = match terminal_decision(evidence) {
             TerminalDecision::StaleGeneration => {
                 tracing::warn!(
                     session_id = %session_id,
@@ -4831,7 +5147,7 @@ impl SessionManager {
             TerminalDecision::Finalize(decision) => {
                 // #1098: a covered worker ending a turn without RESULT. Boxed
                 // and out of line so the monitor future stays small.
-                no_result_verdict = super::worker_result_guard::verdict_for_active_boxed(
+                let no_result_verdict = super::worker_result_guard::verdict_for_active_boxed(
                     &store,
                     &active,
                     session_id,
@@ -4844,6 +5160,9 @@ impl SessionManager {
                 // tool calls, out of line and before the write lock.
                 let tree_clean_at_handoff = decision.status == SessionStatus::Completed
                     && super::post_handoff::tree_unchanged_proof_boxed(&active, session_id).await;
+                // #2320: a sandbox that ends its turn off its assigned branch
+                // is put back when that is safe, and reported either way.
+                super::branch_custody::check_turn_end_boxed(&active, session_id, &event_bus).await;
                 let mut active_guard = active.write().await;
                 let Some(tracked) = active_guard.get_mut(&session_id) else {
                     return;
@@ -4867,7 +5186,7 @@ impl SessionManager {
                     tracked.session.stop_reason =
                         provider_launch_failure_stop_reason(evidence, decision);
                 }
-                decision
+                (decision, no_result_verdict)
             }
         };
         let Some(finalized_decision) = Self::finalize_session(
@@ -5454,6 +5773,82 @@ impl SessionManager {
                     }))),
                 }]);
             }
+            // #3163: a Harness model stream failed after output was forwarded;
+            // the partial output is superseded by a retry of the step.
+            super::harness::agent_loop::STREAM_SUPERSEDED_STREAM_EVENT => {
+                *sequence += 1;
+                let detail = stream
+                    .data
+                    .get("detail_code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("stream_disconnected")
+                    .to_string();
+                let retry = stream
+                    .data
+                    .get("retry")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::System,
+                    role: None,
+                    content: format!(
+                        "[harness] the model stream failed ({detail}); its partial output is \
+                         superseded and the step is retried (stream retry {retry})"
+                    ),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "stream_superseded": { "detail_code": detail, "retry": retry },
+                    }))),
+                }]);
+            }
+            // #2257: the same Harness tool call failed the same way three times
+            // and the model was nudged once; record it as a visible System row.
+            super::harness::agent_loop::REPEAT_FAILURE_STREAM_EVENT => {
+                *sequence += 1;
+                let name = stream
+                    .data
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("a tool")
+                    .to_string();
+                let count = stream
+                    .data
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let error = stream
+                    .data
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::System,
+                    role: None,
+                    content: format!(
+                        "[harness] `{name}` failed the same way {count} times in a row; \
+                         nudged the model to change approach: {error}"
+                    ),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "repeat_failure": { "name": name, "count": count, "error": error },
+                    }))),
+                }]);
+            }
             super::harness::tools::utility::PLAN_STREAM_EVENT => {
                 let mut content = stream
                     .data
@@ -5589,7 +5984,36 @@ impl SessionManager {
             "tool_result" => EventType::ToolResult,
             "system" => EventType::System,
             "parse_error" => EventType::System, // Surface parse errors as system events
-            "result" => return Some(Vec::new()), // Handled separately
+            // Handled separately, except a schema-validated handoff (#2759):
+            // Claude's `structured_output` is the turn's final message, so it
+            // becomes the assistant `Message` the topology executor reads,
+            // as the canonical handoff block.
+            "result" => {
+                let Some(payload) = stream
+                    .data
+                    .get("structured_output")
+                    .filter(|value| value.is_object())
+                else {
+                    return Some(Vec::new());
+                };
+                let content = rsi_common::structured_handoff::render_structured_handoff(payload)
+                    .unwrap_or_else(|| payload.to_string());
+                *sequence += 1;
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::Message,
+                    role: Some(Role::Assistant),
+                    content,
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({ "structured_output": true }))),
+                }]);
+            }
             _ => return None,
         };
 
@@ -6332,6 +6756,7 @@ mod terminal_decision_tests {
             stall_interrupted: false,
             interrupt_requested: false,
             pending_question: false,
+            provider_exit_stop: false,
             rotation_action: TerminalRotationAction::None,
         }
     }
@@ -6473,6 +6898,74 @@ mod terminal_decision_tests {
         for (name, evidence, expected) in cases {
             assert_eq!(terminal_decision(evidence), expected, "{name}");
         }
+    }
+
+    /// Hub #3029: the reconciler stops the monitor because the provider child
+    /// is gone. A final successful result followed by exit 0 is a finished
+    /// turn; every other evidence keeps the interrupt.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn provider_exit_after_result_is_completed_and_every_other_exit_stays_interrupted() {
+        let completed = TerminalDecision::Finalize(TerminalFinalizeDecision::completed());
+        let interrupted = TerminalDecision::Finalize(TerminalFinalizeDecision::interrupted());
+        let mut clean = evidence();
+        clean.break_reason = MonitorBreakReason::Interrupted;
+        clean.provider_exit_stop = true;
+        clean.current_result = TerminalResult::Success;
+        clean.exit_code = Some(0);
+        assert_eq!(terminal_decision(clean), completed, "result then exit 0");
+
+        let mut no_result = clean;
+        no_result.current_result = TerminalResult::None;
+        assert_eq!(
+            terminal_decision(no_result),
+            interrupted,
+            "exit 0 before any result event"
+        );
+
+        let mut nonzero = clean;
+        nonzero.exit_code = Some(1);
+        assert_eq!(terminal_decision(nonzero), interrupted, "non-zero exit");
+
+        let mut signalled = clean;
+        signalled.exit_code = Some(-1);
+        assert_eq!(terminal_decision(signalled), interrupted, "signal exit");
+
+        let mut unknown_exit = clean;
+        unknown_exit.exit_code = None;
+        assert_eq!(terminal_decision(unknown_exit), interrupted, "exit unknown");
+
+        let mut halted = clean;
+        halted.interrupt_requested = true;
+        assert_eq!(terminal_decision(halted), interrupted, "halt");
+
+        // A deploy cut-off, a manager action or an unnamed writer is not the
+        // reconciler's provider-exit source.
+        let mut deploy_cut_off = clean;
+        deploy_cut_off.provider_exit_stop = false;
+        assert_eq!(
+            terminal_decision(deploy_cut_off),
+            interrupted,
+            "deploy cut-off"
+        );
+
+        let mut stalled = clean;
+        stalled.stall_interrupted = true;
+        assert_eq!(
+            terminal_decision(stalled),
+            TerminalDecision::Finalize(TerminalFinalizeDecision::failed(
+                AutofileCause::StallTimeout
+            )),
+            "stall"
+        );
+
+        let mut provider_error = clean;
+        provider_error.current_result = TerminalResult::ProviderError;
+        assert_eq!(
+            terminal_decision(provider_error),
+            interrupted,
+            "provider error result"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -7139,6 +7632,54 @@ mod unrecognized_stream_event_tests {
         );
     }
 
+    /// #2759: Claude's schema-validated `structured_output` on the result event
+    /// is the turn's final assistant message, rendered as the canonical handoff
+    /// block the topology executor parses; the parsed handoff matches the
+    /// payload. A result without it still yields nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn a_result_with_structured_output_becomes_the_final_handoff_message() {
+        let session_id = Uuid::new_v4();
+        let result = StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({
+                "subtype": "success",
+                "is_error": false,
+                "result": "",
+                "structured_output": {
+                    "stage": "IMPLEMENTATION", "status": "complete",
+                    "doc_path": "inline", "manifest_path": "inline",
+                    "summary": "done", "commit": "0123456789abcdef0123456789abcdef01234567",
+                    "scoped_test_job": null, "scoped_test_exit_code": 0, "tests_added": null,
+                    "evidence_commit": null, "blocker": null, "blocker_class": null,
+                    "blocker_evidence": null, "blocker_question": null,
+                    "capability_class": null, "friction": "none"
+                }
+            }),
+        };
+        let mut sequence = 4;
+        let converted =
+            SessionManager::convert_recognized_stream_event(&result, session_id, &mut sequence)
+                .expect("recognized");
+        assert_eq!(converted.len(), 1);
+        assert_eq!(sequence, 5);
+        let event = &converted[0];
+        assert_eq!(event.event_type, EventType::Message);
+        assert_eq!(event.role, Some(Role::Assistant));
+        let handoff = rsi_common::agent_contract::parse_pipeline_handoff_v2(&event.content, "")
+            .expect("the rendered message is a valid handoff");
+        assert_eq!(
+            handoff.strict_status,
+            rsi_common::agent_contract::PipelineStatusV2::Complete
+        );
+        // The executor reads the last assistant message of the conversation.
+        let output = crate::session::graph_runner::extract_session_output(&converted);
+        assert!(matches!(
+            output.get("content"),
+            Some(rsi_graph::data::Value::String(text)) if text == &event.content
+        ));
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn a_content_less_system_event_is_recognized_and_dropped() {
@@ -7638,6 +8179,7 @@ mod live_context_state_tests {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
+            interrupt_evidence: Default::default(),
             pending_archive: false,
             rotation: RotationCoordinator::new(session_id, 0, false),
             live_input_tokens,
@@ -7657,15 +8199,16 @@ mod live_context_state_tests {
             work_time_base_ms: 0,
             received_meaningful_output: false,
             exit_code: None,
-            retry_attempt: 0,
             max_retries: 0,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
+            turn_tools: Default::default(),
             last_usage_update: None,
             last_mismatch_warn: None,
             last_classified_at: None,
             classification_count: 0,
             last_verdict: None,
+            store_fields: Default::default(),
         }
     }
 
@@ -7701,7 +8244,7 @@ mod live_context_state_tests {
             break_reason: MonitorBreakReason::Result,
         });
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("test.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("test.db")).unwrap();
         store.insert_session(&tracked.session).unwrap();
         capture_spawn_child_handoff(&mut tracked.session, &action);
         store.update_session_metadata(&tracked.session).unwrap();
@@ -8444,7 +8987,7 @@ mod live_context_state_tests {
             .expect("fixture starts with a typed budget");
         let directory = tempfile::tempdir().expect("create runtime rollback store");
         let store = Arc::new(tokio::sync::Mutex::new(
-            Store::open(&directory.path().join("runtime-rollback.db"))
+            Store::open_test_fixture(&directory.path().join("runtime-rollback.db"))
                 .expect("open runtime rollback store"),
         ));
         {
@@ -9405,6 +9948,124 @@ mod retry_tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "stall timeout");
     }
+
+    /// #2109: the terminal Codex events of workers 5ad7e7af (launch) and
+    /// 2e6901d6 (mid-work, after ~3.5 h) carried the same text; both map to a
+    /// stop reason the capacity classifiers recognize, and both heal as
+    /// capacity. A non-capacity provider error keeps its own classification.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn real_codex_capacity_events_map_to_capacity_stop_reasons() {
+        use crate::model_control::transient_heal::{
+            PROVIDER_CAPACITY_HEAL_REASON, TransientVerdict, classify_transient_failure_with_stop,
+        };
+        let event = |provider_event_type: &str, text: &str| StreamEvent {
+            event_type: "process_error".into(),
+            data: serde_json::json!({
+                "source": "codex_event",
+                "provider_event_type": provider_event_type,
+                "terminal": true,
+                "error": text,
+            }),
+        };
+        for provider_event_type in ["error", "turn.failed"] {
+            let stop = terminal_provider_stop_reason(&event(
+                provider_event_type,
+                "Selected model is at capacity. Please try a different model.",
+            ))
+            .expect("a terminal provider error has a stop reason");
+            assert_eq!(
+                stop,
+                "provider_error:codex:Selected model is at capacity. Please try a different model."
+            );
+            assert!(
+                crate::store_support::provider_defaults::is_provider_capacity_stop_reason(&stop)
+            );
+            assert_eq!(
+                classify_transient_failure_with_stop(None, Some(&stop), None, &[]),
+                TransientVerdict::Transient {
+                    reason: PROVIDER_CAPACITY_HEAL_REASON
+                }
+            );
+        }
+        let fatal = terminal_provider_stop_reason(&event(
+            "error",
+            "unexpected status 429 Too Many Requests",
+        ))
+        .expect("stop reason");
+        assert!(!crate::store_support::provider_defaults::is_provider_capacity_stop_reason(&fatal));
+        assert!(
+            !classify_transient_failure_with_stop(None, Some(&fatal), None, &[]).is_transient()
+        );
+    }
+
+    /// #2753: a logged-out `codex exec` ends on the 401 `Missing bearer or basic
+    /// authentication`; that is the typed missing-login class, distinct from a
+    /// rejected credential, and neither is healed as transient capacity.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn codex_logged_out_failure_maps_to_login_required_and_a_rejected_key_to_auth_invalid() {
+        use crate::model_control::transient_heal::classify_transient_failure_with_stop;
+        let stop_for = |text: &str| {
+            terminal_provider_stop_reason(&StreamEvent {
+                event_type: "process_error".into(),
+                data: serde_json::json!({
+                    "source": "codex_event",
+                    "provider_event_type": "turn.failed",
+                    "terminal": true,
+                    "error": text,
+                }),
+            })
+            .expect("a terminal provider error has a stop reason")
+        };
+        let logged_out = stop_for(
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+        );
+        assert_eq!(
+            logged_out,
+            crate::store_support::provider_defaults::PROVIDER_LOGIN_REQUIRED_STOP_REASON
+        );
+        let rejected = stop_for("unexpected status 401 Unauthorized: Incorrect API key provided");
+        assert_eq!(
+            rejected,
+            crate::store_support::provider_defaults::PROVIDER_AUTH_INVALID_STOP_REASON
+        );
+        for stop in [&logged_out, &rejected] {
+            assert!(
+                !classify_transient_failure_with_stop(None, Some(stop), None, &[]).is_transient()
+            );
+        }
+        // Both auth stop reasons are the ones the login probe follows.
+        assert!(is_auth_stop_reason(&logged_out));
+        assert!(is_auth_stop_reason(&rejected));
+        assert!(!is_auth_stop_reason("provider_error:codex_usage_limit"));
+    }
+
+    /// #2735: the Codex 400 for a model the ChatGPT account cannot use is the
+    /// typed `model_unavailable` class naming the model, not a generic provider
+    /// error, and it is never healed as transient capacity.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn codex_model_refusal_maps_to_typed_model_unavailable_stop_reason() {
+        use crate::model_control::transient_heal::classify_transient_failure_with_stop;
+        let text = "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.\"}}";
+        for provider_event_type in ["error", "turn.failed"] {
+            let stop = terminal_provider_stop_reason(&StreamEvent {
+                event_type: "process_error".into(),
+                data: serde_json::json!({
+                    "source": "codex_event",
+                    "provider_event_type": provider_event_type,
+                    "terminal": true,
+                    "error": text,
+                }),
+            })
+            .expect("a terminal provider error has a stop reason");
+            assert_eq!(stop, "provider_error:model_unavailable:gpt-6.1-sol");
+            assert!(
+                !classify_transient_failure_with_stop(None, Some(&stop), None, &[]).is_transient()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9426,7 +10087,7 @@ mod pending_question_producer_tests {
         Uuid,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("question-producer.db")).unwrap();
+        let store = Store::open_test_fixture(&dir.path().join("question-producer.db")).unwrap();
         let stamp = chrono::Utc::now();
         let project = Uuid::new_v4();
         store

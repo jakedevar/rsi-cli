@@ -172,18 +172,12 @@ impl<'a> CodegraphReadService<'a> {
         let mut after = None;
         let mut scanned = 0usize;
         loop {
-            let page = {
-                let guard = store.blocking_lock();
-                if !guard
-                    .codegraph_read_fence_matches(&mut fence)
-                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
-                {
-                    return Err(CodegraphServiceError::ScopeDenied);
-                }
-                guard
-                    .codegraph_custody_page(after, false, 64)
-                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
-            };
+            // One fence check per traversal, at the match below: a registry
+            // change since the fence is refused there (#306).
+            let page = store
+                .blocking_lock()
+                .codegraph_custody_page(after, false, 64)
+                .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
             if page.is_empty() {
                 return Err(CodegraphServiceError::ScopeDenied);
             }
@@ -470,6 +464,7 @@ impl<'a> CodegraphReadService<'a> {
                 changed_paths: s.metrics.changed_paths,
                 staged_files: s.metrics.staged_files,
                 overflow_count: s.metrics.overflow_count,
+                skipped_symlinks: s.metrics.skipped_symlinks,
             }),
             run_id: durable.as_ref().and_then(|s| s.run_id),
             last_attempt_at: durable.as_ref().and_then(|s| s.last_attempt_at.clone()),
@@ -481,7 +476,38 @@ impl<'a> CodegraphReadService<'a> {
                 .map(|error| bounded_status_error(&error)),
             pending_rescan: transient.as_ref().is_some_and(|s| s.pending_rescan)
                 || durable.as_ref().is_some_and(|s| s.metrics.pending_rescan),
+            partial_reasons: durable
+                .as_ref()
+                .map(|s| {
+                    s.metrics
+                        .partial_reasons
+                        .iter()
+                        .map(|reason| reason.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            scope_note: self.scope_note(binding)?,
         })
+    }
+
+    /// A non-primary checkout the index never registers (sandboxes and
+    /// worktrees wait for content-shared storage, #2245) would otherwise read
+    /// as an indexing failure. Say it is deliberate.
+    fn scope_note(
+        &self,
+        binding: &IndexWorkspaceBinding,
+    ) -> Result<Option<String>, CodegraphServiceError> {
+        if matches!(
+            binding.workspace.instance,
+            rsi_codegraph::WorkspaceInstanceKey::Primary
+        ) {
+            return Ok(None);
+        }
+        let registered = self
+            .handle
+            .registered_workspace(binding.workspace.workspace_id())?
+            .is_some();
+        Ok((!registered).then(|| "primary_checkout_only".to_owned()))
     }
 
     pub fn list_workspaces(
@@ -570,18 +596,12 @@ impl<'a> CodegraphReadService<'a> {
             let mut after = None;
             let mut scanned = 0usize;
             loop {
-                let page = {
-                    let guard = store.blocking_lock();
-                    if !guard
-                        .codegraph_read_fence_matches(fence.as_mut().expect("Store read fence"))
-                        .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
-                    {
-                        return Err(CodegraphServiceError::CursorExpired);
-                    }
-                    guard
-                        .codegraph_custody_page(after, false, 64)
-                        .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?
-                };
+                // The fence is checked once after the last page and the
+                // status reads below, not per page (#306).
+                let page = store
+                    .blocking_lock()
+                    .codegraph_custody_page(after, false, 64)
+                    .map_err(|error| CodegraphServiceError::Invalid(error.to_string()))?;
                 if page.is_empty() {
                     break;
                 }

@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 /// Upper bound on one response line (large conversations included).
 pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
@@ -49,12 +48,44 @@ impl std::fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
+/// One connection to rsid. rsid listens on a Unix socket only (AF_UNIX,
+/// `crates/rsid/src/instance_guard.rs`), so this is a `UnixStream` on Unix.
+/// rsid does not run on Windows yet (hub #1229): there the type is a stand-in
+/// that [`connect_socket`] never returns, so the backend builds and every
+/// daemon call fails with [`UNSUPPORTED_TRANSPORT`].
+#[cfg(unix)]
+pub type DaemonStream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+pub type DaemonStream = tokio::io::DuplexStream;
+
+/// The error every daemon call returns where rsid's transport does not exist.
+pub const UNSUPPORTED_TRANSPORT: &str = "rsid's socket transport is Unix-only; the desktop cannot reach rsid on this platform yet (hub #1229)";
+
+/// Open one connection to the daemon socket at `socket`.
+pub async fn connect_socket(socket: &Path) -> std::io::Result<DaemonStream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            UNSUPPORTED_TRANSPORT,
+        ))
+    }
+}
+
 /// Resolve the daemon socket: `$RSI_DAEMON_SOCKET`, else `~/.rsi/daemon.sock`.
 pub fn default_socket() -> PathBuf {
     if let Some(p) = std::env::var_os("RSI_DAEMON_SOCKET").filter(|p| !p.is_empty()) {
         return PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    // USERPROFILE is the home directory on Windows, which has no HOME.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".rsi").join("daemon.sock")
 }
 
@@ -90,7 +121,7 @@ impl DaemonClient {
     }
 
     async fn exchange(&self, method: &str, params: Value) -> Result<Value, DaemonError> {
-        let mut stream = UnixStream::connect(&self.socket)
+        let mut stream = connect_socket(&self.socket)
             .await
             .map_err(|e| DaemonError::Connect(format!("{}: {e}", self.socket.display())))?;
         let request = json!({
@@ -137,11 +168,16 @@ pub fn parse_response(line: &[u8]) -> Result<Value, DaemonError> {
         .ok_or_else(|| DaemonError::Malformed("response is not an object".into()))?;
     if let Some(err) = obj.get("error").filter(|e| !e.is_null()) {
         let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-        let message = err
+        let mut message = err
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error")
             .to_string();
+        // A typed Issue-workspace error carries its code in `data` (stale_version,
+        // dependency_cycle, ...); keep it so the UI can tell a stale write apart.
+        if let Some(code) = err.pointer("/data/code").and_then(Value::as_str) {
+            message = format!("{message} [{code}]");
+        }
         return Err(DaemonError::Rpc { code, message });
     }
     Ok(obj.get("result").cloned().unwrap_or(Value::Null))
@@ -150,9 +186,12 @@ pub fn parse_response(line: &[u8]) -> Result<Value, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
+    #[cfg(unix)]
     fn fake_daemon(dir: &Path, reply: &'static str) -> (PathBuf, Arc<Mutex<Option<String>>>) {
         let sock = dir.join("d.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -169,6 +208,7 @@ mod tests {
         (sock, seen)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn sends_one_line_request_without_token_and_returns_result() {
         let dir = tempfile::tempdir().unwrap();
@@ -187,6 +227,19 @@ mod tests {
         assert!(sent.get("session_token").is_none());
     }
 
+    #[test]
+    fn typed_workspace_error_code_is_kept_in_the_message() {
+        let line = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"row changed","data":{"code":"stale_version","retryable":false}}}"#;
+        assert_eq!(
+            parse_response(line).unwrap_err(),
+            DaemonError::Rpc {
+                code: -32000,
+                message: "row changed [stale_version]".into()
+            }
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn rpc_error_object_maps_to_rpc_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -217,6 +270,7 @@ mod tests {
         assert!(matches!(err, DaemonError::Connect(_)));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn silent_daemon_times_out() {
         let dir = tempfile::tempdir().unwrap();

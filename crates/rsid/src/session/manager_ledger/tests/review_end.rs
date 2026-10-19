@@ -487,7 +487,7 @@ async fn codex_review_mid_turn_restart_preserves_assignment_and_resumes_exact_wo
     }
     let mut restarted = SessionManager::new(
         Arc::new(EventBus::new(64)),
-        Store::open(&f.dir.path().join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&f.dir.path().join("rsi.db")).unwrap(),
         false,
         f.dir.path().join("restart.sock"),
         None,

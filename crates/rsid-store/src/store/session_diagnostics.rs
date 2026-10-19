@@ -5,7 +5,7 @@ use crate::error::{DaemonError, Result};
 use crate::store::parse_timestamp;
 use chrono::SecondsFormat;
 use rsi_common::types::{NewSessionDiagnosticV1, SessionDiagnosticLevelV1, SessionDiagnosticV1};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 pub const MAX_SESSION_DIAGNOSTIC_MESSAGE_BYTES: usize = 4 * 1024;
@@ -69,6 +69,7 @@ pub(crate) fn apply_v127_migration(store: &Store) -> Result<()> {
 }
 // RSI-RELEASED-MIGRATION-END: v127-session-diagnostics-migration
 
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: v127-session-diagnostics-catalog
 pub(crate) const V127_CATALOG_OBJECTS: [(&str, &str); 4] = [
     ("table", "session_diagnostics"),
@@ -79,7 +80,8 @@ pub(crate) const V127_CATALOG_OBJECTS: [(&str, &str); 4] = [
 // RSI-RELEASED-MIGRATION-END: v127-session-diagnostics-catalog
 
 /// Install the schema in isolated tests.
-pub(crate) fn install_schema(conn: &Connection) -> Result<()> {
+#[cfg(any(test, feature = "test-seam"))]
+pub(crate) fn install_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(SESSION_DIAGNOSTICS_SCHEMA)?;
     Ok(())
 }

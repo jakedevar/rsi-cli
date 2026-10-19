@@ -89,6 +89,12 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
+    // `rsi-eval bench ...` (#3179) is a separate command family with its own arguments.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "bench") {
+        return rsi_eval::bench::run_cli(args.into_iter().skip(2));
+    }
+
     let cli = Cli::parse();
 
     match run(cli).await {

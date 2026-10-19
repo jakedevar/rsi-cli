@@ -68,7 +68,7 @@ pub fn grant_narrows(child: &GrantBoundsV1, parent: &GrantBoundsV1) -> Result<()
         || child
             .launches
             .iter()
-            .any(|launch| !parent.launches.contains(launch))
+            .any(|launch| !parent.launches.iter().any(|entry| entry.allows(launch)))
     {
         return Err(MANAGER_CAPABILITY_WIDENED);
     }
@@ -191,6 +191,31 @@ impl ManagerNodeGrantV1 {
     }
 }
 
+/// Intersect allowlists, retaining the narrower entry for each matching pair.
+/// Empty lists have no overlap; inheritance is handled by the caller.
+#[must_use]
+pub fn intersect_launches(
+    left: &[ManagerLaunchChoiceV2],
+    right: &[ManagerLaunchChoiceV2],
+) -> Vec<ManagerLaunchChoiceV2> {
+    let mut result = Vec::new();
+    for a in left {
+        for b in right {
+            let choice = if a.allows(b) {
+                b
+            } else if b.allows(a) {
+                a
+            } else {
+                continue;
+            };
+            if !result.contains(choice) {
+                result.push(choice.clone());
+            }
+        }
+    }
+    result
+}
+
 /// The launches a portfolio grant may make in a project: the operator grant's
 /// `allowed_launches`, narrowed by the project policy's list when that list
 /// is non-empty (an empty V2 list means "any launch"). A disjoint policy list
@@ -200,13 +225,11 @@ pub fn portfolio_effective_launches(
     allowed_launches: &[ManagerLaunchChoiceV2],
     policy: &ManagerPolicyV2,
 ) -> Vec<ManagerLaunchChoiceV2> {
-    let narrowed: Vec<_> = allowed_launches
-        .iter()
-        .filter(|launch| {
-            policy.allowed_launches.is_empty() || policy.allowed_launches.contains(launch)
-        })
-        .cloned()
-        .collect();
+    let narrowed = if policy.allowed_launches.is_empty() {
+        allowed_launches.to_vec()
+    } else {
+        intersect_launches(allowed_launches, &policy.allowed_launches)
+    };
     if narrowed.is_empty() {
         allowed_launches.to_vec()
     } else {
@@ -348,6 +371,73 @@ mod tests {
         child.allowances = vec![3, 7, 0];
         child.provider_limits[0].max_active = 3;
         child
+    }
+
+    #[test]
+    fn launch_narrowing_preserves_any_effort_ceiling() {
+        let mut parent = parent();
+        parent.launches[0].effort = None;
+        let mut child = child();
+        assert_eq!(grant_narrows(&child, &parent), Ok(()));
+        child.launches[0].effort = Some("low".into());
+        assert_eq!(grant_narrows(&child, &parent), Ok(()));
+        child.launches[0].effort = None;
+        assert_eq!(grant_narrows(&child, &parent), Ok(()));
+        parent.launches[0].effort = Some("high".into());
+        assert_eq!(
+            grant_narrows(&child, &parent),
+            Err(MANAGER_CAPABILITY_WIDENED)
+        );
+        child.launches[0].effort = Some("low".into());
+        assert_eq!(
+            grant_narrows(&child, &parent),
+            Err(MANAGER_CAPABILITY_WIDENED)
+        );
+    }
+
+    #[test]
+    fn launch_intersection_keeps_exact_effort_in_both_directions() {
+        let exact = launch("a");
+        let mut any = exact.clone();
+        any.effort = None;
+        assert_eq!(
+            intersect_launches(&[any.clone()], &[exact.clone()]),
+            vec![exact.clone()]
+        );
+        assert_eq!(
+            intersect_launches(&[exact.clone()], &[any.clone()]),
+            vec![exact.clone()]
+        );
+        assert_eq!(
+            intersect_launches(&[any.clone()], &[any.clone()]),
+            vec![any.clone()]
+        );
+        let mut low = exact.clone();
+        low.effort = Some("low".into());
+        assert_eq!(intersect_launches(&[exact.clone()], &[low]), vec![]);
+        assert_eq!(intersect_launches(&[any.clone()], &[launch("b")]), vec![]);
+        let mut policy = ManagerPolicyV2::default();
+        policy.allowed_launches = vec![exact.clone()];
+        assert_eq!(
+            portfolio_effective_launches(&[any.clone()], &policy),
+            vec![exact.clone()]
+        );
+        policy.allowed_launches = vec![any.clone()];
+        assert_eq!(
+            portfolio_effective_launches(&[exact.clone()], &policy),
+            vec![exact.clone()]
+        );
+        policy.allowed_launches.clear();
+        assert_eq!(
+            portfolio_effective_launches(&[any.clone()], &policy),
+            vec![any.clone()]
+        );
+        // Preserve the existing fallback for a wholly disjoint project policy.
+        policy.allowed_launches = vec![launch("b")];
+        assert_eq!(
+            portfolio_effective_launches(&[any.clone()], &policy),
+            vec![any]
+        );
     }
 
     #[test]

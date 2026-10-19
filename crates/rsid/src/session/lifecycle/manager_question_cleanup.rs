@@ -52,6 +52,7 @@ impl SessionManager {
                     if !proved_dead {
                         let kill = tokio::time::timeout(Duration::from_secs(5), process.kill()).await;
                         let alive = process.is_alive();
+                        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
                         let orphan_store = std::sync::Arc::clone(&store);
                         #[cfg(target_os = "linux")]
                         let reap = tokio::task::spawn_blocking(move || {
@@ -92,7 +93,10 @@ impl SessionManager {
                 }.await;
                 match outcome {
                     Ok(()) => {
-                        completed.write().await.insert(session_id, cached);
+                        crate::session::cohort_settlement::publish_completed_from_store(
+                            &completed, &store, session_id, cached,
+                        )
+                        .await;
                         if let Some(tx) = first_tx.take() {
                             let _ = tx.send(());
                         }

@@ -1,0 +1,7 @@
+# Generated files are compared byte for byte by `npm test` (--check);
+# keep them LF on every platform (Windows autocrlf would make them stale).
+PARITY.md text eol=lf
+parity-status.d/*.json text eol=lf
+src/actions/*.generated.ts text eol=lf
+src/keymap.generated.ts text eol=lf
+src-tauri/src/handlers.generated.rs text eol=lf

@@ -37,50 +37,29 @@ pub enum CommandSource {
 
 /// Discover commands from `.claude/commands/` and `.claude/skills/` directories.
 ///
-/// Scans relative to `working_dir` (the cwd when the TUI starts).
+/// Scans relative to `working_dir` (the cwd when the TUI starts) through the
+/// discovery `rsid`'s `ListSlashCommands` serves (hub #3044,
+/// `rsi_common::input_assets`): frontmatter descriptions, and no entry whose
+/// canonical path leaves `working_dir`.
 pub fn discover_commands(working_dir: &Path) -> Vec<CommandSuggestion> {
-    let mut commands = Vec::new();
-
-    // Scan .claude/commands/*.md
-    let commands_dir = working_dir.join(".claude/commands");
-    if let Ok(entries) = std::fs::read_dir(&commands_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                commands.push(CommandSuggestion {
-                    name: stem.to_string(),
-                    description: "Custom command from .claude/commands/".to_string(),
-                    source: CommandSource::CustomCommand,
-                });
-            }
-        }
-    }
-
-    // Scan .claude/skills/*/SKILL.md — use directory name as command name
-    let skills_dir = working_dir.join(".claude/skills");
-    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let skill_file = path.join("SKILL.md");
-                if skill_file.exists()
-                    && let Some(dir_name) = path.file_name().and_then(|s| s.to_str())
-                {
-                    commands.push(CommandSuggestion {
-                        name: dir_name.to_string(),
-                        description: "Skill from .claude/skills/".to_string(),
-                        source: CommandSource::Skill,
-                    });
-                }
-            }
-        }
-    }
-
-    // Sort alphabetically for consistent ordering
-    commands.sort_by(|a, b| a.name.cmp(&b.name));
-    commands
+    use rsi_common::input_assets::{
+        DEFAULT_SLASH_COMMANDS, SlashCommandSourceV1, discover_slash_commands,
+    };
+    let Ok(listing) = discover_slash_commands(working_dir, DEFAULT_SLASH_COMMANDS) else {
+        return Vec::new();
+    };
+    listing
+        .commands
+        .into_iter()
+        .map(|command| CommandSuggestion {
+            name: command.name,
+            description: command.description,
+            source: match command.source {
+                SlashCommandSourceV1::Command => CommandSource::CustomCommand,
+                SlashCommandSourceV1::Skill => CommandSource::Skill,
+            },
+        })
+        .collect()
 }
 
 /// A scored suggestion result from fuzzy matching.
@@ -218,6 +197,29 @@ mod tests {
         let commands = discover_commands(&temp_dir);
         assert_eq!(commands.len(), 0);
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    /// hub #3044: the TUI lists what `ListSlashCommands` serves.
+    #[test]
+    fn test_discover_commands_maps_the_shared_listing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let commands = dir.path().join(".claude/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("plan.md"), "---\ndescription: Plan it\n---\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude/skills/debug")).unwrap();
+        std::fs::write(dir.path().join(".claude/skills/debug/SKILL.md"), "").unwrap();
+        let found = discover_commands(dir.path());
+        let found: Vec<_> = found
+            .iter()
+            .map(|c| (c.name.as_str(), c.description.as_str(), c.source.clone()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("debug", "Skill from .claude/skills/", CommandSource::Skill),
+                ("plan", "Plan it", CommandSource::CustomCommand),
+            ]
+        );
     }
 
     #[test]

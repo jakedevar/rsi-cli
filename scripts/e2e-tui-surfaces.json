@@ -1,0 +1,132 @@
+{
+  "_doc": "#2321: which rsi `e2e_tui` modules drive which crates/rsi/src surfaces. scripts/check-touched-shards reads this at the candidate head and, for each changed path matching a surface, suggests `rsi=test:e2e_tui:test(<module>::)` (only that module's tests, not the whole target). Globs: `*` stays inside one path segment, `**` crosses directories. Add a surface here when an e2e_tui module starts driving a new TUI file; modules not mounted in crates/rsi/tests/e2e_tui.rs are dropped and reported.",
+  "package": "rsi",
+  "target": "e2e_tui",
+  "root": "crates/rsi/tests/e2e_tui.rs",
+  "surfaces": [
+    {
+      "modules": ["editing_mode"],
+      "paths": [
+        "crates/rsi/src/settings*.rs",
+        "crates/rsi/src/ui/settings.rs",
+        "crates/rsi/src/action_handler/daemon_config.rs",
+        "crates/rsi/src/editing_mode_prompt.rs",
+        "crates/rsi/src/input_bar.rs",
+        "crates/rsi/src/input_surface.rs",
+        "crates/rsi/src/input_surface/**",
+        "crates/rsi/src/vim_textarea/**",
+        "crates/rsi/src/overlay/command_palette.rs"
+      ],
+      "reason": "Settings staging (Enter stages, w applies), the first-start editing-mode prompt, the composer and the command palette"
+    },
+    {
+      "modules": ["fresh_install"],
+      "paths": [
+        "crates/rsi/src/editing_mode_prompt.rs",
+        "crates/rsi/src/overlay/project_form.rs",
+        "crates/rsi/src/overlay/project_picker.rs",
+        "crates/rsi/src/overlay/global_manager*.rs",
+        "crates/rsi/src/overlay/harness_manager.rs",
+        "crates/rsi/src/overlay/harness_manager/**",
+        "crates/rsi/src/overlay/manager_v2.rs",
+        "crates/rsi/src/overlay/manager_v2/**",
+        "crates/rsi/src/overlay/launch_settings.rs",
+        "crates/rsi/src/overlay/launch_settings/**",
+        "crates/rsi/src/app/projects.rs",
+        "crates/rsi/src/app/bootstrap.rs"
+      ],
+      "reason": "first start, adding a project, :manager appoint, the policy preset and the global seat"
+    },
+    {
+      "modules": ["manager_seats"],
+      "paths": [
+        "crates/rsi/src/overlay/global_manager*.rs",
+        "crates/rsi/src/overlay/harness_manager.rs",
+        "crates/rsi/src/overlay/harness_manager/**",
+        "crates/rsi/src/overlay/manager_tree.rs",
+        "crates/rsi/src/overlay/manager_tree/**",
+        "crates/rsi/src/overlay/manager_v2.rs",
+        "crates/rsi/src/overlay/manager_v2/**",
+        "crates/rsi/src/overlay/launch_settings.rs",
+        "crates/rsi/src/overlay/launch_settings/**",
+        "crates/rsi/src/app/manager_roster.rs"
+      ],
+      "reason": "the seat list and launch form in `:manager workspace`"
+    },
+    {
+      "modules": ["manager_decisions"],
+      "paths": [
+        "crates/rsi/src/overlay/harness_manager.rs",
+        "crates/rsi/src/overlay/harness_manager/**",
+        "crates/rsi/src/overlay/manager_v2.rs",
+        "crates/rsi/src/overlay/manager_v2/**"
+      ],
+      "reason": "the `:manager decisions` board"
+    },
+    {
+      "modules": ["manager_presets"],
+      "paths": [
+        "crates/rsi/src/overlay/harness_manager.rs",
+        "crates/rsi/src/overlay/harness_manager/**",
+        "crates/rsi/src/overlay/manager_v2.rs",
+        "crates/rsi/src/overlay/manager_v2/**",
+        "crates/rsi/src/overlay/budget_policy_form.rs",
+        "crates/rsi/src/overlay/launch_settings.rs",
+        "crates/rsi/src/overlay/launch_settings/**"
+      ],
+      "reason": "manager policy presets saved and reopened"
+    },
+    {
+      "modules": ["manager_surface"],
+      "paths": [
+        "crates/rsi/src/overlay/harness_manager.rs",
+        "crates/rsi/src/overlay/harness_manager/**",
+        "crates/rsi/src/overlay/manager_v2.rs",
+        "crates/rsi/src/overlay/manager_v2/**",
+        "crates/rsi/src/overlay/manager_tree.rs",
+        "crates/rsi/src/overlay/manager_tree/**",
+        "crates/rsi/src/overlay/global_manager*.rs"
+      ],
+      "reason": "the manager console sections that share one entry"
+    },
+    {
+      "modules": ["operator_todos"],
+      "paths": [
+        "crates/rsi/src/todo_panel.rs",
+        "crates/rsi/src/ui/todo_panel.rs",
+        "crates/rsi/src/app/todo.rs"
+      ],
+      "reason": "the operator to-do panel in session detail"
+    },
+    {
+      "modules": ["topology_run"],
+      "paths": [
+        "crates/rsi/src/overlay/graph.rs",
+        "crates/rsi/src/overlay/recursive_dag.rs",
+        "crates/rsi/src/app/graph.rs"
+      ],
+      "reason": "`:topology run` and the graph review run view"
+    },
+    {
+      "modules": ["issue_jump"],
+      "paths": [
+        "crates/rsi/src/app/issues.rs",
+        "crates/rsi/src/ui/issues.rs",
+        "crates/rsi/src/ui/issue_detail.rs",
+        "crates/rsi/src/types/issues.rs",
+        "crates/rsi/src/app/todo.rs",
+        "crates/rsid-store/src/store/issues.rs"
+      ],
+      "reason": "going to an Issue by number (the `#` key, the search, `:issue N`, Closed or Archived Issues) and the tracker's operator filter and detail links"
+    },
+    {
+      "modules": ["agent_projects"],
+      "paths": [
+        "crates/rsi/src/app/agent_projects.rs",
+        "crates/rsi/src/app/projects.rs",
+        "crates/rsi/src/overlay/project_picker.rs"
+      ],
+      "reason": "following an agent-created project"
+    }
+  ]
+}

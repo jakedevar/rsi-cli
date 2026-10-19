@@ -27,7 +27,7 @@ use rsi_common::global_manager::GlobalManagerGrantV1;
 use rsi_common::manager_node_workspace::{
     MANAGER_NODE_WORKSPACE_MAX_CHILDREN, MANAGER_NODE_WORKSPACE_MAX_ESCALATIONS,
     MANAGER_NODE_WORKSPACE_MAX_REASON_BYTES, ManagerNodeAreaGrantV1, ManagerNodeCountsV1,
-    ManagerNodeFleetV1, ManagerNodePendingEscalationV1, bounded_reason,
+    ManagerNodeFleetV1, ManagerNodePendingEscalationV1, ManagerNodeSeatHandoffV1, bounded_reason,
 };
 use rsi_common::manager_nodes::ManagerNodeSelectorV1;
 use rsi_common::manager_tier_routing::{MANAGER_TIER_TARGET_UNKNOWN, ManagerNodeRefV1};
@@ -88,6 +88,8 @@ pub struct NodeWorkspaceRaw {
     pub escalations_truncated: bool,
     /// `None` when the caller skipped the fleet rollup.
     pub fleet: Option<ManagerNodeFleetV1>,
+    /// A portfolio node's latest self-handoff (#2021).
+    pub last_seat_handoff: Option<ManagerNodeSeatHandoffV1>,
 }
 
 fn refused(code: &str) -> DaemonError {
@@ -135,6 +137,49 @@ struct AreaIdentity {
 }
 
 impl Store {
+    /// #2021: `node`'s latest self-handoff: the newest completed appointment
+    /// whose grantor and target are both the node (old seat, new seat, the
+    /// recorded handoff reference and the time it completed).
+    pub(crate) fn last_seat_handoff_of(
+        &self,
+        node: Uuid,
+    ) -> Result<Option<ManagerNodeSeatHandoffV1>> {
+        let row: Option<(String, String, String, Option<String>, String)> = self
+            .conn
+            .query_row(
+                "SELECT id,caller_session_id,session_id,handoff,updated_at
+                 FROM manager_portfolio_appointments
+                 WHERE grantor_node_id=?1 AND target_ref=?2 AND state='appointed'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![
+                    node.to_string(),
+                    super::portfolio_nodes::delegation::ChildTargetRef::Portfolio(node).as_column()
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(id, old, new, handoff, at)| {
+            Ok(ManagerNodeSeatHandoffV1 {
+                appointment_id: parse_uuid(&id)?,
+                old_seat: parse_uuid(&old)?,
+                new_seat: parse_uuid(&new)?,
+                handoff,
+                handed_at: parse_time(&at)?,
+                handoff_changed_after_appointment: false,
+                handoff_modified_at: None,
+            })
+        })
+        .transpose()
+    }
+
     /// The manager node whose seat `caller` holds (#1238's resolver): a
     /// portfolio seat, a project's live PM, or an area node's seat tip.
     ///
@@ -244,6 +289,7 @@ impl Store {
             escalations,
             escalations_truncated,
             fleet,
+            last_seat_handoff: self.last_seat_handoff_of(node_id)?,
         })
     }
 
@@ -284,6 +330,7 @@ impl Store {
             escalations,
             escalations_truncated,
             fleet,
+            last_seat_handoff: None,
         })
     }
 
@@ -354,6 +401,7 @@ impl Store {
             escalations,
             escalations_truncated,
             fleet,
+            last_seat_handoff: None,
         })
     }
 

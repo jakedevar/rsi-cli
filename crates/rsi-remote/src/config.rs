@@ -28,6 +28,11 @@ pub struct Config {
     /// default; every answer route denies with zero dispatch while false.
     #[serde(default)]
     pub allow_answers: bool,
+    /// Message writes to manager seats (API v2) are a separate opt-in from the
+    /// read policy and from answers. Off by default; the message route denies
+    /// with zero dispatch while false.
+    #[serde(default)]
+    pub allow_messages: bool,
 }
 
 impl Config {
@@ -295,6 +300,7 @@ mod tests {
             allowed_node_ids: (0..count).map(|n| format!("{n:0>128}")).collect(),
             project_ids: vec!["550e8400-e29b-41d4-a716-446655440000".into()],
             allow_answers: false,
+            allow_messages: false,
         }
     }
 
@@ -356,5 +362,24 @@ mod tests {
         write(&path, &config, false).unwrap();
         assert!(!read(&path).unwrap().allow_answers);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn allow_messages_defaults_off_and_round_trips() {
+        let parsed: Config = toml::from_str("enabled = false\n").unwrap();
+        assert!(!parsed.allow_messages);
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("policy.toml");
+        let on = Config {
+            allow_messages: true,
+            ..Config::default()
+        };
+        write(&path, &on, true).unwrap();
+        let read_back = read(&path).unwrap();
+        assert!(read_back.allow_messages);
+        assert!(!read_back.allow_answers, "the switches are independent");
+        write(&path, &Config::default(), false).unwrap();
+        assert!(!read(&path).unwrap().allow_messages);
     }
 }

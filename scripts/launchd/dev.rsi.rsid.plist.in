@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  rsid as a launchd user agent on a macOS satellite (#2936).
+
+  Template only: scripts/rsid-launchd.sh renders it into
+  ~/Library/LaunchAgents/dev.rsi.rsid.plist, replacing each @...@ placeholder with an
+  XML-escaped value. It runs the same chain as the Linux launchers: the socket
+  holder keeps ~/.rsi/daemon.sock open while rsid-supervisor.sh replaces rsid
+  (deploys exit 75 and the supervisor relaunches the swapped binary inside this
+  job). launchd restarts the whole chain when the holder exits (KeepAlive), and
+  starts it at login (RunAtLoad).
+
+  No secrets: provider credentials come from ~/.rsi/.env, never from here.
+  ExitTimeOut outlasts the supervisor's largest shutdown grace plus its SIGTERM
+  wait, like TimeoutStopSec in scripts/systemd/rsid.service.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@INSTALL_DIR@/rsi-socket-hold</string>
+		<string>@SOCKET@</string>
+		<string>--</string>
+		<string>@INSTALL_DIR@/rsid-supervisor.sh</string>
+		<string>@INSTALL_DIR@/rsid</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+		<key>PATH</key>
+		<string>@PATH@</string>
+		<key>LANG</key>
+		<string>@LANG@</string>
+		<key>RSI_SOCKET</key>
+		<string>@SOCKET@</string>
+		<key>RSI_DAEMON_SOCKET_PATH</key>
+		<string>@SOCKET@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@HOME@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>3700</integer>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>8192</integer>
+	</dict>
+	<key>StandardInPath</key>
+	<string>/dev/null</string>
+	<key>StandardOutPath</key>
+	<string>@LOG@</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG@</string>
+</dict>
+</plist>

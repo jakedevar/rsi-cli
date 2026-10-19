@@ -886,7 +886,7 @@ fn portfolio_caps_require_confirmation_and_overview_reports_chain_minimum() {
     let saved_edit = store
         .configure_portfolio_node_confirmed(
             &edit,
-            PortfolioGrantor::Operator,
+            portfolio_nodes::PortfolioGrantor::Operator,
             "operator:test",
             true,
         )
@@ -926,5 +926,378 @@ fn portfolio_caps_require_confirmation_and_overview_reports_chain_minimum() {
     assert_eq!(
         store.get_portfolio_node(node.node_id).unwrap().unwrap(),
         raised
+    );
+}
+
+/// #1902: a new global node after a revoke keeps the last revoked root's
+/// direct-report limit and child policy over the same coverage; other
+/// coverage starts from the defaults.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn new_global_node_after_a_revoke_inherits_the_last_grants_node_policy() {
+    let store = Store::open_in_memory().unwrap();
+    let (a, b, c) = (
+        project(&store, "A"),
+        project(&store, "B"),
+        project(&store, "C"),
+    );
+    let mut child = ManagerPolicyV2::default();
+    child.max_active_sessions = 3;
+    let first = store
+        .configure_portfolio_node(
+            &ConfigurePortfolioNodeRequestV1 {
+                node_id: None,
+                parent_node_id: None,
+                adopt_node_ids: Vec::new(),
+                expected_parent_grant_version: None,
+                tier_label: "global".into(),
+                seat_session_id: session(&store, None),
+                project_ids: vec![a, b],
+                allowed_launches: vec![launch()],
+                policy: ManagerPolicyV2::default(),
+                child_policy: Some(child.clone()),
+                max_direct_reports: 11,
+                expected_node_grant_version: 0,
+                expected_authority_epoch: 0,
+                idempotency_key: "n1".into(),
+            },
+            portfolio_nodes::PortfolioGrantor::Operator,
+            "operator:test",
+        )
+        .unwrap();
+    store
+        .revoke_global_manager(&RevokeGlobalManagerRequestV1 {
+            expected_grant_version: first.grant.grant_version,
+            idempotency_key: "r1".into(),
+        })
+        .unwrap();
+    let other = configure(&store, session(&store, None), &[c], 0, "other").unwrap();
+    let other_node = store
+        .list_portfolio_nodes(false)
+        .unwrap()
+        .into_iter()
+        .find(|node| node.grant.grant_id == other.grant_id)
+        .unwrap();
+    assert_eq!(other_node.max_direct_reports, 5);
+    assert_eq!(other_node.child_policy, None);
+    store
+        .revoke_global_manager(&RevokeGlobalManagerRequestV1 {
+            expected_grant_version: other.grant_version,
+            idempotency_key: "r2".into(),
+        })
+        .unwrap();
+
+    let replacement = configure(&store, session(&store, None), &[b, a], 0, "again").unwrap();
+    let node = store
+        .list_portfolio_nodes(false)
+        .unwrap()
+        .into_iter()
+        .find(|node| node.grant.grant_id == replacement.grant_id)
+        .unwrap();
+    assert_eq!(node.max_direct_reports, 11);
+    assert_eq!(node.child_policy, Some(child));
+}
+
+/// #2560: the next PM seat of `project`: a same-project, same-parent successor
+/// of `predecessor`, published through the rotation receipt the way a
+/// committed succession or a context-cap rotation publishes it.
+#[cfg(test)]
+fn rotate_pm(store: &Store, project: Uuid, predecessor: Uuid) -> Uuid {
+    let successor = Uuid::new_v4();
+    let mut row = test_session(successor, PathBuf::from("/tmp/global-manager"));
+    row.project_id = Some(project);
+    row.continued_from = Some(predecessor);
+    row.rotation_depth = store
+        .get_session(predecessor)
+        .unwrap()
+        .unwrap()
+        .rotation_depth
+        + 1;
+    store.insert_session(&row).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Archived' WHERE id=?1",
+            [predecessor.to_string()],
+        )
+        .unwrap();
+    assert!(
+        store
+            .record_harness_manager_rotation(predecessor, successor)
+            .unwrap()
+    );
+    successor
+}
+
+#[cfg(test)]
+fn watch_on(store: &Store, owner: Uuid, watched: Uuid) -> Uuid {
+    use crate::store_support::schedule_wake_job::{ScheduleWakeRequest, build_agent_scheduled_job};
+    let job = build_agent_scheduled_job(ScheduleWakeRequest {
+        message: "the PM ended".into(),
+        in_seconds: Some(600),
+        at: None,
+        name: None,
+        every_seconds: None,
+        mode: Some("on_terminal".into()),
+        working_dir: PathBuf::from("/tmp/global-manager"),
+        provider: None,
+        model: None,
+        project_id: None,
+        origin_session_id: Some(owner),
+        watch_session_id: Some(watched),
+    })
+    .unwrap();
+    store.insert_scheduled_job(&job).unwrap();
+    job.id
+}
+
+#[cfg(test)]
+fn enabled_watches_of(store: &Store, owner: Uuid) -> Vec<(Uuid, String)> {
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT id, wake_mode FROM scheduled_jobs
+             WHERE enabled=1 AND wake_session_id=?1 AND wake_mode LIKE 'on_terminal:%'",
+        )
+        .unwrap();
+    statement
+        .query_map([owner.to_string()], |r| {
+            Ok((Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(), r.get(1)?))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+}
+
+/// #2560: three routine seat handovers leave the parent holding exactly one
+/// watch on the slot, the one it armed, now pointing at the live seat; a
+/// retired seat of the slot stays readable by the parent, a stranger does not.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_parents_watch_follows_the_pm_slot_across_three_rotations_2560() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let seat = session(&store, None);
+    configure(&store, seat, &[a], 0, "g1").unwrap();
+    let first = appoint_pm(&store, a);
+    let watch = watch_on(&store, seat, first);
+
+    let second = rotate_pm(&store, a, first);
+    let third = rotate_pm(&store, a, second);
+    let fourth = rotate_pm(&store, a, third);
+
+    assert_eq!(
+        enabled_watches_of(&store, seat),
+        vec![(watch, format!("on_terminal:{fourth}"))],
+        "one watch for the slot, the same job, on the live seat"
+    );
+    assert_eq!(store.global_live_manager(a).unwrap(), Some(fourth));
+    for retired in [first, second, third, fourth] {
+        assert!(store.global_seat_reads_manager(seat, retired).unwrap());
+    }
+    let stranger = session(&store, Some(a));
+    assert!(!store.global_seat_reads_manager(seat, stranger).unwrap());
+    let other_project = appoint_pm(&store, project(&store, "B"));
+    assert!(
+        !store
+            .global_seat_reads_manager(seat, other_project)
+            .unwrap()
+    );
+}
+
+/// #2560: re-arming is idempotent per slot. A watch the parent already holds
+/// on the successor wins; the watch on the retired seat is disabled, never
+/// deleted, and a watch on the slot armed by a different parent is untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_duplicate_slot_watch_collapses_and_other_parents_keep_theirs_2560() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let seat = session(&store, None);
+    let other_parent = session(&store, None);
+    configure(&store, seat, &[a], 0, "g1").unwrap();
+    let first = appoint_pm(&store, a);
+    let stale = watch_on(&store, seat, first);
+    let theirs = watch_on(&store, other_parent, first);
+    let second = rotate_pm(&store, a, first);
+    // The parent re-arms on the new seat by hand, as the playbook used to say.
+    let manual = watch_on(&store, seat, second);
+    let third = rotate_pm(&store, a, second);
+    assert_eq!(
+        enabled_watches_of(&store, seat).len(),
+        1,
+        "one watch per slot"
+    );
+    assert!(
+        enabled(&store, manual) || enabled(&store, stale),
+        "a duplicate is disabled, the other survives"
+    );
+    assert_eq!(
+        enabled_watches_of(&store, seat)[0].1,
+        format!("on_terminal:{third}")
+    );
+    assert_eq!(
+        enabled_watches_of(&store, other_parent),
+        vec![(theirs, format!("on_terminal:{third}"))]
+    );
+    for job in [stale, manual] {
+        assert!(
+            store.get_scheduled_job(&job).unwrap().is_some(),
+            "disabled, never deleted"
+        );
+    }
+}
+
+/// #2560: a Completed seat that is mid-handover (a rotation entered and not
+/// finished) is not a slot left empty; once the handover completes, is
+/// refused, or outlives the grace window, the seat's own terminal counts.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_completed_seat_mid_handover_holds_its_parents_watch_2560() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let pm = appoint_pm(&store, a);
+    let mut completed = store.get_session(pm).unwrap().unwrap();
+    completed.status = SessionStatus::Completed;
+    let pending = |store: &Store, session: &rsi_common::types::Session| {
+        store.portfolio_terminal_watch_pending(session).unwrap()
+    };
+    assert!(!pending(&store, &completed), "no handover, no hold");
+
+    store
+        .insert_rotation_event(pm, "r1", "writing_handoff", "entered", None)
+        .unwrap();
+    assert!(pending(&store, &completed), "handover in flight");
+    assert!(
+        !store
+            .manager_seat_change_in_flight(pm, chrono::Duration::zero())
+            .unwrap(),
+        "an expired grace window stops holding"
+    );
+    let mut interrupted = completed.clone();
+    interrupted.status = SessionStatus::Interrupted;
+    assert!(
+        !pending(&store, &interrupted),
+        "an Interrupted or Failed seat wakes the parent at once"
+    );
+
+    store
+        .insert_rotation_event(pm, "r1", "completed", "completed", None)
+        .unwrap();
+    assert!(!pending(&store, &completed), "handover finished");
+    store
+        .insert_rotation_event(pm, "r2", "writing_handoff", "entered", None)
+        .unwrap();
+    store
+        .insert_rotation_event(pm, "r2", "refused", "refused:no_handoff", None)
+        .unwrap();
+    assert!(!pending(&store, &completed), "refused handover");
+}
+
+/// #118: an explicit reappointment of a fresh, parentless session starts a
+/// new lineage; the new holder still reads the displaced appointment's seats
+/// (the durable `harness_manager_notice_scope_retirements` record), and
+/// nothing else: not another project's displaced seat, not a stranger, and a
+/// displaced seat gains no reach of its own.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_reappointed_pm_reads_its_projects_displaced_seats_only_118() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let b = project(&store, "B");
+    let first = appoint_pm(&store, a);
+    let second = rotate_pm(&store, a, first);
+    let other = appoint_pm(&store, b);
+    let seat = appoint_pm(&store, a);
+    let other_seat = appoint_pm(&store, b);
+    assert_eq!(
+        store
+            .get_harness_manager(a)
+            .unwrap()
+            .unwrap()
+            .current_session_id,
+        Some(seat)
+    );
+
+    assert!(store.manager_seat_reads_predecessor(seat, second).unwrap());
+    assert!(store.manager_seat_reads_predecessor(seat, first).unwrap());
+    assert!(
+        store
+            .manager_seat_reads_predecessor(other_seat, other)
+            .unwrap()
+    );
+    assert!(!store.manager_seat_reads_predecessor(seat, other).unwrap());
+    assert!(
+        !store
+            .manager_seat_reads_predecessor(other_seat, first)
+            .unwrap()
+    );
+    assert!(!store.manager_seat_reads_predecessor(second, seat).unwrap());
+    assert!(!store.manager_seat_reads_predecessor(second, first).unwrap());
+    let stranger = session(&store, Some(a));
+    assert!(
+        !store
+            .manager_seat_reads_predecessor(stranger, first)
+            .unwrap()
+    );
+
+    // The next reappointment reads every earlier appointment; the displaced
+    // holder reads nothing any more.
+    let third_seat = appoint_pm(&store, a);
+    for earlier in [first, second, seat] {
+        assert!(
+            store
+                .manager_seat_reads_predecessor(third_seat, earlier)
+                .unwrap()
+        );
+    }
+    assert!(!store.manager_seat_reads_predecessor(seat, first).unwrap());
+}
+
+/// #2531: the live holder of a PM slot reads earlier seats of that slot, and
+/// nobody else: not a later seat, itself, a sibling project's seat, a
+/// stranger, or any seat once the appointment is revoked.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_pm_successor_reads_earlier_seats_of_its_slot_only_2531() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let first = appoint_pm(&store, a);
+    let second = rotate_pm(&store, a, first);
+    let third = rotate_pm(&store, a, second);
+
+    assert!(store.manager_seat_reads_predecessor(third, second).unwrap());
+    assert!(store.manager_seat_reads_predecessor(third, first).unwrap());
+    // Only the live holder reads: a retired seat reaches nothing, even earlier ones.
+    assert!(!store.manager_seat_reads_predecessor(second, first).unwrap());
+    // Not itself, and never forward in the lineage: a retired seat holds nothing.
+    assert!(!store.manager_seat_reads_predecessor(third, third).unwrap());
+    assert!(!store.manager_seat_reads_predecessor(first, second).unwrap());
+    assert!(!store.manager_seat_reads_predecessor(second, third).unwrap());
+    // A stranger in the project, and a sibling project's slot.
+    let stranger = session(&store, Some(a));
+    assert!(
+        !store
+            .manager_seat_reads_predecessor(third, stranger)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .manager_seat_reads_predecessor(stranger, first)
+            .unwrap()
+    );
+    let b = project(&store, "B");
+    let other = appoint_pm(&store, b);
+    let other_next = rotate_pm(&store, b, other);
+    assert!(!store.manager_seat_reads_predecessor(third, other).unwrap());
+    assert!(
+        !store
+            .manager_seat_reads_predecessor(other_next, first)
+            .unwrap()
+    );
+    assert!(
+        store
+            .manager_seat_reads_predecessor(other_next, other)
+            .unwrap()
     );
 }

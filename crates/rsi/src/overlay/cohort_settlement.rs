@@ -10,8 +10,17 @@ use rsi_common::cohort_settlement::{
 pub async fn open_source_worktree_settlement(app: &mut App) {
     match app.client.list_source_worktree_cohorts().await {
         Ok(cohorts) => {
+            let (recent_runs, history_error) =
+                match app.client.list_source_worktree_settlement_runs().await {
+                    Ok(runs) => (runs, None),
+                    Err(error) => (
+                        Vec::new(),
+                        Some(format!("Settlement history load failed: {error}")),
+                    ),
+                };
             app.overlay =
                 OverlayState::SourceWorktreeSettlement(SourceWorktreeSettlementOverlayState {
+                    recent_runs,
                     cohorts,
                     selected_index: 0,
                     scroll_offset: 0,
@@ -20,7 +29,7 @@ pub async fn open_source_worktree_settlement(app: &mut App) {
                     authorization_input: String::new(),
                     authorization_active: false,
                     idempotency_key: None,
-                    last_error: None,
+                    last_error: history_error,
                 });
         }
         Err(error) => app.notify_error(format!("Settlement cohort load failed: {error}")),
@@ -207,6 +216,27 @@ fn install_matching_receipt(
     Ok(())
 }
 
+/// Why `A` cannot start authorization. A fresh audit that is not applyable
+/// names the audit's own typed refusal (or the empty-plan fact) instead of a
+/// generic message, so the operator learns what blocked Apply (#1880).
+fn apply_unavailable_reason(
+    state: &SourceWorktreeSettlementOverlayState,
+    selected_identity: Option<&str>,
+) -> String {
+    match state.audit.as_ref() {
+        Some(audit) if selected_identity == Some(audit.repository_identity.as_str()) => {
+            if let Some(refusal) = &audit.refusal {
+                format!("Apply refused by audit: {refusal}")
+            } else if !audit.applyable {
+                "Apply refused by audit: no eligible worktree roots to settle".into()
+            } else {
+                "Run a fresh applyable audit before Apply".into()
+            }
+        }
+        _ => "Run a fresh applyable audit before Apply".into(),
+    }
+}
+
 fn begin_authorization(app: &mut App) {
     if let OverlayState::SourceWorktreeSettlement(state) = &mut app.overlay {
         let selected_identity = state
@@ -219,7 +249,7 @@ fn begin_authorization(app: &mut App) {
                 && selected_identity == Some(audit.repository_identity.as_str())
         });
         if !enabled {
-            state.last_error = Some("Run a fresh applyable audit before Apply".into());
+            state.last_error = Some(apply_unavailable_reason(state, selected_identity));
             return;
         }
         // Never prefill or synthesize authorization text. The operator must
@@ -380,6 +410,20 @@ async fn apply_exact_authorization(app: &mut App) {
 }
 
 async fn refresh_receipt(app: &mut App) {
+    match app.client.list_source_worktree_settlement_runs().await {
+        Ok(runs) => {
+            if let OverlayState::SourceWorktreeSettlement(state) = &mut app.overlay {
+                state.recent_runs = runs;
+            }
+        }
+        Err(error) => {
+            if let OverlayState::SourceWorktreeSettlement(state) = &mut app.overlay {
+                state.last_error = Some(format!("Settlement history load failed: {error}"));
+                return;
+            }
+        }
+    }
+
     let expected = match &app.overlay {
         OverlayState::SourceWorktreeSettlement(state) => receipt_identity(state),
         _ => None,
@@ -472,6 +516,7 @@ mod tests {
         digest: Sha256Digest,
     ) -> SourceWorktreeSettlementRunV1 {
         SourceWorktreeSettlementRunV1 {
+            attribution: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             run_id,
@@ -499,6 +544,7 @@ mod tests {
                 before_observation: None,
                 after_observation: Some("settled".into()),
             }],
+            retained_roots: Vec::new(),
             created_at: "2026-08-24T00:00:00.000000000Z".into(),
             updated_at: "2026-08-24T00:00:01.000000000Z".into(),
             finished_at: Some("2026-08-24T00:00:01.000000000Z".into()),
@@ -555,6 +601,7 @@ mod tests {
                 diagnostic: None,
             }],
             run_id: Some(run_id),
+            last_run_retained_roots: Vec::new(),
             refusal: None,
         }
         .validate_wire()
@@ -565,6 +612,7 @@ mod tests {
     fn selection_change_invalidates_authority_and_phrase_is_never_prefilled() {
         let digest = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
         let mut state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 9,
@@ -582,6 +630,7 @@ mod tests {
                 counts: SourceWorktreeSettlementCountsV1::default(),
                 items: Vec::new(),
                 run_id: None,
+                last_run_retained_roots: Vec::new(),
                 refusal: Some("no action".into()),
             }),
             receipt: None,
@@ -640,12 +689,14 @@ mod tests {
             counts: SourceWorktreeSettlementCountsV1::default(),
             items: Vec::new(),
             run_id: Some(run_id),
+            last_run_retained_roots: Vec::new(),
             refusal: Some("no current eligible roots".into()),
         }
         .validate_wire()
         .expect("restart audit");
         let receipt = settled_receipt(run_id, identity, digest);
         let mut state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 11,
@@ -680,6 +731,7 @@ mod tests {
         let receipt = settled_receipt(run_id, identity.clone(), digest.clone());
         let audit = live_audit_with_historical_run(run_id, identity.clone(), digest);
         let mut state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: vec![SourceWorktreeCohortSummaryV1 {
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
@@ -727,6 +779,7 @@ mod tests {
         let mut wrong_path = settled_receipt(run_id, identity.clone(), digest.clone());
         wrong_path.canonical_repo_dir = "/different-repo".into();
         let mut state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -775,6 +828,7 @@ mod tests {
             live_audit_with_historical_run(historical_run_id, identity.clone(), digest.clone());
         let historical = settled_receipt(historical_run_id, identity.clone(), digest.clone());
         let mut state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
@@ -826,6 +880,7 @@ mod tests {
         )));
         app.overlay =
             OverlayState::SourceWorktreeSettlement(SourceWorktreeSettlementOverlayState {
+                recent_runs: Vec::new(),
                 cohorts: vec![SourceWorktreeCohortSummaryV1 {
                     schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                     policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
@@ -854,6 +909,7 @@ mod tests {
                     },
                     items: Vec::new(),
                     run_id: None,
+                    last_run_retained_roots: Vec::new(),
                     refusal: None,
                 }),
                 receipt: None,
@@ -881,5 +937,71 @@ mod tests {
             Some("Authorization phrase does not match exactly")
         );
         assert!(state.receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_on_a_refused_audit_names_the_audit_refusal() {
+        crate::state::DevState::clear();
+        let identity = "/repo/.git".to_string();
+        let refusal = "source-worktree cohort exceeds bounded maximum of 256 roots";
+        let mut app = App::new(crate::client::DaemonClient::new(std::path::PathBuf::from(
+            "/tmp/test-settlement-refusal.sock",
+        )));
+        app.overlay =
+            OverlayState::SourceWorktreeSettlement(SourceWorktreeSettlementOverlayState {
+                recent_runs: Vec::new(),
+                cohorts: vec![SourceWorktreeCohortSummaryV1 {
+                    schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+                    policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+                    repository_identity: identity.clone(),
+                    canonical_repo_dir: "/repo".into(),
+                    live_roots: 257,
+                    terminal_roots: 0,
+                }],
+                selected_index: 0,
+                scroll_offset: 0,
+                audit: Some(
+                    SourceWorktreeCohortAuditV1 {
+                        schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+                        policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+                        repository_identity: identity,
+                        canonical_repo_dir: "/repo".into(),
+                        target_ref: None,
+                        target_oid: None,
+                        plan_digest: Sha256Digest::parse(format!("sha256:{}", "a".repeat(64)))
+                            .unwrap(),
+                        authorization_phrase: None,
+                        writes: 0,
+                        applyable: false,
+                        counts: SourceWorktreeSettlementCountsV1::default(),
+                        items: Vec::new(),
+                        run_id: None,
+                        last_run_retained_roots: Vec::new(),
+                        refusal: Some(refusal.into()),
+                    }
+                    .validate_wire()
+                    .expect("wire-valid refused audit"),
+                ),
+                receipt: None,
+                authorization_input: String::new(),
+                authorization_active: false,
+                idempotency_key: None,
+                last_error: None,
+            });
+
+        handle_source_worktree_settlement_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('A'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+
+        let OverlayState::SourceWorktreeSettlement(state) = &app.overlay else {
+            panic!("settlement overlay");
+        };
+        assert!(!state.authorization_active);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some(format!("Apply refused by audit: {refusal}").as_str())
+        );
     }
 }

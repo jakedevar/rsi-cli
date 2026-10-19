@@ -1,5 +1,10 @@
 //! Provider form overlay input handling (add/edit custom providers).
 //!
+//! The form saves through the daemon's `PutCustomProvider` (hub #3039). The
+//! key goes to the daemon vault and never comes back: editing an existing
+//! provider starts with an empty key field, and leaving it empty keeps the
+//! stored key.
+//!
 //! The provider form now uses the shared `InputSurface` editing engine so each
 //! field behaves like a vim text area: insert/normal mode, motions, and
 //! `Ctrl+Enter` submit. `Tab`/`Shift+Tab` still cycle fields.
@@ -17,7 +22,7 @@ pub fn open_provider_form(app: &mut App, entry: Option<&crate::settings::CustomP
         Some(e) => (
             make_surface(&e.name),
             make_surface(&e.base_url),
-            make_surface(&e.api_key),
+            make_surface(""),
             make_surface(&e.default_model),
             Some(e.id),
         ),
@@ -220,42 +225,19 @@ fn submit_provider_form(app: &mut App, editing_id: Option<uuid::Uuid>) {
         return;
     }
 
-    let mut updated = false;
-    match editing_id {
-        Some(id) => {
-            if let Some(entry) = app
-                .settings
-                .custom_providers
-                .iter_mut()
-                .find(|e| e.id == id)
-            {
-                entry.name = name.clone();
-                entry.base_url = base_url;
-                entry.api_key = api_key;
-                entry.default_model = default_model;
-                updated = true;
-                app.notify_success(format!("Updated provider: {}", name));
-            } else {
-                app.notify_error("Provider entry no longer exists");
-            }
-        }
-        None => {
-            let entry = crate::settings::CustomProviderEntry {
-                id: uuid::Uuid::new_v4(),
-                name: name.clone(),
+    let api_key = if api_key.is_empty() {
+        rsi_common::operator_config::CustomProviderKeyChange::Keep
+    } else {
+        rsi_common::operator_config::CustomProviderKeyChange::Set { secret: api_key }
+    };
+    app.pending_lc_actions
+        .push(crate::modalkit_types::LcAction::PutCustomProvider {
+            params: rsi_common::operator_config::PutCustomProviderParams {
+                id: editing_id,
+                name,
                 base_url,
-                api_key,
                 default_model,
-            };
-            app.settings.custom_providers.push(entry);
-            updated = true;
-            app.notify_success(format!("Added provider: {}", name));
-        }
-    }
-
-    if updated {
-        app.needs_model_refresh = true;
-        app.overlay = OverlayState::None;
-        app.mark_dirty();
-    }
+                api_key,
+            },
+        });
 }

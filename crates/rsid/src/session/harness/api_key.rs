@@ -90,8 +90,15 @@ impl ApiCredential {
 
     #[must_use]
     pub fn for_slot_only(slot: Slot) -> Self {
+        Self::for_slot_only_in(&crate::vault::global(), slot)
+    }
+
+    /// The slot's own key only, from `vault`: no generic legacy fallback, so
+    /// a key meant for another vendor can never be sent to this one.
+    #[must_use]
+    pub fn for_slot_only_in(vault: &VaultHandle, slot: Slot) -> Self {
         Self::VaultSlotOnly {
-            vault: crate::vault::global(),
+            vault: vault.clone(),
             slot,
         }
     }
@@ -261,6 +268,7 @@ mod tests {
             stream: false,
             reasoning_effort: None,
             context_editing: false,
+            tool_choice_none: false,
         };
         let openai_route =
             || ModelExecutionCapability::for_test(RuntimeExecutionRoute::SessionHarnessOpenAiHttp);
@@ -388,6 +396,7 @@ mod tests {
             stream: false,
             reasoning_effort: None,
             context_editing: false,
+            tool_choice_none: false,
         };
         let error = provider
             .chat(
@@ -397,7 +406,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            crate::session::harness::errors::ProviderError::from_daemon_error(&error)
+            <crate::session::harness::errors::ProviderError as crate::session::harness::errors::ProviderErrorExt>::from_daemon_error(&error)
                 .unwrap()
                 .class,
             crate::session::harness::errors::ProviderErrorClass::CreditExhausted,

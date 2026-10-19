@@ -27,17 +27,24 @@ pub(super) enum CoordinatorRole {
 }
 
 /// The coordinator role `session_id` holds now, or `None` for a worker.
+/// A topology node or Issue-bound worker session, or a rotation child of one,
+/// is a worker whatever pointer names it (#2791, #2804, #2805): a stale
+/// `lead_session_id` never makes it a seat the context cap rotates.
 pub(super) fn coordinator_role(store: &Store, session_id: Uuid) -> Result<Option<CoordinatorRole>> {
     let epic: Option<String> = store
         .conn
         .query_row(
             "SELECT id FROM sessions WHERE session_kind='Epic' AND lead_session_id=?1
-               AND status NOT IN ('Archived','Deleted') ORDER BY id LIMIT 1",
+               AND status NOT IN ('Archived','Deleted')
+               AND NOT EXISTS (SELECT 1 FROM topology_node_attempts WHERE session_id=?1)
+             ORDER BY id LIMIT 1",
             [session_id.to_string()],
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(epic) = epic {
+    if let Some(epic) = epic
+        && !store.is_non_lead_worker_session(session_id)?
+    {
         let epic_id = Uuid::parse_str(&epic)
             .map_err(|error| crate::error::DaemonError::Store(error.to_string()))?;
         return Ok(Some(CoordinatorRole::Lead { epic_id }));

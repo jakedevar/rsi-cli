@@ -100,6 +100,145 @@ fn s1_current_schema_catalog(conn: &Connection) -> Vec<(String, String, String, 
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn file_fixture_matches_migration_schema_rows_and_reopens_without_replacing_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let started = chrono::Utc::now();
+    let direct = Store::open(&directory.path().join("direct.db")).unwrap();
+    let fixture_path = directory.path().join("fixture.db");
+    let fixture = Store::open_test_fixture(&fixture_path).unwrap();
+    assert_eq!(
+        s1_current_schema_catalog(&direct.conn),
+        s1_current_schema_catalog(&fixture.conn)
+    );
+    assert_eq!(
+        s1_registered_function_inventory(&direct.conn),
+        s1_registered_function_inventory(&fixture.conn)
+    );
+    for (kind, name, _, _) in s1_current_schema_catalog(&direct.conn) {
+        if kind != "table" {
+            continue;
+        }
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+        let rows = |conn: &Connection| {
+            let mut statement = conn.prepare(&sql).unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            // Two freshly created stores have distinct creation timestamps.
+            // Verify freshness before comparing the rest of every seed row.
+            let timestamp_column = match name.as_str() {
+                "daemon_settings" | "source_worktree_batch_cursor_keys" | "satellite_registry" => {
+                    Some(2)
+                }
+                "sandbox_reclaim_sweeps" => Some(7),
+                "sandbox_target_reclaim_intent_sweeps" => Some(5),
+                _ => None,
+            };
+            for row in &mut rows {
+                if let Some(column) = timestamp_column {
+                    let rusqlite::types::Value::Text(timestamp) = &row[column] else {
+                        panic!("bootstrap timestamp is text");
+                    };
+                    assert!(is_canonical_rfc3339_nanos(timestamp));
+                    let at = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+                    assert!(at >= started && at <= chrono::Utc::now());
+                    row[column] = rusqlite::types::Value::Null;
+                }
+                if name == "source_worktree_batch_cursor_keys" {
+                    let rusqlite::types::Value::Blob(key) = &row[1] else {
+                        panic!("cursor key is a blob");
+                    };
+                    assert_eq!(key.len(), 32);
+                    row[1] = rusqlite::types::Value::Null;
+                }
+                if name == "satellite_installation_identity" {
+                    let rusqlite::types::Value::Text(id) = &row[1] else {
+                        panic!("installation identity is text");
+                    };
+                    let parsed = Uuid::parse_str(id).unwrap();
+                    assert!(!parsed.is_nil());
+                    assert_eq!(parsed.to_string(), *id);
+                    row[1] = rusqlite::types::Value::Null;
+                }
+            }
+            rows
+        };
+        assert_eq!(rows(&direct.conn), rows(&fixture.conn), "table {name}");
+    }
+    assert_ne!(
+        direct.satellite_installation_id().unwrap(),
+        fixture.satellite_installation_id().unwrap()
+    );
+    let key = |conn: &Connection| {
+        conn.query_row(
+            "SELECT cursor_key FROM source_worktree_batch_cursor_keys WHERE key_id=1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .unwrap()
+    };
+    assert_ne!(key(&direct.conn), key(&fixture.conn));
+    let second = Store::open_test_fixture(&directory.path().join("second.db")).unwrap();
+    let installation_id = fixture.satellite_installation_id().unwrap();
+    assert_ne!(installation_id, second.satellite_installation_id().unwrap());
+    assert_ne!(key(&fixture.conn), key(&second.conn));
+    for pragma in [
+        "journal_mode",
+        "foreign_keys",
+        "busy_timeout",
+        "user_version",
+    ] {
+        let value = |conn: &Connection| {
+            conn.query_row(&format!("PRAGMA {pragma}"), [], |row| {
+                row.get::<_, rusqlite::types::Value>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(value(&direct.conn), value(&fixture.conn), "{pragma}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&fixture_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    fixture
+        .conn
+        .execute_batch(
+            "CREATE TABLE fixture_probe(value TEXT); INSERT INTO fixture_probe VALUES('retained');",
+        )
+        .unwrap();
+    drop(fixture);
+    let reopened = Store::open_test_fixture(&fixture_path).unwrap();
+    assert_eq!(
+        installation_id,
+        reopened.satellite_installation_id().unwrap()
+    );
+    assert_eq!(
+        reopened
+            .conn
+            .query_row("SELECT value FROM fixture_probe", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "retained"
+    );
+}
+
 fn s1_registered_function_inventory(conn: &Connection) -> Vec<(String, i64)> {
     let mut statement = conn
         .prepare(
@@ -1849,6 +1988,7 @@ fn assert_issue_event_semantics_are_complete(event: &rsi_common::types::IssueEve
             issue_id,
             expected_row_version,
             status,
+            ..
         } => {
             assert_eq!(*issue_id, event.issue_id);
             assert_eq!(*expected_row_version, event.expected_row_version);
@@ -3587,7 +3727,7 @@ fn closure_operator_same_key_replays_and_different_payload_refuses_without_effec
 
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("closure-launch-replay.sqlite");
-    let mut store = Store::open(&database).unwrap();
+    let store = Store::open(&database).unwrap();
     let idempotency_key = Uuid::new_v4();
     let request = CreateClosureProgramRequestV1 {
         config: ClosureProgramConfigV1 {
@@ -3991,7 +4131,7 @@ fn closure_event_and_typed_provenance_commit_atomically() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_migration_backfills_and_triggers_unverified_projections() {
-    let mut store = Store::open_in_memory().unwrap();
+    let store = Store::open_in_memory().unwrap();
     let version: i32 = store
         .conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -4673,6 +4813,24 @@ fn h1_v83_startup_reconciliation_finishes_all_bounded_batches_before_restore_rea
     assert_eq!(running, 0);
 }
 
+/// A reclaim the test expects to remove the target. A refusal panics naming the
+/// check that refused, so a red run is attributable (#2163).
+fn reclaim_target_or_panic(
+    store: &Store,
+    custody_id: Uuid,
+    generation: u64,
+    sandbox_base: &std::path::Path,
+) {
+    crate::sandbox::custody::CustodyService::reclaim_terminal_target_or_refusal(
+        store,
+        custody_id,
+        generation,
+        sandbox_base,
+    )
+    .unwrap()
+    .unwrap_or_else(|attempt| panic!("target reclaim was refused: {attempt:?}"));
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
 fn h1_v83_target_reclaim_removes_only_target_under_generation_fence() {
@@ -4875,7 +5033,7 @@ fn h1_v83_target_reclaim_removes_only_target_under_generation_fence() {
         ],
     );
 
-    assert!(CustodyService::reclaim_terminal_target(&store, custody_id, 1, &sandbox_base).unwrap());
+    reclaim_target_or_panic(&store, custody_id, 1, &sandbox_base);
     assert!(root.is_dir());
     assert!(!target.exists());
     assert!(
@@ -6940,7 +7098,7 @@ fn multi_root_startup_store_961() -> MultiRootStartup961 {
         .to_string();
     let source_commit = h1_v83_git(&canonical, &["rev-parse", "HEAD"]);
     let db = tempdir.path().join("custody.db");
-    let mut store = Store::open(&db).unwrap();
+    let mut store = Store::open_test_fixture(&db).unwrap();
     let specs = [
         (SessionStatus::Completed, None, "live", None),
         (
@@ -7014,7 +7172,6 @@ fn multi_root_startup_store_961() -> MultiRootStartup961 {
             Some(RootFault961::SwitchedBranch) => {
                 h1_v83_git(&root, &["switch", "-qc", &format!("rsi/elsewhere-{index}")]);
             }
-            Some(RootFault961::None) => unreachable!(),
         }
         roots.push((custody_id, owner.id, expected_state, expected_error));
     }
@@ -7086,7 +7243,6 @@ fn multi_root_startup_store_961() -> MultiRootStartup961 {
 
 #[derive(Clone, Copy, Debug)]
 enum RootFault961 {
-    None,
     MissingRoot,
     SwitchedBranch,
 }
@@ -7294,18 +7450,9 @@ fn h1_v83_startup_retains_authenticated_failed_terminal_history() {
 #[test]
 fn h1_v83_reclaim_first_keeps_worktree_and_allows_cold_transfer() {
     use super::sandbox_custody::{CustodyCause, SessionCustodyBinding};
-    use crate::sandbox::custody::CustodyService;
 
     let mut fixture = h1_v83_real_custody_fixture(SessionStatus::Completed, "reclaim-first");
-    assert!(
-        CustodyService::reclaim_terminal_target(
-            &fixture.store,
-            fixture.custody_id,
-            1,
-            &fixture.sandbox_base
-        )
-        .unwrap()
-    );
+    reclaim_target_or_panic(&fixture.store, fixture.custody_id, 1, &fixture.sandbox_base);
     assert!(!fixture.target.exists());
     assert!(fixture.root.is_dir());
 
@@ -7544,14 +7691,11 @@ async fn h1_v83_transfer_first_revalidates_successor_and_reclaims_original_root_
         .await
         .update_session_status(successor.id, SessionStatus::Completed)
         .unwrap();
-    assert!(
-        CustodyService::reclaim_terminal_target(
-            &*store.lock().await,
-            fixture.custody_id,
-            2,
-            &fixture.sandbox_base
-        )
-        .unwrap()
+    reclaim_target_or_panic(
+        &*store.lock().await,
+        fixture.custody_id,
+        2,
+        &fixture.sandbox_base,
     );
     assert!(!fixture.target.exists());
     assert_eq!(
@@ -7682,14 +7826,11 @@ async fn h1_v83_effect_first_fences_reclaim_until_settlement() {
         )
         .unwrap();
     assert_eq!(counters, (0, 0));
-    assert!(
-        CustodyService::reclaim_terminal_target(
-            &*store.lock().await,
-            fixture.custody_id,
-            1,
-            &fixture.sandbox_base
-        )
-        .unwrap()
+    reclaim_target_or_panic(
+        &*store.lock().await,
+        fixture.custody_id,
+        1,
+        &fixture.sandbox_base,
     );
     assert!(!fixture.target.exists());
     worker.shutdown(&service).await.unwrap();
@@ -7846,6 +7987,74 @@ async fn admission_surrenders_root_busy_within_its_budget_on_a_longer_hold() {
         elapsed < budget + std::time::Duration::from_secs(5),
         "surrendered within the budget, not after the hold: {elapsed:?}"
     );
+    drop(release);
+    holder.join().unwrap();
+    crate::store::custody_lock_order::set_bounded_wait_for_test(None);
+}
+
+/// #1162: the resume preauthentication takes the Store and the stripe within
+/// the same budget, so a stripe that stays held after a RootBusy cannot pin the
+/// Store ahead of admission, and the guard it acquires is the one it uses.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[tokio::test]
+async fn resume_preauthentication_surrenders_root_busy_without_pinning_the_store() {
+    let fixture = AdmissionStripeFixture::new("preauth-long-hold");
+    let budget = std::time::Duration::from_millis(200);
+    crate::store::custody_lock_order::set_bounded_wait_for_test(Some(budget));
+    let (release, holder) = fixture.hold_stripe();
+    let started = std::time::Instant::now();
+    let refused = crate::store::custody_lock_order::lock_store_then_session_root_within(
+        &fixture.store,
+        fixture.session.id,
+        crate::store::custody_lock_order::admission_wait(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(refused.is_none(), "a hold longer than the budget refuses");
+    assert!(elapsed >= budget, "waited the budget first: {elapsed:?}");
+    assert!(
+        elapsed < budget + std::time::Duration::from_secs(5),
+        "surrendered within the budget: {elapsed:?}"
+    );
+    // The refused preauthentication left the Store free for other callers.
+    assert!(
+        fixture.store.try_lock().is_ok(),
+        "the Store is not pinned behind the busy stripe"
+    );
+    drop(release);
+    holder.join().unwrap();
+    // With the stripe free it succeeds and returns the stripe it acquired.
+    let (_store, root) = crate::store::custody_lock_order::lock_store_then_session_root_within(
+        &fixture.store,
+        fixture.session.id,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("acquired once the stripe is free");
+    assert!(root.is_some(), "the live custody stripe is returned held");
+    crate::store::custody_lock_order::set_bounded_wait_for_test(None);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[tokio::test]
+async fn handoff_resume_preauthentication_returns_retryable_root_busy_on_a_held_stripe() {
+    let fixture = AdmissionStripeFixture::new("preauth-handoff");
+    crate::store::custody_lock_order::set_bounded_wait_for_test(Some(
+        std::time::Duration::from_millis(150),
+    ));
+    let runtime = crate::sandbox::custody::CustodyExecutionRuntime::new(
+        std::sync::Arc::clone(&fixture.store),
+        fixture.service.clone(),
+        fixture.sandbox_base.clone(),
+        fixture.boot_id,
+    );
+    let (release, holder) = fixture.hold_stripe();
+    let error = runtime
+        .prepare_handoff_resume(&fixture.session)
+        .await
+        .err()
+        .expect("held stripe is refused after its budget");
+    assert_root_busy_retryable(&error);
     drop(release);
     holder.join().unwrap();
     crate::store::custody_lock_order::set_bounded_wait_for_test(None);
@@ -8232,7 +8441,7 @@ fn test_store_open_sets_busy_timeout() {
 fn test_insert_and_load_session() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = Session {
         context_fill_pct: None,
@@ -8343,7 +8552,7 @@ fn test_insert_and_load_session() {
 fn test_pending_question_persists_rehydrates_and_clears() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut session = make_test_session();
     session.status = SessionStatus::WaitingApproval;
@@ -8373,7 +8582,7 @@ fn test_pending_question_persists_rehydrates_and_clears() {
 fn test_update_session_status() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8402,7 +8611,7 @@ fn test_update_session_status() {
 fn event_watermark_moves_on_append_and_on_inplace_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8446,7 +8655,7 @@ fn event_watermark_moves_on_append_and_on_inplace_rewrite() {
 fn test_insert_and_load_events() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8500,7 +8709,7 @@ fn test_insert_and_load_events() {
 #[test]
 fn plan_events_round_trip_through_the_store() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("test.db")).unwrap();
+    let store = Store::open_test_fixture(&dir.path().join("test.db")).unwrap();
     let session = make_test_session();
     store.insert_session(&session).unwrap();
 
@@ -8543,7 +8752,7 @@ fn plan_events_round_trip_through_the_store() {
 fn test_load_events_since_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8582,7 +8791,7 @@ fn test_load_events_since_sequence() {
 fn test_event_autoincrement_id() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8610,7 +8819,7 @@ fn test_event_autoincrement_id() {
 fn test_load_sessions_empty_db() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let sessions = store.load_sessions().unwrap();
     assert!(sessions.is_empty());
@@ -8621,7 +8830,7 @@ fn test_load_sessions_empty_db() {
 fn test_delete_session() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -8647,7 +8856,7 @@ fn test_delete_session() {
 fn test_delete_nonexistent_session() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     // Should not error when deleting a session that doesn't exist
     let result = store.delete_session(Uuid::new_v4());
@@ -8978,7 +9187,7 @@ fn soft_delete_retains_restorable_session_and_execution_projection() {
 fn test_update_claude_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -9001,7 +9210,7 @@ fn test_update_claude_session_id() {
 fn test_session_metadata_persistence() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut session = make_test_session();
     store.insert_session(&session).unwrap();
@@ -9281,7 +9490,9 @@ fn h1_rb_insert_fixed_custody(
 }
 
 fn h1_rb_create_complete_v84_checkpoint(path: &std::path::Path) {
-    let store = Store::open(path).expect("create RB head Store");
+    // Only the current-head setup uses the cached schema. The checkpoint rewind
+    // and every historical migration replay below still use their normal paths.
+    let store = Store::open_test_fixture(path).expect("create RB head Store");
     h1_rb_insert_fixed_session(&store, H1_RB_ORDINARY_SESSION, false);
     h1_rb_insert_fixed_session(&store, H1_RB_SOURCE_SESSION, true);
     h1_rb_insert_fixed_session(&store, H1_RB_AGENT_FRESH_SESSION, true);
@@ -10563,7 +10774,7 @@ fn h1_v85_request_key_grammar_and_claim_family_coupling_are_exhaustive() {
 
     let dir = tempfile::tempdir().expect("temporary request-key database");
     let path = dir.path().join("v85-request-key.sqlite");
-    Store::open(&path).expect("create V85 request-key database");
+    Store::open_test_fixture(&path).expect("create V85 request-key database");
     let raw = Connection::open(&path).expect("open raw unregistered connection");
     assert!(raw.execute(
         "INSERT INTO execution_origin_receipts(receipt_id,request_key,requested_origin_session_id,outcome,code,occurred_at) VALUES(?1,?2,?3,'refused','request-key',?4)",
@@ -10962,37 +11173,6 @@ fn h1_v85_data_bearing_upgrade_to_v86_is_atomic_reopenable_and_catalog_identical
             "{fault:?} leaves exact V85 integrity clean"
         );
     }
-}
-
-/// Insert through the exact current Session serializer while a migration
-/// fixture intentionally exposes a pre-V99 catalog. The temporary suffix is
-/// transaction-local and is removed before the historical fixture commits;
-/// production writers remain strict against stale schemas.
-fn insert_pre_v99_migration_session(store: &Store, session: &Session) {
-    let version: i32 = store
-        .conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .expect("read pre-V99 migration fixture version");
-    assert!(
-        (83..99).contains(&version),
-        "pre-V99 Session fixture requires V83..=V98, found V{version}"
-    );
-    let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate)
-        .expect("open pre-V99 Session fixture transaction");
-    tx.execute_batch(
-        "ALTER TABLE sessions ADD COLUMN agent_role TEXT;
-         ALTER TABLE sessions ADD COLUMN epic_spawn_ordinal INTEGER;",
-    )
-    .expect("add temporary V99 Session suffix");
-    super::sessions::insert_session_on(&tx, session)
-        .expect("insert Session through current serializer");
-    tx.execute_batch(
-        "ALTER TABLE sessions DROP COLUMN epic_spawn_ordinal;
-         ALTER TABLE sessions DROP COLUMN agent_role;",
-    )
-    .expect("remove temporary V99 Session suffix");
-    tx.commit()
-        .expect("commit exact pre-V99 Session migration fixture");
 }
 
 fn h1_v87_create_sealed_deployed_v86_fixture(path: &std::path::Path) -> Store {
@@ -19002,40 +19182,53 @@ fn h1_fqrrev_build_active_terminal_hostile(
     binding
 }
 
-fn h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(sandbox: bool) {
-    for terminal_phase in [false, true] {
-        for hostile in [
-            H1FqrrevV87TerminalHostile::MissingInvocation,
-            H1FqrrevV87TerminalHostile::ForeignInvocation,
-            H1FqrrevV87TerminalHostile::NonterminalInvocation,
-            H1FqrrevV87TerminalHostile::MissingC5Setting,
-            H1FqrrevV87TerminalHostile::WrongC5Setting,
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let source = directory.path().join(format!(
-                "fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
-            ));
-            h1_fqrrev_build_active_terminal_hostile(&source, sandbox, terminal_phase, hostile);
-            h1_trrev_assert_refusal_at_every_v88_seam(
-                &source,
-                directory.path(),
-                &format!("fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
-                "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)",
-            );
-        }
+fn h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(
+    sandbox: bool,
+    terminal_phase: bool,
+) {
+    for hostile in [
+        H1FqrrevV87TerminalHostile::MissingInvocation,
+        H1FqrrevV87TerminalHostile::ForeignInvocation,
+        H1FqrrevV87TerminalHostile::NonterminalInvocation,
+        H1FqrrevV87TerminalHostile::MissingC5Setting,
+        H1FqrrevV87TerminalHostile::WrongC5Setting,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join(format!(
+            "fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
+        ));
+        h1_fqrrev_build_active_terminal_hostile(&source, sandbox, terminal_phase, hostile);
+        h1_trrev_assert_refusal_at_every_v88_seam(
+            &source,
+            directory.path(),
+            &format!("fqrrev-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
+            "Store error: V88 cannot classify 1 active V87 authority/claim binding(s)",
+        );
     }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-fn h1_fqrrev_v88_ordinary_active_terminal_hostiles_refuse_before_every_seam() {
-    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(false);
+fn h1_fqrrev_v88_ordinary_open_phase_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(false, false);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-fn h1_fqrrev_v88_sandbox_active_terminal_hostiles_refuse_before_every_seam() {
-    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(true);
+fn h1_fqrrev_v88_ordinary_terminal_phase_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(false, true);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_fqrrev_v88_sandbox_open_phase_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(true, false);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_fqrrev_v88_sandbox_terminal_phase_active_terminal_hostiles_refuse_before_every_seam() {
+    h1_fqrrev_v88_active_terminal_hostiles_refuse_before_every_seam(true, true);
 }
 
 fn h1_fqrrev_pin_exact_v90(path: &std::path::Path) {
@@ -19112,44 +19305,57 @@ fn h1_fqrrev_assert_refusal_at_every_v91_seam(
     }
 }
 
-fn h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(sandbox: bool) {
-    for terminal_phase in [false, true] {
-        for hostile in [
-            H1FqrrevV87TerminalHostile::MissingInvocation,
-            H1FqrrevV87TerminalHostile::ForeignInvocation,
-            H1FqrrevV87TerminalHostile::NonterminalInvocation,
-            H1FqrrevV87TerminalHostile::MissingC5Setting,
-            H1FqrrevV87TerminalHostile::WrongC5Setting,
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let source = directory.path().join(format!(
-                "v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
-            ));
-            let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, "settling", false);
-            h1_fqrrev_pin_exact_v90(&source);
-            let connection = h1_trrev_open_exact_v87(&source);
-            h1_fqrrev_apply_active_terminal_hostile(&connection, &binding, terminal_phase, hostile);
-            drop(connection);
-            h1_fqrrev_assert_refusal_at_every_v91_seam(
-                &source,
-                directory.path(),
-                &format!("v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
-                "Store error: V91 cannot classify 1 active V90 authority/claim binding(s)",
-            );
-        }
+fn h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(
+    sandbox: bool,
+    terminal_phase: bool,
+) {
+    for hostile in [
+        H1FqrrevV87TerminalHostile::MissingInvocation,
+        H1FqrrevV87TerminalHostile::ForeignInvocation,
+        H1FqrrevV87TerminalHostile::NonterminalInvocation,
+        H1FqrrevV87TerminalHostile::MissingC5Setting,
+        H1FqrrevV87TerminalHostile::WrongC5Setting,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join(format!(
+            "v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}.sqlite"
+        ));
+        let binding = h1_trrev_build_exact_v87_binding(&source, sandbox, "settling", false);
+        h1_fqrrev_pin_exact_v90(&source);
+        let connection = h1_trrev_open_exact_v87(&source);
+        h1_fqrrev_apply_active_terminal_hostile(&connection, &binding, terminal_phase, hostile);
+        drop(connection);
+        h1_fqrrev_assert_refusal_at_every_v91_seam(
+            &source,
+            directory.path(),
+            &format!("v91-terminal-{sandbox}-{terminal_phase}-{hostile:?}"),
+            "Store error: V91 cannot classify 1 active V90 authority/claim binding(s)",
+        );
     }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-fn h1_v91_ordinary_terminal_predecessor_hostiles_refuse_before_every_seam() {
-    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(false);
+fn h1_v91_ordinary_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(false, false);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
-fn h1_v91_sandbox_terminal_predecessor_hostiles_refuse_before_every_seam() {
-    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(true);
+fn h1_v91_ordinary_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(false, true);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_v91_sandbox_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(true, false);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn h1_v91_sandbox_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam() {
+    h1_v91_terminal_predecessor_hostiles_refuse_before_every_seam(true, true);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -21767,7 +21973,7 @@ pub(crate) fn create_v88_pre_antigravity_fixture(path: &std::path::Path) -> Conn
 fn test_delete_project_clears_session_project_id() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let project = make_test_project("to-delete");
     store.insert_project(&project).unwrap();
@@ -22876,7 +23082,7 @@ fn tag_default_empty_after_v43_upgrade() {
 fn topology_unique_name_constraint() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("rsi.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let now = chrono::Utc::now().to_rfc3339();
     let id1 = Uuid::new_v4().to_string();
@@ -23187,7 +23393,7 @@ fn migration_v46_adds_chain_iterations_table_and_indexes() {
 fn session_is_eval_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut s = make_test_session();
     s.is_eval = true;
@@ -23222,7 +23428,7 @@ fn test_rpc_delete_container_empty_succeeds_via_has_children() {
     // returns has_children=false, so the RPC handler proceeds with delete.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut group = make_test_session();
     group.session_kind = rsi_common::types::SessionKind::Group;
@@ -23241,7 +23447,7 @@ fn test_rpc_delete_container_non_empty_rejected_via_has_children() {
     // has_children=true, which the RPC handler converts to InvalidParam.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut group = make_test_session();
     group.session_kind = rsi_common::types::SessionKind::Group;
@@ -23265,7 +23471,7 @@ fn test_list_children_root_and_parent_scopes() {
     // returns direct children only — no recursion.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut top = make_test_session();
     top.session_kind = rsi_common::types::SessionKind::Group;
@@ -23297,7 +23503,7 @@ fn test_update_session_parent_persists_reparent() {
     // and the change is visible through subsequent list_children() calls.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open_test_fixture(&db_path).unwrap();
 
     let mut g1 = make_test_session();
     g1.session_kind = rsi_common::types::SessionKind::Group;
@@ -23756,6 +23962,8 @@ fn agent_list_issues_ready_filter_matches_operator_projection_and_pages() {
     let legacy_rows = store
         .agent_list_issues(lead, &rsi_common::rpc::AgentListIssuesRequestV1::default())
         .unwrap()
+        .into_full()
+        .expect("full Issue page")
         .issues;
     assert_eq!(
         legacy_rows.iter().map(|issue| issue.id).collect::<Vec<_>>(),
@@ -23777,7 +23985,9 @@ fn agent_list_issues_ready_filter_matches_operator_projection_and_pages() {
                         ..Default::default()
                     },
                 )
-                .unwrap();
+                .unwrap()
+                .into_full()
+                .expect("full Issue page");
             ids.extend(page.issues.into_iter().map(|issue| issue.id));
             let Some(next) = page.next_cursor else {
                 break;
@@ -23847,18 +24057,9 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
     assert_eq!(by_number.issue.id, issue.id);
 
     let edit = || AgentUpdateIssueRequestV1 {
-        project_id: None,
-        issue_id: None,
         display_number: Some(issue.display_number),
-        expected_row_version: issue.row_version,
-        idempotency_key: "by-number-edit".into(),
         title: Some("renamed by number".into()),
-        body: None,
-        labels: None,
-        priority: None,
-        clear_priority: false,
-        assignee: None,
-        clear_assignee: false,
+        ..AgentUpdateIssueRequestV1::new(issue.row_version, "by-number-edit".into())
     };
     let updated = store.agent_update_issue(lead, &edit()).unwrap();
     assert_eq!(updated.issue.id, issue.id);
@@ -23870,6 +24071,8 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
         .agent_update_issue_status(
             lead,
             &AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: None,
                 display_number: Some(issue.display_number),
@@ -23942,18 +24145,8 @@ fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
                 .agent_update_issue(
                     lead,
                     &AgentUpdateIssueRequestV1 {
-                        project_id: None,
-                        issue_id,
-                        display_number,
-                        expected_row_version: issue.row_version,
-                        idempotency_key: "bad-target".into(),
                         title: Some("nope".into()),
-                        body: None,
-                        labels: None,
-                        priority: None,
-                        clear_priority: false,
-                        assignee: None,
-                        clear_assignee: false,
+                        ..AgentUpdateIssueRequestV1::new(issue.row_version, "bad-target".into())
                     },
                 )
                 .is_err()
@@ -23963,6 +24156,8 @@ fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
                 .agent_update_issue_status(
                     lead,
                     &AgentUpdateIssueStatusRequestV1 {
+                        note: None,
+                        include_issue: false,
                         project_id: None,
                         issue_id,
                         display_number,
@@ -24013,10 +24208,14 @@ fn agent_list_issues_desc_order_pages_with_cursor_and_filters_title() {
                         order,
                         title_contains: title_contains.map(str::to_string),
                         cursor,
+                        // #2052: a title search is summary-only by default.
+                        fields: Some(rsi_common::rpc::IssueListFieldsV1::Full),
                         ..Default::default()
                     },
                 )
-                .unwrap();
+                .unwrap()
+                .into_full()
+                .expect("full Issue page");
             ids.extend(page.issues.into_iter().map(|issue| issue.id));
             let Some(next) = page.next_cursor else {
                 break;
@@ -24036,6 +24235,8 @@ fn agent_list_issues_desc_order_pages_with_cursor_and_filters_title() {
         store
             .agent_list_issues(lead, &AgentListIssuesRequestV1::default())
             .unwrap()
+            .into_full()
+            .expect("full Issue page")
             .issues
             .iter()
             .map(|issue| issue.id)
@@ -24060,6 +24261,58 @@ fn agent_list_issues_desc_order_pages_with_cursor_and_filters_title() {
         "LIKE metacharacters match literally"
     );
     assert!(collect(IssueListOrderV1::Asc, Some("no such title"), 5).is_empty());
+}
+
+/// #2052: a title search returns bodyless summary rows by default;
+/// `fields:"full"` returns whole records and `fields:"summary"` trims any list.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+#[allow(clippy::unwrap_used)]
+fn agent_list_issues_title_search_returns_summary_rows_by_default() {
+    use rsi_common::rpc::{AgentListIssuesRequestV1, IssueListFieldsV1};
+    let (store, lead, project) = issue_v97_authority_fixture();
+    let created = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            body: "SECRET-BODY-TEXT".to_string(),
+            ..make_new_issue("rotation dedupe target")
+        })
+        .unwrap();
+    let list = |title: Option<&str>, fields| {
+        store
+            .agent_list_issues(
+                lead,
+                &AgentListIssuesRequestV1 {
+                    title_contains: title.map(str::to_string),
+                    fields,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    for page in [
+        list(Some("rotation"), None),
+        list(None, Some(IssueListFieldsV1::Summary)),
+        list(Some("rotation"), Some(IssueListFieldsV1::Summary)),
+    ] {
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(!json.contains("SECRET-BODY-TEXT"), "{json}");
+        let rsi_common::types::AgentIssuePageV1::Summary(page) = page else {
+            panic!("expected summary rows: {json}");
+        };
+        let row = &page.issues[0];
+        assert_eq!(row.id, created.id);
+        assert_eq!(row.display_number, created.display_number);
+        assert_eq!(row.title, "rotation dedupe target");
+        assert_eq!(row.updated_at, created.updated_at);
+    }
+    for page in [
+        list(Some("rotation"), Some(IssueListFieldsV1::Full)),
+        list(None, None),
+    ] {
+        let page = page.into_full().expect("full rows keep bodies");
+        assert_eq!(page.issues[0].body, "SECRET-BODY-TEXT");
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -24823,6 +25076,135 @@ fn issue_v97_to_v96_rewind_preserves_exact_catalog_projection_dependencies_and_f
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
 #[test]
+fn agent_issue_status_note_is_recorded_replayed_and_shown_by_get_and_history() {
+    let (store, caller, project) = issue_v97_authority_fixture();
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("covered-by close")
+        })
+        .unwrap();
+    let status_request = |status, expected_row_version, key: &str, note: Option<&str>| {
+        rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+            note: note.map(str::to_string),
+            include_issue: false,
+            project_id: None,
+            issue_id: Some(issue.id),
+            display_number: None,
+            status,
+            expected_row_version,
+            idempotency_key: key.into(),
+        }
+    };
+    let get = || {
+        store
+            .agent_get_issue(
+                caller,
+                &rsi_common::rpc::AgentGetIssueRequestV1 {
+                    project_id: None,
+                    issue_id: Some(issue.id),
+                    display_number: None,
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(get().status_note, None);
+
+    let note = "covered_by 80ea5e0ce";
+    let closed = store
+        .agent_update_issue_status(
+            caller,
+            &status_request(
+                IssueStatus::Closed,
+                issue.row_version,
+                "note-close",
+                Some(note),
+            ),
+        )
+        .unwrap();
+    assert!(!closed.deduplicated);
+    assert_eq!(get().status_note.as_deref(), Some(note));
+
+    // Same key and same note replays the same receipt.
+    let replay = store
+        .agent_update_issue_status(
+            caller,
+            &status_request(
+                IssueStatus::Closed,
+                issue.row_version,
+                "note-close",
+                Some(note),
+            ),
+        )
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.event.id, closed.event.id);
+    // Same key and a different (or absent) note is a conflict.
+    for other in [Some("duplicate of #1"), None] {
+        let error = store
+            .agent_update_issue_status(
+                caller,
+                &status_request(IssueStatus::Closed, issue.row_version, "note-close", other),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("idempotency_conflict"), "{error}");
+    }
+    // An oversized or blank note is refused before any write.
+    for bad in ["".to_string(), "  ".to_string(), "x".repeat(2_049)] {
+        assert!(
+            store
+                .agent_update_issue_status(
+                    caller,
+                    &status_request(
+                        IssueStatus::Open,
+                        closed.issue.row_version,
+                        "note-bad",
+                        Some(&bad),
+                    ),
+                )
+                .is_err()
+        );
+    }
+    // A reopen without a note clears the shown note; the history keeps both.
+    store
+        .agent_update_issue_status(
+            caller,
+            &status_request(
+                IssueStatus::Open,
+                closed.issue.row_version,
+                "note-reopen",
+                None,
+            ),
+        )
+        .unwrap();
+    assert_eq!(get().status_note, None);
+    let history = store
+        .agent_list_issue_events(
+            caller,
+            &rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
+                issue_id: issue.id,
+                after_sequence: 0,
+                limit: None,
+            },
+        )
+        .unwrap();
+    let notes: Vec<Option<String>> = history
+        .events
+        .iter()
+        .filter_map(|event| match &event.request.operation {
+            rsi_common::types::IssueSemanticOperationV1::StatusUpdated { note, .. } => {
+                Some(note.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes, vec![Some(note.to_string()), None]);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
 fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
     let (store, caller, project) = issue_v97_authority_fixture();
     let issue = store
@@ -24835,6 +25217,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -24849,6 +25233,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -24864,6 +25250,8 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -25028,18 +25416,12 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                    project_id: None,
                     issue_id: Some(issue_id),
-                    display_number: None,
-                    expected_row_version: 1,
-                    idempotency_key: format!("v97-equality-update-{suffix}"),
                     title: Some("hidden update".to_string()),
-                    body: None,
-                    labels: None,
-                    priority: None,
-                    clear_priority: false,
-                    assignee: None,
-                    clear_assignee: false,
+                    ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(
+                        1,
+                        format!("v97-equality-update-{suffix}"),
+                    )
                 },
             )
             .unwrap_err()
@@ -25055,6 +25437,8 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                    note: None,
+                    include_issue: false,
                     project_id: None,
                     issue_id: Some(issue_id),
                     display_number: None,
@@ -25214,6 +25598,8 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -25364,18 +25750,12 @@ fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
                 .agent_update_issue(
                     caller,
                     &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                        project_id: None,
                         issue_id: Some(issue.id),
-                        display_number: None,
-                        expected_row_version: issue.row_version,
-                        idempotency_key: format!("rollback-agent-{index}"),
                         title: Some("must roll back".to_string()),
-                        body: None,
-                        labels: None,
-                        priority: None,
-                        clear_priority: false,
-                        assignee: None,
-                        clear_assignee: false,
+                        ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(
+                            issue.row_version,
+                            format!("rollback-agent-{index}")
+                        )
                     },
                 )
                 .is_err()
@@ -25455,18 +25835,12 @@ fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
         .agent_update_issue(
             caller,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(ordinary.id),
-                display_number: None,
-                expected_row_version: ordinary.row_version,
-                idempotency_key: "lead-writer-key".to_string(),
                 title: Some("lead patch".to_string()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(
+                    ordinary.row_version,
+                    "lead-writer-key".to_string(),
+                )
             },
         )
         .unwrap();
@@ -25804,7 +26178,11 @@ fn agent_issue_authority_matrix_denies_nonlead_projectless_container_and_unknown
             .to_string(),
         expected
     );
-    store.agent_list_issues(ordinary.id, &request).unwrap();
+    store
+        .agent_list_issues(ordinary.id, &request)
+        .unwrap()
+        .into_full()
+        .expect("full Issue page");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -25870,18 +26248,9 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: "lead-update".into(),
                 title: Some("lead updated issue".into()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..AgentUpdateIssueRequestV1::new(issue.row_version, "lead-update".into())
             },
         )
         .unwrap();
@@ -25895,7 +26264,9 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
             manager.id,
             &rsi_common::rpc::AgentListIssuesRequestV1::default(),
         )
-        .unwrap();
+        .unwrap()
+        .into_full()
+        .expect("full Issue page");
     assert_eq!(page.issues, vec![issue.clone(), operator_issue]);
     let manager_read = store
         .agent_get_issue(
@@ -25942,18 +26313,9 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             manager.id,
             &AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: "manager-update".into(),
                 title: Some("manager updated issue".into()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..AgentUpdateIssueRequestV1::new(issue.row_version, "manager-update".into())
             },
         )
         .unwrap();
@@ -25961,6 +26323,8 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue_status(
             manager.id,
             &AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -26069,6 +26433,8 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         store
             .agent_list_issues(lead, &ordinary)
             .unwrap()
+            .into_full()
+            .expect("full Issue page")
             .issues
             .len(),
         2,
@@ -26153,18 +26519,9 @@ fn agent_issue_lead_concurrent_cas_has_one_winner_alongside_manager_coordinate_g
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: key.into(),
                 title: Some(format!("updated by {key}")),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..AgentUpdateIssueRequestV1::new(issue.row_version, key.into())
             };
             barrier.wait();
             store.agent_update_issue(lead_id, &request)
@@ -26239,7 +26596,7 @@ fn manager_issue_list(store: &Store, caller: Uuid) -> Result<Vec<Issue>> {
             caller,
             &rsi_common::rpc::AgentListIssuesRequestV1::default(),
         )
-        .map(|page| page.issues)
+        .map(|page| page.into_full().expect("full Issue page").issues)
 }
 
 #[allow(clippy::unwrap_used)]
@@ -26316,18 +26673,9 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: "lead-update".into(),
                 title: Some("lead updated".into()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..AgentUpdateIssueRequestV1::new(issue.row_version, "lead-update".into())
             },
         )
         .unwrap();
@@ -26335,6 +26683,8 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue_status(
             lead,
             &AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -26719,6 +27069,8 @@ fn lead_set_status(store: &Store, lead: Uuid, issue: &Issue, status: IssueStatus
         .agent_update_issue_status(
             lead,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -26741,18 +27093,9 @@ fn manager_issue_update_content_records_manager_actor_replays_and_refuses_stale_
             store.agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                    project_id: None,
                     issue_id: Some(issue.id),
-                    display_number: None,
-                    expected_row_version: issue.row_version,
-                    idempotency_key: key.into(),
                     title: Some(format!("manager retitled {}", issue.row_version)),
-                    body: None,
-                    labels: None,
-                    priority: None,
-                    clear_priority: false,
-                    assignee: None,
-                    clear_assignee: false,
+                    ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(issue.row_version, key.into())
                 },
             )
         },
@@ -26780,6 +27123,8 @@ fn manager_issue_update_status_records_manager_actor_replays_and_refuses_stale_o
             store.agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                    note: None,
+                    include_issue: false,
                     project_id: None,
                     issue_id: Some(issue.id),
                     display_number: None,
@@ -26878,18 +27223,12 @@ fn manager_issue_mutations_refuse_ordinary_worker_without_coordinator_grant() {
         .agent_update_issue(
             worker.id,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: "worker-update".into(),
                 title: Some("worker retitle".into()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(
+                    issue.row_version,
+                    "worker-update".into(),
+                )
             },
         )
         .unwrap_err()
@@ -26928,18 +27267,9 @@ fn manager_issue_concurrent_cas_has_one_winner_and_one_stale_version() {
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(issue.id),
-                display_number: None,
-                expected_row_version: issue.row_version,
-                idempotency_key: key.into(),
                 title: Some(format!("updated by {key}")),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..AgentUpdateIssueRequestV1::new(issue.row_version, key.into())
             };
             barrier.wait();
             store.agent_update_issue(manager_id, &request)
@@ -27246,18 +27576,12 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
         store.agent_update_issue(
             old_lead,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
-                project_id: None,
                 issue_id: Some(mutation_issue.id),
-                display_number: None,
-                expected_row_version: mutation_issue.row_version,
-                idempotency_key: "lead-transfer-race".to_string(),
                 title: Some("serialized old-lead write".to_string()),
-                body: None,
-                labels: None,
-                priority: None,
-                clear_priority: false,
-                assignee: None,
-                clear_assignee: false,
+                ..rsi_common::rpc::AgentUpdateIssueRequestV1::new(
+                    mutation_issue.row_version,
+                    "lead-transfer-race".to_string(),
+                )
             },
         )
     });
@@ -27302,7 +27626,9 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
             new_lead,
             &rsi_common::rpc::AgentListIssuesRequestV1::default(),
         )
-        .unwrap();
+        .unwrap()
+        .into_full()
+        .expect("full Issue page");
 }
 
 /// V72: fresh store lands at LATEST_SCHEMA_VERSION with both issue tables.
@@ -27533,6 +27859,7 @@ fn issue_workspace_page_request(project_id: Uuid) -> ListIssuesPageRequestV1 {
         assignee: None,
         unassigned: false,
         labels_all: Vec::new(),
+        labels_any: Vec::new(),
         provenance: Vec::new(),
         query: None,
         archive: rsi_common::types::IssueArchiveFilterV1::Active,
@@ -27541,6 +27868,111 @@ fn issue_workspace_page_request(project_id: Uuid) -> ListIssuesPageRequestV1 {
         cursor: None,
         limit: 2,
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn issue_workspace_search_matches_number_title_labels_and_body() {
+    let store = Store::open_in_memory().unwrap();
+    let project_id = d04_test_project_id();
+    let target = store
+        .create_issue(&NewIssue {
+            title: "Cache warmup".into(),
+            labels: vec!["operator-request".into()],
+            ..make_new_issue("unused")
+        })
+        .unwrap();
+    let mention = store
+        .create_issue(&NewIssue {
+            title: "Unrelated".into(),
+            body: format!("see issue {} for the cache", target.display_number),
+            ..make_new_issue("unused")
+        })
+        .unwrap();
+    let closed = store
+        .update_issue_status(target.id, IssueStatus::Closed)
+        .unwrap();
+    assert_eq!(closed.status, IssueStatus::Closed);
+
+    let search = |query: &str| {
+        store
+            .list_issue_workspace_page(&ListIssuesPageRequestV1 {
+                query: Some(query.to_string()),
+                archive: rsi_common::types::IssueArchiveFilterV1::All,
+                limit: 64,
+                ..issue_workspace_page_request(project_id)
+            })
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row.issue.id)
+            .collect::<Vec<_>>()
+    };
+
+    // `#N` names that Issue alone, even once it is Closed.
+    assert_eq!(
+        search(&format!("#{}", target.display_number)),
+        vec![target.id]
+    );
+    // A bare number finds the Issue and the text that mentions it.
+    assert_eq!(
+        search(&target.display_number.to_string()),
+        vec![target.id, mention.id]
+    );
+    // Labels, titles and bodies are searched too.
+    assert_eq!(search("operator-request"), vec![target.id]);
+    assert_eq!(search("warmup"), vec![target.id]);
+    assert_eq!(search("for the cache"), vec![mention.id]);
+    assert!(search("#99999").is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn issue_workspace_labels_any_keeps_issues_carrying_one_of_the_labels() {
+    let store = Store::open_in_memory().unwrap();
+    let project_id = d04_test_project_id();
+    let make = |title: &str, labels: &[&str]| {
+        store
+            .create_issue(&NewIssue {
+                title: title.into(),
+                labels: labels.iter().map(|label| label.to_string()).collect(),
+                ..make_new_issue("unused")
+            })
+            .unwrap()
+    };
+    let request = make("Operator asked", &["operator-request", "tui"]);
+    let decision = make("Operator must decide", &["operator-decision"]);
+    let _other = make("Plain bug", &["bug"]);
+    let _unlabeled = make("No labels", &[]);
+
+    let page = store
+        .list_issue_workspace_page(&ListIssuesPageRequestV1 {
+            labels_any: vec!["operator-request".into(), "operator-decision".into()],
+            limit: 64,
+            ..issue_workspace_page_request(project_id)
+        })
+        .unwrap();
+    assert_eq!(
+        page.rows.iter().map(|row| row.issue.id).collect::<Vec<_>>(),
+        vec![request.id, decision.id]
+    );
+    // An empty list is no filter at all, and `labels_all` still ANDs on top.
+    let narrowed = store
+        .list_issue_workspace_page(&ListIssuesPageRequestV1 {
+            labels_any: vec!["operator-request".into(), "operator-decision".into()],
+            labels_all: vec!["tui".into()],
+            limit: 64,
+            ..issue_workspace_page_request(project_id)
+        })
+        .unwrap();
+    assert_eq!(
+        narrowed
+            .rows
+            .iter()
+            .map(|row| row.issue.id)
+            .collect::<Vec<_>>(),
+        vec![request.id]
+    );
 }
 
 fn issue_workspace_cursor_for_test(
@@ -33290,6 +33722,16 @@ mod d02_idea_event_cas_tests {
 
 mod d03_controller_store_tests {
     use super::*;
+
+    // Synthetic fixture labels only. Production witness issuance and comparison
+    // are implemented by the daemon registry, never by a store-side token map.
+    impl crate::idea_control::AgentTransportBinding for std::collections::HashMap<String, Uuid> {
+        type Witness = String;
+
+        fn binding_matches(&self, session_id: Uuid, expected: &Self::Witness) -> bool {
+            self.get(expected) == Some(&session_id)
+        }
+    }
     use crate::idea_control::IdeaControllerClock;
     use crate::store::ideas::{
         IdeaControllerWriteFault, SqliteFailureClass, classify_sqlite_error,
@@ -34866,6 +35308,386 @@ mod d03_controller_store_tests {
         Ok(())
     }
 
+    async fn publish_rotation_for_test(
+        store: &Arc<Mutex<Store>>,
+        predecessor: Uuid,
+        successor: Uuid,
+        rotation_id: &str,
+    ) -> crate::error::Result<crate::store::rotation_abandon::RotationPublication> {
+        let guards = crate::store_support::spawn_single_flight::RotationPublicationGuards::acquire(
+            predecessor,
+            successor,
+        )
+        .await;
+        let metadata = serde_json::json!({ "successor_id": successor }).to_string();
+        store
+            .lock()
+            .await
+            .publish_rotation_successor_with_chain(&guards, rotation_id, &metadata)
+    }
+
+    /// #1186: a rotation publication moves the assigned Idea controller to the
+    /// exact published successor in the same commit as the Epic lead pointer.
+    /// A failed publication leaves the controller, its epoch and the lead
+    /// untouched.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[tokio::test]
+    async fn d03_rotation_publication_moves_the_controller_with_the_lead_in_one_commit()
+    -> anyhow::Result<()> {
+        let (store, project, idea) = d03_fixture().await;
+        let transfer = d03_transfer(&store, &idea).await;
+        let reservation = transfer
+            .reserve(&ReserveIdeaControllerRequestV1 {
+                expected_row_version: idea.row_version,
+                transfer_intent_key: "rotation-publication-former".to_string(),
+            })
+            .await?
+            .reservation
+            .context("former reservation")?;
+        let (former, confirmation) = {
+            let store = store.lock().await;
+            seed_confirmed_candidate(&store, project.id, &reservation, SessionProvider::Claude)?
+        };
+        let token = "rotation-publication-token".to_string();
+        let a6 = RwLock::new(HashMap::from([(token.clone(), former.id)]));
+        let assigned = transfer
+            .assign_confirmed_guarded(&reservation, &confirmation, &token, &a6)
+            .await?
+            .idea;
+        assert_eq!(assigned.current_controller_session_id, Some(former.id));
+
+        let mut epic = make_test_session();
+        epic.session_kind = rsi_common::types::SessionKind::Epic;
+        let mut successor = make_test_session();
+        successor.status = SessionStatus::Starting;
+        successor.project_id = Some(project.id);
+        successor.parent_id = Some(epic.id);
+        successor.continued_from = Some(former.id);
+        successor.rotation_depth = 1;
+        {
+            let store = store.lock().await;
+            store.insert_session(&epic)?;
+            store.update_session_parent(former.id, Some(epic.id))?;
+            store.update_session_status(former.id, SessionStatus::Completed)?;
+            store.set_lead_session(epic.id, Some(former.id))?;
+            store.insert_rotation_event(
+                former.id,
+                "rot-ctl",
+                "writing_handoff",
+                "entered",
+                None,
+            )?;
+            store.insert_session(&successor)?;
+            store.insert_rotation_event(
+                former.id,
+                "rot-ctl",
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({ "successor_id": successor.id }).to_string()),
+            )?;
+        }
+
+        store.lock().await.conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_rotation_event BEFORE INSERT ON rotation_events
+             WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )?;
+        assert!(
+            publish_rotation_for_test(&store, former.id, successor.id, "rot-ctl")
+                .await
+                .is_err()
+        );
+        {
+            let store = store.lock().await;
+            assert_eq!(
+                store.load_idea_controller_projection_v1(project.id, idea.id)?,
+                assigned,
+                "a failed publication leaves the controller and its epoch"
+            );
+            assert_eq!(
+                store.get_session(epic.id)?.context("epic")?.lead_session_id,
+                Some(former.id)
+            );
+            store
+                .conn
+                .execute_batch("DROP TRIGGER fail_rotation_event;")?;
+        }
+
+        let publication =
+            publish_rotation_for_test(&store, former.id, successor.id, "rot-ctl").await?;
+        assert_eq!(publication.epics, vec![epic.id]);
+        assert_eq!(publication.controller_moves.len(), 1);
+        let moved = &publication.controller_moves[0];
+        let store = store.lock().await;
+        let after = store.load_idea_controller_projection_v1(project.id, idea.id)?;
+        assert_eq!(after.current_controller_session_id, Some(successor.id));
+        assert_eq!(after.controller_epoch, assigned.controller_epoch + 1);
+        assert_eq!(after.row_version, assigned.row_version + 1);
+        assert_eq!(
+            (
+                moved.former_session_id,
+                moved.successor_session_id,
+                moved.controller_epoch
+            ),
+            (former.id, successor.id, after.controller_epoch)
+        );
+        assert_eq!(
+            store.get_session(epic.id)?.context("epic")?.lead_session_id,
+            Some(successor.id),
+            "the lead moved in the same commit"
+        );
+        let payload_json: String = store.conn.query_row(
+            "SELECT payload_json FROM idea_events WHERE id = ?1",
+            [moved.event_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let payload: rsi_common::types::IdeaControllerEventPayloadV1 =
+            serde_json::from_str(&payload_json)?;
+        payload.validate().map_err(anyhow::Error::msg)?;
+        assert_eq!(payload.outcome.idea, after);
+        assert!(matches!(
+            payload.request.operation,
+            rsi_common::types::IdeaControllerControlOperationV1::TransferToRotationSuccessor {
+                former_controller_session_id,
+                successor_session_id,
+                ref rotation_id,
+                proposed_epoch,
+                ..
+            } if former_controller_session_id == former.id
+                && successor_session_id == successor.id
+                && rotation_id == "rot-ctl"
+                && proposed_epoch == after.controller_epoch
+        ));
+        let reconciled = store.reconcile_idea_controllers_page_v1(None, chrono::Utc::now())?;
+        assert!(reconciled.corrupt_idea_ids.is_empty());
+        assert_eq!(reconciled.committed_event_ids, vec![moved.event_id]);
+        drop(store);
+        Ok(())
+    }
+
+    /// #1186: a live rotation's reserved candidate is assigned the controller
+    /// inside the publication transaction, with the Epic lead pointer. A
+    /// refused publication leaves the predecessor's controller, epoch, grant
+    /// and the candidate's reservation untouched, and the candidate holds no
+    /// grant; the retry of the same reservation then commits all of it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[tokio::test]
+    async fn d03_rotation_publication_assigns_the_reserved_candidate_in_one_commit()
+    -> anyhow::Result<()> {
+        let (store, project, idea) = d03_fixture().await;
+        let transfer = d03_transfer(&store, &idea).await;
+        let former_reservation = transfer
+            .reserve(&ReserveIdeaControllerRequestV1 {
+                expected_row_version: idea.row_version,
+                transfer_intent_key: "candidate-publication-former".to_string(),
+            })
+            .await?
+            .reservation
+            .context("former reservation")?;
+        let (former, former_confirmation) = {
+            let store = store.lock().await;
+            seed_confirmed_candidate(
+                &store,
+                project.id,
+                &former_reservation,
+                SessionProvider::Claude,
+            )?
+        };
+        let former_token = "candidate-publication-former-token".to_string();
+        let a6 = RwLock::new(HashMap::from([(former_token.clone(), former.id)]));
+        let assigned = transfer
+            .assign_confirmed_guarded(
+                &former_reservation,
+                &former_confirmation,
+                &former_token,
+                &a6,
+            )
+            .await?
+            .idea;
+        let former_grant = store
+            .lock()
+            .await
+            .controller_grant_v1(former.id)
+            .context("former semantic grant")?;
+
+        // The rotation reserves the candidate; its id is the reservation's.
+        let rotation_transfer = d03_transfer(&store, &assigned).await;
+        let reservation = rotation_transfer
+            .reserve(&ReserveIdeaControllerRequestV1 {
+                expected_row_version: assigned.row_version,
+                transfer_intent_key: "rotation:candidate-publication:rot-cand".to_string(),
+            })
+            .await?
+            .reservation
+            .context("candidate reservation")?;
+        let mut epic = make_test_session();
+        epic.session_kind = rsi_common::types::SessionKind::Epic;
+        let mut candidate = make_test_session();
+        candidate.id = reservation.candidate_session_id;
+        candidate.project_id = Some(project.id);
+        candidate.provider = SessionProvider::Claude;
+        candidate.status = SessionStatus::Running;
+        candidate.parent_id = Some(epic.id);
+        candidate.continued_from = Some(former.id);
+        candidate.rotation_depth = 1;
+        let admission_invocation_id = Uuid::new_v4();
+        {
+            let store = store.lock().await;
+            store.insert_session(&epic)?;
+            store.update_session_parent(former.id, Some(epic.id))?;
+            store.update_session_status(former.id, SessionStatus::Completed)?;
+            store.set_lead_session(epic.id, Some(former.id))?;
+            store.insert_rotation_event(
+                former.id,
+                "rot-cand",
+                "writing_handoff",
+                "entered",
+                None,
+            )?;
+            store.insert_session(&candidate)?;
+            bind_live_model_invocation(&store, candidate.id, project.id, admission_invocation_id);
+            store.insert_rotation_event(
+                former.id,
+                "rot-cand",
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({ "successor_id": candidate.id }).to_string()),
+            )?;
+        }
+        let confirmation = IdeaControllerLaunchConfirmationV1 {
+            candidate_session_id: candidate.id,
+            project_id: project.id,
+            provider: SessionProvider::Claude,
+            admission_invocation_id,
+            durable_session_id: candidate.id,
+            durable_project_id: project.id,
+            durable_provider: SessionProvider::Claude,
+            a6_bound_session_id: candidate.id,
+            confirmation_kind: ControllerConfirmationKindV1::InstalledProvider,
+            confirmed_at: chrono::Utc::now(),
+        };
+        let candidate_token = "candidate-publication-candidate-token".to_string();
+        a6.write()
+            .await
+            .insert(candidate_token.clone(), candidate.id);
+        let metadata = serde_json::json!({ "successor_id": candidate.id }).to_string();
+        let reserved_projection = store
+            .lock()
+            .await
+            .load_idea_controller_projection_v1(project.id, idea.id)?;
+        assert_eq!(
+            reserved_projection.current_controller_session_id,
+            Some(former.id)
+        );
+
+        store.lock().await.conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_rotation_event BEFORE INSERT ON rotation_events
+             WHEN NEW.event_type='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )?;
+        let refused = {
+            let guards =
+                crate::store_support::spawn_single_flight::RotationPublicationGuards::acquire(
+                    former.id,
+                    candidate.id,
+                )
+                .await;
+            rotation_transfer
+                .publish_rotation_assigning(
+                    &guards,
+                    "rot-cand",
+                    &metadata,
+                    &reservation,
+                    &confirmation,
+                    &candidate_token,
+                    &a6,
+                )
+                .await
+        };
+        assert!(refused.is_err());
+        {
+            let store = store.lock().await;
+            assert_eq!(
+                store.load_idea_controller_projection_v1(project.id, idea.id)?,
+                reserved_projection,
+                "a refused publication leaves the controller, epoch and reservation"
+            );
+            assert_eq!(store.controller_grant_v1(former.id), Some(former_grant));
+            assert_eq!(store.controller_grant_v1(candidate.id), None);
+            assert_eq!(
+                store.get_session(epic.id)?.context("epic")?.lead_session_id,
+                Some(former.id)
+            );
+            store
+                .conn
+                .execute_batch("DROP TRIGGER fail_rotation_event;")?;
+        }
+
+        let publication = {
+            let guards =
+                crate::store_support::spawn_single_flight::RotationPublicationGuards::acquire(
+                    former.id,
+                    candidate.id,
+                )
+                .await;
+            rotation_transfer
+                .publish_rotation_assigning(
+                    &guards,
+                    "rot-cand",
+                    &metadata,
+                    &reservation,
+                    &confirmation,
+                    &candidate_token,
+                    &a6,
+                )
+                .await?
+        };
+        assert_eq!(publication.epics, vec![epic.id]);
+        assert_eq!(publication.controller_moves.len(), 1);
+        let moved = &publication.controller_moves[0];
+        assert_eq!(
+            (
+                moved.former_session_id,
+                moved.successor_session_id,
+                moved.controller_epoch
+            ),
+            (former.id, candidate.id, reservation.proposed_epoch)
+        );
+        let store = store.lock().await;
+        let after = store.load_idea_controller_projection_v1(project.id, idea.id)?;
+        assert_eq!(after.current_controller_session_id, Some(candidate.id));
+        assert_eq!(after.controller_epoch, reservation.proposed_epoch);
+        assert_eq!(
+            store.get_session(epic.id)?.context("epic")?.lead_session_id,
+            Some(candidate.id),
+            "the lead moved in the same commit"
+        );
+        assert_eq!(store.controller_grant_v1(former.id), None);
+        let candidate_grant = store
+            .controller_grant_v1(candidate.id)
+            .context("candidate semantic grant installed after the commit")?;
+        assert_eq!(candidate_grant.controller_epoch(), after.controller_epoch);
+        let payload_json: String = store.conn.query_row(
+            "SELECT payload_json FROM idea_events WHERE id = ?1",
+            [moved.event_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let payload: rsi_common::types::IdeaControllerEventPayloadV1 =
+            serde_json::from_str(&payload_json)?;
+        payload.validate().map_err(anyhow::Error::msg)?;
+        assert_eq!(payload.outcome.idea, after);
+        assert!(matches!(
+            payload.request.operation,
+            rsi_common::types::IdeaControllerControlOperationV1::Assign {
+                reservation: ref assigned_reservation,
+                ..
+            } if assigned_reservation.reservation_id == reservation.reservation_id
+        ));
+        let reconciled = store.reconcile_idea_controllers_page_v1(None, chrono::Utc::now())?;
+        assert!(reconciled.corrupt_idea_ids.is_empty());
+        assert_eq!(reconciled.committed_event_ids, vec![moved.event_id]);
+        drop(store);
+        Ok(())
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[tokio::test]
     async fn d03_controller_assignment_and_cancellation_have_one_terminal_winner()
@@ -35689,7 +36511,7 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 162;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 182;
 const FLEET_INDEX_SCHEMA_VERSION: i32 = 153;
 const FLEET_INDEX_NAMES: [&str; 3] = [
     "idx_fleet_invocations_created",
@@ -35895,6 +36717,254 @@ pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= 182 && target < 182 {
+        // Recreate V43 plus V129 byte-for-byte: historical catalog pins
+        // authenticate the table SQL, including whitespace and quoting. Renaming
+        // a temporary replacement would quote the table name and break them.
+        let foreign_keys: bool = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        let tx = connection.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "CREATE TEMP TABLE topology_name_rewind_copy AS SELECT rowid AS original_rowid,* FROM topologies;
+             DROP TABLE topologies;
+             CREATE TABLE topologies (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL UNIQUE,
+                    definition_json TEXT NOT NULL,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL
+                );
+             ALTER TABLE topologies ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'operator' CHECK(owner_kind IN ('operator','manager','epic'));
+             ALTER TABLE topologies ADD COLUMN owner_session_id TEXT;
+             ALTER TABLE topologies ADD COLUMN project_id TEXT;
+             ALTER TABLE topologies ADD COLUMN epic_id TEXT;
+             ALTER TABLE topologies ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0);
+             ALTER TABLE topologies ADD COLUMN definition_digest TEXT;
+             ALTER TABLE topologies ADD COLUMN shared INTEGER NOT NULL DEFAULT 0 CHECK(shared IN (0,1));
+             ALTER TABLE topologies ADD COLUMN archived_at TEXT;
+             INSERT INTO topologies (rowid,id,name,definition_json,created_at,updated_at,
+                owner_kind,owner_session_id,project_id,epic_id,revision,definition_digest,shared,archived_at)
+                SELECT * FROM topology_name_rewind_copy;
+             DROP TABLE topology_name_rewind_copy;
+             CREATE INDEX idx_topologies_name ON topologies(name);"
+        ).expect("rewind topology name ownership");
+        tx.pragma_update(None, "user_version", 182 - 1).unwrap();
+        tx.commit().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", foreign_keys)
+            .unwrap();
+    }
+    if active >= 181 && target < 181 {
+        // #1671: back to V180 (drop the turn-custody delete/replace guards).
+        connection
+            .execute_batch(
+                "DROP TRIGGER provider_turn_custody_no_delete;
+                 DROP TRIGGER provider_turn_custody_no_replace;
+                 DROP TRIGGER provider_turn_custody_rowid_immutable;
+                 PRAGMA user_version=180;",
+            )
+            .expect("rewind turn custody delete guard");
+    }
+    if active >= 180 && target < 180 {
+        // #1572: back to V179 (the deploy unique key on the owner again; the
+        // request identity column goes).
+        connection
+            .execute_batch(
+                "ALTER TABLE agent_deploys RENAME TO agent_deploys_rewound;
+                 DROP TRIGGER agent_deploys_request_identity_immutable;
+                 DROP TRIGGER agent_deploys_terminal_immutable;
+                 DROP TRIGGER agent_deploys_no_delete;
+                 DROP INDEX agent_deploys_one_live;
+                 CREATE TABLE agent_deploys (
+                    id TEXT PRIMARY KEY CHECK(rsi_uuid_is_canonical(id)),
+                    owner_session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT CHECK(owner_session_id IS NULL OR rsi_uuid_is_canonical(owner_session_id)),
+                    idempotency_digest TEXT NOT NULL CHECK(length(idempotency_digest)=64),
+                    request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint)=64),
+                    sha TEXT NOT NULL CHECK(length(sha)=40 AND sha=lower(sha) AND sha NOT GLOB '*[^0-9a-f]*'),
+                    manifest_json TEXT NOT NULL CHECK(json_valid(manifest_json)),
+                    state TEXT NOT NULL CHECK(state IN ('staged','restarting','succeeded','failed','timed_out')),
+                    reason TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 1024),
+                    wake_job_id TEXT UNIQUE CHECK(wake_job_id IS NULL OR rsi_uuid_is_canonical(wake_job_id)),
+                    created_at TEXT NOT NULL CHECK(rsi_rfc3339_nanos_is_canonical(created_at)),
+                    deadline_at TEXT NOT NULL CHECK(rsi_rfc3339_nanos_is_canonical(deadline_at)),
+                    restarted_at TEXT CHECK(restarted_at IS NULL OR rsi_rfc3339_nanos_is_canonical(restarted_at)),
+                    settled_at TEXT CHECK(settled_at IS NULL OR rsi_rfc3339_nanos_is_canonical(settled_at)),
+                    origin TEXT NOT NULL DEFAULT 'agent' CHECK(origin IN ('agent','operator')),
+                    forced INTEGER NOT NULL DEFAULT 0 CHECK(forced IN (0,1)),
+                    interrupt_workers INTEGER NOT NULL DEFAULT 0 CHECK(interrupt_workers IN (0,1)),
+                    interrupted_sessions TEXT CHECK(interrupted_sessions IS NULL OR json_valid(interrupted_sessions)),
+                    UNIQUE(owner_session_id, idempotency_digest),
+                    CHECK((origin='agent' AND owner_session_id IS NOT NULL) OR (origin='operator' AND owner_session_id IS NULL)),
+                    CHECK((state IN ('staged','restarting') AND settled_at IS NULL AND wake_job_id IS NULL)
+                       OR (state IN ('succeeded','failed','timed_out') AND settled_at IS NOT NULL
+                           AND ((origin='agent' AND wake_job_id IS NOT NULL) OR (origin='operator' AND wake_job_id IS NULL))))
+                 );
+                 INSERT INTO agent_deploys (id, owner_session_id, idempotency_digest, request_fingerprint, sha,
+                    manifest_json, state, reason, wake_job_id, created_at, deadline_at, restarted_at, settled_at,
+                    origin, forced, interrupt_workers, interrupted_sessions)
+                    SELECT id, owner_session_id, idempotency_digest, request_fingerprint, sha,
+                    manifest_json, state, reason, wake_job_id, created_at, deadline_at, restarted_at, settled_at,
+                    origin, forced, interrupt_workers, interrupted_sessions
+                    FROM agent_deploys_rewound;
+                 DROP TABLE agent_deploys_rewound;
+                 CREATE UNIQUE INDEX agent_deploys_one_live ON agent_deploys((1)) WHERE state IN ('staged','restarting');
+                 CREATE TRIGGER agent_deploys_no_delete BEFORE DELETE ON agent_deploys BEGIN SELECT RAISE(ABORT,'agent deploys are append only'); END;
+                 CREATE TRIGGER agent_deploys_terminal_immutable BEFORE UPDATE ON agent_deploys WHEN OLD.state IN ('succeeded','failed','timed_out') BEGIN SELECT RAISE(ABORT,'settled agent deploys are immutable'); END;
+                 PRAGMA user_version=179;",
+            )
+            .expect("rewind deploy request identity");
+    }
+    if active >= 179 && target < 179 {
+        // #2635: back to V178 (drop the settlement retained-root snapshots).
+        connection
+            .execute_batch(
+                "DROP TABLE source_worktree_settlement_retained_roots;
+                 PRAGMA user_version=178;",
+            )
+            .expect("rewind settlement retained roots");
+    }
+    if active >= 178 && target < 178 {
+        // #2649: back to V177 (drop the standing directives).
+        connection
+            .execute_batch(
+                "DROP TABLE standing_directives;
+                 PRAGMA user_version=177;",
+            )
+            .expect("rewind standing directives");
+    }
+    if active >= 177 && target < 177 {
+        // #2453: back to V176 (drop the satellite report obligations).
+        connection
+            .execute_batch(
+                "DROP TABLE satellite_report_obligations;
+                 PRAGMA user_version=176;",
+            )
+            .expect("rewind satellite report obligations");
+    }
+    if active >= 176 && target < 176 {
+        // #2384: back to V175 (drop the cold-archive index and Guards 1-3, and
+        // restore the V84 unconditional provenance no-delete trigger).
+        connection
+            .execute_batch(
+                "DROP TRIGGER sessions_cold_status_guard;
+                 DROP TRIGGER conversation_events_cold_insert_guard;
+                 DROP TRIGGER conversation_event_provenance_no_delete;
+                 CREATE TRIGGER conversation_event_provenance_no_delete BEFORE DELETE ON conversation_event_provenance BEGIN SELECT RAISE(ABORT,'conversation event provenance is retained'); END;
+                 DROP TABLE cold_archive_runs;
+                 DROP INDEX cold_archive_sessions_state;
+                 DROP TABLE cold_archive_sessions;
+                 DROP TABLE cold_archive_files;
+                 PRAGMA user_version=175;",
+            )
+            .expect("rewind cold-archive index");
+    }
+    if active >= 175 && target < 175 {
+        // #2050: back to V174 (the released V120 evidence view and its health values).
+        super::source_worktree_v120::health_v175::rewind_to_v174(connection);
+    }
+    if active >= 174 && target < 174 {
+        // #2364: back to V173 (drop the reclaim journal's custody index).
+        connection
+            .execute_batch(
+                "DROP INDEX sandbox_reclaim_items_custody;
+                 PRAGMA user_version=173;",
+            )
+            .expect("rewind reclaim journal custody index");
+    }
+    if active >= 173 && target < 173 {
+        let tx = connection
+            .unchecked_transaction()
+            .expect("untouched-intent rewind transaction");
+        super::cohort_settlement::untouched_intent::rewind(&tx)
+            .expect("rewind settlement untouched-intent reproof");
+        tx.pragma_update(None, "user_version", 173 - 1).unwrap();
+        tx.commit().unwrap();
+    }
+    if active >= 172 && target < 172 {
+        let tx = connection
+            .unchecked_transaction()
+            .expect("completion retry rewind transaction");
+        super::cohort_settlement::completion_retry::rewind(&tx)
+            .expect("rewind settlement completion retries");
+        tx.pragma_update(None, "user_version", 172 - 1).unwrap();
+        tx.commit().unwrap();
+    }
+    if active >= 171 && target < 171 {
+        let tx = connection
+            .unchecked_transaction()
+            .expect("reproof rewind transaction");
+        super::cohort_settlement::reproof::rewind(&tx).expect("rewind quarantine reproof");
+        tx.pragma_update(None, "user_version", 171 - 1).unwrap();
+        tx.commit().unwrap();
+    }
+    if active >= 170 && target < 170 {
+        // #2021: back to V169 (drop the appointment row's seat-handoff reference).
+        connection
+            .execute_batch(
+                "DROP TRIGGER manager_portfolio_appointments_handoff_immutable;
+                 ALTER TABLE manager_portfolio_appointments DROP COLUMN handoff;
+                 PRAGMA user_version=169;",
+            )
+            .expect("rewind portfolio appointment handoff");
+    }
+    if active >= 169 && target < 169 {
+        // #2012: back to V168 (drop the launch record's worker scope).
+        connection
+            .execute_batch(
+                "DROP TRIGGER provider_turn_custody_scope_immutable;
+                 ALTER TABLE provider_turn_custody DROP COLUMN worker_scope;
+                 PRAGMA user_version=168;",
+            )
+            .expect("rewind provider turn custody worker scope");
+    }
+    let deleted_version = super::cohort_settlement::SETTLEMENT_DELETED_OWNER_SCHEMA_VERSION;
+    if active >= deleted_version && target < deleted_version {
+        let tx = connection.unchecked_transaction().unwrap();
+        super::cohort_settlement::rebuild_settlement_status_constraint(&tx, false)
+            .expect("rewind settlement Deleted-owner status constraint");
+        tx.pragma_update(None, "user_version", deleted_version - 1)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let attribution_version = super::cohort_settlement::SETTLEMENT_ATTRIBUTION_SCHEMA_VERSION;
+    if active >= attribution_version && target < attribution_version {
+        connection
+            .execute_batch("DROP TABLE source_worktree_settlement_attribution;")
+            .expect("rewind source settlement attribution");
+        connection
+            .pragma_update(None, "user_version", attribution_version - 1)
+            .unwrap();
+    }
+    if active >= 166 && target < 166 {
+        connection
+            .execute_batch(
+                "DROP TABLE satellite_message_scope_project;
+                 DROP TABLE satellite_inbound_project_scope;
+                 DROP TABLE satellite_peer_project_scope; PRAGMA user_version=165;",
+            )
+            .expect("rewind satellite project scope");
+    }
+    if active >= 165 && target < 165 {
+        connection
+            .execute_batch("DROP TRIGGER issue_handoffs_no_replace; PRAGMA user_version=164;")
+            .expect("rewind issue handoff replacement guard");
+    }
+    if active >= 164 && target < 164 {
+        connection
+            .execute_batch("DROP TABLE issue_handoffs; PRAGMA user_version=163;")
+            .expect("rewind issue handoff records");
+    }
+    if active >= 163 && target < 163 {
+        connection
+            .execute_batch(
+                "DROP TABLE operator_todo_receipts; DROP TABLE operator_todos; PRAGMA user_version=162;",
+            )
+            .expect("rewind operator to-do list");
+    }
     if active >= 162 && target < 162 {
         connection
             .execute_batch("DROP TABLE remote_answer_deliveries; PRAGMA user_version=161;")
@@ -38503,7 +39573,7 @@ pub(crate) fn rewind_store_to_schema_version(connection: &Connection, target_ver
         && target_version != 121
         && target_version != 122
         && target_version != 123
-        && target_version != 147
+        && !(124..=REWIND_TEARDOWN_COVERED_THROUGH).contains(&target_version)
     {
         assert_eq!(
             target_version, LATEST_SCHEMA_VERSION,
@@ -39991,6 +41061,238 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
         target_version >= super::portfolio_nodes::PORTFOLIO_NODE_SCHEMA_VERSION,
         "fixture V{target_version} has incorrect #1236 global_manager_grants.node_id presence"
     );
+    for (kind, name) in super::cohort_settlement::SETTLEMENT_ATTRIBUTION_CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present,
+            target_version >= super::cohort_settlement::SETTLEMENT_ATTRIBUTION_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect settlement attribution {kind} `{name}` presence"
+        );
+    }
+    if target_version >= 95 {
+        let sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='source_worktree_settlement_items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sql.contains("'Archived','Deleted'"),
+            target_version >= super::cohort_settlement::SETTLEMENT_DELETED_OWNER_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect settlement Deleted-owner status constraint"
+        );
+    }
+
+    // Newest guards go last: a version-only rewind of an older fixture must trip its own
+    // (older) assertion first, which the should_panic fixture-guard tests expect.
+    let handoff_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_portfolio_appointments') WHERE name='handoff')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("probe V170 appointment handoff column");
+    assert_eq!(
+        handoff_column,
+        target_version >= 170,
+        "fixture V{target_version} has incorrect V170 appointment handoff column presence"
+    );
+    let handoff_trigger: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='manager_portfolio_appointments_handoff_immutable')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("probe V170 appointment handoff trigger");
+    assert_eq!(
+        handoff_trigger,
+        target_version >= 170,
+        "fixture V{target_version} has incorrect V170 appointment handoff trigger presence"
+    );
+    let standing_directives: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='standing_directives')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        standing_directives,
+        target_version >= 178,
+        "fixture V{target_version}: standing directives"
+    );
+    let scoped_topology_names: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='idx_topologies_owner_name')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        scoped_topology_names,
+        target_version >= 182,
+        "fixture V{target_version}: topology owner name key"
+    );
+    let custody_delete_guard: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                'provider_turn_custody_no_delete','provider_turn_custody_no_replace',
+                'provider_turn_custody_rowid_immutable')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        custody_delete_guard,
+        if target_version >= 181 { 3 } else { 0 },
+        "fixture V{target_version}: turn custody delete guards"
+    );
+    let deploy_request_identity: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_deploys') WHERE name='request_session_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deploy_request_identity,
+        target_version >= 180,
+        "fixture V{target_version}: deploy request identity"
+    );
+    let retained_roots: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='source_worktree_settlement_retained_roots')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained_roots,
+        target_version >= 179,
+        "fixture V{target_version}: settlement retained roots"
+    );
+    let report_obligations: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='satellite_report_obligations')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        report_obligations,
+        target_version >= 177,
+        "fixture V{target_version}: satellite report obligations"
+    );
+    let custody_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='sandbox_reclaim_items_custody')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        custody_index,
+        target_version >= 174,
+        "fixture V{target_version}: reclaim journal custody index"
+    );
+    let cold_archive_objects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                'cold_archive_files','cold_archive_sessions','cold_archive_runs',
+                'cold_archive_sessions_state','conversation_events_cold_insert_guard',
+                'sessions_cold_status_guard')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        cold_archive_objects,
+        if target_version >= 176 { 6 } else { 0 },
+        "fixture V{target_version}: cold-archive index objects"
+    );
+    let provenance_delete_guard: String = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sql), '') FROM sqlite_master WHERE name='conversation_event_provenance_no_delete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        provenance_delete_guard.contains("cold_archive_sessions"),
+        target_version >= 176,
+        "fixture V{target_version}: provenance no-delete guard"
+    );
+    if target_version >= 120 {
+        let evidence_view: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='view' AND name='source_worktree_session_dependency_evidence_v120'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence_view.contains("rsi_swc_v175_session_dependency_relevance("),
+            target_version >= 175,
+            "fixture V{target_version}: dependency-health evidence view classifier"
+        );
+    }
+    let retry_insert: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='settlement_completion_retries_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        retry_insert
+            .is_some_and(|sql| sql.contains("retained intent followed an earlier terminal stop")),
+        target_version >= 173,
+        "fixture V{target_version}: untouched-intent retry admission"
+    );
+    for name in [
+        "source_worktree_settlement_completion_retries",
+        "settlement_completion_retries_reopen",
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present,
+            target_version >= 172,
+            "fixture V{target_version}: {name}"
+        );
+    }
+    for name in [
+        "source_worktree_settlement_reproof_runs",
+        "source_worktree_settlement_reproof_items",
+        "source_worktree_settlement_current_runs",
+        "settlement_reproof_items_reopen",
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present,
+            target_version >= 171,
+            "fixture V{target_version}: {name}"
+        );
+    }
 }
 
 /// Assert that the migration steps from V77 up **actually executed** during the
@@ -40009,6 +41311,163 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
 /// that stopped short cannot produce a matching value.
 #[allow(clippy::expect_used)]
 pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
+    let scoped_topology_names: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='idx_topologies_owner_name')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(scoped_topology_names, "topology owner name key replayed");
+    let custody_delete_guard: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                'provider_turn_custody_no_delete','provider_turn_custody_no_replace',
+                'provider_turn_custody_rowid_immutable')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        custody_delete_guard, 3,
+        "turn custody delete guards replayed"
+    );
+    let deploy_request_identity: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_deploys') WHERE name='request_session_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(deploy_request_identity, "deploy request identity replayed");
+    let retained_roots: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='source_worktree_settlement_retained_roots')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(retained_roots, "settlement retained roots replayed");
+    let standing_directives: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='standing_directives')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(standing_directives, "standing directives replayed");
+    let report_obligations: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='satellite_report_obligations')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(report_obligations, "satellite report obligations replayed");
+    let custody_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='sandbox_reclaim_items_custody')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(custody_index, "reclaim journal custody index replayed");
+    let cold_archive_objects: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN (
+                'cold_archive_files','cold_archive_sessions','cold_archive_runs',
+                'cold_archive_sessions_state','conversation_events_cold_insert_guard',
+                'sessions_cold_status_guard')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cold_archive_objects, 6, "V176 cold-archive index replayed");
+    let provenance_delete_guard: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='conversation_event_provenance_no_delete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        provenance_delete_guard.contains("cold_archive_sessions"),
+        "V176 provenance no-delete guard replayed"
+    );
+    let evidence_view: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name='source_worktree_session_dependency_evidence_v120'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        evidence_view.contains("rsi_swc_v175_session_dependency_relevance("),
+        "V175 dependency-health evidence view replayed"
+    );
+    let retry_insert: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='settlement_completion_retries_insert'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        retry_insert.contains("retained intent followed an earlier terminal stop"),
+        "untouched-intent retry admission replayed"
+    );
+    for name in [
+        "source_worktree_settlement_completion_retries",
+        "settlement_completion_retries_reopen",
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "settlement completion retry replay: {name}");
+    }
+    for name in [
+        "source_worktree_settlement_reproof_runs",
+        "source_worktree_settlement_reproof_items",
+        "source_worktree_settlement_current_runs",
+        "settlement_reproof_items_reopen",
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "quarantine reproof replay: {name}");
+    }
+
+    let sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='source_worktree_settlement_items'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        sql.contains("'Archived','Deleted'"),
+        "settlement Deleted-owner constraint replayed"
+    );
+
+    for (kind, name) in super::cohort_settlement::SETTLEMENT_ATTRIBUTION_CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "settlement attribution replay: {kind} {name}");
+    }
+
     let queue_wake_column: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rolling_queue_entries') WHERE name='wake_session_id')",
@@ -40057,6 +41516,18 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
             .unwrap();
         assert!(exists, "#1236 portfolio replay: {kind} {name}");
     }
+    let appointment_handoff: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('manager_portfolio_appointments') WHERE name='handoff')
+                AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='manager_portfolio_appointments_handoff_immutable')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        appointment_handoff,
+        "#2021 appointment handoff column and trigger replayed"
+    );
     for name in FLEET_INDEX_NAMES {
         let exists: bool = connection
             .query_row(
@@ -40171,8 +41642,8 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
             .expect("probe V119 target reclaim catalog object");
         assert_eq!(found, 1, "V119 did not execute: {kind} {name} is missing");
     }
-    super::source_worktree_v120::validate_v120_catalog(connection)
-        .expect("V120 did not replay the exact source-worktree batch catalog");
+    super::source_worktree_v120::health_v175::validate_current_catalog(connection)
+        .expect("V120/V175 did not replay the exact source-worktree batch catalog");
     // V134 replaces the V121 forward trigger after validating its exact
     // predecessor. Its validator covers every V121 review object at head.
     super::restart_intents::validate_v134_catalog(connection)
@@ -40597,6 +42068,21 @@ fn fixture_guard_rejects_a_version_only_rewind() {
         .pragma_update(None, "user_version", 39_i64)
         .unwrap();
     assert_fixture_matches_claimed_version(&store.conn, 39);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+#[should_panic(
+    expected = "incorrect settlement attribution table `source_worktree_settlement_attribution` presence"
+)]
+fn settlement_attribution_fixture_guard_rejects_version_only_rewind() {
+    let store = Store::open_in_memory().unwrap();
+    let previous_version = super::cohort_settlement::SETTLEMENT_ATTRIBUTION_SCHEMA_VERSION - 1;
+    store
+        .conn
+        .pragma_update(None, "user_version", previous_version)
+        .unwrap();
+    assert_fixture_matches_claimed_version(&store.conn, previous_version);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -41266,7 +42752,13 @@ fn v92_pre_antigravity_descendant_matches_pinned_fingerprint() {
         controller_grant_incarnations: std::cell::RefCell::new(std::collections::HashMap::new()),
         program_run_boot_id: std::cell::Cell::new(Uuid::new_v4()),
         delivery_boot_id: std::cell::Cell::new(Uuid::new_v4()),
-        hub_reports: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        hub_reports: std::cell::RefCell::new(
+            super::satellite_report_outbox::HubReportOutbox::default(),
+        ),
+        manager_intent_idle: std::cell::RefCell::new(
+            super::manager_intent::idle::IdleIntentCache::default(),
+        ),
+        session_activity: std::cell::RefCell::new(None),
     };
     store
         .init_schema_internal(false, true)
@@ -41869,6 +43361,78 @@ fn v95_migration_failpoints_restore_exact_v94_state_then_converge() {
     }
 }
 
+/// Frozen V94 journal writes for migration fixtures. Current production writes
+/// require V167 attribution; a historical journal has no such relation or data.
+fn insert_v94_settlement_run_fixture(
+    store: &mut Store,
+    run: &super::cohort_settlement::NewSettlementRun,
+) -> Result<()> {
+    assert_eq!(schema_version(&store.conn), 94, "requires a V94 fixture");
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    tx.execute(
+        "INSERT INTO source_worktree_settlement_runs (
+            run_id,schema_version,policy_version,repository_identity,canonical_repo_dir,
+            target_ref,target_oid,plan_digest,idempotency_key,authorization_digest,
+            request_fingerprint,state,observed_count,eligible_count,retained_count,
+            settled_count,refused_count,recovery_required_count,unattempted_count,
+            created_at,updated_at,finished_at,terminal_error
+         ) VALUES (?1,1,1,?2,?3,?4,?5,?6,?7,?8,?9,'intent_committed',?10,?11,?12,0,0,0,0,?13,?13,NULL,NULL)",
+        params![
+            run.run_id.to_string(),
+            run.repository_identity,
+            run.canonical_repo_dir,
+            run.target_ref,
+            run.target_oid,
+            run.plan_digest,
+            run.idempotency_key,
+            run.authorization_digest,
+            run.request_fingerprint,
+            run.observed_count,
+            u32::try_from(run.items.len()).expect("fixture item count fits u32"),
+            run.retained_count,
+            now,
+        ],
+    )?;
+    for (sequence, item) in run.items.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO source_worktree_settlement_items (
+                run_id,sequence,session_id,original_status,original_updated_at,custody_id,
+                custody_generation,canonical_repo_dir,sandbox_root,sandbox_branch,
+                repository_identity,source_ref,source_oid,target_oid,evidence_digest,
+                clean_state_digest,reserved_effects,active_effects,participant_count,
+                phase,before_observation,after_observation,refusal_code,created_at,updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,'intent_committed',NULL,NULL,NULL,?20,?20)",
+            params![
+                run.run_id.to_string(),
+                u32::try_from(sequence).expect("fixture item sequence fits u32"),
+                item.session_id.to_string(),
+                item.original_status,
+                item.original_updated_at,
+                item.custody_id.to_string(),
+                item.custody_generation,
+                item.canonical_repo_dir,
+                item.sandbox_root,
+                item.sandbox_branch,
+                item.repository_identity,
+                item.source_ref,
+                item.source_oid,
+                item.target_oid,
+                item.evidence_digest,
+                item.clean_state_digest,
+                item.reserved_effects,
+                item.active_effects,
+                item.participant_count,
+                now,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn seed_v94_settlement_projection_fixture(
     store: &mut Store,
     key: &str,
@@ -41957,22 +43521,29 @@ fn seed_v94_settlement_projection_fixture(
         });
     }
     let run_id = Uuid::new_v4();
-    store
-        .insert_source_worktree_settlement_run(&NewSettlementRun {
-            run_id,
-            repository_identity,
-            canonical_repo_dir,
-            target_ref: "refs/heads/main".into(),
-            target_oid: "b".repeat(40),
-            plan_digest: format!("sha256:{}", "e".repeat(64)),
-            idempotency_key: key.into(),
-            authorization_digest: format!("sha256:{}", "f".repeat(64)),
-            request_fingerprint: format!("sha256:{}", "1".repeat(64)),
-            observed_count: phases.len() as u32,
-            retained_count: 0,
-            items,
-        })
-        .expect("insert V94 settlement projection fixture");
+    let run = NewSettlementRun {
+        run_id,
+        repository_identity,
+        canonical_repo_dir,
+        target_ref: "refs/heads/main".into(),
+        target_oid: "b".repeat(40),
+        plan_digest: format!("sha256:{}", "e".repeat(64)),
+        idempotency_key: key.into(),
+        authorization_digest: format!("sha256:{}", "f".repeat(64)),
+        request_fingerprint: format!("sha256:{}", "1".repeat(64)),
+        observed_count: phases.len() as u32,
+        retained_count: 0,
+        retained: Vec::new(),
+        items,
+    };
+    if schema_version(&store.conn) == 94 {
+        insert_v94_settlement_run_fixture(store, &run)
+            .expect("insert frozen V94 settlement projection fixture");
+    } else {
+        store
+            .insert_source_worktree_settlement_run(&run)
+            .expect("insert current settlement projection fixture");
+    }
 
     for (sequence, (phase, refusal)) in phases.iter().enumerate() {
         use rsi_common::cohort_settlement::SourceWorktreeSettlementPhaseV1 as P;
@@ -43810,6 +45381,16 @@ fn v95_backfill_generation_survives_vacuum_and_reopen() {
         .expect("VACUUM pointer database");
     drop(store);
     let reopened = Store::open(&path).expect("reopen VACUUMed pointer database");
+    for run_id in [first_run_id, second_run_id] {
+        let historical = reopened
+            .get_source_worktree_settlement_run(run_id)
+            .expect("load historical receipt after V167 replay and VACUUM")
+            .expect("historical receipt retained");
+        assert_eq!(historical.attribution, None);
+        historical
+            .validate_wire()
+            .expect("valid historical receipt");
+    }
     assert_eq!(
         reopened
             .latest_source_worktree_settlement_run("repo:v95-normalize:pointer-backfill")
@@ -45537,7 +47118,7 @@ fn jsonrpc_id_function_is_registered_on_every_store_connection_after_reopen() {
 fn raw_sql_insert_with_malformed_canonical_jsonrpc_id_is_rejected_by_check() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("v81.db");
-    drop(Store::open(&path).expect("production open"));
+    drop(Store::open_test_fixture(&path).expect("production open"));
     let conn = open_raw_store_connection(&path);
 
     const MALFORMED: [&str; 8] = [
@@ -46990,6 +48571,7 @@ mod v99_provider_telemetry_tests {
                     resets_at_epoch: Some(1_788_883_200),
                 },
             ],
+            stale_reason: None,
         }
     }
 
@@ -49059,7 +50641,7 @@ pub fn while_another_connection_writes<T>(
 fn add_issue_dep_waits_for_a_concurrent_writer_instead_of_failing_busy() {
     let directory = tempfile::tempdir().expect("issue dependency fixture dir");
     let database = directory.path().join("rsi.db");
-    let store = Store::open(&database).expect("issue dependency store");
+    let store = Store::open_test_fixture(&database).expect("issue dependency store");
     let project = make_test_project("issue dependency under a concurrent writer");
     store.insert_project(&project).expect("insert project");
     let blocker = store
@@ -49219,4 +50801,213 @@ fn store_open_accepts_the_latest_schema_and_migrates_an_older_one() {
     );
     drop(store);
     Store::open(&database).expect("a database at LATEST reopens");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn issue_handoffs_refuse_replace_and_upsert_and_keep_the_original_rows() {
+    // #1750 fix-forward: `INSERT OR REPLACE` deletes a conflicting row without
+    // firing the DELETE trigger (recursive_triggers is off); the V165 BEFORE
+    // INSERT guard refuses a collision on either unique key.
+    let (store, _lead, project) = issue_v97_authority_fixture();
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            ..make_new_issue("handoff records")
+        })
+        .unwrap();
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let author = Uuid::new_v4().to_string();
+    let other_author = Uuid::new_v4().to_string();
+    let insert = |verb: &str, sequence: i64, author: &str, key: &str, body: &str| {
+        store.conn.execute(
+            &format!(
+                "{verb} INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            ),
+            params![
+                issue.id.to_string(),
+                sequence,
+                project.id.to_string(),
+                author,
+                key,
+                body,
+                at
+            ],
+        )
+    };
+    insert("INSERT", 1, &author, "k-1", "original").unwrap();
+    insert("INSERT", 2, &author, "k-2", "second").unwrap();
+
+    for verb in ["INSERT OR REPLACE", "REPLACE"] {
+        // Same (issue_id, sequence), new key: would rewrite the record.
+        assert!(insert(verb, 1, &other_author, "k-x", "replaced").is_err());
+        // Same (author, key), new sequence: would delete the original record.
+        assert!(insert(verb, 3, &author, "k-1", "replaced").is_err());
+    }
+    // UPSERT on either key is refused as well, and a plain duplicate too.
+    for conflict in ["issue_id, sequence", "author_session_id, idempotency_key"] {
+        let upsert = format!(
+            "INSERT INTO issue_handoffs
+                 (issue_id, sequence, project_id, author_session_id, idempotency_key, body, created_at)
+             VALUES (?1, 1, ?2, ?3, 'k-1', 'replaced', ?4)
+             ON CONFLICT({conflict}) DO UPDATE SET body=excluded.body"
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    &upsert,
+                    params![issue.id.to_string(), project.id.to_string(), author, at]
+                )
+                .is_err(),
+            "{conflict}"
+        );
+    }
+    assert!(insert("INSERT", 1, &author, "k-1", "replaced").is_err());
+
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT sequence, idempotency_key, body FROM issue_handoffs ORDER BY sequence")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (1, "k-1".to_string(), "original".to_string()),
+            (2, "k-2".to_string(), "second".to_string()),
+        ]
+    );
+    // A fresh record still appends.
+    insert("INSERT", 3, &author, "k-3", "third").unwrap();
+    let total: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM issue_handoffs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(total, 3);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn newest_stored_handoff_orders_records_against_body_handoffs() {
+    use rsi_common::rpc::AgentUpdateIssueRequestV1;
+    // #1750 fix-forward: whichever surface was written last holds the latest
+    // handoff for a review brief and a continuation.
+    let (store, lead, project) = issue_v97_authority_fixture();
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: project.id,
+            body: "x".repeat(60_000),
+            ..make_new_issue("ordering")
+        })
+        .unwrap();
+    let record = |sequence: i64, body: &str| {
+        store
+            .conn
+            .execute(
+                "INSERT INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key, body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    issue.id.to_string(),
+                    sequence,
+                    project.id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    format!("k-{sequence}"),
+                    body,
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                ],
+            )
+            .unwrap();
+    };
+    // Replace the whole body (a manager edit), not only append to it.
+    let set_body = |body: String, key: &str| {
+        let current = store.get_issue(issue.id).unwrap().unwrap();
+        store
+            .agent_update_issue(
+                lead,
+                &AgentUpdateIssueRequestV1 {
+                    issue_id: Some(issue.id),
+                    body: Some(body),
+                    ..AgentUpdateIssueRequestV1::new(current.row_version, key.into())
+                },
+            )
+            .unwrap();
+        store.get_issue(issue.id).unwrap().unwrap().body
+    };
+    let append = |text: &str, key: &str| {
+        let current = store.get_issue(issue.id).unwrap().unwrap();
+        set_body(format!("{}{text}", current.body), key)
+    };
+    fn locate(body: &str) -> Option<usize> {
+        body.rfind("## Handoff")
+    }
+    let newest = |body: &str| {
+        Store::newest_stored_handoff(&store.conn, issue.id, body, locate)
+            .unwrap()
+            .map(|record| record.body)
+    };
+
+    // No record: the body is the source.
+    assert_eq!(newest(&issue.body), None);
+    // A record with no body handoff is the latest.
+    record(1, "A_RECORD");
+    assert_eq!(newest(&issue.body).as_deref(), Some("A_RECORD"));
+    // A smaller handoff appended to the body afterwards is newer than the record.
+    let body = append("\n\n## Handoff\nB_BODY", "append-b");
+    assert_eq!(newest(&body), None);
+    // A record written after that body handoff is the latest again.
+    record(2, "C_RECORD");
+    assert_eq!(newest(&body).as_deref(), Some("C_RECORD"));
+    // Trailing whitespace does not change the body handoff's text, so the
+    // older body handoff does not become newer.
+    let body = append("\n \n", "append-space");
+    assert_eq!(newest(&body).as_deref(), Some("C_RECORD"));
+    // Text appended after the heading is part of the latest handoff (it runs
+    // to the end of the body), so a note after the record makes it newer.
+    let body = append("\n\nnote after the record", "append-note");
+    assert_eq!(newest(&body), None);
+    record(3, "C2_RECORD");
+    assert_eq!(newest(&body).as_deref(), Some("C2_RECORD"));
+    // The whole body replaced by a SHORT handoff after the record: the body
+    // handoff is new text written after the record, so it is the latest.
+    let body = set_body("## Handoff\nD_SHORT".into(), "replace-short");
+    assert_eq!(newest(&body), None);
+    // A record after it wins; whitespace appended to the body afterwards
+    // does not change the handoff text, so the record still wins.
+    record(4, "E_RECORD");
+    assert_eq!(newest(&body).as_deref(), Some("E_RECORD"));
+    let body = append("\n\n  \n", "append-space-2");
+    assert_eq!(newest(&body).as_deref(), Some("E_RECORD"));
+    // Editing the handoff text itself after the record makes the body newer.
+    let body = set_body(body.replace("D_SHORT", "F_EDITED"), "edit-handoff");
+    assert_eq!(newest(&body), None);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn in_memory_fixtures_have_independent_installation_identity_and_cursor_key() {
+    let a = Store::open_in_memory().unwrap();
+    let b = Store::open_in_memory().unwrap();
+    assert_ne!(
+        a.satellite_installation_id().unwrap(),
+        b.satellite_installation_id().unwrap()
+    );
+    let key = |s: &Store| {
+        s.conn
+            .query_row(
+                "SELECT cursor_key FROM source_worktree_batch_cursor_keys WHERE key_id=1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+    };
+    assert_ne!(key(&a), key(&b));
+    assert_eq!(key(&a).len(), 32);
 }

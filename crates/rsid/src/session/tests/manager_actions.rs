@@ -1025,7 +1025,25 @@ fn git(repo: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+/// The Pilot's seeded default launch (#2537). The `cfg(test)` model validator
+/// admits the registered `SCRIPTED_TEST_MODEL`s by exact name, so a launch fixture needs
+/// no live catalog and no hard-coded provider model.
+fn pilot_seed_launch() -> ManagerLaunchChoiceV2 {
+    ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: crate::session::provider_model_validation::SCRIPTED_TEST_MODEL.into(),
+        effort: None,
+    }
+}
+
 async fn pilot() -> Pilot {
+    pilot_with_default_launch(pilot_seed_launch()).await
+}
+
+/// A Pilot whose policy grants `default_launch` first. Every success fixture
+/// launches [`Pilot::default_launch`], so reseeding the default here changes
+/// them all together.
+async fn pilot_with_default_launch(default_launch: ManagerLaunchChoiceV2) -> Pilot {
     let (manager, dir) = manager();
     let repo = dir.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -1040,11 +1058,7 @@ async fn pilot() -> Pilot {
     let group = Uuid::new_v4();
     let epic = Uuid::new_v4();
     let lead = Uuid::new_v4();
-    let choice = ManagerLaunchChoiceV2 {
-        provider: SessionProvider::Claude,
-        model: "manager-scripted-provider".into(),
-        effort: None,
-    };
+    let choice = default_launch;
     let policy = ManagerPolicyV2 {
         mode: ManagerOperatingModeV2::Execute,
         capabilities: vec![
@@ -1145,6 +1159,11 @@ async fn pilot() -> Pilot {
 }
 
 impl Pilot {
+    /// The one launch a success fixture uses: the policy's own default grant,
+    /// never a hard-coded provider model that the policy or catalog may drop.
+    fn default_launch(&self) -> ManagerLaunchChoiceV2 {
+        self.policy.allowed_launches[0].clone()
+    }
     async fn fence(&self) -> ManagerLeadFenceV2 {
         self.manager
             .store
@@ -1154,15 +1173,14 @@ impl Pilot {
             .unwrap()
     }
     fn request(&self, key: &str, operation: ManagerActionV2) -> AgentManagerControlRequestV2 {
-        AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
+        AgentManagerControlRequestV2::new(
+            ManagerFenceV2 {
                 scope_version: 1,
                 policy_version: 1,
             },
-            idempotency_key: key.into(),
+            key.into(),
             operation,
-        }
+        )
     }
     async fn admit(&self, key: &str, operation: ManagerActionV2) -> ManagerActionReceiptV2 {
         self.manager
@@ -1884,9 +1902,13 @@ async fn prepared_manager_action_attributes_the_live_rotated_manager() {
     );
 }
 
+/// #1748: an empty resolved launch list never grants a launch, whatever the
+/// provider. Granting each provider's exact choice admits it, and the creation
+/// quota still applies on top of the grant.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
-async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_creation_limit() {
+async fn manager_actions_empty_launch_list_refuses_every_provider_and_granted_launches_retain_creation_limit()
+ {
     let mut p = pilot().await;
     p.policy.allowed_launches.clear();
     p.policy.max_active_sessions = 12;
@@ -1898,12 +1920,12 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
             project_id: p.project,
             expected_scope_version: 1,
             expected_policy_version: 1,
-            idempotency_key: "unrestricted-launches".into(),
+            idempotency_key: "empty-launches".into(),
             policy: p.policy.clone(),
         })
         .unwrap();
 
-    for (i, provider) in [
+    let launches: Vec<ManagerLaunchChoiceV2> = [
         SessionProvider::Claude,
         SessionProvider::Codex,
         SessionProvider::Pioneer,
@@ -1914,26 +1936,73 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
     ]
     .into_iter()
     .enumerate()
-    {
+    .map(|(i, provider)| ManagerLaunchChoiceV2 {
+        provider,
+        model: format!("configured-model-{i}"),
+        effort: (i % 2 == 0).then(|| "high".into()),
+    })
+    .collect();
+    let create = |p: &Pilot, key: &str, launch: &ManagerLaunchChoiceV2, policy_version: i64| {
         let mut request = p.request(
-            &format!("unrestricted-provider-{i}"),
+            key,
             ManagerActionV2::CreateSession {
                 parent_id: p.epic,
                 kind: SessionKind::Task,
                 query: "admission only; do not start a provider".into(),
-                launch: ManagerLaunchChoiceV2 {
-                    provider,
-                    model: format!("configured-model-{i}"),
-                    effort: (i % 2 == 0).then(|| "high".into()),
-                },
+                launch: launch.clone(),
                 sandbox_source: None,
             },
         );
-        request.fence.policy_version = 2;
+        request.fence.policy_version = policy_version;
+        request
+    };
+
+    for (i, launch) in launches.iter().enumerate() {
+        let error = p
+            .manager
+            .agent_control()
+            .agent_manager_control(
+                p.owner,
+                create(&p, &format!("empty-provider-{i}"), launch, 2),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manager_v2_launch_not_granted: allowed_launches=[]"),
+            "{:?}: {error}",
+            launch.provider
+        );
+    }
+
+    let another = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Codex,
+        model: "another-configured-model".into(),
+        effort: Some("medium".into()),
+    };
+    p.policy.allowed_launches = launches.iter().cloned().chain([another.clone()]).collect();
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 2,
+            idempotency_key: "granted-launches".into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+    for (i, launch) in launches.iter().enumerate() {
+        let provider = launch.provider;
         let receipt = p
             .manager
             .agent_control()
-            .agent_manager_control(p.owner, request)
+            .agent_manager_control(
+                p.owner,
+                create(&p, &format!("granted-provider-{i}"), launch, 3),
+            )
             .await
             .unwrap();
         assert_eq!(receipt.state, ManagerActionStateV2::Queued, "{provider:?}");
@@ -1959,30 +2028,15 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
         .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
             project_id: p.project,
             expected_scope_version: 1,
-            expected_policy_version: 2,
+            expected_policy_version: 3,
             idempotency_key: "stop-creation".into(),
             policy: p.policy.clone(),
         })
         .unwrap();
-    let mut request = p.request(
-        "unrestricted-still-limited",
-        ManagerActionV2::CreateSession {
-            parent_id: p.epic,
-            kind: SessionKind::Task,
-            query: "creation quota still applies".into(),
-            launch: ManagerLaunchChoiceV2 {
-                provider: SessionProvider::Codex,
-                model: "another-configured-model".into(),
-                effort: Some("medium".into()),
-            },
-            sandbox_source: None,
-        },
-    );
-    request.fence.policy_version = 3;
     let error = p
         .manager
         .agent_control()
-        .agent_manager_control(p.owner, request)
+        .agent_manager_control(p.owner, create(&p, "granted-still-limited", &another, 4))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("manager_v2_creation_limit"));
@@ -2040,52 +2094,94 @@ async fn manager_actions_empty_launch_list_retains_model_and_effort_validation()
     }
 }
 
+/// A populated list admits only its entries. An exact-effort entry admits
+/// exactly its own effort; an entry with no effort admits any effort for its
+/// provider and model, never another provider or model (#1905).
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn manager_actions_populated_launch_list_requires_exact_provider_model_and_effort() {
-    let p = pilot().await;
-    let allowed = p.policy.allowed_launches[0].clone();
-    let mut different_provider = allowed.clone();
-    different_provider.provider = SessionProvider::Codex;
-    let mut different_model = allowed.clone();
-    different_model.model = "another-configured-model".into();
-    let mut different_effort = allowed.clone();
-    different_effort.effort = Some("high".into());
-    for (i, launch) in [different_provider, different_model, different_effort]
-        .into_iter()
-        .enumerate()
-    {
-        let request = p.request(
-            &format!("restricted-choice-{i}"),
+    let mut p = pilot().await;
+    let exact = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "manager-scripted-provider".into(),
+        effort: Some("low".into()),
+    };
+    let any_effort = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "any-effort-model".into(),
+        effort: None,
+    };
+    p.policy.allowed_launches = vec![exact.clone(), any_effort.clone()];
+    p.manager
+        .store
+        .lock()
+        .await
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: 1,
+            expected_policy_version: 1,
+            idempotency_key: "exact-and-any-effort".into(),
+            policy: p.policy.clone(),
+        })
+        .unwrap();
+    let request = |key: &str, launch: ManagerLaunchChoiceV2| {
+        let mut request = p.request(
+            key,
             ManagerActionV2::CreateSession {
                 parent_id: p.epic,
                 kind: SessionKind::Task,
-                query: "requires exact configured choice".into(),
+                query: "requires a configured choice".into(),
                 launch,
                 sandbox_source: None,
             },
         );
+        request.fence.policy_version = 2;
+        request
+    };
+
+    let mut different_provider = exact.clone();
+    different_provider.provider = SessionProvider::Codex;
+    let mut different_model = exact.clone();
+    different_model.model = "another-configured-model".into();
+    let mut different_effort = exact.clone();
+    different_effort.effort = Some("high".into());
+    let mut no_effort = exact.clone();
+    no_effort.effort = None;
+    let mut any_effort_other_provider = any_effort.clone();
+    any_effort_other_provider.provider = SessionProvider::Codex;
+    let mut any_effort_other_model = any_effort.clone();
+    any_effort_other_model.model = "another-configured-model".into();
+    for (i, launch) in [
+        different_provider,
+        different_model,
+        different_effort,
+        no_effort,
+        any_effort_other_provider,
+        any_effort_other_model,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let error = p
             .manager
             .agent_control()
-            .agent_manager_control(p.owner, request)
+            .agent_manager_control(p.owner, request(&format!("restricted-choice-{i}"), launch))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("manager_v2_launch_not_granted"));
     }
-    let receipt = p
-        .admit(
-            "exact-allowed-choice",
-            ManagerActionV2::CreateSession {
-                parent_id: p.epic,
-                kind: SessionKind::Task,
-                query: "exact configured choice".into(),
-                launch: allowed,
-                sandbox_source: None,
-            },
-        )
-        .await;
-    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+
+    let mut any_effort_high = any_effort.clone();
+    any_effort_high.effort = Some("high".into());
+    for (i, launch) in [exact, any_effort, any_effort_high].into_iter().enumerate() {
+        let receipt = p
+            .manager
+            .agent_control()
+            .agent_manager_control(p.owner, request(&format!("allowed-choice-{i}"), launch))
+            .await
+            .unwrap();
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -2113,6 +2209,7 @@ async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal
         .agent_manager_inspect(
             p.owner,
             AgentManagerInspectRequestV2 {
+                include_history: false,
                 project_id: None,
                 section: ManagerInspectSectionV2::Actions,
                 epic_id: None,
@@ -2167,6 +2264,7 @@ async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal
         .agent_manager_inspect(
             p.owner,
             AgentManagerInspectRequestV2 {
+                include_history: false,
                 project_id: None,
                 section: ManagerInspectSectionV2::Actions,
                 epic_id: Some(id),
@@ -3600,6 +3698,156 @@ async fn manager_actions_unsandboxed_source_forks_from_fresh_origin_rolling_when
     );
     assert!(git(&p.repo, &["for-each-ref", "refs/rsi/sandbox-base"]).is_empty());
     super::super::launch::drop_controller_candidate_test_stream(child);
+}
+
+/// #1640: `replace_lead` seats a successor even when the old lead's sandbox
+/// cleanup failed (every fork of it is refused `sandbox_custody:cleanup_failed`).
+/// The successor forks from the published `rolling` tip, keeps the old lead's
+/// identity and lineage, becomes the Epic's lead, and the old lead's row is not
+/// rewritten.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::large_futures, clippy::significant_drop_tightening)]
+async fn manager_replace_lead_seats_a_successor_when_the_old_lead_sandbox_cleanup_failed() {
+    let p = pilot().await;
+    let origin = rolling_checkout_with_origin(&p);
+    let fresh = advance_origin_rolling(&p, &origin);
+    p.manager.store.lock().await.conn.execute(
+        "UPDATE sessions SET sandbox_kind='GitWorktree',sandbox_cleanup_state='Failed' WHERE id=?1",
+        [p.lead.to_string()],
+    ).unwrap();
+    let before = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(p.lead)
+        .unwrap()
+        .unwrap();
+
+    let receipt = p
+        .admit(
+            "replace-failed-cleanup-lead",
+            ManagerActionV2::ReplaceLead {
+                epic_id: p.epic,
+                expected: p.fence().await,
+                query: "take over the stale epic".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+            },
+        )
+        .await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    let child = receipt.target_session_id.unwrap();
+    let process = super::super::launch::install_controller_candidate_test_process(child);
+    p.execute().await.unwrap();
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    wait_launch_event(&p, child).await;
+
+    let store = p.manager.store.lock().await;
+    let successor = store.get_session(child).unwrap().unwrap();
+    assert_eq!(successor.continued_from, Some(p.lead));
+    assert_eq!(successor.parent_id, Some(p.epic));
+    assert_eq!(successor.session_kind, before.session_kind);
+    assert_eq!(successor.agent_role, before.agent_role);
+    assert_eq!(
+        store.get_session(p.epic).unwrap().unwrap().lead_session_id,
+        Some(child)
+    );
+    assert_eq!(
+        git(&successor.sandbox_root.unwrap(), &["rev-parse", "HEAD"]),
+        fresh
+    );
+    let after = store.get_session(p.lead).unwrap().unwrap();
+    assert_eq!(after.sandbox_cleanup_state, before.sandbox_cleanup_state);
+    drop(store);
+    super::super::launch::drop_controller_candidate_test_stream(child);
+}
+
+/// #2741: a predecessor lead whose custody tuple is incomplete (a sandbox kind
+/// with no root, branch or cleanup state) may still own a live sandbox, so
+/// `replace_lead` and `retry_lead` refuse `sandbox_custody:tuple_incomplete`
+/// instead of seating a successor from `rolling`; no successor is seated.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::large_futures, clippy::significant_drop_tightening)]
+async fn manager_lead_handover_refuses_an_incomplete_custody_tuple() {
+    let p = pilot().await;
+    let _origin = rolling_checkout_with_origin(&p);
+    settle_pilot_lead(&p, SessionStatus::Failed, false).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET sandbox_kind='GitWorktree',sandbox_root=NULL,sandbox_branch=NULL,sandbox_cleanup_state=NULL WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    let operations = |p: &Pilot| {
+        let store = p.manager.store.clone();
+        async move {
+            store
+                .lock()
+                .await
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM harness_manager_v2_operations",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        }
+    };
+    let before = operations(&p).await;
+
+    let replace = admit_err(
+        &p,
+        "replace-incomplete-tuple-lead",
+        ManagerActionV2::ReplaceLead {
+            epic_id: p.epic,
+            expected: p.fence().await,
+            query: "take over the stale epic".into(),
+            launch: p.policy.allowed_launches[0].clone(),
+        },
+    )
+    .await;
+    assert!(
+        replace
+            .to_string()
+            .contains("sandbox_custody:tuple_incomplete"),
+        "{replace}"
+    );
+    let retry_error = admit_err(
+        &p,
+        "retry-incomplete-tuple-lead",
+        retry(&p, p.fence().await),
+    )
+    .await;
+    assert!(
+        retry_error
+            .to_string()
+            .contains("sandbox_custody:tuple_incomplete"),
+        "{retry_error}"
+    );
+
+    assert_eq!(operations(&p).await, before);
+    let store = p.manager.store.lock().await;
+    assert_eq!(
+        store.get_session(p.epic).unwrap().unwrap().lead_session_id,
+        Some(p.lead)
+    );
+    let successors: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE continued_from=?1",
+            [p.lead.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(successors, 0);
 }
 
 /// #913: a sandboxed source (predecessor lead fork) keeps its exact frozen
@@ -6023,7 +6271,7 @@ fn pilot_worker(p: &Pilot, query: &str) -> ManagerActionV2 {
         parent_id: p.epic,
         kind: SessionKind::Task,
         query: query.into(),
-        launch: p.policy.allowed_launches[0].clone(),
+        launch: p.default_launch(),
         sandbox_source: None,
     }
 }
@@ -6162,6 +6410,21 @@ async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_
         .await
         .unwrap_err();
     assert!(error.to_string().contains("manager_v2_creation_limit"));
+    // #2502: the PM's own-policy refusal names its project row, the cap,
+    // used/limit and the TUI path that raises it.
+    let detail = rsi_common::manager_budget::CreationCapRefusalV1::parse(&error.to_string())
+        .expect("typed creation refusal");
+    assert_eq!(
+        detail.node_kind,
+        rsi_common::manager_budget::BudgetNodeKindV1::Project
+    );
+    assert_eq!(detail.node_id, p.project);
+    assert_eq!(detail.cap_field, "max_created_sessions");
+    assert_eq!((detail.used, detail.limit), (4, 4));
+    assert!(
+        detail.raise_in.contains("b Budget > project "),
+        "{detail:?}"
+    );
     // The refusal journaled nothing, so it charged nothing.
     assert_eq!(pilot_created_usage(&p).await, 4);
 }
@@ -6491,6 +6754,95 @@ async fn manager_retry_lead_recovers_failed_and_interrupted_without_auto_retry()
     }
 }
 
+/// #2815: a manager lead action whose candidate is an Issue-bound worker is
+/// refused at the commit, and the Epic keeps its lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_retry_lead_refuses_an_issue_bound_candidate_and_keeps_the_lead() {
+    let p = pilot().await;
+    settle_pilot_lead(&p, SessionStatus::Failed, false).await;
+    let receipt = p.admit("bound-candidate", retry(&p, p.fence().await)).await;
+    let id = receipt.target_session_id.unwrap();
+    {
+        let store = p.manager.store.lock().await;
+        let project = store
+            .get_session(p.epic)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        let issue = store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: project,
+                title: "bound candidate".into(),
+                body: String::new(),
+                priority: None,
+                labels: Vec::new(),
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .id;
+        let payload = serde_json::json!({
+            "request": {"operation": {"action": "create_session"}},
+            "issue_binding": {"issue_id": issue.to_string()},
+        });
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,
+                    scope_version,policy_version,idempotency_key,fingerprint,kind,payload_json,
+                    state,target_session_id,outcome_json,not_before,created_at,updated_at)
+                 SELECT ?1,project_id,manager_session_id,scope_version,policy_version,?1,
+                    'fixture','lifecycle_action',?2,'succeeded',?3,'{}',created_at,created_at,created_at
+                 FROM harness_manager_v2_operations WHERE id=?4",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    payload.to_string(),
+                    id.to_string(),
+                    receipt.operation_id.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(store.is_non_lead_worker_session(id).unwrap());
+    }
+    let process = super::super::launch::install_controller_candidate_test_process(id);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // The commit itself refuses the bound candidate with the typed code.
+    let error = p
+        .execute()
+        .await
+        .expect_err("a bound candidate must be refused");
+    assert_eq!(
+        error.to_string(),
+        "Invalid parameter: manager_v2_candidate_changed"
+    );
+    // The claimed operation left the queue and never succeeded.
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_ne!(settled.state, ManagerActionStateV2::Queued);
+    assert_ne!(settled.state, ManagerActionStateV2::Succeeded);
+    assert_ne!(settled.outcome.as_deref(), Some("lead_committed"));
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(p.epic)
+            .unwrap()
+            .unwrap()
+            .lead_session_id,
+        Some(p.lead)
+    );
+    drop(process);
+    super::super::lifecycle::interrupt_active_in_maps(&p.manager.active, id)
+        .await
+        .ok();
+    super::super::launch::drop_controller_candidate_test_stream(id);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_retry_lead_admits_completed_lead_only_without_provider_session() {
@@ -6728,13 +7080,14 @@ async fn manager_retry_lead_policy_stop_applies_with_auto_retry_disabled() {
             .agent_manager_control(
                 p.owner,
                 AgentManagerControlRequestV2 {
-                    project_id: None,
-                    fence: ManagerFenceV2 {
-                        scope_version: 1,
-                        policy_version: 2,
-                    },
-                    idempotency_key: format!("retry-{name}"),
-                    operation: retry(&p, p.fence().await),
+                    ..AgentManagerControlRequestV2::new(
+                        ManagerFenceV2 {
+                            scope_version: 1,
+                            policy_version: 2,
+                        },
+                        format!("retry-{name}"),
+                        retry(&p, p.fence().await),
+                    )
                 },
             )
             .await
@@ -7408,6 +7761,159 @@ async fn a_held_create_whose_seat_retired_without_a_successor_is_revoked_clearly
     assert_eq!(noticed, "manager_v2_actor_seat_retired");
 }
 
+/// #1716 reproduction (action 36b0dfc2): a create queued by seat A under a
+/// deploy drain; the operator appoints another session over A (A stays live,
+/// it is displaced, not archived) before the hold ends. The claim after the
+/// restart re-proved A's authority and failed `manager_scope_denied`, which
+/// had no receipt class, so the create settled `blocked` with the catch-all
+/// `manager_v2_lifecycle_unconfirmed` that no verb could settle. It is now
+/// revoked with its own class, and nothing was launched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_create_whose_seat_was_replaced_is_revoked_clearly() {
+    let p = pilot().await;
+    let live = hold_deploy_until(&p, chrono::Utc::now() + chrono::Duration::seconds(600));
+    let receipt = p
+        .admit(
+            "held-seat-replaced",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "worker for a held Issue".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
+            },
+        )
+        .await;
+    let child = receipt.target_session_id.unwrap();
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued,
+        "held by the drain"
+    );
+
+    let replacement = Uuid::new_v4();
+    {
+        let store = p.manager.store.lock().await;
+        let mut session = bare_session(replacement);
+        session.project_id = Some(p.project);
+        session.working_dir = p.repo.clone();
+        session.session_kind = SessionKind::Standard;
+        session.provider = SessionProvider::Claude;
+        session.model = Some("manager-scripted-provider".into());
+        store.insert_session(&session).unwrap();
+        let current = store.get_harness_manager(p.project).unwrap().unwrap();
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: p.project,
+                session_id: replacement,
+                epic_ids: Some(vec![p.epic]),
+                expected_row_version: current.row_version,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .get_harness_manager(p.project)
+                .unwrap()
+                .unwrap()
+                .current_session_id,
+            Some(replacement)
+        );
+    }
+    p.manager.deploy_drain().sync_until(
+        Some(&live),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+        true,
+        chrono::Utc::now(),
+    );
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Revoked, "{settled:?}");
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_actor_seat_replaced")
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(child)
+            .unwrap()
+            .is_none(),
+        "the revoked create launched nothing"
+    );
+}
+
+/// #1716: a create held by a deploy drain stays durable across the restart
+/// (the claim loop re-admits it from the queue) and launches once the hold
+/// releases; it is never a running claim a restart would mark uncertain.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_held_by_a_drain_survives_a_restart_and_launches_after_it() {
+    let p = pilot().await;
+    let live = hold_deploy_until(&p, chrono::Utc::now() + chrono::Duration::seconds(600));
+    let receipt = p
+        .admit(
+            "held-across-restart",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "worker for a held Issue".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
+            },
+        )
+        .await;
+    let child = receipt.target_session_id.unwrap();
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+
+    // The restart: startup recovery of a previous boot's claims finds none
+    // (the create was never claimed) and the drain is re-derived from the
+    // durable deploy row, still engaged.
+    let recovered = p
+        .manager
+        .store
+        .lock()
+        .await
+        .recover_manager_actions_startup(Uuid::new_v4())
+        .unwrap();
+    assert_eq!(recovered, 0);
+    p.manager.deploy_drain().sync_until(
+        Some(&live),
+        Some(chrono::Utc::now() + chrono::Duration::seconds(600)),
+        true,
+        chrono::Utc::now(),
+    );
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued,
+        "still held after the restart"
+    );
+
+    // The deploy settles and the hold releases.
+    p.manager
+        .deploy_drain()
+        .sync(None, true, chrono::Utc::now());
+    let process = super::super::launch::install_controller_candidate_test_process(child);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        settled.state,
+        ManagerActionStateV2::Succeeded,
+        "{settled:?}"
+    );
+    assert_eq!(settled.outcome.as_deref(), Some("session_established"));
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn a_create_claimed_before_the_drain_engaged_is_requeued_before_any_effect() {
@@ -7549,7 +8055,20 @@ async fn second_epic(p: &Pilot) -> Uuid {
 
 /// Lift the launch allow-list (policy v2) so a create may use any launch.
 async fn open_launch_policy(p: &mut Pilot, key: &str) {
-    p.policy.allowed_launches.clear();
+    // An empty grant list refuses every launch (`manager_v2_launch_not_granted`),
+    // so grant the scripted-provider triple for each provider the fixtures use.
+    p.policy.allowed_launches = [
+        SessionProvider::Claude,
+        SessionProvider::Codex,
+        SessionProvider::CodexAppServer,
+    ]
+    .into_iter()
+    .map(|provider| ManagerLaunchChoiceV2 {
+        provider,
+        model: "manager-scripted-provider".into(),
+        effort: None,
+    })
+    .collect();
     p.policy.max_active_sessions = 12;
     p.manager
         .store
@@ -7631,20 +8150,7 @@ async fn admit_create_session_with_model(
 #[tokio::test]
 async fn independent_create_session_actions_claim_in_parallel_up_to_the_bound() {
     let mut p = pilot().await;
-    p.policy.allowed_launches.clear();
-    p.policy.max_active_sessions = 12;
-    p.manager
-        .store
-        .lock()
-        .await
-        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
-            project_id: p.project,
-            expected_scope_version: 1,
-            expected_policy_version: 1,
-            idempotency_key: "parallel-launches".into(),
-            policy: p.policy.clone(),
-        })
-        .unwrap();
+    open_launch_policy(&mut p, "parallel-launches").await;
     let other_epic = second_epic(&p).await;
     let first = admit_create_session(&p, "par-1", 1).await;
     let second = admit_create_session_under(&p, "par-2", 2, other_epic).await;
@@ -7720,20 +8226,7 @@ async fn independent_create_session_actions_claim_in_parallel_up_to_the_bound() 
 #[tokio::test]
 async fn same_parent_create_session_actions_serialize_and_distinct_parents_overlap() {
     let mut p = pilot().await;
-    p.policy.allowed_launches.clear();
-    p.policy.max_active_sessions = 12;
-    p.manager
-        .store
-        .lock()
-        .await
-        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
-            project_id: p.project,
-            expected_scope_version: 1,
-            expected_policy_version: 1,
-            idempotency_key: "same-parent-launches".into(),
-            policy: p.policy.clone(),
-        })
-        .unwrap();
+    open_launch_policy(&mut p, "same-parent-launches").await;
     let other_epic = second_epic(&p).await;
     let first = admit_create_session(&p, "sp-1", 1).await;
     let same_parent = admit_create_session(&p, "sp-2", 2).await;
@@ -7783,6 +8276,29 @@ async fn same_parent_create_session_actions_serialize_and_distinct_parents_overl
     }
 }
 
+/// #2285: run a claimed launch whose candidate pauses at a test phase. The
+/// driver waits for the launch to park (the `reached` notification), then
+/// expires the step deadline through the manager's test trigger, so the real
+/// deadline path (drop the run, settle from `effect_started`, drain the
+/// candidate) runs with no wall-clock wait. Returns the run result and
+/// whether the phase was reached.
+async fn run_launch_until_parked_then_expire_deadline(
+    p: &Pilot,
+    claim: ManagerActionClaimV2,
+    reached: tokio::sync::oneshot::Receiver<()>,
+) -> (crate::error::Result<bool>, bool) {
+    let drive = async {
+        let reached_phase = matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), reached).await,
+            Ok(Ok(()))
+        );
+        p.manager.expire_manager_launch_step_deadline();
+        reached_phase
+    };
+    let (settled, reached_phase) = tokio::join!(p.manager.run_claimed_manager_action(claim), drive);
+    (settled, reached_phase)
+}
+
 /// #1143: drive one `create_session` whose launch stalls at `phase` past the
 /// step deadline, then assert the deadline left no orphan: nothing in
 /// `active`, the candidate row settled, and exactly one provider launch.
@@ -7800,17 +8316,10 @@ async fn deadline_during_create_leaves_no_orphan(
     let process = crate::session::launch::install_controller_candidate_test_process(child);
     let (reached, _resume) =
         crate::session::launch::install_controller_candidate_test_pause(child, phase);
-    p.manager
-        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
     let claim = p.claim().await;
-    assert!(
-        p.manager.run_claimed_manager_action(claim).await.unwrap(),
-        "the timed-out action settles"
-    );
-    let reached_phase = matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
-        Ok(Ok(()))
-    );
+    let (settled, reached_phase) =
+        run_launch_until_parked_then_expire_deadline(&p, claim, reached).await;
+    assert!(settled.unwrap(), "the timed-out action settles");
     let settled = p.receipt(receipt.operation_id).await;
     assert!(
         reached_phase,
@@ -7921,23 +8430,17 @@ done
         child,
         crate::session::launch::ControllerCandidateTestPhase::ManagerActionStartGateHeld,
     );
-    p.manager
-        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
     let claim = p.claim().await;
-    let settled = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        p.manager.run_claimed_manager_action(claim),
+    let (settled, reached_phase) = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        run_launch_until_parked_then_expire_deadline(&p, claim, reached),
     )
     .await
-    .expect("the deadline drain must not wait behind the deferred start gate")
-    .unwrap();
-    assert!(settled);
+    .expect("the deadline drain must not wait behind the deferred start gate");
+    assert!(settled.unwrap());
     let early = p.receipt(receipt.operation_id).await;
     assert!(
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
-            Ok(Ok(()))
-        ),
+        reached_phase,
         "the launch parked at the start gate: {early:?}"
     );
     // The parked launch task was dropped (its resume receiver is gone).
@@ -7979,17 +8482,18 @@ async fn launch_drain_debt_survives_a_reap_failure_until_exit_is_proved() {
         admit_create_session_with(&p, "debt-create", 1, parent, SessionProvider::Claude).await;
     let child = receipt.target_session_id.unwrap();
     let _process = crate::session::launch::install_controller_candidate_test_process(child);
-    let (_reached, _resume) = crate::session::launch::install_controller_candidate_test_pause(
+    let (reached, _resume) = crate::session::launch::install_controller_candidate_test_pause(
         child,
         crate::session::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
     );
     // The provider started before `active` publication: nothing tracks it, so
     // only a reaped (and verified-empty) cohort proves it gone.
     crate::session::reaper::fail_runtime_orphan_reap_for_test(child);
-    p.manager
-        .set_manager_launch_step_deadline(std::time::Duration::from_secs(10));
     let claim = p.claim().await;
-    assert!(p.manager.run_claimed_manager_action(claim).await.unwrap());
+    let (settled, reached_phase) =
+        run_launch_until_parked_then_expire_deadline(&p, claim, reached).await;
+    assert!(settled.unwrap());
+    assert!(reached_phase, "the launch parked after the provider start");
 
     let owed = p.receipt(receipt.operation_id).await;
     assert_eq!(owed.state, ManagerActionStateV2::Uncertain);
@@ -8044,7 +8548,7 @@ async fn launch_drain_debt_survives_a_reap_failure_until_exit_is_proved() {
 async fn launch_step_deadline_names_the_stuck_step() {
     use crate::session::manager_actions::{bound_launch_steps, note_launch_step_for_tests};
     let deadline = std::time::Duration::from_secs(30);
-    let stuck = bound_launch_steps(deadline, Uuid::new_v4(), async {
+    let stuck = bound_launch_steps(deadline, Uuid::new_v4(), std::future::pending(), async {
         note_launch_step_for_tests("settle_predecessor");
         note_launch_step_for_tests("prepare_fork");
         std::future::pending::<Result<()>>().await
@@ -8055,7 +8559,7 @@ async fn launch_step_deadline_names_the_stuck_step() {
         crate::session::manager_actions::safe_action_error(&stuck),
         "manager_v2_launch_timeout_prepare_fork"
     );
-    let fine = bound_launch_steps(deadline, Uuid::new_v4(), async {
+    let fine = bound_launch_steps(deadline, Uuid::new_v4(), std::future::pending(), async {
         note_launch_step_for_tests("prepare_fork");
         Ok(7)
     })

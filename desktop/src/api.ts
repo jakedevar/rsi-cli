@@ -1,5 +1,6 @@
 // Typed adapter over the Rust backend's Tauri commands. The webview never
 // talks to rsid directly; every call goes through one named command.
+import type { ItemState, MenuNode, Submenu } from './registry.js';
 
 export type SessionStatus =
   | 'Starting' | 'Running' | 'WaitingApproval' | 'Completed'
@@ -29,7 +30,20 @@ export interface Session {
   model?: string | null;
   project_id?: string | null;
   parent_id?: string | null;
+  lead_session_id?: string | null;
+  group_id?: string | null;
+  pinned_at?: string | null;
+  /** The scheduled job that launched it (the Jobs zone, gj). */
+  scheduled_job_id?: string | null;
+  tags?: string[] | null;
+  description?: string | null;
+  sandbox_root?: string | null;
   pending_question?: PendingQuestion | null;
+  /** Operator rating, 1-10 (UpdateSessionRating). */
+  rating?: number | null;
+  /** The topology bound to this session (UpdateSessionWorkflow); children usually inherit it from their Epic. */
+  workflow_id?: string | null;
+  workflow_id_override?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -38,6 +52,14 @@ export interface Project {
   id: string;
   name: string;
   path?: string | null;
+  color: string;
+}
+
+export interface SessionLabel {
+  id: string;
+  name: string;
+  description?: string | null;
+  project_id?: string | null;
   color: string;
 }
 
@@ -51,6 +73,9 @@ export interface ConversationEvent {
   content: string;
   tool_name?: string | null;
   tool_input?: unknown;
+  /** Provider tool call id: pairs a ToolUse with its ToolResult. */
+  tool_use_id?: string | null;
+  metadata?: unknown;
 }
 
 export interface DaemonInfo {
@@ -79,7 +104,7 @@ function tauri(): TauriGlobal {
   return t;
 }
 
-async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await tauri().core.invoke<T>(cmd, args);
   } catch (e) {
@@ -89,6 +114,8 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 export const api = {
   daemonInfo: () => invoke<DaemonInfo>('daemon_info'),
+  /** Prints the boot result to the process log (src-tauri/src/boot.rs). */
+  bootReport: (report: unknown) => invoke<void>('boot_report', { report }),
   providers: () => invoke<string[]>('providers'),
   listProjects: () => invoke<Project[]>('list_projects'),
   listSessions: () => invoke<Session[]>('list_sessions'),
@@ -112,4 +139,14 @@ export const api = {
   setOperatorPause: (sessionId: string, level: 'none' | 'soft') =>
     invoke<unknown>('set_operator_pause', { sessionId, level }),
   setAttentionCount: (count: number) => invoke<void>('set_attention_count', { count }),
+  /** Native menus built from the action registry (src-tauri/src/menu.rs validates them). */
+  setAppMenu: (menu: Submenu[]) => invoke<void>('set_app_menu', { menu }),
+  syncMenuState: (items: Record<string, ItemState>) => invoke<void>('sync_menu_state', { items }),
+  popupContextMenu: (items: MenuNode[]) => invoke<void>('popup_context_menu', { items }),
+  quit: () => invoke<void>('quit_app'),
 };
+
+/** True inside the Tauri shell (false in a plain browser preview). */
+export function inTauri(): boolean {
+  return !!(globalThis as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+}

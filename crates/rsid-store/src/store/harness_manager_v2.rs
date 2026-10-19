@@ -110,7 +110,7 @@ pub(super) const RETIRE_BOOKKEEPING_SQL: &str = "UPDATE harness_manager_v2_recor
                             AND origin.record_key=r.record_key AND i.admission_status='admitted'
                             AND i.status NOT IN ('running','cancellation_requested'))))";
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(super) const LIVE_BOOKKEEPING_INDEX_CATALOG_OBJECTS: [(&str, &str); 2] = [
     ("index", "harness_manager_v2_live_records"),
     ("index", "harness_manager_v2_coordination_budget"),
@@ -371,6 +371,29 @@ impl Store {
         let result = self.configure_harness_manager_policy_in_tx(&tx, request)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// #2237: appoint the manager and save its policy in one IMMEDIATE
+    /// transaction. Either both land or neither does: a policy the store
+    /// refuses (a stale policy version, an out-of-scope Group) rolls the
+    /// appointment back with it.
+    pub fn configure_harness_manager_with_policy(
+        &self,
+        request: &ConfigureHarnessManagerWithPolicyRequestV2,
+    ) -> Result<(
+        HarnessManagerConfigV1,
+        rsi_common::harness_manager::HarnessManagerPolicyOutcomeV1,
+        HarnessManagerPolicyConfigV2,
+    )> {
+        request.validate().map_err(refused)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (config, outcome) = self.configure_harness_manager_in_tx(&tx, &request.scope)?;
+        let policy = self.configure_harness_manager_policy_in_tx(
+            &tx,
+            &request.policy_request(config.row_version),
+        )?;
+        tx.commit()?;
+        Ok((config, outcome, policy))
     }
 
     /// [`Self::configure_harness_manager_policy`] inside the caller's
@@ -946,6 +969,7 @@ impl Store {
             deduplicated: false,
             operator_result: None,
             sandbox_source: None,
+            cancelled_wakes: None,
         };
         let stamp = now();
         let actor = match &origin {
@@ -1288,6 +1312,7 @@ impl Store {
             deduplicated: false,
             operator_result: None,
             sandbox_source: None,
+            cancelled_wakes: None,
         };
         let changed = self.conn.execute(
             "UPDATE harness_manager_v2_operations
@@ -1470,6 +1495,131 @@ mod tests {
                 expected_row_version: expected,
             })
             .unwrap()
+    }
+
+    /// A project with one completed manager-capable session and no appointment.
+    #[allow(clippy::unwrap_used)]
+    fn unappointed(store: &Store) -> (Uuid, Uuid) {
+        let project = Uuid::new_v4();
+        let stamp = Utc::now();
+        store
+            .insert_project(&Project {
+                id: project,
+                name: "Appoint with policy".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: stamp,
+                updated_at: stamp,
+            })
+            .unwrap();
+        let mut seat = test_session(Uuid::new_v4(), PathBuf::from("/tmp/appoint-with-policy"));
+        seat.session_kind = SessionKind::Standard;
+        seat.status = SessionStatus::Completed;
+        seat.project_id = Some(project);
+        store.insert_session(&seat).unwrap();
+        (project, seat.id)
+    }
+
+    fn appoint_with(
+        project: Uuid,
+        seat: Uuid,
+        policy: ManagerPolicyV2,
+    ) -> ConfigureHarnessManagerWithPolicyRequestV2 {
+        ConfigureHarnessManagerWithPolicyRequestV2 {
+            scope: ConfigureHarnessManagerRequestV1 {
+                project_id: project,
+                session_id: seat,
+                epic_ids: None,
+                group_ids: Vec::new(),
+                expected_row_version: 0,
+            },
+            expected_policy_version: 0,
+            idempotency_key: "appoint-with-policy".into(),
+            policy,
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn appointing_with_a_policy_saves_scope_and_grant_together() {
+        let store = Store::open_in_memory().unwrap();
+        let (project, seat) = unappointed(&store);
+        let policy = ManagerPolicyV2 {
+            mode: ManagerOperatingModeV2::Execute,
+            capabilities: vec![
+                ManagerCapabilityV2::WorkPlan,
+                ManagerCapabilityV2::SessionCreate,
+            ],
+            max_created_sessions: 12,
+            ..Default::default()
+        };
+        let (config, _, granted) = store
+            .configure_harness_manager_with_policy(&appoint_with(project, seat, policy.clone()))
+            .unwrap();
+        assert_eq!(config.manager_session_id, seat);
+        let saved = store.get_harness_manager_policy(project).unwrap().unwrap();
+        assert_eq!(saved.policy, policy);
+        assert_eq!(saved.manager_session_id, seat);
+        assert_eq!(saved.scope_version, config.row_version);
+        assert_eq!(granted.row_version, saved.row_version);
+        assert!(
+            !saved.revoked,
+            "the grant is live the moment the appointment is: no scope-then-policy gap"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_refused_policy_leaves_no_appointment_behind() {
+        let store = Store::open_in_memory().unwrap();
+        let (project, seat) = unappointed(&store);
+        // A Group outside the project: the policy half is refused.
+        let policy = ManagerPolicyV2 {
+            group_ids: vec![Uuid::new_v4()],
+            ..Default::default()
+        };
+        let error = store
+            .configure_harness_manager_with_policy(&appoint_with(project, seat, policy))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manager_v2_group_out_of_scope"), "{error}");
+        assert!(
+            store.get_harness_manager(project).unwrap().is_none(),
+            "the appointment rolled back with the refused policy"
+        );
+        assert!(store.get_harness_manager_policy(project).unwrap().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn appointing_with_a_policy_refuses_a_revocation_and_an_invalid_grant() {
+        let store = Store::open_in_memory().unwrap();
+        let (project, seat) = unappointed(&store);
+        let mut revoke = appoint_with(project, seat, ManagerPolicyV2::default());
+        revoke.scope.epic_ids = Some(Vec::new());
+        let error = store
+            .configure_harness_manager_with_policy(&revoke)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("manager_v2_invalid_policy_request"),
+            "{error}"
+        );
+        let invalid = ManagerPolicyV2 {
+            max_active_sessions: 0,
+            ..Default::default()
+        };
+        let error = store
+            .configure_harness_manager_with_policy(&appoint_with(project, seat, invalid))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manager_v2_invalid_policy"), "{error}");
+        assert!(store.get_harness_manager(project).unwrap().is_none());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -1827,7 +1977,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn area_node_session_scope_excludes_the_root_seat() {
         let store = Store::open_in_memory().unwrap();
-        let (_project, manager, epic, node, seat) = area_node_fixture(&store, None);
+        let (_project, manager, epic, _node, seat) = area_node_fixture(&store, None);
         let mut target = store.get_session(manager).unwrap().unwrap();
         target.id = Uuid::new_v4();
         target.parent_id = Some(epic);
@@ -2420,18 +2570,19 @@ mod tests {
         idempotency_key: &str,
     ) -> AgentManagerControlRequestV2 {
         AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
-                scope_version,
-                policy_version,
-            },
-            idempotency_key: idempotency_key.into(),
-            operation: ManagerActionV2::Integrate {
-                work_key: work_key.into(),
-                target_ref: target_ref.into(),
-                expected_tip: expected_tip.into(),
-                source_commit: source_commit.into(),
-            },
+            ..AgentManagerControlRequestV2::new(
+                ManagerFenceV2 {
+                    scope_version,
+                    policy_version,
+                },
+                idempotency_key.into(),
+                ManagerActionV2::Integrate {
+                    work_key: work_key.into(),
+                    target_ref: target_ref.into(),
+                    expected_tip: expected_tip.into(),
+                    source_commit: source_commit.into(),
+                },
+            )
         }
     }
 
@@ -2924,7 +3075,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 2, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -2961,7 +3112,7 @@ mod tests {
             )
             .unwrap();
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3001,7 +3152,7 @@ mod tests {
             )
             .unwrap();
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3071,7 +3222,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3085,7 +3236,7 @@ mod tests {
             .persist_integrate_candidate(&claim, FAKE_SHA2)
             .unwrap();
         // Verify the execution record has the candidate OID.
-        let op = store.manager_action_operation(claim.id()).unwrap().unwrap();
+        let _op = store.manager_action_operation(claim.id()).unwrap().unwrap();
         let key = claim.id().to_string();
         let exec = store
             .manager_v2_record(&config, "lifecycle_execution", &key)
@@ -3110,7 +3261,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3141,7 +3292,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3171,7 +3322,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();
@@ -3202,7 +3353,7 @@ mod tests {
         let config = harness_config(&store, project);
         put_work(&store, &config, &work_record(epic, "w1", FAKE_SHA));
         let request = integrate_request(1, 1, "w1", INTEGRATE_TARGET, FAKE_SHA, FAKE_SHA, "k1");
-        let receipt = store
+        let _receipt = store
             .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller: manager }, request)
             .unwrap();
         let boot_id = Uuid::new_v4();

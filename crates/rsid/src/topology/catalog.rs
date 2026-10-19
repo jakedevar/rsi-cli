@@ -281,9 +281,11 @@ pub(crate) enum StaleGroup {
     Empty,
     /// Every live member runs inside the attempt's sandbox: it is still the
     /// catalog op's group, and it was killed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Owned { members: usize },
     /// A member runs outside the sandbox (or could not be read): the number
     /// was reused by an unrelated group, which is left alone (#1227).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Foreign { pid: i32, cwd: Option<PathBuf> },
     /// No sandbox root was recorded, or the platform has no `/proc` to prove
     /// the group's identity with: nothing is signalled.
@@ -692,7 +694,7 @@ mod tests {
         let policy = GovernorPolicy {
             build_slots: 1,
             min_free_disk_gb: 30,
-            ..GovernorPolicy::default()
+            ..GovernorPolicy::LINUX_DEFAULT
         };
         let runner = CommandRunner::default();
         let (first, second) = (Uuid::new_v4(), Uuid::new_v4());

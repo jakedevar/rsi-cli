@@ -7,7 +7,11 @@
 //! catalog probes.  The synchronous settlement runner uses the same process
 //! group and Linux no-escape primitives without changing its polling policy.
 
-use crate::error::{DaemonError, Result as DaemonResult};
+#[cfg(target_os = "linux")]
+use crate::error::DaemonError;
+use crate::error::Result as DaemonResult;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::os::unix::process::CommandExt;
 use std::process::{ExitStatus, Stdio};
@@ -37,6 +41,56 @@ pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROVIDER_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 pub const PROVIDER_MAX_STDERR_BYTES: usize = 256 * 1024;
 pub const AGY_MAX_TURN_BYTES: usize = 4 * 1024 * 1024;
+
+// The rolling lander uses a current-thread runtime, so a thread-local registry
+// keeps its capture groups scoped to that runner and out of ordinary daemon
+// work and concurrently running test runtimes.
+thread_local! {
+    static TRACK_PROCESS_GROUPS: Cell<bool> = const { Cell::new(false) };
+    static TRACKED_PROCESS_GROUPS: RefCell<BTreeSet<i32>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// Start recording the process groups created by bounded captures in this
+/// process. Intended for the rolling lander, which must clean them up when its
+/// parent stops it.
+pub fn track_bounded_process_groups() {
+    TRACKED_PROCESS_GROUPS.with(|groups| groups.borrow_mut().clear());
+    TRACK_PROCESS_GROUPS.with(|enabled| enabled.set(true));
+}
+
+/// Snapshot process groups currently owned by bounded captures.
+pub fn tracked_bounded_process_groups() -> Vec<nix::unistd::Pid> {
+    TRACKED_PROCESS_GROUPS.with(|groups| {
+        groups
+            .borrow()
+            .iter()
+            .copied()
+            .map(nix::unistd::Pid::from_raw)
+            .collect()
+    })
+}
+
+/// Record a child process group while lander shutdown tracking is active.
+pub fn track_child_process_group(pgid: nix::unistd::Pid) {
+    TRACK_PROCESS_GROUPS.with(|enabled| {
+        if enabled.get() {
+            TRACKED_PROCESS_GROUPS.with(|groups| {
+                groups.borrow_mut().insert(pgid.as_raw());
+            });
+        }
+    });
+}
+
+/// Remove a settled child process group from lander shutdown tracking.
+pub fn untrack_child_process_group(pgid: nix::unistd::Pid) {
+    TRACK_PROCESS_GROUPS.with(|enabled| {
+        if enabled.get() {
+            TRACKED_PROCESS_GROUPS.with(|groups| {
+                groups.borrow_mut().remove(&pgid.as_raw());
+            });
+        }
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowBehavior {
@@ -327,13 +381,15 @@ where
         return Err(CaptureError::Cancelled);
     }
 
+    let scope = worker_scope_of_command(command.as_std());
     let mut child = spawn(command)?;
     let pgid = nix::unistd::Pid::from_raw(child.id().ok_or_else(|| {
         CaptureError::Spawn("spawned child did not expose a process id".to_string())
     })? as i32);
+    let stop = WorkerStopHandle::new(child.id(), scope.clone());
     if let Some(payload) = stdin {
         let Some(mut child_stdin) = child.stdin.take() else {
-            terminate_process_group(pgid);
+            let _ = stop.terminate("bounded capture missing pipe");
             let _ = tokio::time::timeout(limits.cleanup_timeout, child.wait()).await;
             return Err(CaptureError::MissingPipe("stdin"));
         };
@@ -349,16 +405,17 @@ where
         });
     }
     let Some(stdout) = child.stdout.take() else {
-        terminate_process_group(pgid);
+        let _ = stop.terminate("bounded capture missing pipe");
         let _ = tokio::time::timeout(limits.cleanup_timeout, child.wait()).await;
         return Err(CaptureError::MissingPipe("stdout"));
     };
     let Some(stderr) = child.stderr.take() else {
-        terminate_process_group(pgid);
+        let _ = stop.terminate("bounded capture missing pipe");
         drop(stdout);
         let _ = tokio::time::timeout(limits.cleanup_timeout, child.wait()).await;
         return Err(CaptureError::MissingPipe("stderr"));
     };
+    track_child_process_group(pgid);
 
     // The supervisor owns every resource. If its caller is aborted, the drop
     // guard cancels this detached task, which still kills and reaps the child.
@@ -367,6 +424,7 @@ where
     let external_cancel = cancel.clone();
     let supervisor = tokio::spawn(supervise_capture(
         child,
+        scope,
         stdout,
         stderr,
         limits,
@@ -375,6 +433,7 @@ where
     ));
     let joined = supervisor.await;
     abandon_guard.disarm();
+    untrack_child_process_group(pgid);
     joined.map_err(|error| CaptureError::Supervisor(error.to_string()))?
 }
 
@@ -409,6 +468,7 @@ struct PipeCapture {
 
 async fn supervise_capture(
     child: Child,
+    scope: Option<String>,
     stdout: ChildStdout,
     stderr: ChildStderr,
     limits: CaptureLimits,
@@ -418,8 +478,8 @@ async fn supervise_capture(
     // The leader stays unreaped (a zombie) until every group signal is sent, so
     // its group id cannot be reused while the supervisor still signals it
     // (#1259, #1251). Only `leader.reap()` ends that, on the way out.
-    let mut leader =
-        OwnedGroupLeader::new(child).map_err(|error| CaptureError::Spawn(error.to_string()))?;
+    let mut leader = OwnedGroupLeader::with_scope(child, scope)
+        .map_err(|error| CaptureError::Spawn(error.to_string()))?;
     let mut stdout_read = Box::pin(read_pipe(
         stdout,
         "stdout",
@@ -811,13 +871,31 @@ pub fn signal_process_group_because(
     reason: &str,
 ) -> std::result::Result<(), nix::errno::Errno> {
     use nix::errno::Errno;
-    use nix::sys::signal::{kill, killpg};
     if pgid.as_raw() <= 0 {
         return Err(Errno::EINVAL);
     }
     // Read the target before signalling: a killed process loses its /proc entry.
     let target = SignalTarget::describe(pgid.as_raw());
-    let caller = std::panic::Location::caller();
+    signal_process_group_described(
+        pgid,
+        signal,
+        reason,
+        target,
+        std::panic::Location::caller(),
+        SignalLogLevel::Info,
+    )
+}
+
+fn signal_process_group_described(
+    pgid: nix::unistd::Pid,
+    signal: nix::sys::signal::Signal,
+    reason: &str,
+    target: SignalTarget,
+    caller: &'static std::panic::Location<'static>,
+    level: SignalLogLevel,
+) -> std::result::Result<(), nix::errno::Errno> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, killpg};
     #[cfg(any(test, feature = "test-seam"))]
     recorded_group_signals::record(pgid.as_raw(), signal, reason, &target);
     let result = match killpg(pgid, signal) {
@@ -831,7 +909,8 @@ pub fn signal_process_group_because(
         Ok(()) => "sent".to_string(),
         Err(error) => format!("failed: {error}"),
     };
-    log_signal(
+    log_signal_at(
+        level,
         &SignalRecord {
             pid: pgid.as_raw(),
             pgid: Some(pgid.as_raw()),
@@ -843,6 +922,231 @@ pub fn signal_process_group_because(
         &outcome,
     );
     result
+}
+
+/// Upper bound on one `systemctl --user kill` (#2008).
+#[cfg(target_os = "linux")]
+#[cfg_attr(any(test, feature = "test-seam"), allow(dead_code))]
+const SCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether `unit` is a daemon-created worker scope name.
+#[must_use]
+pub fn is_worker_scope_unit(unit: &str) -> bool {
+    unit.starts_with("rsi-worker-")
+        && unit.ends_with(".scope")
+        && unit.len() <= 255
+        && unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Immutable launch identity shared by the process owner and its pipe readers.
+/// Numeric group signaling and reaping use the same lock: after release only
+/// this launch's unique scope can be killed, regardless of PID reuse.
+#[derive(Clone, Debug)]
+pub struct WorkerStopHandle {
+    scope: Option<String>,
+    group: std::sync::Arc<std::sync::Mutex<Option<nix::unistd::Pid>>>,
+}
+
+/// Releases numeric process authority if a launch fails after readers start.
+pub struct WorkerStopGuard(Option<WorkerStopHandle>);
+
+impl WorkerStopGuard {
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for WorkerStopGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.release();
+        }
+    }
+}
+
+impl WorkerStopHandle {
+    pub fn release_on_drop(&self) -> WorkerStopGuard {
+        WorkerStopGuard(Some(self.clone()))
+    }
+
+    /// Capture a freshly spawned, unreaped child configured with `process_group(0)`.
+    /// Its owner must fence every reap with this handle and release before dropping the child.
+    pub fn new(pid: Option<u32>, scope: Option<String>) -> Self {
+        Self {
+            scope,
+            group: std::sync::Arc::new(std::sync::Mutex::new(
+                pid.and_then(|pid| i32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                    .map(nix::unistd::Pid::from_raw),
+            )),
+        }
+    }
+
+    pub fn terminate(&self, reason: &str) -> std::result::Result<(), nix::errno::Errno> {
+        if let Some(unit) = &self.scope {
+            kill_worker_scope(unit, nix::sys::signal::Signal::SIGKILL);
+        }
+        let group = self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *group {
+            Some(pgid) => {
+                signal_process_group_because(pgid, nix::sys::signal::Signal::SIGKILL, reason)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The child owner must use this for every reap and release before Drop.
+    pub fn try_wait(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+        let mut group = self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = child.try_wait();
+        if !matches!(result, Ok(None)) {
+            *group = None;
+        }
+        result
+    }
+
+    pub fn release(&self) {
+        *self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub async fn wait(&self, child: &mut Child) -> std::io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait(child)? {
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Read only the launcher's options, never provider arguments after `--`.
+#[must_use]
+pub fn worker_scope_of_command(command: &std::process::Command) -> Option<String> {
+    let launcher = command.get_program() == "/usr/bin/systemd-run";
+    #[cfg(any(test, feature = "test-seam"))]
+    let launcher = launcher
+        || std::path::Path::new(command.get_program())
+            .file_name()
+            .is_some_and(|name| {
+                name == "process_scope_direct_runner.sh" || name == "process_scope_group_runner.sh"
+            });
+    if !launcher
+        || !command
+            .get_args()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--scope")
+    {
+        return None;
+    }
+    command
+        .get_args()
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| arg.to_str()?.strip_prefix("--unit=").map(str::to_string))
+        .find(|unit| is_worker_scope_unit(unit))
+}
+
+/// SIGKILL every process in the recorded worker scope `unit` (`systemctl
+/// --user kill --kill-whom=all`). Best effort: a missing `systemctl` or an
+/// already-collected scope leaves the group kill as the only effect. It never
+/// blocks the caller: the command runs on its own thread under a deadline
+/// (#2008), so it is safe on async halt and capture paths. A no-op off Linux,
+/// and under tests it only records the request.
+pub fn kill_worker_scope(unit: &str, signal: nix::sys::signal::Signal) {
+    if !is_worker_scope_unit(unit) {
+        return;
+    }
+    #[cfg(any(test, feature = "test-seam"))]
+    recorded_scope_kills::record(unit, signal);
+    #[cfg(all(target_os = "linux", not(any(test, feature = "test-seam"))))]
+    {
+        let unit = unit.to_string();
+        let signal = signal.as_str().to_string();
+        let spawned = std::thread::Builder::new()
+            .name("rsid-scope-kill".into())
+            .spawn(move || run_scope_kill(&unit, &signal, SCOPE_KILL_TIMEOUT));
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the worker scope kill thread");
+        }
+    }
+    #[cfg(all(not(target_os = "linux"), not(any(test, feature = "test-seam"))))]
+    let _ = (unit, signal);
+}
+
+/// Run `systemctl --user kill` for `unit`, killing it after `timeout`.
+#[cfg(target_os = "linux")]
+#[cfg_attr(any(test, feature = "test-seam"), allow(dead_code))]
+fn run_scope_kill(unit: &str, signal: &str, timeout: Duration) {
+    run_bounded_scope_command(
+        std::process::Command::new("/usr/bin/systemctl")
+            .args(["--user", "kill", "--kill-whom=all"])
+            .arg(format!("--signal={signal}"))
+            .arg(unit),
+        timeout,
+    );
+}
+
+/// Spawn `command` with no stdio and wait for it at most `timeout`; a command
+/// still running at the deadline is killed and reaped. Returns whether it
+/// exited on its own in time.
+#[cfg(target_os = "linux")]
+fn run_bounded_scope_command(command: &mut std::process::Command, timeout: Duration) -> bool {
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Records the worker scopes a forced kill asked systemd to stop.
+#[cfg(any(test, feature = "test-seam"))]
+pub mod recorded_scope_kills {
+    use std::sync::Mutex;
+
+    static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(unit: &str, _signal: nix::sys::signal::Signal) {
+        RECORDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(unit.to_string());
+    }
+
+    pub fn killed(unit: &str) -> usize {
+        RECORDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|recorded| recorded.as_str() == unit)
+            .count()
+    }
 }
 
 /// Who a daemon signal is about to hit, read from `/proc` before it is sent
@@ -916,18 +1220,44 @@ pub struct SignalRecord<'a> {
 /// Log one daemon signal on the `rsid::signal` target with the sender's
 /// source location (#1227).
 pub fn log_signal(record: &SignalRecord<'_>, caller: &std::panic::Location<'_>, outcome: &str) {
-    tracing::info!(
-        target: "rsid::signal",
-        pid = record.pid,
-        pgid = record.pgid,
-        signal = record.signal,
-        unit = record.target.unit.as_deref().unwrap_or("-"),
-        comm = record.target.comm.as_deref().unwrap_or("-"),
-        reason = record.reason,
-        caller = %caller,
-        outcome,
-        "daemon signal",
-    );
+    log_signal_at(SignalLogLevel::Info, record, caller, outcome);
+}
+
+/// How loudly a daemon signal is logged. Every kill path logs at `Info`; only
+/// routine cleanup of a group proved to hold no live member drops to `Debug`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalLogLevel {
+    Info,
+    Debug,
+}
+
+/// [`log_signal`] at an explicit [`SignalLogLevel`].
+pub fn log_signal_at(
+    level: SignalLogLevel,
+    record: &SignalRecord<'_>,
+    caller: &std::panic::Location<'_>,
+    outcome: &str,
+) {
+    macro_rules! emit {
+        ($macro:ident) => {
+            tracing::$macro!(
+                target: "rsid::signal",
+                pid = record.pid,
+                pgid = record.pgid,
+                signal = record.signal,
+                unit = record.target.unit.as_deref().unwrap_or("-"),
+                comm = record.target.comm.as_deref().unwrap_or("-"),
+                reason = record.reason,
+                caller = %caller,
+                outcome,
+                "daemon signal",
+            )
+        };
+    }
+    match level {
+        SignalLogLevel::Info => emit!(info),
+        SignalLogLevel::Debug => emit!(debug),
+    }
 }
 
 /// Test seam: every process-group signal the daemon attempts, so a test can
@@ -1009,6 +1339,98 @@ pub fn terminate_process_group(pgid: nix::unistd::Pid) {
 #[track_caller]
 pub fn terminate_process_group_because(pgid: nix::unistd::Pid, reason: &str) {
     let _ = signal_process_group_because(pgid, nix::sys::signal::Signal::SIGKILL, reason);
+}
+
+/// What a group holds once its leader has exited but is not yet reaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupLiveness {
+    /// At least one member that is not a zombie: a helper survived its leader.
+    Live,
+    /// Every member is gone or a zombie, so a signal can change nothing.
+    NoLiveMember,
+    /// The platform cannot enumerate the group (no `/proc`, or it was unreadable).
+    Unknown,
+}
+
+/// Whether process group `pgid` still has a live (non-zombie) member. An
+/// exited-but-unreaped leader keeps its group id reserved and stays a member
+/// in state `Z`, so `killpg` reports success on an otherwise empty group; only
+/// the members' state distinguishes a survivor from that corpse.
+#[must_use]
+pub fn owned_group_liveness(pgid: nix::unistd::Pid) -> GroupLiveness {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = pgid.as_raw();
+        if raw <= 0 {
+            return GroupLiveness::Unknown;
+        }
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return GroupLiveness::Unknown;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            // A process that exits during the scan has no stat: not a member.
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            if let Some((state, group)) = parse_stat_state_and_group(&stat)
+                && group == raw
+                && !matches!(state, 'Z' | 'X')
+            {
+                return GroupLiveness::Live;
+            }
+        }
+        GroupLiveness::NoLiveMember
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pgid;
+        GroupLiveness::Unknown
+    }
+}
+
+/// The state letter and process-group id of one `/proc/<pid>/stat` line. The
+/// command name is parenthesised and may itself hold spaces or parentheses, so
+/// the fields are read after the LAST `)`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_state_and_group(stat: &str) -> Option<(char, i32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _parent = fields.next()?;
+    let group = fields.next()?.parse().ok()?;
+    Some((state, group))
+}
+
+/// SIGKILL a group the caller owns (a direct child started with
+/// `process_group(0)`, leader exited but not yet reaped) as routine cleanup.
+/// The signal is always sent. It is logged at INFO with `reason` when a live
+/// member survived the leader (or liveness cannot be told) and at DEBUG when
+/// the group held nothing but the corpse, so a clean child leaves no INFO line.
+#[track_caller]
+pub fn terminate_owned_group_cleanup(pgid: nix::unistd::Pid, reason: &str) {
+    use nix::errno::Errno;
+    if pgid.as_raw() <= 0 {
+        return;
+    }
+    // Probe and describe before signalling: a killed process loses its /proc entry.
+    let level = match owned_group_liveness(pgid) {
+        GroupLiveness::NoLiveMember => SignalLogLevel::Debug,
+        GroupLiveness::Live | GroupLiveness::Unknown => SignalLogLevel::Info,
+    };
+    let target = SignalTarget::describe(pgid.as_raw());
+    let _: std::result::Result<(), Errno> = signal_process_group_described(
+        pgid,
+        nix::sys::signal::Signal::SIGKILL,
+        reason,
+        target,
+        std::panic::Location::caller(),
+        level,
+    );
 }
 
 fn configure_no_escape(command: &mut std::process::Command) -> DaemonResult<()> {
@@ -1153,6 +1575,161 @@ const SECCOMP_COMPAT_SYSCALL_BIT: u32 = 0;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stat_line_is_read_after_the_last_paren_of_the_command_name() {
+        let stat = "4242 (a) b (c) Z 1 4200 4200 0 -1";
+        assert_eq!(super::parse_stat_state_and_group(stat), Some(('Z', 4200)));
+        assert_eq!(super::parse_stat_state_and_group("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_liveness_tells_a_survivor_from_an_unreaped_leader() {
+        use super::{GroupLiveness, configure_std_process_group, owned_group_liveness};
+        use nix::sys::wait::{Id, WaitPidFlag, waitid};
+        let spawn = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            configure_std_process_group(&mut command, super::ProcessContainment::Group)
+                .expect("group");
+            let child = command.spawn().expect("spawn");
+            let pgid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid"));
+            waitid(Id::Pid(pgid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).expect("exited");
+            (child, pgid)
+        };
+        let (mut empty, empty_pgid) = spawn("exit 0");
+        assert_eq!(
+            owned_group_liveness(empty_pgid),
+            GroupLiveness::NoLiveMember
+        );
+        empty.wait().expect("reap");
+
+        let (mut survivor, survivor_pgid) = spawn("sleep 30 & exit 0");
+        assert_eq!(owned_group_liveness(survivor_pgid), GroupLiveness::Live);
+        super::terminate_process_group(survivor_pgid);
+        survivor.wait().expect("reap");
+    }
+
+    #[test]
+    fn only_daemon_named_worker_scopes_are_recordable() {
+        assert!(is_worker_scope_unit("rsi-worker-a-b.scope"));
+        assert!(!is_worker_scope_unit("rsi-job-1.service"));
+        assert!(!is_worker_scope_unit("app-other.scope"));
+        assert!(!is_worker_scope_unit("rsi-worker-a b.scope"));
+    }
+
+    #[test]
+    fn scope_is_read_only_from_launcher_arguments() {
+        let mut command = std::process::Command::new("/usr/bin/systemd-run");
+        command.args([
+            "--scope",
+            "--unit=rsi-worker-launch.scope",
+            "--",
+            "tool",
+            "--unit=rsi-worker-forged.scope",
+        ]);
+        assert_eq!(
+            worker_scope_of_command(&command).as_deref(),
+            Some("rsi-worker-launch.scope")
+        );
+        let mut plain = std::process::Command::new("tool");
+        plain.args(["--scope", "--unit=rsi-worker-forged.scope"]);
+        assert_eq!(worker_scope_of_command(&plain), None);
+    }
+
+    #[tokio::test]
+    async fn old_reader_after_pid_reuse_kills_only_its_launch_scope() {
+        let mut command = Command::new("true");
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let old = WorkerStopHandle::new(pid, Some("rsi-worker-old-reader.scope".into()));
+        let reader = old.clone();
+        old.wait(&mut child).await.unwrap();
+        // A new launch gets the same numeric PID; the old reader is still alive.
+        let replacement = WorkerStopHandle::new(pid, Some("rsi-worker-reused-pid.scope".into()));
+        let signals = recorded_group_signals::sent_to(pid.unwrap() as i32);
+        reader.terminate("late reader failure").unwrap();
+        assert_eq!(
+            recorded_scope_kills::killed("rsi-worker-old-reader.scope"),
+            1
+        );
+        assert_eq!(
+            recorded_scope_kills::killed("rsi-worker-reused-pid.scope"),
+            0
+        );
+        assert_eq!(
+            recorded_group_signals::sent_to(pid.unwrap() as i32),
+            signals
+        );
+        replacement.release();
+    }
+
+    #[tokio::test]
+    async fn five_thousand_launches_preserve_the_oldest_live_scope() {
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let oldest =
+            WorkerStopHandle::new(child.id(), Some("rsi-worker-capacity-oldest.scope".into()));
+        let live: Vec<_> = (0..5000)
+            .map(|i| WorkerStopHandle::new(None, Some(format!("rsi-worker-capacity-{i}.scope"))))
+            .collect();
+        assert!(oldest.try_wait(&mut child).unwrap().is_none());
+        oldest.terminate("oldest live worker").unwrap();
+        oldest.wait(&mut child).await.unwrap();
+        assert_eq!(
+            recorded_scope_kills::killed("rsi-worker-capacity-oldest.scope"),
+            1
+        );
+        assert_eq!(live.len(), 5000);
+    }
+
+    #[test]
+    fn failed_launch_releases_reader_group_authority() {
+        let stop = WorkerStopHandle::new(Some(2_000_002), None);
+        let reader = stop.clone();
+        let lease = stop.release_on_drop();
+        drop(lease);
+        let signals = recorded_group_signals::sent_to(2_000_002);
+        reader.terminate("reader outlived failed launch").unwrap();
+        assert_eq!(recorded_group_signals::sent_to(2_000_002), signals);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_kill_command_is_bounded_by_its_deadline() {
+        let started = std::time::Instant::now();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        assert!(!run_bounded_scope_command(
+            &mut command,
+            Duration::from_millis(200)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let mut quick = std::process::Command::new("true");
+        assert!(run_bounded_scope_command(
+            &mut quick,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[tokio::test]
+    async fn scope_kill_does_not_block_the_async_runtime() {
+        // The recorded request returns immediately (the real kill runs on its
+        // own thread); nothing here may wait on systemctl.
+        let started = std::time::Instant::now();
+        kill_worker_scope(
+            "rsi-worker-2008-nonblocking.scope",
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            recorded_scope_kills::killed("rsi-worker-2008-nonblocking.scope"),
+            1
+        );
+    }
+
     use super::*;
     use std::io::Cursor;
     use tempfile::TempDir;

@@ -117,6 +117,38 @@ pub(crate) fn classify_manager_program_evidence(
     }
 }
 
+/// The assistant text after the last user message, accumulated under the
+/// program gate's event and byte bounds.
+#[derive(Default)]
+struct ProgramWindow {
+    output: String,
+    separated: String,
+    count: usize,
+}
+
+impl ProgramWindow {
+    /// Adds one event. `false` when a bound is exceeded (the evidence is then
+    /// unknown): more than `max_events` events, or an event that does not fit in
+    /// what is left of `max_bytes`.
+    fn push(&mut self, text: &str, bytes: usize, max_events: usize, max_bytes: usize) -> bool {
+        self.count += 1;
+        if self.count > max_events || bytes > max_bytes.saturating_sub(self.output.len()) {
+            return false;
+        }
+        // #413: streamed Assistant events may split one carrier mid-line, so
+        // the verbatim concatenation stays the primary reading. A second
+        // reading puts each event on its own line, so a carrier followed (or
+        // preceded) by prose in another event is not glued into trailing
+        // characters or a missing key.
+        if !self.separated.is_empty() {
+            self.separated.push('\n');
+        }
+        self.separated.push_str(text);
+        self.output.push_str(text);
+        true
+    }
+}
+
 pub fn check_manager_notice_program_gate(store: &crate::store::Store, target: Uuid) -> Result<()> {
     check_manager_program_gate(store, target, true, false)
 }
@@ -163,40 +195,47 @@ pub fn check_manager_program_gate(
         [target.to_string()],
         |row| row.get(0),
     )?;
-    let mut stmt = store.conn.prepare(
-        "SELECT substr(content,1,?2), length(CAST(content AS BLOB))
-         FROM conversation_events
-         WHERE session_id=?1 AND role='Assistant'
-           AND sequence > ?4
-         ORDER BY sequence LIMIT ?3",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![
-        target.to_string(),
-        MAX_BYTES + 1,
-        MAX_EVENTS + 1,
+    let mut window = ProgramWindow::default();
+    // #2384: a cold target's window is read through the one merge function; its
+    // `ToolUse` rows (role `Assistant`) are in the archive, not in the live tail.
+    if let Some(cold_rows) = store.cold_assistant_window(
+        target,
         last_user.unwrap_or(-1),
-    ])?;
-    let mut output = String::new();
-    let mut separated = String::new();
-    let mut count = 0;
-    while let Some(row) = rows.next()? {
-        count += 1;
-        let bytes: usize = row.get(1)?;
-        if count > MAX_EVENTS || bytes > MAX_BYTES.saturating_sub(output.len()) {
-            return Err(evidence_unknown());
+        MAX_EVENTS + 1,
+        MAX_BYTES + 1,
+    )? {
+        for (text, bytes) in cold_rows {
+            if !window.push(&text, bytes, MAX_EVENTS, MAX_BYTES) {
+                return Err(evidence_unknown());
+            }
         }
-        let text = row.get::<_, String>(0)?;
-        // #413: streamed Assistant events may split one carrier mid-line, so
-        // the verbatim concatenation stays the primary reading. A second
-        // reading puts each event on its own line, so a carrier followed (or
-        // preceded) by prose in another event is not glued into trailing
-        // characters or a missing key.
-        if !separated.is_empty() {
-            separated.push('\n');
+    } else {
+        let mut stmt = store.conn.prepare(
+            "SELECT substr(content,1,?2), length(CAST(content AS BLOB))
+             FROM conversation_events
+             WHERE session_id=?1 AND role='Assistant'
+               AND sequence > ?4
+             ORDER BY sequence LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![
+            target.to_string(),
+            MAX_BYTES + 1,
+            MAX_EVENTS + 1,
+            last_user.unwrap_or(-1),
+        ])?;
+        while let Some(row) = rows.next()? {
+            let bytes: usize = row.get(1)?;
+            let text = row.get::<_, String>(0)?;
+            if !window.push(&text, bytes, MAX_EVENTS, MAX_BYTES) {
+                return Err(evidence_unknown());
+            }
         }
-        separated.push_str(&text);
-        output.push_str(&text);
     }
+    let ProgramWindow {
+        mut output,
+        separated,
+        ..
+    } = window;
     let mut outcome = parse_orchestration_outcome_v1(&output);
     if outcome.is_err() && separated != output {
         let separated_outcome = parse_orchestration_outcome_v1(&separated);

@@ -41,7 +41,7 @@ pub(super) fn spawn_decision_targets_read(
 ) -> Result<JoinHandle<RemoteReadCompleted<RemoteGetDecisionTargetsResponseV1>>> {
     limiter.spawn(move |budget| {
         budget.check()?;
-        let guard = store.try_lock_owned().map_err(|_| ReadError::Busy)?;
+        let guard = super::permit::acquire_store(&store, budget)?;
         let response = decision_targets_response(&guard, &request)?;
         drop(guard);
         budget.check()?;
@@ -65,13 +65,14 @@ pub(super) fn decision_targets_response(
         .get_harness_manager(project)
         .map_err(|_| ReadError::SourceUnavailable)?
     else {
-        let (pending_items, truncated) = pending_items(store, project, session, &[])?;
+        let pending = pending_items(store, project, session, request, &[])?;
         return Ok(RemoteGetDecisionTargetsResponseV1 {
             manager: DecisionTargetsManagerV1::NotConfigured,
             fence: None,
             items: Vec::new(),
-            pending_items,
-            truncated,
+            pending_items: pending.items,
+            pending_next: pending.next,
+            truncated: pending.truncated,
         });
     };
     let mut items = Vec::new();
@@ -84,6 +85,7 @@ pub(super) fn decision_targets_response(
             .manager_v2_inspect_operator(
                 project,
                 &AgentManagerInspectRequestV2 {
+                    include_history: false,
                     section: ManagerInspectSectionV2::Decisions,
                     epic_id: None,
                     cursor: cursor.clone(),
@@ -116,27 +118,59 @@ pub(super) fn decision_targets_response(
     if !complete {
         truncated = true;
     }
-    let (pending_items, pending_truncated) = pending_items(store, project, session, &items)?;
+    let pending = pending_items(store, project, session, request, &items)?;
     Ok(RemoteGetDecisionTargetsResponseV1 {
         manager: DecisionTargetsManagerV1::Configured,
         fence,
         items,
-        pending_items,
-        truncated: truncated || pending_truncated,
+        pending_items: pending.items,
+        pending_next: pending.next,
+        truncated: truncated || pending.truncated,
     })
 }
 
+/// Producer candidates examined per request, before the runtime filters
+/// (manager-inbox overlap, dead native writers) run.
+const MAX_PENDING_SCAN: usize = 32;
+
+struct PendingPage {
+    items: Vec<PendingDecisionTargetItemV1>,
+    /// Continue after this `decision_id` for the rest of the inventory.
+    next: Option<Text<160>>,
+    truncated: bool,
+}
+
+/// `truncated` is true exactly when answerable rows may remain beyond this
+/// page: either the filtered result overflowed the wire cap, or the store scan
+/// stopped at its candidate cap. Filtering never hides either condition, and an
+/// exhausted scan with fewer rows than the cap reports complete.
 fn pending_items(
     store: &Store,
     project: Uuid,
     session: Uuid,
+    request: &RemoteGetDecisionTargetsV1,
     manager_items: &[DecisionTargetItemV1],
-) -> Result<(Vec<PendingDecisionTargetItemV1>, bool)> {
-    let targets = store
-        .remote_pending_decision_targets(project, session, MAX_DECISION_TARGETS + 1)
-        .map_err(|_| ReadError::SourceUnavailable)?;
+) -> Result<PendingPage> {
+    let scan = store
+        .remote_pending_decision_targets(
+            project,
+            session,
+            request.pending_after.as_ref().map(|after| after.as_str()),
+            MAX_PENDING_SCAN,
+        )
+        .map_err(|_| {
+            if request.pending_after.is_some() {
+                ReadError::InvalidSource
+            } else {
+                ReadError::SourceUnavailable
+            }
+        })?;
     let mut items = Vec::new();
-    for (id, target) in targets {
+    let mut previous: Option<String> = None;
+    let mut next = scan.next_after.clone();
+    let mut truncated = scan.next_after.is_some();
+    for (id, target) in scan.targets {
+        let previous_id = previous.replace(id.clone());
         let approval = target["kind"] == "appserver_approval";
         let inbox_key = if approval {
             format!(
@@ -165,6 +199,13 @@ fn pending_items(
                             == target["incarnation_id"].as_str().unwrap_or_default() => {}
                 _ => continue,
             }
+        }
+        if items.len() == MAX_DECISION_TARGETS {
+            // A further answerable row exists: stop after the last row this
+            // page did cover.
+            truncated = true;
+            next = previous_id;
+            break;
         }
         let digest = crate::store::harness_manager_v2::fingerprint(&target)
             .map_err(|_| ReadError::SourceUnavailable)?;
@@ -212,9 +253,13 @@ fn pending_items(
             options: bounded_options(options),
         });
     }
-    let truncated = items.len() > MAX_DECISION_TARGETS;
-    items.truncate(MAX_DECISION_TARGETS);
-    Ok((items, truncated))
+    Ok(PendingPage {
+        items,
+        next: next
+            .map(|cursor| Text::new(cursor).map_err(|_| ReadError::InvalidSource))
+            .transpose()?,
+        truncated,
+    })
 }
 
 /// A fence is usable only while the project's current grant is live and covers
@@ -485,7 +530,96 @@ mod tests {
         RemoteGetDecisionTargetsV1 {
             project_id: WireUuid::new(project.to_string()).unwrap(),
             session_id: WireUuid::new(session.to_string()).unwrap(),
+            pending_after: None,
         }
+    }
+
+    /// Open published approvals with no live native writer: scan candidates the
+    /// runtime filter always drops.
+    fn seed_filtered_approvals(store: &Store, session: Uuid, count: usize) {
+        let approval = rsi_common::types::Approval {
+            id: Uuid::new_v4(),
+            session_id: session,
+            tool_name: "command".into(),
+            tool_input: json!({}),
+            status: rsi_common::types::ApprovalStatus::Pending,
+            created_at: Utc::now(),
+            resolved_at: None,
+        };
+        store.insert_approval(&approval).unwrap();
+        let incarnation = Uuid::new_v4().to_string();
+        for n in 0..count {
+            store.conn.execute(
+                "INSERT INTO appserver_approval_publications(publication_id,session_id,incarnation_id,request_id_json,approval_id,state,target_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'published','{}',?6,?6)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    session.to_string(),
+                    incarnation,
+                    n.to_string(),
+                    approval.id.to_string(),
+                    format!("2026-10-08T00:00:{n:02}.000000000Z"),
+                ],
+            ).unwrap();
+        }
+    }
+
+    fn leaf_with_question(store: &Store) -> (Fixture, Uuid) {
+        let fixture = fixture(store);
+        let mut leaf = fixture.lead.clone();
+        leaf.id = Uuid::new_v4();
+        leaf.parent_id = None;
+        store.insert_session(&leaf).unwrap();
+        raise_question(store, leaf.id, 1);
+        (fixture, leaf.id)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn capped_scan_is_truncated_even_when_filtering_removes_every_row() {
+        let store = Store::open_in_memory().unwrap();
+        let (fixture, leaf) = leaf_with_question(&store);
+        seed_filtered_approvals(&store, leaf, MAX_PENDING_SCAN + 8);
+        let project = fixture.config.project_id;
+        let first = decision_targets_response(&store, &targets(project, leaf)).unwrap();
+        assert_eq!(first.pending_items.len(), 1, "only the question answers");
+        assert!(first.truncated, "the scan stopped at its cap");
+        let mut request = targets(project, leaf);
+        request.pending_after = first.pending_next.clone();
+        assert!(request.pending_after.is_some());
+
+        // The continuation returns the rest: nothing answerable remains, and
+        // the exhausted scan says so.
+        let rest = decision_targets_response(&store, &request).unwrap();
+        assert!(rest.pending_items.is_empty());
+        assert!(rest.pending_next.is_none());
+        assert!(!rest.truncated);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn exhausted_scan_below_the_cap_is_complete() {
+        let store = Store::open_in_memory().unwrap();
+        let (fixture, leaf) = leaf_with_question(&store);
+        seed_filtered_approvals(&store, leaf, 3);
+        let response =
+            decision_targets_response(&store, &targets(fixture.config.project_id, leaf)).unwrap();
+        assert_eq!(response.pending_items.len(), 1);
+        assert!(!response.truncated);
+        assert!(response.pending_next.is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn stale_pending_cursor_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let (fixture, leaf) = leaf_with_question(&store);
+        let mut request = targets(fixture.config.project_id, leaf);
+        request.pending_after =
+            Some(Text::new(format!("pending-approval:{}", Uuid::new_v4())).unwrap());
+        assert!(matches!(
+            decision_targets_response(&store, &request),
+            Err(ReadError::InvalidSource)
+        ));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

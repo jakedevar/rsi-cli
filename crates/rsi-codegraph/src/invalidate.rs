@@ -7,7 +7,7 @@ use crate::cargo_metadata::{CargoWorkspace, apply_workspace};
 use crate::{
     CodegraphError, NodeKind, Result, SourceFile,
     extract::extract_file,
-    resolve::resolve_unique,
+    resolve::resolve_workspace,
     staged::{MAX_STAGED_FILE_BYTES, MAX_STAGED_SOURCE_BYTES, PerFileFacts},
     validate_path,
 };
@@ -49,6 +49,14 @@ impl ExtractionCache {
     /// # Errors
     /// Duplicate paths and staged inventory bounds are rejected.
     pub fn update(&mut self, files: Vec<SourceFile>) -> Result<CorpusUpdate> {
+        self.update_resolved(files, None)
+    }
+
+    fn update_resolved(
+        &mut self,
+        files: Vec<SourceFile>,
+        cargo: Option<&CargoWorkspace>,
+    ) -> Result<CorpusUpdate> {
         if files.len() > crate::staged::MAX_STAGED_FILES {
             return Err(CodegraphError::LimitExceeded {
                 requested: files.len(),
@@ -98,7 +106,7 @@ impl ExtractionCache {
             }
         }
         let mut facts = next_raw.values().cloned().collect::<Vec<_>>();
-        resolve_unique(&mut facts);
+        resolve_workspace(&mut facts, cargo);
         let inventory = SourceInventory::from_facts(&facts);
         let mut invalidated = changed.clone();
         if let Some(previous) = &self.previous_inventory {
@@ -129,7 +137,7 @@ impl ExtractionCache {
         let previous = self.previous_inventory.clone();
         let cargo_changed = self.previous_cargo_metadata_digest.as_deref()
             != Some(metadata.metadata_digest.as_str());
-        let mut update = self.update(files)?;
+        let mut update = self.update_resolved(files, Some(metadata))?;
         apply_workspace(&mut update.facts, metadata);
         update.inventory =
             SourceInventory::from_facts(&update.facts).with_cargo_digest(&metadata.metadata_digest);

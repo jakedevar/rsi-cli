@@ -47,6 +47,7 @@ fn row(
         focus_session_id: focus,
         grant: None,
         launches: Vec::new(),
+        last_seat_handoff: None,
         load: ManagerTreeLoadV1 {
             running_workers: Some(2),
             direct_reports: None,
@@ -399,6 +400,8 @@ fn row_text_shows_the_effective_launch_set() {
         text.contains("launches sonnet-5-5/high Codex:gpt-6-astra/xhigh"),
         "{text}"
     );
+    node.launches[0].effort = None;
+    assert!(row_text(&node).contains("sonnet-5-5/any effort"));
 }
 
 #[test]
@@ -1859,4 +1862,39 @@ async fn portfolio_cap_preview_requires_y_before_retrying_with_confirmation() {
     > = serde_json::from_value(sent[1].clone()).unwrap();
     assert_eq!(confirmed.request, request);
     assert!(tree_state(&app).modal.is_none());
+}
+
+#[test]
+fn row_text_shows_the_last_seat_handoff_and_old_rows_parse() {
+    let mut node = row("portfolio:p", None, 0, ManagerTreeKindV1::Portfolio, None);
+    assert!(handoff_text(&node).is_none());
+    let old = Uuid::new_v4();
+    let new = Uuid::new_v4();
+    node.last_seat_handoff = Some(
+        rsi_common::manager_node_workspace::ManagerNodeSeatHandoffV1 {
+            appointment_id: Uuid::new_v4(),
+            old_seat: old,
+            new_seat: new,
+            handoff: Some("thoughts/shared/handoffs/h.md".into()),
+            handed_at: chrono::Utc::now(),
+            handoff_changed_after_appointment: false,
+            handoff_modified_at: None,
+        },
+    );
+    let text = row_text(&node);
+    assert!(
+        text.contains(&format!(
+            "seat handed on {} -> {}",
+            &old.to_string()[..8],
+            &new.to_string()[..8]
+        )) && text.contains("handoff thoughts/shared/handoffs/h.md"),
+        "{text}"
+    );
+    let wire = serde_json::to_value(&node).unwrap();
+    let back: ManagerTreeRowV1 = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(back, node);
+    let mut legacy = wire;
+    legacy.as_object_mut().unwrap().remove("last_seat_handoff");
+    let back: ManagerTreeRowV1 = serde_json::from_value(legacy).unwrap();
+    assert!(back.last_seat_handoff.is_none());
 }

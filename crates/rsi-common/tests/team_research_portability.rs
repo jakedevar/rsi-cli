@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(rsi_common::manifest_dir!())
         .parent()
         .and_then(Path::parent)
         .expect("workspace root")

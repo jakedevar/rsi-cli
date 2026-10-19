@@ -402,7 +402,7 @@ run_list() {
   read -r -a package_flags <<<"${shard_package_flags[$shard]}"
   if env CARGO_TARGET_DIR="$sweep_root/target/cloud-$sha/rsid-$shard" \
     cargo nextest list --profile rsid-fast "${package_flags[@]}" --lib --no-default-features \
-    --features "test-shard-$shard" --message-format json \
+    --features "test-shard-$shard" --ignore-default-filter --message-format json \
     >"$result_dir/lists/$shard.json" 2>"$result_dir/logs/list-$shard.log"; then
     status=0
   else
@@ -427,7 +427,7 @@ wait || true
 if grep -qv '^0$' "$result_dir"/list-status/*; then exit 1; fi
 python3.11 scripts/check-rsid-test-shards.py --require-gates --runtime-dir "$result_dir/lists"
 for shard in "${shards[@]}"; do
-  run_lane "rsid-$shard" scripts/run-rsid-test-shards.sh shard "$shard" --jobs 4 &
+  run_lane "rsid-$shard" scripts/run-rsid-test-shards.sh shard "$shard" --jobs 4 --slow-tier &
   bounded_wait
 done
 wait || true

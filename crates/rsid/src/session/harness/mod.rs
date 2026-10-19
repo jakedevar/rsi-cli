@@ -1,13 +1,17 @@
 pub mod agent_loop;
 pub(crate) mod agent_mail;
 pub mod api_key;
+pub(crate) mod base_prompt;
 mod bedrock_stream;
 pub mod compaction;
 pub mod compatible_table;
+#[cfg(test)]
+mod e2e_tests;
 pub mod egress;
 pub mod errors;
+mod loop_ports;
 pub mod models;
-mod normalize;
+pub(crate) mod net;
 pub mod provider;
 pub mod providers;
 pub mod retry;
@@ -29,6 +33,7 @@ use crate::model_control::call_control::{
 };
 use crate::session::harness::agent_loop::run_harness_loop_with_compact_budget;
 use crate::session::harness::agent_mail::{HarnessAgentMailBoundary, HarnessMailBoundary};
+use crate::session::harness::errors::ProviderErrorExt as _;
 use crate::session::harness::provider::resolve_provider;
 use crate::session::harness::tools::HarnessToolRegistry;
 use crate::session::harness::tools::policy::ToolPolicyRuntime;
@@ -151,6 +156,49 @@ impl HarnessClient {
                     session_id,
                     binding.clone(),
                 )));
+            }
+        }
+    }
+
+    /// Register the native `web_search` tool when the operator's backend choice
+    /// names a backend that is configured: its vault key resolves, or for
+    /// SearXNG the operator set `harness_searxng_url` (#2251, #2315). Otherwise nothing is
+    /// registered, so an unconfigured tool never wastes an autonomous call; the
+    /// returned `system` notice tells the operator why (none when the operator
+    /// disabled the tool, when the session policy would not advertise it, or
+    /// when the route offers its own hosted search).
+    pub(super) fn register_web_search(
+        &self,
+        tools: &mut HarnessToolRegistry,
+        vault: &crate::vault::VaultHandle,
+        route_has_hosted_search: bool,
+    ) -> Option<StreamEvent> {
+        let choice = self
+            .runtime_config
+            .as_ref()
+            .map(|config| config.harness_web_search_backend())
+            .unwrap_or_default();
+        let searxng_url = self
+            .runtime_config
+            .as_ref()
+            .and_then(|config| config.harness_searxng_url());
+        match tools::web_search::select_backend(choice, vault, searxng_url.as_deref()) {
+            tools::web_search::BackendSelection::Ready(backend) => {
+                tools.register(Arc::new(tools::web_search::WebSearchTool::new(backend)));
+                None
+            }
+            tools::web_search::BackendSelection::Unavailable(unavailable) => {
+                let advertised_otherwise = route_has_hosted_search
+                    || tools.policy().is_some_and(|policy| {
+                        policy
+                            .tool_permitted(rsi_common::harness_tool_policy::WEB_SEARCH_TOOL, false)
+                            .is_err()
+                    });
+                if advertised_otherwise {
+                    None
+                } else {
+                    unavailable.notice()
+                }
             }
         }
     }
@@ -326,14 +374,37 @@ impl HarnessClient {
         if !effective_policy.is_default() {
             tools.set_policy(Arc::new(ToolPolicyRuntime::new(effective_policy)));
         }
+        // #2251: the native search tool, only when a backend key resolves. The
+        // policy is set first so a refused tool raises no notice.
+        let web_search_notice = self.register_web_search(
+            &mut tools,
+            &crate::vault::global(),
+            provider_backend
+                .web_capabilities(&model)
+                .tools
+                .iter()
+                .any(|tool| tool.name == rsi_common::harness_tool_policy::WEB_SEARCH_TOOL),
+        );
         mcp_bridge.register_with_threshold(&mut tools, self.mcp_deferred_tool_threshold());
-        let mcp_events = mcp_bridge.take_events();
+        let mut mcp_events = mcp_bridge.take_events();
+        mcp_events.extend(web_search_notice);
         let tools = Arc::new(tools);
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
-        let system_prompt = system_prompt.unwrap_or_default();
+        // #2258: the static base instructions lead every Harness-loop prompt,
+        // then the launch's own text. A resumed history carries no system
+        // message, so the whole composed prompt is put back at its front
+        // (#2347): the continue path's custody instruction, and on a fresh
+        // relaunch the router and preamble parts, reach the model again.
+        let system_prompt =
+            base_prompt::compose_system_prompt(config.provider, system_prompt).unwrap_or_default();
+        let conversation_history = base_prompt::seed_resumed_history(
+            config.provider,
+            &system_prompt,
+            conversation_history,
+        );
         let query = config.query.clone();
         let reasoning_effort = config.effort.clone();
         let working_dir = working_dir.to_path_buf();
@@ -404,26 +475,7 @@ impl HarnessClient {
             .await;
 
             if let Err(e) = result {
-                let typed = errors::ProviderError::from_daemon_error(&e);
-                let _ = event_tx
-                    .send(StreamEvent {
-                        event_type: "process_error".into(),
-                        data: typed.map_or_else(
-                            || serde_json::json!({ "error": e.to_string() }),
-                            |error| {
-                                serde_json::json!({
-                                    "error": format!("provider_error:{}", error.detail_code),
-                                    "source": "harness",
-                                    "terminal": true,
-                                    "error_class": error.class,
-                                    "http_status": error.http_status,
-                                    "retry_after_ms": error.retry_after_ms,
-                                    "detail_code": error.detail_code,
-                                })
-                            },
-                        ),
-                    })
-                    .await;
+                let _ = event_tx.send(process_error_event(&e)).await;
             }
         });
 
@@ -437,9 +489,217 @@ impl HarnessClient {
     }
 }
 
+/// The terminal `process_error` a failed Harness turn ends with (#304).
+///
+/// The monitor settles a turn `Failed` only on daemon-owned terminal evidence
+/// (`monitor.rs::is_terminal_provider_error`); an event without it is a
+/// nonterminal diagnostic and the drained stream completes the session. A
+/// classified provider failure carries its typed fields; every other loop
+/// error (a policy denial, a process or store fault) is just as final for the
+/// turn, so it carries the same `source: "harness"` / `terminal: true` marker
+/// and keeps its text visible.
+pub(in crate::session) fn process_error_event(error: &crate::error::DaemonError) -> StreamEvent {
+    let data = match errors::ProviderError::from_daemon_error(error) {
+        Some(typed) => serde_json::json!({
+            "error": format!("provider_error:{}", typed.detail_code),
+            "source": "harness",
+            "terminal": true,
+            "error_class": typed.class,
+            "http_status": typed.http_status,
+            "retry_after_ms": typed.retry_after_ms,
+            "detail_code": typed.detail_code,
+        }),
+        None => serde_json::json!({
+            "error": error.to_string(),
+            "source": "harness",
+            "terminal": true,
+        }),
+    };
+    StreamEvent {
+        event_type: "process_error".into(),
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vault(env: &'static [(&'static str, &'static str)]) -> crate::vault::VaultHandle {
+        crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+            .env(move |name| {
+                env.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            })
+            .open()
+            .expect("test vault")
+    }
+
+    fn advertises_web_search(tools: &HarnessToolRegistry) -> bool {
+        tools.specs().iter().any(|spec| spec.name == "web_search")
+    }
+
+    /// #2251: the native `web_search` tool is advertised only when the chosen
+    /// backend's vault key resolves. Without one the tool is absent and the
+    /// operator gets one visible `system` notice; the notice is withheld when
+    /// the operator disabled the tool, the session policy refuses it, or the
+    /// route has a hosted search of its own.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn web_search_is_registered_only_when_a_backend_key_resolves() {
+        let keyless = vault(&[]);
+        let keyed = vault(&[("SERPER_API_KEY", "serper-fake-key-0123456789abcdef")]);
+        let client = HarnessClient::new();
+
+        // No key: no tool, one notice that persists as a visible System row.
+        let mut tools = HarnessToolRegistry::new();
+        let notice = client
+            .register_web_search(&mut tools, &keyless, false)
+            .expect("a missing key is announced");
+        assert!(!advertises_web_search(&tools));
+        assert_eq!(notice.event_type, "system");
+        assert_eq!(notice.data["subtype"], "web_search_unavailable");
+        assert_eq!(notice.data["reason"], "no_backend_credential");
+        let mut sequence = 0;
+        let rows = crate::session::SessionManager::convert_recognized_stream_event(
+            &notice,
+            uuid::Uuid::new_v4(),
+            &mut sequence,
+        )
+        .expect("a system event is recognized");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, rsi_common::types::EventType::System);
+        assert!(
+            rows[0].content.contains("Provider Keys"),
+            "{}",
+            rows[0].content
+        );
+
+        // The route's own hosted search needs no notice.
+        let mut tools = HarnessToolRegistry::new();
+        assert!(
+            client
+                .register_web_search(&mut tools, &keyless, true)
+                .is_none()
+        );
+        assert!(!advertises_web_search(&tools));
+
+        // A refused tool raises no notice either.
+        let mut tools = HarnessToolRegistry::new();
+        tools.set_policy(Arc::new(ToolPolicyRuntime::new(HarnessToolPolicy {
+            web_access: Some(rsi_common::harness_tool_policy::WebAccessMode::Disabled),
+            ..HarnessToolPolicy::default()
+        })));
+        assert!(
+            client
+                .register_web_search(&mut tools, &keyless, false)
+                .is_none()
+        );
+
+        // A resolvable key registers the tool and says nothing.
+        let mut tools = HarnessToolRegistry::new();
+        assert!(
+            client
+                .register_web_search(&mut tools, &keyed, false)
+                .is_none()
+        );
+        assert!(advertises_web_search(&tools));
+
+        // The operator's `disabled` wins over a key, silently.
+        let mut disabled = HarnessClient::new();
+        let runtime = Arc::new(crate::config::RuntimeConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        runtime
+            .update_field("harness_web_search_backend", &serde_json::json!("disabled"))
+            .unwrap();
+        disabled.set_runtime_config(Arc::clone(&runtime));
+        let mut tools = HarnessToolRegistry::new();
+        assert!(
+            disabled
+                .register_web_search(&mut tools, &keyed, false)
+                .is_none()
+        );
+        assert!(!advertises_web_search(&tools));
+
+        // `serper` named explicitly behaves like `auto` with a key.
+        runtime
+            .update_field("harness_web_search_backend", &serde_json::json!("serper"))
+            .unwrap();
+        let mut tools = HarnessToolRegistry::new();
+        assert!(
+            disabled
+                .register_web_search(&mut tools, &keyed, false)
+                .is_none()
+        );
+        assert!(advertises_web_search(&tools));
+        // ... and says so when the key is missing.
+        let mut tools = HarnessToolRegistry::new();
+        let named = disabled
+            .register_web_search(&mut tools, &keyless, false)
+            .expect("a named backend without a key is announced");
+        assert_eq!(named.data["backend"], "serper");
+    }
+
+    /// #2315: with no key at all, the operator's SearXNG URL registers the
+    /// tool (under `auto` and when named); `searxng` named without a URL is
+    /// announced with its own reason; clearing the URL takes the tool away.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn web_search_is_registered_from_the_searxng_url_without_any_key() {
+        let keyless = vault(&[]);
+        let mut client = HarnessClient::new();
+        let runtime = Arc::new(crate::config::RuntimeConfig::from_config(
+            &crate::config::Config::default(),
+        ));
+        client.set_runtime_config(Arc::clone(&runtime));
+
+        // No URL under `auto`: the generic notice, now naming SearXNG too.
+        let mut tools = HarnessToolRegistry::new();
+        let none = client
+            .register_web_search(&mut tools, &keyless, false)
+            .expect("nothing configured is announced");
+        assert_eq!(none.data["reason"], "no_backend_credential");
+        assert!(
+            none.data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("SearXNG URL"))
+        );
+        assert!(!advertises_web_search(&tools));
+
+        runtime
+            .update_field(
+                "harness_searxng_url",
+                &serde_json::json!("http://127.0.0.1:8888/"),
+            )
+            .unwrap();
+        for choice in ["auto", "searxng"] {
+            runtime
+                .update_field("harness_web_search_backend", &serde_json::json!(choice))
+                .unwrap();
+            let mut tools = HarnessToolRegistry::new();
+            assert!(
+                client
+                    .register_web_search(&mut tools, &keyless, false)
+                    .is_none(),
+                "{choice}"
+            );
+            assert!(advertises_web_search(&tools), "{choice}");
+        }
+
+        // Cleared again: `searxng` named is announced with its own reason.
+        runtime
+            .update_field("harness_searxng_url", &serde_json::Value::Null)
+            .unwrap();
+        let mut tools = HarnessToolRegistry::new();
+        let named = client
+            .register_web_search(&mut tools, &keyless, false)
+            .expect("a named backend without a URL is announced");
+        assert_eq!(named.data["reason"], "no_backend_url");
+        assert_eq!(named.data["backend"], "searxng");
+        assert!(!advertises_web_search(&tools));
+    }
 
     /// #1111: the daemon default decides context editing for a launch that sets
     /// nothing, an explicit session policy overrides it, and a policy resolved
@@ -574,6 +834,211 @@ mod tests {
                 kind.name()
             );
         }
+    }
+
+    fn resume_launch_config(
+        session_id: uuid::Uuid,
+        model: &str,
+        query: &str,
+        system_prompt: String,
+        working_dir: &Path,
+    ) -> LaunchConfig {
+        LaunchConfig {
+            completion_gates: None,
+            query: query.to_string(),
+            title: None,
+            agent_role: None,
+            epic_spawn_ordinal: None,
+            working_dir: Some(working_dir.to_path_buf()),
+            provider: Some(rsi_common::types::SessionProvider::Harness),
+            model: Some(model.to_string()),
+            configured_context_window: None,
+            max_turns: None,
+            system_prompt: Some(system_prompt),
+            resume_session_id: Some(session_id.to_string()),
+            session_kind: None,
+            project_id: None,
+            rsi_session_id: Some(session_id),
+            rsi_socket: None,
+            rsi_session_token: None,
+            continued_from: None,
+            openai_base_url: None,
+            openai_api_key: None,
+            conversation_history: None,
+            workflow_id: None,
+            workflow_id_override: None,
+            max_retries: None,
+            group_id: None,
+            parent_id: None,
+            effort: None,
+            issue_identifier: None,
+            issue_url: None,
+            issue_tracker_id: None,
+            scheduled_job_id: None,
+            model_invocation_owner: None,
+            model_invocation_dedup_key: None,
+            model_invocation_request_fingerprint: None,
+            skip_project_model_default: false,
+            tool_policy: None,
+            model_invocation_purpose:
+                rsi_common::model_control::ModelInvocationPurpose::SessionContinueResume,
+            sandbox: None,
+            cargo_target_dir: None,
+            execution_scratch: None,
+            is_eval: false,
+            skip_context_pipeline: false,
+            capability_class: None,
+            tags: vec![],
+            topology_node_id: None,
+            topology_iteration: 0,
+            closure_selector: None,
+            structured_handoff: false,
+        }
+    }
+
+    /// Launch a resumed Harness session through `launch_with_binding` (the call
+    /// `ResumedLauncher` makes) against a recording model, and return the
+    /// `messages` of the one request it sent.
+    async fn first_resumed_request(
+        model: &str,
+        system_prompt: String,
+        history: Vec<ChatMessage>,
+        query: &str,
+    ) -> Vec<serde_json::Value> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = [
+            serde_json::json!({"choices": [{"index": 0, "delta": {
+                "role": "assistant", "content": "ok"}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {},
+                "finish_reason": "stop"}]}),
+            serde_json::json!({"choices": [], "usage": {
+                "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}}),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>()
+            + "data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+        provider::install_test_openai_compatible_route(model, &server.uri());
+
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let session_id = uuid::Uuid::new_v4();
+        let permit = agent_loop::tests::root_permit_keyed(&store, session_id, "resume").await;
+        let event_bus = Arc::new(EventBus::new(8));
+        let worker = crate::model_control::call_control::ModelCallSettlementWorker::new(
+            Arc::clone(&store),
+            Arc::clone(&event_bus),
+        )
+        .expect("settlement worker");
+        let settlements = worker.handle().expect("settlement producer");
+        let dir = tempfile::tempdir().expect("working dir");
+        let config =
+            resume_launch_config(session_id, model, query, system_prompt.clone(), dir.path());
+        let budget = crate::provider_capabilities::resolve_fresh_context_budget(
+            rsi_common::types::SessionProvider::Harness,
+            "claude-sonnet-5",
+            None,
+        );
+
+        let (_process, mut events) = HarnessClient::new()
+            .launch_with_binding(
+                1,
+                &config,
+                &budget,
+                Some(system_prompt),
+                dir.path(),
+                Some(history),
+                permit,
+                None,
+                None,
+                Arc::clone(&store),
+                event_bus,
+                settlements,
+                Some(session_id),
+                None,
+                None,
+                None,
+            )
+            .expect("the resumed launch");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while events.recv().await.is_some() {}
+        })
+        .await
+        .expect("the turn ends");
+
+        let requests = server.received_requests().await.expect("request recording");
+        assert_eq!(requests.len(), 1, "one model request");
+        let body: serde_json::Value = requests[0].body_json().expect("JSON request body");
+        body["messages"].as_array().expect("messages").clone()
+    }
+
+    /// #2347: a continued Harness session's first request starts with one system
+    /// message holding the base and the launch's supplemental prompt (the
+    /// sandbox custody instruction), ahead of the replayed history. A fresh
+    /// relaunch replays its router and preamble parts the same way.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_launch_sends_the_launch_prompt_once_ahead_of_the_history() {
+        let custody = crate::session::preamble::sandbox_custody_instruction(
+            Path::new("/tmp/rsi-sandboxes/2347"),
+            "rsi/2347",
+        );
+        let history = vec![
+            ChatMessage::user("first task"),
+            ChatMessage::assistant("first answer"),
+        ];
+
+        // A plain continue: the custody instruction is the supplemental text.
+        let supplemental = crate::session::preamble::prepend_sandbox_custody_instruction(
+            None,
+            Some(custody.clone()),
+        )
+        .expect("custody prompt");
+        let messages = first_resumed_request(
+            "resume-prompt-continue",
+            supplemental,
+            history.clone(),
+            "keep going",
+        )
+        .await;
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "user"],
+            "{messages:?}"
+        );
+        let system = messages[0]["content"].as_str().expect("system text");
+        assert!(system.starts_with(base_prompt::base_instructions()));
+        assert_eq!(system.matches(&custody).count(), 1, "custody appears once");
+        assert!(system.contains("<session_instructions>"));
+        assert_eq!(messages[1]["content"], "first task");
+        assert_eq!(messages[2]["content"], "first answer");
+        assert_eq!(messages[3]["content"], "keep going");
+
+        // A fresh relaunch carries the preamble parts ahead of the custody text.
+        let preamble = "ROUTER-AND-PREAMBLE-MARKER";
+        let relaunch = format!("{preamble}\n\n{custody}");
+        let messages =
+            first_resumed_request("resume-prompt-relaunch", relaunch, Vec::new(), "start").await;
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(roles, ["system", "user"], "{messages:?}");
+        let system = messages[0]["content"].as_str().expect("system text");
+        assert!(system.starts_with(base_prompt::base_instructions()));
+        assert_eq!(system.matches(preamble).count(), 1);
+        assert_eq!(system.matches(&custody).count(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]

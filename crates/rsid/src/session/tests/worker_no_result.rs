@@ -1,9 +1,10 @@
 //! Issue #1098: a worker never silently ends without RESULT.
 use super::*;
 use crate::session::worker_result_guard::{
-    NO_RESULT_STOP_REASON, install_test_provider_pid, live_descendant_count, no_result_wake_id,
-    settled_descendant_count,
+    NO_RESULT_STOP_REASON, install_test_provider_pid, no_result_wake_id,
 };
+#[cfg(target_os = "linux")]
+use crate::session::worker_result_guard::{live_descendant_count, settled_descendant_count};
 use rsi_common::types::WakeMode;
 use std::sync::Arc;
 
@@ -260,6 +261,89 @@ async fn running_agent_job_counts_as_owned_work() {
     assert_eq!(wake_count(&f, worker.id).await, 1);
 }
 
+/// #1734: a running job whose completion is awaited by an enabled
+/// `when.jobs_terminal` wake is a correct wait, so the worker gets no nudge.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn running_job_with_completion_wake_is_not_nudged() {
+    use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+    let f = fixture();
+    let (_parent, worker) = worker_pair(&f).await;
+    let job_id = Uuid::new_v4();
+    {
+        let store = f.manager.store.lock().await;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,log_path,status_path,state,created_at,row_version)
+                 VALUES(?1,?2,'test','{}','/tmp','unit-1734','/tmp/log','/tmp/status','running',?3,1)",
+                rusqlite::params![job_id.to_string(), worker.id.to_string(), now],
+            )
+            .unwrap();
+        let mut wake = mk_watch_job_for(worker.id, worker.id, "job finished");
+        wake.wake_mode = WakeMode::Resume;
+        wake.schedule.recurrence = rsi_common::types::Recurrence::Once;
+        wake.next_fire_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        store
+            .insert_wake_when(
+                &wake,
+                &WakeWhenState {
+                    predicate: WakePredicate {
+                        sha_on_rolling: None,
+                        issue_closed: None,
+                        todo_closed: None,
+                        topology_execution_settled: None,
+                        health_anomaly: None,
+                        settlement_run_settled: None,
+                        jobs_terminal: Some(vec![job_id]),
+                    },
+                    armed_at: chrono::Utc::now(),
+                    deadline: None,
+                    repo_dir: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(
+            store
+                .owner_running_job_has_completion_wake(worker.id)
+                .unwrap()
+        );
+    }
+    run_turn(&f, &worker, "waiting for the job wake").await;
+    assert_eq!(wake_count(&f, worker.id).await, 0);
+    assert_eq!(stored(&f, worker.id).await.status, SessionStatus::Completed);
+}
+
+/// #1958: an armed durable wake the worker owns (`resume`, `on_terminal`) is
+/// the pending result, even with a live child: no no-result continuation.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn armed_own_wake_is_the_pending_result_and_gets_no_nudge() {
+    for mode in [WakeMode::Resume, WakeMode::OnTerminal(Uuid::new_v4())] {
+        let f = fixture();
+        let (_parent, worker) = worker_pair(&f).await;
+        let run = LiveRun::start(None);
+        install_test_provider_pid(worker.id, run.sh.id());
+        {
+            let store = f.manager.store.lock().await;
+            let mut wake = mk_watch_job_for(worker.id, worker.id, "armed wake");
+            wake.wake_mode = mode;
+            wake.next_fire_at = chrono::Utc::now() + chrono::Duration::hours(1);
+            store.insert_scheduled_job(&wake).unwrap();
+            assert!(store.owner_has_armed_result_wake(worker.id).unwrap());
+        }
+        run_turn(&f, &worker, "waiting on my armed wake").await;
+        assert_eq!(wake_count(&f, worker.id).await, 0);
+        assert_eq!(stored(&f, worker.id).await.status, SessionStatus::Completed);
+        assert_ne!(
+            stored(&f, worker.id).await.stop_reason.as_deref(),
+            Some(NO_RESULT_STOP_REASON)
+        );
+    }
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn result_line_or_idle_worker_is_never_continued() {
@@ -323,8 +407,15 @@ fn result_line_detection_accepts_report_forms_only() {
     assert!(has_result_line("verdict\nREVIEW APPROVE commit=abc"));
     assert!(has_result_line("REVIEW CHANGES: two blockers"));
     assert!(has_result_line("**REVIEW APPROVE**"));
+    // #1791: reviewers also use lowercase or mixed-case verdicts.
+    assert!(has_result_line("REVIEW approve 0 findings\nFriction: none"));
+    assert!(has_result_line("REVIEW changes 2 findings"));
+    assert!(has_result_line("**REVIEW Approve**"));
     assert!(!has_result_line("REVIEW: ACCEPTED"));
     assert!(!has_result_line("REVIEW APPROVED by nobody yet"));
+    assert!(!has_result_line("REVIEW approved by nobody yet"));
+    assert!(!has_result_line("REVIEW changeset pending"));
+    assert!(!has_result_line("REVIEW 批准 findings"));
     assert!(!has_result_line("REVIEWS pending"));
     assert!(!has_result_line("the result is pending"));
     assert!(!has_result_line("RESULTS are pending"));
@@ -524,7 +615,11 @@ async fn terminal_watch_waits_for_the_automatic_continuation_then_fires() {
     let f = fixture();
     let (worker, _run, wake) = worker_with_armed_wake(&f).await;
     // Transient Completed with the continuation armed: the watch is held.
-    let (held, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
+    let (held, _) = f
+        .manager
+        .watch_decision_for(worker.id, true, worker.parent_id.unwrap())
+        .await
+        .unwrap();
     assert_eq!(held, WatchDecision::NotReady);
 
     // The continuation is retired (ineligible at delivery): the watch fires.
@@ -538,7 +633,11 @@ async fn terminal_watch_waits_for_the_automatic_continuation_then_fires() {
         )
         .unwrap();
     assert_retired_at_delivery(&f, &worker, &wake).await;
-    let (decision, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
+    let (decision, _) = f
+        .manager
+        .watch_decision_for(worker.id, true, worker.parent_id.unwrap())
+        .await
+        .unwrap();
     assert!(
         matches!(decision, WatchDecision::Fire { .. }),
         "{decision:?}"
@@ -566,7 +665,11 @@ async fn terminal_watch_fires_on_the_final_no_result_completed() {
     run_turn(&f, &worker, "still waiting").await;
     let second = stored(&f, worker.id).await;
     assert_eq!(second.stop_reason.as_deref(), Some(NO_RESULT_STOP_REASON));
-    let (decision, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
+    let (decision, _) = f
+        .manager
+        .watch_decision_for(worker.id, true, worker.parent_id.unwrap())
+        .await
+        .unwrap();
     assert!(
         matches!(decision, WatchDecision::Fire { .. }),
         "{decision:?}"
@@ -616,6 +719,18 @@ async fn finished_worker_and_reviewer_get_no_nudge() {
         stored(&f, reviewer.id).await.status,
         SessionStatus::Completed
     );
+
+    // #1791: a bare lowercase verdict is also a report, even with a live run.
+    for report in ["REVIEW approve 0 findings", "REVIEW changes 2 findings"] {
+        let (_parent, reviewer) = worker_pair(&f).await;
+        install_test_provider_pid(reviewer.id, run.sh.id());
+        run_turn(&f, &reviewer, report).await;
+        assert_eq!(wake_count(&f, reviewer.id).await, 0);
+        assert_eq!(
+            stored(&f, reviewer.id).await.status,
+            SessionStatus::Completed
+        );
+    }
 }
 
 /// #1459: a foreground command that has just returned is still winding down
@@ -834,4 +949,163 @@ async fn watch_line_carries_the_stranded_worker_note() {
     let note = "no-result: stranded; owns job 12345678 unit rsi-job-unit";
     let line = compose_watch_line(&row, None, false, None, Some(note), "worker completed");
     assert!(line.contains(&format!("({note})")), "{line}");
+}
+
+/// #31: the lead's watch line names a child that stopped at a rejected tool
+/// call, with the exact id to continue and the dirty-sandbox flag.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn watch_line_names_a_rejected_tool_stop_with_the_exact_recovery_id() {
+    let f = fixture();
+    let (_, worker) = worker_pair(&f).await;
+    let mut row = stored(&f, worker.id).await;
+    row.terminal_reason = Some("provider_tool_rejected".to_string());
+    let line = compose_watch_line(&row, Some(false), false, Some(true), None, "worker ended");
+    assert!(line.contains("stopped-at-rejected-tool: true"), "{line}");
+    assert!(
+        line.contains(&format!("recover: AgentContinueChild {}", worker.id)),
+        "{line}"
+    );
+    assert!(line.contains("sandbox-worktree-dirty: true"), "{line}");
+
+    row.terminal_reason = Some("completed".to_string());
+    let plain = compose_watch_line(&row, None, false, None, None, "worker ended");
+    assert!(!plain.contains("AgentContinueChild"), "{plain}");
+}
+
+/// A running daemon job owned by `worker`.
+async fn own_running_job(f: &Fixture, worker: &Session) {
+    let store = f.manager.store.lock().await;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,log_path,status_path,state,created_at,row_version)
+             VALUES(?1,?2,'test','{}','/tmp',?4,'/tmp/log','/tmp/status','running',?3,1)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                worker.id.to_string(),
+                now,
+                format!("unit-151-{}", Uuid::new_v4()),
+            ],
+        )
+        .unwrap();
+}
+
+/// The worker appended a handoff to an Issue (`AgentUpdateIssue {handoff}`).
+async fn publish_issue_handoff(f: &Fixture, worker: &Session) {
+    let store = f.manager.store.lock().await;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO issue_handoffs
+                 (issue_id, sequence, project_id, author_session_id, idempotency_key, body, created_at)
+             VALUES (?1, 1, ?2, ?3, 'handoff-151', 'LANDED abc1234', ?4)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                worker.id.to_string(),
+                now
+            ],
+        )
+        .unwrap();
+    store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+}
+
+/// The launch brief: the session's first user message.
+async fn record_launch_brief(f: &Fixture, worker: &Session, brief: &str) {
+    let store = f.manager.store.lock().await;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at)
+             VALUES(?1,-1000,'Message','User',?2,?3)",
+            rusqlite::params![worker.id.to_string(), brief, now],
+        )
+        .unwrap();
+}
+
+/// #151: a worker that published its handoff to its Issue has reported, even
+/// when its last message carries no `RESULT`/`PIPELINE HANDOFF` marker and a
+/// job row is still open: no nudge. One that published nothing still gets it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn published_issue_handoff_gets_no_nudge_and_a_silent_worker_still_does() {
+    let f = fixture();
+    let (_parent, published) = worker_pair(&f).await;
+    own_running_job(&f, &published).await;
+    publish_issue_handoff(&f, &published).await;
+    run_turn(&f, &published, "Landed and published the handoff.").await;
+    assert_eq!(wake_count(&f, published.id).await, 0);
+    assert_ne!(
+        stored(&f, published.id).await.stop_reason.as_deref(),
+        Some(NO_RESULT_STOP_REASON)
+    );
+
+    let (_parent, silent) = worker_pair(&f).await;
+    own_running_job(&f, &silent).await;
+    run_turn(&f, &silent, "Landed and published the handoff.").await;
+    assert_eq!(wake_count(&f, silent.id).await, 1);
+}
+
+/// #151: the result format the launch brief declares is a final report; a
+/// worker that does not use it, or has no brief format, is still nudged.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn launch_brief_result_format_is_a_final_report() {
+    let brief = "Land the change. End with a final line starting `LANDED <sha>`.";
+    let f = fixture();
+
+    let (_parent, declared) = worker_pair(&f).await;
+    record_launch_brief(&f, &declared, brief).await;
+    own_running_job(&f, &declared).await;
+    run_turn(&f, &declared, "LANDED abc1234 on rolling").await;
+    assert_eq!(wake_count(&f, declared.id).await, 0);
+
+    let (_parent, wrong_format) = worker_pair(&f).await;
+    record_launch_brief(&f, &wrong_format, brief).await;
+    own_running_job(&f, &wrong_format).await;
+    run_turn(&f, &wrong_format, "still waiting on the run").await;
+    assert_eq!(wake_count(&f, wrong_format.id).await, 1);
+
+    let (_parent, no_brief_format) = worker_pair(&f).await;
+    own_running_job(&f, &no_brief_format).await;
+    run_turn(&f, &no_brief_format, "LANDED abc1234 on rolling").await;
+    assert_eq!(wake_count(&f, no_brief_format.id).await, 1);
+}
+
+/// #151: an armed continuation is retired at delivery when the worker has
+/// published its Issue handoff since it was armed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn armed_wake_is_retired_when_the_worker_published_its_issue_handoff() {
+    let f = fixture();
+    let (worker, _run, wake) = worker_with_armed_wake(&f).await;
+    publish_issue_handoff(&f, &worker).await;
+    assert_retired_at_delivery(&f, &worker, &wake).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn declared_result_prefixes_come_from_report_format_lines_only() {
+    use crate::store::worker_no_result::declared_result_prefixes;
+    assert_eq!(
+        declared_result_prefixes("End with a final line starting `LANDED <sha>`."),
+        vec!["LANDED".to_string()]
+    );
+    assert_eq!(
+        declared_result_prefixes("Your final message must start with \"DONE:\" then a summary."),
+        vec!["DONE".to_string()]
+    );
+    // Built-in keywords, non-report lines and mixed-case spans are not formats.
+    assert!(
+        declared_result_prefixes(
+            "The final report is a `PIPELINE HANDOFF — <STAGE>:` or `RESULT ...`.\n\
+             Run `FOO_BAR` first.\nEnd your final message with `Friction: none`."
+        )
+        .is_empty()
+    );
 }

@@ -4,12 +4,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p . && node scripts/copy-static.mjs",
+    "build": "node scripts/slices.mjs && tsc -p . && node scripts/copy-static.mjs",
     "typecheck": "tsc -p . --noEmit",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "node scripts/slices.mjs --check && npm run build && node scripts/parity.mjs --check && node scripts/source-guard.mjs --check && node --test tests/*.test.mjs",
     "tauri": "cargo tauri"
   },
   "devDependencies": {
     "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0"
   }
 }

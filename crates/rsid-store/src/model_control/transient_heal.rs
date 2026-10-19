@@ -6,18 +6,28 @@
 use rsi_common::types::{SessionKind, SessionStatus};
 
 use super::retry::{RetryClassification, classify_error_message};
+use crate::store_support::provider_defaults::is_provider_capacity_stop_reason;
+
+/// The heal reason for a provider "model at capacity" / HTTP 503 failure
+/// (#2109). The heal resumes the SAME session on the same model with a short,
+/// bounded backoff; past the bound the daemon relaunches an Issue-bound worker
+/// on the next allowed launch (`manager_actions::issue_worker_capacity`).
+pub const PROVIDER_CAPACITY_HEAL_REASON: &str = "provider_capacity";
 
 // ── Slice A: transient failure classification ──────────────────────────
 
 /// Labels whose retry only repeats the same failure. Checked first; they win
 /// over any transient label in either position.
-const EXCLUDED_LABELS: [&str; 4] = [
+const EXCLUDED_LABELS: [&str; 5] = [
     "restart_reconciled_failed",
     "codex_resume_tool_history_invalid",
     // Context is full: a resume fails again. Rotation (E04) owns this case.
     "blocking_limit",
     // The operator's own message interrupted the tool call: a human action.
     "aborted_tools",
+    // The run stopped at its operator-set spend cap (#2762): a heal would spend
+    // the same budget again.
+    crate::store_support::provider_defaults::CLAUDE_BUDGET_EXCEEDED_STOP_REASON,
 ];
 
 /// Terminal-reason / invocation error-class labels that mark a transient,
@@ -89,6 +99,16 @@ pub fn classify_transient_failure_with_stop(
     }
     if let Some(reason) = matched_label(labels, &TRANSIENT_LABELS) {
         return TransientVerdict::Transient { reason };
+    }
+    // #2109: a provider capacity failure is recorded as the bounded
+    // `provider_error:<provider>:<detail>` stop reason, never as a label (the
+    // diagnostic text itself lands in Assistant messages, not System events,
+    // so the text fallback below cannot see it). Auth, quota and invalid-model
+    // stop reasons never match and stay fatal.
+    if stop_reason.is_some_and(is_provider_capacity_stop_reason) {
+        return TransientVerdict::Transient {
+            reason: PROVIDER_CAPACITY_HEAL_REASON,
+        };
     }
 
     let mut signal = None;
@@ -203,6 +223,20 @@ mod tests {
         assert!(matches!(verdict, TransientVerdict::Transient { .. }));
     }
 
+    /// #2762: a run that stopped at its spend cap is never healed, even with a
+    /// transient label next to it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn a_spend_cap_stop_is_never_transient() {
+        let verdict = classify_transient_failure_with_stop(
+            Some("aborted_streaming"),
+            Some(crate::store_support::provider_defaults::CLAUDE_BUDGET_EXCEEDED_STOP_REASON),
+            None,
+            &[],
+        );
+        assert!(!verdict.is_transient(), "{verdict:?}");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn error_during_execution_error_class_is_transient() {
@@ -223,6 +257,42 @@ mod tests {
         let verdict =
             classify_transient_failure(None, Some("manager_v2_concurrency_capacity"), &[]);
         assert!(matches!(verdict, TransientVerdict::Transient { .. }));
+    }
+
+    /// #2109: the real stop reasons of workers 2e6901d6 (mid-work, event 338)
+    /// and 5ad7e7af (launch), plus the other capacity phrasings, heal by
+    /// resuming; every fatal provider error keeps failing fast.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn provider_capacity_stop_reason_is_transient() {
+        for stop in [
+            "provider_error:codex:Selected model is at capacity. Please try a different model.",
+            "provider_error:codex:Reconnecting... 5/5 (503)",
+            "provider_error:codex:Service Unavailable",
+            "provider_error:codex:model overloaded",
+        ] {
+            assert_eq!(
+                classify_transient_failure_with_stop(None, Some(stop), None, &[]),
+                TransientVerdict::Transient {
+                    reason: PROVIDER_CAPACITY_HEAL_REASON
+                },
+                "{stop}"
+            );
+        }
+        for stop in [
+            "provider_error:codex_usage_limit",
+            "provider_error:provider_auth_invalid",
+            "provider_error:codex:invalid model",
+            "provider_error:codex:unexpected status 401 Unauthorized: Incorrect API key",
+            "provider_error:codex:exceeded your quota",
+            "provider_error:unclassified",
+            "daemon_restart_resume:at capacity",
+        ] {
+            assert!(
+                !classify_transient_failure_with_stop(None, Some(stop), None, &[]).is_transient(),
+                "{stop}"
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

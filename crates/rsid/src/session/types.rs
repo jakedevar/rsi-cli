@@ -78,6 +78,97 @@ pub struct CompletedSession {
     /// already authoritative (freshly finalized, explicitly loaded, or a
     /// container kind that never has events) and needs no further loading.
     pub(crate) events_hydrated: bool,
+    /// Which Store writes this entry's mirrored fields and `updated_at` hold,
+    /// by Store commit order (#263, #265). See
+    /// `cohort_settlement::apply_store_write`.
+    pub(crate) store_writes: CompletedStoreWrites,
+}
+
+/// The session field a mirrored Store metadata write sets on a runtime entry
+/// (#263): the key under which [`StoreFieldOrder`] orders writes of one field.
+/// The Store records the same key with each stamped write (#265).
+pub(crate) use crate::store::SessionWriteField as CompletedStoreField;
+
+/// Copy `field`'s value from `from` (a Store row) into `to`.
+pub(crate) fn copy_store_field(field: CompletedStoreField, from: &Session, to: &mut Session) {
+    match field {
+        CompletedStoreField::Title => to.title.clone_from(&from.title),
+        CompletedStoreField::Description => to.description.clone_from(&from.description),
+        CompletedStoreField::Rating => to.rating = from.rating,
+        CompletedStoreField::Project => to.project_id = from.project_id,
+        CompletedStoreField::Workflow => to.workflow_id = from.workflow_id,
+        CompletedStoreField::ActiveTask => to.active_task.clone_from(&from.active_task),
+        CompletedStoreField::Label => to.group_id = from.group_id,
+        CompletedStoreField::Parent => to.parent_id = from.parent_id,
+        CompletedStoreField::Pin => to.pinned_at = from.pinned_at,
+    }
+}
+
+/// The `write_seq` of the newest Store write applied to each mirrored field of
+/// a runtime entry, 0 for none (#265, hub #2818). Store commit order, not the
+/// wall-clock stamps: a clock that steps back or ties cannot reorder it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StoreFieldOrder([u64; CompletedStoreField::COUNT]);
+
+impl StoreFieldOrder {
+    /// True when a write of `field` is newer than every Store write already
+    /// applied to it, recording it as applied. A write with no stamp carries
+    /// no order and applies only to a field no stamped write has set.
+    pub(crate) fn admit(
+        &mut self,
+        field: CompletedStoreField,
+        stamp: Option<&crate::store::SessionWriteStamp>,
+    ) -> bool {
+        let Some(stamp) = stamp else {
+            return self.applied(field) == 0;
+        };
+        self.admit_seq(field, stamp.write_seq)
+    }
+
+    /// True when the Store write `write_seq` of `field` is newer than every one
+    /// already applied to it, recording it as applied.
+    pub(crate) fn admit_seq(&mut self, field: CompletedStoreField, write_seq: u64) -> bool {
+        let applied = &mut self.0[field as usize];
+        if write_seq <= *applied {
+            return false;
+        }
+        *applied = write_seq;
+        true
+    }
+
+    /// The `write_seq` of the write last applied to `field`, 0 for none.
+    pub(crate) fn applied(&self, field: CompletedStoreField) -> u64 {
+        self.0[field as usize]
+    }
+}
+
+/// The Store write order a completed entry holds (#265).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CompletedStoreWrites {
+    pub(crate) fields: StoreFieldOrder,
+    /// The Store write whose stamp `session.updated_at` holds, when a mirror
+    /// set it; `None` while the entry holds the finalizer's (or the restored
+    /// row's) own stamp.
+    pub(crate) updated_at: Option<AppliedStoreWrite>,
+}
+
+impl CompletedStoreWrites {
+    /// A fresh completed entry made from a live one: its field order carries
+    /// over, its `updated_at` is the finalizer's own.
+    pub(crate) fn from_fields(fields: StoreFieldOrder) -> Self {
+        Self {
+            fields,
+            updated_at: None,
+        }
+    }
+}
+
+/// The Store write a completed entry's `updated_at` was advanced to (#265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppliedStoreWrite {
+    pub(crate) write_seq: u64,
+    pub(crate) run_seq: u64,
+    pub(crate) stamped_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Internal retry-only admission data.  A retry child is not an ordinary
@@ -159,34 +250,33 @@ impl RetryAdmission {
     }
 }
 
-/// Redacted prospective A6 witness shared between the launch core and the
-/// transfer coordinator. The token value is never formatted, serialized, or
-/// persisted.
+/// Non-secret prospective A6 incarnation shared between the launch core and
+/// transfer coordinator. Only the registry issues the contained witness.
 #[derive(Clone, Default)]
-pub(super) struct ProspectiveAgentTokenWitness {
-    token: Arc<tokio::sync::Mutex<Option<String>>>,
+pub(super) struct ProspectiveAgentTransportWitness {
+    binding: Arc<tokio::sync::Mutex<Option<super::AgentTransportWitness>>>,
 }
 
-impl std::fmt::Debug for ProspectiveAgentTokenWitness {
+impl std::fmt::Debug for ProspectiveAgentTransportWitness {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ProspectiveAgentTokenWitness")
+            .debug_struct("ProspectiveAgentTransportWitness")
             .field("present", &"<redacted>")
             .finish()
     }
 }
 
-impl ProspectiveAgentTokenWitness {
-    pub(super) async fn install(&self, token: String) {
-        *self.token.lock().await = Some(token);
+impl ProspectiveAgentTransportWitness {
+    pub(super) async fn install(&self, binding: super::AgentTransportWitness) {
+        *self.binding.lock().await = Some(binding);
     }
 
-    pub(super) async fn current_token(&self) -> Option<String> {
-        self.token.lock().await.clone()
+    pub(super) async fn current_binding(&self) -> Option<super::AgentTransportWitness> {
+        *self.binding.lock().await
     }
 
     pub(super) async fn clear(&self) {
-        self.token.lock().await.take();
+        self.binding.lock().await.take();
     }
 }
 
@@ -195,17 +285,17 @@ pub(super) struct ControllerTransferLaunchContext {
     pub(super) project_id: Uuid,
     pub(super) idea_id: Uuid,
     pub(super) reservation: IdeaControllerReservationV1,
-    pub(super) prospective_a6: ProspectiveAgentTokenWitness,
+    pub(super) prospective_a6: ProspectiveAgentTransportWitness,
     pub(super) confirmation_tx:
         Option<tokio::sync::oneshot::Sender<IdeaControllerLaunchConfirmationV1>>,
 }
 
 /// Server-owned context for one stable master-successor candidate launch.
 /// The reservation is the frozen authority and launch witness; the prospective
-/// token is never persisted and is held only until the final fenced commit.
+/// opaque launch binding is held only until the final fenced commit.
 pub(super) struct AgentSuccessorLaunchContext {
     pub(super) reservation: AgentSuccessorReservation,
-    pub(super) prospective_a6: ProspectiveAgentTokenWitness,
+    pub(super) prospective_a6: ProspectiveAgentTransportWitness,
     pub(super) confirmation_tx:
         Option<tokio::sync::oneshot::Sender<AgentSuccessorLaunchConfirmation>>,
 }
@@ -216,6 +306,7 @@ pub(super) struct AgentSuccessorLaunchConfirmation {
     pub(super) provider: SessionProvider,
     pub(super) admission_invocation_id: Uuid,
     pub(super) confirmation_kind: rsi_common::types::ControllerConfirmationKindV1,
+    pub(super) transport_binding: super::AgentTransportWitness,
 }
 
 /// Server-owned durable identity for one agent child launch.
@@ -288,12 +379,20 @@ pub(super) struct TopologyNodeLaunchContext {
     pub(super) fork: crate::topology::custody::TopologyForkSource,
 }
 
+/// Authority to publish after the reserved seat is durable and before provider context.
+#[derive(Debug)]
+pub(super) struct PortfolioAppointmentLaunchContext {
+    pub(super) caller: Uuid,
+    pub(super) request: rsi_common::portfolio_delegation::AgentManagerAppointChildRequestV1,
+    pub(super) appointment: crate::store::portfolio_nodes::delegation::ChildAppointment,
+}
+
 #[derive(Debug)]
 pub(super) enum LaunchPurpose {
     Interactive,
     /// #872: an interactive launch under the daemon-reserved session id the
     /// global manager's appointment journal recorded before the launch.
-    GlobalAppointment(Uuid),
+    GlobalAppointment(Uuid, Option<Box<PortfolioAppointmentLaunchContext>>),
     ManagerSuccessor(Box<super::manager_succession::ManagerSuccessionLaunchContext>),
     ManagerAction(Box<ManagerActionLaunchContext>),
     TopologyNode(TopologyNodeLaunchContext),
@@ -307,7 +406,7 @@ impl LaunchPurpose {
     pub(super) fn session_id(&self) -> Uuid {
         match self {
             Self::Interactive => Uuid::new_v4(),
-            Self::GlobalAppointment(session_id) => *session_id,
+            Self::GlobalAppointment(session_id, _) => *session_id,
             Self::ManagerSuccessor(context) => context.candidate_id(),
             Self::ManagerAction(context) => context
                 .claim
@@ -329,6 +428,12 @@ impl LaunchPurpose {
 
     pub(super) const fn is_agent_successor(&self) -> bool {
         matches!(self, Self::AgentSuccessor(_))
+    }
+
+    /// #2791: a topology node worker is bound to its execution, not to the
+    /// Epic it runs under.
+    pub(super) const fn is_topology_node(&self) -> bool {
+        matches!(self, Self::TopologyNode(_))
     }
 
     pub(super) fn manager_successor(
@@ -372,18 +477,18 @@ impl LaunchPurpose {
         matches!(
             self,
             Self::Interactive
-                | Self::GlobalAppointment(_)
+                | Self::GlobalAppointment(..)
                 | Self::ClosureSource(_)
                 | Self::ManagerAction(_)
                 | Self::TopologyNode(_)
         )
     }
 
-    pub(super) const fn prospective_a6(&self) -> Option<&ProspectiveAgentTokenWitness> {
+    pub(super) const fn prospective_a6(&self) -> Option<&ProspectiveAgentTransportWitness> {
         match self {
             Self::ManagerSuccessor(context) => Some(&context.prospective_a6),
             Self::Interactive
-            | Self::GlobalAppointment(_)
+            | Self::GlobalAppointment(..)
             | Self::ManagerAction(_)
             | Self::TopologyNode(_) => None,
             Self::ControllerCandidate(context) => Some(&context.prospective_a6),
@@ -405,6 +510,7 @@ impl CompletedSession {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: CompletedStoreWrites::default(),
         }
     }
 }
@@ -436,7 +542,10 @@ pub struct TrackedSession {
     pub(super) interrupt_requested: bool,
     /// First recorded interrupt source for the active turn (#588); the
     /// finalizer persists it as the `Interrupted` terminal cause.
-    pub(super) interrupt_source: Option<crate::terminal_cause::InterruptSource>,
+    pub(crate) interrupt_source: Option<crate::terminal_cause::InterruptSource>,
+    /// Provider exit status and stopping writer, collected by the monitor so
+    /// an interrupt with no `interrupt_source` still names its writer (#2514).
+    pub(super) interrupt_evidence: crate::terminal_cause::InterruptEvidence,
     pub(super) pending_archive: bool,
     /// Context rotation state machine. Owns all rotation lifecycle state.
     /// `pub(crate)` for reconciliation to check rotation state before intervention.
@@ -505,8 +614,6 @@ pub struct TrackedSession {
     /// Process exit code captured after the provider subprocess exits.
     /// `None` until the process is checked, `Some(code)` after `try_exit_status()`.
     pub(super) exit_code: Option<i32>,
-    /// Current retry attempt (0-based). 0 on first run.
-    pub(super) retry_attempt: u8,
     /// Maximum retry attempts configured for this session.
     pub(super) max_retries: u8,
     /// Timestamp of the last StreamEvent received by the monitor loop.
@@ -516,6 +623,11 @@ pub struct TrackedSession {
     /// Changes the break reason classification so stall-interrupted sessions
     /// are eligible for retry (unlike user-initiated interrupts).
     pub(crate) stall_interrupted: bool,
+    /// Tools the current turn has opened and not yet closed, fed by the monitor
+    /// from the provider stream. The operator DRAIN wait reads it to tell a turn
+    /// blocked only on a call the daemon is serving from one running a real tool
+    /// (#2353, `daemon_wait`).
+    pub(crate) turn_tools: super::daemon_wait::TurnToolLedger,
     /// Monotonic clock of the last API-reported usage update (i.e., the last
     /// assistant chunk that carried a `usage` block with non-Missing
     /// confidence). Driven by Tokio's monotonic `Instant` — never subject to
@@ -547,6 +659,8 @@ pub struct TrackedSession {
     /// Most recent verdict (for the `gV` TUI keybinding). Daemon-internal;
     /// surfaced to the TUI via `GetClassificationStatus` RPC in Phase 5.
     pub(crate) last_verdict: Option<crate::stall_classifier::types::Verdict>,
+    /// Which Store writes the mirrored fields hold, by commit order (#265).
+    pub(crate) store_fields: StoreFieldOrder,
 }
 
 impl TrackedSession {
@@ -586,7 +700,6 @@ impl TrackedSession {
         let session_id = session.id;
         let work_time_base_ms = session.work_time_ms.unwrap_or(0);
         let approval_wait_total_ms = session.approval_wait_ms.unwrap_or(0);
-        let retry_attempt = session.retry_attempt.unwrap_or(0);
         let max_retries = session.max_retries.unwrap_or(0);
         let pending_archive = session.pending_archive;
         let pending_question = session.pending_question.clone();
@@ -607,6 +720,7 @@ impl TrackedSession {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
+            interrupt_evidence: Default::default(),
             pending_archive,
             rotation: super::rotation_coordinator::RotationCoordinator::new(session_id, 0, false),
             live_input_tokens,
@@ -626,15 +740,18 @@ impl TrackedSession {
             work_time_base_ms,
             received_meaningful_output: false,
             exit_code: None,
-            retry_attempt,
             max_retries,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
+            // Rebuilt from the store or adopted from a spool: this ledger did not
+            // see the turn begin, so it never vouches for it.
+            turn_tools: super::daemon_wait::TurnToolLedger::untracked(),
             last_usage_update: None,
             last_mismatch_warn: None,
             last_classified_at: None,
             classification_count: 0,
             last_verdict: None,
+            store_fields: Default::default(),
         }
     }
 
@@ -762,6 +879,22 @@ impl ScriptedProcess {
     }
 }
 
+impl TrackedSession {
+    /// Capture the exited provider child's code or terminating signal for the
+    /// terminal decision and the `Interrupted` cause (#2514).
+    pub(super) fn record_provider_exit(&mut self) {
+        let Some(process) = self.process.as_mut() else {
+            return;
+        };
+        let exit = process.try_exit_evidence();
+        self.exit_code = exit.map(|exit| match exit {
+            crate::terminal_cause::ProviderExit::Code(code) => code,
+            crate::terminal_cause::ProviderExit::Signal(_) => -1,
+        });
+        self.interrupt_evidence.exit = exit;
+    }
+}
+
 pub enum ProviderProcess {
     Claude(ClaudeProcess),
     Codex(CodexProcess),
@@ -844,6 +977,16 @@ impl ProviderProcess {
     /// Returns `Some(exit_code)` if the process has exited, `None` if still running
     /// or if the provider doesn't use a subprocess (e.g., OpenAI API task).
     pub(super) fn try_exit_status(&mut self) -> Option<i32> {
+        self.try_exit_evidence().map(|exit| match exit {
+            crate::terminal_cause::ProviderExit::Code(code) => code,
+            crate::terminal_cause::ProviderExit::Signal(_) => -1,
+        })
+    }
+
+    /// Like [`Self::try_exit_status`], but keeps the terminating signal
+    /// instead of collapsing it to `-1`.
+    pub(super) fn try_exit_evidence(&mut self) -> Option<crate::terminal_cause::ProviderExit> {
+        use crate::terminal_cause::ProviderExit;
         let status = match self {
             Self::Claude(p) => p.try_wait().ok()?,
             Self::Codex(p) => p.try_wait().ok()?,
@@ -852,10 +995,31 @@ impl ProviderProcess {
             // Task-based providers use tokio tasks, not subprocesses
             Self::Local(_) | Self::Harness(_) => return None,
             #[cfg(test)]
-            Self::Scripted(p) => return p.try_exit_status(),
+            // A scripted code below -1 stands for the signal `-code`.
+            Self::Scripted(p) => {
+                return p.try_exit_status().map(|code| match code {
+                    code if code < -1 => ProviderExit::Signal(-code),
+                    code => ProviderExit::Code(code),
+                });
+            }
         };
-        status.map(|s| s.code().unwrap_or(-1))
+        status.map(|s| match s.code() {
+            Some(code) => ProviderExit::Code(code),
+            None => ProviderExit::Signal(exit_signal(&s).unwrap_or(0)),
+        })
     }
+}
+
+/// The signal that terminated a child, where the platform reports one.
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 pub(super) fn install_context_budget(
@@ -1011,6 +1175,10 @@ pub(super) struct TerminalEvidence {
     pub(super) stall_interrupted: bool,
     pub(super) interrupt_requested: bool,
     pub(super) pending_question: bool,
+    /// The only recorded stop source is the reconciler seeing the provider
+    /// child gone (`InterruptSource::ProviderExit`): no halt, deploy drain,
+    /// manager action or other writer asked for the stop (hub #3029).
+    pub(super) provider_exit_stop: bool,
     pub(super) rotation_action: TerminalRotationAction,
 }
 
@@ -1163,6 +1331,11 @@ pub enum StoreCommand {
         session_id: Uuid,
         status: rsi_common::types::SessionStatus,
     },
+    /// The monitor's start-of-turn `Running` write; a row that has already
+    /// ended keeps its status (#277).
+    MarkSessionRunning {
+        session_id: Uuid,
+    },
     /// Terminal status and its normalized cause in one statement (#588).
     UpdateTerminalSessionStatus {
         session_id: Uuid,
@@ -1214,32 +1387,40 @@ pub enum StoreCommand {
         barrier_scope: Option<MetadataBarrierScope>,
         respond_to: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },
+    // #257: each session-metadata write answers with the `updated_at` stamp it
+    // wrote (`None` when it failed or changed no row) so the caller can mirror
+    // it into the runtime completed entry.
     UpdateSessionProject {
         session_id: Uuid,
         project_id: Option<Uuid>,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     UpdateSessionTitle {
         session_id: Uuid,
         title: String,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     /// Generated-title enrichment: fill the title only while it is absent so
     /// asynchronous generation cannot overwrite an explicit title.
     FillSessionTitleIfAbsent {
         session_id: Uuid,
         title: String,
-        respond_to: tokio::sync::oneshot::Sender<Result<bool>>,
+        respond_to: tokio::sync::oneshot::Sender<Result<Option<crate::store::SessionWriteStamp>>>,
     },
     UpdateSessionDescription {
         session_id: Uuid,
         description: String,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     UpdateSessionRating {
         session_id: Uuid,
         rating: Option<i16>,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     UpdateSessionActiveTask {
         session_id: Uuid,
         active_task: Option<String>,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     DeleteSession {
         session_id: Uuid,
@@ -1291,6 +1472,7 @@ pub enum StoreCommand {
     UpdateSessionWorkflow {
         session_id: Uuid,
         workflow_id: Option<Uuid>,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     InsertRotationEvent {
         session_id: Uuid,
@@ -1320,6 +1502,7 @@ pub enum StoreCommand {
     UpdateSessionLabel {
         session_id: Uuid,
         group_id: Option<Uuid>,
+        respond_to: tokio::sync::oneshot::Sender<Option<crate::store::SessionWriteStamp>>,
     },
     UpdatePendingArchive {
         session_id: Uuid,

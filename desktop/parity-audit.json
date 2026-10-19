@@ -1,0 +1,614 @@
+{
+  "version": 1,
+  "about": "Hub #3104 audit of every PARITY `substitute` row, checked by scripts/parity.mjs --check: each row names a group saying what replaces the TUI behaviour, the rsid operation (or why none), the confirmation, the refusal and the interaction evidence. References are verified mechanically (TUI files exist, rsid methods are quoted in both the TUI and src-tauri sources, evidence anchors are in their files). A row whose behaviour is a read-only replacement for editing or an unsupported feature is not a substitute: it is `partial` with an owner in parity-status.d.",
+  "groups": {
+    "diagnostics": {
+      "class": "source-backed",
+      "what": "The overlay shows the desktop's own measurements (daemon round trip, frame interval, sessions listed, connection) in place of the TUI's RSI_PROFILE render, poll and cache metrics, which are TUI process internals.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/diagnostics.rs"
+      ],
+      "rsid": [
+        "GetHealthStatus"
+      ],
+      "confirmation": "none: the overlay is read-only (q/Esc close, r measures again).",
+      "refusal": "none: nothing to refuse; an unreachable daemon shows connected=false and an unknown value renders as an em dash.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/admin.test.mjs",
+          "anchor": "diagnostics lines use an em dash for an unknown value"
+        },
+        {
+          "file": "tests/admin.test.mjs",
+          "anchor": ":diagnostics (:diag) run their overlays through the TUI keymap"
+        }
+      ]
+    },
+    "assist-ai": {
+      "class": "source-backed",
+      "what": "The same GenerateText call with the TUI's AI_COMMAND / AI_CHAT system prompts and message layout. The model is rsid's configured prompt-processor model, because the TUI's own prompt_processor choice is TUI state that no RPC serves (the Settings row for it, prompt_compiler, is a documented TUI-only preference, see tuiOnlyRows).",
+      "tui": [
+        "crates/rsi/src/prompt_processor.rs",
+        "crates/rsi/src/ui/overlay/ai_command.rs",
+        "crates/rsi/src/ui/overlay/ai_chat.rs"
+      ],
+      "rsid": [
+        "GenerateText"
+      ],
+      "confirmation": "AI command: the result is a preview; a accepts, d or Esc discards, so no field changes without the operator. AI chat: Esc clears then closes; nothing is applied.",
+      "refusal": "An rsid error is kept as an 'Error: ...' turn (chat) or a toast (command); the request carries no model, provider or credential, and empty input is not sent.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/assist.test.mjs",
+          "anchor": "['ai_command', 'GenerateText']"
+        },
+        {
+          "file": "src-tauri/src/assist.rs",
+          "anchor": "ai_command_sends_the_tuis_prompt_and_no_model_or_credential"
+        }
+      ]
+    },
+    "window-layout": {
+      "class": "ui-adaptation",
+      "what": "The TUI's modalkit windows and tabs have no desktop meaning: the window is one fixed split (list beside the open session). :split/:vsplit move the keys between panes, :only closes the open overlay pane, a tab is the project filter (:tabnew opens the project picker; :tabclose, > / <, :tabnext, :tabprev step it), <Space>T opens the session in place.",
+      "tui": [
+        "crates/rsi/src/commands.rs",
+        "crates/rsi/src/modalkit_types.rs"
+      ],
+      "rsid": [],
+      "rsidNone": "Client layout and view state (modalkit windows and tabs); the TUI calls no daemon operation for it either.",
+      "confirmation": "none: view changes only; nothing is written or destroyed.",
+      "refusal": "none: each command is accepted and its notice says what it did (WINDOW_SUBSTITUTES); there is no mutation to refuse.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/commandmode.test.mjs",
+          "anchor": "WINDOW_SUBSTITUTES"
+        },
+        {
+          "file": "tests/nav.test.mjs",
+          "anchor": "keyHints('next-tab')"
+        }
+      ]
+    },
+    "project-picker": {
+      "class": "source-backed",
+      "what": "The picker filters the session list to one project instead of opening a per-project workspace pane (the desktop has none). New, Edit and Delete are the TUI's Ctrl-N / Ctrl-E / Ctrl-D, also as buttons.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/project_picker.rs",
+        "crates/rsi/src/client.rs"
+      ],
+      "rsid": [
+        "ListProjects",
+        "CreateProject",
+        "UpdateProject",
+        "DeleteProject"
+      ],
+      "confirmation": "Delete asks confirmDialog before DeleteProject (actions/sessionlist-run.ts); the TUI's Ctrl-D (docs/keybindings.md, Project Picker) has no such step, so the desktop is stricter.",
+      "refusal": "An rsid refusal (for example a duplicate name) is a toast, failed('Delete project failed', e), and the picker and list stay as they were.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/sessionlist-actions.test.mjs",
+          "anchor": "search actions and the project and sort pickers"
+        },
+        {
+          "file": "src/actions/sessionlist-run.ts",
+          "anchor": "Delete project"
+        }
+      ]
+    },
+    "launch-dialog": {
+      "class": "source-backed",
+      "what": "One New session dialog (and one continue dialog) with the TUI's editor, model, effort, sandbox and manager controls; no stacked prompts, tabs or splits (Ctrl-T / Ctrl-S launch into the list, Ctrl-J / Ctrl-K and Space N say there are none). The grant page is the full manager policy editor opened with p, on the granted policy right after the appointment.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/prompt.rs",
+        "crates/rsi/src/client.rs"
+      ],
+      "rsid": [
+        "LaunchSession",
+        "GetDaemonConfig",
+        "GetHarnessManager",
+        "GetHarnessManagerPolicy",
+        "ConfigureHarnessManagerWithPolicy"
+      ],
+      "confirmation": "The TUI launches without a confirmation and so does the dialog (Ctrl-Enter). The manager appointment runs only after the launch is accepted, fenced by GetHarnessManager / GetHarnessManagerPolicy; the policy editor saves with its own explicit step.",
+      "refusal": "Launch is refused with the TUI notice 'Daemon configuration is still loading; draft preserved' until GetDaemonConfig answers, and the draft stays; an appointment refusal is a notice and the session stays launched.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/input-model.test.mjs",
+          "anchor": "Daemon configuration is still loading; draft preserved"
+        },
+        {
+          "file": "tests/overlays.test.mjs",
+          "anchor": "prompt chords: the launch prompt, the continue prompt and the input modal"
+        },
+        {
+          "file": "tests/manager-cmds.test.mjs",
+          "anchor": "ConfigureHarnessManagerWithPolicy"
+        }
+      ]
+    },
+    "launch-line": {
+      "class": "ui-adaptation",
+      "what": "The TUI opens no quick-launch or continue line in production (only its tests set InputMode::Input). The launch dialog (Ctrl-N) and continue dialog (:continue) replace it: their native text boxes take typing and Backspace, Esc closes (the continue draft is kept), Ctrl+Enter launches or sends. The desktop has no splits or tabs, so Ctrl-S and Ctrl-T are one Launch.",
+      "tui": [
+        "crates/rsi/src/keybindings.rs"
+      ],
+      "rsid": [
+        "LaunchSession",
+        "GetDaemonConfig"
+      ],
+      "confirmation": "none: the TUI launches immediately and so does Ctrl+Enter.",
+      "refusal": "Launch is refused with the TUI notice 'Daemon configuration is still loading; draft preserved' while get_daemon_config is pending; the dialog and draft stay open.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/input-model.test.mjs",
+          "anchor": "Daemon configuration is still loading; draft preserved"
+        },
+        {
+          "file": "tests/overlays.test.mjs",
+          "anchor": "prompt chords: the launch prompt, the continue prompt and the input modal"
+        }
+      ]
+    },
+    "app-chrome": {
+      "class": "ui-adaptation",
+      "what": "Ctrl-C (Cmd-C) copies, as in any desktop app; quit is Cmd-Q / File > Quit, ZZ, ZQ or :quit. :commands opens the command palette, which lists desktop actions and runs TUI commands from a : query. :sessions shows the Active sessions view.",
+      "tui": [
+        "crates/rsi/src/keybindings.rs",
+        "crates/rsi/src/commands.rs"
+      ],
+      "rsid": [
+        "ListSessions"
+      ],
+      "confirmation": "none: copy and view changes write nothing; :quit closes the window only (sessions keep running in rsid).",
+      "refusal": "none: no mutation; a command the palette cannot run answers with its disabled reason.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/registry.test.mjs",
+          "anchor": "a palette query starting with : is a TUI command line"
+        },
+        {
+          "file": "tests/registry.test.mjs",
+          "anchor": "every registered action appears in the palette with its binding and disabled state"
+        }
+      ]
+    },
+    "detail-input-box": {
+      "class": "ui-adaptation",
+      "what": "The message box is a native text field: focused, it owns every key; Esc hands the keyboard back to the app keys and keeps the draft; Up/Down scroll the transcript from a one-line draft; i / a / o / O enter it with the TUI caret placement. The Space and g leaders reach the app whenever the box is not focused, so the TUI's pass-through exceptions are not needed.",
+      "tui": [
+        "crates/rsi/src/ui/session.rs",
+        "crates/rsi/src/keybindings.rs"
+      ],
+      "rsid": [],
+      "rsidNone": "Key routing between the message box and the app keys; the send itself is covered by the done input rows.",
+      "confirmation": "none: key routing only; sending is the done input-send rows.",
+      "refusal": "none: key routing only; nothing is refused or written.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/detail.test.mjs",
+          "anchor": "the message box owns its keys; Esc hands the keyboard back; Up / Down scroll only a one-line draft"
+        }
+      ]
+    },
+    "file-read-ui": {
+      "class": "ui-adaptation",
+      "what": "Read-only presentation: the explorer's / opens the picker popup instead of an inline finder (same keys); tree-sitter and syntect are native parsers, so the desktop lexes the same languages with a small line lexer and derives folds from brackets, comments, indentation and Markdown sections. These rows are display only; editing and the explorer's file operations are #113 and #134 (done: the editor draws the same colours, search, folds, bracket match and git signs as the viewer; see PARITY.md).",
+      "tui": [
+        "crates/rsi/src/ui/overlay/file_explorer.rs",
+        "crates/rsi/src/ui/treesitter.rs",
+        "crates/rsi/src/ui/highlight.rs"
+      ],
+      "rsid": [
+        "ListProjectFiles"
+      ],
+      "tuiEquivalent": {
+        "ListProjectFiles": "The TUI reads the project directory from its own file system (ui/overlay/file_explorer.rs); the desktop must not, so rsid's root-scoped read-only ListProjectFiles / ListProjectDirectory serve the same listing."
+      },
+      "confirmation": "none: read-only listing and display.",
+      "refusal": "A listing error, a capped listing and an empty folder show as notes, not entries; the root-scoped rsid methods refuse paths outside the project.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/files.test.mjs",
+          "anchor": "a listing error, a capped listing and an empty folder show as notes, not entries"
+        },
+        {
+          "file": "tests/viewer.test.mjs",
+          "anchor": "the highlighter tags keywords, strings, numbers, comments, types and functions"
+        },
+        {
+          "file": "tests/viewer.test.mjs",
+          "anchor": "fold regions: bracket pairs and block comments spanning lines, never inside strings"
+        }
+      ]
+    },
+    "hooks-form": {
+      "class": "source-backed",
+      "what": "A desktop form (event, matcher, command, timeout) with Enter/Esc in place of the TUI's five-key edit overlay; changing the event or matcher moves the hook, like the TUI's HookEdit.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/hook_form.rs",
+        "crates/rsi/src/claude_config.rs"
+      ],
+      "rsid": [
+        "ListClaudeHooks",
+        "PutClaudeHooks",
+        "DeleteClaudeHooks"
+      ],
+      "tuiEquivalent": {
+        "DeleteClaudeHooks": "The TUI removes one hook at a time with PutClaudeHooks and HookEdit::Delete; DeleteClaudeHooks (the whole hooks block) is a desktop addition behind its own 'Remove all' confirmation."
+      },
+      "confirmation": "Delete a hook and Remove all hooks each ask confirmDialog; saving over a file that changed since it was read asks 'Overwrite it with your change?' (the TUI opens its conflict overlay on a stale revision). The TUI deletes a hook without a prompt, so the desktop is stricter.",
+      "refusal": "PutClaudeHooks carries the revision read; a stale revision is refused by rsid and surfaces the overwrite question; other rsid errors are toasts and the form keeps its values.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/operatorconfig.test.mjs",
+          "anchor": "adding a hook joins the entry with the same matcher and leaves the input alone"
+        },
+        {
+          "file": "src/actions/operatorconfig.ts",
+          "anchor": "changed since it was read. Overwrite it with your change?"
+        }
+      ]
+    },
+    "provider-forms": {
+      "class": "source-backed",
+      "what": "Custom provider form (name, base URL, default model) and role routes over the same daemon store the TUI uses. The API key is a password field: blank keeps the stored key, typing sets it, a checkbox removes it; only the key state and fingerprint are shown and the key goes to the daemon vault, never read back.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/provider_form.rs",
+        "crates/rsi/src/ui/overlay/provider_credential_form.rs",
+        "crates/rsi/src/settings_keys.rs"
+      ],
+      "rsid": [
+        "ListCustomProviders",
+        "PutCustomProvider",
+        "DeleteCustomProvider",
+        "SetCustomProviderRoute",
+        "ListCustomProviderRoutes"
+      ],
+      "tuiEquivalent": {
+        "ListCustomProviderRoutes": "The TUI keeps each role's chosen provider id in its own settings (custom_provider_id fields) and re-sends SetCustomProviderRoute after it connects, so it shows the route from that state; the desktop keeps no such state, so its route picker reads the daemon's stored route with ListCustomProviderRoutes."
+      },
+      "confirmation": "Deleting a provider asks confirmDialog (roles routed to it are detached and its key removed); the TUI deletes on d without a prompt. Removing a key is the form's checkbox plus Save, an explicit step; the Provider Keys slot overlay (admin) keeps the TUI's arm-then-confirm clear.",
+      "refusal": "rsid refusals (invalid URL, duplicate name) are toasts and the form keeps its values; the key value is never put in a toast, log or the page after submit.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/operatorconfig.test.mjs",
+          "anchor": "bridges list both kinds, configured or not"
+        },
+        {
+          "file": "src/actions/operatorconfig.ts",
+          "anchor": "Delete the custom provider"
+        }
+      ]
+    },
+    "bridge-forms": {
+      "class": "source-backed",
+      "what": "Signal and iMessage bridge form (enabled, account, allow-from, working dir) with remove, from the View menu or palette.",
+      "tui": [
+        "crates/rsi/src/ui/overlay/message_bridge_form.rs",
+        "crates/rsi/src/client.rs"
+      ],
+      "rsid": [
+        "ListMessageBridges",
+        "PutMessageBridge",
+        "DeleteMessageBridge"
+      ],
+      "tuiEquivalent": {
+        "ListMessageBridges": "The TUI reads each bridge kind with GetMessageBridge; the desktop lists both kinds in one call.",
+        "DeleteMessageBridge": "The TUI writes a bridge config with PutMessageBridge and has no remove call; DeleteMessageBridge is a desktop addition behind its own confirmation."
+      },
+      "confirmation": "Remove asks confirmDialog ('Remove the ... bridge config?'); saving is the explicit step.",
+      "refusal": "rsid refusals are toasts and the form keeps its values; the form follows the daemon's rules for which fields each bridge takes.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/operatorconfig.test.mjs",
+          "anchor": "bridges list both kinds, configured or not"
+        },
+        {
+          "file": "src/actions/operatorconfig.ts",
+          "anchor": "Remove the ${bridgeLabel(kind)} bridge config?"
+        }
+      ]
+    },
+    "manager-text-entry": {
+      "class": "source-backed",
+      "what": "A modal text field (Enter submits, Esc cancels) replaces the inline entry the TUI draws in the manager view; Ctrl-U is the platform's own field editing.",
+      "tui": [
+        "crates/rsi/src/keybindings.rs"
+      ],
+      "rsid": [
+        "AnswerHarnessManagerDecision"
+      ],
+      "confirmation": "Answering a decision sends one exact pending record with its digest, version and both fences; revokes ask for confirmation first, showing the impact.",
+      "refusal": "Only a pending record with its identity and a current policy can be answered; a stale fence is refused by rsid and shown, and Esc sends nothing.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/managers.test.mjs",
+          "anchor": "only a pending record with its identity and a current policy can be answered"
+        },
+        {
+          "file": "tests/managers.test.mjs",
+          "anchor": "AnswerHarnessManagerDecision carries the exact digest, version and both fences"
+        }
+      ]
+    },
+    "fleet-filter": {
+      "class": "ui-adaptation",
+      "what": "A modal filter field (Enter applies, Esc cancels) replaces the inline filter over the fleet overview.",
+      "tui": [
+        "crates/rsi/src/keybindings.rs"
+      ],
+      "rsid": [
+        "GetFleetOverview"
+      ],
+      "confirmation": "none: filtering is a view change.",
+      "refusal": "none: a filter that matches nothing shows an empty list; rsid is read, not written.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "src/managers.ts",
+          "anchor": "filter: ''"
+        }
+      ]
+    },
+    "create-entity-topology": {
+      "class": "ui-adaptation",
+      "what": "The topology in the create-entity form is a native select, whose type-ahead jumps to the matching name, in place of the TUI's typed filter; j/k, G, Space, Enter, Esc, Ctrl-Enter and Ctrl-D keep their TUI meaning.",
+      "tui": [
+        "crates/rsi/src/keybindings.rs"
+      ],
+      "rsid": [
+        "ListTopologies"
+      ],
+      "confirmation": "none: Ctrl-Enter creates and Ctrl-D discards, as in the TUI.",
+      "refusal": "The create call is refused by rsid for an illegal parent/child kind (legal_children) and shown; the form keeps its values.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/overlays.test.mjs",
+          "anchor": "create-entity topology keys"
+        }
+      ]
+    },
+    "issue-inspector": {
+      "class": "ui-adaptation",
+      "what": "The inspector shows body, metadata, dependencies, events, handoffs and the associated-session selection. In place of the TUI's fold cursor, handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole.",
+      "tui": [
+        "crates/rsi/src/ui/issue_detail.rs"
+      ],
+      "rsid": [
+        "ListIssuesPage"
+      ],
+      "confirmation": "none: the inspector is read-only; lifecycle actions (cancel, archive) keep their own confirmations in the done Issues rows.",
+      "refusal": "none: read-only; a missing Issue shows the rsid error.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/issues-tracker.test.mjs",
+          "anchor": "associated sessions are the ones launched for the Issue, by UUID"
+        }
+      ]
+    },
+    "session-render": {
+      "class": "ui-adaptation",
+      "what": "Cell-by-cell terminal drawing has no desktop meaning; the desktop draws the same information in HTML and CSS: the session pane (header, transcript, message box), the status line (daemon indicator, NORMAL / INSERT badge, pending-chord hint, toasts), the glyph vocabulary explained in help's Symbols view, browser wrapping for row heights, the one-line navigator row, and status dots for the animated loaders.",
+      "tui": [
+        "crates/rsi/src/ui/session.rs",
+        "crates/rsi/src/ui/status.rs",
+        "crates/rsi/src/ui/glyphs.rs",
+        "crates/rsi/src/ui/height.rs",
+        "crates/rsi/src/ui/navigator_layout.rs",
+        "crates/rsi/src/ui/rainbow_loaders.rs"
+      ],
+      "rsid": [],
+      "rsidNone": "Terminal rendering code: layout, wrapping and animation are the browser/CSS; the data they show comes from rows covered elsewhere.",
+      "confirmation": "none: rendering only.",
+      "refusal": "none: rendering only; nothing is refused or written.",
+      "interaction": "model-test",
+      "gap": "Layout, wrapping and loaders are CSS and are not asserted by any test in this tree; the only visual evidence is the #109 smoke screenshots (separate branch). No DOM key-event run.",
+      "evidence": [
+        {
+          "file": "tests/overlay-help.test.mjs",
+          "anchor": "s opens the Symbols view and Tab cycles Contextual → All Commands → Symbols"
+        }
+      ]
+    },
+    "tool-pairing": {
+      "class": "ui-adaptation",
+      "what": "The same pairing rules (strictly by tool_use_id, parallel calls batch, pending and orphan rows kept) annotate each call and result instead of collapsing rows, because selection, folds and copy act on events.",
+      "tui": [
+        "crates/rsi/src/ui/tool_projection.rs"
+      ],
+      "rsid": [],
+      "rsidNone": "A pure projection of conversation events already fetched; no daemon operation.",
+      "confirmation": "none: display only.",
+      "refusal": "none: display only; orphan and pending rows are kept visible, not hidden.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/tool-projection.test.mjs",
+          "anchor": "a result pairs with the call carrying its id, however far apart"
+        }
+      ]
+    },
+    "theme-palettes": {
+      "class": "ui-adaptation",
+      "what": "The TUI palettes and role baselines (generated) drive the desktop CSS variables; terminal-default and transparent backgrounds use the palette colour since a window has no terminal behind it.",
+      "tui": [
+        "crates/rsi/src/ui/theme.rs"
+      ],
+      "rsid": [],
+      "rsidNone": "Theme choice and role overrides are desktop-local (localStorage), as the TUI keeps its own in state.json; no daemon operation.",
+      "confirmation": "none: choosing a theme is immediate and local; Reset theme resets only local overrides.",
+      "refusal": "none: a low-contrast role colour is flagged by the TUI's contrast check (theme_roles.rs assess_contrast, ported in theme-model.ts); nothing is sent to rsid.",
+      "interaction": "model-test",
+      "gap": "No DOM key-event run in this tree: model and unit tests only. The real-rsid interaction harness (#115, branch mac-mini/3000-desktop-e2e-on-b3f292d6b) is not in this base, so a DOM run exists only once it lands.",
+      "evidence": [
+        {
+          "file": "tests/theme.test.mjs",
+          "anchor": "a theme maps its palette onto the desktop CSS variables through the roles"
+        },
+        {
+          "file": "tests/theme.test.mjs",
+          "anchor": "contrast is the WCAG ratio and a low one is flagged"
+        }
+      ]
+    },
+    "graph-review-dashboard": {
+      "class": "source-backed",
+      "what": "The graph review's info dashboard (Tab, or l at the right edge of a bridged recursive graph) opens the recursive DAG browser on that graph instead of a split column inside the pane; the browser shows the same daemon readbacks. A run links the selected session to its workflow with UpdateSessionWorkflow, as the TUI does. The TUI renders no graph in the session pane (the comment in overlay/graph.rs about an embedded graph is stale: ui/session.rs draws the session inspector only), so there is no pane graph to replace.",
+      "tui": [
+        "crates/rsi/src/overlay/graph.rs",
+        "crates/rsi/src/ui/overlay/graph.rs",
+        "crates/rsi/src/client.rs"
+      ],
+      "rsid": [
+        "UpdateSessionWorkflow",
+        "ExecuteWorkflow"
+      ],
+      "confirmation": "none: the TUI runs on one r and links the session with no prompt. The desktop's key r, the Run (r) header button and the palette entry \"Graph: run workflow\" all call the same runDraft, so each also runs and links with no prompt.",
+      "refusal": "The run is refused before the daemon when the draft fails the rsi_graph preflight (the TUI's blocker toast) or a UUID is malformed (graphs.rs bind_session_workflow_params). The TUI drops a daemon refusal of UpdateSessionWorkflow (`let _ =`) and keeps its local link; the desktop keeps the local link too and shows the refusal as a toast, which is more than the TUI says.",
+      "interaction": "dom-e2e",
+      "gap": "The isolated run drives the run-and-link path (<Space>v, o, Enter, r) with CDP key events and reads the session's workflow_id and the execution back from rsid (scripts/smoke-e2e-sections.mjs, extra graph-run). Not driven there: the info dashboard (Tab / l, which needs a bridged recursive graph and the gv_info_dashboard capability), the refusal of UpdateSessionWorkflow (the TUI drops it; the desktop toasts it, model-tested), and a run that succeeds: the workflow's one node is pinned to the unconfigured local provider so the run ends failed at rsid's admission before any model call.",
+      "evidence": [
+        {
+          "file": "tests/graphs.test.mjs",
+          "anchor": "a successful run links the selected session only when its own workflow differs"
+        },
+        {
+          "file": "tests/graphs.test.mjs",
+          "anchor": "graphs.ts binds after ExecuteWorkflow succeeds"
+        },
+        {
+          "file": "tests/graphs.test.mjs",
+          "anchor": "every webview call names a Tauri command of graphs.rs with its typed args"
+        },
+        {
+          "file": "scripts/smoke-e2e-sections.mjs",
+          "anchor": "id: 'graph-run'"
+        }
+      ]
+    }
+  },
+  "rows": {
+    "cmd:diagnostics": "diagnostics",
+    "module:ui/overlay/diagnostics.rs": "diagnostics",
+    "overlay-ref:diagnostics": "diagnostics",
+    "overlay-ref:ai-command": "assist-ai",
+    "module:ui/overlay/ai_command.rs": "assist-ai",
+    "overlay-ref:ai-chat": "assist-ai",
+    "module:ui/overlay/ai_chat.rs": "assist-ai",
+    "cmd:split": "window-layout",
+    "cmd:vsplit": "window-layout",
+    "cmd:only": "window-layout",
+    "cmd:tabnew": "window-layout",
+    "cmd:tabclose": "window-layout",
+    "section:vim-commands-pass-through": "window-layout",
+    "key:>": "window-layout",
+    "key:<": "window-layout",
+    "cmd:tabnext": "window-layout",
+    "cmd:tabprev": "window-layout",
+    "section:workspace-management": "window-layout",
+    "key:<Space>T": "window-layout",
+    "cmd:project": "project-picker",
+    "cmd:projects": "project-picker",
+    "key:<Space>p": "project-picker",
+    "module:ui/overlay/project_picker.rs": "project-picker",
+    "overlay-ref:project-picker": "project-picker",
+    "overlay:project-picker-overlay-workspace-opener": "project-picker",
+    "section:project-workspace-navigation": "project-picker",
+    "overlay:prompt-overlay-new-session-continue-session": "launch-dialog",
+    "module:ui/overlay/prompt.rs": "launch-dialog",
+    "overlay-ref:new-session-prompt": "launch-dialog",
+    "overlay-ref:new-session-settings": "launch-dialog",
+    "global:backspace/quick-launch-continue-input-line": "launch-line",
+    "global:char/quick-launch-continue-input-line": "launch-line",
+    "global:enter/quick-launch-continue-input-line": "launch-line",
+    "global:enter/quick-launch-input-daemon-config-pending": "launch-line",
+    "global:esc/quick-launch-continue-input-line": "launch-line",
+    "global:ctrl-s/launch-prompt-daemon-config-pending": "launch-line",
+    "global:ctrl-t/launch-prompt-daemon-config-pending": "launch-line",
+    "global:ctrl-c/any-context": "app-chrome",
+    "cmd:commands": "app-chrome",
+    "cmd:sessions": "app-chrome",
+    "section:session-detail-input-bar-priority": "detail-input-box",
+    "overlay-ref:file-explorer-finder": "file-read-ui",
+    "module:ui/treesitter.rs": "file-read-ui",
+    "module:ui/highlight.rs": "file-read-ui",
+    "overlay-ref:hook-form": "hooks-form",
+    "module:ui/overlay/hook_form.rs": "hooks-form",
+    "overlay-ref:provider-form": "provider-forms",
+    "overlay-ref:provider-key-form": "provider-forms",
+    "module:ui/overlay/provider_form.rs": "provider-forms",
+    "module:ui/overlay/provider_credential_form.rs": "provider-forms",
+    "overlay-ref:message-bridge-form": "bridge-forms",
+    "module:ui/overlay/message_bridge_form.rs": "bridge-forms",
+    "overlay-ref:manager-text-entry": "manager-text-entry",
+    "overlay-ref:fleet-filter": "fleet-filter",
+    "overlay-ref:create-entity-topology": "create-entity-topology",
+    "module:ui/issue_detail.rs": "issue-inspector",
+    "module:ui/session.rs": "session-render",
+    "module:ui/status.rs": "session-render",
+    "module:ui/glyphs.rs": "session-render",
+    "module:ui/height.rs": "session-render",
+    "module:ui/navigator_layout.rs": "session-render",
+    "module:ui/rainbow_loaders.rs": "session-render",
+    "module:ui/tool_projection.rs": "tool-pairing",
+    "module:ui/theme.rs": "theme-palettes",
+    "overlay:graph-review-overlay-space-v-or-graph": "graph-review-dashboard",
+    "module:ui/overlay/graph.rs": "graph-review-dashboard"
+  },
+  "tuiOnlyRows": {
+    "reason": "Presentation preferences the TUI keeps in its own state.json (crates/rsi/src/state.rs); rsid has no state for them and no RPC reads or writes them, so there is nothing for the desktop to control. PM ruling on local #125 (Mac PM 241d3b87, 2026-10-19): they are TUI-only. Each Settings row shows 'TUI only' and its reason. The desktop has its own appearance settings (themes, text-area background, Vim keys).",
+    "tui": [
+      "crates/rsi/src/settings_registry.rs",
+      "crates/rsi/src/state.rs"
+    ],
+    "rows": {
+      "formulation_animation": "TUI renderer animation preference (state.json); no rsid state.",
+      "formulation_speed": "Speed of the TUI formulation animation (state.json); no rsid state.",
+      "activity_indicator": "Which activity indicator the TUI status line draws (state.json); no rsid state.",
+      "detail_column": "Which detail column the TUI session list shows (state.json); no rsid state.",
+      "navigator_preset": "TUI navigator column preset (state.json); the desktop session list has no optional navigator columns.",
+      "navigator_columns": "TUI navigator optional columns and their K/J order (state.json); the desktop session list has no such columns.",
+      "card_fields": "Which fields the TUI session cards show (state.json); no rsid state.",
+      "show_system_events": "TUI transcript default for system events (state.json); no rsid state.",
+      "show_thinking_events": "TUI transcript default for thinking events (state.json); no rsid state.",
+      "hide_tool_results": "TUI transcript default for tool results (state.json); no rsid state.",
+      "submit_on_enter": "Whether Enter submits in the TUI input bar (state.json); no rsid state.",
+      "auto_open_question_panel": "Whether the TUI opens its question panel on a pending question (state.json); no rsid state.",
+      "prompt_compiler": "TUI toggle for compiling a prompt before it is sent (state.json); no rsid state.",
+      "default_model": "The model the TUI launch prompt starts with (state.json); no rsid state. rsid's own model roles are the config model rows, which the desktop controls."
+    }
+  }
+}

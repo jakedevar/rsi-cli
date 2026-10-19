@@ -701,18 +701,9 @@ async fn generate_ollama_admitted(
     .await
 }
 
-/// LLM generation via headless Claude CLI (fallback).
-async fn generate_cli_fallback(prompt: &str, model: &str) -> Result<String> {
-    let mut command = title_cli_command(prompt, model);
-    let output = command
-        .output()
-        .await
-        .map_err(|e| DaemonError::Store(format!("Title generation failed: {}", e)))?;
-    title_cli_output(&output, model)
-}
-
 /// The title fallback's bypass-permissions Claude child (agent-facing).
-// Reached only through `generate_cli_fallback`, which is currently unwired.
+// The CLI title fallback has no caller; this builder stays so its credential-scrub test
+// pins the child environment should the fallback be wired again.
 #[allow(dead_code)]
 fn title_cli_command(prompt: &str, model: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(
@@ -732,29 +723,6 @@ fn title_cli_command(prompt: &str, model: &str) -> tokio::process::Command {
     // #694 K1: a bypass-permissions Claude is agent-facing; scrub keys.
     crate::vault::scrub_credential_env(&mut command);
     command
-}
-
-#[allow(dead_code)]
-fn title_cli_output(output: &std::process::Output, model: &str) -> Result<String> {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("exit status {}", output.status)
-        } else {
-            format!("exit status {}; stderr: {}", output.status, stderr)
-        };
-        return Err(DaemonError::Store(format!(
-            "Title generation fallback failed using Claude model '{}': {}",
-            model, detail
-        )));
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return Err(DaemonError::Store("Empty title generated".into()));
-    }
-
-    Ok(text)
 }
 
 #[cfg(test)]

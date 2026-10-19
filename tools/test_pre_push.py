@@ -16,8 +16,11 @@ def git(
     *args: str,
     agent_marker: str | None = None,
     lander_marker: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("RSI_SKIP_STATIC_GUARDS", None)
+    env.update(extra_env or {})
     for marker in AGENT_MARKERS:
         env.pop(marker, None)
     if agent_marker:
@@ -70,7 +73,13 @@ class PrePushTest(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"refs/heads/{ref}", result.stderr)
-                self.assertIn("land with rsi-rolling-land after an ACCEPTED review", result.stderr)
+                if ref == "rolling":
+                    # #2072: agents are pointed at the queue, never the lander.
+                    self.assertIn("merge queue", result.stderr)
+                    self.assertIn("rsi land <session-id|branch>", result.stderr)
+                else:
+                    self.assertIn("main is operator-only", result.stderr)
+                self.assertNotIn("rsi-rolling-land", result.stderr)
                 self.assertEqual(self.remote_ref(f"refs/heads/{ref}"), "")
 
     def test_lander_marker_allows_rolling_but_never_main(self) -> None:
@@ -113,6 +122,81 @@ class PrePushTest(unittest.TestCase):
         self.assertEqual(self.remote_ref("refs/heads/feature"), source)
         self.assertEqual(self.remote_ref("refs/heads/main"), source)
         self.assertEqual(self.remote_ref("refs/heads/rolling"), source)
+
+    def commit_file(self, relative: str, text: str) -> None:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        self.assert_git(self.repo, "add", relative)
+        self.assert_git(self.repo, "commit", "-q", "-m", f"add {relative}")
+
+    def test_operator_push_to_rolling_refuses_a_python_syntax_error(self) -> None:
+        # #2055: the incident was an IndentationError in tools/ pushed by a
+        # hand merge; the hook refuses it and points at the queue command.
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        good = self.remote_ref("refs/heads/rolling")
+        self.commit_file("tools/broken.py", "def main():\n    x = 1\n      y = 2\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tools/broken.py:3: IndentationError", result.stderr)
+        self.assertIn("rsi land <session-id|branch>", result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
+
+    def test_a_file_name_with_spaces_is_still_syntax_checked(self) -> None:
+        # #2071: a whitespace-split file list skipped `tools/my script.py`.
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.commit_file("tools/my script.py", "def main():\n    x = 1\n      y = 2\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tools/my script.py:3: IndentationError", result.stderr)
+
+    def test_an_unknown_remote_tip_still_checks_the_pushed_python(self) -> None:
+        # #2070: the remote tip was pushed from another clone, so this clone
+        # does not have it; the guard falls back to the merge base with
+        # origin/rolling (or the whole tree) instead of checking nothing.
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        shared = self.remote_ref("refs/heads/rolling")
+        self.assert_git(self.repo, "update-ref", "refs/remotes/origin/rolling", shared)
+        other = self.root / "other"
+        self.assert_git(self.root, "clone", "-q", "-b", "rolling", str(self.remote), str(other))
+        self.assert_git(other, "config", "user.name", "Other")
+        self.assert_git(other, "config", "user.email", "other@example.invalid")
+        (other / "elsewhere.txt").write_text("moved\n")
+        self.assert_git(other, "add", "elsewhere.txt")
+        self.assert_git(other, "commit", "-q", "-m", "remote moves")
+        self.assert_git(other, "push", "-q", "origin", "HEAD:refs/heads/rolling")
+        self.commit_file("tools/broken.py", "def main():\n    x = 1\n      y = 2\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tools/broken.py:3: IndentationError", result.stderr)
+
+    def test_operator_override_and_lander_marker_skip_the_static_guards(self) -> None:
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.commit_file("scripts/broken.py", "if True:\nprint('x')\n")
+        overridden = git(
+            self.repo,
+            "push",
+            "publish",
+            "HEAD:refs/heads/rolling",
+            extra_env={"RSI_SKIP_STATIC_GUARDS": "1"},
+        )
+        self.assertEqual(overridden.returncode, 0, overridden.stderr)
+        self.commit_file("scripts/broken_again.py", "if True:\nprint('y')\n")
+        lander = git(
+            self.repo,
+            "push",
+            "publish",
+            "HEAD:refs/heads/rolling",
+            lander_marker=True,
+        )
+        self.assertEqual(lander.returncode, 0, lander.stderr)
+
+    def test_operator_push_with_valid_python_still_passes(self) -> None:
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.commit_file("tools/fine.py", "print('ok')\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rsi land <session-id|branch>", result.stderr)
 
     def test_role_only_environment_without_rsi_session_can_push(self) -> None:
         result = git(

@@ -455,7 +455,7 @@ pub(in crate::store) fn apply_manager_actor_migration(store: &Store) -> Result<(
 
 /// Whether the live `issue_events` definition admits the manager actor. Used
 /// by the migration-chain fixtures to check a rewound store's claimed version.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(in crate::store) fn issue_events_admit_manager_actor(
     connection: &rusqlite::Connection,
 ) -> bool {
@@ -472,7 +472,7 @@ pub(in crate::store) fn issue_events_admit_manager_actor(
 /// (unquoted table SQL, V97 indexes and triggers) with every row copied back,
 /// and pin the source version. Panics if a manager-actor row exists, because
 /// V97 cannot represent it.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(in crate::store) fn rewind_manager_actor_fixture_to_source(connection: &rusqlite::Connection) {
     let version: i32 = connection

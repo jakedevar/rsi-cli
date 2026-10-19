@@ -320,6 +320,19 @@ impl Store {
                 "{CONTINUATION_TARGET_RETIRED}:global_message_undeliverable"
             )));
         }
+        // #797: the wake rows' delivery claims learn here that this
+        // continuation reached its first durable write, in the same
+        // transaction. A crash after this point may have delivered the wake;
+        // a claim without the mark never reached an effect.
+        for job_id in scheduled_jobs {
+            tx.execute(
+                "UPDATE scheduled_jobs
+                 SET schedule_json=json_set(schedule_json,'$.delivery_claim.effect',json('true'))
+                 WHERE id=?1 AND json_valid(schedule_json)
+                   AND json_extract(schedule_json,'$.delivery_claim') IS NOT NULL",
+                [job_id.to_string()],
+            )?;
+        }
         let claimed = tx.execute(
             "UPDATE sessions SET updated_at=?2 WHERE id=?1",
             rusqlite::params![
@@ -372,7 +385,8 @@ impl Store {
 
     /// The `AgentContinueChild` mutation scope, recomputed in this store
     /// hold: `caller` is the tip's direct parent, the lead of its parent, or
-    /// the appointed manager with a live `SessionControl` grant over it.
+    /// the appointed manager with a live `SessionControl` grant over it, or a
+    /// portfolio seat whose direct-child reach covers it (#2498).
     fn agent_continue_actor_authorized(&self, caller: Uuid, tip: Uuid) -> Result<bool> {
         let pause = self.get_operator_pause(tip)?;
         if pause == super::OperatorPause::Hard {
@@ -392,9 +406,20 @@ impl Store {
         if direct_parent || self.parent_lead_authorizes_child(caller, tip)? {
             return Ok(true);
         }
-        Ok(matches!(
+        if matches!(
             self.manager_session_control_scope_with_soft_restart(caller, tip, true, true),
             Ok(Some(_))
+        ) {
+            return Ok(true);
+        }
+        // #2498: the front-door authorization admits a portfolio seat over a
+        // direct child seat (a child node's seat, or the PM of the project it
+        // covers deepest); the guarded recheck must name the same reach, or
+        // the continuation is refused as an authority change it never had.
+        // A refusal (paused, capability denied, human gate) is "not authorized".
+        Ok(matches!(
+            self.portfolio_seat_reach(caller, tip, true),
+            Ok(true)
         ))
     }
 

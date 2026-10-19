@@ -6,15 +6,15 @@ remote mode because a matching toolchain and runner fingerprint does not prove
 that tests behave identically on two hosts. Failure comparison and isolated
 retries still run in the lander. Other affected-crate commands remain local.
 
-Pass all three required flags together:
+Agents never run the lander directly. Managers enqueue accepted SHAs with
+`AgentEnqueueLandingSource {derive_filters:true}`. For `queue_disabled`, keep
+the commit pushed and report with `AgentReportUp`, or send the result with
+`AgentReportToHub` on a satellite. The operator enables the queue or lands with
+`rsi land` or `EnqueueRollingQueueSource`. See
+[Landing](agents/landing-and-gates.md#landing).
 
-```bash
-rsi-rolling-land --repo /path/to/assigned-sandbox --remote origin \
-  --accepted SOURCE_SHA \
-  --remote-gate-host ec2-user@host.example \
-  --remote-gate-dir /srv/rsi/rolling-gates \
-  --remote-gate-identity /path/to/ssh-key
-```
+The queue's internal lander configuration requires all three remote flags
+together: `--remote-gate-host`, `--remote-gate-dir`, and `--remote-gate-identity`.
 
 `--remote-gate-run-as USER` defaults to `rsi`. The SSH login must be able to
 run `sudo -n` as that user. The host needs Git, Python 3.11, and the project's

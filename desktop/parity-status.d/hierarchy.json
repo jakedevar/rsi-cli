@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>G": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "Create Group: opens the create-entity form with the kind chosen after the TUI's legal_children precheck against the container the cursor is in (the desktop tree is inline, so the cursor stands in for the TUI's descent head); an illegal kind is a toast and the form does not open"
+    },
+    "key:<Space>E": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "Create Epic (under the Group the cursor is on): opens the create-entity form with the kind chosen after the TUI's legal_children precheck against the container the cursor is in (the desktop tree is inline, so the cursor stands in for the TUI's descent head); an illegal kind is a toast and the form does not open"
+    },
+    "key:<Space>gS": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "Create Story (under the Epic the cursor is in): opens the create-entity form with the kind chosen after the TUI's legal_children precheck against the container the cursor is in (the desktop tree is inline, so the cursor stands in for the TUI's descent head); an illegal kind is a toast and the form does not open"
+    },
+    "key:<Space>gT": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "Create Task: opens the create-entity form with the kind chosen after the TUI's legal_children precheck against the container the cursor is in (the desktop tree is inline, so the cursor stands in for the TUI's descent head); an illegal kind is a toast and the form does not open"
+    },
+    "key:<Space>B": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "Create Bug: opens the create-entity form with the kind chosen after the TUI's legal_children precheck against the container the cursor is in (the desktop tree is inline, so the cursor stands in for the TUI's descent head); an illegal kind is a toast and the form does not open"
+    },
+    "key:gL": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "SetEpicLead {epic_id, new_lead_session_id} for the cursor's leaf under an Epic; the TUI's refusals (No session selected, Session has no parent Epic, Parent is not an Epic) are the rule's reasons; also :lead / :setlead"
+    },
+    "cmd:lead": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "same action as gL (named here because it is the same feature as the Normal-mode row)"
+    },
+    "section:session-hierarchy-creation": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "<Space>G, <Space>E, <Space>gS, <Space>gT and <Space>B open the one create-entity form with the kind pre-selected"
+    },
+    "section:session-hierarchy-unified-entity-creation-modal-create-entity-form": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs, src/topology-preview.ts",
+      "note": "One dialog with the TUI's kind-driven fields: Kind (only kinds some legal parent accepts), Name, Tags (normalize_tag chips, at least one required), Parent (legal containers), Topology for an Epic with the slice-11 DAG preview, and Provider / Model (DiscoverModels suggestions) / Effort / Sandbox plus the prompt for a leaf. Submit is CreateContainer (a Group never passes a topology) or LaunchSession with session_kind, title, parent, tags and a GitWorktree sandbox; the working directory is the filtered project's folder, else the parent's, else the open session's. Esc keeps the draft, Ctrl-D discards it, Ctrl-Enter submits from any field, and the last successful choices prefill the next form. The TUI's single-key field grammar (n, k, T, t, m, e/E, s, gp) is the dialog's own Tab order and controls"
+    },
+    "section:session-hierarchy-lead-assignment": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "gL and :lead / :setlead"
+    },
+    "section:session-hierarchy-rebinds-caused-by-hierarchy-chords": {
+      "status": "done",
+      "location": "src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs, src/actions/lifecycle-spec.ts",
+      "note": "<Space>gS and <Space>gT are the Story and Task creation chords; the trash browser is <Space>gX (slice 6)"
+    },
+    "section:session-hierarchy": {
+      "status": "done",
+      "location": "src/tree.ts, src/sessionTree.ts, src/actions/sessionlist-run.ts, src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs",
+      "note": "tree with folds, ascend, mp / mo reassignment (slice 4), the creation chords and gL (G2) and gR (slice 11)"
+    },
+    "section:session-hierarchy-reassignment": {
+      "status": "done",
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts, src/actions/hierarchy.ts, src/actions/hierarchy-run.ts, src/hierarchy-model.ts, src-tauri/src/hierarchy.rs, src/actions/graphs.ts",
+      "note": "mp and mo (slice 4), gL (G2) and gR (slice 11)"
+    }
+  }
+}

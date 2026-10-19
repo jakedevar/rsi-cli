@@ -29,6 +29,20 @@ const STALE_SCAN: i64 = 2048;
 /// Rows one `rulings` page may carry.
 const RULINGS_PAGE: usize = 65;
 
+/// Only a daemon-authored topology question has execution scope. A manager's
+/// ordinary decision, even under a similar key, retains the Epic launch gate.
+pub(crate) fn topology_decision_execution(key: &str, payload: &Value) -> Option<Uuid> {
+    if payload["asked_by"]["kind"] != "topology_executor" {
+        return None;
+    }
+    let execution = payload["asked_by"]["execution_id"]
+        .as_str()?
+        .parse::<Uuid>()
+        .ok()?;
+    key.starts_with(&format!("{TOPOLOGY_DECISION_PREFIX}{execution}:"))
+        .then_some(execution)
+}
+
 /// Why a record is operator-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecisionGate {
@@ -117,7 +131,7 @@ const GATE_PHRASES: &[(&str, &[&str])] = &[
 /// Formatting and intervening words must not turn an operator gate into a
 /// manager decision (for example, "merge this into `main`" or "delete all
 /// user data"). Match action/target words independently of their order.
-fn scan_decision_gate(question: &str) -> Option<&'static str> {
+pub fn scan_decision_gate(question: &str) -> Option<&'static str> {
     let lower = question.to_lowercase();
     let words: Vec<_> = lower
         .split(|c: char| !c.is_alphanumeric())
@@ -459,9 +473,11 @@ impl Store {
             (true, Some(_)) => json!("operator"),
             (true, None) => json!("manager"),
         };
+        let execution = topology_decision_execution(&key, row);
         row["blocks"] = json!({
             "launches": blocking,
-            "epic_ids": if blocking { vec![row["epic_id"].clone()] } else { Vec::new() },
+            "epic_ids": if blocking && execution.is_none() { vec![row["epic_id"].clone()] } else { Vec::new() },
+            "execution_ids": if blocking { execution.into_iter().collect::<Vec<_>>() } else { Vec::new() },
             "work_key": row["work_key"],
             "request_id": row["request_id"],
             "reason": "manager_v2_pending_operator_decision",
@@ -1149,8 +1165,7 @@ impl Store {
     }
 
     /// Withdraw a still-pending topology decision whose node no longer waits
-    /// (the execution was cancelled): a pending record would otherwise keep
-    /// holding the Epic's manager launches. Returns whether it withdrew one.
+    /// (the execution was cancelled). Returns whether it withdrew one.
     pub fn manager_v2_withdraw_topology_decision(
         &self,
         config: &HarnessManagerConfigV1,

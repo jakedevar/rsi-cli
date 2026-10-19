@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:alerts": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": ":alerts (:att, :attention) toggles the notification browser. The numbered attention queue (slice 4) is the \"Attention queue…\" action in the Go menu and palette."
+    },
+    "cmd:delete": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": ":delete (:del) moves the session to the trash like DD; run from the palette it asks first"
+    },
+    "cmd:pause-soft": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": ":pause soft downgrades the HARD pause of the open session to SOFT"
+    },
+    "key:<Space>gX": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "opens the trash browser (ListDeletedSessions) grouped by time period; also Go menu, palette"
+    },
+    "key:<Space>gq": {
+      "status": "done",
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/lifecycle.ts",
+      "note": "opens the question modal for the open session, else the first session with a question; also Session menu, right-click"
+    },
+    "key:<Space>hs": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "downgrades the open session's HARD pause to SOFT (SetOperatorPause); refuses when it is not HARD"
+    },
+    "key:<Space>n": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "notification browser: desktop toasts and session completed/failed/waiting transitions, active first then history; also Go menu, palette. The numbered attention queue (slice 4) is the \"Attention queue…\" action in the Go menu and palette."
+    },
+    "key:DD": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "moves the session to the trash (DeleteSession); DD is the double-tap confirmation, so menus, the palette and buttons ask first; refuses Running, Starting and Archived sessions like the TUI"
+    },
+    "key:U": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "unarchives the list-cursor session (the open one without a cursor) in the Archived view; also Session menu, right-click, palette"
+    },
+    "key:gr": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "recent completions: the six latest Completed, Failed or Interrupted sessions; Enter opens one"
+    },
+    "module:ui/overlay/notification_browser.rs": {
+      "status": "done",
+      "location": "src/actions/lifecycle.ts, src/lifecycle-model.ts, src/actions/input.ts",
+      "note": "notification browser and recent completions, with the modal geometry keys (G1)"
+    },
+    "module:ui/overlay/question_modal.rs": {
+      "status": "done",
+      "location": "src/approvals.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "inline banner plus the question modal"
+    },
+    "module:ui/overlay/trash_browser.rs": {
+      "status": "done",
+      "location": "src/sessions.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "Archived view plus the trash browser"
+    },
+    "overlay-ref:notifications": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts, src/actions/input.ts",
+      "note": "j/k, g/G, x, N, Enter, Esc/q, Space N and Space ;; Ctrl+Arrows move, Ctrl+Shift+Arrows resize and Ctrl+0 resets the dialog (G1's modal geometry, saved per dialog)"
+    },
+    "overlay-ref:question-insert": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "type, Enter or Ctrl/Cmd-Enter submits, Shift-Enter adds a line, Esc returns to the options; submit-on-Enter is fixed on (no setting yet)"
+    },
+    "overlay-ref:question-normal": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "j/k, Space, 1-9, Enter/Backspace, i, Ctrl/Cmd-Enter, d, Esc/q as in the TUI"
+    },
+    "overlay-ref:recent-completions": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "j/k, g/G, Enter opens the session, i goes to the message box, Esc/q, Space N, Space ;"
+    },
+    "overlay-ref:trash": {
+      "status": "done",
+      "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "j/k, G, U restores, D purges (the desktop asks for a second D within 5 s, the TUI purges at once), Esc/q, Space N, Space ;"
+    },
+    "overlay:archive-zone-session-list": {
+      "status": "done",
+      "location": "src/sessions.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts, src/actions/nav-run.ts",
+      "note": "archived sessions in the Archive zone with j/k, gg/G, Enter/l and U to restore; gs / gj / ga jump between the Main, Jobs (G2) and Archive zones, shown as the list header’s zone tabs"
+    },
+    "overlay:question-panel": {
+      "status": "done",
+      "location": "src/approvals.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "the inline banner stays; <Space>gq opens the modal with option cursor, multi-select, multi-question navigation, free text, submit and decline; auto-open (Settings > Display) is not in the desktop"
+    },
+    "section:archive-zone": {
+      "status": "done",
+      "location": "src/sessions.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
+      "note": "ga, U, <Space>gX (trash) and gr (recent completions)"
+    },
+    "section:session-management": {
+      "status": "done",
+      "location": "src/registry.ts, src/commands.ts, src/approvals.ts, src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts, src/actions/emergency-spec.ts, src/actions/emergency.ts, src/emergency-model.ts",
+      "note": "interrupt, hard pause, clear pause, downgrade to soft, quick continue, archive and the <Space>X emergency stop. The list marks HARD only on sessions the emergency stop paused; other rows' SOFT/HARD marker is not drawn (the open session shows its pause in the header)"
+    }
+  }
+}

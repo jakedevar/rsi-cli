@@ -240,6 +240,7 @@ fn launch_request(
         continue_from: None,
         qa_lane: false,
         review_of: None,
+        related: Vec::new(),
     }
 }
 
@@ -487,16 +488,11 @@ async fn every_project_bound_verb_serves_a_granted_project_and_refuses_one_outsi
                     AgentUpdateIssueRequestV1 {
                         project_id: target,
                         issue_id: Some(issue.id),
-                        display_number: None,
-                        expected_row_version: issue.row_version,
-                        idempotency_key: format!("title-{project}"),
                         title: Some("retitled by the global".into()),
-                        body: None,
-                        labels: None,
-                        priority: None,
-                        clear_priority: false,
-                        assignee: None,
-                        clear_assignee: false,
+                        ..AgentUpdateIssueRequestV1::new(
+                            issue.row_version,
+                            format!("title-{project}"),
+                        )
                     },
                 )
                 .await
@@ -515,6 +511,8 @@ async fn every_project_bound_verb_serves_a_granted_project_and_refuses_one_outsi
                 .agent_update_issue_status(
                     g.seat,
                     AgentUpdateIssueStatusRequestV1 {
+                        note: None,
+                        include_issue: false,
                         project_id: target,
                         issue_id: Some(issue.id),
                         display_number: None,
@@ -975,12 +973,14 @@ async fn budgets_are_charged_up_the_chain() {
             g.seat,
             AgentManagerControlRequestV2 {
                 project_id: Some(p.project),
-                fence: ManagerFenceV2 {
-                    scope_version: grant.grant_version,
-                    policy_version: grant.grant_version,
-                },
-                idempotency_key: "g-1".into(),
-                operation: create_session(p, p.epic),
+                ..AgentManagerControlRequestV2::new(
+                    ManagerFenceV2 {
+                        scope_version: grant.grant_version,
+                        policy_version: grant.grant_version,
+                    },
+                    "g-1".into(),
+                    create_session(p, p.epic),
+                )
             },
         )
         .await
@@ -1282,6 +1282,8 @@ async fn the_catalog_lists_the_pm_verbs_the_project_policy_grants() {
         .agent_update_issue_status(
             status.seat,
             AgentUpdateIssueStatusRequestV1 {
+                note: None,
+                include_issue: false,
                 project_id: Some(status.b),
                 issue_id: Some(issue.id),
                 display_number: None,
@@ -1403,6 +1405,10 @@ async fn landing_uses_the_in_reach_source_sandbox_and_refuses_one_out_of_reach()
     let head = git(&p.repo, &["rev-parse", "HEAD"]);
     let request = |project: Option<Uuid>, source: Uuid, key: &str| {
         rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+            supersedes: None,
+            derive_filters: false,
+            fixes_issue: None,
+            fixes_tests: Vec::new(),
             project_id: project,
             source_session_id: Some(source),
             source_commit: head.clone(),
@@ -1443,7 +1449,19 @@ async fn landing_uses_the_in_reach_source_sandbox_and_refuses_one_out_of_reach()
         .agent_enqueue_landing_source(g.seat, request(None, outside, "land-c"), true)
         .await
         .unwrap_err();
+    assert!(
+        code(&error).contains("queue_source_session_out_of_scope"),
+        "{error}"
+    );
+    // A global seat's own ID selects its own sandbox, and a global seat holds
+    // no enqueue authority of its own: with a granted project it is refused
+    // `queue_not_authorized` (#1820, #1842).
+    let error = control
+        .agent_enqueue_landing_source(g.seat, request(Some(p.project), g.seat, "land-own"), true)
+        .await
+        .unwrap_err();
     assert!(code(&error).contains("queue_not_authorized"), "{error}");
+    assert_eq!(row_count(&g, "rolling_queue_entries").await, 1);
     // The catalog advertises the landing verb to an executing global seat.
     let projection = p
         .manager
@@ -1453,6 +1471,101 @@ async fn landing_uses_the_in_reach_source_sandbox_and_refuses_one_out_of_reach()
         .agent_authority_projection(g.seat)
         .unwrap();
     assert!(projection.verbs.contains(&Verb::EnqueueLandingSource));
+}
+
+/// #2405: a manager that enqueues a worker's commit gets exactly one outcome
+/// wake per settlement, on publish and on refusal, recorded on the entry as
+/// its `wake_session_id`; the worker whose sandbox was landed is never woken.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_managers_enqueue_of_a_workers_commit_wakes_the_manager_once_per_outcome() {
+    use rsi_common::rolling_queue::{RollingQueueEntryState, RollingQueueOutcome};
+    let g = portfolio().await;
+    let p = &g.p;
+    let worker = Uuid::new_v4();
+    live_leaf(p, worker, g.b, g.b_epic).await;
+    let head = git(&p.repo, &["rev-parse", "HEAD"]);
+    let request = |key: &str| rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+        supersedes: None,
+        derive_filters: false,
+        fixes_issue: None,
+        fixes_tests: Vec::new(),
+        project_id: Some(g.b),
+        source_session_id: Some(worker),
+        source_commit: head.clone(),
+        test_filters: Vec::new(),
+        idempotency_key: key.into(),
+    };
+    let control = p.manager.agent_control();
+    let mut entries = Vec::new();
+    for (key, terminal, outcome) in [
+        (
+            "wake-published",
+            RollingQueueEntryState::Published,
+            RollingQueueOutcome {
+                landed_sha: Some(head.clone()),
+                ..Default::default()
+            },
+        ),
+        (
+            "wake-refused",
+            RollingQueueEntryState::Refused,
+            RollingQueueOutcome {
+                refusal: Some("gate_failed".into()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let receipt = control
+            .agent_enqueue_landing_source(g.seat, request(key), true)
+            .await
+            .unwrap();
+        let store = p.manager.store.lock().await;
+        let recorded: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT wake_session_id FROM rolling_queue_entries WHERE id=?1",
+                [receipt.entry.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, Some(g.seat.to_string()), "{key}");
+        store
+            .claim_rolling_queue_batch(chrono::Utc::now(), 1)
+            .unwrap()
+            .expect("the entry is claimable");
+        store
+            .settle_rolling_queue_entry(receipt.entry.id, terminal, &outcome, chrono::Utc::now())
+            .unwrap()
+            .expect("settle wakes");
+        entries.push(receipt.entry.id);
+    }
+    let wakes: Vec<_> = p
+        .manager
+        .store
+        .lock()
+        .await
+        .list_scheduled_jobs()
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.name.starts_with("merge-queue-"))
+        .collect();
+    assert_eq!(wakes.len(), 2, "one wake per outcome");
+    assert!(
+        wakes
+            .iter()
+            .all(|job| job.wake_session_id == Some(g.seat) && job.wake_mode == WakeMode::Resume),
+        "{wakes:?}"
+    );
+    for entry in entries {
+        assert_eq!(
+            wakes
+                .iter()
+                .filter(|job| job.name == format!("merge-queue-{entry}"))
+                .count(),
+            1
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -1738,6 +1851,193 @@ async fn a_root_never_controls_a_sibling_roots_seat_hosted_in_its_project() {
     }
 }
 
+/// The cursor request a caller holding an exact observation sends.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn exact_continue_request(
+    p: &Pilot,
+    target: Uuid,
+    query: &str,
+) -> rsi_common::agent_coordination::AgentContinueChildRequestV1 {
+    let cursor = p
+        .manager
+        .store
+        .lock()
+        .await
+        .agent_continuation_cursor(target)
+        .unwrap();
+    rsi_common::agent_coordination::AgentContinueChildRequestV1 {
+        target_session_id: target,
+        query: query.into(),
+        expected_tip_session_id: cursor.tip_session_id,
+        expected_event_sequence: cursor.event_sequence,
+        expected_custody_generation: cursor.custody_generation,
+        idempotency_key: Some(format!("continue-{target}")),
+    }
+}
+
+/// Model a seat that went Interrupted mid-turn (#2498).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn interrupt_seat(p: &Pilot, seat: Uuid) {
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(seat, SessionStatus::Interrupted)
+        .unwrap();
+    if let Some(completed) = p.manager.completed.write().await.get_mut(&seat) {
+        completed.session.status = SessionStatus::Interrupted;
+    }
+}
+
+/// #2498: the portfolio seat over a project continues that project's
+/// Interrupted PM seat as the same session: no new session row, the seat
+/// config still names it, and its armed wake survives.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_portfolio_seat_continues_its_projects_interrupted_pm_seat_in_place() {
+    use crate::session::harness::tools::schedule_wake::{
+        ScheduleWakeRequest, build_agent_scheduled_job,
+    };
+    let g = portfolio().await;
+    let p = &g.p;
+    let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+        message: "pm wake".into(),
+        in_seconds: Some(3600),
+        at: None,
+        name: Some("pm-standing-wake".into()),
+        every_seconds: None,
+        mode: Some("resume".into()),
+        working_dir: p.repo.clone(),
+        provider: Some(SessionProvider::Claude),
+        model: Some("manager-scripted-provider".into()),
+        project_id: Some(p.project),
+        origin_session_id: Some(p.owner),
+        watch_session_id: None,
+    })
+    .unwrap();
+    {
+        let mut store = p.manager.store.lock().await;
+        store.publish_startup_ordinary(p.owner).unwrap();
+        store.insert_scheduled_job(&wake).unwrap();
+    }
+    interrupt_seat(p, p.owner).await;
+    let sessions: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let request = exact_continue_request(p, p.owner, "resume the manager seat").await;
+    let process = crate::session::launch::install_controller_candidate_test_process(p.owner);
+    let receipt = p
+        .manager
+        .agent_continue_child(g.seat, request)
+        .await
+        .expect("the covering portfolio seat continues its PM seat");
+    assert_eq!(receipt.target_session_id, p.owner);
+    assert_eq!(receipt.continued_session_id, p.owner);
+    assert_eq!(
+        process
+            .productive_start_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the PM seat's own provider restarted"
+    );
+    let store = p.manager.store.lock().await;
+    let after: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, sessions, "no new session, so no creation charge");
+    assert_eq!(
+        store
+            .get_harness_manager(p.project)
+            .unwrap()
+            .unwrap()
+            .current_session_id,
+        Some(p.owner)
+    );
+    assert!(
+        store
+            .get_scheduled_job(&wake.id)
+            .unwrap()
+            .is_some_and(|job| job.enabled),
+        "the PM seat's wake stays armed"
+    );
+    drop(store);
+    crate::session::launch::drop_controller_candidate_test_stream(p.owner);
+}
+
+/// #2498: the same continue is refused for a PM seat of a project outside
+/// the portfolio seat's coverage, and nothing is started.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_portfolio_seat_cannot_continue_a_pm_seat_outside_its_coverage() {
+    let g = portfolio().await;
+    let p = &g.p;
+    let outside_pm = Uuid::new_v4();
+    {
+        let mut store = p.manager.store.lock().await;
+        let mut row = bare_session(outside_pm);
+        row.project_id = Some(g.c);
+        row.working_dir = p.repo.clone();
+        row.session_kind = SessionKind::Standard;
+        row.provider = SessionProvider::Claude;
+        row.model = Some("manager-scripted-provider".into());
+        row.claude_session_id = Some(format!("provider-{outside_pm}"));
+        store.insert_session(&row).unwrap();
+        store.publish_startup_ordinary(outside_pm).unwrap();
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: g.c,
+                session_id: outside_pm,
+                epic_ids: Some(vec![g.c_epic]),
+                expected_row_version: 0,
+            })
+            .unwrap();
+        p.manager
+            .completed
+            .write()
+            .await
+            .insert(outside_pm, CompletedSession::for_test(row));
+    }
+    interrupt_seat(p, outside_pm).await;
+    let request = exact_continue_request(p, outside_pm, "resume").await;
+    let process = crate::session::launch::install_controller_candidate_test_process(outside_pm);
+    let refused = p
+        .manager
+        .agent_continue_child(g.seat, request)
+        .await
+        .expect_err("a PM seat outside the coverage is not continued");
+    assert!(
+        refused.to_string().contains("target_not_authorized")
+            || code(&refused).contains("target_not_authorized")
+            || code(&refused).contains("agent_verb_scope_denied"),
+        "{refused}"
+    );
+    assert_eq!(
+        process
+            .productive_start_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(outside_pm)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Interrupted
+    );
+    crate::session::launch::drop_controller_candidate_test_process(outside_pm);
+}
+
 /// #1237 (hierarchy S3): levels above global, on this file's fixtures.
 #[path = "manager_portfolio_levels.rs"]
 mod portfolio_levels;
@@ -1821,6 +2121,10 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
         live_leaf(&g.p, worker, g.b, g.b_epic).await;
         let head = git(&g.p.repo, &["rev-parse", "HEAD"]);
         let request = |key: &str| rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+            supersedes: None,
+            derive_filters: false,
+            fixes_issue: None,
+            fixes_tests: Vec::new(),
             project_id: Some(g.b),
             source_session_id: Some(worker),
             source_commit: head.clone(),
@@ -1862,6 +2166,10 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
         .agent_enqueue_landing_source(
             g.seat,
             rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+                supersedes: None,
+                derive_filters: false,
+                fixes_issue: None,
+                fixes_tests: Vec::new(),
                 project_id: Some(g.b),
                 source_session_id: Some(worker),
                 source_commit: head,
@@ -2145,4 +2453,650 @@ async fn a_portfolio_seat_rules_a_pms_non_gate_decision_and_refuses_a_gate() {
             .payload["status"],
         "pending"
     );
+}
+
+/// #2091: a #2021 handoff changes the node's grant without a rotation
+/// lineage edge. A later context-cap transfer changes it again. Fresh arms
+/// must use the node seat in both cases, including the missing-watch repair.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_worker_watch_rearm_follows_portfolio_handoff_and_context_cap() {
+    use rsi_common::portfolio_delegation::{
+        AgentManagerAppointChildRequestV1, AppointChildTargetV1,
+    };
+
+    let g = portfolio().await;
+    let p = &g.p;
+    let control = p.manager.agent_control();
+    let issue = new_issue(p, g.b, "succession watch").await;
+    let launched = control
+        .agent_manager_launch_issue_worker(
+            g.seat,
+            launch_request(
+                p,
+                Some(g.b),
+                g.b_epic,
+                issue.display_number,
+                "watch-succession",
+            ),
+        )
+        .await
+        .unwrap();
+    let worker = launched.worker_session_id;
+    let process = crate::session::launch::install_controller_candidate_test_process(worker);
+    p.execute().await.unwrap();
+    crate::session::lifecycle::interrupt_active_in_maps(&p.manager.active, worker)
+        .await
+        .unwrap();
+    crate::session::launch::drop_controller_candidate_test_stream(worker);
+    drop(process);
+    for _ in 0..100 {
+        if !p.manager.active.read().await.contains_key(&worker) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(worker, SessionStatus::Running)
+        .unwrap();
+
+    let successor = {
+        let store = p.manager.store.lock().await;
+        let node = store.portfolio_node_for_seat(g.seat).unwrap().unwrap();
+        let request = AgentManagerAppointChildRequestV1 {
+            target: AppointChildTargetV1::Portfolio {
+                node_id: Some(node.node_id),
+                tier_label: None,
+                project_ids: Vec::new(),
+                allowed_launches: Vec::new(),
+                policy: None,
+                child_policy: None,
+                max_direct_reports: None,
+                launch_project_id: None,
+                expected_grant_version: Some(node.grant.grant_version),
+            },
+            launch: p.policy.allowed_launches[0].clone(),
+            query: "Take the node seat.".into(),
+            sandbox: Some(false),
+            idempotency_key: "watch-handoff".into(),
+            handoff: Some("committed handoff".into()),
+        };
+        let appointment = store.begin_child_appointment(g.seat, &request).unwrap();
+        let mut row = bare_session(appointment.session_id);
+        row.project_id = Some(appointment.launch_project_id);
+        row.working_dir = p.repo.clone();
+        row.session_kind = SessionKind::Standard;
+        row.status = SessionStatus::Running;
+        store.insert_session(&row).unwrap();
+        store
+            .finish_portfolio_appointment(g.seat, &request, &appointment)
+            .unwrap();
+        appointment.session_id
+    };
+
+    // Transferred coverage deduplicates even though repair reads the old
+    // launch caller. Then consumption leaves no enabled watch to transfer.
+    assert_eq!(p.manager.reconcile_issue_worker_watches().await, 0);
+    for (old_seat, new_seat) in [(g.seat, successor), (successor, Uuid::new_v4())] {
+        {
+            let store = p.manager.store.lock().await;
+            if old_seat == successor {
+                let mut row = store.get_session(successor).unwrap().unwrap();
+                row.id = new_seat;
+                row.continued_from = Some(successor);
+                row.rotation_depth += 1;
+                store.insert_session(&row).unwrap();
+                assert!(store.transfer_global_seat(successor, new_seat).unwrap());
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE scheduled_jobs SET enabled=0 WHERE wake_mode=?1",
+                    [format!("on_terminal:{worker}")],
+                )
+                .unwrap();
+        }
+        assert_eq!(p.manager.reconcile_issue_worker_watches().await, 1);
+        assert_eq!(p.manager.reconcile_issue_worker_watches().await, 0);
+        let candidate = control
+            .build_automatic_child_watch_candidate(g.seat, worker)
+            .await
+            .unwrap();
+        assert_eq!(candidate.wake_session_id, Some(new_seat));
+        let watchers: Vec<_> = p
+            .manager
+            .store
+            .lock()
+            .await
+            .list_enabled_terminal_watches()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.wake_mode == WakeMode::OnTerminal(worker))
+            .filter_map(|job| job.wake_session_id)
+            .collect();
+        assert_eq!(watchers, vec![new_seat]);
+    }
+    // End a worker turn after the seat handoffs. The arm and the delivery
+    // plan address exactly the current seat, not either retired launcher.
+    let candidate = control
+        .build_automatic_child_watch_candidate(g.seat, worker)
+        .await
+        .unwrap();
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET enabled=0 WHERE wake_mode=?1",
+                [format!("on_terminal:{worker}")],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Completed',updated_at=?2 WHERE id=?1",
+                rusqlite::params![
+                    worker.to_string(),
+                    (candidate.created_at + chrono::Duration::seconds(1))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+    }
+    let armed = control
+        .arm_automatic_child_watch(g.seat, worker)
+        .await
+        .unwrap();
+    let job = match armed {
+        crate::session::agent_verbs::ArmWatchOutcome::Armed(job) => job,
+        other => panic!("fresh terminal watch expected: {other:?}"),
+    };
+    assert_eq!(job.wake_session_id, candidate.wake_session_id);
+    match p.manager.plan_terminal_watch_fire(&job).await.unwrap() {
+        crate::session::WatchFirePlan::Deliver { tip, .. } => {
+            assert_eq!(Some(tip), candidate.wake_session_id)
+        }
+        other => panic!("terminal worker must wake the current node seat: {other:?}"),
+    }
+}
+
+/// #2213: the owner's current manager (a PM, or a portfolio seat inside its
+/// grant) may cancel a job owned by a session in its live scope, with the
+/// canceller and owner named; ordinary workers and managers out of scope keep
+/// the owner-only `job_not_found`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_manager_cancels_in_scope_jobs_and_everyone_else_stays_owner_only() {
+    use crate::agent_jobs::JobRuntime;
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::{AgentCancelJobRequestV1, JobState, JobWake};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, _: &crate::agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn unit_active(&self, _: &str) -> bool {
+            false
+        }
+        fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(unit.into());
+            Ok(())
+        }
+    }
+
+    let g = portfolio().await;
+    let p = &g.p;
+    let (w1, w2, foreign) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    live_leaf(p, w1, p.project, p.epic).await;
+    live_leaf(p, w2, p.project, p.epic).await;
+    live_leaf(p, foreign, g.c, g.c_epic).await;
+    let make_job = |owner: Uuid, project: Uuid| {
+        let id = Uuid::new_v4();
+        let dir = p.repo.display().to_string();
+        NewAgentJob {
+            id,
+            owner_session_id: owner,
+            project_id: Some(project),
+            name: None,
+            params: serde_json::from_value(serde_json::json!({
+                "kind":"build", "command":"check", "workspace":true
+            }))
+            .unwrap(),
+            cwd: dir.clone(),
+            unit_name: format!("rsi-job-{id}"),
+            log_path: format!("{dir}/{id}.log"),
+            status_path: format!("{dir}/{id}.status"),
+            idempotency_key: None,
+            wake: JobWake::Owner,
+        }
+    };
+    let (by_pm, by_global, own, out_of_scope) = (
+        make_job(w1, p.project),
+        make_job(w2, p.project),
+        make_job(w1, p.project),
+        make_job(foreign, g.c),
+    );
+    {
+        let store = p.manager.store.lock().await;
+        for job in [&by_pm, &by_global, &own, &out_of_scope] {
+            store.insert_agent_job(job, chrono::Utc::now()).unwrap();
+        }
+    }
+    let control = p.manager.agent_control();
+    let runtime = std::sync::Arc::new(Recorder::default());
+    let cancel = |caller: Uuid, job: &NewAgentJob| {
+        control.agent_cancel_job(
+            caller,
+            AgentCancelJobRequestV1 { job_id: job.id },
+            runtime.clone(),
+        )
+    };
+
+    // A worker never cancels another worker's job; a manager never one outside
+    // its scope (the PM covers project A, the seat A and B, neither C).
+    for (caller, job) in [
+        (w2, &by_pm),
+        (p.owner, &out_of_scope),
+        (g.seat, &out_of_scope),
+    ] {
+        let error = cancel(caller, job).await.unwrap_err();
+        assert!(code(&error).contains("job_not_found"), "{error}");
+    }
+    assert!(runtime.0.lock().unwrap().is_empty());
+    for job in [&by_pm, &out_of_scope] {
+        let row = p.manager.store.lock().await.get_agent_job(job.id).unwrap();
+        assert_eq!(row.unwrap().job.state, JobState::Running);
+    }
+
+    // The PM and the portfolio seat cancel in-scope jobs; the receipt names
+    // the canceller and the owner.
+    for (manager, job, owner) in [(p.owner, &by_pm, w1), (g.seat, &by_global, w2)] {
+        let cancelled = cancel(manager, job).await.unwrap();
+        assert!(cancelled.cancelled);
+        assert_eq!(cancelled.cancelled_by_manager, Some(manager));
+        assert_eq!(cancelled.job.owner_session_id, owner);
+        assert_eq!(cancelled.job.state, JobState::Failed);
+        let result = cancelled.job.result.unwrap();
+        assert_eq!(result.refusal.as_deref(), Some("job_cancelled"));
+        let detail = result.detail.unwrap();
+        assert!(detail.contains(&manager.to_string()), "{detail}");
+        assert!(detail.contains(&owner.to_string()), "{detail}");
+    }
+
+    // The owner still cancels its own job, with no manager named.
+    let cancelled = cancel(w1, &own).await.unwrap();
+    assert!(cancelled.cancelled);
+    assert_eq!(cancelled.cancelled_by_manager, None);
+    assert_eq!(
+        cancelled.job.result.unwrap().detail.as_deref(),
+        Some("cancelled by the owner; the unit was stopped")
+    );
+    assert_eq!(
+        *runtime.0.lock().unwrap(),
+        [
+            by_pm.unit_name.clone(),
+            by_global.unit_name.clone(),
+            own.unit_name.clone()
+        ]
+    );
+}
+
+/// Records the units a cancel stopped.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[derive(Default)]
+struct StopRecorder(std::sync::Mutex<Vec<String>>);
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+impl crate::agent_jobs::JobRuntime for StopRecorder {
+    fn launch(&self, _: &crate::agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    fn unit_active(&self, _: &str) -> bool {
+        false
+    }
+    fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+        self.0.lock().unwrap().push(unit.into());
+        Ok(())
+    }
+}
+
+/// A running job of `owner` with the typed `params` (a JSON object with its
+/// `kind`), inserted into the store.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn running_job(
+    p: &Pilot,
+    owner: Uuid,
+    project: Uuid,
+    params: serde_json::Value,
+) -> crate::store::agent_jobs::NewAgentJob {
+    let id = Uuid::new_v4();
+    let dir = p.repo.display().to_string();
+    let job = crate::store::agent_jobs::NewAgentJob {
+        id,
+        owner_session_id: owner,
+        project_id: Some(project),
+        name: None,
+        params: serde_json::from_value(params).unwrap(),
+        cwd: dir.clone(),
+        unit_name: format!("rsi-job-{id}"),
+        log_path: format!("{dir}/{id}.log"),
+        status_path: format!("{dir}/{id}.status"),
+        idempotency_key: None,
+        wake: rsi_common::agent_jobs::JobWake::Owner,
+    };
+    p.manager
+        .store
+        .lock()
+        .await
+        .insert_agent_job(&job, chrono::Utc::now())
+        .unwrap();
+    job
+}
+
+/// `sha_char` repeated into a 40-hex commit id.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+fn commit_id(sha_char: char) -> String {
+    sha_char.to_string().repeat(40)
+}
+
+/// Bind `job` to a real automatic bounded-QA obligation: `source` lands a
+/// published, QA-obliged queue entry (`sha_char` names its commit), and the
+/// obligation records `bounded_qa_requested` for `job` exactly as the QA loop's
+/// hub start does (`rolling_queue/bounded_qa.rs::start_on_hub`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn bind_bounded_qa(p: &Pilot, source: Uuid, sha_char: char, job: Uuid) {
+    use crate::store::rolling_queue::{BoundedQaPlacement, NewQueueEntry};
+    use rsi_common::rolling_queue::{
+        RollingQueueBinding, RollingQueueEntryState, RollingQueueOutcome,
+    };
+    let now = chrono::Utc::now();
+    let sha = commit_id(sha_char);
+    let store = p.manager.store.lock().await;
+    let entry = store
+        .enqueue_rolling_queue_source(
+            &NewQueueEntry {
+                project_id: Some(p.project),
+                repo_path: p.repo.display().to_string(),
+                source_commit: sha.clone(),
+                source_session_id: source,
+                owner_epic_id: None,
+                binding: RollingQueueBinding::Unbound,
+                work_key: None,
+                migration_version: None,
+                hot_files: vec![],
+                test_filters: vec!["rsid=rolling_queue".into()],
+                fixes_tests: Vec::new(),
+                idempotency_key: sha.clone(),
+            },
+            now,
+        )
+        .unwrap()
+        .0;
+    let batch = store.claim_rolling_queue_batch(now, 1).unwrap().unwrap();
+    store
+        .oblige_bounded_qa(batch.batch_id, &[entry.id], "derived_filters", now)
+        .unwrap();
+    store
+        .settle_rolling_queue_entry(
+            entry.id,
+            RollingQueueEntryState::Published,
+            &RollingQueueOutcome {
+                landed_sha: Some(sha.clone()),
+                detail: Some("gate_timing=selection=closure reason=explicit_filters".into()),
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    let landings: Vec<_> = store
+        .bounded_qa_landings()
+        .unwrap()
+        .into_iter()
+        .filter(|landing| landing.entry.id == entry.id)
+        .collect();
+    assert_eq!(landings.len(), 1, "the obliged landing is pending");
+    assert_eq!(landings[0].entry.source_session_id, source);
+    store
+        .request_bounded_qa(
+            &landings,
+            job,
+            &sha,
+            &BoundedQaPlacement::Hub {
+                reason: "no_peer".into(),
+            },
+            now,
+        )
+        .unwrap();
+}
+
+/// #2232: a manager cancels an ordinary in-scope worker test, but never a
+/// daemon-owned job attributed to that same worker: the automatic full-library
+/// QA run the queue starts for a landed worker (by recipe and by its real
+/// `bounded_qa_requested` binding), a lander, a cloud gate or sweep, or a
+/// release build. Every non-owner, in scope or not, gets `job_not_found`, and
+/// nothing is stopped.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_manager_cannot_cancel_a_daemon_owned_job_attributed_to_its_worker() {
+    use rsi_common::agent_jobs::JobState;
+
+    let g = portfolio().await;
+    let p = &g.p;
+    let worker = Uuid::new_v4();
+    live_leaf(p, worker, p.project, p.epic).await;
+    let recipe = serde_json::json!({
+        "kind":"test", "recipe": crate::agent_jobs::LIBRARY_QA_RECIPE, "timeout_minutes": 180
+    });
+    let ordinary_test = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"test","package":"rsid-core","filters":[]}),
+    )
+    .await;
+    // The automatic hub QA run, as `start_on_hub` submits it: attributed to the
+    // landed worker, the recipe job, bound to the obligation.
+    let hub_qa = running_job(p, worker, p.project, recipe.clone()).await;
+    bind_bounded_qa(p, worker, 'a', hub_qa.id).await;
+    // A job that looks ordinary but that an obligation is bound to is as
+    // protected as the recipe: the binding is the daemon's record.
+    let bound_only = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"test","package":"rsid-core","filters":[]}),
+    )
+    .await;
+    bind_bounded_qa(p, worker, 'b', bound_only.id).await;
+    // A recipe run without a bounded binding is a satellite's guest run for a
+    // hub (`RequestHubQaRun`): the same recipe, no local obligation row.
+    let guest_qa = running_job(p, worker, p.project, recipe).await;
+    let lander = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"landing","accepted":commit_id('c')}),
+    )
+    .await;
+    let cloud_gate = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"cloud_gate","accepted":commit_id('d')}),
+    )
+    .await;
+    let sweep = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"cloud_sweep","sha":commit_id('e')}),
+    )
+    .await;
+    let release = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"build","command":"build","workspace":true,"release":true}),
+    )
+    .await;
+    let protected = [
+        &hub_qa,
+        &bound_only,
+        &guest_qa,
+        &lander,
+        &cloud_gate,
+        &sweep,
+        &release,
+    ];
+
+    let control = p.manager.agent_control();
+    let runtime = std::sync::Arc::new(StopRecorder::default());
+    let cancel = |caller: Uuid, job_id: Uuid| {
+        control.agent_cancel_job(
+            caller,
+            rsi_common::agent_jobs::AgentCancelJobRequestV1 { job_id },
+            runtime.clone(),
+        )
+    };
+    let stopped = cancel(p.owner, ordinary_test.id).await.unwrap();
+    assert!(stopped.cancelled, "the ordinary worker test is in scope");
+    assert_eq!(stopped.cancelled_by_manager, Some(p.owner));
+    let missing = code(&cancel(p.owner, Uuid::new_v4()).await.unwrap_err());
+    assert!(missing.contains("job_not_found"), "{missing}");
+    for (manager, name) in [(p.owner, "pm"), (g.seat, "portfolio seat")] {
+        for job in protected {
+            let error = cancel(manager, job.id).await.unwrap_err();
+            assert_eq!(code(&error), missing, "{name} {}", job.id);
+        }
+    }
+    assert_eq!(
+        *runtime.0.lock().unwrap(),
+        [ordinary_test.unit_name.clone()],
+        "only the ordinary test was stopped"
+    );
+    for job in protected {
+        let row = p.manager.store.lock().await.get_agent_job(job.id).unwrap();
+        assert_eq!(row.unwrap().job.state, JobState::Running, "{}", job.id);
+    }
+    // The portfolio seat cancels an ordinary in-scope test the same way.
+    let seats = running_job(
+        p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"test","package":"rsid-core","filters":[]}),
+    )
+    .await;
+    let cancelled = cancel(g.seat, seats.id).await.unwrap();
+    assert_eq!(cancelled.cancelled_by_manager, Some(g.seat));
+}
+
+/// #2233: a non-owner never learns that a foreign job exists. A manager whose
+/// scope covers the owner but whose authority does not (the owner's lifecycle
+/// belongs to an ancestor) gets the same `job_not_found` as for an unknown job,
+/// not `manager_target_owned_by_ancestor`; only the owner's current in-scope
+/// manager sees a typed policy refusal.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn non_owner_cancel_refusals_all_collapse_to_job_not_found() {
+    use rsi_common::agent_jobs::JobState;
+
+    let g = portfolio().await;
+    let p = &g.p;
+    let control = p.manager.agent_control();
+    // A worker the global seat launched: the PM's scope covers it, but the
+    // global owns its lifecycle (rule (c), mutations flow down).
+    let by_global = control
+        .agent_manager_control(
+            g.seat,
+            global_control(&g, Some(p.project), "g-a", create_session(p, p.epic)),
+        )
+        .await
+        .unwrap()
+        .target_session_id
+        .unwrap();
+    let by_pm = control
+        .agent_manager_control(p.owner, pm_control(p, 2, "pm-a", create_session(p, p.epic)))
+        .await
+        .unwrap()
+        .target_session_id
+        .unwrap();
+    live_leaf(p, by_global, p.project, p.epic).await;
+    live_leaf(p, by_pm, p.project, p.epic).await;
+    let ordinary = serde_json::json!({"kind":"test","package":"rsid-core","filters":[]});
+    let ancestor_owned = running_job(p, by_global, p.project, ordinary.clone()).await;
+    let pm_owned = running_job(p, by_pm, p.project, ordinary.clone()).await;
+    let runtime = std::sync::Arc::new(StopRecorder::default());
+    let cancel = |caller: Uuid, id: Uuid| {
+        control.agent_cancel_job(
+            caller,
+            rsi_common::agent_jobs::AgentCancelJobRequestV1 { job_id: id },
+            runtime.clone(),
+        )
+    };
+    let unknown = code(&cancel(p.owner, Uuid::new_v4()).await.unwrap_err());
+    assert!(unknown.contains("job_not_found"), "{unknown}");
+    // The PM covers the global's worker, but the ancestor owns it: refused as
+    // an unknown job, though the same scope check on AgentHalt is typed.
+    let refused = code(&cancel(p.owner, ancestor_owned.id).await.unwrap_err());
+    assert_eq!(refused, unknown);
+    let halt = control.agent_halt(p.owner, by_global).await.unwrap_err();
+    assert!(
+        code(&halt).contains(MANAGER_TARGET_OWNED_BY_ANCESTOR),
+        "{halt}"
+    );
+    // An unrelated worker and the PM's own worker's job likewise.
+    let stranger = Uuid::new_v4();
+    live_leaf(p, stranger, p.project, p.epic).await;
+    for caller in [stranger, by_pm] {
+        let refused = code(&cancel(caller, ancestor_owned.id).await.unwrap_err());
+        assert_eq!(refused, unknown);
+    }
+    assert!(runtime.0.lock().unwrap().is_empty());
+    let row = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_agent_job(ancestor_owned.id);
+    assert_eq!(row.unwrap().unwrap().job.state, JobState::Running);
+    // The global seat is above the PM's worker and stops its job.
+    let cancelled = cancel(g.seat, pm_owned.id).await.unwrap();
+    assert_eq!(cancelled.cancelled_by_manager, Some(g.seat));
+}
+
+/// #2233: the owner's current in-scope manager keeps the typed policy refusal
+/// (here the missing `SessionControl` grant), while a caller with no manager
+/// reach over the owner gets `job_not_found` for the same job.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn the_owners_current_manager_keeps_typed_policy_refusals() {
+    let p = pilot().await;
+    let worker = Uuid::new_v4();
+    live_leaf(&p, worker, p.project, p.epic).await;
+    let job = running_job(
+        &p,
+        worker,
+        p.project,
+        serde_json::json!({"kind":"test","package":"rsid-core","filters":[]}),
+    )
+    .await;
+    let control = p.manager.agent_control();
+    let runtime = std::sync::Arc::new(StopRecorder::default());
+    let request = |caller: Uuid| {
+        control.agent_cancel_job(
+            caller,
+            rsi_common::agent_jobs::AgentCancelJobRequestV1 { job_id: job.id },
+            runtime.clone(),
+        )
+    };
+    let typed = code(&request(p.owner).await.unwrap_err());
+    assert!(typed.contains("manager_v2_capability_denied"), "{typed}");
+    let untyped = code(&request(Uuid::new_v4()).await.unwrap_err());
+    assert!(untyped.contains("job_not_found"), "{untyped}");
+    assert!(runtime.0.lock().unwrap().is_empty());
 }

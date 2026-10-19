@@ -21,6 +21,7 @@ use crate::store::portable_bundle::{self, PathRemap, PortableImportOptions};
 use serde::Deserialize;
 
 /// Operator RPC methods of this family. Never in an agent catalog.
+#[cfg(test)]
 pub const OPERATOR_METHODS: [&str; 2] = ["ExportPortableBundle", "ImportPortableBundle"];
 /// Stable refusal code for a session-attributed call.
 pub const OPERATOR_ONLY_REFUSAL: &str = "portable_bundle_operator_only";
@@ -207,7 +208,7 @@ mod tests {
                 }
             }
             let mut request = RpcRequest::new(method, serde_json::json!({"path": "/tmp/x"}));
-            request.session_token = Some("agent-token".to_string());
+            request.session_token = Some("agent-token".into());
             let error = refuse_attributed(method, &request).unwrap_err().to_string();
             assert!(error.contains(OPERATOR_ONLY_REFUSAL), "{error}");
         }

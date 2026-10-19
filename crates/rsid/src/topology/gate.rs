@@ -2,8 +2,9 @@
 //!
 //! The condition is a closed JSON AST; paths are `nodes.<id>.<field>…` over
 //! the recorded outputs of ancestor nodes only (validated statically). A
-//! missing path or a type mismatch is an error, which fails the gate; it is
-//! never coerced to `false`.
+//! missing path or a type mismatch is an error, which fails the gate, and is
+//! never coerced to `false`; the one exception is `exists`, which reports a
+//! missing (or null) path as `false` instead of failing.
 
 use rsi_common::types::GateCondition;
 use serde_json::{Map, Value};

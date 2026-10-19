@@ -32,9 +32,12 @@ pub mod custody;
 pub mod execution_scratch;
 pub mod git_worktree;
 pub mod reclaim;
-#[cfg(target_os = "linux")]
+// Linux (`openat2`) and macOS (a portable descriptor-relative walk, #89)
+// reclaim build caches; every other platform keeps the fail-closed shim and
+// reports `reclaim_unsupported`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod target_reclaim;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "target_reclaim_unsupported.rs"]
 pub mod target_reclaim;
 mod worktree_content_digest;
@@ -91,12 +94,33 @@ pub struct AllocationPermit {
 pub struct SandboxCapacity {
     pub source_roots: u64,
     pub available_bytes: u64,
+    /// Total size of the filesystem holding the sandbox base.
+    pub total_bytes: u64,
+}
+
+/// No launch floor may demand more than this share of the filesystem (#1884):
+/// a 60 GiB floor tuned for a 775 GiB host would refuse every launch on a
+/// 192 GiB laptop that is only three quarters full.
+pub const MAX_FLOOR_PERCENT_OF_DISK: u64 = 25;
+
+/// The launch floor in bytes: the configured `sandbox_min_free_gib`, capped at
+/// [`MAX_FLOOR_PERCENT_OF_DISK`] of the filesystem. A configured floor of zero
+/// stays zero, and an unknown filesystem size (`0`) applies no cap.
+pub fn effective_min_free_bytes(configured_gib: u64, total_bytes: u64) -> u64 {
+    let configured = configured_gib.saturating_mul(1024 * 1024 * 1024);
+    if total_bytes == 0 {
+        return configured;
+    }
+    let cap = u128::from(total_bytes) * u128::from(MAX_FLOOR_PERCENT_OF_DISK) / 100;
+    configured.min(u64::try_from(cap).unwrap_or(u64::MAX))
 }
 
 static ALLOCATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 #[cfg(test)]
 mod allocation_tests;
+#[cfg(test)]
+pub(crate) mod startup_restore_tests;
 
 impl AllocationPermit {
     pub async fn acquire(base: &Path) -> Result<Self> {
@@ -151,6 +175,7 @@ impl AllocationPermit {
             source_roots,
             available_bytes: (stats.blocks_available() as u64)
                 .saturating_mul(stats.fragment_size() as u64),
+            total_bytes: (stats.blocks() as u64).saturating_mul(stats.fragment_size() as u64),
         })
     }
 
@@ -274,27 +299,6 @@ impl SandboxAllocator {
                 kind
             ))),
         }
-    }
-
-    /// Allocate a distinct sandbox root for a session that had a prior,
-    /// terminal sandbox. This is used to restore an archived session without
-    /// reusing a historical custody identity.
-    #[cfg(any(test, feature = "test-seam"))]
-    pub(crate) fn allocate_replacement(
-        &self,
-        session_id: Uuid,
-        origin: &Path,
-        kind: SandboxKind,
-        source_commit: &str,
-        requested_branch: Option<&str>,
-    ) -> Result<SandboxAllocation> {
-        self.allocate_replacement_unchecked(
-            session_id,
-            origin,
-            kind,
-            source_commit,
-            requested_branch,
-        )
     }
 
     #[allow(clippy::needless_pass_by_value)] // Own the permit through the allocation.

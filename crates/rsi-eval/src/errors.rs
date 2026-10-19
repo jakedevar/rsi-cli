@@ -13,6 +13,9 @@ pub enum EvalError {
     #[error("daemon RPC error: {0}")]
     Rpc(String),
 
+    #[error("bench record error: {0}")]
+    Bench(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use rsi_common::types::{
-    ContextUsageConfidence, EspGame, Project, Session, SessionKind, SessionProvider, SessionStatus,
-    TurnMetric, Workflow, WorkflowDocument, WorkflowStage,
+    ContextUsageConfidence, Project, Session, SessionKind, SessionProvider, SessionStatus,
+    TurnMetric,
 };
 use rsid::store::Store;
 use uuid::Uuid;

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "about": "Documented client facilities for scripts/source-guard.mjs (hub #3104). The shipped desktop client reaches project files, Issues, sessions and rsi state only through rsid. Each entry below is the one narrow exception: a file, a rule, how many uses and why it is not file or state access. A new use needs an entry with a reason; an entry nothing uses fails the check as stale.",
+  "facilities": [
+    { "file": "src-tauri/src/daemon.rs", "rule": "rs-env", "max": 3, "reason": "Finds the rsid socket: RSI_DAEMON_SOCKET, else HOME or USERPROFILE. It names where to connect; nothing is read from that path." },
+    { "file": "src-tauri/src/daemon.rs", "rule": "rs-rsi-state", "max": 1, "reason": "Builds the default socket path ~/.rsi/daemon.sock for the JSON-RPC connection. The client only connects to it, as the TUI does; it opens no rsi state file." },
+    { "file": "src-tauri/src/nav.rs", "rule": "rs-process", "max": 1, "reason": "Hands a checked absolute http(s) URL to the platform opener (open, xdg-open, rundll32) as one argument with no shell; the TUI has the same best-effort opener." },
+    { "file": "src-tauri/src/pty.rs", "rule": "rs-env", "max": 2, "reason": "The terminal overlay picks the user's login shell (SHELL, ComSpec) and home directory (HOME, USERPROFILE) for its PTY." },
+    { "file": "src-tauri/src/pty.rs", "rule": "rs-path-probe", "max": 3, "reason": "Checks that the session's working directory or the home directory exists before the terminal overlay starts a shell there; it lists and reads nothing." },
+    { "file": "src-tauri/src/pty.rs", "rule": "rs-process", "max": 1, "reason": "The terminal overlay's PTY (portable-pty) runs the user's own shell, the desktop counterpart of the TUI's terminal overlay; it is an interactive terminal the operator drives, not a client file read." }
+  ]
+}

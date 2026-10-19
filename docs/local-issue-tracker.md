@@ -138,7 +138,7 @@ are documented in [Agent control](agent-control.md#guarded-issue-control-v95).
 For example, an owning lead can update status through the one lifecycle verb:
 
 ```text
-rsi-rpc AgentUpdateIssueStatus --params '{"issue_id":"<uuid>","status":"Closed","expected_row_version":3,"idempotency_key":"close-v1"}'
+rsi-rpc AgentUpdateIssueStatus --params '{"issue_id":"<uuid>","status":"Closed","expected_row_version":3,"idempotency_key":"close-v1","note":"covered_by <sha>"}'
 ```
 
 The exact retry returns the original `issue` and immutable `event` with
@@ -150,6 +150,12 @@ status, and archived rows never appear in ready/local dispatch selection.
 Issue pages use an exclusive `(display_number, issue_id)` cursor, while history
 uses `after_sequence`. Operators can inspect bounded audit history via
 `ListIssueEvents`; generic Issue verbs remain default-denied to tokened callers.
+Worker handoffs published with `AgentUpdateIssue {handoff}` are separate
+append-only records (`issue_handoffs`); the operator reads them with
+`ListIssueHandoffs` (`project_id`, `issue_id`, `after_sequence`, `limit` 1–32,
+default 16; ascending, with `next_after_sequence` and `total`). The TUI Issue
+inspector loads that page with the other inspector data and shows each record as
+a collapsed `HANDOFF` item that `o` unfolds.
 
 Automatic content is deliberately bounded. Its title is `Pipeline worker
 failed: <Kind> <root-prefix>`; labels are exactly `pipeline-failure`,

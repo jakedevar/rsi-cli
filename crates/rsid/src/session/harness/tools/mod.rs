@@ -4,151 +4,39 @@
 //! file I/O, shell execution, and git operations. The registry collects tools
 //! and dispatches execution by name.
 
-pub mod apply_patch;
 pub mod arguments;
 pub mod codegraph;
 mod completion_gate;
+mod custody_guard;
 pub mod exec;
-pub mod file;
 pub mod git;
-pub mod list_files;
 pub mod memory;
-pub mod policy;
 pub(crate) mod process_registry;
-pub mod read_output;
 pub mod rsi_control;
 pub mod schedule_wake;
 pub mod shell;
-pub(crate) mod truncation;
 pub mod utility;
-pub mod view_image;
+pub mod web_fetch;
+pub mod web_search;
+
+// #2616: the tool trait, context, limits and the pure file/navigation tools live in
+// `rsid-harness`. These re-exports keep every old `harness::tools::<name>` path.
+#[allow(unused_imports)] // Preserves the old module paths for callers and tests.
+pub use rsid_harness::tools::{
+    HarnessTool, ToolContext, ToolExecutionMode, ToolPolicy, apply_patch, file, glob, grep,
+    is_system_blocked, list_files, policy, read_output, suggest_tool_names, view_image,
+};
+pub(crate) use rsid_harness::tools::{MAX_LISTED_TOOL_NAMES, truncation};
 
 use crate::claude::StreamEvent;
 use crate::session::agent_verbs::AgentControlHandle;
 use crate::session::harness::mcp::StdioMcpClient;
-use crate::session::harness::types::{HarnessToolSpec, HarnessToolSpecKind, ToolResult};
-use serde_json::json;
+use crate::session::harness::types::{HarnessToolSpec, ToolResult};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-/// Whether a tool may execute alongside other calls from the same model turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolExecutionMode {
-    ParallelSafe,
-    Sequential,
-}
-
-/// Shared limits passed to tools. Later session policy can narrow these limits.
-#[derive(Debug, Clone, Copy)]
-pub struct ToolPolicy {
-    pub max_output_bytes: usize,
-    /// Network egress policy (#774). A network-capable tool reads it from its
-    /// `ToolContext` and never from an ambient global; the default is the
-    /// fail-closed `deny_private` mode.
-    pub egress: rsi_common::egress_policy::EgressPolicy,
-}
-
-impl Default for ToolPolicy {
-    fn default() -> Self {
-        Self {
-            max_output_bytes: 1024 * 1024,
-            egress: rsi_common::egress_policy::EgressPolicy::default(),
-        }
-    }
-}
-
-/// Construction-bound context for one tool invocation.
-#[derive(Clone)]
-pub struct ToolContext {
-    pub session_id: Option<uuid::Uuid>,
-    pub working_dir: PathBuf,
-    pub cancel: CancellationToken,
-    pub event_sink: Option<mpsc::Sender<StreamEvent>>,
-    pub policy: ToolPolicy,
-}
-
-impl ToolContext {
-    pub async fn report_progress(&self, tool_name: &str, message: &str) {
-        if let Some(sink) = &self.event_sink {
-            let _ = sink
-                .send(StreamEvent {
-                    event_type: "tool_progress".into(),
-                    data: json!({
-                        "session_id": self.session_id,
-                        "name": tool_name,
-                        "message": message,
-                    }),
-                })
-                .await;
-        }
-    }
-}
-
-/// Trait for tools executable by the agent harness.
-#[async_trait::async_trait]
-pub trait HarnessTool: Send + Sync {
-    /// Tool name (must be unique within a registry).
-    fn name(&self) -> &str;
-
-    /// Human-readable description for the LLM.
-    fn description(&self) -> &str;
-
-    /// JSON Schema string for input parameters.
-    fn parameters_json(&self) -> &str;
-
-    /// Calls are sequential unless the tool explicitly declares itself safe.
-    fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Sequential
-    }
-
-    /// Execute the tool with the given arguments.
-    async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult;
-
-    /// Execute while honoring harness cancellation. Process-backed tools
-    /// override this so cancellation waits for child cleanup and reap; other
-    /// tools retain their existing future-drop behavior.
-    async fn execute_cancellable(
-        &self,
-        args: serde_json::Value,
-        working_dir: &Path,
-        cancel: &CancellationToken,
-    ) -> ToolResult {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some("Tool execution cancelled".to_string()),
-            },
-            result = self.execute(args, working_dir) => result,
-        }
-    }
-
-    /// New tools receive progress, cancellation, policy and session context.
-    /// Existing tools keep their cancellable implementation during migration.
-    async fn execute_with_context(
-        &self,
-        args: serde_json::Value,
-        context: &ToolContext,
-    ) -> ToolResult {
-        self.execute_cancellable(args, &context.working_dir, &context.cancel)
-            .await
-    }
-
-    /// Convert to a HarnessToolSpec for provider API calls.
-    fn to_spec(&self) -> HarnessToolSpec {
-        HarnessToolSpec {
-            name: self.name().to_string(),
-            description: self.description().to_string(),
-            parameters_json: self.parameters_json().to_string(),
-            freeform: None,
-            kind: HarnessToolSpecKind::Function,
-        }
-    }
-}
 
 /// Registry of available tools for the agent loop.
 pub struct HarnessToolRegistry {
@@ -310,6 +198,19 @@ impl HarnessToolRegistry {
             .expect("built-in Harness tool names must be unique");
     }
 
+    /// Swap a registered tool for a test double of the same name, keeping the
+    /// roster order. The production web tools refuse loopback servers, so an
+    /// end-to-end scenario built on [`Self::default_tools`] aims them at a
+    /// local page server this way (#2259).
+    #[cfg(test)]
+    pub(crate) fn replace_for_test(&mut self, tool: Arc<dyn HarnessTool>) {
+        let name = tool.name().to_string();
+        assert!(
+            self.tools.insert(name.clone(), tool).is_some(),
+            "replace_for_test: `{name}` is not registered"
+        );
+    }
+
     /// Register a tool without changing the existing roster on a duplicate.
     pub fn try_register(&mut self, tool: Arc<dyn HarnessTool>) -> Result<(), String> {
         let name = tool.name().to_string();
@@ -363,6 +264,7 @@ impl HarnessToolRegistry {
         ProcessTurnGuard(registry)
     }
 
+    #[cfg(test)]
     pub(crate) async fn shutdown_processes(&self) {
         if let Some(registry) = &self.process_registry {
             registry.shutdown_processes().await;
@@ -413,20 +315,95 @@ impl HarnessToolRegistry {
         if let Some(refusal) = self.deferred_mcp_error(name) {
             return refusal;
         }
-        let result = match self.tools.get(name) {
+        if let Some(refusal) = self.argument_refusal(name, &args) {
+            return refusal;
+        }
+        let schema_error = rsi_control::schema_error(name, &args);
+        let mut result = match self.tools.get(name) {
             Some(tool) => self.finish_result(
                 name,
                 tool.execute_with_context(args, &context).await,
                 context.policy.max_output_bytes,
             ),
-            None => ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some(format!("Unknown tool: {name}")),
-            },
+            None => self.unknown_tool_result(name),
         };
+        rsi_control::enrich_schema_refusal(schema_error, &mut result);
         self.record_policy_bytes(&result);
         result
+    }
+
+    /// The refusal for arguments that do not fit the tool's JSON Schema: every
+    /// missing or invalid field and the expected type or enum, with the tool
+    /// not run (#2257). Native control tools keep their own, richer diagnostic
+    /// (`rsi_control::schema_error`), so they are not checked here.
+    fn argument_refusal(&self, name: &str, args: &serde_json::Value) -> Option<ToolResult> {
+        let tool = self.tools.get(name)?;
+        if rsi_control::has_catalog_schema(name) {
+            return None;
+        }
+        let schema: serde_json::Value = serde_json::from_str(tool.parameters_json()).ok()?;
+        let problems = arguments::validate_with_schema(args, &schema);
+        if problems.is_empty() {
+            return None;
+        }
+        Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error_msg: Some(arguments::invalid_arguments_message(
+                name, args, &schema, &problems,
+            )),
+        })
+    }
+
+    /// Names the model can call now: registration order, minus tools the
+    /// session policy refuses and MCP tools still deferred.
+    fn callable_names(&self) -> Vec<String> {
+        let deferred_mcp = self.deferred_mcp.read().expect("deferred MCP state lock");
+        self.order
+            .iter()
+            .filter(|name| {
+                self.policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.tool_permitted(name, false).is_ok())
+                    && !deferred_mcp.is_hidden(name)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The error for a call to a tool that is not registered (or an empty
+    /// name): close names first, then the callable names (#2257).
+    pub(crate) fn unknown_tool_message(&self, name: &str) -> String {
+        let callable = self.callable_names();
+        let mut message = if name.trim().is_empty() {
+            "The tool call has an empty name.".to_string()
+        } else {
+            format!("Unknown tool: {name}.")
+        };
+        let suggestions = suggest_tool_names(name, &callable);
+        if !suggestions.is_empty() {
+            message.push_str(&format!(" Did you mean: {}?", suggestions.join(", ")));
+        }
+        if !callable.is_empty() {
+            let shown = callable.len().min(MAX_LISTED_TOOL_NAMES);
+            message.push_str(&format!(
+                " Available tools: {}",
+                callable[..shown].join(", ")
+            ));
+            if callable.len() > shown {
+                message.push_str(&format!(" (and {} more)", callable.len() - shown));
+            }
+            message.push('.');
+        }
+        message
+    }
+
+    fn unknown_tool_result(&self, name: &str) -> ToolResult {
+        ToolResult {
+            success: false,
+            output: String::new(),
+            error_msg: Some(self.unknown_tool_message(name)),
+        }
     }
 
     pub(crate) fn set_context_usage(&self, used_tokens: u64, token_limit: u64) {
@@ -438,6 +415,7 @@ impl HarnessToolRegistry {
         self.utility_state.take_compaction_focus().await
     }
 
+    #[cfg(test)]
     pub async fn execute(
         &self,
         name: &str,
@@ -450,22 +428,24 @@ impl HarnessToolRegistry {
         if let Some(refusal) = self.deferred_mcp_error(name) {
             return refusal;
         }
-        let result = match self.tools.get(name) {
+        if let Some(refusal) = self.argument_refusal(name, &args) {
+            return refusal;
+        }
+        let schema_error = rsi_control::schema_error(name, &args);
+        let mut result = match self.tools.get(name) {
             Some(tool) => self.finish_result(
                 name,
                 tool.execute(args, working_dir).await,
                 ToolPolicy::default().max_output_bytes,
             ),
-            None => ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some(format!("Unknown tool: {name}")),
-            },
+            None => self.unknown_tool_result(name),
         };
+        rsi_control::enrich_schema_refusal(schema_error, &mut result);
         self.record_policy_bytes(&result);
         result
     }
 
+    #[cfg(test)]
     pub async fn execute_cancellable(
         &self,
         name: &str,
@@ -479,18 +459,19 @@ impl HarnessToolRegistry {
         if let Some(refusal) = self.deferred_mcp_error(name) {
             return refusal;
         }
-        let result = match self.tools.get(name) {
+        if let Some(refusal) = self.argument_refusal(name, &args) {
+            return refusal;
+        }
+        let schema_error = rsi_control::schema_error(name, &args);
+        let mut result = match self.tools.get(name) {
             Some(tool) => self.finish_result(
                 name,
                 tool.execute_cancellable(args, working_dir, cancel).await,
                 ToolPolicy::default().max_output_bytes,
             ),
-            None => ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some(format!("Unknown tool: {name}")),
-            },
+            None => self.unknown_tool_result(name),
         };
+        rsi_control::enrich_schema_refusal(schema_error, &mut result);
         self.record_policy_bytes(&result);
         result
     }
@@ -520,6 +501,7 @@ impl HarnessToolRegistry {
     /// `image_input_supported` is resolved from the actual provider route and
     /// transformed model; the tool remains discoverable on non-vision routes
     /// so attempted calls return an explicit unsupported error.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn default_tools(
         memory_handle: Option<&crate::memory::worker::MemoryHandle>,
@@ -548,6 +530,7 @@ impl HarnessToolRegistry {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn default_tools_with_execution_scratch(
         memory_handle: Option<&crate::memory::worker::MemoryHandle>,
@@ -602,7 +585,10 @@ impl HarnessToolRegistry {
         registry.register(Arc::new(utility::ContextStatusTool::new(Arc::clone(
             &utility_state,
         ))));
-        registry.register(Arc::new(utility::CompactTool::new(utility_state)));
+        registry.register(Arc::new(utility::CompactTool::new(
+            utility_state,
+            store.clone(),
+        )));
         registry.register(Arc::new(file::ReadFileTool));
         registry.register(Arc::new(file::WriteFileTool));
         registry.register(Arc::new(file::EditFileTool));
@@ -629,12 +615,19 @@ impl HarnessToolRegistry {
             launch_invocation_id,
         )));
         registry.register(Arc::new(list_files::ListFilesTool));
+        // #2254: native content and path search, so a model does not shell out
+        // to `rg` or `find` (no external binary, same sandbox and cancel rules).
+        registry.register(Arc::new(grep::GrepTool));
+        registry.register(Arc::new(glob::GlobTool));
         registry.register(Arc::new(read_output::ReadOutputTool::new(
             registry.spill_config(),
         )));
         registry.register(Arc::new(view_image::ViewImageTool::new(
             image_input_supported,
         )));
+        // #2250: the native fetch for routes without a hosted one. The agent
+        // loop drops this spec when the route advertises its own `web_fetch`.
+        registry.register(Arc::new(web_fetch::WebFetchTool::new()));
         if let Some(handle) = memory_handle {
             registry.register(Arc::new(memory::MemorySearchTool::new(
                 handle.clone(),
@@ -679,6 +672,14 @@ impl HarnessToolRegistry {
             registry.register(Arc::new(
                 rsi_control::RsiControlQueryFailureSignaturesTool::new(control.clone(), caller),
             ));
+            registry.register(Arc::new(rsi_control::RsiControlWorkerRosterTool::new(
+                control.clone(),
+                caller,
+            )));
+            registry.register(Arc::new(rsi_control::RsiControlListWakesTool::new(
+                control.clone(),
+                caller,
+            )));
             for verb in rsi_control::GLOBAL_NATIVE_VERBS {
                 registry.register(Arc::new(rsi_control::RsiControlGlobalTool::new(
                     control.clone(),
@@ -758,8 +759,14 @@ fn default_spill_config() -> rsi_common::spill::SpillConfig {
 
 /// Tools whose output the model asked for verbatim: they spill only when the
 /// text would otherwise be cut at the hard cap, never at the 8 KB threshold.
+/// A `web_fetch` page slice is already bounded by its own `max_chars` and
+/// pages by `start_index`, and a `web_search` result list by its own cap, so a
+/// stub would only hide the text the model asked for.
 fn is_deliberate_read(name: &str) -> bool {
-    matches!(name, "read_file" | "view_image")
+    matches!(
+        name,
+        "read_file" | "view_image" | "web_fetch" | "web_search"
+    )
 }
 
 /// `Exit code: N` from a failed command result, else `0` for a successful
@@ -783,7 +790,8 @@ impl HarnessToolRegistry {
         Arc::clone(&self.spill)
     }
 
-    /// Replace the spill store, before tools are registered (tests, operators).
+    /// Replace the spill store, before tools are registered (tests).
+    #[cfg(test)]
     pub fn set_spill_config(&mut self, config: rsi_common::spill::SpillConfig) {
         self.spill = Arc::new(config);
     }
@@ -834,42 +842,10 @@ impl HarnessToolRegistry {
     }
 }
 
-/// System blocklist -- these paths are never writable even with wildcard allowed_paths.
-const SYSTEM_BLOCKLIST: &[&str] = &[
-    "/bin",
-    "/sbin",
-    "/usr/bin",
-    "/usr/sbin",
-    "/usr/lib",
-    "/etc",
-    "/dev",
-    "/proc",
-    "/sys",
-    "/boot",
-];
-
-/// Check if a resolved path falls within the system blocklist.
-pub fn is_system_blocked(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    SYSTEM_BLOCKLIST
-        .iter()
-        .any(|blocked| path_str.starts_with(blocked))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
-    #[test]
-    fn test_is_system_blocked() {
-        assert!(is_system_blocked(Path::new("/etc/passwd")));
-        assert!(is_system_blocked(Path::new("/bin/bash")));
-        assert!(is_system_blocked(Path::new("/usr/bin/ls")));
-        assert!(is_system_blocked(Path::new("/proc/self/maps")));
-        assert!(!is_system_blocked(Path::new("/home/user/project/file.rs")));
-        assert!(!is_system_blocked(Path::new("/tmp/workdir/file.txt")));
-    }
+    use serde_json::json;
 
     struct CountingTool {
         name: &'static str,
@@ -895,6 +871,58 @@ mod tests {
                 output: self.output.to_string(),
                 error_msg: None,
             }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn native_agent_schema_refusals_share_diagnostics_across_execution_modes() {
+        struct RefusingAgentTool;
+        #[async_trait::async_trait]
+        impl HarnessTool for RefusingAgentTool {
+            fn name(&self) -> &str {
+                "rsi_control_read_session_events"
+            }
+            fn description(&self) -> &str {
+                "fixture refusal"
+            }
+            fn parameters_json(&self) -> &str {
+                "{}"
+            }
+            async fn execute(&self, _: serde_json::Value, _: &Path) -> ToolResult {
+                ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(
+                        r#"{"code":"existing_refusal","class":"legacy","field":"limit"}"#.into(),
+                    ),
+                }
+            }
+        }
+        let mut registry = HarnessToolRegistry::new();
+        registry.register(Arc::new(RefusingAgentTool));
+        let name = "rsi_control_read_session_events";
+        let args = serde_json::json!({"session_id":uuid::Uuid::new_v4(), "limit":101});
+        let cancel = CancellationToken::new();
+        let dir = Path::new(".");
+        for result in [
+            registry.execute(name, args.clone(), dir).await,
+            registry
+                .execute_cancellable(name, args.clone(), dir, &cancel)
+                .await,
+            registry
+                .execute_with_context(name, args, dir, &cancel, None)
+                .await,
+        ] {
+            assert!(!result.success);
+            let error: serde_json::Value =
+                serde_json::from_str(result.error_msg.as_deref().unwrap()).unwrap();
+            assert_eq!(error["code"], "existing_refusal");
+            assert_eq!(error["class"], "legacy");
+            assert_eq!(error["field"], "limit");
+            assert_eq!(error["path"], "params.limit");
+            assert_eq!(error["constraint"], "maximum 100");
+            assert_eq!(error["value"], 101);
         }
     }
 
@@ -1025,6 +1053,8 @@ mod tests {
         assert!(names.contains(&"write_stdin".to_string()));
         assert!(names.contains(&"git".to_string()));
         assert!(names.contains(&"list_files".to_string()));
+        assert!(names.contains(&"grep".to_string()));
+        assert!(names.contains(&"glob".to_string()));
         assert!(names.contains(&"view_image".to_string()));
     }
 
@@ -1050,8 +1080,11 @@ mod tests {
                 "write_stdin",
                 "git",
                 "list_files",
+                "grep",
+                "glob",
                 "read_output",
-                "view_image"
+                "view_image",
+                "web_fetch"
             ]
         );
     }
@@ -1271,8 +1304,19 @@ mod tests {
             registry.execution_mode("list_files"),
             Some(ToolExecutionMode::ParallelSafe)
         );
+        for navigation_tool in ["grep", "glob"] {
+            assert_eq!(
+                registry.execution_mode(navigation_tool),
+                Some(ToolExecutionMode::ParallelSafe),
+                "{navigation_tool}"
+            );
+        }
         assert_eq!(
             registry.execution_mode("view_image"),
+            Some(ToolExecutionMode::ParallelSafe)
+        );
+        assert_eq!(
+            registry.execution_mode("web_fetch"),
             Some(ToolExecutionMode::ParallelSafe)
         );
         assert_eq!(
@@ -1378,8 +1422,11 @@ mod tests {
             "write_stdin",
             "git",
             "list_files",
+            "grep",
+            "glob",
             "read_output",
             "view_image",
+            "web_fetch",
             "rsi_control_program_guard",
         ]
         .iter()
@@ -1439,12 +1486,13 @@ mod tests {
                 "AgentReportToHub",
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
+                "AgentPushSatelliteManagerPolicy",
+                "AgentReseatSatelliteManager",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
                 // #1028 and #1042 landed both wake verbs as RPC-only by design.
                 "AgentCancelWake",
-                "AgentListWakes",
             ]),
             "the native Harness RPC-only verb set changed without review"
         );
@@ -1713,5 +1761,144 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "read_output")
         );
+    }
+}
+
+/// Tool-call recovery (#2257): argument validation and unknown-tool guidance
+/// are the registry's, so every execution mode answers alike.
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SchemaTool {
+        name: &'static str,
+        schema: &'static str,
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessTool for SchemaTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "fixture"
+        }
+        fn parameters_json(&self) -> &str {
+            self.schema
+        }
+        async fn execute(&self, _args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            ToolResult {
+                success: true,
+                output: "ran".to_string(),
+                error_msg: None,
+            }
+        }
+    }
+
+    const READ_SCHEMA: &str = r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer"}}}"#;
+
+    fn registry_with(names: &[&'static str]) -> (HarnessToolRegistry, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = HarnessToolRegistry::new();
+        for name in names {
+            registry.register(Arc::new(SchemaTool {
+                name,
+                schema: READ_SCHEMA,
+                runs: Arc::clone(&runs),
+            }));
+        }
+        (registry, runs)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn invalid_arguments_refuse_the_call_in_every_execution_mode() {
+        let (registry, runs) = registry_with(&["read_file"]);
+        let dir = Path::new("/tmp");
+        let cancel = CancellationToken::new();
+        let args = json!({"offset": "later"});
+
+        let results = [
+            registry.execute("read_file", args.clone(), dir).await,
+            registry
+                .execute_cancellable("read_file", args.clone(), dir, &cancel)
+                .await,
+            registry
+                .execute_with_context("read_file", args.clone(), dir, &cancel, None)
+                .await,
+        ];
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the tool must not run");
+        let first = results[0].error_msg.clone().expect("a validation error");
+        for result in &results {
+            assert!(!result.success);
+            assert_eq!(result.error_msg.as_deref(), Some(first.as_str()));
+        }
+        assert!(
+            first.contains("missing required field `path` (expected string)"),
+            "{first}"
+        );
+        assert!(
+            first.contains("`offset`: expected integer, got string \"later\""),
+            "{first}"
+        );
+
+        // The corrected call runs.
+        let fixed = registry
+            .execute("read_file", json!({"path": "a.rs", "offset": 3}), dir)
+            .await;
+        assert!(fixed.success, "{fixed:?}");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn unknown_tools_get_suggestions_and_the_callable_names() {
+        let (registry, _) = registry_with(&["read_file", "file_edit", "glob", "grep", "shell"]);
+        let message = registry
+            .execute("read", json!({}), Path::new("/tmp"))
+            .await
+            .error_msg
+            .expect("an unknown-tool error");
+        assert!(
+            message.starts_with("Unknown tool: read. Did you mean: read_file?"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Available tools: read_file, file_edit, glob, grep, shell."),
+            "{message}"
+        );
+
+        // Within three edits, ignoring case and `-` versus `_`.
+        let typo = registry.unknown_tool_message("Read-Fil");
+        assert!(typo.contains("Did you mean: read_file?"), "{typo}");
+        let namespaced = registry.unknown_tool_message("functions.grep");
+        assert!(namespaced.contains("Did you mean: grep?"), "{namespaced}");
+
+        // Nothing close: no suggestion, still the names.
+        let far = registry.unknown_tool_message("deploy_to_production");
+        assert!(!far.contains("Did you mean"), "{far}");
+        assert!(far.contains("Available tools:"), "{far}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn unknown_tool_names_are_capped_and_an_empty_name_is_named() {
+        let names: Vec<&'static str> = (0..25)
+            .map(|index| &*Box::leak(format!("tool_{index:02}").into_boxed_str()))
+            .collect();
+        let (registry, _) = registry_with(&names);
+        let message = registry.unknown_tool_message("");
+        assert!(
+            message.starts_with("The tool call has an empty name."),
+            "{message}"
+        );
+        assert!(message.contains("tool_19"), "{message}");
+        assert!(!message.contains("tool_20"), "{message}");
+        assert!(message.contains("(and 5 more)"), "{message}");
+        assert!(!message.contains("Did you mean"), "{message}");
     }
 }

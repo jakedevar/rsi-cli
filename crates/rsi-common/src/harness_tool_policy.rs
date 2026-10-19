@@ -22,7 +22,11 @@ pub const HOSTED_SEARCH_COST_USD_MICROS: u64 = 10_000;
 /// Stable refusal codes, used as the whole error text (launch validation) or
 /// the `Error: <code>: ...` prefix of a settled tool-error row.
 pub const TOOL_POLICY_INVALID: &str = "tool_policy_invalid";
-pub const TOOL_POLICY_UNSUPPORTED_PROVIDER: &str = "tool_policy_unsupported_provider";
+/// The whole error text is `tool_policy_unsupported_for_provider:<what>`, where
+/// `<what>` names the provider and, for a CLI provider, the policy field its CLI
+/// cannot express (`claude:web_access`, `antigravity`). A policy is never
+/// silently widened to fit a provider (#2758).
+pub const TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER: &str = "tool_policy_unsupported_for_provider";
 pub const TOOL_POLICY_DENIED: &str = "tool_policy_denied";
 pub const TOOL_BUDGET_EXHAUSTED: &str = "tool_budget_exhausted";
 
@@ -36,6 +40,123 @@ pub const fn provider_runs_harness_loop(provider: crate::types::SessionProvider)
             | crate::types::SessionProvider::OpenRouter
             | crate::types::SessionProvider::Bedrock
     )
+}
+
+/// Providers whose CLI can enforce the CLI-expressible part of a policy
+/// ([`CliAccessMode`]): the Claude Code CLI and the Codex CLI family. The
+/// Codex-routed OpenRouter and Bedrock sessions are Harness-loop providers and
+/// are not listed.
+#[must_use]
+pub const fn provider_runs_policy_cli(provider: crate::types::SessionProvider) -> bool {
+    matches!(
+        provider,
+        crate::types::SessionProvider::Claude
+            | crate::types::SessionProvider::Codex
+            | crate::types::SessionProvider::Pioneer
+    )
+}
+
+/// Lowercase label of a provider inside a `tool_policy_unsupported_for_provider`
+/// `<what>`.
+#[must_use]
+pub const fn provider_label(provider: crate::types::SessionProvider) -> &'static str {
+    use crate::types::SessionProvider as P;
+    match provider {
+        P::Claude => "claude",
+        P::Codex => "codex",
+        P::Pioneer => "pioneer",
+        P::OpenRouter => "openrouter",
+        P::Bedrock => "bedrock",
+        P::Local => "local",
+        P::Antigravity => "antigravity",
+        P::CodexAppServer => "codex_app_server",
+        P::Harness => "harness",
+    }
+}
+
+/// The typed refusal for starting `policy` on `provider`, or `None` when the
+/// provider can enforce it. `policy` is `None` for a session that is under the
+/// daemon-wide Harness defaults only; no CLI enforces those.
+///
+/// Harness-loop providers enforce everything except [`CliAccessMode`]; the
+/// Claude and Codex CLIs enforce only [`CliAccessMode`]; every other provider
+/// enforces nothing.
+#[must_use]
+pub fn provider_policy_refusal(
+    provider: crate::types::SessionProvider,
+    policy: Option<&HarnessToolPolicy>,
+) -> Option<String> {
+    let label = provider_label(provider);
+    let what = if provider_runs_harness_loop(provider) {
+        policy
+            .is_some_and(|policy| policy.cli_access.is_some())
+            .then_some("cli_access")
+    } else if provider_runs_policy_cli(provider) {
+        match policy {
+            Some(policy) => policy.cli_unsupported_field(),
+            None => Some("daemon_defaults"),
+        }
+    } else {
+        return Some(format!("{TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER}:{label}"));
+    }?;
+    Some(format!(
+        "{TOOL_POLICY_UNSUPPORTED_FOR_PROVIDER}:{label}:{what}"
+    ))
+}
+
+/// What a CLI provider is allowed to do (#2758). Unset is today's behavior:
+/// Claude `bypassPermissions`, Codex the daemon-wide `codex_sandbox_mode`.
+/// Operator-only, like the rest of the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliAccessMode {
+    /// A read-only session: the CLI can read the workspace and call the
+    /// `rsi-agent` MCP tools, and nothing else. Codex runs `--sandbox
+    /// read-only`; Claude runs `--permission-mode dontAsk` with an explicit
+    /// read-only `--tools` allowlist (no shell, no edit tools).
+    ReadOnly,
+}
+
+/// Claude's `--permission-mode` for a read-only session. `dontAsk` denies every
+/// tool the allowlist does not name instead of prompting, which a headless
+/// `-p` turn cannot answer.
+pub const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "dontAsk";
+/// The built-in Claude tools a read-only session keeps. MCP tools are not part
+/// of `--tools`; `mcp__rsi-agent` is added to `--allowedTools` separately.
+pub const CLAUDE_READ_ONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+impl CliAccessMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read_only" => Some(Self::ReadOnly),
+            _ => None,
+        }
+    }
+
+    /// One line for the session transcript: the effective sandbox or
+    /// permission mode `provider`'s CLI runs under.
+    #[must_use]
+    pub fn describe(self, provider: crate::types::SessionProvider) -> String {
+        match (self, provider) {
+            (Self::ReadOnly, crate::types::SessionProvider::Claude) => format!(
+                "Access policy: read-only. Claude runs with --permission-mode \
+                 {CLAUDE_READ_ONLY_PERMISSION_MODE} and the built-in tools {}, plus the \
+                 rsi-agent MCP tools; there is no shell and no edit tool.",
+                CLAUDE_READ_ONLY_TOOLS.join(", ")
+            ),
+            (Self::ReadOnly, _) => "Access policy: read-only. The Codex sandbox is read-only: \
+                 shell commands cannot write the workspace; the rsi-agent MCP tools stay available."
+                .to_string(),
+        }
+    }
 }
 
 /// Ordered from most to least restrictive.
@@ -65,6 +186,54 @@ impl WebAccessMode {
             "disabled" => Self::Disabled,
             _ => return None,
         })
+    }
+}
+
+/// Which vendor backs the native Harness `web_search` tool (#2251). The
+/// daemon-wide `harness_web_search_backend` setting; it only picks a backend.
+/// Whether the tool is advertised also needs that backend's vault key, or for
+/// `searxng` the `harness_searxng_url` setting (#2315).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchBackendChoice {
+    /// The first keyed backend whose vault key resolves (Serper, then Exa),
+    /// else the keyless SearXNG instance when `harness_searxng_url` is set.
+    #[default]
+    Auto,
+    Serper,
+    Exa,
+    /// A self-hosted SearXNG instance at `harness_searxng_url`; needs no key
+    /// (#2315).
+    Searxng,
+    /// The native tool is never advertised.
+    Disabled,
+}
+
+impl WebSearchBackendChoice {
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Serper,
+        Self::Exa,
+        Self::Searxng,
+        Self::Disabled,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Serper => "serper",
+            Self::Exa => "exa",
+            Self::Searxng => "searxng",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|choice| choice.as_str() == value)
     }
 }
 
@@ -130,9 +299,35 @@ pub struct HarnessToolPolicy {
     pub context_editing: Option<bool>,
     #[serde(default)]
     pub budgets: ToolBudgets,
+    /// Sandbox / permission mode of a Claude or Codex CLI session (#2758).
+    /// The only field a CLI provider can enforce; a Harness-loop provider
+    /// refuses it. `None` keeps today's argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_access: Option<CliAccessMode>,
 }
 
 impl HarnessToolPolicy {
+    /// The first Harness-only field this policy sets, or `None` when a Claude
+    /// or Codex CLI can enforce all of it (only `cli_access` is set).
+    #[must_use]
+    pub fn cli_unsupported_field(&self) -> Option<&'static str> {
+        if self.enabled_tools.is_some() {
+            Some("enabled_tools")
+        } else if !self.denied_tools.is_empty() {
+            Some("denied_tools")
+        } else if self.web_access.is_some() {
+            Some("web_access")
+        } else if self.egress.is_some() {
+            Some("egress")
+        } else if self.context_editing.is_some() {
+            Some("context_editing")
+        } else if !self.budgets.is_unlimited() {
+            Some("budgets")
+        } else {
+            None
+        }
+    }
+
     /// # Errors
     /// The stable `tool_policy_invalid` code for an unbounded or malformed set.
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -174,6 +369,7 @@ impl HarnessToolPolicy {
             egress: self.egress.or(defaults.egress),
             context_editing: self.context_editing.or(defaults.context_editing),
             budgets: self.budgets.or(defaults.budgets),
+            cli_access: self.cli_access.or(defaults.cli_access),
         }
     }
 
@@ -188,6 +384,7 @@ impl HarnessToolPolicy {
             egress: Some(EgressMode::Offline),
             context_editing: None,
             budgets: ToolBudgets::default(),
+            cli_access: None,
         }
     }
 
@@ -337,5 +534,108 @@ mod tests {
             ..Default::default()
         };
         assert!(session_on.or_defaults(&off).context_editing_enabled());
+    }
+
+    #[test]
+    fn cli_access_round_trips_layers_and_stays_out_of_a_default_wire_form() {
+        let unset = HarnessToolPolicy::default();
+        assert!(
+            !serde_json::to_string(&unset)
+                .unwrap()
+                .contains("cli_access")
+        );
+        let read_only: HarnessToolPolicy =
+            serde_json::from_value(serde_json::json!({"cli_access": "read_only"})).unwrap();
+        assert_eq!(read_only.cli_access, Some(CliAccessMode::ReadOnly));
+        assert!(!read_only.is_default());
+        assert_eq!(read_only.cli_unsupported_field(), None);
+        assert_eq!(
+            serde_json::to_value(&read_only).unwrap()["cli_access"],
+            CliAccessMode::ReadOnly.as_str()
+        );
+        assert_eq!(
+            CliAccessMode::parse("read_only"),
+            Some(CliAccessMode::ReadOnly)
+        );
+        assert!(
+            serde_json::from_value::<HarnessToolPolicy>(serde_json::json!({"cli_access": "rw"}))
+                .is_err()
+        );
+        // A session that leaves it unset follows the defaults; a set value wins.
+        assert_eq!(
+            unset.or_defaults(&read_only).cli_access,
+            Some(CliAccessMode::ReadOnly)
+        );
+        assert_eq!(
+            read_only.or_defaults(&unset).cli_access,
+            Some(CliAccessMode::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn a_provider_refuses_a_policy_field_it_cannot_enforce() {
+        use crate::types::SessionProvider as P;
+        let read_only = HarnessToolPolicy {
+            cli_access: Some(CliAccessMode::ReadOnly),
+            ..HarnessToolPolicy::default()
+        };
+        let web = HarnessToolPolicy {
+            web_access: Some(WebAccessMode::Disabled),
+            ..HarnessToolPolicy::default()
+        };
+        let mixed = HarnessToolPolicy {
+            web_access: Some(WebAccessMode::Disabled),
+            ..read_only.clone()
+        };
+        let refusal =
+            |provider, policy: &HarnessToolPolicy| provider_policy_refusal(provider, Some(policy));
+        // The CLIs enforce exactly the CLI access mode.
+        for provider in [P::Claude, P::Codex, P::Pioneer] {
+            assert_eq!(refusal(provider, &read_only), None, "{provider:?}");
+            assert_eq!(refusal(provider, &HarnessToolPolicy::default()), None);
+        }
+        assert_eq!(
+            refusal(P::Claude, &web).as_deref(),
+            Some("tool_policy_unsupported_for_provider:claude:web_access")
+        );
+        assert_eq!(
+            refusal(P::Codex, &mixed).as_deref(),
+            Some("tool_policy_unsupported_for_provider:codex:web_access")
+        );
+        let budgets = HarnessToolPolicy {
+            budgets: ToolBudgets {
+                max_fetch_calls: Some(1),
+                ..ToolBudgets::default()
+            },
+            ..HarnessToolPolicy::default()
+        };
+        assert_eq!(
+            refusal(P::Claude, &budgets).as_deref(),
+            Some("tool_policy_unsupported_for_provider:claude:budgets")
+        );
+        // The Harness loop enforces the Harness fields and refuses the CLI one.
+        for provider in [P::Harness, P::OpenRouter, P::Bedrock] {
+            assert_eq!(refusal(provider, &web), None, "{provider:?}");
+        }
+        assert_eq!(
+            refusal(P::Harness, &read_only).as_deref(),
+            Some("tool_policy_unsupported_for_provider:harness:cli_access")
+        );
+        // Providers with no policy support, and daemon defaults on a CLI.
+        for (provider, label) in [
+            (P::Local, "local"),
+            (P::Antigravity, "antigravity"),
+            (P::CodexAppServer, "codex_app_server"),
+        ] {
+            assert_eq!(
+                refusal(provider, &read_only),
+                Some(format!("tool_policy_unsupported_for_provider:{label}"))
+            );
+        }
+        assert_eq!(
+            provider_policy_refusal(P::Claude, None).as_deref(),
+            Some("tool_policy_unsupported_for_provider:claude:daemon_defaults")
+        );
+        assert_eq!(provider_policy_refusal(P::Harness, None), None);
     }
 }

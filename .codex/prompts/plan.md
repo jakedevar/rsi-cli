@@ -199,6 +199,14 @@ and every load-bearing citation identifies a primary artifact.
   plan.
 - Keep source and plan in agreement. If new evidence changes a design choice,
   revise and commit the plan before implementation proceeds.
+- **Live slice workers (#2431).** When you revise a plan that a running worker
+  is already building from (the plan names slices, or a manager or Issue says a
+  slice is in flight), the plan file alone does not reach it. List the amended
+  slices in a section of the revision (what changed for each, and the new
+  commit) and, with the authority your catalog grants, `AgentSendMessage` each
+  live slice worker that list and commit, or ask the manager to relaunch it from
+  the new pin. A revision that changes a slice is not finished until that worker
+  has been told.
 - **COMMIT AND PUSH — REQUIRED**: Before responding, commit the plan and other
   task-owned files using explicit paths. Never stage the entire `thoughts/`
   directory or unrelated edits. Leave the tree clean. Push only if the user

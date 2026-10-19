@@ -70,7 +70,6 @@ async fn view(p: &Pilot, id: Uuid) -> ManagerActionViewV2 {
 /// host is loaded.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 async fn claim_like_the_loop(manager: &SessionManager) -> Option<ManagerActionClaimV2> {
-    let gate = manager.host_load();
     manager
         .store
         .lock()
@@ -78,7 +77,7 @@ async fn claim_like_the_loop(manager: &SessionManager) -> Option<ManagerActionCl
         .claim_manager_action_with_create_admission(
             manager.program_run_boot_id,
             manager.deploy_drain().is_draining(),
-            &|key, since, target| gate.admit_manager_create(key, since, target),
+            &|key, since, target| manager.admit_manager_create(key, since, target),
         )
         .unwrap()
 }
@@ -320,6 +319,77 @@ async fn the_threshold_applies_live_to_a_queued_create() {
     assert!(p.manager.host_load().hold_now().is_none());
 }
 
+/// #2562: a hot or full host holds a manager's `create_session` exactly as a
+/// busy one does (queued, never refused; `held {reason: thermal|disk_pressure}`)
+/// even with the load hold disabled, and the claim admits it once the stubbed
+/// temperature drops.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn thermal_and_disk_pressure_hold_a_create_until_the_host_recovers() {
+    use crate::host_pressure::PressureHold;
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    let pressure = Arc::new(std::sync::Mutex::new(Some(PressureHold::Thermal(
+        rsid_core::thermal_guard::ThermalHold {
+            temperature_c: 91.5,
+            ceiling_c: 85,
+        },
+    ))));
+    let shared = Arc::clone(&pressure);
+    p.manager
+        .host_load()
+        .set_pressure_source(Arc::new(move || *shared.lock().unwrap()));
+    let receipt = p.admit("hot-host", create(p.epic, &p, "worker")).await;
+
+    assert!(
+        claim_like_the_loop(&p.manager).await.is_none(),
+        "held, not refused"
+    );
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+    let held = view(&p, receipt.operation_id).await.held.unwrap();
+    assert_eq!(held.reason, "thermal");
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!((held.temperature_c, held.ceiling_c), (Some(91.5), Some(85)));
+    assert_eq!(held.load, None);
+
+    *pressure.lock().unwrap() = Some(PressureHold::DiskPressure {
+        free_gb: 11.0,
+        min_gb: 30,
+    });
+    let held = view(&p, receipt.operation_id).await.held.unwrap();
+    assert_eq!(held.reason, "disk_pressure");
+    assert_eq!(
+        (held.free_disk_gb, held.min_free_disk_gb),
+        (Some(11.0), Some(30))
+    );
+    assert!(claim_like_the_loop(&p.manager).await.is_none());
+
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        1
+    );
+
+    *pressure.lock().unwrap() = None;
+    assert_eq!(view(&p, receipt.operation_id).await.held, None);
+    assert_eq!(
+        claim_like_the_loop(&p.manager).await.unwrap().id(),
+        receipt.operation_id,
+        "the create starts on its own once the host cooled"
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn older_topology_work_releases_before_new_manager_creates() {
@@ -371,19 +441,20 @@ async fn held_creates_from_several_projects_are_released_oldest_first() {
     let admit_b = |key: &'static str| {
         let control = p.manager.agent_control();
         let request = AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
-                scope_version: 1,
-                policy_version: 1,
-            },
-            idempotency_key: key.into(),
-            operation: ManagerActionV2::CreateSession {
-                parent_id: b.epic,
-                kind: SessionKind::Task,
-                query: format!("second project {key}"),
-                launch: b.policy.allowed_launches[0].clone(),
-                sandbox_source: None,
-            },
+            ..AgentManagerControlRequestV2::new(
+                ManagerFenceV2 {
+                    scope_version: 1,
+                    policy_version: 1,
+                },
+                key.into(),
+                ManagerActionV2::CreateSession {
+                    parent_id: b.epic,
+                    kind: SessionKind::Task,
+                    query: format!("second project {key}"),
+                    launch: b.policy.allowed_launches[0].clone(),
+                    sandbox_source: None,
+                },
+            )
         };
         let owner = b.owner;
         async move { control.agent_manager_control(owner, request).await.unwrap() }
@@ -499,5 +570,239 @@ async fn recent_launches_count_toward_the_load_so_a_backlog_is_not_released_at_o
     assert!(
         claim_like_the_loop(&p.manager).await.is_none(),
         "the backlog waits while recent launches are unabsorbed"
+    );
+}
+
+/// #407: disk holds immediately request one serialized, real reclaim pass;
+/// retry ticks and another manager's hold share the same debounce. The roster
+/// exposes queued launches before they have session rows, within its scope.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn disk_held_creates_request_one_reclaim_and_appear_in_roster() {
+    use crate::host_pressure::PressureHold;
+    use rsi_common::agent_worker_roster::AgentWorkerRosterRequestV1;
+
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    p.manager.host_load().set_pressure_source(Arc::new(|| {
+        Some(PressureHold::DiskPressure {
+            free_gb: 8.0,
+            min_gb: 30,
+        })
+    }));
+    let first = p
+        .admit("disk-held", create(p.epic, &p, "held worker"))
+        .await;
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        1
+    );
+
+    // Another manager's eligible hold must use the same daemon-wide debounce.
+    let other = second_project(&p).await;
+    let second = p
+        .manager
+        .agent_control()
+        .agent_manager_control(
+            other.owner,
+            p.request(
+                "second-disk-held",
+                ManagerActionV2::CreateSession {
+                    parent_id: other.epic,
+                    kind: SessionKind::Task,
+                    query: "another held worker".into(),
+                    launch: other.policy.allowed_launches[0].clone(),
+                    sandbox_source: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    // Ask about this second hold explicitly: the store may memoize the oldest.
+    assert!(!p.manager.admit_manager_create(
+        second.operation_id,
+        chrono::Utc::now(),
+        second.target_session_id
+    ));
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        1
+    );
+
+    let roster = p
+        .manager
+        .agent_control()
+        .agent_worker_roster(p.owner, AgentWorkerRosterRequestV1::default())
+        .await
+        .unwrap();
+    assert_eq!(roster.queued_launches.len(), 1);
+    assert_eq!(roster.queued_launches[0].operation_id, first.operation_id);
+    assert_eq!(
+        roster.queued_launches[0].held_reason.as_deref(),
+        Some("disk_pressure")
+    );
+    assert_eq!(
+        roster.queued_launches[0].target_session_id,
+        first.target_session_id
+    );
+
+    // The same queued row is reported without a hold when space recovers.
+    p.manager.host_load().set_pressure_source(Arc::new(|| None));
+    assert!(p.manager.admit_manager_create(
+        first.operation_id,
+        chrono::Utc::now() - chrono::Duration::days(1),
+        first.target_session_id
+    ));
+    assert!(p.manager.admit_manager_create(
+        second.operation_id,
+        chrono::Utc::now() - chrono::Duration::days(1),
+        second.target_session_id
+    ));
+    let roster = p
+        .manager
+        .agent_control()
+        .agent_worker_roster(p.owner, AgentWorkerRosterRequestV1::default())
+        .await
+        .unwrap();
+    assert_eq!(roster.queued_launches[0].held_reason, None);
+}
+
+/// #2920: a create the sandbox allocator refuses for free space is held, not
+/// blocked as `manager_v2_lifecycle_unconfirmed`. It stays queued with
+/// `held {reason: sandbox_free_space, free_disk_gb, min_free_disk_gb}`, no pass
+/// retries it while the hold stands, and it launches on its own once the hold
+/// ends.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_free_space_refusal_holds_the_create_and_resumes_on_its_own() {
+    use crate::sandbox::SandboxCapacity;
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    p.manager
+        .runtime_config
+        .sandbox_min_free_gib
+        .store(30, Ordering::Relaxed);
+    let low = SandboxCapacity {
+        source_roots: 0,
+        available_bytes: 8 << 30,
+        total_bytes: u64::MAX,
+    };
+    // The allocator measures twice: before and after its one reclaim page.
+    p.manager
+        .sandbox_allocation_test_capacities
+        .lock()
+        .unwrap()
+        .extend([low, low]);
+    let receipt = p
+        .admit("disk-full", create(p.epic, &p, "worker on a full disk"))
+        .await;
+    let child = receipt.target_session_id.unwrap();
+
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let held = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        held.state,
+        ManagerActionStateV2::Queued,
+        "held, never blocked: {held:?}"
+    );
+    let reason = view(&p, receipt.operation_id).await.held.unwrap();
+    assert_eq!(reason.reason, "sandbox_free_space");
+    let roster = p
+        .manager
+        .agent_control()
+        .agent_worker_roster(
+            p.owner,
+            rsi_common::agent_worker_roster::AgentWorkerRosterRequestV1::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roster.queued_launches[0].held_reason.as_deref(),
+        Some("sandbox_free_space")
+    );
+    assert_eq!(reason.free_disk_gb, Some(8.0));
+    assert_eq!(reason.min_free_disk_gb, Some(30));
+    assert_eq!(reason.load, None);
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        1
+    );
+
+    // A later pass leaves it alone while the hold stands.
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.manager
+            .launch_hold_reclaim
+            .submissions
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+
+    // The hold ends (space returned or the retry delay passed): it launches.
+    p.manager.host_load().expire_sandbox_free_space_hold();
+    assert_eq!(view(&p, receipt.operation_id).await.held, None);
+    let process = super::super::super::launch::install_controller_candidate_test_process(child);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        settled.state,
+        ManagerActionStateV2::Succeeded,
+        "{settled:?}"
+    );
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+}
+
+/// #2920: a root count at `sandbox_max_source_roots` is not a transient
+/// shortage. It still refuses, with its own typed code and no hold, never the
+/// `manager_v2_lifecycle_unconfirmed` catch-all.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_root_cap_refusal_keeps_its_own_typed_code() {
+    use crate::sandbox::SandboxCapacity;
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    p.manager
+        .runtime_config
+        .sandbox_max_source_roots
+        .store(1, Ordering::Relaxed);
+    let full = SandboxCapacity {
+        source_roots: 1,
+        available_bytes: u64::MAX,
+        total_bytes: u64::MAX,
+    };
+    p.manager
+        .sandbox_allocation_test_capacities
+        .lock()
+        .unwrap()
+        .extend([full, full]);
+    let receipt = p
+        .admit("root-cap", create(p.epic, &p, "worker at the root cap"))
+        .await;
+
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Blocked, "{settled:?}");
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_sandbox_source_root_limit")
+    );
+    assert!(
+        p.manager.host_load().pressure_now().is_none(),
+        "a root-count refusal is no free-space hold"
     );
 }

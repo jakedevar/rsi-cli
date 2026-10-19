@@ -33,7 +33,7 @@ use crate::error::{DaemonError, Result};
 use crate::store::Store;
 use crate::store::global_manager::GlobalProjectRow;
 use crate::store::manager_node_workspace::ProjectSpan;
-use crate::store::portfolio_nodes::delegation::ChildTargetRef;
+use crate::store::portfolio_nodes::delegation::{ChildAppointment, ChildTargetRef};
 
 fn invalid(code: &'static str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
@@ -145,19 +145,82 @@ impl AgentControlHandle {
                 updated_at: prior.updated_at,
             });
         }
+        let succession_refusal = self.succession_refusal_of(session.id).await;
         Some(GlobalSeatSessionV1 {
             session_id: session.id,
             project_id: session.project_id,
             status: session.status,
             provider: session.provider,
+            rotation_threshold_pct: self.seat_rotation_threshold_pct(&session),
+            coordinator_budget: self.seat_coordinator_budget(&session),
             model: session.model,
             context_fill_pct: session.context_fill_pct,
             cost_usd: session.cost_usd,
             updated_at: session.updated_at,
             pending_question: session.pending_question.is_some(),
+            succession_refusal,
             predecessors,
             predecessors_truncated: truncated,
         })
+    }
+
+    /// #2558: the rotation threshold a manager seat is held to, beside its
+    /// `context_fill_pct` (same unit, same window).
+    fn seat_rotation_threshold_pct(&self, session: &rsi_common::types::Session) -> Option<f64> {
+        let runtime = self.runtime_config.as_deref()?;
+        super::context_cap::rotation_threshold_for(runtime, session, true).map(|t| t.pct)
+    }
+
+    pub(super) fn seat_coordinator_budget(
+        &self,
+        session: &rsi_common::Session,
+    ) -> Option<rsi_common::coordinator_budget::CoordinatorBudgetV1> {
+        Some(self.runtime_config.as_deref()?.resolved_coordinator_budget(
+            session.provider,
+            session.model.as_deref(),
+            crate::provider_capabilities::resolved_context_budget_for_session(session),
+        ))
+    }
+
+    /// Operator settings projection. Enumerate only seat roots, then use the
+    /// same live-tip/session projection as manager overviews (never all history).
+    pub(crate) async fn coordinator_budgets(
+        &self,
+    ) -> Result<Vec<rsi_common::coordinator_budget::CoordinatorSeatBudgetV1>> {
+        let ids = {
+            let store = self.store.lock().await;
+            let roots: Vec<String> = store.conn.prepare(
+                "SELECT manager_session_id FROM harness_manager_scopes
+                 UNION SELECT seat_root_session_id FROM manager_nodes WHERE state='active'
+                 UNION SELECT seat_session_id FROM global_manager_grants WHERE state='active'
+                 UNION SELECT lead_session_id FROM sessions WHERE lead_session_id IS NOT NULL AND session_kind='Epic'"
+            )?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut ids = std::collections::BTreeSet::new();
+            for root in roots {
+                let root = Uuid::parse_str(&root).map_err(|e| DaemonError::Store(e.to_string()))?;
+                // Historical/revoked roots can have no valid live lineage.
+                // They must not make GetDaemonConfig unavailable.
+                let Ok(tip) = store.manager_lineage_tip(root) else {
+                    continue;
+                };
+                if super::context_cap::capped_seat(&store, tip)?.is_some() {
+                    ids.insert(tip);
+                }
+            }
+            ids
+        };
+        let mut budgets = Vec::new();
+        for session_id in ids {
+            if let Some(session) = self.get_session(session_id).await {
+                if let Some(budget) = self.seat_coordinator_budget(&session) {
+                    budgets.push(rsi_common::coordinator_budget::CoordinatorSeatBudgetV1 {
+                        session_id,
+                        budget,
+                    });
+                }
+            }
+        }
+        Ok(budgets)
     }
 
     /// Each project row with its live PM seat.
@@ -174,6 +237,24 @@ impl AgentControlHandle {
                 }
                 None => None,
             };
+            let standing_directives = self
+                .active_standing_directives(
+                    rsi_common::manager_tier_routing::ManagerNodeRefV1::Project {
+                        project_id: row.project_id,
+                    },
+                )
+                .await;
+            // #2743: is rolling known good? A read failure leaves the field
+            // out rather than failing the whole snapshot.
+            let rolling_health = self
+                .store
+                .lock()
+                .await
+                .rolling_health_for_project(row.project_id, chrono::Utc::now())
+                .map_err(|error| {
+                    tracing::warn!(project_id = %row.project_id, %error, "rolling health unavailable");
+                })
+                .ok();
             projects.push(GlobalWorkspaceProjectV1 {
                 scope_revoked: row.scope_revoked,
                 overview: GlobalProjectOverviewV1 {
@@ -187,6 +268,8 @@ impl AgentControlHandle {
                     waiting_approval_sessions: row.waiting_approval_sessions,
                     pending_questions: row.pending_questions,
                     pending_approvals: row.pending_approvals,
+                    standing_directives,
+                    rolling_health,
                 },
             });
         }
@@ -195,18 +278,36 @@ impl AgentControlHandle {
 
     async fn global_pm_seat(&self, id: Uuid, scope_version: i64) -> Option<GlobalPmSeatV1> {
         let session = self.get_session(id).await?;
+        let rotation_threshold_pct = self.seat_rotation_threshold_pct(&session);
+        let coordinator_budget = self.seat_coordinator_budget(&session);
+        let succession_refusal = self.succession_refusal_of(session.id).await;
         Some(GlobalPmSeatV1 {
             session_id: session.id,
             status: session.status,
             provider: session.provider,
             model: session.model,
+            rotation_threshold_pct,
+            coordinator_budget,
             effort: session.effort,
             context_fill_pct: session.context_fill_pct,
             cost_usd: session.cost_usd,
             updated_at: session.updated_at,
             scope_version,
             pending_question: session.pending_question.is_some(),
+            succession_refusal,
         })
+    }
+
+    /// #2667: the typed code of the seat's finally refused succession.
+    async fn succession_refusal_of(&self, session_id: Uuid) -> Option<String> {
+        self.store
+            .lock()
+            .await
+            .manager_succession_refusal(session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%session_id, %error, "manager succession refusal unavailable");
+                None
+            })
     }
 
     /// `AgentGlobalSend` (#1238: alias of `AgentSendDown` to a project for
@@ -308,7 +409,8 @@ impl AgentControlHandle {
 }
 
 /// `AgentManagerAppointChild` (#1239) with an injected launcher. `launch`
-/// receives the reserved session id and the project to launch in
+/// receives the reserved session id, the project to launch in and the
+/// admitted appointment
 /// (production passes [`super::SessionManager::launch_global_appointment`]
 /// through [`child_launch_config`]).
 ///
@@ -322,11 +424,13 @@ impl AgentControlHandle {
 ///    appointment.
 /// 2. The launch persists exactly that id, so a replay never launches twice.
 ///    Its Model Control admission rechecks the grantor's resource gates and
-///    reserves the slot immediately before the provider runs (#1314).
-/// 3. After the launch, under the held store lock, the grantor's seat and
-///    authority epoch are re-checked and the seat is appointed: a project's
-///    PM (whole-project scope, then the node's child policy), or a child
-///    node's grant (checks re-run, grant and completion in one transaction).
+///    reserves the slot immediately before the provider runs (#1314). A
+///    portfolio launch publishes its grant after durable session establishment
+///    and before provider context or dispatch (#1835).
+/// 3. After the launch, under the held store lock, completion is returned
+///    idempotently for the published portfolio grant, or a project's PM is
+///    appointed (whole-project scope, then the node's child policy). The
+///    grantor's seat and authority epoch are re-checked at completion.
 ///
 /// # Errors
 /// The admission refusals, `global_manager_not_seat` after a re-grant, a
@@ -338,7 +442,7 @@ pub(crate) async fn appoint_child_with<F, Fut>(
     launch: F,
 ) -> Result<AgentManagerAppointChildResultV1>
 where
-    F: FnOnce(Uuid, Uuid) -> Fut,
+    F: FnOnce(Uuid, Uuid, ChildAppointment) -> Fut,
     Fut: Future<Output = Result<Uuid>>,
 {
     request.validate().map_err(invalid)?;
@@ -368,7 +472,12 @@ where
         return Ok(result(versions, true));
     }
     if !session_exists {
-        let launched = launch(appointment.session_id, appointment.launch_project_id).await?;
+        let launched = launch(
+            appointment.session_id,
+            appointment.launch_project_id,
+            appointment.clone(),
+        )
+        .await?;
         if launched != appointment.session_id {
             return Err(DaemonError::Store(
                 "a delegated appointment launched an unexpected session".into(),
@@ -406,7 +515,7 @@ where
     request.validate().map_err(invalid)?;
     let child = AgentManagerAppointChildRequestV1::from(request);
     // The alias keeps v0's refusal codes for its callers.
-    let result = appoint_child_with(store, caller, &child, |session_id, _| launch(session_id))
+    let result = appoint_child_with(store, caller, &child, |session_id, _, _| launch(session_id))
         .await
         .map_err(|error| match error {
             DaemonError::InvalidParam(code)
@@ -441,9 +550,14 @@ impl super::SessionManager {
         request: AgentManagerAppointChildRequestV1,
     ) -> Result<AgentManagerAppointChildResultV1> {
         let store = Arc::clone(self.store());
-        appoint_child_with(&store, caller, &request, |session_id, project_id| {
-            self.launch_child_seat(&request, project_id, session_id)
-        })
+        appoint_child_with(
+            &store,
+            caller,
+            &request,
+            |session_id, project_id, appointment| {
+                self.launch_child_seat(caller, &request, project_id, session_id, Some(appointment))
+            },
+        )
         .await
     }
 
@@ -460,25 +574,42 @@ impl super::SessionManager {
         let store = Arc::clone(self.store());
         let child = AgentManagerAppointChildRequestV1::from(&request);
         global_appoint_manager_with(&store, caller, &request, |session_id| {
-            self.launch_child_seat(&child, request.project_id, session_id)
+            self.launch_child_seat(caller, &child, request.project_id, session_id, None)
         })
         .await
     }
 
     async fn launch_child_seat(
         &self,
+        caller: Uuid,
         request: &AgentManagerAppointChildRequestV1,
         project_id: Uuid,
         session_id: Uuid,
+        appointment: Option<ChildAppointment>,
     ) -> Result<Uuid> {
         let working_dir = self.resolve_project_working_dir(project_id).await?;
         let config = child_launch_config(request, project_id, working_dir, session_id);
-        self.launch_global_appointment(config, session_id).await
+        let publication = if matches!(
+            request.target,
+            rsi_common::portfolio_delegation::AppointChildTargetV1::Portfolio { .. }
+        ) {
+            let appointment =
+                appointment.expect("portfolio launch carries its admitted appointment");
+            Some(Box::new(super::types::PortfolioAppointmentLaunchContext {
+                caller,
+                request: request.clone(),
+                appointment,
+            }))
+        } else {
+            None
+        };
+        self.launch_global_appointment(config, session_id, publication)
+            .await
     }
 }
 
-/// The v0 PM launch (kept for the real-launch test): see
-/// [`child_launch_config`].
+/// The legacy PM launch conversion, retained for focused launch-shape tests.
+#[cfg(test)]
 pub(crate) fn global_manager_launch_config(
     request: &AgentGlobalAppointManagerRequestV1,
     working_dir: std::path::PathBuf,
@@ -559,6 +690,7 @@ pub(crate) fn child_launch_config(
             topology_node_id: None,
             topology_iteration: 0,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 }

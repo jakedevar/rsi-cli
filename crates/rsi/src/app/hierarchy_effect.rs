@@ -7,7 +7,6 @@
 use super::{App, HierarchyFetchResult, NavigationEffectNode};
 use crate::types::Pane;
 use rsi_common::types::Session;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 impl App {
@@ -75,6 +74,8 @@ impl App {
                 }
                 // Trigger model segments fetch for SessionDetail panes
                 self.trigger_model_segments_fetch_if_needed(id);
+                // An archived session may have its rows in cold storage (badge).
+                self.trigger_cold_storage_fetch_if_needed(id);
             }
         }
     }
@@ -383,21 +384,6 @@ impl App {
                 false
             }
         }
-    }
-
-    /// Conversation polling should follow actual detail visibility, not the
-    /// selected row in a session list. This prevents list navigation from
-    /// becoming a periodic event-fetch trigger.
-    pub(crate) fn visible_detail_session_ids(&self) -> HashSet<Uuid> {
-        let mut ids = HashSet::new();
-        for tab in &self.tabs {
-            for pane_id in tab.layout.leaf_ids() {
-                if let Some(Pane::SessionDetail { session_id }) = tab.layout.find_pane(pane_id) {
-                    ids.insert(*session_id);
-                }
-            }
-        }
-        ids
     }
 }
 

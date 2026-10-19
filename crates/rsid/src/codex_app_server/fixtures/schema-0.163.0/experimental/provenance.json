@@ -1,0 +1,16 @@
+{
+  "provider": "codex-cli 0.163.0",
+  "generation_command": "codex app-server generate-json-schema --experimental --out <dir>",
+  "variant": "experimental",
+  "source_sha256": {
+    "v1/InitializeParams.json": "b55124e7c0f36a1789396daa5578217a92be67f053903696236686e59f6f212e",
+    "ClientNotification.json": "706cf248d75027c84a3c63348d0ed507182e8eba40069dd17541793de029145a",
+    "v2/ThreadStartParams.json": "80a40a7fac15b4bf70efb7f893fb353acc0a0d30c68f54aee4f01923deca85de",
+    "v2/ThreadResumeParams.json": "8152ea774ace4eb5623081abd64a1135f28cbff1e73ca641cfb80ac16f6eed32",
+    "v2/TurnStartParams.json": "abf0d6d29d223b38c650ff1155cb9c9f9b4211e6d0e20c57d750a9e1babfdb41",
+    "ClientRequest.json": "92d920b10b9ce7871e21f49573275bb931a58ad7fd367ab71b3716edbb6a0352"
+  },
+  "excerpts": {
+    "ClientRequest-methods.json": "Every ClientRequest method name, sorted. The full ClientRequest.json is not stored."
+  }
+}

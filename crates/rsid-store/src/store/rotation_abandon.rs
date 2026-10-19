@@ -613,8 +613,9 @@ impl Store {
     }
 
     /// A custody-bearing abandon hop must stay open on launch/publication
-    /// failure. The transfer receipt is irreversible, even if subsequent
-    /// revalidation quarantines the root. Publishing or another abandon must
+    /// failure. An abandon hop retains its transfer receipt even if subsequent
+    /// revalidation quarantines the root; the guarded unstarted cap return does
+    /// not apply to abandon hops. Publishing or another abandon must
     /// settle that exact hop; a non-live root cannot erase the custody commit.
     pub fn rotation_abandon_bound_successor(
         &self,
@@ -750,4 +751,24 @@ pub struct RotationPublication {
     /// The chain sessions an abandon publication archived (#1176): P and
     /// every earlier holder before the publishing holder. Empty otherwise.
     pub archived: Vec<Uuid>,
+    /// The Idea controller the publication moved to the successor in the same
+    /// commit (#1186). Empty when no chain holder controlled an Idea, or when
+    /// the controller was already assigned to the successor.
+    pub controller_moves: Vec<RotationControllerMove>,
+}
+
+/// One Idea controller moved to the published successor by a rotation
+/// publication (#1186). The process-local semantic grant is not part of the
+/// commit: the caller drops the former holder's grant and re-establishes the
+/// successor's from this durable assignment once the commit is observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationControllerMove {
+    pub project_id: Uuid,
+    pub idea_id: Uuid,
+    pub former_session_id: Uuid,
+    pub successor_session_id: Uuid,
+    pub controller_epoch: i64,
+    /// The committed `controller_assigned` event, published to subscribers as
+    /// `idea_controller_assigned:{event_id}`.
+    pub event_id: Uuid,
 }

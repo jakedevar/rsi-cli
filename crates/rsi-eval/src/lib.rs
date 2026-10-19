@@ -9,6 +9,7 @@
 //! adds the metrics collector, baseline I/O, and regression gate.
 
 pub mod baseline;
+pub mod bench;
 pub mod corpus;
 pub mod driver;
 pub mod errors;

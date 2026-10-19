@@ -16,21 +16,18 @@ use rsi_common::types::{
     ReleaseIdeaControllerReservationRequestV1, ReserveIdeaControllerRequestV1,
     validate_idea_actor_id,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+/// The daemon owns issuance; the store only compares an opaque installed
+/// incarnation under the registry guard held through the assignment commit.
 #[allow(clippy::redundant_pub_crate)]
-pub trait AgentTokenLookup: Send + Sync {
-    fn session_for_token(&self, token: &str) -> Option<Uuid>;
-}
+pub trait AgentTransportBinding: Send + Sync {
+    type Witness: Send + Sync;
 
-impl AgentTokenLookup for HashMap<String, Uuid> {
-    fn session_for_token(&self, token: &str) -> Option<Uuid> {
-        self.get(token).copied()
-    }
+    fn binding_matches(&self, session_id: Uuid, expected: &Self::Witness) -> bool;
 }
 
 /// Redacted, stable `SQLite` integrity classes exposed only through the
@@ -450,11 +447,11 @@ impl IdeaControllerTransferHandle {
     }
 
     /// Assign only the exact confirmed and unexpired reservation.
-    pub async fn assign_confirmed_guarded<T: AgentTokenLookup>(
+    pub async fn assign_confirmed_guarded<T: AgentTransportBinding>(
         &self,
         reservation: &IdeaControllerReservationV1,
         confirmation: &IdeaControllerLaunchConfirmationV1,
-        prospective_token: &str,
+        prospective_binding: &T::Witness,
         agent_tokens: &RwLock<T>,
     ) -> Result<IdeaControllerControlResultV1, IdeaControlError> {
         if self.authority.actor_kind() != IdeaActorKind::System {
@@ -464,7 +461,7 @@ impl IdeaControllerTransferHandle {
         // write guard and therefore cannot overtake this assignment commit.
         let store = self.store.lock().await;
         let a6 = agent_tokens.read().await;
-        if a6.session_for_token(prospective_token) != Some(reservation.candidate_session_id) {
+        if !a6.binding_matches(reservation.candidate_session_id, prospective_binding) {
             return Err(IdeaControlError::ForbiddenActor);
         }
         let result = store.assign_idea_controller_v1(
@@ -483,6 +480,87 @@ impl IdeaControllerTransferHandle {
         drop(a6);
         drop(store);
         Ok(result)
+    }
+
+    /// #1186: publish a rotation whose successor is the reserved controller
+    /// candidate, assigning the controller inside the publication transaction.
+    /// The controller, the Epic lead pointer and the global grant commit
+    /// together or not at all: a refused publication leaves the predecessor's
+    /// controller, epoch and grant untouched and the reservation for the
+    /// caller to release. The candidate holds no controller authority before
+    /// the commit; its semantic grant is installed after it, with the former
+    /// holder's removed, under the same Store -> A6 guards as
+    /// [`Self::assign_confirmed_guarded`].
+    ///
+    /// # Errors
+    /// `PolicyDenied("rotation_controller_assignment_failed:..")` when the
+    /// binding witness, the reservation or the confirmation no longer hold;
+    /// the publication's own refusal otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_rotation_assigning<T: AgentTransportBinding>(
+        &self,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
+        rotation_id: &str,
+        metadata: &str,
+        reservation: &IdeaControllerReservationV1,
+        confirmation: &IdeaControllerLaunchConfirmationV1,
+        prospective_binding: &T::Witness,
+        agent_tokens: &RwLock<T>,
+    ) -> crate::error::Result<crate::store::rotation_abandon::RotationPublication> {
+        let assignment_failed = |detail: &dyn std::fmt::Display| {
+            crate::error::DaemonError::PolicyDenied(format!(
+                "rotation_controller_assignment_failed:{detail}"
+            ))
+        };
+        if self.authority.actor_kind() != IdeaActorKind::System {
+            return Err(assignment_failed(&"forbidden_actor"));
+        }
+        let former = reservation
+            .base_controller_session_id
+            .ok_or_else(|| assignment_failed(&"no_former_controller"))?;
+        // Global lock order is Store -> A6 read. Remint/revoke requires the A6
+        // write guard and therefore cannot overtake this publication commit.
+        let store = self.store.lock().await;
+        let a6 = agent_tokens.read().await;
+        if !a6.binding_matches(reservation.candidate_session_id, prospective_binding) {
+            return Err(assignment_failed(&"binding_mismatch"));
+        }
+        let now = self.clock.now();
+        let publication = store.publish_rotation_successor_assigning_controller(
+            guards,
+            rotation_id,
+            metadata,
+            &|tx| {
+                let assigned = store
+                    .assign_idea_controller_in_tx(
+                        tx,
+                        &self.authority,
+                        reservation,
+                        confirmation,
+                        now,
+                    )
+                    .map_err(|error| assignment_failed(&error))?;
+                Ok(crate::store::rotation_abandon::RotationControllerMove {
+                    project_id: assigned.idea.project_id,
+                    idea_id: assigned.idea.id,
+                    former_session_id: former,
+                    successor_session_id: reservation.candidate_session_id,
+                    controller_epoch: reservation.proposed_epoch,
+                    event_id: assigned.event.id,
+                })
+            },
+        )?;
+        let candidate_grant = BoundControllerWriteAuthority::new(
+            self.authority.project_id(),
+            self.authority.idea_id(),
+            reservation.candidate_session_id,
+            reservation.proposed_epoch,
+        )
+        .map_err(|error| assignment_failed(&error))?;
+        store.transfer_controller_grant_v1(Some(former), candidate_grant);
+        drop(a6);
+        drop(store);
+        Ok(publication)
     }
 
     /// Resolve the exact reservation derived from one intent.

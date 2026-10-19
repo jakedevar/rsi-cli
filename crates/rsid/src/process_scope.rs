@@ -7,11 +7,12 @@
 //! admission; each production command verifies it without mutating policy.
 
 use crate::error::{DaemonError, Result};
-use crate::process_control::{
-    ProcessContainment, configure_tokio_process_group, signal_process_group_because,
-};
+use crate::process_control::WorkerStopHandle;
+#[cfg(any(test, target_os = "linux"))]
+use crate::process_control::{ProcessContainment, configure_tokio_process_group};
 use rsi_common::rpc::WorkerSliceMemoryPressure;
 use std::ffi::OsStr;
+#[cfg(any(test, target_os = "linux"))]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -20,7 +21,9 @@ use std::time::Instant;
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[cfg(all(target_os = "linux", not(test)))]
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) const SCOPE_SLICE: &str = "rsi-workers.slice";
 const MIN_MEMORY_MIB: u64 = 256;
 const MAX_MEMORY_MIB: u64 = 1024 * 1024;
@@ -35,9 +38,17 @@ pub(crate) struct WorkerScopeLimits {
     memory_max_mib: u64,
     memory_swap_max_mib: u64,
     cpu_weight: u64,
+    /// `CPUQuota` percent of one CPU for each scope (#1992); 0 is uncapped.
+    cpu_quota_percent: u32,
 }
 
 impl WorkerScopeLimits {
+    /// Cap each scope at `percent` of one CPU (0 removes the cap).
+    pub(crate) fn with_cpu_quota_percent(mut self, percent: u32) -> Self {
+        self.cpu_quota_percent = percent;
+        self
+    }
+
     pub(crate) fn new(high: u64, max: u64, swap_max: u64, cpu_weight: u64) -> Result<Self> {
         if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&high)
             || !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&max)
@@ -54,6 +65,7 @@ impl WorkerScopeLimits {
             memory_max_mib: max,
             memory_swap_max_mib: swap_max,
             cpu_weight,
+            cpu_quota_percent: 0,
         })
     }
 
@@ -61,6 +73,14 @@ impl WorkerScopeLimits {
     /// config writes. A changed value refuses new work until the supported
     /// restart has reconciled the parent slice.
     pub(crate) fn from_launcher_snapshot() -> Result<Self> {
+        // The operator's live `worker_cpu_quota_percent` (#1992) is read at
+        // each launch; it is not part of the restart-class memory snapshot.
+        Self::memory_limits_from_launcher_snapshot().map(|limits| {
+            limits.with_cpu_quota_percent(rsid_core::worker_cpu_quota::current_percent())
+        })
+    }
+
+    fn memory_limits_from_launcher_snapshot() -> Result<Self> {
         #[cfg(not(target_os = "linux"))]
         {
             // macOS has no systemd memory controller; retain its established
@@ -88,6 +108,7 @@ impl WorkerScopeLimits {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn parse_launcher_snapshot(contents: &str) -> Result<Self> {
         let mut values = [None; 4];
         for line in contents.lines() {
@@ -135,6 +156,7 @@ impl WorkerScopeLimits {
     /// A finite parent must be present before the provider inherits ambient
     /// credentials or begins any work. Read four cgroup files directly rather
     /// than waiting for the user-manager D-Bus path on a Tokio runtime thread.
+    #[cfg(all(target_os = "linux", not(test)))]
     fn verify_parent(self) -> Result<()> {
         let cgroup = std::fs::read_to_string("/proc/self/cgroup").map_err(|error| {
             DaemonError::Process(format!("cannot inspect daemon cgroup: {error}"))
@@ -145,6 +167,7 @@ impl WorkerScopeLimits {
         self.verify_parent_files(&path)
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn verify_parent_files(self, path: &Path) -> Result<()> {
         let number = |name: &str| -> Option<u64> {
             std::fs::read_to_string(path.join(name))
@@ -167,6 +190,7 @@ impl WorkerScopeLimits {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn worker_slice_cgroup_path(cgroup: &str, uid: u32) -> Result<std::path::PathBuf> {
     // systemd.slice(5): each dash in a slice name encodes one parent level.
     Ok(user_manager_cgroup_root(cgroup, uid)?
@@ -177,6 +201,7 @@ fn worker_slice_cgroup_path(cgroup: &str, uid: u32) -> Result<std::path::PathBuf
 /// The cgroup directory of this user's systemd manager (`user@<uid>.service`)
 /// from the daemon's own `/proc/self/cgroup`. #1337: the CPU-time andon reads
 /// agent scopes and job units beneath it.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn user_manager_cgroup_root(cgroup: &str, uid: u32) -> Result<std::path::PathBuf> {
     let own = cgroup
         .lines()
@@ -322,22 +347,21 @@ pub(crate) async fn worker_slice_memory_pressure() -> Option<WorkerSliceMemoryPr
 /// Kill the exact private process group and reap its direct child. Provider
 /// children use this for forced termination; tool capture has its own bounded
 /// group settlement path.
-pub(crate) async fn kill_worker_child(child: &mut tokio::process::Child) -> Result<()> {
-    if let Some(pid) = child.id() {
-        let pgid = nix::unistd::Pid::from_raw(pid as i32);
-        if let Err(error) = signal_process_group_because(
-            pgid,
-            nix::sys::signal::Signal::SIGKILL,
-            "forced termination of a provider process group",
-        ) {
-            child.kill().await?;
-            return Err(DaemonError::Process(format!(
-                "worker process group kill failed: {error}"
-            )));
-        }
-    }
-    let _ = child.wait().await?;
+pub(crate) async fn kill_worker_child(
+    child: &mut tokio::process::Child,
+    stop: &WorkerStopHandle,
+) -> Result<()> {
+    stop.terminate("forced termination of a provider process group")
+        .map_err(|error| {
+            DaemonError::Process(format!("worker process group kill failed: {error}"))
+        })?;
+    stop.wait(child).await?;
     Ok(())
+}
+
+/// The worker scope unit `command` was configured to launch into, if any.
+pub(crate) fn command_scope(command: &Command) -> Option<String> {
+    rsid_core::process_control::worker_scope_of_command(command.as_std())
 }
 
 /// A configured command whose direct child is the synchronous `systemd-run`
@@ -346,6 +370,8 @@ pub(crate) async fn kill_worker_child(child: &mut tokio::process::Child) -> Resu
 /// for each command, including concurrent tools in one model invocation.
 pub(crate) struct ScopedWorkerCommand {
     command: Command,
+    /// Read only by tests that assert one unit per command.
+    #[cfg(test)]
     unit_name: String,
 }
 
@@ -360,6 +386,7 @@ impl ScopedWorkerCommand {
             let _ = (invocation_id, limits);
             return Ok(Self {
                 command: Command::new(program),
+                #[cfg(test)]
                 unit_name: String::new(),
             });
         }
@@ -377,6 +404,7 @@ impl ScopedWorkerCommand {
         }
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     fn with_runner(
         runner: &Path,
         program: &OsStr,
@@ -406,17 +434,25 @@ impl ScopedWorkerCommand {
                 "--property=MemorySwapMax={}M",
                 limits.memory_swap_max_mib
             ))
-            .arg(format!("--property=CPUWeight={}", limits.cpu_weight))
-            .arg("--")
-            .arg(program);
+            .arg(format!("--property=CPUWeight={}", limits.cpu_weight));
+        if let Some(quota) = rsid_core::worker_cpu_quota::property_value(limits.cpu_quota_percent) {
+            command.arg(format!("--property=CPUQuota={quota}"));
+        }
+        command.arg("--").arg(program);
         configure_tokio_process_group(&mut command, ProcessContainment::Group)?;
-        Ok(Self { command, unit_name })
+        Ok(Self {
+            command,
+            #[cfg(test)]
+            unit_name,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn command_mut(&mut self) -> &mut Command {
         &mut self.command
     }
 
+    #[cfg(test)]
     pub(crate) fn unit_name(&self) -> &str {
         &self.unit_name
     }
@@ -449,10 +485,9 @@ impl ScopedWorkerCommand {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn test_runner() -> &'static Path {
-    Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
+    Path::new(rsi_common::manifest_dir!(
         "/tests/fixtures/process_scope_direct_runner.sh"
     ))
 }
@@ -594,8 +629,7 @@ mod tests {
     }
 
     fn fake_runner() -> &'static Path {
-        Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
+        Path::new(rsi_common::manifest_dir!(
             "/tests/fixtures/process_scope_group_runner.sh"
         ))
     }
@@ -655,9 +689,44 @@ mod tests {
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn worker_scope_carries_the_operator_cpu_quota_and_zero_disables_it() {
+        let args_for = |limits: WorkerScopeLimits| -> Vec<String> {
+            ScopedWorkerCommand::with_runner(
+                Path::new("/fake/systemd-run"),
+                OsStr::new("fake-provider"),
+                Uuid::new_v4(),
+                limits,
+            )
+            .unwrap()
+            .command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .collect()
+        };
+        let capped = args_for(limits().with_cpu_quota_percent(400));
+        assert!(capped.contains(&"--property=CPUQuota=400%".to_string()));
+        let tail = capped.iter().rev().take(2).rev().collect::<Vec<_>>();
+        assert_eq!(tail, ["--", "fake-provider"]);
+        let uncapped = args_for(limits().with_cpu_quota_percent(0));
+        assert!(!uncapped.iter().any(|arg| arg.contains("CPUQuota")));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn launcher_snapshot_limits_follow_the_live_quota_setting() {
+        rsid_core::worker_cpu_quota::set_percent(250);
+        let limits = WorkerScopeLimits::from_launcher_snapshot().unwrap();
+        rsid_core::worker_cpu_quota::set_percent(
+            rsid_core::worker_cpu_quota::WORKER_CPU_QUOTA_PERCENT_DEFAULT,
+        );
+        assert_eq!(limits.cpu_quota_percent, 250);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn fake_scope_keeps_direct_child_streams_and_exit_status() {
-        let dir = tempfile::tempdir().unwrap();
         let runner = fake_runner();
         let mut scoped =
             ScopedWorkerCommand::with_runner(runner, OsStr::new("sh"), Uuid::new_v4(), limits())
@@ -755,5 +824,46 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), None),
             Err(nix::errno::Errno::ESRCH)
         );
+    }
+
+    /// #2006: the scope recorded at launch is the one a forced halt kills.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_records_the_scope_a_forced_halt_kills() {
+        let mut scoped =
+            ScopedWorkerCommand::new(std::ffi::OsStr::new("sleep"), Uuid::new_v4(), limits())
+                .unwrap();
+        let unit = scoped.unit_name().to_string();
+        scoped.command_mut().arg("30");
+        let mut command = scoped.into_command();
+        let scope = command_scope(&command);
+        assert_eq!(scope.as_deref(), Some(unit.as_str()));
+        let mut child = command.spawn().unwrap();
+        let stop = WorkerStopHandle::new(child.id(), scope);
+        let other = format!("rsi-worker-{}-never-launched.scope", Uuid::new_v4());
+        kill_worker_child(&mut child, &stop).await.unwrap();
+        assert_eq!(
+            rsid_core::process_control::recorded_scope_kills::killed(&unit),
+            1
+        );
+        assert_eq!(
+            rsid_core::process_control::recorded_scope_kills::killed(&other),
+            0
+        );
+    }
+
+    /// Off Linux there is no worker scope: the launch records none, so a forced
+    /// halt has no unit to kill.
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn launch_records_no_scope_where_scopes_are_unsupported() {
+        let mut scoped =
+            ScopedWorkerCommand::new(std::ffi::OsStr::new("sleep"), Uuid::new_v4(), limits())
+                .unwrap();
+        scoped.command_mut().arg("30");
+        let command = scoped.into_command();
+        assert_eq!(command_scope(&command), None);
     }
 }

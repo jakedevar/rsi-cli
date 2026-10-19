@@ -146,7 +146,7 @@ for ticket_id in "${!STATUS_MAP[@]}"; do
     ENV_ARGS+=("STATUS_FOR_${ticket_id}=${STATUS_MAP[$ticket_id]}")
 done
 
-env "${ENV_ARGS[@]}" awk -v status_keys="${!STATUS_MAP[*]}" '
+env ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} awk -v status_keys="${!STATUS_MAP[*]}" '
 BEGIN {
     n = split(status_keys, keys, " ");
     for (i = 1; i <= n; i++) {

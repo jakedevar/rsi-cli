@@ -12,16 +12,20 @@ use crate::overlay::{
     open_provider_credential_form, open_provider_form, open_skill_preview,
     open_text_area_bg_editor,
 };
-use crate::settings::{
-    DaemonFeatureEntry, FORMULATION_ANIM_DURATIONS, MessageBridgeKind, UserSettings, cycle_u64,
-};
+use crate::settings::{DaemonFeatureEntry, MessageBridgeKind, UserSettings};
 #[cfg(test)]
-use crate::settings::{DaemonFeatureValue, OBSERVATION_THRESHOLDS};
+use crate::settings::{
+    DaemonFeatureValue, FORMULATION_ANIM_DURATIONS, OBSERVATION_THRESHOLDS, cycle_u64,
+};
 use crate::settings_registry::{
     SETTINGS, SettingId, SettingOwner, SettingSpec, SettingsGroup, SettingsSection,
 };
+use crate::settings_staging::{
+    LocalPref, RowValue, SYSTEM_PROMPT_FIELD, Step, pending_count, row_value_of_entry,
+};
 use crate::types::{
     HookFormEditingTarget, Pane, ProviderKeyClearConfirmation, SettingsFocus, SettingsState,
+    SkillDeleteConfirmation,
 };
 use rsi_common::provider_credentials::ProviderCredentialSlot;
 use rsi_common::types::SessionProvider;
@@ -32,13 +36,26 @@ use rsi_common::types::SessionProvider;
 pub const DAEMON_FEATURE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::EditingMode,
     SettingsSection::ModelControl,
+    SettingsSection::CloudSpend,
     SettingsSection::RetriesRecovery,
+    SettingsSection::ContextRotation,
     SettingsSection::StallDetection,
     SettingsSection::MemoryDreaming,
-    SettingsSection::Orchestration,
+    SettingsSection::Scheduling,
+    SettingsSection::RecursiveDag,
     SettingsSection::CodeIntelligence,
     SettingsSection::ProviderIsolation,
+    SettingsSection::ProviderSubagents,
+    SettingsSection::ProviderSkills,
+    SettingsSection::ApiRoutes,
+    SettingsSection::HarnessTools,
+    SettingsSection::ResourceLimits,
+    SettingsSection::BuildGovernor,
+    SettingsSection::MergeQueue,
     SettingsSection::SandboxStorage,
+    SettingsSection::ColdStorage,
+    SettingsSection::BuildCache,
+    SettingsSection::AgentBuilds,
 ];
 
 /// The `app.daemon_features` field name for a registry row, for every row
@@ -51,6 +68,10 @@ pub(crate) fn daemon_feature_field_for(id: SettingId) -> Option<&'static str> {
         SettingId::ModelControlMode => Some("model_control_mode"),
         SettingId::EmergencyStop => Some("model_control_stop_all"),
         SettingId::SandboxStorageStatus => Some("sandbox_storage_status"),
+        SettingId::ColdArchiveStatus => Some("cold_archive_status"),
+        SettingId::ColdArchiveLastRun => Some("cold_archive_last_run"),
+        SettingId::ColdArchiveRunNow => Some("cold_archive_run_now"),
+        SettingId::TargetPoolStatus => Some("target_pool_status"),
         SettingId::CloudSpendStatus => Some("cloud_spend_status"),
         SettingId::PreviewReclaim => Some("sandbox_build_cache_dry_run"),
         SettingId::ReclaimNow => Some("sandbox_build_cache_reclaim_now"),
@@ -355,7 +376,9 @@ fn open_hook_edit_for_selected_index(app: &mut App) {
     open_hook_form(app, target);
 }
 
-/// Delete the hook row at the current selection, write the file, refresh cache.
+/// Delete the hook row at the current selection through the daemon
+/// (`PutClaudeHooks` with the cached revision; a stale one opens the conflict
+/// prompt, hub #3039).
 fn delete_hook_at_selected_index(app: &mut App) {
     let idx = app.settings_state.selected_index;
     let target = {
@@ -363,46 +386,23 @@ fn delete_hook_at_selected_index(app: &mut App) {
         rows.get(idx)
             .map(|row| (row.event.clone(), row.entry_index, row.hook_index))
     };
-    let (event, entry_idx, hook_idx) = match target {
-        Some(t) => t,
-        None => return,
-    };
-
-    let mut settings = match claude_config::load_user_settings() {
-        Ok(s) => s.data,
-        Err(e) => {
-            app.notify_error(format!("Failed to read ~/.claude/settings.json: {}", e));
-            return;
-        }
-    };
-
-    // Walk down the (event, entry, hook) coordinate, peeling empty parents.
-    if let Some(entries) = settings.hooks.get_mut(&event) {
-        if let Some(entry) = entries.get_mut(entry_idx) {
-            if hook_idx < entry.hooks.len() {
-                entry.hooks.remove(hook_idx);
-            }
-            if entry.hooks.is_empty() {
-                entries.remove(entry_idx);
-            }
-        }
-        if entries.is_empty() {
-            settings.hooks.remove(&event);
-        }
-    }
-
-    if let Err(e) = claude_config::save_user_settings(&settings) {
-        app.notify_error(format!("Failed to save ~/.claude/settings.json: {}", e));
+    let Some((event, entry_index, hook_index)) = target else {
         return;
-    }
-    app.invalidate_claude_settings_cache();
-
-    // Clamp selection so the next render lands on a valid row.
-    let new_max = app.cached_claude_settings_rows().len().saturating_sub(1);
-    if app.settings_state.selected_index > new_max {
-        app.settings_state.selected_index = new_max;
-    }
-    app.notify_success("Deleted hook. Applies to new Claude sessions.");
+    };
+    let Some(view) = app.cached_claude_hooks.clone() else {
+        return;
+    };
+    let edit = claude_config::HookEdit::Delete {
+        event,
+        entry_index,
+        hook_index,
+    };
+    let hooks = edit.apply(view.hooks);
+    app.pending_lc_actions.push(LcAction::SaveClaudeHooks {
+        expected_revision: view.revision,
+        hooks,
+        edit,
+    });
 }
 
 // --- Budgets helpers --------------------------------------------------------
@@ -457,7 +457,7 @@ fn now_ms() -> i64 {
 const CLEAR_CONFIRM_TTL_MS: i64 = 2_000;
 
 /// Selected slot for the Provider Keys category's current row.
-/// `ProviderCredentialSlot::ALL` is a fixed, ordered 23-slot enum, so
+/// `ProviderCredentialSlot::ALL` is a fixed, ordered slot enum, so
 /// `selected_index` maps onto it directly — no daemon round trip needed to
 /// know WHICH slot is selected, only to know its current state.
 fn selected_provider_credential_slot(app: &App) -> Option<ProviderCredentialSlot> {
@@ -479,6 +479,16 @@ fn check_selected_provider_credential(app: &mut App) {
     if let Some(slot) = selected_provider_credential_slot(app) {
         app.pending_lc_actions
             .push(LcAction::CheckProviderCredentialSlot(slot));
+    } else if app.settings_state.selected_index < crate::provider_credential_rows::login_row_end() {
+        // A login row: `c` probes the CLI logins now (#2753).
+        app.pending_lc_actions
+            .push(LcAction::RefreshProviderLogin { probe: true });
+    } else if app.settings_state.selected_index
+        < crate::provider_credential_rows::provider_key_row_count()
+    {
+        // A contract row: `c` runs the CLI contract canary now (#2755).
+        app.pending_lc_actions
+            .push(LcAction::RefreshProviderContract { probe: true });
     }
 }
 
@@ -582,21 +592,47 @@ fn toggle_skill_at_selected_index(app: &mut App) {
     }
 }
 
-/// Delete the selected skill directory immediately (no confirm — matches
-/// ApiModels precedent at the existing `'d'` arm above).
-fn delete_skill_at_selected_index(app: &mut App) {
+/// `d` on a Skills row: the first press arms a "press d again" confirmation
+/// for the selected skill; a second `d` on the SAME skill within
+/// `CLEAR_CONFIRM_TTL_MS` deletes it. Deletion is permanent (no trash), so
+/// both frontends ask twice. Same arm-then-confirm shape as
+/// `arm_or_confirm_clear_selected_credential`.
+fn arm_or_confirm_delete_selected_skill(app: &mut App) {
+    arm_or_confirm_delete_selected_skill_in(app, &claude_config::skills_home());
+}
+
+fn arm_or_confirm_delete_selected_skill_in(app: &mut App, home: &std::path::Path) {
     let idx = app.settings_state.selected_index;
     let name = {
         let skills = app.cached_user_skills();
         skills.get(idx).map(|s| s.name.clone())
     };
-    let name = match name {
-        Some(n) => n,
-        None => return,
+    let Some(name) = name else {
+        return;
     };
-    match claude_config::delete_skill(&name) {
+    let now = now_ms();
+    let confirmed = app
+        .settings_state
+        .skill_delete_confirmation
+        .as_ref()
+        .is_some_and(|c| {
+            c.name == name && now.saturating_sub(c.armed_at_ms) <= CLEAR_CONFIRM_TTL_MS
+        });
+    if !confirmed {
+        app.settings_state.skill_delete_confirmation = Some(SkillDeleteConfirmation {
+            name: name.clone(),
+            armed_at_ms: now,
+        });
+        app.notify(format!(
+            "Delete skill {name} permanently? Press d again to confirm"
+        ));
+        return;
+    }
+    app.settings_state.skill_delete_confirmation = None;
+    match claude_config::delete_skill_in(home, &name) {
         Ok(()) => {
-            app.invalidate_claude_skills_cache();
+            // Re-list under the same `home` the delete used.
+            app.cached_user_skills = Some(claude_config::list_skills_in(home).unwrap_or_default());
             let new_max = app.cached_user_skills().len().saturating_sub(1);
             if app.settings_state.selected_index > new_max {
                 app.settings_state.selected_index = new_max;
@@ -776,11 +812,8 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             } else if section == SettingsSection::Satellites {
                 if idx == 0 {
                     app.pending_lc_actions.push(LcAction::OpenSatelliteRegistry);
-                } else if let Some(field) = daemon_feature_field_for(SettingId::SatellitePolling)
-                    && let Some(vec_idx) = app.daemon_features.iter().position(|e| e.field == field)
-                {
-                    app.pending_lc_actions
-                        .push(LcAction::ToggleDaemonFeature(vec_idx));
+                } else {
+                    stage_selected_row(app, Step::Activate);
                 }
             } else if section == SettingsSection::Remote {
                 app.pending_lc_actions.push(LcAction::OpenRemoteSettings);
@@ -793,14 +826,35 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                     let field = app
                         .daemon_features
                         .get(vec_idx)
-                        .map(|entry| entry.field.as_str());
-                    app.pending_lc_actions.push(match field {
-                        Some("source_worktree_settlement") => {
-                            LcAction::OpenSourceWorktreeSettlement
+                        .map(|entry| entry.field.clone());
+                    match field.as_deref() {
+                        Some("source_worktree_settlement") => app
+                            .pending_lc_actions
+                            .push(LcAction::OpenSourceWorktreeSettlement),
+                        Some("legacy_scratch_adoption") => {
+                            app.pending_lc_actions.push(LcAction::OpenLegacyScratch);
                         }
-                        Some("legacy_scratch_adoption") => LcAction::OpenLegacyScratch,
-                        _ => LcAction::ToggleDaemonFeature(vec_idx),
-                    });
+                        // A free-text value (a path, a URL): edited in its own
+                        // overlay, written when saved (#2438, #2393).
+                        Some(field) if crate::overlay::daemon_text_field(field).is_some() => {
+                            crate::overlay::open_daemon_text_editor(app, field);
+                        }
+                        // Switches and choices stage; the daemon hears of them
+                        // when the operator applies (#2241).
+                        _ if app
+                            .daemon_features
+                            .get(vec_idx)
+                            .and_then(row_value_of_entry)
+                            .is_some() =>
+                        {
+                            stage_selected_row(app, Step::Activate);
+                        }
+                        // Action buttons (emergency stop, cache preview and
+                        // reclaim) run on the key press.
+                        _ => app
+                            .pending_lc_actions
+                            .push(LcAction::ToggleDaemonFeature(vec_idx)),
+                    }
                 }
             } else if section == SettingsSection::Usage {
                 if let Some(action) = stats_row_action(app, idx) {
@@ -834,8 +888,26 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 // Text-area background hex editor — open overlay instead of toggling.
                 open_text_area_bg_editor(app);
             } else {
-                let state_snapshot = app.settings_state.clone();
-                toggle_setting_on_app(app, &state_snapshot);
+                stage_selected_row(app, Step::Activate);
+            }
+            true
+        }
+
+        // `-` / `+` step the selected row down / up. Like Enter they only stage
+        // the value; `w` applies every pending row at once (#2241).
+        KeyCode::Char(c @ ('-' | '+')) if app.settings_state.focus == SettingsFocus::Items => {
+            let step = if c == '+' { Step::Next } else { Step::Previous };
+            if !stage_selected_row(app, step) {
+                app.notify("This row has no values to step");
+            }
+            true
+        }
+
+        KeyCode::Char('w') => {
+            if pending_count(app) == 0 {
+                app.notify("No pending settings changes");
+            } else {
+                app.pending_lc_actions.push(LcAction::ApplyPendingSettings);
             }
             true
         }
@@ -867,13 +939,11 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                 && app.settings_state.focus == SettingsFocus::Items =>
         {
             let idx = app.settings_state.selected_index;
-            if idx < app.settings.custom_providers.len() {
-                app.settings.custom_providers.remove(idx);
-                // Clamp selection
-                let new_max = app.settings.custom_providers.len().saturating_sub(1);
-                if app.settings_state.selected_index > new_max {
-                    app.settings_state.selected_index = new_max;
-                }
+            if let Some(entry) = app.settings.custom_providers.get(idx) {
+                // hub #3039: the daemon removes the provider and its vault
+                // key; the list (and the selection clamp) follow its reply.
+                app.pending_lc_actions
+                    .push(LcAction::DeleteCustomProvider { id: entry.id });
             }
             true
         }
@@ -920,12 +990,12 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
-        // Skills-specific: 'd' to delete selected skill (matches ApiModels precedent — no confirm)
+        // Skills-specific: 'd' to delete selected skill (press twice: permanent)
         KeyCode::Char('d')
             if app.settings_state.section == SettingsSection::ClaudeSkills
                 && app.settings_state.focus == SettingsFocus::Items =>
         {
-            delete_skill_at_selected_index(app);
+            arm_or_confirm_delete_selected_skill(app);
             true
         }
 
@@ -991,6 +1061,10 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
         {
             app.pending_lc_actions
                 .push(LcAction::RefreshProviderCredentials);
+            app.pending_lc_actions
+                .push(LcAction::RefreshProviderLogin { probe: true });
+            app.pending_lc_actions
+                .push(LcAction::RefreshProviderContract { probe: true });
             true
         }
 
@@ -1187,6 +1261,7 @@ fn cycle_section_tab(app: &mut App, step: isize) {
     app.settings_state.model_dropdown.close();
     app.settings_state.active_dropdown_item = None;
     app.settings_state.provider_key_clear_confirmation = None;
+    app.settings_state.skill_delete_confirmation = None;
     enter_remembered_settings_section(app, next);
 }
 
@@ -1297,9 +1372,17 @@ pub fn close_settings(app: &mut App) {
             };
         }
     }
+    // Leaving the panel discards edits that were never applied.
+    let discarded = pending_count(app);
     app.settings_state.remember_position();
     app.settings_state.clear_transient();
     crate::state::PersistedState::capture(app).save();
+    if discarded > 0 {
+        app.notify(format!(
+            "Discarded {discarded} pending settings change{}",
+            if discarded == 1 { "" } else { "s" }
+        ));
+    }
 }
 
 /// Floor row count for a daemon-features-backed section, computed against
@@ -1357,17 +1440,30 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         // live rendering/navigation expands this through
         // `model_control_budgets::budget_row_count`.
         SettingsSection::Budgets => 1,
-        SettingsSection::ProviderKeys => ProviderCredentialSlot::ALL.len(),
+        SettingsSection::ProviderKeys => crate::provider_credential_rows::provider_key_row_count(),
         SettingsSection::McpServers => 1,
         SettingsSection::EditingMode
         | SettingsSection::ModelControl
+        | SettingsSection::CloudSpend
         | SettingsSection::RetriesRecovery
+        | SettingsSection::ContextRotation
         | SettingsSection::StallDetection
         | SettingsSection::MemoryDreaming
-        | SettingsSection::Orchestration
+        | SettingsSection::Scheduling
+        | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
         | SettingsSection::ProviderIsolation
-        | SettingsSection::SandboxStorage => {
+        | SettingsSection::ProviderSubagents
+        | SettingsSection::ProviderSkills
+        | SettingsSection::ApiRoutes
+        | SettingsSection::HarnessTools
+        | SettingsSection::ResourceLimits
+        | SettingsSection::BuildGovernor
+        | SettingsSection::MergeQueue
+        | SettingsSection::SandboxStorage
+        | SettingsSection::ColdStorage
+        | SettingsSection::BuildCache
+        | SettingsSection::AgentBuilds => {
             unreachable!("handled by DAEMON_FEATURE_SECTIONS above")
         }
     }
@@ -1422,34 +1518,148 @@ fn handle_message_bridges_enter(app: &mut App) {
     open_message_bridge_form(app, bridge);
 }
 
-fn toggle_setting_on_app(app: &mut App, state: &SettingsState) {
-    // RSI-026: SystemPrompt cycling is now daemon-owned. Skip the in-memory
-    // mutation in `toggle_setting` (it would race the daemon's authoritative
-    // value) and instead emit an action; the async dispatcher dispatches the
-    // UpdateDaemonConfig RPC and refreshes the local cache on success.
-    if state.section == SettingsSection::SystemPrompt && state.selected_index == 0 {
-        app.pending_lc_actions
-            .push(LcAction::CycleSystemPromptPreset);
-        return;
-    }
-    toggle_setting(&mut app.settings, state);
-    // Rebuild prompt_processor guard when the Prompt compiler toggle changes.
-    if state.section == SettingsSection::InputPrompts && state.selected_index == 2 {
-        app.prompt_processor =
-            crate::prompt_processor::build_processor(&app.settings.prompt_processor);
-    }
-    // When the global "hide tool results" default changes, update all existing sessions.
-    if state.section == SettingsSection::TranscriptDefaults && state.selected_index == 2 {
-        let hide = app.settings.default_hide_tool_results;
-        for session_state in app.sessions.values_mut() {
-            session_state.show_tool_results = !hide;
-            crate::ui::height::invalidate_heights(session_state);
+/// What the selected row stages when a key presses it.
+enum RowTarget {
+    /// A flat `app.daemon_features` entry (including the System prompt row,
+    /// whose value is the daemon's `system_prompt_preset` field).
+    Daemon(usize),
+    /// A local TUI preference.
+    Local(LocalPref),
+}
+
+fn selected_row_target(app: &App) -> Option<RowTarget> {
+    let section = app.settings_state.section;
+    let idx = app.settings_state.selected_index;
+    let daemon_index = |field: &str| app.daemon_features.iter().position(|e| e.field == field);
+    match section {
+        SettingsSection::SystemPrompt => {
+            if idx == 0 {
+                daemon_index(SYSTEM_PROMPT_FIELD).map(RowTarget::Daemon)
+            } else {
+                None
+            }
+        }
+        // Row 0 opens the registry browser; row 1 is the polling switch.
+        SettingsSection::Satellites => {
+            if idx == 0 {
+                return None;
+            }
+            let field = daemon_feature_field_for(SettingId::SatellitePolling)?;
+            daemon_index(field).map(RowTarget::Daemon)
+        }
+        section if DAEMON_FEATURE_SECTIONS.contains(&section) => {
+            let vec_idx = daemon_feature_vec_index(app, section, idx)?;
+            row_value_of_entry(app.daemon_features.get(vec_idx)?)?;
+            Some(RowTarget::Daemon(vec_idx))
+        }
+        _ => {
+            let view = app.settings_state.pending.view_settings(&app.settings);
+            LocalPref::at(&view, section, idx).map(RowTarget::Local)
         }
     }
-    // Card field changes affect has_pills → must invalidate card height cache.
-    if state.section == SettingsSection::SessionList {
-        app.invalidate_card_cache();
+}
+
+/// Step the selected row and stage the result (#2241). Nothing reaches the
+/// daemon or the saved settings until the operator applies. Returns false when
+/// the row has no value to step.
+pub(crate) fn stage_selected_row(app: &mut App, step: Step) -> bool {
+    match selected_row_target(app) {
+        Some(RowTarget::Daemon(vec_idx)) => stage_daemon_row(app, vec_idx, step),
+        Some(RowTarget::Local(pref)) => stage_local_pref(app, pref, step),
+        None => false,
     }
+}
+
+/// Tell the operator a numeric row is at the end of its range.
+fn notify_range_end(app: &mut App, label: &str, step: Step) {
+    let end = if step == Step::Previous {
+        "minimum"
+    } else {
+        "maximum"
+    };
+    app.notify(format!("{label} is already at its {end}"));
+}
+
+fn stage_daemon_row(app: &mut App, vec_idx: usize, step: Step) -> bool {
+    if !app.authoritative_config_ready() {
+        app.notify(app.daemon_config_unavailable_reason());
+        return true;
+    }
+    let Some(entry) = app.daemon_features.get(vec_idx) else {
+        return false;
+    };
+    let Some(live) = row_value_of_entry(entry) else {
+        return false;
+    };
+    let field = entry.field.clone();
+    let label = entry.label.clone();
+    let current = match app.settings_state.pending.daemon_staged(&field) {
+        Some(staged) => live.with_staged(staged),
+        None => live,
+    };
+    let next = current.stepped(step);
+    if next == current && current.is_clamped_at(step) {
+        notify_range_end(app, &label, step);
+    }
+    app.settings_state
+        .pending
+        .stage_daemon(&field, live.staged(), next.staged());
+    app.mark_dirty();
+    true
+}
+
+fn stage_local_pref(app: &mut App, pref: LocalPref, step: Step) -> bool {
+    let current: RowValue = {
+        let view = app.settings_state.pending.view_settings(&app.settings);
+        pref.read(&view)
+    };
+    let next = current.stepped(step);
+    if next == current && current.is_clamped_at(step) {
+        notify_range_end(app, &pref.label(), step);
+    }
+    app.settings_state
+        .pending
+        .stage_local(pref, next.staged(), &app.settings);
+    app.mark_dirty();
+    true
+}
+
+/// Write the staged local preferences into the live settings and run the side
+/// effects each one had when it applied immediately. Returns how many changed.
+pub(crate) fn commit_pending_local(app: &mut App) -> usize {
+    let changes = app.settings_state.pending.take_local_changes(&app.settings);
+    if changes.is_empty() {
+        return 0;
+    }
+    for (pref, value) in &changes {
+        pref.write(&mut app.settings, *value);
+    }
+    for (pref, _) in &changes {
+        match pref {
+            // Rebuild the prompt_processor guard when the Prompt compiler
+            // switch changes.
+            LocalPref::PromptCompiler => {
+                app.prompt_processor =
+                    crate::prompt_processor::build_processor(&app.settings.prompt_processor);
+            }
+            // When the global "hide tool results" default changes, update all
+            // existing sessions.
+            LocalPref::HideToolResults => {
+                let hide = app.settings.default_hide_tool_results;
+                for session_state in app.sessions.values_mut() {
+                    session_state.show_tool_results = !hide;
+                    crate::ui::height::invalidate_heights(session_state);
+                }
+            }
+            // Card field changes affect has_pills, so the card height cache
+            // is invalid.
+            LocalPref::NavigatorPreset
+            | LocalPref::NavigatorColumn(_)
+            | LocalPref::CardField(_) => app.invalidate_card_cache(),
+            _ => {}
+        }
+    }
+    changes.len()
 }
 
 /// If the current section is daemon-features-backed, queue a refresh action
@@ -1473,6 +1683,10 @@ fn maybe_queue_provider_credentials_refresh(app: &mut App) {
     if app.settings_state.section == SettingsSection::ProviderKeys {
         app.pending_lc_actions
             .push(LcAction::RefreshProviderCredentials);
+        app.pending_lc_actions
+            .push(LcAction::RefreshProviderLogin { probe: false });
+        app.pending_lc_actions
+            .push(LcAction::RefreshProviderContract { probe: false });
     }
 }
 
@@ -1756,8 +1970,8 @@ fn handle_agent_actors_selection(app: &mut App, model_id: String) -> bool {
             app.settings.prompt_processor.custom_provider_id = custom_entry.map(|entry| entry.id);
             app.settings.prompt_processor.custom_base_url =
                 custom_entry.map(|entry| entry.base_url.clone());
-            app.settings.prompt_processor.custom_api_key =
-                custom_entry.map(|entry| entry.api_key.clone());
+            // hub #3039: the daemon resolves the key by provider id; the
+            // legacy `custom_api_key` is left exactly as loaded.
             app.settings.prompt_processor.model = model_id;
             app.prompt_processor =
                 crate::prompt_processor::build_processor(&app.settings.prompt_processor);
@@ -1797,6 +2011,8 @@ fn handle_agent_actors_selection(app: &mut App, model_id: String) -> bool {
     true
 }
 
+// Test-only: the live key path applies settings through the dropdown/editor handlers, not this toggle.
+#[cfg(test)]
 fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
     let idx = state.selected_index;
     match state.section {
@@ -1856,16 +2072,29 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
             }
         }
         // Daemon-features-backed sections and the daemon-owned MemoryDreaming
-        // rows are toggled via RPC (`LcAction::ToggleDaemonFeature`); UserSettings
-        // is not mutated for them here.
+        // rows are staged by `stage_selected_row` and sent on apply;
+        // UserSettings is not mutated for them here.
         SettingsSection::EditingMode
         | SettingsSection::ModelControl
+        | SettingsSection::CloudSpend
         | SettingsSection::RetriesRecovery
+        | SettingsSection::ContextRotation
         | SettingsSection::StallDetection
-        | SettingsSection::Orchestration
+        | SettingsSection::Scheduling
+        | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
         | SettingsSection::ProviderIsolation
-        | SettingsSection::SandboxStorage => {}
+        | SettingsSection::ProviderSubagents
+        | SettingsSection::ProviderSkills
+        | SettingsSection::ApiRoutes
+        | SettingsSection::HarnessTools
+        | SettingsSection::ResourceLimits
+        | SettingsSection::BuildGovernor
+        | SettingsSection::MergeQueue
+        | SettingsSection::SandboxStorage
+        | SettingsSection::ColdStorage
+        | SettingsSection::BuildCache
+        | SettingsSection::AgentBuilds => {}
         // Model Roles items are handled via model dropdown, not toggle_setting.
         SettingsSection::ModelRoles => {}
         // Message bridge rows open an editor form.
@@ -1876,9 +2105,9 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         SettingsSection::ClaudeHooks => {}
         SettingsSection::ClaudeSkills => {}
         SettingsSection::MemoryDreaming => {}
-        // RSI-026: SystemPrompt cycling is daemon-owned and dispatched via
-        // `LcAction::CycleSystemPromptPreset` from `toggle_setting_on_app`;
-        // toggle_setting itself is a no-op for this section so direct
+        // RSI-026: SystemPrompt cycling is daemon-owned. The key handler stages
+        // it as the daemon's `system_prompt_preset` field and sends it on
+        // apply; toggle_setting itself is a no-op for this section so direct
         // in-memory mutation (which would race the daemon) is impossible.
         SettingsSection::SystemPrompt => {}
         // Usage is a read-only daemon aggregate; nothing to toggle.
@@ -1915,6 +2144,107 @@ mod tests {
             app.pending_lc_actions
                 .contains(&LcAction::OpenRemoteSettings)
         );
+    }
+
+    fn skills_app_with_home(label: &str, names: &[&str]) -> (App, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!(
+            "rsi-skill-delete-{}-{}-{}",
+            label,
+            std::process::id(),
+            now_ms()
+        ));
+        let dir = home.join(".claude").join("skills");
+        for name in names {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("SKILL.md"), "hello\n").unwrap();
+        }
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::ClaudeSkills;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.selected_index = 0;
+        app.cached_user_skills = Some(claude_config::list_skills_in(&home).unwrap());
+        (app, home)
+    }
+
+    #[test]
+    fn skill_delete_needs_a_second_d_within_the_window() {
+        let (mut app, home) = skills_app_with_home("twice", &["alpha", "beta"]);
+        let dir = home.join(".claude").join("skills");
+
+        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
+        assert!(dir.join("alpha").exists(), "a single d deletes nothing");
+        assert_eq!(
+            app.settings_state
+                .skill_delete_confirmation
+                .as_ref()
+                .map(|c| c.name.as_str()),
+            Some("alpha")
+        );
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|n| n.message.contains("Press d again")),
+            "the hint names the second press"
+        );
+
+        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
+        assert!(!dir.join("alpha").exists(), "the second d deletes");
+        assert!(dir.join("beta").exists());
+        assert!(app.settings_state.skill_delete_confirmation.is_none());
+        let names: Vec<_> = app
+            .cached_user_skills()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, vec!["beta".to_string()]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn skill_delete_confirmation_times_out_and_is_per_skill() {
+        let (mut app, home) = skills_app_with_home("ttl", &["alpha", "beta"]);
+        let dir = home.join(".claude").join("skills");
+
+        // An arm older than the window does not confirm; it re-arms.
+        app.settings_state.skill_delete_confirmation = Some(SkillDeleteConfirmation {
+            name: "alpha".into(),
+            armed_at_ms: now_ms() - CLEAR_CONFIRM_TTL_MS - 1_000,
+        });
+        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
+        assert!(dir.join("alpha").exists(), "an expired arm deletes nothing");
+        assert!(
+            app.settings_state
+                .skill_delete_confirmation
+                .as_ref()
+                .is_some_and(|c| c.name == "alpha" && now_ms() - c.armed_at_ms < 1_000),
+            "an expired arm is replaced by a fresh one"
+        );
+
+        // An arm for another skill does not confirm this one.
+        app.settings_state.selected_index = 1;
+        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
+        assert!(dir.join("alpha").exists());
+        assert!(dir.join("beta").exists(), "moving rows re-arms");
+        assert_eq!(
+            app.settings_state
+                .skill_delete_confirmation
+                .as_ref()
+                .map(|c| c.name.as_str()),
+            Some("beta")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn skill_d_key_first_press_only_arms() {
+        let (mut app, home) = skills_app_with_home("key", &["alpha"]);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('d'))));
+        assert!(
+            home.join(".claude").join("skills").join("alpha").exists(),
+            "the d key alone deletes nothing"
+        );
+        assert!(app.settings_state.skill_delete_confirmation.is_some());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2125,7 +2455,9 @@ mod tests {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         app.settings_state.focus = SettingsFocus::Items;
         app.settings_state.section = SettingsSection::ThemeColors;
-        app.settings_state.query = "skills".to_string();
+        // "previews skills" is only in the Claude skills row's summary;
+        // "skills" alone also names the Provider Skills tab (#2767).
+        app.settings_state.query = "previews skills".to_string();
         app.settings_state.query_active = true;
         assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
         assert_eq!(app.settings_state.section, SettingsSection::ClaudeSkills);
@@ -2228,8 +2560,110 @@ mod tests {
 
     #[test]
     fn test_settings_category_all_count() {
-        // Seven rail groups, including the satellite integration section.
-        assert_eq!(SettingsSection::ALL.len(), 26);
+        // Eight rail groups and thirty-nine section tabs (#2236 split the
+        // oversized Orchestration, Sandbox Storage and Retries sections; #2384
+        // gave the cold-storage archive its own tab; #2763 gave the subagent
+        // governance rows theirs; #2767 the provider skill delivery row).
+        assert_eq!(SettingsGroup::ALL.len(), 8);
+        assert_eq!(SettingsSection::ALL.len(), 39);
+    }
+
+    /// #2236: splitting a section into tabs must not hide a row from search.
+    /// Searching a row's own label from that very row finds the row itself,
+    /// in its own tab, and the tab strip's per-tab match count sees it.
+    #[test]
+    fn search_finds_every_row_in_its_own_tab() {
+        for section in SettingsSection::ALL {
+            for (position, spec) in SETTINGS
+                .iter()
+                .filter(|spec| spec.section == *section)
+                .enumerate()
+            {
+                assert_eq!(
+                    find_next_search_match(
+                        spec.label,
+                        *section,
+                        ui_row_for_spec_position(*section, position),
+                        true
+                    ),
+                    Some((*section, ui_row_for_spec_position(*section, position))),
+                    "{:?} is found in {} by its own label",
+                    spec.id,
+                    section.label()
+                );
+                assert!(
+                    search_match_count_in_section(*section, spec.label) >= 1,
+                    "{} counts {:?} among its matches",
+                    section.label(),
+                    spec.id
+                );
+            }
+        }
+    }
+
+    /// #2236: a search finds rows in the split tabs, and the tab name itself
+    /// is a search term (every row of "Build Governor" answers to it).
+    #[test]
+    fn search_jumps_across_the_split_tabs() {
+        for (query, expected) in [
+            ("lander slots", SettingsSection::BuildGovernor),
+            ("deploy restarts per hour", SettingsSection::MergeQueue),
+            ("worker cpu quota", SettingsSection::ResourceLimits),
+            ("cloud spend daily cap", SettingsSection::CloudSpend),
+            ("cache reclaim ttl", SettingsSection::BuildCache),
+            ("sccache cap", SettingsSection::AgentBuilds),
+            ("harness search call cap", SettingsSection::HarnessTools),
+            ("durable topology executor", SettingsSection::Scheduling),
+            ("recursive dag run lease", SettingsSection::RecursiveDag),
+            ("rotation threshold codex", SettingsSection::ContextRotation),
+            ("openrouter engine", SettingsSection::ApiRoutes),
+        ] {
+            assert!(
+                search_candidates(query)
+                    .iter()
+                    .any(|(_, _, section)| *section == expected),
+                "{query} is found in {}",
+                expected.label()
+            );
+        }
+        for section in [
+            SettingsSection::ResourceLimits,
+            SettingsSection::BuildGovernor,
+            SettingsSection::MergeQueue,
+            SettingsSection::BuildCache,
+            SettingsSection::AgentBuilds,
+        ] {
+            let rows = SETTINGS
+                .iter()
+                .filter(|spec| spec.section == section)
+                .count();
+            assert_eq!(
+                search_match_count_in_section(section, section.label()),
+                rows,
+                "every row of {} answers to the tab name",
+                section.label()
+            );
+        }
+    }
+
+    /// #2236: `]` walks every tab of every category in page order and wraps,
+    /// so each tab of the split sections is reachable from the keyboard.
+    #[test]
+    fn brackets_visit_every_tab_of_every_category_in_order() {
+        for group in SettingsGroup::ALL {
+            let sections: Vec<SettingsSection> = group.sections().collect();
+            let mut app = crate::app::app_test_helpers::with_session_list(0);
+            app.settings_state.focus = SettingsFocus::Items;
+            app.settings_state.section = sections[0];
+            for expected in sections.iter().skip(1).chain(sections.iter().take(1)) {
+                assert!(handle_settings_key(&mut app, key(KeyCode::Char(']'))));
+                assert_eq!(app.settings_state.section, *expected, "{group:?}");
+            }
+            for expected in sections.iter().rev() {
+                assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
+                assert_eq!(app.settings_state.section, *expected, "{group:?} backwards");
+            }
+        }
     }
 
     #[test]
@@ -2262,6 +2696,7 @@ mod tests {
             SettingsSection::ModelControl,
             SettingsSection::RetriesRecovery,
             SettingsSection::ProviderIsolation,
+            SettingsSection::ResourceLimits,
             SettingsSection::MessageBridges,
         ] {
             state.selected_index = 3;
@@ -2317,6 +2752,8 @@ mod tests {
         assert!(handle_settings_key(&mut app, key(KeyCode::BackTab)));
         assert_eq!(app.settings_state.section, SettingsSection::StallDetection);
         assert_eq!(app.settings_state.selected_index, 3);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
+        assert_eq!(app.settings_state.section, SettingsSection::ContextRotation);
         assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
         assert_eq!(app.settings_state.section, SettingsSection::RetriesRecovery);
         assert!(handle_settings_key(&mut app, key(KeyCode::Char('['))));
@@ -2657,8 +3094,8 @@ mod tests {
     fn test_toggle_system_prompt_preset_is_noop_in_direct_helper() {
         // RSI-026: SystemPrompt cycling is daemon-owned. `toggle_setting`
         // itself is a no-op for the SystemPrompt section — the
-        // `toggle_setting_on_app` wrapper intercepts the section and emits
-        // `LcAction::CycleSystemPromptPreset` instead. Confirm the in-memory
+        // key handler stages the daemon field instead and sends it on apply
+        // (#2241). Confirm the in-memory
         // mutation path is dead so unit-level callers can't race the daemon.
         use crate::settings::SystemPromptPreset;
         let mut settings = UserSettings::default();
@@ -3289,5 +3726,287 @@ mod tests {
             ratatui::layout::Rect::new(0, 0, 100, 30),
         );
         assert_eq!(app.settings_state.selected_index, last);
+    }
+
+    // -- #2241: both-way stepping and stage-then-apply ------------------------
+
+    /// An app showing the Settings pane on the daemon row `field` of `section`.
+    fn settings_panel_on(section: SettingsSection, field: &str) -> App {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        let focused = app.active_tab().focused_pane;
+        let Some(pane) = app.active_tab_mut().layout.find_pane_mut(focused) else {
+            panic!("focused pane exists");
+        };
+        *pane = Pane::Settings;
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        app.settings_state.section = section;
+        app.settings_state.focus = SettingsFocus::Items;
+        let Some(row) = daemon_feature_rows_for_section(&app, section)
+            .iter()
+            .position(|(_, vec_idx)| app.daemon_features[*vec_idx].field == field)
+        else {
+            panic!("{field} is a row of {section:?}");
+        };
+        app.settings_state.selected_index = row;
+        app
+    }
+
+    fn live_choice(app: &App, field: &str) -> (usize, usize) {
+        let Some(entry) = app
+            .daemon_features
+            .iter()
+            .find(|entry| entry.field == field)
+        else {
+            panic!("{field} has a daemon_features entry");
+        };
+        match &entry.value {
+            DaemonFeatureValue::Cycle { options, current } => (*current, options.len()),
+            other => panic!("{field} is not a choice row: {other:?}"),
+        }
+    }
+
+    fn press(app: &mut App, ch: char, times: usize) {
+        for _ in 0..times {
+            assert!(handle_settings_key(app, key(KeyCode::Char(ch))));
+        }
+    }
+
+    #[test]
+    fn numeric_row_steps_down_and_clamps_at_min_and_max_without_wrapping() {
+        let field = "sandbox_max_source_roots";
+        let mut app = settings_panel_on(SettingsSection::SandboxStorage, field);
+        let (live, len) = live_choice(&app, field);
+        assert!(live > 0 && live + 1 < len, "the fixture row sits mid-range");
+
+        press(&mut app, '-', 1);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Choice(live - 1)),
+            "- steps a numeric row down"
+        );
+        press(&mut app, '-', len + 3);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Choice(0)),
+            "the minimum holds; a numeric row never wraps to its maximum"
+        );
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("already at its minimum")),
+            "the operator is told the row is at its minimum"
+        );
+        press(&mut app, '+', len + 3);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Choice(len - 1)),
+            "the maximum holds; it never wraps back to the first value"
+        );
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("already at its maximum"))
+        );
+        assert_eq!(
+            live_choice(&app, field).0,
+            live,
+            "the live row is untouched"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_numeric_row_at_its_maximum_stays_there() {
+        let field = "sandbox_max_source_roots";
+        let mut app = settings_panel_on(SettingsSection::SandboxStorage, field);
+        let (_, len) = live_choice(&app, field);
+        if let Some(entry) = app
+            .daemon_features
+            .iter_mut()
+            .find(|entry| entry.field == field)
+            && let DaemonFeatureValue::Cycle { current, .. } = &mut entry.value
+        {
+            *current = len - 1;
+        }
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            None,
+            "Enter at the maximum is a no-op, not a wrap to 512"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+    }
+
+    #[test]
+    fn enum_cycle_row_steps_backwards_and_wraps_and_stepping_home_clears_the_edit() {
+        let field = "model_control_mode";
+        let mut app = settings_panel_on(SettingsSection::ModelControl, field);
+        let (live, len) = live_choice(&app, field);
+        assert_eq!(live, 0);
+
+        press(&mut app, '-', 1);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Choice(len - 1)),
+            "- on the first option wraps to the last"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+        press(&mut app, '+', 1);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            None,
+            "+ from the last option wraps home and the edit disappears"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+        assert!(app.pending_lc_actions.is_empty(), "stepping sends nothing");
+    }
+
+    #[test]
+    fn switch_rows_take_enter_plus_and_minus() {
+        let field = "retry_enabled";
+        let mut app = settings_panel_on(SettingsSection::RetriesRecovery, field);
+        press(&mut app, '+', 1);
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Bool(true))
+        );
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert_eq!(app.settings_state.pending.daemon_staged(field), None);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Char(' '))));
+        assert_eq!(
+            app.settings_state.pending.daemon_staged(field),
+            Some(crate::settings_staging::StagedValue::Bool(true))
+        );
+        press(&mut app, '-', 1);
+        assert_eq!(app.settings_state.pending.daemon_staged(field), None);
+        assert!(
+            app.pending_lc_actions.is_empty(),
+            "no key reaches the daemon"
+        );
+    }
+
+    #[test]
+    fn keypresses_stage_without_queueing_any_daemon_action() {
+        let field = "sandbox_max_source_roots";
+        let mut app = settings_panel_on(SettingsSection::SandboxStorage, field);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('-'),
+            KeyCode::Char('+'),
+            KeyCode::Char('-'),
+        ] {
+            assert!(handle_settings_key(&mut app, key(code)));
+        }
+        assert!(
+            app.pending_lc_actions.is_empty(),
+            "five keypresses queued {:?}",
+            app.pending_lc_actions
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+    }
+
+    #[test]
+    fn apply_key_queues_one_apply_only_when_something_is_pending() {
+        let field = "sandbox_max_source_roots";
+        let mut app = settings_panel_on(SettingsSection::SandboxStorage, field);
+        press(&mut app, 'w', 1);
+        assert!(app.pending_lc_actions.is_empty());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("No pending settings changes"))
+        );
+        press(&mut app, '-', 2);
+        press(&mut app, 'w', 1);
+        assert_eq!(app.pending_lc_actions, vec![LcAction::ApplyPendingSettings]);
+    }
+
+    #[test]
+    fn local_preferences_stage_and_do_not_change_until_applied() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.section = SettingsSection::InputPrompts;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.selected_index = 0;
+        let before = app.settings.submit_on_enter;
+
+        press(&mut app, ' ', 1);
+        assert_eq!(app.settings.submit_on_enter, before, "staged, not live");
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+        let view = app
+            .settings_state
+            .pending
+            .view_settings(&app.settings)
+            .submit_on_enter;
+        assert_eq!(view, !before, "the panel shows the staged value");
+
+        press(&mut app, ' ', 1);
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+    }
+
+    #[test]
+    fn local_numeric_preference_clamps_and_local_enum_wraps() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings.formulation_anim_ms = FORMULATION_ANIM_DURATIONS[0];
+        app.settings_state.section = SettingsSection::Screen;
+        app.settings_state.selected_index = 3; // Formulation speed
+        press(&mut app, '-', 3);
+        assert_eq!(
+            crate::settings_staging::pending_count(&app),
+            0,
+            "the shortest duration is the minimum; stepping down stays there"
+        );
+        press(&mut app, '+', 1);
+        let view = app.settings_state.pending.view_settings(&app.settings);
+        assert_eq!(view.formulation_anim_ms, FORMULATION_ANIM_DURATIONS[1]);
+        drop(view);
+
+        app.settings_state.selected_index = 4; // Activity indicator
+        press(&mut app, '-', 1);
+        let view = app.settings_state.pending.view_settings(&app.settings);
+        assert_eq!(
+            view.activity_indicator_style,
+            crate::settings_staging::ACTIVITY_STYLES
+                [crate::settings_staging::ACTIVITY_STYLES.len() - 1],
+            "an enum row steps backwards from the first style and wraps"
+        );
+    }
+
+    #[test]
+    fn escape_discards_pending_edits_and_leaves_live_state_alone() {
+        let field = "sandbox_max_source_roots";
+        let mut app = settings_panel_on(SettingsSection::SandboxStorage, field);
+        let (live, _) = live_choice(&app, field);
+        press(&mut app, '-', 2);
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Esc)));
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+        assert!(app.settings_state.pending.is_empty());
+        assert_eq!(live_choice(&app, field).0, live);
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.starts_with("Discarded 1 pending settings change")),
+            "the discard is announced"
+        );
+        assert!(app.pending_lc_actions.is_empty());
+    }
+
+    #[test]
+    fn pending_edits_survive_section_tabs_and_count_every_row() {
+        let mut app =
+            settings_panel_on(SettingsSection::SandboxStorage, "sandbox_max_source_roots");
+        press(&mut app, '-', 1);
+        assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
+        app.settings_state.section = SettingsSection::InputPrompts;
+        app.settings_state.selected_index = 0;
+        press(&mut app, ' ', 1);
+        assert_eq!(
+            crate::settings_staging::pending_count(&app),
+            2,
+            "a daemon row and a local preference are both pending"
+        );
     }
 }

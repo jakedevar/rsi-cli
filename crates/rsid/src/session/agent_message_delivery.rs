@@ -1175,6 +1175,7 @@ pub(crate) mod tests {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
+            interrupt_evidence: Default::default(),
             pending_archive: false,
             rotation: crate::session::rotation_coordinator::RotationCoordinator::new(
                 session_id, 0, false,
@@ -1196,15 +1197,16 @@ pub(crate) mod tests {
             work_time_base_ms: 0,
             received_meaningful_output: true,
             exit_code: Some(0),
-            retry_attempt: 0,
             max_retries: 0,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
+            turn_tools: Default::default(),
             last_usage_update: None,
             last_mismatch_warn: None,
             last_classified_at: None,
             classification_count: 0,
             last_verdict: None,
+            store_fields: Default::default(),
         }
     }
 

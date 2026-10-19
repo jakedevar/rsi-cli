@@ -54,3 +54,25 @@ The lander validates the source inventory, immutable released prefix, unique
 site anchors and complete version occurrence coverage before making a private
 transform. It recomputes the manifest and refuses semantic conflicts. Existing
 migration code and fingerprints are never edited after landing.
+
+## Numbering after an in-flight sibling (`pending_predecessors`)
+
+A slice that builds on a sibling migration which is reviewed but not yet on
+`rolling` (for example v156 while v155 is pending, #1285) names the numbers it
+skips in its declaration:
+
+```json
+{ "schema_version": 1, "version": 156, "pending_predecessors": [155], "files": [ ... ] }
+```
+
+`pending_predecessors` is optional: a distinct, ascending-or-not list of at most
+8 integers, each above the base's schema head and below `version`. With it,
+`tools/check-released-migrations.py` and `scripts/check-touched-shards`
+(`numbering_conflict`) accept the branch's new files as the base head + 1 ...
+`version` minus the declared numbers, and the rewind fixtures keep their
+"highest step below N" lookup. The rolling lander refuses the source with
+`pending predecessor` until `rolling` already carries the sibling (its schema head
+is at least `version - 1`), then renumbers the slice to the head + 1 as usual.
+Entries at or below the base head are ignored, so a retained declaration goes
+inert once the sibling has landed. Without the field the old rule stands: the
+new files must be exactly base head + 1.

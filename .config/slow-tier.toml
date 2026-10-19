@@ -1,0 +1,201 @@
+# Slow tier of the rsid + rsid-store library suite (#2270).
+#
+# The tests named here re-prove RELEASED, immutable historical migrations:
+# failpoint, rewind, replay and hostile-classifier matrices that rebuild a
+# database per seam (store::tests h1_*, d04/d05, v95, v97, v112/v113, ...). Each
+# took 2 s to 3 min in the 2026-10-13 `test-timings` run (rolling c61b71e19,
+# nextest profile test-timings, 8-core slice) and together they were 47% of the
+# summed rsid + rsid-store library test time. They matter when a migration or
+# the migration runner changes; they do not need to run on every landing gate,
+# every scoped_test and every QA sweep.
+#
+# How the tier works (docs/testing.md "Slow tier"):
+#   * `.config/nextest.toml` `[profile.default] default-filter` EXCLUDES exactly
+#     these tests, so every profile that inherits it (rsid-fast, test-timings,
+#     the default profile) skips them. It is generated from `tests` below:
+#         python3 scripts/check-touched-shards --write-slow-tier-filter
+#     and scripts/tests/test_slow_tier.py fails on drift.
+#   * `ci-full` and `rsid-qa` set `default-filter = "all()"`, and the full QA
+#     (`make rolling-library-qa`, scripts/run-rolling-qa.py) runs the slow tier.
+#   * scripts/check-touched-shards decides mechanically, per candidate diff,
+#     whether the slow tier runs (`slow_tier.mode` in its receipt, and
+#     `--slow-tier-only` for the lander): `full` when the diff touches a
+#     `trigger_paths` entry or a line of a slow test's own source, `excluded`
+#     otherwise. scripts/scoped-test and rsi-rolling-land follow it.
+#   * `make test-slow-tier` runs only this tier.
+#
+# Membership is an EXACT list, never a wildcard: a test is hidden from the
+# default tier only because it is named here. Add a test by name when
+# `make test-timings` shows a released-migration test over ~2 s; delete the name
+# when the test is deleted (the Python guard fails on a name no source defines).
+#
+# Membership is decided by the test's SUBJECT (#2298): a test belongs here only if
+# it rewinds, upgrades or replays a HISTORICAL schema (a rewound or copied database
+# at an older version, a historical fixture, a migration failpoint). A version number
+# or the word "replay" in the name is not enough: a test that opens the CURRENT
+# schema and asserts current behaviour (a request replaying by idempotency key, a
+# CAS winner, an event round-trip, a trigger or CHECK predicate, a column default)
+# stays in the default tier, where a non-migration change to what it observes runs
+# it. Judge a candidate by reading its body (and the fixture helper it opens), not
+# its name.
+
+package = "rsid-store"
+
+# A candidate diff touching any of these runs the slow tier in full: a path
+# ending in "/" is a directory prefix, any other entry is one file.
+trigger_paths = [
+    "crates/rsid-store/src/store/migrations/",
+    "crates/rsid-store/build.rs",
+    # The migration runner (`init_schema_internal`, MIGRATION_STEPS) and its
+    # backup, allocation and convergence helpers.
+    "crates/rsid-store/src/store/mod.rs",
+    "crates/rsid-store/src/store/migration_allocation.rs",
+    "crates/rsid-store/src/store/migration_backup.rs",
+    "crates/rsid-store/src/store/catalog_convergence.rs",
+    "crates/rsid-store/src/store/lineage_convergence.rs",
+    "tools/released-migrations.json",
+    # The tier's own definition.
+    ".config/slow-tier.toml",
+    ".config/nextest.toml",
+]
+
+tests = [
+    "store::agent_coordination::watch_repair_v123::tests::v121_upgrade_reaches_v123_and_reopen_rejects_catalog_drift",
+    "store::agent_jobs::tests::the_cloud_sweep_migration_keeps_the_autoincrement_high_water_mark",
+    "store::harness_manager::tests::harness_manager_v110_migration_preserves_legacy_selection_and_revocation",
+    "store::manager_ledger::tests::work_identity::v121_database_upgrade_carries_forward_the_newest_row_per_identity",
+    "store::manager_ledger::tests::work_identity::v121_upgrade_refuses_cross_epic_or_cross_work_key_collisions",
+    "store::manager_ledger::tests::work_identity::v121_upgrade_refuses_defective_carry_forward_instead_of_dropping_rows",
+    "store::manager_prepared_actions::tests::v115_fresh_upgrade_reopen_and_exact_rewind",
+    "store::manager_prepared_actions::tests::v116_forward_upgrade_preserves_exact_v115_and_reopens",
+    "store::manager_successions::tests::root_succession_drain_defers_same_occurrence_after_v110_migration_and_reopen",
+    "store::recursive_dag::tests::recursive_dag_live_v58_migration_preserves_existing_null_heartbeat_fields",
+    "store::recursive_dag::tests::recursive_dag_live_v59_migration_tightens_existing_v58_heartbeat_index",
+    "store::target_reclaim_sweep::tests::target_reclaim_sweep_v119_migration_faults_rollback_retry_and_reopen",
+    "store::tests::agent_coordination_v80_fresh_v79_failpoints_reopen_and_fingerprint",
+    "store::tests::agent_issue_legacy_create_adoption_replays_immutable_receipt_after_mutation_and_reopen",
+    "store::tests::approval_lifecycle_v107_migrates_without_inventing_a_writer_and_reopens",
+    "store::tests::cached_current_schema_fixture_matches_migrated_current_schema",
+    "store::tests::closure_v84_copied_v83_upgrades_twice_with_catalog_guards_intact",
+    "store::tests::d01_idea_kernel_copied_prior_upgrade_reopen_fault_and_rollback",
+    "store::tests::d02_idea_event_cas_tests::d02_idea_event_cas_copied_v75_schema_reopen_and_restore_are_unchanged",
+    "store::tests::d03_controller_store_tests::d03_controller_store_migration_v76_reopen_idempotency_and_query_plan",
+    "store::tests::d04_issue_linkage_copied_v76_upgrade_reopen_fault_rollback_and_fingerprint",
+    "store::tests::d04_v77_attributes_issues_with_no_creating_session_by_declaration",
+    "store::tests::d05_canonical_v78_baseline_is_untouched_by_the_repair",
+    "store::tests::d05_legacy_v78_baseline_repairs_forward_to_v79",
+    "store::tests::d05_v79_fresh_v77_v76_chain_failpoints_reopen_and_fingerprint",
+    "store::tests::deployed_additive_v114_catalog_converges_and_reaches_the_head",
+    "store::tests::every_recovered_migration_step_actually_executes",
+    "store::tests::file_fixture_matches_migration_schema_rows_and_reopens_without_replacing_data",
+    "store::tests::h1_fqrrev_v88_ordinary_open_phase_active_terminal_hostiles_refuse_before_every_seam",
+    "store::tests::h1_fqrrev_v88_ordinary_terminal_phase_active_terminal_hostiles_refuse_before_every_seam",
+    "store::tests::h1_fqrrev_v88_prebind_provider_cell_absence_hostiles_refuse_before_every_seam",
+    "store::tests::h1_fqrrev_v88_sandbox_open_phase_active_terminal_hostiles_refuse_before_every_seam",
+    "store::tests::h1_fqrrev_v88_sandbox_terminal_phase_active_terminal_hostiles_refuse_before_every_seam",
+    "store::tests::h1_qrrev_v88_active_authority_classifier_hostiles_refuse_before_every_seam",
+    "store::tests::h1_qrrev_v88_prebind_claimed_controls_migrate_and_remain_bindable",
+    "store::tests::h1_rb_full_v84_graph_is_nonempty_rewindable_and_replayable",
+    "store::tests::h1_rb_v91_terminal_pending_hostiles_refuse_before_every_seam",
+    "store::tests::h1_trrev_v88_ordinary_session_binding_classifier_hostiles_are_exact_and_non_mutating",
+    "store::tests::h1_trrev_v88_sandbox_session_binding_classifier_hostiles_are_exact_and_non_mutating",
+    "store::tests::h1_trrev_v88_session_binding_classifier_accepts_active_and_terminal_controls",
+    "store::tests::h1_trrev_v88_session_bound_live_phases_refuse_laundering_before_every_seam",
+    "store::tests::h1_v85_catalog_drift_refuses_before_ddl",
+    "store::tests::h1_v85_copied_v83_cross_domain_projection_refuses_atomically",
+    "store::tests::h1_v85_copied_v83_sandbox_history_uses_custody_events",
+    "store::tests::h1_v85_copied_v84_ordinary_matrix_is_deterministic",
+    "store::tests::h1_v85_data_bearing_upgrade_to_v86_is_atomic_reopenable_and_catalog_identical",
+    "store::tests::h1_v85_ordered_migration_failpoints_rollback_exact_v84_snapshot",
+    "store::tests::h1_v87_data_bearing_direct_deep_rewind_families_replay_cleanly",
+    "store::tests::h1_v87_session_fence_migration_is_atomic_reopenable_and_rewindable",
+    "store::tests::h1_v88_static_state_machine_data_bearing_migration_failpoints_rewind_and_replay",
+    "store::tests::h1_v91_active_terminal_controls_migrate_finalize_and_execute_unchanged_unbind",
+    "store::tests::h1_v91_ordinary_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam",
+    "store::tests::h1_v91_ordinary_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam",
+    "store::tests::h1_v91_refuses_catalog_integrity_and_foreign_key_drift_without_mutation",
+    "store::tests::h1_v91_sandbox_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam",
+    "store::tests::h1_v91_sandbox_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam",
+    "store::tests::h1_v91_schema_preserving_migration_is_atomic_rewindable_and_replayable",
+    "store::tests::h1_v92_migration_failpoints_restore_exact_v91_state",
+    "store::tests::harness_manager_fixture_rewinds_v102_v103_v104_v105_v106_v107_v108_v109_v110_v111_and_replays_the_exact_head_catalog",
+    "store::tests::issue_events_manager_actor_migration_copies_rows_verbatim_and_reopens_idempotently",
+    "store::tests::issue_v97_all_shipped_histories_share_exact_v96_issue_projection_and_migrate_stably",
+    "store::tests::issue_v97_every_fault_rolls_back_and_repairs_fresh_copied_and_large_fixtures",
+    "store::tests::issue_v97_fault_after_baseline_rolls_back_to_exact_v96_then_repairs_once",
+    "store::tests::issue_v97_hostile_v96_semantics_reject_before_ddl_then_repair_and_reopen_stably",
+    "store::tests::issue_v97_migration_backfills_deterministic_baseline_event",
+    "store::tests::issue_v97_rejects_malformed_v96_columns_indexes_foreign_keys_and_retained_catalog",
+    "store::tests::issue_v97_to_v96_rewind_preserves_exact_catalog_projection_dependencies_and_fks",
+    "store::tests::manager_decision_history_v108_upgrade_preserves_records_and_exact_catalog",
+    "store::tests::manager_decision_history_v109_upgrade_preserves_approval_mirrors_and_exact_catalog",
+    "store::tests::manager_notice_v117_migrates_exact_v116_and_reopens_idempotently",
+    "store::tests::migration_v39_to_latest_idempotent",
+    "store::tests::migration_v40_adds_parent_id_column_and_index",
+    "store::tests::migration_v41_adds_approval_wait_ms_column",
+    "store::tests::migration_v42_adds_lead_session_id_column_and_index",
+    "store::tests::migration_v43_adds_tag_column_and_topologies_tables",
+    "store::tests::migration_v44_adds_is_eval_column_and_index",
+    "store::tests::migration_v45_adds_capability_class_column",
+    "store::tests::migration_v46_adds_chain_iterations_table_and_indexes",
+    "store::tests::migration_v47_adds_topology_columns_and_index",
+    "store::tests::migration_v70_adds_work_time_ms_column",
+    "store::tests::migration_v73_repair_runs_on_reopened_partial_latest_schema",
+    "store::tests::pending_approval_v106_fixture_requires_exact_predecessor_preserves_legacy_and_reopens",
+    "store::tests::pending_question_v105_fixture_requires_exact_predecessor_and_preserves_legacy_display",
+    "store::tests::pre_v98_custody_fixture_insert_backfills_to_the_allocation_owner",
+    "store::tests::rewind_tears_down_the_non_idempotent_migration_tail",
+    "store::tests::session_diagnostics_v127_migration_installs_and_rewinds_catalog",
+    "store::tests::session_execution_projection_retention_migration_copy_parity_and_except_fail_closed",
+    "store::tests::session_execution_projection_retention_migration_failpoints_rollback_exact_prior_head",
+    "store::tests::session_execution_projection_retention_migration_rebuilds_prior_head_data_and_catalog",
+    "store::tests::session_execution_projection_retention_migration_refuses_bad_preflight_without_mutation",
+    "store::tests::store_open_accepts_the_latest_schema_and_migrates_an_older_one",
+    "store::tests::test_delete_project_preserves_appointments_and_revocations_across_v111_backfill",
+    "store::tests::test_delete_project_preserves_v111_seeded_rotation_history_without_appointment",
+    "store::tests::test_legacy_db_migration",
+    "store::tests::v100_forward_migration_preserves_windows_backfills_legacy_and_reopens",
+    "store::tests::v101_forward_migration_preserves_v100_tuple_and_new_writes_reopen_raw_configuration",
+    "store::tests::v111_branch_convergence_tests::a_detached_successor_keeps_its_manager_rotation_attribution",
+    "store::tests::v111_branch_convergence_tests::both_observed_branch_shapes_converge_and_reach_the_schema_head",
+    "store::tests::v111_branch_convergence_tests::converging_a_branched_v111_database_twice_is_a_no_op",
+    "store::tests::v112_v113_convergence_tests::exact_v111_sources_converge_to_one_v113_catalog_and_preserve_rows",
+    "store::tests::v112_v113_convergence_tests::historical_v111_data_bearing_upgrade_preserves_identity_custody_archive_and_backfills",
+    "store::tests::v112_v113_convergence_tests::v112_archive_faults_roll_back_and_retry",
+    "store::tests::v112_v113_convergence_tests::v112_identity_faults_roll_back_and_retry",
+    "store::tests::v112_v113_convergence_tests::v112_refuses_unknown_hybrid_without_mutation",
+    "store::tests::v112_v113_convergence_tests::v113_projection_faults_roll_back_and_retry",
+    "store::tests::v126_rewind_fixture_replays_bedrock_provider_constraint",
+    "store::tests::v72_idempotent_reopen",
+    "store::tests::v89_data_bearing_v88_migration_reopen_and_direct_rewind_replay",
+    "store::tests::v89_deployed_additive_v88_migration_preserves_data_and_reopens",
+    "store::tests::v89_migration_failpoints_restore_exact_v88_catalog_data_and_version",
+    "store::tests::v89_pre_antigravity_v88_migration_preserves_data_and_reopens",
+    "store::tests::v89_rejects_drifted_or_non_v88_sources_before_ddl",
+    "store::tests::v89_rejects_unpinned_pre_antigravity_catalog_variant",
+    "store::tests::v91_pre_antigravity_v90_descendant_matches_pinned_fingerprint",
+    "store::tests::v92_pre_antigravity_descendant_matches_pinned_fingerprint",
+    "store::tests::v94_authenticates_each_normalized_v93_history_before_ddl",
+    "store::tests::v94_migrated_database_reopens_without_catalog_or_row_drift",
+    "store::tests::v94_migration_failpoints_restore_exact_v93_state_then_converge",
+    "store::tests::v94_rejects_malformed_v93_dependency_catalogs_before_ddl",
+    "store::tests::v94_rewind_fixture_removes_and_replays_the_settlement_tail",
+    "store::tests::v95_authenticates_each_original_v94_history_before_hardening",
+    "store::tests::v95_backfill_generation_survives_vacuum_and_reopen",
+    "store::tests::v95_deployed_v94_bridge_faults_roll_back_exactly_then_retry",
+    "store::tests::v95_deployed_v94_bridge_reaches_schema_head_for_empty_and_data_bearing_journals",
+    "store::tests::v95_deployed_v94_bridge_rejects_hostile_catalog_and_row_before_writing",
+    "store::tests::v95_deployed_v94_v95_failpoints_roll_back_exactly_then_retry",
+    "store::tests::v95_empty_journal_rewinds_exactly_and_rejects_hostile_source_drift",
+    "store::tests::v95_migrated_split_journal_reopens_without_drift",
+    "store::tests::v95_migration_failpoints_restore_exact_v94_state_then_converge",
+    "store::tests::v95_normalizes_split_run_projection_and_preserves_item_evidence",
+    "store::tests::v95_rejects_authentic_v94_invalid_original_timestamp_before_hardening",
+    "store::tests::v95_rejects_authentic_v94_nil_run_authority_before_hardening",
+    "store::tests::v95_rejects_authentic_v94_oversized_text_before_any_hardening",
+    "store::tests::v95_rejects_authentic_v94_run_with_more_than_256_items",
+    "store::tests::v95_rejects_authentic_v94_wrong_text_storage_class_before_hardening",
+    "store::tests::v95_rejects_malformed_v94_catalog_before_any_hardening",
+    "store::tests::v95_source_row_auth_rejects_null_and_noncanonical_authority_ids",
+    "store::tests::v96_upgrade_from_v95_adds_columns_without_backfill",
+]

@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteIdentityV1, SatelliteUuidV1};
 use rsi_common::satellite_dispatch::{
-    SATELLITE_REPORT_MAX_PER_FETCH, SatelliteFetchReportsRequestV1, SatelliteReportV1,
+    SATELLITE_REPORT_MAX_ACKS, SATELLITE_REPORT_MAX_PER_FETCH, SatelliteFetchReportsRequestV1,
+    SatelliteReportOutcomeV1, SatelliteReportV1, SatelliteReportVerdictV1,
 };
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
@@ -29,7 +30,7 @@ use super::poll::{
 };
 use super::registry::RegistryPeer;
 use crate::store::Store;
-use crate::store::satellite_reports::{INSTALLATION_CHANGED, ReportRecord};
+use crate::store::satellite_reports::{INSTALLATION_CHANGED, RETRY_RECORD_FAILED, ReportRecord};
 
 #[cfg(not(test))]
 const POLL_EVERY: Duration = Duration::from_secs(15);
@@ -45,6 +46,29 @@ pub(crate) struct ReportState {
     /// Acknowledgements per peer, tagged with the installation they were
     /// recorded from; never sent to a satellite with a different identity.
     pending_acks: HashMap<Uuid, (Uuid, Vec<Uuid>)>,
+    /// The hub's verdicts on the reports it could not record, tagged the same
+    /// way and sent only to a satellite that advertises `report_outcomes`.
+    pending_outcomes: HashMap<Uuid, (Uuid, Vec<SatelliteReportOutcomeV1>)>,
+}
+
+/// What recording one pulled page decided: the ids safe to acknowledge, and
+/// why the rest (and the permanently refused) were not recorded.
+#[derive(Debug, Default)]
+pub(crate) struct ReportVerdicts {
+    pub(crate) acks: Vec<Uuid>,
+    pub(crate) outcomes: Vec<SatelliteReportOutcomeV1>,
+}
+
+impl ReportVerdicts {
+    fn outcome(&mut self, report_id: Uuid, verdict: SatelliteReportVerdictV1, reason: &str) {
+        if self.outcomes.len() < SATELLITE_REPORT_MAX_ACKS {
+            self.outcomes.push(SatelliteReportOutcomeV1 {
+                report_id,
+                verdict,
+                reason: reason.to_string(),
+            });
+        }
+    }
 }
 
 /// One authenticated fetch: the verified installation and the reports. `None`
@@ -54,6 +78,7 @@ pub(crate) async fn fetch_reports(
     peer: &RegistryPeer,
     hub_installation: Uuid,
     acked: Vec<Uuid>,
+    outcomes: Vec<SatelliteReportOutcomeV1>,
 ) -> Option<(Uuid, Vec<SatelliteReportV1>)> {
     let expected = peer.expected_installation_id?;
     let mut links: Vec<_> = peer.links.iter().filter(|link| link.enabled).collect();
@@ -85,6 +110,13 @@ pub(crate) async fn fetch_reports(
             wire_version: SATELLITE_WIRE_VERSION_V1,
             hub_installation_id: SatelliteUuidV1(hub_installation),
             acked,
+            // An older satellite refuses the unknown field: verdicts only to
+            // a build that says it accepts them.
+            outcomes: if identity.capabilities.report_outcomes {
+                outcomes
+            } else {
+                Vec::new()
+            },
         };
         return match call_fetch_reports_rpc(&mut rpc, &request, FETCH_DEADLINE).await {
             Ok(FetchReportsReply::Accepted(reply)) => Some((expected, reply.reports)),
@@ -121,62 +153,110 @@ pub(crate) async fn report_round(store: &Arc<Mutex<Store>>, root: &Path, state: 
     let live: std::collections::HashSet<Uuid> = peers.iter().map(|peer| peer.id).collect();
     state.next_poll.retain(|id, _| live.contains(id));
     state.pending_acks.retain(|id, _| live.contains(id));
+    state.pending_outcomes.retain(|id, _| live.contains(id));
     for peer in peers {
         let now = Instant::now();
         if state.next_poll.get(&peer.id).is_some_and(|due| *due > now) {
             continue;
         }
         state.next_poll.insert(peer.id, now + POLL_EVERY);
+        // A re-appointed project manager retires the notices of the old seat
+        // unretrieved; put those reports in front of the new one (#2242). This
+        // needs no link, so a dark satellite does not hold it back.
+        adopt_orphaned_reports(store, peer.id).await;
         let acked = state
             .pending_acks
             .get(&peer.id)
             .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
             .map(|(_, acks)| acks.clone())
             .unwrap_or_default();
+        let outcomes = state
+            .pending_outcomes
+            .get(&peer.id)
+            .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
+            .map(|(_, outcomes)| outcomes.clone())
+            .unwrap_or_default();
         let Some((installation, reports)) =
-            fetch_reports(root, &peer, hub_installation, acked).await
+            fetch_reports(root, &peer, hub_installation, acked, outcomes).await
         else {
             continue;
         };
         // A full page means more may be queued: pull again next round instead
         // of waiting out the pacing interval (the queue holds up to 32).
         let full_page = reports.len() >= SATELLITE_REPORT_MAX_PER_FETCH;
-        let acks = record_reports(store, peer.id, installation, reports).await;
-        if full_page && !acks.is_empty() {
+        let verdicts = record_reports(store, peer.id, installation, reports).await;
+        if full_page && !verdicts.acks.is_empty() {
             state.next_poll.insert(peer.id, Instant::now());
         }
-        state.pending_acks.insert(peer.id, (installation, acks));
+        state
+            .pending_acks
+            .insert(peer.id, (installation, verdicts.acks));
+        state
+            .pending_outcomes
+            .insert(peer.id, (installation, verdicts.outcomes));
     }
 }
 
-/// Record each pulled report; the returned ids are safe to acknowledge
-/// (recorded, a replay, or permanently refused). A report with no live manager
-/// to receive it, at the peer's retention cap, or fetched from an installation
-/// that is no longer the peer's pin stays unacknowledged. The pin is rechecked
-/// per report under the store lock (`verified_installation` came from the
-/// fetch).
+/// Re-home the peer's retired, never-retrieved reports onto the current
+/// manager of its project (see `Store::adopt_orphaned_satellite_reports_for_peer`).
+async fn adopt_orphaned_reports(store: &Arc<Mutex<Store>>, peer_id: Uuid) {
+    match store
+        .lock()
+        .await
+        .adopt_orphaned_satellite_reports_for_peer(peer_id)
+    {
+        Ok(0) => {}
+        Ok(adopted) => tracing::info!(
+            peer_id = %peer_id,
+            adopted,
+            "satellite reports re-homed onto the project's current manager"
+        ),
+        Err(error) => {
+            tracing::warn!(peer_id = %peer_id, "satellite report re-homing failed: {error}");
+        }
+    }
+}
+
+/// Record each pulled report; `acks` are safe to acknowledge (recorded, a
+/// replay, or permanently refused). A report with no live manager to receive
+/// it, at the peer's retention cap, or fetched from an installation that is no
+/// longer the peer's pin stays unacknowledged. `outcomes` names why a report
+/// was held or refused, so the satellite's manager can read it (#2242). The
+/// pin is rechecked per report under the store lock (`verified_installation`
+/// came from the fetch).
 pub(crate) async fn record_reports(
     store: &Arc<Mutex<Store>>,
     peer_id: Uuid,
     verified_installation: Uuid,
     reports: Vec<SatelliteReportV1>,
-) -> Vec<Uuid> {
+) -> ReportVerdicts {
     let guard = store.lock().await;
-    let mut acks = Vec::new();
+    let mut verdicts = ReportVerdicts::default();
     let mut retries: Vec<&'static str> = Vec::new();
     for report in reports.into_iter().take(SATELLITE_REPORT_MAX_PER_FETCH) {
         match guard.record_satellite_report(peer_id, verified_installation, &report, Utc::now()) {
-            Ok(ReportRecord::Recorded | ReportRecord::Duplicate) => acks.push(report.report_id),
+            Ok(ReportRecord::Recorded | ReportRecord::Duplicate) => {
+                verdicts.acks.push(report.report_id);
+            }
             Ok(ReportRecord::Refused(INSTALLATION_CHANGED)) => {
                 tracing::warn!(peer_id = %peer_id, "satellite report dropped: installation changed");
             }
             Ok(ReportRecord::Refused(class)) => {
                 tracing::warn!(peer_id = %peer_id, class, "satellite report refused");
-                acks.push(report.report_id);
+                verdicts.outcome(report.report_id, SatelliteReportVerdictV1::Refused, class);
+                verdicts.acks.push(report.report_id);
             }
-            Ok(ReportRecord::Retry(reason)) => retries.push(reason),
+            Ok(ReportRecord::Retry(reason)) => {
+                verdicts.outcome(report.report_id, SatelliteReportVerdictV1::Held, reason);
+                retries.push(reason);
+            }
             Err(error) => {
                 tracing::warn!(peer_id = %peer_id, "satellite report record failed: {error}");
+                verdicts.outcome(
+                    report.report_id,
+                    SatelliteReportVerdictV1::Held,
+                    RETRY_RECORD_FAILED,
+                );
             }
         }
     }
@@ -190,7 +270,7 @@ pub(crate) async fn record_reports(
             "satellite reports held on the satellite: not recorded"
         );
     }
-    acks
+    verdicts
 }
 
 #[cfg(test)]
@@ -207,6 +287,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -218,6 +299,11 @@ mod tests {
         fetches: Arc<AtomicUsize>,
         reports: Arc<StdMutex<Vec<SatelliteReportV1>>>,
         acks_seen: Arc<StdMutex<Vec<Uuid>>>,
+        /// The verdicts the hub sent with its pulls.
+        outcomes_seen: Arc<StdMutex<Vec<SatelliteReportOutcomeV1>>>,
+        /// Whether the fake's identity advertises `report_outcomes` (false is
+        /// an older satellite, which would refuse the unknown field).
+        outcomes_capable: Arc<AtomicBool>,
     }
 
     struct Rig {
@@ -233,10 +319,7 @@ mod tests {
     }
 
     async fn rig_with(dispatch_enabled: bool, honor_acks: bool, queued: usize) -> Rig {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-rep-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-rep-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -256,21 +339,27 @@ mod tests {
                     .collect(),
             )),
             acks_seen: Arc::new(StdMutex::new(Vec::new())),
+            outcomes_seen: Arc::new(StdMutex::new(Vec::new())),
+            outcomes_capable: Arc::new(AtomicBool::new(true)),
         };
-        let (fetches, reports, acks_seen) = (
+        let (fetches, reports, acks_seen, outcomes_seen, outcomes_capable) = (
             Arc::clone(&fake.fetches),
             Arc::clone(&fake.reports),
             Arc::clone(&fake.acks_seen),
+            Arc::clone(&fake.outcomes_seen),
+            Arc::clone(&fake.outcomes_capable),
         );
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (fetches, reports, acks_seen) = (
+                let (fetches, reports, acks_seen, outcomes_seen, outcomes_capable) = (
                     Arc::clone(&fetches),
                     Arc::clone(&reports),
                     Arc::clone(&acks_seen),
+                    Arc::clone(&outcomes_seen),
+                    Arc::clone(&outcomes_capable),
                 );
                 tokio::spawn(async move {
                     let mut stream = tokio::io::BufReader::new(stream);
@@ -282,15 +371,22 @@ mod tests {
                         }
                         let request: RpcRequest = serde_json::from_str(&line).unwrap();
                         let result = match request.method.as_str() {
-                            "GetSatelliteIdentity" => serde_json::to_value(
-                                crate::satellite::identity(installation, Uuid::new_v4()),
-                            )
-                            .unwrap(),
+                            "GetSatelliteIdentity" => {
+                                let mut identity =
+                                    crate::satellite::identity(installation, Uuid::new_v4());
+                                identity.capabilities.report_outcomes =
+                                    outcomes_capable.load(Ordering::SeqCst);
+                                serde_json::to_value(identity).unwrap()
+                            }
                             "FetchHubReports" => {
                                 fetches.fetch_add(1, Ordering::SeqCst);
                                 let params: SatelliteFetchReportsRequestV1 =
                                     serde_json::from_value(request.params.clone()).unwrap();
                                 acks_seen.lock().unwrap().extend(params.acked.iter());
+                                outcomes_seen
+                                    .lock()
+                                    .unwrap()
+                                    .extend(params.outcomes.iter().cloned());
                                 let mut held = reports.lock().unwrap();
                                 if honor_acks {
                                     held.retain(|report| !params.acked.contains(&report.report_id));
@@ -436,8 +532,9 @@ mod tests {
         let fetched_from = Uuid::new_v4();
         let reports = rig.fake.reports.lock().unwrap().clone();
         // The peer's pin is a different installation by ingest time.
-        let acks = record_reports(&rig.store, rig.peer, fetched_from, reports.clone()).await;
-        assert!(acks.is_empty());
+        let verdicts = record_reports(&rig.store, rig.peer, fetched_from, reports.clone()).await;
+        assert!(verdicts.acks.is_empty());
+        assert!(verdicts.outcomes.is_empty());
         assert_eq!(notices(&rig).await, 0);
         // The verified pin is accepted.
         let pin: String = rig
@@ -451,14 +548,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let acks = record_reports(
+        let verdicts = record_reports(
             &rig.store,
             rig.peer,
             Uuid::parse_str(&pin).unwrap(),
             reports.clone(),
         )
         .await;
-        assert_eq!(acks.len(), reports.len());
+        assert_eq!(verdicts.acks.len(), reports.len());
         assert_eq!(notices(&rig).await, 1);
     }
 
@@ -517,5 +614,133 @@ mod tests {
         let mut state = ReportState::default();
         report_round(&rig.store, &rig.root, &mut state).await;
         assert_eq!(notices(&rig).await, 3);
+    }
+
+    /// #2242: the hub tells the satellite why it did not record a report, in
+    /// the pull that follows, so the seat reads `held` with a typed reason
+    /// instead of a bare `queued`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_report_the_hub_cannot_record_is_explained_to_the_satellite() {
+        let rig = rig(true, true).await;
+        // The project's manager scope is revoked: nobody can receive it.
+        rig.store
+            .lock()
+            .await
+            .conn
+            .execute("UPDATE harness_manager_scopes SET epic_ids_json='[]'", [])
+            .unwrap();
+        let mut state = ReportState::default();
+        report_round(&rig.store, &rig.root, &mut state).await;
+        assert_eq!(notices(&rig).await, 0);
+        assert!(rig.fake.outcomes_seen.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        report_round(&rig.store, &rig.root, &mut state).await;
+        let seen = rig.fake.outcomes_seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].verdict, SatelliteReportVerdictV1::Held);
+        assert_eq!(seen[0].reason, "manager_unavailable");
+        assert!(rig.fake.acks_seen.lock().unwrap().is_empty());
+        assert_eq!(notices(&rig).await, 0);
+    }
+
+    /// An older satellite refuses the unknown `outcomes` field and its pull
+    /// would stall: the hub sends verdicts only to a build that advertises it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_satellite_that_does_not_advertise_outcomes_never_receives_them() {
+        let rig = rig(true, true).await;
+        rig.fake.outcomes_capable.store(false, Ordering::SeqCst);
+        rig.store
+            .lock()
+            .await
+            .conn
+            .execute("UPDATE harness_manager_scopes SET epic_ids_json='[]'", [])
+            .unwrap();
+        let mut state = ReportState::default();
+        for _ in 0..3 {
+            report_round(&rig.store, &rig.root, &mut state).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(rig.fake.fetches.load(Ordering::SeqCst) >= 3);
+        assert!(rig.fake.outcomes_seen.lock().unwrap().is_empty());
+    }
+
+    /// #2242, end to end through the pull round: a report recorded for the
+    /// manager seat that is then replaced reaches the new manager without the
+    /// satellite resending anything.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_pull_round_re_homes_a_report_recorded_for_a_replaced_manager() {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerPolicyV2,
+        };
+        let rig = rig(true, true).await;
+        let mut state = ReportState::default();
+        report_round(&rig.store, &rig.root, &mut state).await;
+        assert_eq!(notices(&rig).await, 1);
+        let live = |rig: &Rig| {
+            let store = Arc::clone(&rig.store);
+            async move {
+                store
+                    .lock()
+                    .await
+                    .conn
+                    .query_row(
+                        "SELECT manager_session_id FROM harness_manager_notices
+                         WHERE subject_id='satellite_report' AND retired_at IS NULL
+                         ORDER BY sequence DESC LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+            }
+        };
+        let first = live(&rig).await;
+
+        // The portfolio manager appoints the next project manager; the old
+        // scope's unretrieved notice is retired.
+        let new_manager = {
+            let guard = rig.store.lock().await;
+            let project: String = guard
+                .conn
+                .query_row("SELECT project_id FROM harness_manager_scopes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let project = Uuid::parse_str(&project).unwrap();
+            let mut session = rsid_store::test_support::make_test_session();
+            session.project_id = Some(project);
+            session.status = rsi_common::types::SessionStatus::Completed;
+            guard.insert_session(&session).unwrap();
+            let scope = guard.get_harness_manager(project).unwrap().unwrap();
+            let config = guard
+                .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: session.id,
+                    epic_ids: None,
+                    group_ids: Vec::new(),
+                    expected_row_version: scope.row_version,
+                })
+                .unwrap();
+            let policy = guard.get_harness_manager_policy(project).unwrap().unwrap();
+            guard
+                .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: project,
+                    expected_scope_version: config.row_version,
+                    expected_policy_version: policy.row_version,
+                    idempotency_key: "regrant".into(),
+                    policy: ManagerPolicyV2::default(),
+                })
+                .unwrap();
+            guard.reconcile_harness_manager_watches().unwrap();
+            session.id
+        };
+        assert_ne!(first, new_manager.to_string());
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        report_round(&rig.store, &rig.root, &mut state).await;
+        assert_eq!(live(&rig).await, new_manager.to_string());
     }
 }

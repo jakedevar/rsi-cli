@@ -446,6 +446,46 @@ fn manager_job_key_collision_rolls_back_seat_succession() {
     );
 }
 
+/// #2471: a portfolio seat's context-cap rotation and a grantor's replacement
+/// both hand the seat's durable results and predicate waits (completed-job
+/// outcomes, batch waits, issue/todo/topology/sha predicates, terminal
+/// watches, deploy results) to the new seat in the same commit; maintenance
+/// leaves them armed and a repeat carries nothing.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_portfolio_seat_change_carries_results_and_predicates() {
+    use crate::store::manager_obligations::test_support as ob;
+    for replace in [false, true] {
+        let store = Store::open_in_memory().unwrap();
+        let a = project(&store, "A");
+        let seat = session(&store, None);
+        let node = create(&store, &root("global", seat, &[a], "g")).unwrap();
+        let epic = session(&store, None);
+        let armed = ob::arm(&store, seat, Some((a, epic)));
+        let successor = if replace {
+            session(&store, None)
+        } else {
+            successor_of(&store, seat)
+        };
+        if replace {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &store.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            store
+                .replace_portfolio_seat_in_tx(node.node_id, successor, "replace-2471")
+                .unwrap();
+            tx.commit().unwrap();
+        } else {
+            assert!(store.transfer_global_seat(seat, successor).unwrap());
+        }
+        ob::assert_carried(&store, &armed, seat, successor, !replace);
+        ob::assert_maintenance_keeps_obligations(&store, &armed);
+        ob::assert_second_transfer_is_empty(&store, seat, successor);
+    }
+}
+
 /// Retention (plan §4 I10): no deletes, identity is immutable, revoked is
 /// final, and an active grant names a live node.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
@@ -1092,5 +1132,99 @@ fn global_configure_replays_bind_to_the_global_shim_node() {
             &format!("context-cap:{successor}")
         )),
         rsi_common::global_manager::GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT
+    );
+}
+
+/// #2103: one launch is added to a live node through the dedicated edit: the
+/// grant version and epoch advance by one, every other field is unchanged, and
+/// a stale version, a missing node and an emptying removal are refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn launch_edit_adds_and_removes_one_launch_without_touching_the_rest() {
+    use rsi_common::harness_manager_v2::ManagerLaunchChoiceV2;
+    use rsi_common::portfolio_nodes::ConfigurePortfolioNodeLaunchesRequestV1;
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let seat = session(&store, None);
+    let node = create(&store, &root("global", seat, &[a], "launch-root")).unwrap();
+    let extra = ManagerLaunchChoiceV2 {
+        provider: rsi_common::types::SessionProvider::Claude,
+        model: "claude-fable-5-1".into(),
+        effort: Some("max".into()),
+    };
+    let edit = |add: Vec<ManagerLaunchChoiceV2>,
+                remove: Vec<ManagerLaunchChoiceV2>,
+                version: i64,
+                key: &str| ConfigurePortfolioNodeLaunchesRequestV1 {
+        node_id: node.node_id,
+        add,
+        remove,
+        expected_node_grant_version: version,
+        idempotency_key: key.into(),
+    };
+    let added = store
+        .configure_portfolio_node_launches(
+            &edit(
+                vec![extra.clone()],
+                Vec::new(),
+                node.grant.grant_version,
+                "add",
+            ),
+            "operator:test",
+            false,
+        )
+        .unwrap();
+    let mut expected = node.grant.allowed_launches.clone();
+    expected.push(extra.clone());
+    assert_eq!(added.grant.allowed_launches, expected);
+    assert_eq!(added.grant.grant_version, node.grant.grant_version + 1);
+    assert_eq!(added.authority_epoch, node.authority_epoch + 1);
+    assert_eq!(added.grant.seat_session_id, seat);
+    assert_eq!(added.grant.project_ids, node.grant.project_ids);
+    assert_eq!(added.grant.project_policy, node.grant.project_policy);
+    assert_eq!(added.max_direct_reports, node.max_direct_reports);
+
+    // The old version is stale now.
+    assert_eq!(
+        refusal(store.configure_portfolio_node_launches(
+            &edit(
+                vec![extra.clone()],
+                Vec::new(),
+                node.grant.grant_version,
+                "again"
+            ),
+            "operator:test",
+            false,
+        )),
+        "manager_node_stale"
+    );
+    // Removing the added launch restores the original list.
+    let removed = store
+        .configure_portfolio_node_launches(
+            &edit(Vec::new(), vec![extra], added.grant.grant_version, "remove"),
+            "operator:test",
+            false,
+        )
+        .unwrap();
+    assert_eq!(removed.grant.allowed_launches, node.grant.allowed_launches);
+    // Emptying the grant's launches is refused.
+    assert_eq!(
+        refusal(store.configure_portfolio_node_launches(
+            &edit(
+                Vec::new(),
+                node.grant.allowed_launches.clone(),
+                removed.grant.grant_version,
+                "empty"
+            ),
+            "operator:test",
+            false,
+        )),
+        "portfolio_invalid_request"
+    );
+    let mut missing = edit(vec![launch()], Vec::new(), 1, "missing");
+    missing.node_id = Uuid::new_v4();
+    assert_eq!(
+        refusal(store.configure_portfolio_node_launches(&missing, "operator:test", false)),
+        "portfolio_node_not_found"
     );
 }

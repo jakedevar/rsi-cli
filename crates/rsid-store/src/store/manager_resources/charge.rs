@@ -211,7 +211,7 @@ impl Store {
         provider: SessionProvider,
         existing_session: Option<Uuid>,
     ) -> Result<ChargedUsage> {
-        let members = self.manager_v2_charged_members(config, charge, true)?;
+        let members = self.manager_v2_charged_members(config, charge, true, None)?;
         let active = members.active;
         let mut count = active.len() as u64;
         let mut provider_active = active.values().filter(|p| **p == provider).count() as u64;
@@ -236,18 +236,32 @@ impl Store {
     /// resource snapshot (#1336), so a reader sees what the gate enforces.
     /// `enforce_budget` refuses a cohort over [`COHORT_BUDGET`] (the gate);
     /// the snapshot reports it instead.
+    ///
+    /// `own_cohort` is `config`'s cohort when the caller already read it in
+    /// this pass (#2494); the ledgers below it are always read here.
     pub(super) fn manager_v2_charged_members(
         &self,
         config: &HarnessManagerConfigV1,
         charge: &ChargeScope,
         enforce_budget: bool,
+        own_cohort: Option<&[ManagerCohortMemberV2]>,
     ) -> Result<ChargedMembers> {
         let mut active = BTreeMap::new();
         let mut ledgers = Vec::new();
-        for scope in std::iter::once(config).chain(charge.below.iter()) {
-            let cohort = self.manager_v2_cohort(scope)?;
-            let rotation = self.manager_v2_resource_reservations(scope, &cohort)?;
-            for (id, member_provider) in self.manager_v2_active_members(&cohort, &rotation)? {
+        for (index, scope) in std::iter::once(config)
+            .chain(charge.below.iter())
+            .enumerate()
+        {
+            let read;
+            let cohort = match own_cohort {
+                Some(cohort) if index == 0 => cohort,
+                _ => {
+                    read = self.manager_v2_cohort(scope)?;
+                    &read
+                }
+            };
+            let rotation = self.manager_v2_resource_reservations(scope, cohort)?;
+            for (id, member_provider) in self.manager_v2_active_members(cohort, &rotation)? {
                 active.entry(id).or_insert(member_provider);
             }
             ledgers.push((scope.manager_session_id, scope.row_version));

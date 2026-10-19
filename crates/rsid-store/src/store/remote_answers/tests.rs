@@ -554,3 +554,75 @@ fn remote_answer_migration_inventory_and_replay_preserve_existing_rows() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+/// Open published approval rows that never resolve to an answerable target
+/// (empty `target_json`): they are scan candidates the runtime filters away.
+fn seed_unresolved_approvals(store: &Store, session: Uuid, count: usize) -> Vec<String> {
+    let approval = rsi_common::types::Approval {
+        id: Uuid::new_v4(),
+        session_id: session,
+        tool_name: "command".into(),
+        tool_input: serde_json::json!({}),
+        status: rsi_common::types::ApprovalStatus::Pending,
+        created_at: chrono::Utc::now(),
+        resolved_at: None,
+    };
+    store.insert_approval(&approval).unwrap();
+    let incarnation = Uuid::new_v4().to_string();
+    (0..count)
+        .map(|n| {
+            let id = Uuid::new_v4().to_string();
+            let stamp = format!("2026-10-08T00:00:{n:02}.000000000Z");
+            store.conn.execute(
+                "INSERT INTO appserver_approval_publications(publication_id,session_id,incarnation_id,request_id_json,approval_id,state,target_json,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'published','{}',?6,?6)",
+                params![id, session.to_string(), incarnation, n.to_string(), approval.id.to_string(), stamp],
+            ).unwrap();
+            id
+        })
+        .collect()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn pending_scan_reports_its_cap_and_continues_from_the_cursor() {
+    let (store, request) = fixture();
+    let (project, session) = (uuid(&request.project_id), uuid(&request.session_id));
+    let ids = seed_unresolved_approvals(&store, session, 5);
+    let approval = |n: usize| format!("pending-approval:{}", ids[n]);
+
+    // The question plus two approvals fill a cap of three; three remain.
+    let first = store
+        .remote_pending_decision_targets(project, session, None, 3)
+        .unwrap();
+    assert_eq!(first.targets.len(), 1, "unresolved approvals are dropped");
+    assert_eq!(first.next_after.as_deref(), Some(approval(1).as_str()));
+
+    // Exactly the cap left is an exhausted scan, not a capped one.
+    let second = store
+        .remote_pending_decision_targets(project, session, first.next_after.as_deref(), 3)
+        .unwrap();
+    assert!(second.targets.is_empty());
+    assert_eq!(second.next_after, None);
+
+    // A smaller cap resumes at the next candidate and stops before the last.
+    let partial = store
+        .remote_pending_decision_targets(project, session, first.next_after.as_deref(), 2)
+        .unwrap();
+    assert_eq!(partial.next_after.as_deref(), Some(approval(3).as_str()));
+    let rest = store
+        .remote_pending_decision_targets(project, session, partial.next_after.as_deref(), 2)
+        .unwrap();
+    assert_eq!(rest.next_after, None);
+
+    // A cursor naming an unknown approval is refused, never treated as the start.
+    assert!(
+        store
+            .remote_pending_decision_targets(
+                project,
+                session,
+                Some(&format!("pending-approval:{}", Uuid::new_v4())),
+                3
+            )
+            .is_err()
+    );
+}

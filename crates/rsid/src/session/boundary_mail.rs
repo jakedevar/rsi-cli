@@ -119,7 +119,7 @@ struct PendingBoundaryDelivery {
 /// is persisted), or by the settlement that marks it `uncertain`.
 #[derive(Debug, Default)]
 pub(crate) struct PendingBoundaryDeliveries {
-    entries: std::sync::Mutex<HashMap<Uuid, PendingBoundaryDelivery>>,
+    entries: Arc<std::sync::Mutex<HashMap<Uuid, PendingBoundaryDelivery>>>,
     #[cfg(test)]
     fail_next_record: std::sync::atomic::AtomicBool,
 }
@@ -133,24 +133,6 @@ impl PendingBoundaryDeliveries {
 
     fn insert(&self, delivery: PendingBoundaryDelivery) {
         self.lock().insert(delivery.fence.message_id, delivery);
-    }
-
-    /// Record that `session_id`'s hook printed `message_id`. Only the claiming
-    /// session's own, not-yet-printed delivery qualifies.
-    fn mark_printed(
-        &self,
-        session_id: Uuid,
-        message_id: Uuid,
-        evidence: TranscriptEvidence,
-    ) -> bool {
-        let mut entries = self.lock();
-        match entries.get_mut(&message_id) {
-            Some(delivery) if delivery.session_id == session_id && delivery.evidence.is_none() => {
-                delivery.evidence = Some(evidence);
-                true
-            }
-            _ => false,
-        }
     }
 
     fn get(&self, message_id: Uuid) -> Option<PendingBoundaryDelivery> {
@@ -261,7 +243,7 @@ pub(crate) async fn claim_boundary_mail(
     };
 
     // Queued OPERATOR messages (#929) go first, then agent mail.
-    claim_operator_queue(store, session_id, &mut response.messages).await;
+    claim_operator_queue(store, session_id, &mut response.messages).await?;
 
     while response.messages.len() < BOUNDARY_MAIL_MAX_PER_CLAIM {
         let grant = {
@@ -271,9 +253,17 @@ pub(crate) async fn claim_boundary_mail(
                 BoundaryDecision::SyntheticContinuation(_) => break,
             }
         };
-        match claim_one(store, pending, session_id, grant).await? {
-            Some(mail) => response.messages.push(mail),
-            None => break,
+        match claim_one(store, pending, session_id, grant).await {
+            Ok(Some(mail)) => response.messages.push(mail),
+            Ok(None) => break,
+            // Earlier exact claims already won admission. Return that bounded
+            // snapshot while refusing to start another claim after revocation.
+            Err(crate::error::DaemonError::InvalidParam(code))
+                if code == "agent_verb_unknown_session_token" && !response.messages.is_empty() =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(response)
@@ -299,14 +289,15 @@ async fn claim_operator_queue(
     store: &Arc<Mutex<Store>>,
     session_id: Uuid,
     out: &mut Vec<BoundaryMail>,
-) {
+) -> Result<()> {
     let mut guard = store.lock().await;
+    let admission = super::rpc_admission::admit_current_rpc(session_id).await?;
     let message = match guard.claim_operator_message(session_id) {
         Ok(Some(message)) => message,
-        Ok(None) => return,
+        Ok(None) => return Ok(()),
         Err(error) => {
             tracing::warn!(session_id = %session_id, error = %error, "operator boundary claim failed");
-            return;
+            return Ok(());
         }
     };
     if let Err(error) = guard.mark_operator_message_effect_possible(message.id) {
@@ -314,8 +305,9 @@ async fn claim_operator_queue(
         if let Err(settle) = guard.settle_operator_message(message.id, false) {
             tracing::warn!(message_id = %message.id, error = %settle, "operator boundary message could not be released");
         }
-        return;
+        return Ok(());
     }
+    drop(admission);
     drop(guard);
     out.push(BoundaryMail {
         message_id: message.id,
@@ -323,6 +315,7 @@ async fn claim_operator_queue(
         sender_session_id: None,
         text: message.content,
     });
+    Ok(())
 }
 
 /// `sender_role` of a boundary message that came from the operator's queue.
@@ -355,6 +348,9 @@ pub(crate) fn operator_message_ids(result: &serde_json::Value) -> Vec<Uuid> {
 #[derive(Default)]
 pub(crate) struct OperatorTranscriptInbox {
     pending: std::sync::Mutex<Vec<Uuid>>,
+    /// #2766: provider lifecycle-hook rows waiting for a sequence from the
+    /// monitor (`provider_lifecycle_events.rs`).
+    lifecycle: std::sync::Mutex<Vec<rsi_common::types::ConversationEvent>>,
     wake: tokio::sync::Notify,
 }
 
@@ -365,6 +361,24 @@ impl OperatorTranscriptInbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(message_id);
         self.wake.notify_one();
+    }
+
+    /// #2766: queue a lifecycle-hook row for the monitor to number and write.
+    pub(crate) fn push_lifecycle(&self, row: rsi_common::types::ConversationEvent) {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(row);
+        self.wake.notify_one();
+    }
+
+    fn take_lifecycle(&self) -> Vec<rsi_common::types::ConversationEvent> {
+        std::mem::take(
+            &mut *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(crate) fn take(&self) -> Vec<Uuid> {
@@ -451,6 +465,15 @@ pub(crate) async fn drain_operator_transcript_inbox(
     session_id: Uuid,
     sequence: &mut i32,
 ) {
+    super::provider_lifecycle_events::drain_lifecycle_rows(
+        inbox.take_lifecycle(),
+        store,
+        active,
+        event_bus,
+        session_id,
+        sequence,
+    )
+    .await;
     for message_id in inbox.take() {
         let Some(next) = sequence.checked_add(1) else {
             tracing::error!(%session_id, "transcript sequence exhausted; operator delivery left uncertain");
@@ -530,17 +553,50 @@ pub(crate) async fn confirm_boundary_mail(
         )
     })?;
     let cursor = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-    let mut response = ConfirmBoundaryMailResponse::default();
-    for &message_id in &params.message_ids {
-        let evidence = TranscriptEvidence {
-            path: path.clone(),
-            cursor,
-        };
-        if pending.mark_printed(session_id, message_id, evidence) {
-            response.confirmed.push(message_id);
+    // Filesystem proof above is preparation only. Acquire the pending ledger
+    // first, then A6 last on a blocking thread; mark only exact owned claims.
+    let entries = Arc::clone(&pending.entries);
+    let message_ids = params.message_ids.clone();
+    let admission = super::rpc_admission::current();
+    tokio::task::spawn_blocking(move || {
+        let mut response = ConfirmBoundaryMailResponse::default();
+        // Large batches preserve compatibility without making one A6 hold
+        // proportional to request size. Each batch is a separate admission.
+        for ids in message_ids.chunks(BOUNDARY_MAIL_MAX_PER_CLAIM) {
+            let mut entries = entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut mark = || {
+                let mut confirmed = Vec::new();
+                for &message_id in ids {
+                    if let Some(delivery) = entries.get_mut(&message_id)
+                        && delivery.session_id == session_id
+                        && delivery.evidence.is_none()
+                    {
+                        delivery.evidence = Some(TranscriptEvidence {
+                            path: path.clone(),
+                            cursor,
+                        });
+                        confirmed.push(message_id);
+                    }
+                }
+                confirmed
+            };
+            let batch = match admission.as_ref() {
+                Some(admission) => admission.with_admission(session_id, mark),
+                None => Ok(mark()),
+            };
+            drop(entries);
+            match batch {
+                Ok(ids) => response.confirmed.extend(ids),
+                Err(_) if !response.confirmed.is_empty() => break,
+                Err(error) => return Err(error),
+            }
         }
-    }
-    Ok(response)
+        Ok(response)
+    })
+    .await
+    .map_err(|error| crate::error::DaemonError::Store(error.to_string()))?
 }
 
 /// The hook's transcript path, accepted only when it is this session's own
@@ -710,18 +766,20 @@ async fn claim_one(
         build_claim_request(&grant, invocation_id, guard.delivery_boot_id())
     };
     let authority_id = claim.authority_id;
-    let fence = {
+    let claimed = {
         let guard = store.lock().await;
-        match guard.claim_agent_message_exact(&claim) {
-            Ok(ClaimAgentMessageOutcome::Claimed(fence)) => fence,
-            Ok(ClaimAgentMessageOutcome::CasLost(_)) => {
-                grant.release();
-                return Ok(None);
-            }
-            Err(error) => {
-                grant.release();
-                return Err(error);
-            }
+        let _admission = super::rpc_admission::admit_current_rpc(session_id).await?;
+        guard.claim_agent_message_exact(&claim)
+    };
+    let fence = match claimed {
+        Ok(ClaimAgentMessageOutcome::Claimed(fence)) => fence,
+        Ok(ClaimAgentMessageOutcome::CasLost(_)) => {
+            grant.release();
+            return Ok(None);
+        }
+        Err(error) => {
+            grant.release();
+            return Err(error);
         }
     };
 
@@ -1267,6 +1325,129 @@ mod tests {
         assert!(fixture.arbiter.roots_with_outstanding_grant().is_empty());
     }
 
+    /// #2144: mail sent to a worker parked on its own wake (turn ended, no
+    /// final report) is accepted through the guarded send path, waits
+    /// `queued` and unclaimable while the session is parked, and is handed to
+    /// the first boundary of the resumed turn exactly once.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn mail_to_a_parked_session_is_delivered_once_in_its_resumed_turn() {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        let fixture = fixture(true);
+        // Park the target: its process is gone, the turn ended without a
+        // final report, and it owns one armed `resume` wake.
+        let parked_row = fixture
+            .active
+            .write()
+            .await
+            .remove(&fixture.target)
+            .expect("tracked target");
+        {
+            let store = fixture.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET status='Completed', parent_id=?1 WHERE id=?2",
+                    rusqlite::params![fixture.owner.to_string(), fixture.target.to_string()],
+                )
+                .expect("park target");
+            let now = chrono::Utc::now();
+            store
+                .insert_scheduled_job(&ScheduledJob {
+                    id: Uuid::new_v4(),
+                    name: "scoped-test-wake".into(),
+                    message: "the job finished".into(),
+                    schedule: ScheduleSpec {
+                        recurrence: Recurrence::Once,
+                        anchor: now + chrono::Duration::hours(1),
+                    },
+                    last_fired_at: None,
+                    next_fire_at: now + chrono::Duration::hours(1),
+                    enabled: true,
+                    working_dir: None,
+                    provider: None,
+                    model: None,
+                    project_id: None,
+                    created_at: now,
+                    updated_at: now,
+                    wake_mode: WakeMode::Resume,
+                    wake_session_id: Some(fixture.target),
+                })
+                .expect("arm the wake");
+        }
+
+        let id = {
+            let store = fixture.store.lock().await;
+            store
+                .accept_authorized_agent_message(
+                    fixture.owner,
+                    None,
+                    None,
+                    &AgentSendMessageRequestV1 {
+                        target_session_id: fixture.target,
+                        message: "overlapping landing in topology/executor.rs".to_string(),
+                        idempotency_key: "park-1".to_string(),
+                        expires_at: None,
+                    },
+                )
+                .expect("a parked worker accepts mail")
+                .receipt()
+                .message_id
+        };
+        // Parked: nothing to claim, nothing lost.
+        assert!(claim(&fixture).await.messages.is_empty());
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "queued");
+
+        // The wake resumes the session: the first boundary delivers the mail.
+        fixture
+            .store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Running' WHERE id=?1",
+                rusqlite::params![fixture.target.to_string()],
+            )
+            .expect("resume");
+        fixture
+            .active
+            .write()
+            .await
+            .insert(fixture.target, parked_row);
+        let first = claim(&fixture).await;
+        assert_eq!(first.messages.len(), 1);
+        let mail = &first.messages[0];
+        assert_eq!(mail.message_id, id);
+        assert!(
+            mail.text
+                .contains("overlapping landing in topology/executor.rs")
+        );
+        deliver(&fixture, mail).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "injected");
+
+        // Delivered once: the next boundary has nothing, and the exact replay
+        // of the send does not queue a second copy.
+        assert!(claim(&fixture).await.messages.is_empty());
+        let replay = fixture
+            .store
+            .lock()
+            .await
+            .accept_authorized_agent_message(
+                fixture.owner,
+                None,
+                None,
+                &AgentSendMessageRequestV1 {
+                    target_session_id: fixture.target,
+                    message: "overlapping landing in topology/executor.rs".to_string(),
+                    idempotency_key: "park-1".to_string(),
+                    expires_at: None,
+                },
+            )
+            .expect("replay");
+        assert!(replay.receipt().deduplicated);
+        assert!(claim(&fixture).await.messages.is_empty());
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_session_that_is_not_running_claims_nothing() {
@@ -1684,5 +1865,110 @@ mod tests {
         let guard = fixture.store.lock().await;
         assert_eq!(operator_state(&guard, uncertain.id), "uncertain");
         assert_eq!(operator_state(&guard, later.id), "queued");
+    }
+    fn rpc_admission_fixture(target: Uuid) -> (super::super::rpc_admission::RpcAdmission, String) {
+        let token = crate::test_support::agent_token("boundary-admission");
+        let mut registry = super::super::AgentTokenRegistry::default();
+        registry.insert(token.clone(), target);
+        let caller = registry.resolve_bound(&token).unwrap();
+        (
+            super::super::rpc_admission::RpcAdmission {
+                caller,
+                registry: Arc::new(RwLock::new(registry)),
+            },
+            token,
+        )
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn boundary_rpc_claim_rechecks_original_witness_at_store_admission() {
+        use super::super::rpc_admission::RPC_ADMISSION;
+        for remint in [false, true] {
+            let fixture = fixture(true);
+            let operator_id = fixture
+                .store
+                .lock()
+                .await
+                .queue_operator_message(fixture.target, "bounded operator mail", "rpc-op-race")
+                .unwrap()
+                .id;
+            let (admission, token) = rpc_admission_fixture(fixture.target);
+            let registry = Arc::clone(&admission.registry);
+            let store = fixture.store.lock().await;
+            let (resolved_tx, resolved_rx) = tokio::sync::oneshot::channel();
+            let rpc_claim = RPC_ADMISSION.scope(Some(admission), async {
+                resolved_tx.send(()).unwrap();
+                let mut out = Vec::new();
+                claim_operator_queue(&fixture.store, fixture.target, &mut out).await
+            });
+            let replace = async {
+                resolved_rx.await.unwrap();
+                let mut registry =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), registry.write())
+                        .await
+                        .expect("hook must not pin A6 while waiting for Store");
+                if remint {
+                    registry.insert(token, fixture.target);
+                } else {
+                    registry.revoke_session(fixture.target);
+                }
+                drop(registry);
+                drop(store);
+            };
+            let (result, ()) = tokio::join!(rpc_claim, replace);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("agent_verb_unknown_session_token")
+            );
+            assert_eq!(
+                operator_state(&*fixture.store.lock().await, operator_id),
+                "queued"
+            );
+            let messages = claim(&fixture).await.messages;
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].message_id, operator_id);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn boundary_rpc_confirmation_rechecks_after_file_preparation_and_ledger_contention() {
+        use super::super::rpc_admission::RPC_ADMISSION;
+        let fixture = fixture(true);
+        let message_id = send(&fixture, "rpc-confirm-race", "bounded mail").await;
+        claim(&fixture).await;
+        let (admission, token) = rpc_admission_fixture(fixture.target);
+        let registry = Arc::clone(&admission.registry);
+        let params = confirm_params(&fixture, &[message_id]);
+        let ledger = fixture.pending.lock();
+        let (resolved_tx, resolved_rx) = tokio::sync::oneshot::channel();
+        let rpc_confirm = RPC_ADMISSION.scope(Some(admission), async {
+            resolved_tx.send(()).unwrap();
+            confirm_boundary_mail(&fixture.active, &fixture.pending, fixture.target, &params).await
+        });
+        let replace = async {
+            resolved_rx.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), registry.write())
+                .await
+                .expect("confirmation must release A6 before proof and ledger locks")
+                .insert(token, fixture.target);
+            drop(ledger);
+        };
+        let (result, ()) = tokio::join!(rpc_confirm, replace);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("agent_verb_unknown_session_token")
+        );
+        assert!(fixture.pending.get(message_id).unwrap().evidence.is_none());
+        // A fresh confirmation of this existing exact claim still succeeds.
+        assert_eq!(
+            confirm(&fixture, fixture.target, &[message_id]).await,
+            vec![message_id]
+        );
     }
 }

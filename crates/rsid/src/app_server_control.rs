@@ -1398,7 +1398,11 @@ impl AppServerControlPlane {
     /// given latch.
     ///
     /// The scan is bounded twice over: by the frozen 32-latch count and by the
-    /// frozen 2 ms wall-clock budget. The key collection it walks is itself
+    /// frozen 2 ms wall-clock budget. The budget is checked only AFTER the
+    /// first key, so every pass examines at least one latch: a thread that was
+    /// preempted before the scan (`started_at` is taken before the plane lock)
+    /// still makes progress instead of spending the whole budget waiting and
+    /// examining nothing (#2831). The key collection it walks is itself
     /// bounded by the frozen 64-attempt registry cap, so there is no unbounded
     /// scan even before the budget applies.
     #[must_use]
@@ -1435,7 +1439,7 @@ impl AppServerControlPlane {
         for offset in 0..total {
             let key = keys[(start + offset) % total];
             if sweep.latches.len() >= APP_SERVER_CONTROL_MAX_LATCHES_PER_TICK
-                || Instant::now().saturating_duration_since(started_at) >= budget
+                || (offset > 0 && Instant::now().saturating_duration_since(started_at) >= budget)
             {
                 break;
             }
@@ -2681,6 +2685,42 @@ mod tests {
             wrapped.latches.iter().any(|latch| latch.key < last),
             "wrapping must reach keys ordered BEFORE the cursor"
         );
+    }
+
+    /// #2831: a tick whose wall-clock budget was already spent before the scan
+    /// began (a preempted thread on a loaded host) must still examine one
+    /// latch, and the cursor must walk the whole registry across ticks.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn an_already_expired_budget_still_examines_one_latch_per_tick() {
+        let plane = AppServerControlPlane::new();
+        let now = Instant::now();
+        let total = 3usize;
+        for index in 0..total {
+            let f = fence_for(index as u128 + 1, 1);
+            plane.register_attempt(&f, CorrelationStateV1::CorrelationPending, now);
+        }
+        assert_eq!(
+            plane.latch_overflow_seal_all(QuarantineSealReason::IngressMailboxOverflow),
+            total
+        );
+
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(APP_SERVER_CONTROL_MAX_MS_PER_TICK) * 100)
+            .expect("the monotonic clock is older than the 2 ms tick budget times 100");
+        let mut seen = BTreeSet::new();
+        let mut cursor = None;
+        for _ in 0..total {
+            let sweep = plane.drain_dirty_latches_from(cursor, expired);
+            assert_eq!(
+                sweep.examined, 1,
+                "an expired budget still examines exactly the first latch"
+            );
+            assert_eq!(sweep.latches.len(), 1);
+            seen.insert(sweep.latches[0].key);
+            cursor = sweep.next_cursor;
+        }
+        assert_eq!(seen.len(), total, "the cursor must reach every latch");
     }
 
     /// An empty registry must cost nothing and reset the cursor, so an idle

@@ -85,11 +85,6 @@ impl NativeMessageTurnRequest {
         })
     }
 
-    #[must_use]
-    pub(crate) const fn fence(&self) -> &MessageAttemptFenceV1 {
-        &self.fence
-    }
-
     /// Consume the wrapper at the exact provider dispatch boundary, yielding
     /// the fence, the settlement identity the caller must settle, and the
     /// one-use execution capability.

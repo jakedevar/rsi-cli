@@ -49,6 +49,72 @@ fn row(text: String, selected: bool) -> Line<'static> {
     ))
 }
 
+/// The peer's declared hub dispatch scope. The hub verifies only the declared
+/// ids; a project is resolved to its current appointed manager by the satellite.
+fn peer_scope_line(peer: &rsi_common::satellite::SatellitePeerV1) -> String {
+    if peer.dispatch_scope.is_empty() && peer.dispatch_project_scope.is_empty() {
+        return "Dispatch scope: none declared".into();
+    }
+    let sessions = peer
+        .dispatch_scope
+        .iter()
+        .map(|id| format!("session {}", id.0));
+    let projects = peer
+        .dispatch_project_scope
+        .iter()
+        .map(|id| format!("project {} (seat resolved by the satellite)", id.0));
+    format!(
+        "Dispatch scope: {}",
+        sessions.chain(projects).collect::<Vec<_>>().join(" · ")
+    )
+}
+
+/// This host's inbound scope and whether each entry resolves to a live seat.
+fn inbound_scope_lines(state: &SatelliteRegistryOverlayState) -> Vec<Line<'static>> {
+    let Some(status) = &state.scope_status else {
+        return Vec::new();
+    };
+    if status.inbound.is_empty() {
+        return vec![Line::from(
+            "Inbound scope (this host): none declared (press I)",
+        )];
+    }
+    let mut lines = vec![Line::from("Inbound scope (this host):")];
+    for entry in &status.inbound {
+        let kind = match entry.kind {
+            rsi_common::satellite_dispatch::SatelliteScopeKindV1::Session => "session",
+            rsi_common::satellite_dispatch::SatelliteScopeKindV1::Project => "project",
+        };
+        let seat = entry
+            .seat_session_id
+            .map_or_else(String::new, |id| format!(" -> seat {}", id.0));
+        lines.push(Line::from(format!(
+            "  {kind} {} · {}{seat}",
+            entry.id.0,
+            entry.state.label()
+        )));
+    }
+    lines
+}
+
+/// ` · launches: none` (or the smallest count) for a satellite manager seat;
+/// empty when the satellite reported no manager seat (#1941).
+fn launches_suffix(observation: Option<&rsi_common::satellite::SatelliteObservationV1>) -> String {
+    observation
+        .and_then(|observation| {
+            rsi_common::satellite_manager_policy::launches_summary(&observation.manager_launches)
+        })
+        .map(|summary| format!(" · launches: {summary}"))
+        .unwrap_or_default()
+}
+
+fn platform_summary(observation: Option<&rsi_common::satellite::SatelliteObservationV1>) -> String {
+    observation
+        .and_then(|observation| observation.platform.as_ref())
+        .map(|platform| format!("{}/{}", safe(&platform.os, 64), safe(&platform.arch, 64)))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOverlayState) {
     let popup = fixed_centered_rect(
         area,
@@ -97,7 +163,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                     ("Session reads", read_enabled.to_string()),
                     ("Hub message dispatch", dispatch_enabled.to_string()),
                     (
-                        "Dispatch scope (session IDs, comma-separated)",
+                        "Dispatch scope (session IDs or project:<id>, comma-separated)",
                         dispatch_scope.clone(),
                     ),
                     (
@@ -130,7 +196,10 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                         "Allowed hub installation IDs (comma-separated)",
                         hubs.clone(),
                     ),
-                    ("Scope root session IDs (comma-separated)", roots.clone()),
+                    (
+                        "Scope roots: session IDs or project:<id> (comma-separated)",
+                        roots.clone(),
+                    ),
                 ]
                 .into_iter()
                 .enumerate()
@@ -197,7 +266,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 .map(|time| format!("{}s", (chrono::Utc::now() - time).num_seconds().max(0)))
                 .unwrap_or_else(|| "never".into());
             lines.push(Line::from(format!(
-                "Peer {} · {} · {} · observed {} ago · {}",
+                "Peer {} · {} · {} · observed {} ago · {}{}",
                 peer.config.peer_id.0,
                 safe(&peer.config.label, 80),
                 status,
@@ -206,14 +275,21 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                     "STALE"
                 } else {
                     "fresh"
-                }
+                },
+                launches_suffix(observation)
             )));
             if let Some(error) =
                 observation.and_then(|observation| observation.last_error.as_deref())
             {
                 lines.push(Line::from(format!("Last failure: {}", safe(error, 120))));
             }
+            lines.push(Line::from(peer_scope_line(peer)));
+            lines.push(Line::from(format!(
+                "Platform: {}",
+                platform_summary(observation)
+            )));
         }
+        lines.extend(inbound_scope_lines(state));
         lines.push(Line::default());
         match state.tab {
             SatelliteRegistryTab::Peers => {
@@ -233,7 +309,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 {
                     lines.push(row(
                         format!(
-                            "{} {}  {}  [{}{}]  {} link(s)",
+                            "{} {}  {}  [{}{}]  platform: {}  {} link(s){}",
                             if idx == state.selected_peer {
                                 "▸"
                             } else {
@@ -251,7 +327,9 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                             } else {
                                 ""
                             },
-                            peer.links.len()
+                            platform_summary(peer.observation.as_ref()),
+                            peer.links.len(),
+                            launches_suffix(peer.observation.as_ref()).replace(" · ", "  ")
                         ),
                         idx == state.selected_peer,
                     ));
@@ -362,12 +440,166 @@ mod tests {
     };
     use rsi_common::types::{SessionProvider, SessionStatus};
 
+    fn registry_state(peer: SatellitePeerV1) -> SatelliteRegistryOverlayState {
+        SatelliteRegistryOverlayState {
+            registry: SatelliteRegistryV1 {
+                revision: 1,
+                peers: vec![peer],
+            },
+            selected_peer: 0,
+            selected_link: 0,
+            selected_session: 0,
+            tab: SatelliteRegistryTab::Peers,
+            sessions: None,
+            form: None,
+            last_probe: None,
+            scope_status: None,
+            last_error: None,
+        }
+    }
+
+    fn peer_with_scope(
+        sessions: Vec<SatelliteUuidV1>,
+        projects: Vec<SatelliteUuidV1>,
+    ) -> SatellitePeerV1 {
+        SatellitePeerV1 {
+            config: SatellitePeerConfigV1 {
+                peer_id: SatelliteUuidV1(uuid::Uuid::new_v4()),
+                label: "laptop".into(),
+                expected_installation_id: None,
+                enabled: true,
+                read_enabled: true,
+                dispatch_enabled: true,
+            },
+            row_version: 1,
+            links: Vec::new(),
+            observation: None,
+            dispatch_scope: sessions,
+            dispatch_project_scope: projects,
+        }
+    }
+
+    fn text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn peer_view_shows_reported_and_unknown_platforms() {
+        for platform in [
+            Some(serde_json::json!({"os": "macos", "arch": "aarch64"})),
+            None,
+        ] {
+            let mut peer = peer_with_scope(Vec::new(), Vec::new());
+            peer.observation = Some(
+                serde_json::from_value(serde_json::json!({
+                    "state": "healthy", "installation_id": null, "incarnation_id": null,
+                    "last_observed_at": null, "last_error": null,
+                    "cached_session_count": 0, "stale": false, "platform": platform
+                }))
+                .unwrap(),
+            );
+            let state = registry_state(peer);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 55)).unwrap();
+            terminal
+                .draw(|frame| render(frame, frame.area(), &state))
+                .unwrap();
+            let shown = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let expected = if platform.is_some() {
+                "macos/aarch64"
+            } else {
+                "unknown"
+            };
+            assert!(shown.contains(&format!("Platform: {expected}")), "{shown}");
+            assert!(shown.contains(&format!("platform: {expected}")), "{shown}");
+        }
+    }
+
+    /// #1928: the hub view names the declared scope by kind; a project is
+    /// resolved by the satellite, not by the hub.
+    #[test]
+    fn peer_scope_line_names_declared_sessions_and_projects() {
+        let session = SatelliteUuidV1(uuid::Uuid::new_v4());
+        let project = SatelliteUuidV1(uuid::Uuid::new_v4());
+        let line = peer_scope_line(&peer_with_scope(vec![session], vec![project]));
+        assert!(line.contains(&format!("session {}", session.0)), "{line}");
+        assert!(
+            line.contains(&format!(
+                "project {} (seat resolved by the satellite)",
+                project.0
+            )),
+            "{line}"
+        );
+        assert_eq!(
+            peer_scope_line(&peer_with_scope(Vec::new(), Vec::new())),
+            "Dispatch scope: none declared"
+        );
+    }
+
+    /// #1928: this host's inbound scope shows whether each entry resolves to a
+    /// live seat.
+    #[test]
+    fn inbound_scope_lines_show_each_entry_and_whether_it_resolves() {
+        use rsi_common::satellite_dispatch::{
+            SatelliteScopeEntryStatusV1, SatelliteScopeKindV1, SatelliteScopeStateV1,
+            SatelliteScopeStatusV1,
+        };
+        let mut state = registry_state(peer_with_scope(Vec::new(), Vec::new()));
+        assert!(inbound_scope_lines(&state).is_empty());
+        state.scope_status = Some(SatelliteScopeStatusV1::default());
+        assert!(text(&inbound_scope_lines(&state)).contains("none declared"));
+        let project = SatelliteUuidV1(uuid::Uuid::new_v4());
+        let seat = SatelliteUuidV1(uuid::Uuid::new_v4());
+        let revoked = SatelliteUuidV1(uuid::Uuid::new_v4());
+        state.scope_status = Some(SatelliteScopeStatusV1 {
+            inbound: vec![
+                SatelliteScopeEntryStatusV1 {
+                    kind: SatelliteScopeKindV1::Project,
+                    id: project,
+                    state: SatelliteScopeStateV1::Live,
+                    seat_session_id: Some(seat),
+                },
+                SatelliteScopeEntryStatusV1 {
+                    kind: SatelliteScopeKindV1::Project,
+                    id: revoked,
+                    state: SatelliteScopeStateV1::Revoked,
+                    seat_session_id: None,
+                },
+            ],
+        });
+        let shown = text(&inbound_scope_lines(&state));
+        assert!(
+            shown.contains(&format!("project {} · live -> seat {}", project.0, seat.0)),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(&format!("project {} · revoked", revoked.0)),
+            "{shown}"
+        );
+    }
+
     #[test]
     fn stale_remote_session_shows_composite_identity_with_sanitized_label() {
         let peer_id = SatelliteUuidV1(uuid::Uuid::new_v4());
         let remote_id = SatelliteUuidV1(uuid::Uuid::new_v4());
         let now = chrono::Utc::now();
         let observation = SatelliteObservationV1 {
+            platform: None,
             state: "offline".into(),
             installation_id: None,
             incarnation_id: None,
@@ -375,6 +607,12 @@ mod tests {
             last_error: None,
             cached_session_count: 1,
             stale: true,
+            manager_launches: vec![
+                rsi_common::satellite_manager_policy::SatelliteManagerLaunchesV1 {
+                    project_id: uuid::Uuid::new_v4(),
+                    launches: 0,
+                },
+            ],
         };
         let state = SatelliteRegistryOverlayState {
             registry: SatelliteRegistryV1 {
@@ -392,6 +630,7 @@ mod tests {
                     links: Vec::new(),
                     observation: Some(observation.clone()),
                     dispatch_scope: Vec::new(),
+                    dispatch_project_scope: Vec::new(),
                 }],
             },
             selected_peer: 0,
@@ -421,6 +660,7 @@ mod tests {
             }),
             form: None,
             last_probe: None,
+            scope_status: None,
             last_error: None,
         };
         let backend = ratatui::backend::TestBackend::new(160, 55);
@@ -438,6 +678,7 @@ mod tests {
         assert!(text.contains(&peer_id.0.to_string()));
         assert!(text.contains(&remote_id.0.to_string()));
         assert!(text.contains("STALE"));
+        assert!(text.contains("launches: none"));
         assert!(text.contains("bad[31mpeer"));
         assert!(text.contains("remote[31mtitle"));
         assert!(!text.contains('\u{1b}'));

@@ -16,9 +16,9 @@ mod inspect;
 mod mutations;
 mod review_source;
 mod work_view;
+#[cfg(test)]
+pub(crate) use facts::V122_CATALOG_OBJECTS;
 pub(crate) use facts::{FactReach, apply_work_facts_migration, is_work_fact};
-#[cfg(any(test, feature = "test-seam"))]
-pub(crate) use facts::{V122_CATALOG_OBJECTS, WORK_FACTS_SCHEMA_VERSION};
 pub(crate) use inspect::record_row;
 #[cfg(test)]
 mod tests;
@@ -63,7 +63,67 @@ pub struct StageRecord {
     pub note: String,
     pub evidence: Option<ManagerEvidenceV2>,
     pub admission: Option<EvidenceAdmission>,
+    /// The caller-owned verification job a stage update cited, as the daemon
+    /// read it from its own job table. It is reported evidence of this stage's
+    /// outcome: it never becomes an `admission` and never accepts the Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_evidence: Option<JobEvidenceObservation>,
     pub updated_at: String,
+}
+/// How a cited verification job ended, judged from its recorded receipt (the
+/// same attribution a verified topology node uses): `green` is exit 0,
+/// `baseline_red` fails only tests an open known-failure record names, `red`
+/// has a failure no record names, `incomplete` ended without a verdict
+/// (build or guard failure, timeout, partial run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobEvidenceOutcome {
+    Green,
+    BaselineRed,
+    Red,
+    Incomplete,
+}
+impl JobEvidenceOutcome {
+    /// The stage states this outcome may describe: a pass needs a green or
+    /// baseline-only run, a failure needs a run that did not pass, and a
+    /// partial or blocked stage may cite either. A terminal job says nothing
+    /// about a stage still pending, running or unknown.
+    #[must_use]
+    pub const fn describes(self, state: ManagerStageStateV2) -> bool {
+        match state {
+            ManagerStageStateV2::Passed => matches!(self, Self::Green | Self::BaselineRed),
+            ManagerStageStateV2::Failed => matches!(self, Self::Red | Self::Incomplete),
+            ManagerStageStateV2::Partial | ManagerStageStateV2::Blocked => true,
+            ManagerStageStateV2::Unknown
+            | ManagerStageStateV2::Pending
+            | ManagerStageStateV2::Running => false,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobKnownFailure {
+    pub test: String,
+    pub issue: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobEvidenceObservation {
+    pub job_id: Uuid,
+    /// The authenticated caller that owns the job (never a supplied identity).
+    pub owner_session_id: Uuid,
+    /// The commit the job's receipt records as tested.
+    pub source_commit: String,
+    pub artifact_path: String,
+    pub artifact_commit: String,
+    pub artifact_digest: String,
+    pub outcome: JobEvidenceOutcome,
+    pub exit_code: Option<i32>,
+    pub plan: Option<String>,
+    pub failing_tests: Vec<String>,
+    pub known_failures: Vec<JobKnownFailure>,
+    pub new_failures: Vec<String>,
+    pub observed_at: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +242,7 @@ pub struct LedgerObservationContext {
 #[derive(Default)]
 pub struct LedgerObservation {
     pub evidence: Option<EvidenceAdmission>,
+    pub job_evidence: Option<JobEvidenceObservation>,
     pub source_commit: Option<String>,
     pub custody: Vec<(Uuid, Uuid, u64)>,
     /// #984: descendants of the author whose own branch changes are

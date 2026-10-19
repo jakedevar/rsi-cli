@@ -16,6 +16,7 @@ pub mod format;
 pub mod generate;
 pub mod hook;
 pub mod node;
+pub mod planning;
 pub mod retrieval;
 pub mod state;
 #[cfg(test)]

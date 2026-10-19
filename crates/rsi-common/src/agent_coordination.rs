@@ -1971,10 +1971,14 @@ impl BoundaryAdmissionV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSendMessageRequestV1 {
+    /// #2313: canonical wire name `session_id`; `target_session_id` is a
+    /// deprecated alias accepted for one release.
+    #[serde(rename = "session_id", alias = "target_session_id")]
     pub target_session_id: Uuid,
     pub message: String,
     pub idempotency_key: String,
-    /// Omit or send null for a deadline 30 minutes after first acceptance.
+    /// Omit or send null for a deadline 30 minutes after first acceptance,
+    /// or six hours when the recipient owns an armed result wake or open job.
     /// An explicit RFC3339 deadline is preserved without a policy cap.
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
@@ -2010,7 +2014,8 @@ impl AgentSendMessageRequestV1 {
 /// delivery tip belongs to one attempt and is never a public target.
 /// `state=queued` proves acceptance only, not delivery to the provider. The
 /// returned deadline is the original persisted deadline, including the
-/// 30-minute default when the request omitted `expires_at`.
+/// default (30 minutes, or six hours with a pending wake/job) when the
+/// request omitted `expires_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendMessageResultV1 {
     pub message_id: Uuid,
@@ -2251,6 +2256,9 @@ impl AgentContinuationCursorV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentContinueChildRequestV1 {
+    /// #2313: canonical wire name `session_id`; `target_session_id` is a
+    /// deprecated alias accepted for one release.
+    #[serde(rename = "session_id", alias = "target_session_id")]
     pub target_session_id: Uuid,
     pub query: String,
     pub expected_tip_session_id: Uuid,
@@ -2441,6 +2449,9 @@ impl AgentArchiveRefusalDetailV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentArchiveChildRequestV1 {
+    /// #2313: canonical wire name `session_id`; `target_session_id` is a
+    /// deprecated alias accepted for one release.
+    #[serde(rename = "session_id", alias = "target_session_id")]
     pub target_session_id: Uuid,
     pub expected_tip_session_id: Uuid,
     pub expected_event_sequence: i64,

@@ -87,6 +87,7 @@ pub fn spawn_chain_driver(
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
+                            event_bus.record_lagged(n);
                             warn!(
                                 "chain_driver: broadcast lagged by {n} events; \
                                  re-querying active chains"

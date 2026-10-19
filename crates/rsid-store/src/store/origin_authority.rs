@@ -13,10 +13,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
-pub(crate) const CLAIM_NAMESPACE: Uuid = Uuid::from_u128(0x672e0ca2_9b3e_5a70_84a2_7c4c8f5ec7a1);
-pub(crate) const RECEIPT_NAMESPACE: Uuid = Uuid::from_u128(0x8d4ca179_a598_596e_9e5b_5e22265c4a49);
-pub(crate) const MODEL_INVOCATION_NAMESPACE: Uuid =
-    Uuid::from_u128(0x695ef6d4_3f91_5410_9ee0_6c65b0ecb6f1);
 pub(crate) const MALFORMED_LINEAGE_NAMESPACE: Uuid =
     Uuid::from_u128(0x50c3df80_188c_52a1_93de_5f63e2034516);
 
@@ -819,6 +815,7 @@ pub(crate) fn v85_table_sql() -> String {
     .concat()
 }
 
+#[cfg(test)]
 pub(crate) fn v85_catalog_table_sql() -> String {
     [
         V85_CATALOG_BEFORE_CLAIM_MATCH_SQL,
@@ -832,7 +829,7 @@ pub(crate) fn v85_catalog_table_sql() -> String {
 /// catalog.  This is test-only migration input: V86 must upgrade databases
 /// created before the parser functions and family/provenance CHECK landed,
 /// rather than proving only an upgrade from the already-amended V85 text.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn v85_pre_rk_catalog_table_sql() -> String {
     const AMENDED_KEY_CHECK: &str = "request_key TEXT NOT NULL UNIQUE CHECK(rsi_execution_origin_request_key_is_canonical(request_key)=1)";
     const SEALED_KEY_CHECK: &str = r#"request_key TEXT NOT NULL UNIQUE CHECK(
@@ -970,6 +967,7 @@ ALTER TABLE execution_origin_receipts RENAME TO execution_origin_receipts_v87;
 
 /// Every column is named on both sides so V88 cannot silently normalize,
 /// default, reorder, or omit a deployed byte during the five-table rebuild.
+#[cfg(test)]
 pub(crate) const V88_REBUILD_COPY_AND_DROP_SQL: &str = r#"
 INSERT INTO execution_origin_authorities(authority_kind,authority_uuid,owner_session_id,owner_generation,claim_generation,event_sequence,active_claim_id,phase,boot_id,quarantine_code,created_at,updated_at)
 SELECT authority_kind,authority_uuid,owner_session_id,owner_generation,claim_generation,event_sequence,active_claim_id,phase,boot_id,quarantine_code,created_at,updated_at FROM execution_origin_authorities_v87;
@@ -1656,6 +1654,7 @@ pub(crate) struct SeedMember {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct HydratedOriginAuthority {
     pub(crate) kind: String,
     pub(crate) authority: String,
@@ -1670,6 +1669,7 @@ pub(crate) struct HydratedOriginAuthority {
 /// Read-only hydration for V85 consumers.  It deliberately validates every
 /// persisted token and aggregate; corrupt rows are Store errors, never an
 /// implicit idle authority.
+#[cfg(test)]
 pub(crate) fn hydrate_authority(
     tx: &Transaction<'_>,
     kind: &str,

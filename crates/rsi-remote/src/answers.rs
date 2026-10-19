@@ -25,6 +25,7 @@
 use crate::{
     config::Config,
     ingress::{self, Method, Request},
+    managers::MessageGate,
     reads::{OperatorCall, OperatorDispatch, OperatorError, ReadError},
     session::{self, Binding, SessionDenial, Sessions},
 };
@@ -46,7 +47,7 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
-        Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -69,7 +70,7 @@ const AUDIT_FILE: &str = "audit.jsonl";
 /// Forwarded requests remembered so a lost-response retry can reach the
 /// daemon's idempotency replay after the decision is no longer pending.
 const FORWARDED_CAP: usize = 256;
-const RETRY_AFTER_BUSY: u64 = 1;
+pub(crate) const RETRY_AFTER_BUSY: u64 = 1;
 
 /// The reply the HTTP layer sends. Statuses are limited to the set the
 /// gateway's response writer knows.
@@ -81,7 +82,7 @@ pub struct AnswerReply {
 }
 
 impl AnswerReply {
-    const fn bare(status: u16) -> Self {
+    pub(crate) const fn bare(status: u16) -> Self {
         Self {
             status,
             body: Vec::new(),
@@ -89,7 +90,7 @@ impl AnswerReply {
         }
     }
 
-    fn coded(status: u16, code: &str) -> Self {
+    pub(crate) fn coded(status: u16, code: &str) -> Self {
         Self {
             status,
             body: serde_json::to_vec(&json!({ "error": code })).unwrap_or_default(),
@@ -97,7 +98,7 @@ impl AnswerReply {
         }
     }
 
-    const fn after(mut self, seconds: u64) -> Self {
+    pub(crate) const fn after(mut self, seconds: u64) -> Self {
         self.retry_after = Some(seconds);
         self
     }
@@ -276,19 +277,19 @@ impl AuditSink for FileAudit {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Per-session answer rate: one per second and 32 per hour.
 #[derive(Default)]
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     by_session: HashMap<String, VecDeque<Instant>>,
 }
 
 impl RateLimiter {
     /// Records the attempt, or returns how long until one is allowed.
-    fn check(&mut self, session: &str, now: Instant) -> Result<(), Duration> {
+    pub(crate) fn check(&mut self, session: &str, now: Instant) -> Result<(), Duration> {
         self.by_session.retain(|_, times| {
             while times
                 .front()
@@ -320,18 +321,18 @@ impl RateLimiter {
 /// replay. Bounded and short lived; a restart forgets it (the client then sees
 /// 409 and polling shows the real state).
 #[derive(Default)]
-struct Forwarded {
+pub(crate) struct Forwarded {
     by_key: HashMap<String, (String, Instant)>,
 }
 
 impl Forwarded {
-    fn is_repeat(&self, key: &str, payload: &str, now: Instant) -> bool {
+    pub(crate) fn is_repeat(&self, key: &str, payload: &str, now: Instant) -> bool {
         self.by_key.get(key).is_some_and(|(seen, at)| {
             seen == payload && now.saturating_duration_since(*at) < ANSWER_WINDOW
         })
     }
 
-    fn remember(&mut self, key: &str, payload: String, now: Instant) {
+    pub(crate) fn remember(&mut self, key: &str, payload: String, now: Instant) {
         if self.by_key.len() >= FORWARDED_CAP && !self.by_key.contains_key(key) {
             self.by_key
                 .retain(|_, (_, at)| now.saturating_duration_since(*at) < ANSWER_WINDOW);
@@ -430,7 +431,7 @@ fn targets_contain(response: &RemoteGetDecisionTargetsResponseV1, body: &AnswerB
         })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     Sha256::digest(bytes)
         .iter()
@@ -440,7 +441,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
@@ -542,21 +543,32 @@ pub struct AnswerRequest<'a> {
 /// Gateway-wide answer state: the audit sink, rate limiter and the bounded
 /// memory of forwarded requests.
 pub struct AnswerGate {
-    audit: Box<dyn AuditSink>,
+    audit: Arc<dyn AuditSink>,
     gateway_epoch: uuid::Uuid,
     limiter: Mutex<RateLimiter>,
     forwarded: Mutex<Forwarded>,
+    /// The API v2 message pipeline shares this gate's audit sink, so there is
+    /// one append-only trail with one rotation owner.
+    messages: MessageGate,
 }
 
 impl AnswerGate {
     #[must_use]
     pub fn new(audit: Box<dyn AuditSink>) -> Self {
+        let audit: Arc<dyn AuditSink> = Arc::from(audit);
         Self {
+            messages: MessageGate::new(Arc::clone(&audit)),
             audit,
             gateway_epoch: uuid::Uuid::new_v4(),
             limiter: Mutex::new(RateLimiter::default()),
             forwarded: Mutex::new(Forwarded::default()),
         }
+    }
+
+    /// The closed message pipeline (API v2), on this gate's audit sink.
+    #[must_use]
+    pub const fn messages(&self) -> &MessageGate {
+        &self.messages
     }
 
     /// Run the whole answer pipeline for one answer POST.
@@ -949,6 +961,7 @@ mod tests {
             allowed_node_ids: vec!["nHOME".to_string()],
             project_ids: vec![PROJECT.to_string()],
             allow_answers,
+            allow_messages: false,
         }
     }
 
@@ -1035,6 +1048,11 @@ mod tests {
                 OperatorCall::Answer(request) => {
                     lock(&self.answer_calls).push(serde_json::to_value(request).unwrap());
                     lock(&self.answer).clone()
+                }
+                OperatorCall::ManagerSeats(_)
+                | OperatorCall::ManagerConversation(_)
+                | OperatorCall::SendManagerMessage(_) => {
+                    Err(OperatorError::Refused("answer rig has no v2".into()))
                 }
             }
         }

@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>gp": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the Policy section of the manager view for the project (GetHarnessManager + GetHarnessManagerPolicy)"
+    },
+    "key:<Space>gb": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the manager Board: the Overview, Decisions, Requests and Health first pages (GetHarnessManagerState)"
+    },
+    "key:<Space>gd": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the Decisions section (GetHarnessManagerState section decisions)"
+    },
+    "key:gm": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the global manager workspace (GetGlobalManagerWorkspace)"
+    },
+    "cmd:manager": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the manager view on the Board"
+    },
+    "cmd:manager-board": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the Board"
+    },
+    "cmd:manager-decisions": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens Decisions"
+    },
+    "cmd:manager-inbox": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens Inbox (section requests)"
+    },
+    "cmd:manager-inspect": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens Inspect; [ / ] step its subsections"
+    },
+    "cmd:manager-policy": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the Policy section"
+    },
+    "cmd:manager-scope": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the scope picker (ListHarnessManagerScope pages, ConfigureHarnessManager save)"
+    },
+    "cmd:manager-appoint": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the scope picker with the selected session as the seat; Enter saves the appointment (ConfigureHarnessManager)"
+    },
+    "cmd:manager-clear": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "asks, then revokes supervision with the explicit empty selection (ConfigureHarnessManager)"
+    },
+    "cmd:manager-tree": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the manager tree (GetManagerTree pages)"
+    },
+    "cmd:global-manager": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the global manager workspace; :gm and :manager workspace are its aliases"
+    },
+    "cmd:manager-global": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "bare :manager global opens the workspace with the grant in its header; show prints the grant line; set <active|sessions|containers|spend|groups> <value> [confirm], add-project <names>, configure <JSON> and prefill [projects] send ConfigureGlobalManager built by the TUI's rules (manager_ops.rs over rsi_common::global_manager); a cap-reduction refusal opens a review and y resends with confirm_cap_reductions"
+    },
+    "cmd:manager-global-revoke": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "asks, then RevokeGlobalManager with the grant version read just before"
+    },
+    "cmd:manager-portfolio": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "list (active nodes), show <node>, appoint <label> [--adopt <nodes>] [projects] (prefilled from the last revoked root, or a covering grant above adopted nodes), launch add|remove <node> <Provider/model[/effort]>... (ConfigurePortfolioNodeLaunches), configure <JSON> and revoke <node> (asks first; RevokePortfolioNode at its current versions); nodes resolve by id, 4+ character prefix or unique label"
+    },
+    "cmd:manager-escalations": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "list / all open the queue (escalations, top-of-chain reports, undelivered tier mail with its next-page cursor); rule <hop> <text> (RuleOperatorEscalation), ack <notice> (AcknowledgeOperatorNotice) and undelivered [<cursor>] (ListOperatorEscalations undelivered_after); hop and notice ids resolve by a unique 4+ character prefix"
+    },
+    "cmd:manager-friction": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "the friction rollup (ListFrictionRollup); :manager friction <hours> widens the window (1..720)"
+    },
+    "cmd:fleet": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "opens the fleet workspace (GetFleetOverview)"
+    },
+    "overlay:harness-manager-scope-manager-appoint-manager-scope": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "j/k g/G, Space toggles with the TUI Group/Epic rules and 32 limits, a whole project, / filter (a modal field), Enter saves (an empty explicit selection asks, then revokes), Esc/q; [x] explicit, [+] inherited; unavailable selections stay listed for removal"
+    },
+    "overlay-ref:manager-scope": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "every key of the Manager Scope table"
+    },
+    "overlay:harness-manager-policy-manager-policy": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs, src-tauri/src/manager_ops.rs",
+      "note": "rows: Preset (Observe / Execute / Full project control through rsi_common's apply_manager_policy_preset; the row shows the preset the draft matches, Custom otherwise), Use suggested allowances (apply_suggested_manager_allowances), mode, operator pause, capabilities, Group creation, quotas, retry count and delay, request timeout, spend cap, reviewer tier, Paused Epics / Group grants / Provider ceilings / Daemon setting bounds as JSON lists, Allowed launches in a picker (catalog checks plus typed Provider/model[/effort]), and Advanced (every field as JSON); list and Advanced edits pass ManagerPolicyV2::validate before reaching the draft; s saves the whole policy fenced on scope and policy versions (an unchanged retry keeps its key), r reloads; a revoked grant is labelled and s regrants the draft"
+    },
+    "overlay-ref:manager-policy": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs, src-tauri/src/manager_ops.rs",
+      "note": "1-5, Tab / Shift-Tab, [ ], j/k, g/G, Enter/Space, s, r, Esc/q"
+    },
+    "overlay:harness-manager-board-decisions": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs, src-tauri/src/manager_ops.rs",
+      "note": "1-5 and Tab / Shift-Tab sections, [ ] Inspect subsections, j/k g/G, o open session, Enter on a Board band opens its full section, a answers a DECISIONS row in place, n/p cursor pages, Page Up / Page Down scroll the detail pane, r refresh, decisions answered with the exact digest/version and fences (h/l option, Enter, y recommended, a free text), X archives stale decisions after a count confirm; the header carries the KPI line (program and product rows, read from at most 4 Overview pages, or the bound named)"
+    },
+    "overlay-ref:manager-board": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs, src-tauri/src/manager_ops.rs",
+      "note": "every key, Page Up / Page Down and Shift-Tab included"
+    },
+    "overlay-ref:manager-decisions": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs, src-tauri/src/manager_ops.rs",
+      "note": "every key, Page Up / Page Down and Shift-Tab included"
+    },
+    "overlay-ref:manager-text-entry": {
+      "status": "substitute",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "a modal text field (Enter submits, Esc cancels) replaces the inline entry; Ctrl-U is the platform's own field editing"
+    },
+    "overlay:manager-tree": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "guided tree with kind badge, seat health, grant and load columns (an uncounted load is ?), h/l Space H/L folds, j/k g/G PgDn/PgUp, n next page, r refresh, p preview (impact and every action's availability), o project; Enter opens the node console of a Portfolio, Project or Area row (GetManagerNodeWorkspace; a pre-#1236 global row opens gm; an Epic its lead); a replaces a global, portfolio or project seat with the focused session; e edits a global or portfolio grant (granted projects and per-project caps, the parent's caps shown) or carves a childless area node's allowance (ConfigureManagerNode), or opens the project scope picker; x revokes; A appoints the focused session above a portfolio node and m, then m on a sibling, moves a node under it (Esc cancels). Every action re-reads the node, refreshes when the tree was stale, reviews the change with its descendant impact and needs y when destructive; requests are the TUI's (manager_ops.rs over rsi_common)"
+    },
+    "overlay:global-manager-workspace-gm-global-manager": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "the grant header, the global seat and its earlier sessions, each granted project's PM with its earlier sessions and signals, missing projects; node consoles (GetManagerNodeWorkspace) show where the node sits, its grant, a fleet rollup and waiting escalations, child nodes as digests and the projects it manages; Enter/l opens a seat session or a child's console, Backspace the parent console; i types to the selected seat and t to the console's own seat (a message dialog stands in for the in-place input bar), s status, x halts softly and X now (press twice; the session list's pause path), a archives an earlier seat session, n launches and appoints (seat, launch from the catalog, prompt, scope and host, optional grant editor; ConfigureGlobalManager or ConfigureHarnessManagerWithPolicy; a refused appointment is retried by n), Tab focuses the seat's conversation (last 40 events; j/k, Ctrl-D/U, g/G), p, b Budget, T tree, F fleet, : the command line, r refresh; the view re-reads every 15 s and keeps the last snapshot on a failed read"
+    },
+    "overlay-ref:global-manager-workspace": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "every key: j/k g/G, i, t, s, x, X, a, n, b (+ and typed limits), Tab, Enter/l, Backspace, p, T, F, r, :, Esc/q"
+    },
+    "overlay-ref:fleet": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "j/k g/G, / filter, Tab agents/usage, yy copy UUID, s then 1-5 sort column, S reverse, b group by, w rate window, Enter open session, r refresh, Esc/q"
+    },
+    "overlay-ref:fleet-filter": {
+      "status": "substitute",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "a modal filter field (Enter applies, Esc cancels) replaces the inline filter"
+    },
+    "overlay-ref:fleet-sort": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "s, then 1-5 picks one of the five displayed columns; Esc cancels"
+    },
+    "overlay-ref:fleet-usage": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "the usage-group table with the same keys; Tab/Enter return to agents"
+    },
+    "module:ui/overlay/fleet.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "agents and usage groups with the TUI filter, sorts, grouping and 5 min / 1 h / 24 h rates"
+    },
+    "module:ui/overlay/gm_budget.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "Budget panel (GetGlobalManagerBudget): every cap as used / limit with the binding cap marked; + or a typed limit, reviewed, saved through ConfigurePortfolioNode or ConfigureHarnessManagerPolicy behind the grant/policy fences, then read back; a delegate points to :manager tree"
+    },
+    "module:ui/overlay/manager_tree.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "see overlay:manager-tree"
+    },
+    "module:ui/overlay/harness_manager.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "scope picker, board, decisions and policy as in their overlay rows; :manager node commands"
+    },
+    "module:ui/overlay/manager_v2.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "Board (with the KPI line), Decisions, Inbox, Inspect and Policy sections over GetHarnessManagerState; see the board and policy rows"
+    },
+    "module:ui/overlay/global_manager_workspace.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "see overlay:global-manager-workspace-gm-global-manager"
+    },
+    "cmd:manager-global-appoint": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "the focused session over the named projects (comma list, one name, or words; default every project; an active grant keeps its projects, launches and PM policy); after a revoke the most recent revoked root grant over the coverage is the prefill (--defaults opts out) and the toast names the diff; ConfigureGlobalManager with the cap-reduction review"
+    },
+    "cmd:manager-node": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "list (ListManagerNodes, 64 per page) for the selected session's project, get <UUID> (GetManagerNode), configure <JSON> (ConfigureManagerNode, project must match), revoke <UUID> <epoch> (fenced on the epoch read now), tree"
+    },
+    "cmd:manager-restart": {
+      "status": "done",
+      "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
+      "note": "status / now / cancel send GetOperatorRestart, ForceOperatorRestart and CancelOperatorRestart and toast the TUI's summary (waiting for a landing + N turns, release by …)"
+    },
+    "module:ui/overlay/grant_editor.rs": {
+      "status": "done",
+      "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
+      "note": "the grant editor behind n: preset (applies and reopens on the result), mode, one check per capability, created containers / sessions, active sessions, spend ceiling and the launches (the global grant's list, at least one; a PM's own allowlist), checked by ManagerPolicyV2::validate before anything launches"
+    }
+  }
+}

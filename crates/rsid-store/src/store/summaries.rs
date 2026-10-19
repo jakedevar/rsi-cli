@@ -121,7 +121,7 @@ impl Store {
     /// Get the latest short summary content for a session.
     /// Used for `Session.short_summary` denormalization at query time.
     pub fn get_short_summary_content(&self, session_id: Uuid) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT content FROM session_summaries
              WHERE session_id = ?1 AND kind = 'Short'
              ORDER BY created_at DESC
@@ -150,29 +150,21 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // SQLite doesn't support array parameters, so we use a subquery pattern.
-        // For each session, get the latest short summary via a correlated subquery.
-        let placeholders: Vec<String> = session_ids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
+        // One JSON array parameter (#2494): a constant statement text is prepared
+        // once for any batch size and cannot exceed SQLite's variable limit.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT ss.session_id, ss.content
              FROM session_summaries ss
              INNER JOIN (
                  SELECT session_id, MAX(created_at) as max_created
                  FROM session_summaries
-                 WHERE kind = 'Short' AND session_id IN ({})
+                 WHERE kind = 'Short' AND session_id IN (SELECT value FROM json_each(?1))
                  GROUP BY session_id
              ) latest ON ss.session_id = latest.session_id AND ss.created_at = latest.max_created
              WHERE ss.kind = 'Short'",
-            placeholders.join(",")
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-
-        let params: Vec<String> = session_ids.iter().map(|id| id.to_string()).collect();
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
+        )?;
+        let ids = serde_json::to_string(session_ids)?;
+        let param_refs: [&dyn rusqlite::types::ToSql; 1] = [&ids];
 
         let mut result = std::collections::HashMap::new();
         let mut rows = stmt.query(param_refs.as_slice())?;

@@ -31,8 +31,15 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: RequestOperatorRestartRequestV1 = decode(request)?;
         let store = self.session_manager.store();
-        let status =
-            deploy_operator::request(store, DeployService::global(), params, Utc::now()).await?;
+        let status = deploy_operator::request(
+            store,
+            DeployService::global(),
+            &self.session_manager.deploy_drain(),
+            &self.runtime_config,
+            params,
+            Utc::now(),
+        )
+        .await?;
         Ok(serde_json::to_value(status)?)
     }
 

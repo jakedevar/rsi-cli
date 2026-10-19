@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "rows": {
+    "key:<Space>X": {
+      "status": "done",
+      "location": "src/actions/emergency-spec.ts, src/actions/emergency.ts, src/emergency-model.ts, src-tauri/src/emergency.rs",
+      "note": "EmergencyStopAll: forwards UpdateModelControlPolicy {mode: stop_all, interrupt_active: true} like the TUI. The TUI has no confirmation, so the chord runs at once; the Session menu and palette ask first. Interrupted sessions get a HARD badge in the list and the toast is the TUI's"
+    },
+    "cmd:stopall": {
+      "status": "done",
+      "location": "src/actions/emergency-spec.ts, src/actions/emergency.ts, src/emergency-model.ts, src-tauri/src/emergency.rs",
+      "note": ":stopall (:stop-all) runs at once like the TUI (no confirmation); same action as <Space>X"
+    }
+  }
+}

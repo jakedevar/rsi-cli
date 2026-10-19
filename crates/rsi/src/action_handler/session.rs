@@ -107,6 +107,23 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             app.cancel_retry_focused_session().await;
         }
 
+        LcAction::ToggleTodoPanel => app.toggle_todo_panel(),
+        LcAction::TodoNext => app.todo_move(1),
+        LcAction::TodoPrev => app.todo_move(-1),
+        LcAction::TodoOpenLink => app.todo_open_link().await,
+        // Done and dismiss never act at once (#2950): they open the pop-up on
+        // its y/n prompt.
+        LcAction::TodoDone => {
+            app.todo_confirm_close(rsi_common::operator_todos::OperatorTodoStatusV1::Done);
+        }
+        LcAction::TodoDismiss => {
+            app.todo_confirm_close(rsi_common::operator_todos::OperatorTodoStatusV1::Dismissed);
+        }
+        LcAction::TodoCopy => app.todo_copy_selected(),
+        LcAction::TodoAcknowledge => app.todo_acknowledge(),
+        LcAction::TodoPopup => app.todo_open_popup(),
+        LcAction::TodoUndo => app.todo_undo(),
+
         LcAction::ReassignSessionProject => {
             let session_id = match app.focused_pane().cloned() {
                 Some(Pane::SessionDetail { session_id }) => Some(session_id),
@@ -131,6 +148,10 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::AbandonRotation(target) => {
             app.abandon_focused_rotation(target.clone()).await;
+        }
+
+        LcAction::ReseatManager(args) => {
+            app.reseat_focused_manager(args.clone()).await;
         }
 
         LcAction::CommitAndPush => {
@@ -352,6 +373,18 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::RunEpicTopology => {
             run_epic_topology(app).await;
+        }
+
+        LcAction::LandSessionBranch => {
+            crate::land::land_focused_session(app).await;
+        }
+
+        LcAction::ColdRestoreSession => {
+            crate::cold_storage::restore_focused_session(app).await;
+        }
+
+        LcAction::ColdArchive(args) => {
+            crate::cold_storage::cold_archive_command(app, args.as_deref()).await;
         }
 
         _ => unreachable!("session::dispatch called with non-session action"),

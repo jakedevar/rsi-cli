@@ -99,26 +99,31 @@ overrides this automatic route.
    paths and behavior. Code References list checked `path:line` locations.
    Open Questions record facts that could not be established.
 
-6b. **Emit JSON companion + validate (RSI-014):**
-   After the markdown research document is written at `<doc>.md`, resolve `rsi-research-validate` from the active repository root before constructing a sidecar. Never search or build from an absolute RSI checkout and never assume a `crates/` layout.
-   1. **Present/repo-local:** if `target/debug/rsi-research-validate` is executable, select it and require validation.
-   2. **Buildable/repo-local:** otherwise run `cargo metadata --no-deps --format-version 1`; if successful metadata contains package `rsi-common` with exact binary target `rsi-research-validate`, run `cargo build -p rsi-common --bin rsi-research-validate --quiet`, select `target/debug/rsi-research-validate`, and require validation. A build failure remains a required-validator failure; it is never `SKIPPED`.
-   3. **Present/PATH:** if the repository has no exact buildable target but `command -v rsi-research-validate` resolves an executable, select it and require validation.
-   4. **Unavailable:** only if no repository-local executable exists, successful metadata proves the exact package/target absent (or the active repository has no Cargo manifest), and PATH has no executable, report `Validator: SKIPPED — rsi-research-validate unavailable (no executable and no buildable rsi-common target); markdown remains authoritative; continuing.` Do not create a new JSON sidecar, do not set `json_companion_status: invalid`, and do not overwrite, validate, trust, or delete a pre-existing sidecar.
-   5. **Probe error:** if the active repository has a Cargo manifest but metadata fails and no executable is available, report the capability-probe error as a failure. It is never `SKIPPED`.
-   When a validator is selected, emit a structured JSON sidecar so consumer skills (`/plan`, `/team_plan`) can parse a typed contract instead of grepping markdown. The JSON conforms to the v2 schema enforced by `rsi-research-validate` (source: `crates/rsi-common/src/research_schema/`).
-   6. Construct the JSON object from your in-memory working set:
+6b. **Emit JSON companion + validate (RSI-014, optional):**
+   The markdown research document is always the authoritative source. Consumer skills (`/plan`, `/team_plan`) read markdown when no JSON exists or when the markdown declares `json_companion_status: invalid`.
+
+   Generate a typed JSON sidecar ONLY when:
+   - The user explicitly requests typed output (e.g., "with typed findings"),
+   - OR a downstream consumer explicitly requests the research with `typed: true`,
+   - OR you choose to provide it for a complex research that will directly feed planning via `satisfies:` linkage.
+
+   When JSON is generated, follow this flow. Never search or build from an absolute RSI checkout and never assume a `crates/` layout.
+
+   1. **Probe for validator:** Check if `target/debug/rsi-research-validate` is executable.
+   2. **Build if needed/wanted:** If the validator is absent and you choose to generate JSON (per the conditions above), run `cargo metadata --no-deps --format-version 1`; if successful metadata contains package `rsi-common` with exact binary target `rsi-research-validate`, run `cargo build -p rsi-common --bin rsi-research-validate --quiet`, select `target/debug/rsi-research-validate`. A build failure does not block JSON generation (JSON is best-effort when unsolicited); validate later or report the build failure and use markdown fallback.
+   3. **PATH fallback:** If a validator is not found locally, skip JSON generation; markdown is authoritative.
+   4. Construct the JSON object from your in-memory working set:
       - `version`: `2` (the constant `RESEARCH_SCHEMA_VERSION`; v2 is a strict superset of v1).
       - `research_question`: the original user query verbatim.
       - `areas`: the list of `### [Component/Area X]` heading names you wrote under `## Detailed Findings`. Must be non-empty.
       - `findings`: for each subsection bullet, emit `{ id: <"F-001", "F-002", …>, summary: <≤25 words>, file_ref: <"path:line" or "path:start-end">, confidence: "medium" }`. **Mint `id` as a stable, monotonic join key** (`F-001`, `F-002`, …) — this is the provenance anchor `/plan` items reference via `satisfies:` and the cross-stage VERIFY pass checks. Assign each finding its own id; never reuse or renumber across a revision.
       - `file_refs`: for each entry under `## Code References`, emit `{ path, lines: [start, end] }` (encode `path:N` as `lines: [N, N]`).
       - `open_questions`: for each entry under `## Open Questions`, emit `{ summary: <≤25 words>, blocks_planning: false }` unless the question explicitly names a missing prerequisite (then `true`).
-   7. Write the JSON to `<doc>.json` (sibling of the markdown).
-   8. Run the selected `rsi-research-validate <doc>.json`.
-   9. On exit `0` → proceed to step 7 (GitHub permalinks). Both files commit together.
-   10. On exit `2` → delete `<doc>.json` (`rm`); insert `json_companion_status: invalid` into the markdown frontmatter (before the closing `---`); proceed to step 7. The markdown remains committed; consumer skills detect the frontmatter flag and skip the JSON probe.
-   11. On exit `1` (I/O) → same fallback as exit 2; surface the I/O error in your final summary to the user. Validator exit failures are never `SKIPPED`.
+   5. Write the JSON to `<doc>.json` (sibling of the markdown).
+   6. If a validator is available, run `rsi-research-validate <doc>.json --strict`.
+   7. On validator exit `0` → proceed to step 7 (GitHub permalinks). Both files commit together.
+   8. On validator exit `2` or `1` → delete `<doc>.json` (`rm`); insert `json_companion_status: invalid` into the markdown frontmatter (before the closing `---`); proceed to step 7. The markdown remains committed; consumer skills detect the frontmatter flag and skip the JSON probe.
+
    The JSON is opaque to daemon pipeline detection (`PIPELINE_PATH_RE` only matches `.md`); no auto-derive double-fire concern.
 
 7. **Add GitHub permalinks (if applicable):** Only use a permalink when
@@ -127,8 +132,8 @@ overrides this automatic route.
 8. **Commit and report.** Commit the markdown and a valid JSON companion
    together. Summarize the findings, references, and unresolved questions.
 9. **Follow-up research.** Append dated findings to the same document, update
-   `last_updated` and `last_updated_by`, revalidate any companion, and
-   commit the revision. Recheck live code for each new question.
+   `last_updated` and `last_updated_by`. If a JSON companion exists, revalidate
+   it; otherwise, update only markdown and commit. Recheck live code for each new question.
 
 ## Stage contract
 
@@ -140,17 +145,21 @@ Named question and files, or a bounded code-discovery budget using `rg` and
 ### Process
 
 Trace current code and tests, inspect relevant history, verify references,
-write the markdown, then apply step 6b to its companion.
+and write the markdown. Generate JSON companion (step 6b) only when explicitly
+requested or when consuming planning will directly use `satisfies:` linkage.
 
 ### Outputs
 
-A committed research markdown file and, when validation succeeds, a v2 JSON
-sidecar with stable `F-001` style finding IDs.
+A committed research markdown file with YAML frontmatter. When JSON is generated,
+a v2 JSON sidecar with stable `F-001` style finding IDs (sibling `.json` file).
+The markdown is always the authoritative source.
 
 ### Verify
 
-Run the selected `rsi-research-validate` when available under step 6b, and
-check that every cited path and line exists in the current checkout.
+Check that every cited path and line exists in the current checkout. If JSON
+was generated, validate it with `rsi-research-validate` when the validator is
+available. Markdown remains authoritative even if validation fails or if JSON
+is absent.
 
 - **COMMIT AND PUSH — REQUIRED**: Before responding, commit the research document and other task-owned files using explicit paths. Never stage the entire `thoughts/` directory or unrelated edits. Leave the tree clean. Push only if the user explicitly asked; then push the current feature branch as a safe fast-forward, never `main`.
 - Preserve the exact directory of every `thoughts/` source you cite;

@@ -31,8 +31,8 @@ struct World {
 
 impl World {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("approvals.db")).unwrap();
+        let dir = crate::test_support::disk_backed_tempdir("pending-approvals");
+        let store = Store::open_test_fixture(&dir.path().join("approvals.db")).unwrap();
         let (config, mut lead) = crate::store::pending_approvals::approval_test_fixture(
             &store,
             ManagerPolicyV2::default(),
@@ -304,10 +304,113 @@ const METHOD: &str = "item/commandExecution/requestApproval";
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
+async fn remote_pending_answer_inventory_pages_every_occurrence_once() {
+    use rsi_common::remote_decision_targets::{
+        MAX_DECISION_TARGETS, RemoteGetDecisionTargetsResponseV1,
+    };
+    use rsi_common::rpc::RpcRequest;
+    use std::collections::BTreeSet;
+
+    let w = World::new().await;
+    // Keep this producer outside the manager inbox so its approvals appear in
+    // the independent pending inventory.
+    w.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET parent_id=NULL WHERE id=?1",
+            [w.session.to_string()],
+        )
+        .unwrap();
+    let count = MAX_DECISION_TARGETS * 2 + 3;
+    let mut expected = BTreeSet::new();
+    let mut prior = None;
+    for n in 0..count {
+        w.inject(json!(900 + n), METHOD);
+        let target = w.publication(prior.as_ref(), "published").await;
+        expected.insert(format!(
+            "pending-approval:{}",
+            target["publication_id"].as_str().unwrap()
+        ));
+        prior = Some(target);
+    }
+    // Publication persistence precedes the runtime witness update. Observe the
+    // monitor releasing that lock before starting the bounded read.
+    let runtime = WRITERS
+        .lock()
+        .unwrap()
+        .get(&w.session)
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    let pending = runtime.pending.lock().await;
+    assert_eq!(pending.len(), count);
+    drop(pending);
+    let epoch = Uuid::new_v4();
+    let signer = Arc::new(crate::remote_read::RemoteCursorSigner::new(epoch));
+    let mut after: Option<String> = None;
+    let mut seen = BTreeSet::new();
+    for size in [MAX_DECISION_TARGETS, MAX_DECISION_TARGETS, 3] {
+        let rpc = RpcRequest::new(
+            "RemoteGetDecisionTargetsV1",
+            json!({
+                "project_id": w.config.project_id, "session_id": w.session, "pending_after": after,
+            }),
+        );
+        // The read waits at most 100 ms for the Store lock and answers the typed
+        // `busy` (REMOTE_BUSY) when a loaded host keeps the monitor holding it;
+        // the contract is that the caller retries, as the witness test does.
+        let wire: Value = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut bytes = Vec::new();
+                crate::remote_read::send_operator_read(
+                    &w.manager, &signer, epoch, &rpc, &mut bytes,
+                )
+                .await
+                .unwrap();
+                let wire: Value = serde_json::from_slice(&bytes).unwrap();
+                if wire["error"]["code"].as_i64() == Some(i64::from(rsi_common::rpc::REMOTE_BUSY)) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                break wire;
+            }
+        })
+        .await
+        .expect("operator inventory read stays busy past the retry budget");
+        let page: RemoteGetDecisionTargetsResponseV1 =
+            serde_json::from_value(wire["result"].clone())
+                .unwrap_or_else(|e| panic!("successful operator inventory read: {e}: {wire}"));
+        assert!(page.items.is_empty());
+        assert_eq!(page.pending_items.len(), size);
+        assert_eq!(page.truncated, size == MAX_DECISION_TARGETS);
+        for item in &page.pending_items {
+            assert!(
+                seen.insert(item.decision_id.as_str().to_owned()),
+                "each occurrence appears once"
+            );
+        }
+        after = page.pending_next.map(|next| next.as_str().to_owned());
+        assert_eq!(after.is_some(), size == MAX_DECISION_TARGETS);
+        if let Some(cursor) = &after {
+            assert_eq!(
+                cursor,
+                page.pending_items.last().unwrap().decision_id.as_str()
+            );
+        }
+    }
+    assert_eq!(seen, expected);
+    w.finish().await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
 async fn remote_exact_native_witness_is_bounded_and_nonblocking() {
     use crate::remote_read::{NativeRuntimeApprovalRecheck, NativeRuntimeApprovalState, ReadError};
 
-    let mut w = World::new().await;
+    let w = World::new().await;
     w.inject(json!(610), METHOD);
     let target = w.publication(None, "published").await;
     let id = Uuid::parse_str(target["publication_id"].as_str().unwrap()).unwrap();
@@ -775,7 +878,7 @@ async fn appserver_approval_reopen_expires_exact_enqueued_writer_and_preserves_d
     w.response(true, 141).await;
     let delivery = w.deliveries().await.remove(0);
     w.quiesce().await;
-    let reopened = Store::open(&w._dir.path().join("approvals.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w._dir.path().join("approvals.db")).unwrap();
     reopened.expire_appserver_approvals(&[]).unwrap();
     reopened
         .manager_v2_refresh_question_decisions(&w.config)
@@ -936,7 +1039,7 @@ async fn appserver_approval_queued_restart_loses_writer_and_stays_explicitly_blo
     w.queue("queued-restart", "deny").await;
     let delivery = w.deliveries().await.remove(0);
     w.quiesce().await;
-    let reopened = Store::open(&w._dir.path().join("approvals.db")).unwrap();
+    let reopened = Store::open_test_fixture(&w._dir.path().join("approvals.db")).unwrap();
     reopened
         .expire_appserver_approvals(&live_incarnations())
         .unwrap();

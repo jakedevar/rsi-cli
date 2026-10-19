@@ -161,7 +161,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_store() -> Store {
-        Store::open(std::path::Path::new(":memory:")).unwrap()
+        Store::open_in_memory().unwrap()
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]

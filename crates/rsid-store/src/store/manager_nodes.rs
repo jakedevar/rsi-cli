@@ -402,7 +402,7 @@ pub struct AreaNode {
 }
 
 pub(super) fn area_node_on(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     project: Uuid,
     id: Uuid,
 ) -> Result<Option<AreaNode>> {
@@ -600,10 +600,12 @@ fn policy_matches_grant(policy: &ManagerPolicyV2, grant: &ManagerNodeGrantV1) ->
             .iter()
             .all(|limit| grant.allowance.provider_limits.contains(limit))
         && policy.allowed_launches.len() == grant.allowed_launches.len()
-        && policy
-            .allowed_launches
-            .iter()
-            .all(|choice| grant.allowed_launches.contains(choice))
+        && policy.allowed_launches.iter().all(|choice| {
+            grant
+                .allowed_launches
+                .iter()
+                .any(|entry| entry.allows(choice) && choice.allows(entry))
+        })
 }
 
 fn reserve_child_capacity(
@@ -1088,11 +1090,12 @@ impl Store {
             || (parent_policy.paused && !request.policy.paused)
             || (request.policy.allow_create_groups && !parent_policy.allow_create_groups)
             || request.policy.max_recovery_attempts > parent_policy.max_recovery_attempts
-            || request
-                .policy
-                .allowed_launches
-                .iter()
-                .any(|launch| !parent_policy.allowed_launches.contains(launch))
+            || request.policy.allowed_launches.iter().any(|launch| {
+                !parent_policy
+                    .allowed_launches
+                    .iter()
+                    .any(|entry| entry.allows(launch))
+            })
             || parent_policy.provider_limits.iter().any(|limit| {
                 !request.policy.provider_limits.iter().any(|child| {
                     child.provider == limit.provider && child.max_active <= limit.max_active

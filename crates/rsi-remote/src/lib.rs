@@ -7,8 +7,10 @@
 //! checks (`session`), and the closed first-page read adapter that enforces
 //! project scope before dispatch (`reads`). The single write, answering a
 //! waiting manager decision, is the closed pipeline in `answers` and is off
-//! unless the policy sets `allow_answers`. Each layer's denials are tested to
-//! cause zero daemon dispatch.
+//! unless the policy sets `allow_answers`. API v2 (`managers`) adds the exposed
+//! projects' manager seats, a seat's conversation and one second closed write,
+//! a message to a seat, off unless the policy sets `allow_messages`. Each
+//! layer's denials are tested to cause zero daemon dispatch.
 
 pub mod answers;
 pub mod assets;
@@ -17,5 +19,10 @@ pub mod gate;
 pub mod ingress;
 pub mod localapi;
 pub mod localapi_client;
+pub mod managers;
 pub mod reads;
 pub mod session;
+
+#[cfg(test)]
+#[path = "test_support.rs"]
+mod test_support;

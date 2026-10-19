@@ -28,6 +28,7 @@ use crate::global_manager::{
 };
 use crate::manager_nodes::{ManagerNodeGrantV1, ManagerNodeSelectorV1};
 use crate::manager_tier_routing::ManagerNodeRefV1;
+use crate::standing_directives::StandingDirectiveV1;
 
 /// The operator-only node workspace RPC (never in an agent catalog).
 pub const OPERATOR_METHODS: [&str; 1] = ["GetManagerNodeWorkspace"];
@@ -62,10 +63,87 @@ impl GetManagerNodeWorkspaceRequestV1 {
     }
 }
 
-/// `AgentManagerOverview {}`: the caller's own node.
+/// `AgentManagerOverview {fleet?}`: the caller's own node.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentManagerOverviewRequestV1 {}
+pub struct AgentManagerOverviewRequestV1 {
+    /// #2052: how much of the fleet rollup to return. Defaults to `summary`.
+    #[serde(default)]
+    pub fleet: ManagerOverviewFleetV1,
+}
+
+/// Fleet detail of `AgentManagerOverview` (#2052).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerOverviewFleetV1 {
+    /// `fleet` is `null`.
+    None,
+    /// Active agents, 1h/24h totals and one row per model.
+    #[default]
+    Summary,
+    /// The whole rollup (every group, three windows of nine counters).
+    Full,
+}
+
+impl ManagerNodeFleetV1 {
+    /// #2052: the compact agent view of the rollup: `active`, the 1h and 24h
+    /// totals and one row per model (1h and 24h invocations, errors and cost).
+    #[must_use]
+    pub fn summary_value(&self) -> serde_json::Value {
+        fn window(usage: &FleetUsage) -> serde_json::Value {
+            serde_json::json!({
+                "invocations": usage.invocations,
+                "errors": usage.errors,
+                "cost": (usage.cost * 10_000.0).round() / 10_000.0,
+            })
+        }
+        let models: Vec<_> = self
+            .groups
+            .iter()
+            .filter(|group| group.dimension == "model")
+            .map(|group| {
+                serde_json::json!({
+                    "model": group.label,
+                    "active": group.active,
+                    "1h": window(&group.windows[1]),
+                    "24h": window(&group.windows[2]),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "view": "summary",
+            "as_of": self.as_of,
+            "active": self.active,
+            "totals": {"1h": window(&self.totals[1]), "24h": window(&self.totals[2])},
+            "models": models,
+            "agents_truncated": self.agents_truncated,
+            "usage_truncated": self.usage_truncated,
+        })
+    }
+}
+
+impl ManagerNodeWorkspaceV1 {
+    /// #2052: the agent-facing JSON of the overview. `Full` is exactly the
+    /// serialized workspace; `Summary` and `None` replace only `fleet`.
+    ///
+    /// # Errors
+    /// A serialization error.
+    pub fn into_overview_value(
+        self,
+        fleet: ManagerOverviewFleetV1,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let compact = match fleet {
+            ManagerOverviewFleetV1::Full => None,
+            ManagerOverviewFleetV1::Summary => Some(self.fleet.summary_value()),
+            ManagerOverviewFleetV1::None => Some(serde_json::Value::Null),
+        };
+        let mut value = serde_json::to_value(&self)?;
+        if let (Some(compact), Some(object)) = (compact, value.as_object_mut()) {
+            object.insert("fleet".to_string(), compact);
+        }
+        Ok(value)
+    }
+}
 
 /// Session-level counts summed over a node's coverage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,8 +251,33 @@ impl ManagerNodeFleetV1 {
     }
 }
 
+/// #2021: the latest time a portfolio node's seat handed its own seat to a
+/// successor it launched (`AgentManagerAppointChild` on its own node).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerNodeSeatHandoffV1 {
+    pub appointment_id: Uuid,
+    /// The seat that handed the node on.
+    pub old_seat: Uuid,
+    /// The seat that holds it from then on.
+    pub new_seat: Uuid,
+    /// Where the old seat wrote its handoff (a repo path or a commit).
+    pub handoff: Option<String>,
+    pub handed_at: DateTime<Utc>,
+    /// #2749: the handoff file was modified after the appointment completed
+    /// (the retired seat appended to it, or anything else wrote it). A
+    /// successor that read it earlier must read it again. The daemon sets it
+    /// when it assembles a workspace, from a handoff that names an absolute
+    /// or `~/` path it can stat; otherwise it stays `false`.
+    #[serde(default)]
+    pub handoff_changed_after_appointment: bool,
+    /// #2749: that file's modification time when it is later than
+    /// `handed_at`; `None` otherwise.
+    #[serde(default)]
+    pub handoff_modified_at: Option<DateTime<Utc>>,
+}
+
 /// `GetManagerNodeWorkspace` and `AgentManagerOverview` result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ManagerNodeWorkspaceV1 {
     pub node: ManagerNodeRefV1,
     /// A portfolio node's tier label, a project's name, or `area`.
@@ -206,6 +309,15 @@ pub struct ManagerNodeWorkspaceV1 {
     pub escalations: Vec<ManagerNodePendingEscalationV1>,
     pub escalations_truncated: bool,
     pub fleet: ManagerNodeFleetV1,
+    /// A portfolio node's latest self-handoff (#2021); `None` when its seat
+    /// never handed it on.
+    #[serde(default)]
+    pub last_seat_handoff: Option<ManagerNodeSeatHandoffV1>,
+    /// #2649: the standing operator directives active on this node's scope,
+    /// verbatim with author, provenance and timestamps. Each covered project's
+    /// own directives are on its entry in `projects`.
+    #[serde(default)]
+    pub standing_directives: Vec<StandingDirectiveV1>,
 }
 
 impl ManagerNodeWorkspaceV1 {
@@ -270,5 +382,47 @@ mod tests {
     fn reason_is_cut_on_a_char_boundary() {
         assert_eq!(bounded_reason("abc", 8), "abc");
         assert_eq!(bounded_reason("ééé", 3), "é");
+    }
+}
+
+impl Serialize for ManagerNodeWorkspaceV1 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut output = serializer.serialize_struct("ManagerNodeWorkspaceV1", 19)?;
+        output.serialize_field("node", &self.node)?;
+        output.serialize_field("label", &self.label)?;
+        output.serialize_field("state", &self.state)?;
+        output.serialize_field("parent", &self.parent)?;
+        output.serialize_field("grant", &self.grant)?;
+        output.serialize_field("grantor", &self.grantor)?;
+        output.serialize_field("max_direct_reports", &self.max_direct_reports)?;
+        output.serialize_field("area", &self.area)?;
+        output.serialize_field("seat", &self.seat)?;
+        output.serialize_field("children", &self.children)?;
+        output.serialize_field("children_truncated", &self.children_truncated)?;
+        output.serialize_field("projects", &self.projects)?;
+        output.serialize_field("missing_project_ids", &self.missing_project_ids)?;
+        output.serialize_field("escalations", &self.escalations)?;
+        output.serialize_field("escalations_truncated", &self.escalations_truncated)?;
+        output.serialize_field("fleet", &self.fleet)?;
+        output.serialize_field("last_seat_handoff", &self.last_seat_handoff)?;
+        output.serialize_field("standing_directives", &self.standing_directives)?;
+        let launches_display: Vec<_> = self
+            .grant
+            .as_ref()
+            .map(|grant| grant.allowed_launches.as_slice())
+            .or_else(|| {
+                self.area
+                    .as_ref()?
+                    .grant
+                    .as_ref()
+                    .map(|grant| grant.allowed_launches.as_slice())
+            })
+            .unwrap_or(&[])
+            .iter()
+            .map(crate::harness_manager_v2::ManagerLaunchChoiceV2::display)
+            .collect();
+        output.serialize_field("launches_display", &launches_display)?;
+        output.end()
     }
 }

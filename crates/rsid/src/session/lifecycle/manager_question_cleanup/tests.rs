@@ -21,7 +21,7 @@ enum CrashWindow {
 
 async fn run_clear_failure(retain_first_cleanup: bool, crash: Option<CrashWindow>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("test.db")).unwrap();
+    let store = Store::open_test_fixture(&dir.path().join("test.db")).unwrap();
     let (scope, lead) = fixture(&store, ManagerPolicyV2::default());
     // Measured zero on the preceding invocation is deliberately tempting but
     // must never become telemetry for the answer's unmonitored invocation.
@@ -240,7 +240,7 @@ async fn run_clear_failure(retain_first_cleanup: bool, crash: Option<CrashWindow
         // The snapshot was taken at the actual effect boundary. Only reopen
         // after the runtime owner has proved both the provider and its stamped
         // writer gone, matching the production process-first startup contract.
-        let reopened = Store::open(&snapshot_path).unwrap();
+        let reopened = Store::open_test_fixture(&snapshot_path).unwrap();
         let answer: Uuid = reopened.conn.query_row(
             "SELECT id FROM model_invocations WHERE session_id=?1 AND dedup_key LIKE 'manager.answer:%'",
             [lead.id.to_string()], |row| row.get::<_, String>(0),

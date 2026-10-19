@@ -403,6 +403,77 @@ fn select_model_usage<'a>(
     usage_by_model.values().next()
 }
 
+/// A `--fallback-model` that ran (#2762): the model a session was launched on
+/// and the chain member that served part of the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelFallback {
+    pub from: String,
+    pub to: String,
+}
+
+/// The fallback a `result` reports, if one ran: its `modelUsage` has an entry
+/// other than the session's own model that is a member of the operator's chain
+/// (`chain` is already the chain this session launched with, see
+/// `claude_fallback_chain_for`). An entry that is not a chain member is a
+/// subagent's model, not a fallback. The map key can carry a variant suffix
+/// and the entry a `canonicalModel`; both are compared without it. `to` is the
+/// chain member's name as the operator wrote it, so the event names the
+/// configured model.
+pub(crate) fn model_fallback_used(
+    stream_event: &StreamEvent,
+    session_model: Option<&str>,
+    chain: &[String],
+) -> Option<ModelFallback> {
+    let usage_by_model = stream_event.data.get("modelUsage")?.as_object()?;
+    if usage_by_model.len() < 2 || chain.is_empty() {
+        return None;
+    }
+    let names_of = |key: &str, usage: &serde_json::Value| -> Vec<String> {
+        let mut names = vec![key.to_string()];
+        if let Some(canonical) = usage.get("canonicalModel").and_then(|v| v.as_str()) {
+            names.push(canonical.to_string());
+        }
+        names
+    };
+    let chain_member = |names: &[String]| {
+        chain.iter().find(|member| {
+            names
+                .iter()
+                .any(|name| crate::claude::same_claude_model(name, member))
+        })
+    };
+    let is_session_model = |names: &[String]| {
+        session_model.is_some_and(|own| {
+            names
+                .iter()
+                .any(|name| crate::claude::same_claude_model(name, own))
+        })
+    };
+    let mut fallback = None;
+    let mut unmatched_primary = None;
+    for (key, usage) in usage_by_model {
+        let names = names_of(key, usage);
+        if is_session_model(&names) {
+            continue;
+        }
+        match chain_member(&names) {
+            Some(member) if fallback.is_none() => fallback = Some(member.clone()),
+            Some(_) => {}
+            None => unmatched_primary = unmatched_primary.or(Some(key.clone())),
+        }
+    }
+    let to = fallback?;
+    let from = session_model
+        .map(rsi_common::claude_catalog::strip_context_variant_suffix)
+        .map(str::to_string)
+        .or_else(|| {
+            unmatched_primary.map(|key| {
+                rsi_common::claude_catalog::strip_context_variant_suffix(&key).to_string()
+            })
+        })?;
+    Some(ModelFallback { from, to })
+}
+
 /// Stable `stop_reason`/`terminal_reason` for a Claude Code exit that rejected
 /// the selected model (#1484).
 pub(crate) const PROVIDER_MODEL_UNRECOGNIZED_REASON: &str = "provider_model_unrecognized";
@@ -426,6 +497,146 @@ pub(crate) fn unrecognized_model_in_text(text: &str) -> Option<String> {
         .and_then(|r| r.split(')').next())
         .unwrap_or_default();
     Some(model.trim().to_string())
+}
+
+/// Stable `terminal_reason` for a Claude turn that ended in an error result
+/// right after the provider echoed a tool call as rejected (#31). The
+/// provider's own `stop_reason` stays as reported; this names the shape so a
+/// lead is told the child stopped at a rejected tool call (work possibly
+/// left in its sandbox) instead of reading a bare provider error.
+pub(crate) const PROVIDER_TOOL_REJECTED_REASON: &str = "provider_tool_rejected";
+
+/// The text Claude Code puts in a tool result for a rejected tool call.
+const TOOL_REJECTION_MARKER: &str = "doesn't want to proceed with this tool use";
+
+/// Does a tool result body carry the provider's tool-rejection text.
+pub(crate) fn is_tool_rejection_text(text: &str) -> bool {
+    text.contains(TOOL_REJECTION_MARKER)
+}
+
+/// How one stream event moves the "the last thing the provider said was a
+/// rejected tool call" flag: `Some(true)` for a `user` event whose tool result
+/// is the rejection text, `Some(false)` for output that proves the turn went on
+/// (an assistant or tool-use event), `None` for events that say nothing.
+pub(crate) fn tool_rejection_transition(stream_event: &StreamEvent) -> Option<bool> {
+    match stream_event.event_type.as_str() {
+        "assistant" | "tool_use" => Some(false),
+        "user" => {
+            let blocks = stream_event
+                .data
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_array())?;
+            let rejected = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+                .filter_map(|block| block.get("content"))
+                .any(|content| match content {
+                    serde_json::Value::String(text) => is_tool_rejection_text(text),
+                    serde_json::Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                        .any(is_tool_rejection_text),
+                    _ => false,
+                });
+            rejected.then_some(true)
+        }
+        _ => None,
+    }
+}
+
+/// The typed terminal reason for an error result that follows a rejected tool
+/// call, or `None` when the turn did not end that way or the provider already
+/// typed its own `terminal_reason` (kept as reported).
+pub(crate) fn tool_rejection_terminal_reason(
+    rejection_is_last_output: bool,
+    result_is_error: bool,
+    provider_terminal_reason: Option<&str>,
+) -> Option<&'static str> {
+    (rejection_is_last_output && result_is_error && provider_terminal_reason.is_none())
+        .then_some(PROVIDER_TOOL_REJECTED_REASON)
+}
+
+/// The auth or billing class a Claude retry notice names (#2753), or `None`
+/// for any other event. Claude Code writes the notice as a `system` event with
+/// `subtype: "api_retry"` (`{"type":"system","subtype":"api_retry",
+/// "error":"billing_error",...}`); the reader forwards the wire `type` as
+/// `event_type` unchanged, so the subtype is what identifies it (#2811). A
+/// top-level `type: "api_retry"` is accepted too.
+pub(crate) fn api_retry_auth_class(
+    stream_event: &StreamEvent,
+) -> Option<crate::store_support::provider_defaults::ProviderAuthClass> {
+    let data = &stream_event.data;
+    let is_api_retry = match stream_event.event_type.as_str() {
+        "system" => data.get("subtype").and_then(serde_json::Value::as_str) == Some("api_retry"),
+        "api_retry" => true,
+        _ => false,
+    };
+    if !is_api_retry {
+        return None;
+    }
+    data.get("error")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::store_support::provider_defaults::classify_api_retry_error)
+}
+
+/// The stop reason of an error result that follows a Claude `system/api_retry`
+/// naming an auth or billing class (`authentication_failed`, `account_on_hold`,
+/// `billing_error`, #2753): that class, unless the result's own text already
+/// typed it (`provider_*`), e.g. as a rejected model or a missing login.
+pub(crate) fn stop_reason_after_api_retry(
+    stop_reason: Option<String>,
+    class: Option<crate::store_support::provider_defaults::ProviderAuthClass>,
+) -> Option<String> {
+    match (stop_reason, class) {
+        (Some(reason), _) if reason.starts_with("provider_") => Some(reason),
+        (_, Some(class)) => Some(class.stop_reason().to_string()),
+        (reason, None) => reason,
+    }
+}
+
+/// What the monitor knows about the turn around a `result` event, beyond the
+/// event itself, that types the stop and terminal reasons (#2824).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ResultContext {
+    /// The `result` is a provider error (not a clean completion).
+    pub provider_error: bool,
+    /// The auth or billing class a preceding `system/api_retry` named (#2753).
+    pub api_retry_class: Option<crate::store_support::provider_defaults::ProviderAuthClass>,
+    /// The last provider output was a rejected tool call (#31).
+    pub tool_rejection_last: bool,
+    /// The provider's stderr or notices rejected the selected model (#1484).
+    pub rejected_model: bool,
+}
+
+/// The result metadata the session keeps, with every stop-reason adjustment
+/// applied exactly once: the `api_retry` class (#2753), the rejected-tool
+/// terminal reason (#31) and the rejected-model reason (#1484). The monitor
+/// computes this once per `result` and uses the one value for the login-probe
+/// note and for the tracked-session write, so a new adjustment cannot reach
+/// one consumer and miss the other (#2824).
+pub(crate) fn extract_adjusted_result_metadata(
+    stream_event: &StreamEvent,
+    session_model: Option<&str>,
+    context: ResultContext,
+) -> ResultMetadata {
+    let mut meta = extract_result_metadata(stream_event, session_model);
+    if context.provider_error {
+        meta.stop_reason =
+            stop_reason_after_api_retry(meta.stop_reason.take(), context.api_retry_class);
+    }
+    if let Some(reason) = tool_rejection_terminal_reason(
+        context.tool_rejection_last,
+        context.provider_error,
+        meta.terminal_reason.as_deref(),
+    ) {
+        meta.terminal_reason = Some(reason.to_string());
+    }
+    if context.rejected_model {
+        meta.stop_reason = Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.to_string());
+        meta.terminal_reason = Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.to_string());
+    }
+    meta
 }
 
 /// Extract session metadata from a "result" stream event.
@@ -489,8 +700,32 @@ pub(crate) fn extract_result_metadata(
         .then(|| stream_event.data.get("result").and_then(|v| v.as_str()))
         .flatten()
         .and_then(unrecognized_model_in_text);
+    // #2753: an error result whose text says the CLI holds no login (`Not
+    // logged in · Please run /login`, `Login expired`) or that the provider
+    // rejected the credential is that typed class, not the bare subtype.
+    let auth_class = stream_event
+        .data
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then(|| stream_event.data.get("result").and_then(|v| v.as_str()))
+        .flatten()
+        .and_then(crate::store_support::provider_defaults::classify_provider_auth_text);
+    let budget_exceeded = stream_event.data.get("subtype").and_then(|v| v.as_str())
+        == Some("error_max_budget_usd")
+        || stream_event
+            .data
+            .get("terminal_reason")
+            .and_then(|v| v.as_str())
+            == Some("budget_exhausted");
     let stop_reason = if rejected_model.is_some() {
         Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.to_string())
+    } else if budget_exceeded {
+        Some(
+            crate::store_support::provider_defaults::CLAUDE_BUDGET_EXCEEDED_STOP_REASON.to_string(),
+        )
+    } else if let Some(class) = auth_class {
+        Some(class.stop_reason().to_string())
     } else {
         stream_event
             .data
@@ -850,6 +1085,207 @@ mod tests {
         assert_eq!(meta.stop_reason, Some("success".to_string()));
     }
 
+    /// #31: the incident shape (child 53b1437b): a Bash tool call, the
+    /// provider's rejection echoed as a tool result, then an
+    /// `error_during_execution` result and no further output.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_rejected_tool_call_then_an_error_result_is_typed_provider_tool_rejected() {
+        let rejection = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.";
+        let user = |content: serde_json::Value| StreamEvent {
+            event_type: "user".to_string(),
+            data: serde_json::json!({"message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": content}
+            ]}}),
+        };
+        // Both content shapes the CLI emits (bare string, text-block array).
+        assert_eq!(
+            tool_rejection_transition(&user(serde_json::json!(rejection))),
+            Some(true)
+        );
+        assert_eq!(
+            tool_rejection_transition(&user(
+                serde_json::json!([{"type": "text", "text": rejection}])
+            )),
+            Some(true)
+        );
+        // An ordinary tool result says nothing; later assistant output clears it.
+        assert_eq!(
+            tool_rejection_transition(&user(serde_json::json!("ok"))),
+            None
+        );
+        let assistant = StreamEvent {
+            event_type: "assistant".to_string(),
+            data: serde_json::json!({"message": {"content": []}}),
+        };
+        assert_eq!(tool_rejection_transition(&assistant), Some(false));
+
+        let result = StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({"subtype": "error_during_execution", "is_error": true}),
+        };
+        let meta = extract_result_metadata(&result, None);
+        assert_eq!(meta.stop_reason.as_deref(), Some("error_during_execution"));
+        assert_eq!(
+            tool_rejection_terminal_reason(true, true, meta.terminal_reason.as_deref()),
+            Some("provider_tool_rejected")
+        );
+        // Not at a rejection, a clean result, or a provider-typed reason: no relabel.
+        assert_eq!(tool_rejection_terminal_reason(false, true, None), None);
+        assert_eq!(tool_rejection_terminal_reason(true, false, None), None);
+        assert_eq!(
+            tool_rejection_terminal_reason(true, true, Some("aborted_tools")),
+            None
+        );
+    }
+
+    /// #2753: the observed and documented Claude texts type the error result
+    /// as a missing login or a rejected credential; the api_retry class types
+    /// one that carries neither.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn claude_auth_results_and_api_retry_classes_map_to_typed_stop_reasons() {
+        use crate::store_support::provider_defaults::{
+            PROVIDER_AUTH_INVALID_STOP_REASON, PROVIDER_BILLING_ERROR_STOP_REASON,
+            PROVIDER_LOGIN_REQUIRED_STOP_REASON, ProviderAuthClass, classify_api_retry_error,
+        };
+        let result = |text: &str| StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({
+                "subtype": "success",
+                "is_error": true,
+                "terminal_reason": "api_error",
+                "result": text,
+            }),
+        };
+        for text in [
+            // Observed on a logged-out `claude -p`.
+            "Not logged in \u{b7} Please run /login",
+            // Documented on expiry (CC-AUTH).
+            "Login expired \u{b7} Please run /login",
+        ] {
+            let meta = extract_result_metadata(&result(text), None);
+            assert_eq!(
+                meta.stop_reason.as_deref(),
+                Some(PROVIDER_LOGIN_REQUIRED_STOP_REASON),
+                "{text}"
+            );
+            // The provider's own terminal reason is kept as reported.
+            assert_eq!(meta.terminal_reason.as_deref(), Some("api_error"));
+        }
+        let meta = extract_result_metadata(
+            &result("API Error: 401 Unauthorized \u{b7} invalidated oauth token"),
+            None,
+        );
+        assert_eq!(
+            meta.stop_reason.as_deref(),
+            Some(PROVIDER_AUTH_INVALID_STOP_REASON)
+        );
+        // A successful result that merely mentions a login is not a failure.
+        let ok = StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({
+                "subtype": "success",
+                "is_error": false,
+                "result": "You are not logged in to the app; I fixed the redirect.",
+            }),
+        };
+        assert_eq!(
+            extract_result_metadata(&ok, None).stop_reason.as_deref(),
+            Some("success")
+        );
+
+        // `system/api_retry` `error` classes.
+        for (error, class, stop) in [
+            (
+                "authentication_failed",
+                ProviderAuthClass::LoginRequired,
+                PROVIDER_LOGIN_REQUIRED_STOP_REASON,
+            ),
+            (
+                "oauth_org_not_allowed",
+                ProviderAuthClass::AuthInvalid,
+                PROVIDER_AUTH_INVALID_STOP_REASON,
+            ),
+            (
+                "account_on_hold",
+                ProviderAuthClass::AuthInvalid,
+                PROVIDER_AUTH_INVALID_STOP_REASON,
+            ),
+            (
+                "billing_error",
+                ProviderAuthClass::Billing,
+                PROVIDER_BILLING_ERROR_STOP_REASON,
+            ),
+        ] {
+            assert_eq!(classify_api_retry_error(error), Some(class), "{error}");
+            assert_eq!(
+                stop_reason_after_api_retry(Some("error_during_execution".into()), Some(class))
+                    .as_deref(),
+                Some(stop),
+                "{error}"
+            );
+        }
+        assert_eq!(classify_api_retry_error("rate_limit"), None);
+        // The result's own typed reason wins; no class leaves the reason alone.
+        assert_eq!(
+            stop_reason_after_api_retry(
+                Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.into()),
+                Some(ProviderAuthClass::Billing)
+            )
+            .as_deref(),
+            Some(PROVIDER_MODEL_UNRECOGNIZED_REASON)
+        );
+        assert_eq!(
+            stop_reason_after_api_retry(Some("success".into()), None).as_deref(),
+            Some("success")
+        );
+    }
+
+    /// #2811: the retry notice is recognised in its wire shape, a `system`
+    /// event with `subtype: "api_retry"`, parsed exactly as the Claude reader
+    /// parses a stdout line.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn api_retry_auth_class_reads_the_system_api_retry_wire_shape() {
+        use crate::store_support::provider_defaults::ProviderAuthClass;
+        let wire = |line: &str| serde_json::from_str::<StreamEvent>(line).unwrap();
+        assert_eq!(
+            api_retry_auth_class(&wire(
+                r#"{"type":"system","subtype":"api_retry","attempt":2,"error":"billing_error"}"#
+            )),
+            Some(ProviderAuthClass::Billing)
+        );
+        assert_eq!(
+            api_retry_auth_class(&wire(
+                r#"{"type":"system","subtype":"api_retry","error":"authentication_failed"}"#
+            )),
+            Some(ProviderAuthClass::LoginRequired)
+        );
+        assert_eq!(
+            api_retry_auth_class(&wire(r#"{"type":"api_retry","error":"account_on_hold"}"#)),
+            Some(ProviderAuthClass::AuthInvalid)
+        );
+        // A retryable class, another system subtype and another event type
+        // carry no auth class.
+        assert_eq!(
+            api_retry_auth_class(&wire(
+                r#"{"type":"system","subtype":"api_retry","error":"rate_limit"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            api_retry_auth_class(&wire(
+                r#"{"type":"system","subtype":"init","error":"billing_error"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            api_retry_auth_class(&wire(r#"{"type":"assistant","error":"billing_error"}"#)),
+            None
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn unrecognized_model_maps_to_provider_model_unrecognized() {
@@ -924,6 +1360,81 @@ mod tests {
         assert!(meta.stop_reason.is_none());
     }
 
+    /// #2824: one helper types the stop and terminal reasons, so the
+    /// `api_retry` class, the rejected tool and the rejected model all reach
+    /// the one value the monitor writes to the session.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn adjusted_result_metadata_applies_every_stop_reason_adjustment_once() {
+        use crate::store_support::provider_defaults::ProviderAuthClass;
+        let error_result = StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({"subtype": "error_during_execution", "is_error": true}),
+        };
+        let error = ResultContext {
+            provider_error: true,
+            ..ResultContext::default()
+        };
+
+        let retried = extract_adjusted_result_metadata(
+            &error_result,
+            None,
+            ResultContext {
+                api_retry_class: Some(ProviderAuthClass::Billing),
+                ..error
+            },
+        );
+        assert_eq!(
+            retried.stop_reason.as_deref(),
+            Some(ProviderAuthClass::Billing.stop_reason())
+        );
+
+        let tool = extract_adjusted_result_metadata(
+            &error_result,
+            None,
+            ResultContext {
+                tool_rejection_last: true,
+                ..error
+            },
+        );
+        assert_eq!(
+            tool.terminal_reason.as_deref(),
+            Some(PROVIDER_TOOL_REJECTED_REASON)
+        );
+        assert_eq!(tool.stop_reason.as_deref(), Some("error_during_execution"));
+
+        let model = extract_adjusted_result_metadata(
+            &error_result,
+            None,
+            ResultContext {
+                api_retry_class: Some(ProviderAuthClass::Billing),
+                tool_rejection_last: true,
+                rejected_model: true,
+                ..error
+            },
+        );
+        assert_eq!(
+            model.stop_reason.as_deref(),
+            Some(PROVIDER_MODEL_UNRECOGNIZED_REASON)
+        );
+        assert_eq!(
+            model.terminal_reason.as_deref(),
+            Some(PROVIDER_MODEL_UNRECOGNIZED_REASON)
+        );
+
+        let clean = extract_adjusted_result_metadata(
+            &error_result,
+            None,
+            ResultContext {
+                api_retry_class: Some(ProviderAuthClass::Billing),
+                tool_rejection_last: true,
+                ..ResultContext::default()
+            },
+        );
+        assert_eq!(clean.stop_reason.as_deref(), Some("error_during_execution"));
+        assert_eq!(clean.terminal_reason, None);
+    }
+
     /// G-005/F-151: a multi-model `modelUsage` map must resolve to the
     /// SESSION's window, not to whichever entry the CLI serialized first.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -962,6 +1473,104 @@ mod tests {
             Some(200_000),
             "a Haiku session must resolve to the Haiku entry"
         );
+    }
+
+    /// #2762: a result with two `modelUsage` entries where the second is a
+    /// chain member is a fallback; a subagent's model that is not in the chain
+    /// is not; a result with the session's model alone is not.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn model_fallback_used_names_the_chain_member_that_ran() {
+        let event = |usage: serde_json::Value| StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({ "subtype": "success", "modelUsage": usage }),
+        };
+        let chain = vec![
+            "claude-sonnet-5-5".to_string(),
+            "claude-haiku-4-5".to_string(),
+        ];
+
+        let fell_back = event(serde_json::json!({
+            "claude-opus-5[1m]": { "canonicalModel": "claude-opus-5" },
+            "claude-sonnet-5-5": { "canonicalModel": "claude-sonnet-5-5" }
+        }));
+        assert_eq!(
+            model_fallback_used(&fell_back, Some("claude-opus-5"), &chain),
+            Some(ModelFallback {
+                from: "claude-opus-5".to_string(),
+                to: "claude-sonnet-5-5".to_string(),
+            })
+        );
+
+        // The primary never served a token: it is still the `from`.
+        let only_fallback = event(serde_json::json!({
+            "claude-opus-5-shadow": {},
+            "claude-haiku-4-5": {}
+        }));
+        assert_eq!(
+            model_fallback_used(&only_fallback, Some("claude-opus-5"), &chain)
+                .map(|fallback| (fallback.from, fallback.to)),
+            Some(("claude-opus-5".to_string(), "claude-haiku-4-5".to_string()))
+        );
+
+        let subagent = event(serde_json::json!({
+            "claude-opus-5[1m]": { "canonicalModel": "claude-opus-5" },
+            "claude-haiku-4-5-20251001": { "canonicalModel": "claude-haiku-4-5-20251001" }
+        }));
+        assert_eq!(
+            model_fallback_used(&subagent, Some("claude-opus-5"), &chain),
+            None
+        );
+
+        let single = event(serde_json::json!({
+            "claude-opus-5[1m]": { "canonicalModel": "claude-opus-5" }
+        }));
+        assert_eq!(
+            model_fallback_used(&single, Some("claude-opus-5"), &chain),
+            None
+        );
+        assert_eq!(
+            model_fallback_used(&fell_back, Some("claude-opus-5"), &[]),
+            None
+        );
+    }
+
+    /// #2762: the budget-exceeded result (`subtype: error_max_budget_usd`,
+    /// `terminal_reason: budget_exhausted`, read from Claude Code's result
+    /// schema) maps to the typed stop reason, by either field alone.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_budget_exceeded_result_is_typed_provider_budget_exceeded() {
+        for data in [
+            serde_json::json!({
+                "subtype": "error_max_budget_usd",
+                "is_error": true,
+                "terminal_reason": "budget_exhausted",
+                "total_cost_usd": 5.01,
+            }),
+            serde_json::json!({ "subtype": "error_max_budget_usd", "is_error": true }),
+            serde_json::json!({ "subtype": "error_during_execution", "terminal_reason": "budget_exhausted" }),
+        ] {
+            let meta = extract_result_metadata(
+                &StreamEvent {
+                    event_type: "result".to_string(),
+                    data,
+                },
+                None,
+            );
+            assert_eq!(
+                meta.stop_reason.as_deref(),
+                Some("provider_budget_exceeded")
+            );
+        }
+        let other = extract_result_metadata(
+            &StreamEvent {
+                event_type: "result".to_string(),
+                data: serde_json::json!({ "subtype": "error_max_turns", "is_error": true }),
+            },
+            None,
+        );
+        assert_eq!(other.stop_reason.as_deref(), Some("error_max_turns"));
     }
 
     /// Older payloads carry no `canonicalModel`; the `<model>[variant]` key

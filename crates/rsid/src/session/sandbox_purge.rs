@@ -1,17 +1,20 @@
 //! Bounded purge of archived sandboxes whose work is provably in Git.
 use super::reaper;
+use super::sandbox_purge_fence;
 use crate::error::{DaemonError, Result};
 use crate::sandbox::git_worktree::{self, DirectRefObservation};
 use crate::store::custody_lock_order::BlockingStoreLockExt;
 use crate::store::sandbox_custody;
 use crate::store::sandbox_reclaim::ArchivedSandboxPurgeCandidate;
+use crate::store::source_worktree_v120::DependencyProofWork;
 use chrono::{DateTime, Utc};
+use rsid_core::pass_cost::{Cost, LockedSection, StageCosts, ThreadMeter};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const ARCHIVED_SANDBOX_PURGE_INTERVAL: Duration = Duration::from_secs(600);
@@ -82,6 +85,103 @@ impl ArchivedSandboxPurgeReport {
     }
 }
 
+/// Cost evidence of one candidate's proof (hub #2940). Never read by a verdict.
+#[derive(Default)]
+struct CandidateTrace {
+    stages: StageCosts,
+    dependency_proofs: u64,
+    dependency_work: DependencyProofWork,
+}
+
+/// Cost evidence of one purge pass, logged once per pass and never per
+/// candidate (hub #2940). Evidence only: no purge decision reads it.
+#[derive(Default)]
+pub(super) struct PurgePassCosts {
+    stages: StageCosts,
+    /// Candidates the pass proved (listed minus fenced).
+    examined: u64,
+    /// Candidates skipped because an identical retaining proof is still inside
+    /// its backoff window.
+    fenced: u64,
+    dependency_proofs: u64,
+    dependency_work: DependencyProofWork,
+    /// Sum of the blocking threads' own cost; the meter sits in each closure,
+    /// so another lane's concurrent CPU is never counted.
+    blocking: Cost,
+    wall: Duration,
+}
+
+impl PurgePassCosts {
+    fn absorb(&mut self, trace: CandidateTrace, blocking: Cost) {
+        self.examined += 1;
+        self.stages.merge(&trace.stages);
+        self.dependency_proofs += trace.dependency_proofs;
+        self.dependency_work.add(trace.dependency_work);
+        self.blocking.add(blocking);
+    }
+
+    fn log(&self, trigger: &str, report: &ArchivedSandboxPurgeReport) {
+        if report.candidates_examined == 0 {
+            tracing::debug!(trigger, "Archived sandbox purge pass found no candidates");
+            return;
+        }
+        tracing::info!(
+            trigger,
+            dry_run = report.dry_run,
+            listed = report.candidates_examined,
+            examined = self.examined,
+            fenced = self.fenced,
+            purged_no_output = report.purged.no_output,
+            purged_integrated = report.purged.integrated,
+            purged_preserved = report.purged.preserved,
+            bytes_freed = report.bytes_freed,
+            retained = ?report.retained,
+            dependency_proofs = self.dependency_proofs,
+            dependency_enabled_jobs_validated = self.dependency_work.enabled_jobs_validated,
+            dependency_relevant_sessions_validated =
+                self.dependency_work.relevant_sessions_validated,
+            dependency_indexed_job_rows = self.dependency_work.indexed_job_rows_loaded,
+            dependency_indexed_session_rows = self.dependency_work.indexed_session_rows_loaded,
+            dependency_path_canonicalizations = self.dependency_work.path_canonicalizations,
+            wall_ms = u64::try_from(self.wall.as_millis()).unwrap_or(u64::MAX),
+            thread_cpu_ms = self.blocking.cpu_ms(),
+            read_kib = self.blocking.read_kib(),
+            stage_cpu_wall_runs = %self.stages.summary(),
+            more = report.next_cursor.is_some(),
+            "Archived sandbox purge pass finished"
+        );
+    }
+}
+
+/// Forget the fence entries of candidates that no longer exist, but only when
+/// this pass listed the whole cycle: a paged cycle must not lose the entries of
+/// its other pages.
+fn prune_fence(
+    fence: Option<&mut sandbox_purge_fence::RetainFence>,
+    whole_cycle: bool,
+    candidates: &[ArchivedSandboxPurgeCandidate],
+) {
+    let Some(fence) = fence else {
+        return;
+    };
+    if !whole_cycle {
+        return;
+    }
+    fence.retain_listed(&candidates.iter().map(|c| c.session_id).collect());
+}
+
+/// Whether the fence lets the pass skip `candidate`.
+fn fence_skips(
+    fence: Option<&sandbox_purge_fence::RetainFence>,
+    candidate: &ArchivedSandboxPurgeCandidate,
+    now: Instant,
+) -> bool {
+    let Some(fence) = fence else {
+        return false;
+    };
+    fence.decide(candidate, now) == sandbox_purge_fence::FenceDecision::Fenced
+}
+
 impl super::SessionManager {
     pub(crate) async fn run_archived_sandbox_purge(
         &self,
@@ -89,8 +189,25 @@ impl super::SessionManager {
         max_count: usize,
         after: Option<ArchivedSandboxPurgeCursor>,
     ) -> Result<ArchivedSandboxPurgeReport> {
+        self.run_archived_sandbox_purge_metered(dry_run, max_count, after, None)
+            .await
+            .map(|(report, _)| report)
+    }
+
+    /// One pass with its cost evidence. `fence` is the periodic loop's
+    /// retained-candidate fence; the operator RPC and every dry run pass none,
+    /// so they prove every listed candidate.
+    pub(super) async fn run_archived_sandbox_purge_metered(
+        &self,
+        dry_run: bool,
+        max_count: usize,
+        after: Option<ArchivedSandboxPurgeCursor>,
+        mut fence: Option<&mut sandbox_purge_fence::RetainFence>,
+    ) -> Result<(ArchivedSandboxPurgeReport, PurgePassCosts)> {
+        let pass_started = Instant::now();
+        let starts_cycle = after.is_none();
         let candidates = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(&self.store, "sandbox_purge::pass").await;
             store.archived_sandbox_purge_candidates(
                 after.map(|cursor| (cursor.updated_at, cursor.session_id)),
                 max_count,
@@ -100,6 +217,7 @@ impl super::SessionManager {
             dry_run,
             ..ArchivedSandboxPurgeReport::default()
         };
+        let mut costs = PurgePassCosts::default();
         report.candidates_examined = u64::try_from(candidates.len())
             .map_err(|_| DaemonError::Store("candidate count overflowed".into()))?;
         if candidates.len() == max_count
@@ -110,9 +228,15 @@ impl super::SessionManager {
                 session_id: last.session_id,
             });
         }
+        let whole_cycle = starts_cycle && report.next_cursor.is_none();
+        prune_fence(fence.as_deref_mut(), whole_cycle, &candidates);
         for candidate in candidates {
             if self.active.read().await.contains_key(&candidate.session_id) {
                 report.retain("active_session");
+                continue;
+            }
+            if fence_skips(fence.as_deref(), &candidate, pass_started) {
+                costs.fenced += 1;
                 continue;
             }
             let store = Arc::clone(&self.store);
@@ -127,26 +251,49 @@ impl super::SessionManager {
                 candidate.session_id,
                 &sandbox_base,
             );
-            let outcome = tokio::task::spawn_blocking(move || {
+            let (outcome, trace, blocking) = tokio::task::spawn_blocking(move || {
+                let meter = ThreadMeter::start();
+                let mut trace = CandidateTrace::default();
                 #[cfg(test)]
                 if let Some((proc_root, uid)) = test_holder_proc {
-                    return reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
+                    let outcome = reaper::with_quarantine_holder_test_proc(&proc_root, uid, || {
                         process_candidate(
                             &store,
                             &active,
                             &sandbox_base,
                             &session_candidate,
                             dry_run,
+                            &mut trace,
                         )
                     });
+                    return (outcome, trace, meter.finish());
                 }
-                process_candidate(&store, &active, &sandbox_base, &session_candidate, dry_run)
+                let outcome = process_candidate(
+                    &store,
+                    &active,
+                    &sandbox_base,
+                    &session_candidate,
+                    dry_run,
+                    &mut trace,
+                );
+                (outcome, trace, meter.finish())
             })
             .await
             .map_err(|_| DaemonError::Process("archived sandbox purge worker panicked".into()))?;
+            costs.absorb(trace, blocking);
             match outcome {
-                Ok(CandidateOutcome::Purged(kind, bytes)) => report.purged(kind, bytes),
-                Ok(CandidateOutcome::Retained(code)) => report.retain(code),
+                Ok(CandidateOutcome::Purged(kind, bytes)) => {
+                    report.purged(kind, bytes);
+                    if let Some(fence) = fence.as_deref_mut() {
+                        fence.forget(candidate.session_id);
+                    }
+                }
+                Ok(CandidateOutcome::Retained(code)) => {
+                    report.retain(code);
+                    if let Some(fence) = fence.as_deref_mut() {
+                        fence.record_retained(&candidate, code, pass_started);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         session_id = %candidate.session_id,
@@ -154,16 +301,21 @@ impl super::SessionManager {
                         "Archived sandbox purge retained a candidate whose proof failed"
                     );
                     report.retain("proof_failed");
+                    if let Some(fence) = fence.as_deref_mut() {
+                        fence.record_retained(&candidate, "proof_failed", pass_started);
+                    }
                 }
             }
         }
-        Ok(report)
+        costs.wall = pass_started.elapsed();
+        Ok((report, costs))
     }
 
     pub async fn run_archived_sandbox_purge_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(ARCHIVED_SANDBOX_PURGE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut cursor = None;
+        let mut fence = sandbox_purge_fence::RetainFence::default();
         loop {
             interval.tick().await;
             if !self
@@ -171,17 +323,21 @@ impl super::SessionManager {
                 .archived_sandbox_purge_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
+                // Switching the purge back on proves every candidate afresh.
+                fence.clear();
                 continue;
             }
             match self
-                .run_archived_sandbox_purge(
+                .run_archived_sandbox_purge_metered(
                     false,
                     ARCHIVED_SANDBOX_PURGE_MAX_PER_PASS,
                     cursor.clone(),
+                    Some(&mut fence),
                 )
                 .await
             {
-                Ok(report) => {
+                Ok((report, costs)) => {
+                    costs.log("periodic", &report);
                     cursor.clone_from(&report.next_cursor);
                 }
                 Err(error) => {
@@ -204,16 +360,26 @@ fn process_candidate(
     sandbox_base: &Path,
     candidate: &ArchivedSandboxPurgeCandidate,
     dry_run: bool,
+    trace: &mut CandidateTrace,
 ) -> Result<CandidateOutcome> {
     if active.blocking_read().contains_key(&candidate.session_id) {
         return Ok(CandidateOutcome::Retained("active_session"));
     }
-    reaper::prove_archive_cleanup_has_no_provider_processes(&[candidate.session_id])?;
+    trace.stages.stage("provider_processes", || {
+        reaper::prove_archive_cleanup_has_no_provider_processes(&[candidate.session_id])
+    })?;
     let root = PathBuf::from(&candidate.sandbox_root);
     let origin = PathBuf::from(&candidate.canonical_repo_dir);
     let source_ref = format!("refs/heads/{}", candidate.sandbox_branch);
-    let root_exists = root.exists();
-    prove_exact_allocation_path(sandbox_base, &root, candidate, root_exists)?;
+    // `Path::exists` reports every probe failure as absent. Only ENOENT on the
+    // exact path proves absence; any other failure (an unreadable sandbox base,
+    // for one) means the root may exist, so the candidate is retained with its
+    // full protections instead of taking the absent-root path (#1086 review).
+    let root_exists = trace.stages.stage("allocation_path", || {
+        let root_exists = probe_root_exists(&root)?;
+        prove_exact_allocation_path(sandbox_base, &root, candidate, root_exists)?;
+        Ok::<bool, DaemonError>(root_exists)
+    })?;
     let _root_guard = sandbox_custody::lock_custody_root(candidate.custody_id);
     // The slow, read-only proofs (worktree observation, quarantine tree proof,
     // and the /proc-wide holder scan) run before the repository mutation lock:
@@ -222,80 +388,114 @@ fn process_candidate(
     // The locked sections below only do cheap Git reads and re-validate that
     // the proved tree is unchanged before removal.
     let unlocked_proof = if root_exists {
-        let observation = git_worktree::observe_worktree_ignoring_ignored_locked(&origin, &root)?;
+        let observation = trace.stages.stage("worktree_status", || {
+            git_worktree::observe_worktree_ignoring_ignored_locked(&origin, &root)
+        })?;
         if !observation.clean {
             return Ok(CandidateOutcome::Retained("worktree_dirty"));
         }
-        let tree = git_worktree::prove_quarantine_tree_safe(&root)?;
+        let tree = trace.stages.stage("tree_proof", || {
+            git_worktree::prove_quarantine_tree_safe(&root)
+        })?;
         #[cfg(test)]
         proof_test_hook::run(&root, proof_test_hook::Stage::BeforeHolderProof);
-        reaper::prove_quarantine_has_no_untrusted_same_uid_holders(&tree)?;
+        trace.stages.stage("holder_proof", || {
+            reaper::prove_quarantine_has_no_untrusted_same_uid_holders(&tree)
+        })?;
         #[cfg(test)]
         proof_test_hook::run(&root, proof_test_hook::Stage::AfterProofs);
         Some(tree)
     } else {
         None
     };
-    let tip = git_worktree::with_repository_mutation(&origin, || {
-        if root_exists {
-            let tip = branch_tip(&origin, &source_ref)?;
-            git_worktree::prove_registered_worktree_exact_ignoring_ignored_locked(
-                &origin,
-                &root,
-                &source_ref,
-                &tip,
-            )?;
-            Ok(tip)
-        } else {
-            if std::fs::symlink_metadata(&root).is_ok()
-                || !git_worktree::prove_worktree_unregistered_locked(&origin, &root)?
-            {
-                return Err(DaemonError::Process(
-                    "absent archived sandbox recovery has root or registration residue".into(),
-                ));
-            }
-            match git_worktree::observe_direct_ref_locked(&origin, &source_ref)? {
-                DirectRefObservation::Commit(tip) => Ok(tip),
-                DirectRefObservation::Missing if candidate.source_commit.len() == 40 => {
-                    Ok(candidate.source_commit.clone())
+    let tip = trace.stages.stage("repository_proof", || {
+        git_worktree::with_repository_mutation(&origin, || {
+            if root_exists {
+                let tip = branch_tip(&origin, &source_ref)?;
+                git_worktree::prove_registered_worktree_exact_ignoring_ignored_locked(
+                    &origin,
+                    &root,
+                    &source_ref,
+                    &tip,
+                )?;
+                Ok(tip)
+            } else {
+                // The same positive rule under the repository lock: only ENOENT.
+                if !matches!(
+                    std::fs::symlink_metadata(&root),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                ) || !git_worktree::prove_worktree_unregistered_locked(&origin, &root)?
+                {
+                    return Err(DaemonError::Process(
+                        "absent archived sandbox recovery has root or registration residue".into(),
+                    ));
                 }
-                _ => Err(DaemonError::Process(
-                    "absent archived sandbox has no provable branch tip".into(),
-                )),
+                match git_worktree::observe_direct_ref_locked(&origin, &source_ref)? {
+                    DirectRefObservation::Commit(tip) => Ok(tip),
+                    DirectRefObservation::Missing if candidate.source_commit.len() == 40 => {
+                        Ok(candidate.source_commit.clone())
+                    }
+                    _ => Err(DaemonError::Process(
+                        "absent archived sandbox has no provable branch tip".into(),
+                    )),
+                }
             }
-        }
+        })
     })?;
-    {
+    // Meter endpoints (thread CPU clock, /proc reads) are taken before the Store
+    // lock is requested and after the guard is dropped, never under it (#2973).
+    let mut locked = LockedSection::start();
+    let locked_outcome = (|| -> Result<Option<CandidateOutcome>> {
         let store = store.blocking_lock_checked()?;
-        let dependencies = if root_exists {
-            store
-                .source_worktree_targeted_dependencies(candidate.custody_id, candidate.generation)?
-        } else {
-            store.source_worktree_targeted_dependencies_for_absent_root(
-                candidate.custody_id,
-                candidate.generation,
-            )?
-        };
+        locked.acquired();
+        trace.dependency_proofs += 1;
+        let (dependencies, work) = locked.work(|| {
+            if root_exists {
+                store.source_worktree_targeted_dependencies_with_work(
+                    candidate.custody_id,
+                    candidate.generation,
+                )
+            } else {
+                store.source_worktree_targeted_dependencies_for_absent_root_with_work(
+                    candidate.custody_id,
+                    candidate.generation,
+                )
+            }
+        })?;
+        trace.dependency_work.add(work);
         if !dependencies.complete {
-            return Ok(CandidateOutcome::Retained(
+            return Ok(Some(CandidateOutcome::Retained(
                 dependencies.reason.unwrap_or("dependency_incomplete"),
-            ));
+            )));
         }
         if dependencies.scheduled_dependency_count != 0
             || dependencies.session_path_dependency_count != 0
         {
-            return Ok(CandidateOutcome::Retained("external_dependency"));
+            return Ok(Some(CandidateOutcome::Retained("external_dependency")));
         }
         if !store.archived_sandbox_purge_candidate_is_current(candidate)? {
-            return Ok(CandidateOutcome::Retained("candidate_changed"));
+            return Ok(Some(CandidateOutcome::Retained("candidate_changed")));
         }
-        if store
-            .session_has_pending_consumer(&candidate.session_id.to_string(), candidate.custody_id)?
-        {
-            return Ok(CandidateOutcome::Retained("pending_consumer"));
+        let session_id = candidate.session_id.to_string();
+        let pending_consumer = if root_exists {
+            store.session_has_pending_consumer(&session_id, candidate.custody_id)?
+        } else {
+            // The root and its registration are proven absent above (#1086).
+            store.session_has_pending_consumer_for_absent_root(&session_id, candidate.custody_id)?
+        };
+        if pending_consumer {
+            return Ok(Some(CandidateOutcome::Retained("pending_consumer")));
         }
+        Ok(None)
+    })();
+    locked.finish(&mut trace.stages, "store_lock", "dependency_proof");
+    if let Some(outcome) = locked_outcome? {
+        return Ok(outcome);
     }
-    let Some(kind) = classify_tip(&origin, candidate, &tip)? else {
+    let classified = trace
+        .stages
+        .stage("classify", || classify_tip(&origin, candidate, &tip))?;
+    let Some(kind) = classified else {
         return Ok(CandidateOutcome::Retained("unlanded_recent"));
     };
     if dry_run {
@@ -315,50 +515,59 @@ fn process_candidate(
             }
         }
     }
-    let root_bytes = purge_bytes(root_exists, &root)?;
-    let removal = git_worktree::with_repository_mutation(&origin, || {
-        if let Some(tree) = &unlocked_proof {
-            // The holder proof above ran outside the lock and is stale by now:
-            // a task that took a cwd or fd inside the tree since is missed by
-            // a digest check. Re-prove, with its own short wall-clock budget
-            // so the locked section stays bounded; a holder or a timeout
-            // retains the candidate.
-            reaper::reprove_quarantine_has_no_untrusted_same_uid_holders_within(
-                &origin,
-                tree,
-                reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET,
-            )?;
-            #[cfg(test)]
-            proof_test_hook::run(&root, proof_test_hook::Stage::AfterLockedHolderReproof);
-            // The tree, digest and nlink proof is taken last, after the holder
-            // re-proof and immediately before removal (#1250). That re-proof
-            // can take seconds, and link(2) leaves no fd or cwd in the tree,
-            // so an outside alias made meanwhile is visible only here: the
-            // full walk counts every name of each multiply-linked inode
-            // against its nlink. Any change since the unlocked proof retains
-            // the sandbox. This narrows, but does not close, the window: a
-            // link made between this walk and Git's unlinks is not fenced.
-            match git_worktree::quarantine_tree_matches(tree) {
-                Ok(true) => {}
-                Ok(false) => return Ok(PurgeRemoval::Retained("worktree_changed")),
-                Err(error) => {
-                    tracing::warn!(
-                        session_id = %candidate.session_id,
-                        error = %error,
-                        "Archived sandbox purge retained a tree that became unsafe \
-                         during the locked holder re-proof"
-                    );
-                    return Ok(PurgeRemoval::Retained("tree_unsafe_before_removal"));
+    let root_bytes = trace
+        .stages
+        .stage("purge_bytes", || purge_bytes(root_exists, &root))?;
+    let removal = trace.stages.stage("removal", || {
+        git_worktree::with_repository_mutation(&origin, || {
+            if let Some(tree) = &unlocked_proof {
+                // The holder proof above ran outside the lock and is stale by now:
+                // a task that took a cwd or fd inside the tree since is missed by
+                // a digest check. Re-prove, with its own short wall-clock budget
+                // so the locked section stays bounded; a holder or a timeout
+                // retains the candidate.
+                reaper::reprove_quarantine_has_no_untrusted_same_uid_holders_within(
+                    &origin,
+                    tree,
+                    reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET,
+                )?;
+                #[cfg(test)]
+                proof_test_hook::run(&root, proof_test_hook::Stage::AfterLockedHolderReproof);
+                // The tree, digest and nlink proof is taken last, after the holder
+                // re-proof and immediately before removal (#1250). That re-proof
+                // can take seconds, and link(2) leaves no fd or cwd in the tree,
+                // so an outside alias made meanwhile is visible only here: the
+                // full walk counts every name of each multiply-linked inode
+                // against its nlink. Any change since the unlocked proof retains
+                // the sandbox. This narrows, but does not close, the window: a
+                // link made between this walk and Git's unlinks is not fenced.
+                match git_worktree::quarantine_tree_matches(tree) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(PurgeRemoval::Retained("worktree_changed")),
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %candidate.session_id,
+                            error = %error,
+                            "Archived sandbox purge retained a tree that became unsafe \
+                             during the locked holder re-proof"
+                        );
+                        return Ok(PurgeRemoval::Retained("tree_unsafe_before_removal"));
+                    }
                 }
+                git_worktree::remove_live_worktree_non_force_locked(
+                    &origin,
+                    &root,
+                    &source_ref,
+                    &tip,
+                )?;
             }
-            git_worktree::remove_live_worktree_non_force_locked(&origin, &root, &source_ref, &tip)?;
-        }
-        if git_worktree::observe_direct_ref_locked(&origin, &source_ref)?
-            == DirectRefObservation::Commit(tip.clone())
-        {
-            git_worktree::delete_ref_compare_locked(&origin, &source_ref, &tip)?;
-        }
-        Ok::<PurgeRemoval, DaemonError>(PurgeRemoval::Removed)
+            if git_worktree::observe_direct_ref_locked(&origin, &source_ref)?
+                == DirectRefObservation::Commit(tip.clone())
+            {
+                git_worktree::delete_ref_compare_locked(&origin, &source_ref, &tip)?;
+            }
+            Ok::<PurgeRemoval, DaemonError>(PurgeRemoval::Removed)
+        })
     })?;
     if let PurgeRemoval::Retained(code) = removal {
         return Ok(CandidateOutcome::Retained(code));
@@ -376,6 +585,19 @@ fn branch_tip(origin: &Path, source_ref: &str) -> Result<String> {
         _ => Err(DaemonError::Process(
             "archived sandbox branch is not an exact commit ref".into(),
         )),
+    }
+}
+
+/// Whether the sandbox root entry exists, observed without following a final
+/// symlink. `Ok(false)` is returned only for `NotFound`; every other failure is
+/// an error so the candidate is retained rather than treated as absent.
+fn probe_root_exists(root: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DaemonError::Process(format!(
+            "sandbox root could not be probed: {error}"
+        ))),
     }
 }
 
@@ -397,7 +619,10 @@ fn prove_exact_allocation_path(
     if observed_root.parent() != Some(canonical_base.as_path())
         || observed_root.file_name().and_then(|value| value.to_str())
             != Some(allocation_name.as_str())
-        || std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        || match std::fs::symlink_metadata(root) {
+            Ok(metadata) => metadata.file_type().is_symlink(),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     {
         return Err(DaemonError::Process(
             "sandbox root is not the exact private allocation path".into(),
@@ -443,8 +668,10 @@ fn preserve_tip(
 ) -> Result<PreservationResult> {
     let reference = format!("refs/rsi/abandoned/{}", candidate.session_id);
     let push_refspec = format!("{tip}:{reference}");
-    let push = run_preservation_git(origin, &["push", "origin", &push_refspec])?;
-    if push.status.success() {
+    // A push that overran its deadline was killed: read back what the remote
+    // holds, exactly as for a push that exited non-zero.
+    let push = run_preservation_git(origin, &["push", "origin", &push_refspec]);
+    if push.is_ok_and(|output| output.status.success()) {
         return read_back_preserved_tip(origin, tip, &reference);
     }
     match read_back_preserved_tip(origin, tip, &reference)? {
@@ -453,20 +680,29 @@ fn preserve_tip(
     }
 }
 
+/// Wall deadline of one preservation `push` or `ls-remote`.
+const PRESERVATION_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One networked preservation Git call, bounded by the store's portable
+/// process-group runner. It used to wrap Git in GNU `timeout`, which macOS
+/// does not ship, so every unlanded archived sandbox there (a worker whose
+/// commits are only on a `mac-mini/*` branch, hub #3026) failed its
+/// preservation and was retained `proof_failed` forever (hub #3055 part 2).
 fn run_preservation_git(origin: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("timeout")
+    let mut command = Command::new("git");
+    command
         .current_dir(origin)
-        .arg("--kill-after=5")
-        .arg("120")
-        .arg("git")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env(
             "GIT_SSH_COMMAND",
             "ssh -o BatchMode=yes -o ConnectTimeout=15",
         )
-        .args(args)
-        .output()
-        .map_err(|error| DaemonError::Process(format!("Git preservation command failed: {error}")))
+        .args(args);
+    git_worktree::capture_command_bounded_for(
+        command,
+        "preserve archived sandbox tip",
+        PRESERVATION_GIT_TIMEOUT,
+    )
 }
 
 fn observed_reference_tip(output: &std::process::Output) -> Option<String> {
@@ -641,7 +877,7 @@ mod tests {
             session.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
             session.updated_at = Utc::now();
             let database = temp.path().join("purge.db");
-            let mut store = crate::store::Store::open(&database).expect("open store");
+            let mut store = crate::store::Store::open_test_fixture(&database).expect("open store");
             store
                 .insert_session_with_custody(
                     &session,
@@ -678,7 +914,7 @@ mod tests {
                 .store(0, std::sync::atomic::Ordering::Relaxed);
             super::super::SessionManager::new(
                 Arc::new(EventBus::new(1024)),
-                crate::store::Store::open(&self.database).expect("reopen store"),
+                crate::store::Store::open_test_fixture(&self.database).expect("reopen store"),
                 false,
                 self._temp
                     .path()
@@ -850,6 +1086,114 @@ mod tests {
         assert_eq!(fixture.session_row().0, "Purged");
     }
 
+    /// One metered pass over the fixture's candidate with `fence`.
+    async fn fenced_pass(
+        fixture: &PurgeFixture,
+        fence: &mut sandbox_purge_fence::RetainFence,
+    ) -> (ArchivedSandboxPurgeReport, PurgePassCosts) {
+        let manager = fixture.manager();
+        let _holder = manager.install_archive_cleanup_test_holder_proc(fixture.session_id);
+        manager
+            .run_archived_sandbox_purge_metered(false, 32, None, Some(fence))
+            .await
+            .expect("metered purge pass")
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn unchanged_retained_candidate_is_fenced_and_a_changed_one_is_proved_again() {
+        let fixture = PurgeFixture::new();
+        fixture.commit_unique_output();
+        let mut fence = sandbox_purge_fence::RetainFence::default();
+
+        let (first, costs) = fenced_pass(&fixture, &mut fence).await;
+        assert_eq!(first.retained.get("unlanded_recent"), Some(&1));
+        assert_eq!(
+            (costs.examined, costs.fenced, costs.dependency_proofs),
+            (1, 0, 1),
+            "the first pass proves the candidate in full, dependency scan included"
+        );
+        assert!(
+            costs
+                .stages
+                .get("dependency_proof")
+                .is_some_and(|stage| stage.runs == 1),
+            "the dependency stage is metered: {}",
+            costs.stages.summary()
+        );
+
+        let (second, costs) = fenced_pass(&fixture, &mut fence).await;
+        assert!(
+            second.retained.is_empty(),
+            "a fenced candidate is not re-proved"
+        );
+        assert_eq!(
+            (costs.examined, costs.fenced, costs.dependency_proofs),
+            (0, 1, 0),
+            "the unchanged retained candidate does no proof work"
+        );
+        assert_eq!(costs.dependency_work, DependencyProofWork::default());
+        assert!(
+            fixture.root.exists(),
+            "a fenced candidate keeps its sandbox"
+        );
+
+        fixture.set_session_updated_at(fixture.session_id, 1);
+        let (third, costs) = fenced_pass(&fixture, &mut fence).await;
+        assert_eq!(third.retained.get("unlanded_recent"), Some(&1));
+        assert_eq!(
+            (costs.examined, costs.fenced, costs.dependency_proofs),
+            (1, 0, 1),
+            "a changed candidate row is proved at once"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn expired_fence_window_reproves_and_a_purge_ignores_the_fence() {
+        let fixture = PurgeFixture::new();
+        fixture.commit_unique_output();
+        let mut expired =
+            sandbox_purge_fence::RetainFence::with_windows(Duration::ZERO, Duration::ZERO);
+        for _ in 0..2 {
+            let (report, costs) = fenced_pass(&fixture, &mut expired).await;
+            assert_eq!(report.retained.get("unlanded_recent"), Some(&1));
+            assert_eq!((costs.examined, costs.fenced), (1, 0));
+        }
+
+        // A candidate whose row changes (its Session ages past the unlanded
+        // retention window) is proved in full, purged, and forgotten by the
+        // fence, which is never consulted to finish a proof.
+        let mut fence = sandbox_purge_fence::RetainFence::default();
+        let (retained, _) = fenced_pass(&fixture, &mut fence).await;
+        assert_eq!(retained.retained.get("unlanded_recent"), Some(&1));
+        fixture.age_session(48);
+        let (purged, costs) = fenced_pass(&fixture, &mut fence).await;
+        assert_eq!(purged.purged.preserved, 1);
+        assert_eq!((costs.examined, costs.fenced), (1, 0));
+        assert!(!fixture.root.exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn operator_runs_without_a_fence_prove_every_candidate_every_time() {
+        let fixture = PurgeFixture::new();
+        fixture.commit_unique_output();
+        for _ in 0..2 {
+            let manager = fixture.manager();
+            let _holder = manager.install_archive_cleanup_test_holder_proc(fixture.session_id);
+            let (report, costs) = manager
+                .run_archived_sandbox_purge_metered(false, 32, None, None)
+                .await
+                .expect("unfenced pass");
+            assert_eq!(report.retained.get("unlanded_recent"), Some(&1));
+            assert_eq!(
+                (costs.examined, costs.fenced, costs.dependency_proofs),
+                (1, 0, 1)
+            );
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn recent_unlanded_sandbox_is_retained_without_git_effects() {
@@ -875,6 +1219,27 @@ mod tests {
         assert!(observed.starts_with(&tip));
         assert!(!fixture.root.exists());
         assert_eq!(fixture.session_row().0, "Purged");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn preservation_git_runner_is_portable_and_deadline_bounded() {
+        // Hub #3055 part 2: the runner needs no GNU `timeout` (absent on
+        // macOS), runs Git, and kills a command that overruns its deadline.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = run_preservation_git(dir.path(), &["--version"]).expect("git runs");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("git version"));
+        let mut slow = Command::new("sleep");
+        slow.arg("30");
+        let started = Instant::now();
+        let overrun = git_worktree::capture_command_bounded_for(
+            slow,
+            "deadline probe",
+            Duration::from_millis(300),
+        );
+        assert!(overrun.is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -1368,6 +1733,169 @@ mod tests {
         assert_eq!(report.retained.get("session_projection_unhealthy"), None);
         assert_eq!(report.purged.no_output + report.purged.integrated, 1);
         assert_eq!(fixture.session_row().0, "Purged");
+    }
+
+    /// An unarchived manager work fact that names the candidate's Session in
+    /// its payload, inserted without the manager scope and policy rows that
+    /// the foreign keys and CHECK constraints would otherwise require.
+    fn insert_unarchived_work_fact(fixture: &PurgeFixture) {
+        let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let payload = format!(r#"{{"source_session_id":"{}"}}"#, fixture.session_id);
+        let store = fixture.store.lock().expect("lock store");
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")
+            .expect("relax constraints");
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_v2_work_facts
+                   (project_id,kind,record_key,epic_id,work_key,row_version,payload_json,archived,
+                    manager_session_id,scope_version,policy_version,created_at,updated_at)
+                 VALUES(?1,'work','historical-delivery',?2,'historical-delivery',1,?3,0,?4,1,1,?5,?5)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    payload,
+                    Uuid::new_v4().to_string(),
+                    stamp
+                ],
+            )
+            .expect("insert unarchived work fact");
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints=OFF; PRAGMA foreign_keys=ON;")
+            .expect("restore constraints");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn unarchived_work_fact_does_not_block_absent_root_purge() {
+        // Issue #1086 acceptance 3: a manager ledger reference to a long
+        // archived Session pinned every externally removed sandbox on the hub.
+        // With the root and its registration gone there is nothing on disk to
+        // preserve, so the reference no longer retains the candidate.
+        let fixture = PurgeFixture::new();
+        git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "remove",
+                fixture.root.display().to_string().as_str(),
+            ],
+        );
+        insert_unarchived_work_fact(&fixture);
+        let report = fixture.run(false).await;
+        assert_eq!(report.retained.get("pending_consumer"), None);
+        assert_eq!(report.purged.no_output + report.purged.integrated, 1);
+        assert_eq!(fixture.session_row().0, "Purged");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn unarchived_work_fact_still_retains_a_present_root() {
+        let fixture = PurgeFixture::new();
+        std::fs::write(fixture.root.join("tracked"), "integrated\n").expect("write output");
+        git(&fixture.root, &["add", "tracked"]);
+        git(&fixture.root, &["commit", "-qm", "integrated output"]);
+        git(
+            &fixture.repository,
+            &[
+                "merge",
+                "--ff-only",
+                fixture.source_ref.trim_start_matches("refs/heads/"),
+            ],
+        );
+        git(&fixture.repository, &["push", "-q", "origin", "rolling"]);
+        insert_unarchived_work_fact(&fixture);
+        let report = fixture.run(false).await;
+        assert_eq!(report.retained["pending_consumer"], 1);
+        assert_eq!(report.purged.integrated, 0);
+        assert!(fixture.root.join("tracked").exists());
+        assert_eq!(fixture.session_row().0, "Live");
+    }
+
+    /// Removes every access bit from a directory and restores its mode on drop,
+    /// so the fixture's temporary directory can still be cleaned up.
+    #[cfg(unix)]
+    struct DeniedDirectory {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl DeniedDirectory {
+        fn new(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                .expect("remove directory access");
+            Self {
+                path: path.to_path_buf(),
+                mode,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DeniedDirectory {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn unreadable_existing_root_is_not_treated_as_absent() {
+        // Review #2181 / Issue #2184: `Path::exists` is false for a root that
+        // cannot be probed, which sent an existing, unregistered directory
+        // (uncommitted work inside) down the absent-root path, where an
+        // unarchived work fact no longer retains it. Only ENOENT proves
+        // absence: any other probe failure keeps the full protections.
+        let fixture = PurgeFixture::new();
+        git(
+            &fixture.repository,
+            &[
+                "worktree",
+                "remove",
+                fixture.root.display().to_string().as_str(),
+            ],
+        );
+        std::fs::create_dir(&fixture.root).expect("recreate the unregistered root");
+        std::fs::write(fixture.root.join("scratch"), "uncommitted work\n").expect("write work");
+        insert_unarchived_work_fact(&fixture);
+        let manager = fixture.manager();
+        let _holder = manager.install_archive_cleanup_test_holder_proc(fixture.session_id);
+        let denied = DeniedDirectory::new(&fixture.sandbox_base);
+        if std::fs::symlink_metadata(&fixture.root).is_ok() {
+            // Privileged runs ignore permission bits, so the unreadable-root
+            // condition cannot be produced here.
+            return;
+        }
+        let report = manager
+            .run_archived_sandbox_purge(false, 32, None)
+            .await
+            .expect("purge pass");
+        drop(denied);
+        assert_eq!(report.retained["proof_failed"], 1, "{report:?}");
+        assert_eq!(
+            report.purged.no_output + report.purged.integrated + report.purged.preserved,
+            0,
+            "{report:?}"
+        );
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
+        assert!(fixture.root.join("scratch").exists());
     }
 
     /// Archived Session with a verified ordinary projection whose working

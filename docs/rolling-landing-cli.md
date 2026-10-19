@@ -4,20 +4,19 @@
 branch. It requires one or more accepted source/base pairs and always runs the
 repository's `scripts/rolling-landing-guard.py` on the prepared candidate.
 
-```sh
-rsi-rolling-land --repo /path/to/rsi --remote origin \
-  --accepted <base-commit-id>:<source-commit-id> \
-  --test-filter rsid=integration::
-```
+Agents never run this lander directly. Managers enqueue accepted SHAs with
+`AgentEnqueueLandingSource {derive_filters:true}`; the queue derives the filters,
+gates and publishes. For `queue_disabled`, keep the commit pushed and report
+with `AgentReportUp`, or send the result with `AgentReportToHub` on a satellite.
+The operator enables the queue or lands with `rsi land` or
+`EnqueueRollingQueueSource`. See [Landing](agents/landing-and-gates.md#landing).
 
-Repeat `--accepted BASE:SOURCE` for additional accepted commits. The command
-accepts repeatable `--test-filter PACKAGE=FILTER` arguments and forwards each
-one to the guard. Use these for an explicit focused test gate when a crate's
-full suite has known baseline failures. The guard rejects a filter whose
-package is not affected by the candidate.
+The remaining details describe the queue's internal lander and its gate logs.
+The queue supplies `--accepted BASE:SOURCE` for each accepted commit and
+repeatable `--test-filter PACKAGE=FILTER` arguments for the guard. The guard
+rejects a filter whose package is not affected by the candidate.
 
-Use `cargo run -p rsi-codegraph --bin rsi-test-impact -- --repo REPO --base BASE --head HEAD`
-to choose focused filters. The command prints `--test-filter` arguments, the
+Filter derivation uses `rsi-test-impact`, which prints `--test-filter` arguments, the
 equivalent Cargo commands, and JSON reasons. It uses a fresh rsi-codegraph
 snapshot when `--graph PATH --workspace-id UUID` is supplied; otherwise it
 uses module-path mapping. Build inputs, macros, shared test support, rsid
@@ -69,7 +68,16 @@ shard script's test profile (`CARGO_PROFILE_TEST_DEBUG=0`) and keeps its
 artifacts (`RSI_LANDER_KEEP_RSID_ARTIFACTS=1`), so the prebuild is reused. A
 filter that provably selects no test is refused before any build (#1243).
 Compile checks build into their own target and run beside the test prebuild.
-`gate_timing=` reports `base_skipped`, `checks_secs`, `candidate_secs` and
+Release-build check (#1970): test builds enable `test-seam` through the
+dev-dependency self edges, so a `cfg` mistake only a release or deploy build
+sees would pass every test gate. After the dev-profile checks, in the same
+target, the gate runs a non-test `cargo check -p <crate>` (library and shipped
+bins, no dev-dependencies) for every changed crate, plus `rsid` whenever a change
+reaches it (the shipped `rsid` and `rsi-rolling-land` binaries). A failure
+refuses with `release_build_failed:<crate>` (a red gate, bisectable). It is the
+same for the queue and a direct landing.
+`gate_timing=` reports `base_skipped`, `checks_secs`, `release_check_secs` (the
+release-build checks, a subset of `checks_secs`), `candidate_secs` and
 `base_secs`.
 
 The CLI re-reads the remote again after guard work and before preparation. An

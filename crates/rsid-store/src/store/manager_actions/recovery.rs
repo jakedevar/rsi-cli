@@ -9,7 +9,36 @@
 use super::*;
 use rsi_common::harness_manager::{HarnessManagerConfigV1, HarnessManagerScopeModeV1};
 
+/// The receipt outcome `safe_action_error` falls back to for an unmapped
+/// pre-effect failure (`session/manager_actions.rs`).
+const BLOCKED_LIFECYCLE_UNCONFIRMED: &str = "manager_v2_lifecycle_unconfirmed";
+
 impl Store {
+    /// #1716: a `create_session` that ended `blocked` with the catch-all
+    /// `manager_v2_lifecycle_unconfirmed` and whose reserved target session
+    /// never came to exist (no row, no provider effect started). Nothing was
+    /// launched, so settling it `failed` is exact and a relaunch is safe; no
+    /// verb could close it before, because only `uncertain` rows settle.
+    pub(super) fn manager_blocked_create_settleable(
+        &self,
+        op: &ManagerActionOperationV2,
+    ) -> Result<bool> {
+        if op.receipt.state != ManagerActionStateV2::Blocked
+            || op.receipt.outcome.as_deref() != Some(BLOCKED_LIFECYCLE_UNCONFIRMED)
+            || op.effect_started
+            || !matches!(
+                op.context.request.operation,
+                ManagerActionV2::CreateSession { .. }
+            )
+        {
+            return Ok(false);
+        }
+        let Some(target) = op.receipt.target_session_id else {
+            return Ok(false);
+        };
+        Ok(self.get_session(target)?.is_none())
+    }
+
     /// Scope, capability and version checks for `settle_uncertain_action`.
     /// The settled operation must belong to the caller's project and its
     /// Epic/container must still be in the current manager scope.
@@ -28,7 +57,9 @@ impl Store {
         }
         self.manager_settle_scope(authority, &op, 0)?;
         if check_version {
-            if op.receipt.state != ManagerActionStateV2::Uncertain {
+            if op.receipt.state != ManagerActionStateV2::Uncertain
+                && !self.manager_blocked_create_settleable(&op)?
+            {
                 return Err(refused("manager_v2_action_not_uncertain"));
             }
             if op.receipt.row_version != expected_row_version {
@@ -287,8 +318,16 @@ impl Store {
         let op = self
             .manager_action_operation(operation_id)?
             .ok_or_else(|| refused("manager_v2_action_unavailable"))?;
-        if op.receipt.state != ManagerActionStateV2::Uncertain {
-            return Err(refused("manager_v2_action_not_uncertain"));
+        let from_state = op.receipt.state;
+        if from_state != ManagerActionStateV2::Uncertain {
+            // #1716: only a blocked create with no session settles, and only
+            // to `failed`: nothing was launched, so nothing succeeded.
+            if !self.manager_blocked_create_settleable(&op)? {
+                return Err(refused("manager_v2_action_not_uncertain"));
+            }
+            if state != ManagerActionStateV2::Failed {
+                return Err(refused("manager_v2_invalid_result"));
+            }
         }
         if op.receipt.row_version != expected_row_version {
             return Err(refused("manager_v2_action_changed"));
@@ -302,7 +341,7 @@ impl Store {
         receipt.refresh_action_metadata(&op.context.request.operation);
         let changed = self.conn.execute(
             "UPDATE harness_manager_v2_operations SET state=?2,row_version=?3,outcome_json=?4,updated_at=?5
-             WHERE id=?1 AND kind=?6 AND state='uncertain' AND row_version=?7",
+             WHERE id=?1 AND kind=?6 AND state=?8 AND row_version=?7",
             params![
                 operation_id.to_string(),
                 state_name(state),
@@ -310,7 +349,8 @@ impl Store {
                 serde_json::to_string(&receipt)?,
                 now(),
                 ACTION_KIND,
-                expected_row_version
+                expected_row_version,
+                state_name(from_state)
             ],
         )?;
         if changed != 1 {
@@ -405,8 +445,13 @@ impl Store {
         )?;
         // `MAX(sequence)` is 0 both for "no events" and "one event at
         // sequence 0"; the count tells them apart (design test 10).
+        //
+        // #2384: the count is the LOGICAL count (live rows plus the rows archived
+        // for a cold lead), the same expression `manager_lead_program_outcome_
+        // superseded` reads, so the witness stays true across a move and a
+        // restore and turns false only on a real new event.
         let event_count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM conversation_events WHERE session_id=?1",
+            crate::store::cold_archive::LOGICAL_EVENT_COUNT_SQL,
             [lead.to_string()],
             |r| r.get(0),
         )?;
@@ -473,7 +518,7 @@ impl Store {
                        (SELECT COALESCE(MAX(sequence),0) FROM conversation_events WHERE session_id=?1)
                    AND (json_extract(r.payload_json,'$.event_count') IS NULL
                         OR json_extract(r.payload_json,'$.event_count')=
-                           (SELECT count(*) FROM conversation_events WHERE session_id=?1)))
+                           ((SELECT COUNT(*) FROM conversation_events WHERE session_id = ?1) + COALESCE((SELECT archived_event_count FROM cold_archive_sessions WHERE session_id = ?1 AND state = 'cold'), 0))))
                AND NOT EXISTS(SELECT 1 FROM scheduled_jobs WHERE id=?3 AND enabled=1)",
             params![
                 target.to_string(),

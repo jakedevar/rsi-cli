@@ -15,10 +15,12 @@ fi
 if command -v rsi-rpc >/dev/null 2>&1; then
     exec rsi-rpc spill "$@"
 fi
-# Resolve symlinks: install-release.sh links this script into ~/.local/bin.
+# Resolve symlinks: install-release.sh links a stable copy under ~/.rsi/bin
+# into ~/.local/bin (hub #2958), so the checkout-relative candidates below only
+# apply when this script runs from a checkout.
 self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
 here=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
-for candidate in "$here/../target/debug/rsi-rpc" "$HOME/.cargo/shared-target/debug/rsi-rpc" "$HOME/.local/bin/rsi-rpc"; do
+for candidate in "$here/../target/debug/rsi-rpc" "$HOME/.cargo/shared-target/debug/rsi-rpc" "$HOME/.rsi/install/rsi-rpc" "$HOME/.local/bin/rsi-rpc"; do
     if [ -x "$candidate" ]; then
         exec "$candidate" spill "$@"
     fi

@@ -7,10 +7,15 @@ import { markdownBody } from './markdown.js';
 import { splitFold } from './mdmodel.js';
 import { FOLD_CHARS, elideBlobs, eventKind, maxSequence, mergeEvents } from './model.js';
 import { RENDER_PAGE, state } from './state.js';
+import { type Projection, callNote, project, resultNote } from './tool-projection.js';
+
+/** Which result answers which call (tool-projection.ts), for the summaries. */
+let projection: Projection = project([]);
 
 export function eventNode(e: ConversationEvent): HTMLElement {
   const kind = eventKind(e);
   const box = el('div', `ev ev-${kind}`);
+  box.dataset.seq = String(e.sequence);
   const when = new Date(e.created_at).toLocaleTimeString();
   if (kind === 'tool' || kind === 'result' || kind === 'thinking') {
     const d = el('details');
@@ -18,7 +23,11 @@ export function eventNode(e: ConversationEvent): HTMLElement {
       : kind === 'result' ? `◂ result${e.tool_name ? ` (${e.tool_name})` : ''}`
       : '… thinking';
     const firstLine = elideBlobs(e.content).split('\n', 1)[0]?.slice(0, 100) ?? '';
-    d.append(el('summary', undefined, `${when}  ${label}  ${firstLine}`));
+    const summary = el('summary', undefined, `${when}  ${label}  ${firstLine}`);
+    const note = kind === 'tool' ? callNote(projection, e.sequence) : kind === 'result' ? resultNote(projection, e.sequence) : '';
+    const pair = el('span', 'ev-pair', note ? `  ${note}` : '');
+    summary.append(pair);
+    d.append(summary);
     let body = e.content;
     if (kind === 'tool' && e.tool_input != null) {
       try { body = JSON.stringify(e.tool_input, null, 2); } catch { /* keep content */ }
@@ -41,6 +50,13 @@ export function eventNode(e: ConversationEvent): HTMLElement {
   return box;
 }
 
+/** Hide or show tool calls and results in the conversation pane. */
+export function setHideTools(hide: boolean): void {
+  state.hideTools = hide;
+  $('events').classList.toggle('hide-tools', hide);
+  $('toggle-tools').textContent = hide ? 'Show tools' : 'Hide tools';
+}
+
 export function renderEvents(): void {
   const pane = $('events');
   const stick = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
@@ -49,8 +65,19 @@ export function renderEvents(): void {
   const firstSeq = shown[0]?.sequence;
   const canAppend = state.renderedCount > 0 && firstSeq === state.renderedFirstSeq &&
     shown.length >= state.renderedCount;
+  projection = project(state.events);
   if (canAppend) {
-    for (const e of shown.slice(state.renderedCount)) pane.append(eventNode(e));
+    const fresh = shown.slice(state.renderedCount);
+    for (const e of fresh) pane.append(eventNode(e));
+    // A result that just arrived updates its call's summary (and its batch leader's).
+    for (const e of fresh) {
+      const call = projection.results.get(e.sequence)?.call;
+      if (call == null) continue;
+      for (const seq of new Set([call, projection.calls.get(call)?.leader ?? call])) {
+        const span = pane.querySelector<HTMLElement>(`.ev[data-seq="${seq}"] .ev-pair`);
+        if (span) { const n = callNote(projection, seq); span.textContent = n ? `  ${n}` : ''; }
+      }
+    }
   } else {
     const nodes: HTMLElement[] = [];
     if (start > 0) {

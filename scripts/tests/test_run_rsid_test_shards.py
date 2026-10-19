@@ -99,7 +99,7 @@ class ArtifactLockTests(unittest.TestCase):
                 process.kill()
             process.communicate(timeout=20)
 
-    def start(self, name, *, mode="shard", keep=False, dry_run=False, env_target=False, extra_env=None, filterset=None, **flags):
+    def start(self, name, *, mode="shard", keep=False, dry_run=False, env_target=False, extra_env=None, filterset=None, slow_tier=False, **flags):
         # Separate worktrees sharing metadata's resolved (e.g. global-config)
         # target directory, rather than accidentally locking each repo/target.
         repo = self.root / name
@@ -142,6 +142,8 @@ class ArtifactLockTests(unittest.TestCase):
             command.extend(["--filterset", filterset])
         if keep:
             command.append("--keep-rsid-artifacts")
+        if slow_tier:
+            command.append("--slow-tier")
         if dry_run:
             command.append("--dry-run")
         process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -275,6 +277,39 @@ class ArtifactLockTests(unittest.TestCase):
         self.assertIn("-p rsid -p rsid-store --lib --no-default-features --features test-shard-store-01", output)
         self.assertIn("cargo clean -p rsid -p rsid-store --profile test", output)
 
+    def test_the_remote_read_leaf_library_runs_in_fast_mode_and_in_the_full_workspace_lane(self):
+        # #2410: rsid-remote-read declares no shard feature, so no shard lists its tests. `fast`
+        # (make test-fast: "every rsid library test") runs it as its own package; `full` covers it with
+        # the other workspace packages; a single shard does neither.
+        fast = self.finish(self.start("leaf-fast", mode="fast", dry_run=True))
+        self.assertIn("-p rsid-remote-read --lib", fast)
+        full = self.finish(self.start("leaf-full", mode="full", dry_run=True))
+        self.assertIn("--workspace --exclude rsid --exclude rsid-store", full)
+        self.assertNotIn("-p rsid-remote-read", full)
+        shard = self.finish(self.start("leaf-shard", dry_run=True))
+        self.assertNotIn("rsid-remote-read", shard)
+        ran = self.finish(self.start("leaf-ran", mode="fast"))
+        self.assertIn("running remote-read-leaf", ran)
+
+    def test_the_runtime_listing_ignores_the_default_filter_and_a_run_does_only_on_the_slow_tier(self):
+        # #2270: the nextest default-filter leaves the released-migration tests out of a run, but
+        # the runtime identity check needs every shard test listed; only the slow tier (the full QA,
+        # a migration-touching gate) runs them.
+        def commands(output, verb):
+            return [line for line in output.splitlines() if f"nextest {verb}" in line and "--lib" in line]
+
+        plain = self.finish(self.start("tier-plain", dry_run=True))
+        self.assertTrue(commands(plain, "list") and commands(plain, "run"))
+        self.assertTrue(all("--ignore-default-filter" in line for line in commands(plain, "list")))
+        self.assertFalse(any("--ignore-default-filter" in line for line in commands(plain, "run")))
+        for name, kwargs in (("tier-flag", {"slow_tier": True}),
+                             ("tier-env", {"extra_env": {"RSI_LANDER_SLOW_TIER": "full"}})):
+            with self.subTest(name=name):
+                slow = self.finish(self.start(name, dry_run=True, **kwargs))
+                self.assertTrue(all("--ignore-default-filter" in line for line in commands(slow, "list")))
+                self.assertTrue(commands(slow, "run"))
+                self.assertTrue(all("--ignore-default-filter" in line for line in commands(slow, "run")))
+
     def test_a_filterset_atom_of_every_shape_is_forwarded_as_one_quoted_argument(self):
         # #1510: check-touched-shards emits exact and regex atoms, not only test(name).
         for index, atom in enumerate([
@@ -282,6 +317,9 @@ class ArtifactLockTests(unittest.TestCase):
             "test(=session::tests::event_wake)",
             "test(/^session::tests::manager_actions::[A-Za-z0-9_]+$/)",
             "test(/^session::big::(?:\\w+::)*(?:t3|t9)$/)",
+            # #1605: composite filtersets, the landing gate's own shape.
+            "test(a) | test(b)",
+            "test(=a::b::one)|test(=a::b::two) | test(/^sandbox::/)",
         ]):
             with self.subTest(atom=atom):
                 output = self.finish(self.start(f"atom{index}", dry_run=True, filterset=atom))
@@ -289,7 +327,7 @@ class ArtifactLockTests(unittest.TestCase):
                 self.assertIn(f"--filterset {quoted} \n", output)
 
     def test_a_malformed_or_control_character_filterset_is_refused(self):
-        for index, atom in enumerate(["test()", "test(/a/", "all()", "test(/a\tb/)", "test(/\u00e9/)", "test(a) | test(b)"]):
+        for index, atom in enumerate(["test()", "test(/a/", "all()", "test(/a\tb/)", "test(/\u00e9/)", "test(a) | all()", "test(a) |", "test(a) || test(b)", "test(a) | test(b) x"]):
             with self.subTest(atom=atom):
                 self.finish(self.start(f"bad{index}", dry_run=True, filterset=atom), expected_status=2)
 

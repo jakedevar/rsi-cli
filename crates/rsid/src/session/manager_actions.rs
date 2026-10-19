@@ -64,13 +64,19 @@ fn note_launch_step(step: &'static str) {
 /// [`note_launch_step`] is bounded; the deadline restarts whenever the step
 /// changes. On expiry `run` is dropped and the typed
 /// `manager_v2_launch_timeout_<step>` refusal is returned.
+/// `expire_now` is an extra future that, once ready,
+/// counts as the current step's deadline having elapsed (#2285). Production
+/// passes a pending future; tests pass the manager's deadline trigger so the
+/// deadline path runs without a wall-clock wait.
 pub(super) async fn bound_launch_steps<T>(
     deadline: std::time::Duration,
     operation_id: Uuid,
+    expire_now: impl std::future::Future<Output = ()>,
     run: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     let step = std::sync::Arc::new(std::sync::Mutex::new(""));
     let mut run = Box::pin(LAUNCH_STEP.scope(std::sync::Arc::clone(&step), run));
+    let mut expire_now = std::pin::pin!(expire_now);
     let mut seen = "";
     loop {
         let wait = if seen.is_empty() {
@@ -78,16 +84,34 @@ pub(super) async fn bound_launch_steps<T>(
         } else {
             deadline
         };
-        if let Ok(result) = tokio::time::timeout(wait, &mut run).await {
-            return result;
+        let forced = tokio::select! {
+            result = tokio::time::timeout(wait, &mut run) => match result {
+                Ok(result) => return result,
+                Err(_) => false,
+            },
+            () = &mut expire_now => true,
+        };
+        if forced {
+            // The trigger stands for the step's deadline elapsing: wait until
+            // the action has entered a step (the test fires after the launch
+            // parked, so this is immediate), then expire it.
+            while step.lock().unwrap().is_empty() {
+                if let Ok(result) =
+                    tokio::time::timeout(std::time::Duration::from_millis(10), &mut run).await
+                {
+                    return result;
+                }
+            }
+            seen = *step.lock().unwrap();
+        } else {
+            let now = *step.lock().unwrap();
+            if now.is_empty() || now != seen {
+                seen = now;
+                continue;
+            }
         }
-        let now = *step.lock().unwrap();
-        if now.is_empty() || now != seen {
-            seen = now;
-            continue;
-        }
-        tracing::warn!(%operation_id, step = now, "manager launch step deadline expired");
-        return Err(refused(launch_timeout_code(now)));
+        tracing::warn!(%operation_id, step = seen, "manager launch step deadline expired");
+        return Err(refused(launch_timeout_code(seen)));
     }
 }
 
@@ -130,10 +154,12 @@ impl AgentControlHandle {
         caller: Uuid,
         request: AgentManagerPrepareControlRequestV2,
     ) -> Result<ManagerPreparedActionReceiptV2> {
-        self.store
-            .lock()
-            .await
-            .prepare_manager_action(caller, request)
+        crate::store_lock::lock(
+            &self.store,
+            "manager_actions::agent_manager_prepare_control",
+        )
+        .await
+        .prepare_manager_action(caller, request)
     }
 
     pub async fn agent_manager_commit_prepared_control(
@@ -141,10 +167,12 @@ impl AgentControlHandle {
         caller: Uuid,
         request: AgentManagerCommitPreparedControlRequestV2,
     ) -> Result<ManagerPreparedActionCommitResultV2> {
-        self.store
-            .lock()
-            .await
-            .commit_prepared_manager_action(caller, request)
+        crate::store_lock::lock(
+            &self.store,
+            "manager_actions::agent_manager_commit_prepared_control",
+        )
+        .await
+        .commit_prepared_manager_action(caller, request)
     }
 
     pub async fn agent_manager_get_action(
@@ -152,8 +180,7 @@ impl AgentControlHandle {
         caller: Uuid,
         request: AgentManagerGetActionRequestV2,
     ) -> Result<ManagerActionReceiptV2> {
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "manager_actions::agent_manager_get_action")
             .await
             .manager_action_receipt_for_caller(caller, request)
     }
@@ -181,15 +208,16 @@ impl AgentControlHandle {
             .and_then(|gate| gate.hold_for_create(receipt.operation_id));
         if receipt.state == ManagerActionStateV2::Queued
             && (deploy_hold.is_some() || load_hold.is_some())
-            && let Some((action, new_worker)) = self
-                .store
-                .lock()
-                .await
-                .manager_action_operation(receipt.operation_id)?
-                .map(|operation| {
-                    let new_worker = operation.is_new_worker_create();
-                    (operation.context.request.operation, new_worker)
-                })
+            && let Some((action, new_worker)) = crate::store_lock::lock(
+                &self.store,
+                "manager_actions::agent_manager_get_action_view",
+            )
+            .await
+            .manager_action_operation(receipt.operation_id)?
+            .map(|operation| {
+                let new_worker = operation.is_new_worker_create();
+                (operation.context.request.operation, new_worker)
+            })
         {
             let starts_worker = matches!(
                 action,
@@ -207,21 +235,12 @@ impl AgentControlHandle {
                     release_by: Some(
                         release_by.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
                     ),
-                    load: None,
-                    threshold: None,
-                    recent_admissions: None,
+                    ..ManagerActionHeldV1::default()
                 });
             } else if let Some(hold) = load_hold
                 && new_worker
             {
-                held = Some(ManagerActionHeldV1 {
-                    reason: rsi_common::agent_daemon_info::HOST_LOAD.to_string(),
-                    deploy_id: None,
-                    release_by: None,
-                    load: Some(hold.load),
-                    threshold: Some(hold.threshold),
-                    recent_admissions: Some(hold.recent_admissions),
-                });
+                held = Some(admission_held_view(hold));
             }
         }
         Ok(ManagerActionViewV2 { receipt, held })
@@ -236,20 +255,64 @@ impl AgentControlHandle {
             return self.enqueue_root_manager_succession(caller, request).await;
         }
         if matches!(request.operation, ManagerActionV2::Integrate { .. }) {
-            return self
-                .store
-                .lock()
+            return crate::store_lock::lock(&self.store, "manager_actions::agent_manager_control")
                 .await
                 .enqueue_integrate_action(ManagerActionOriginV2::Agent { caller }, request);
         }
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "manager_actions::agent_manager_control")
             .await
             .enqueue_manager_action(ManagerActionOriginV2::Agent { caller }, request)
     }
 }
 
+/// #1417, #2562: the `held` view of a create queued behind the host-admission
+/// gate: `host_load`, `thermal` or `disk_pressure`, with the reading that holds it.
+fn admission_held_view(hold: crate::host_load::AdmissionHold) -> ManagerActionHeldV1 {
+    use crate::host_load::AdmissionHold;
+    use crate::host_pressure::PressureHold;
+    let mut held = ManagerActionHeldV1 {
+        reason: hold.reason().to_string(),
+        ..ManagerActionHeldV1::default()
+    };
+    match hold {
+        AdmissionHold::Load(load) => {
+            held.load = Some(load.load);
+            held.threshold = Some(load.threshold);
+            held.recent_admissions = Some(load.recent_admissions);
+        }
+        AdmissionHold::Pressure(PressureHold::Thermal(hot)) => {
+            held.temperature_c = Some(hot.temperature_c);
+            held.ceiling_c = Some(hot.ceiling_c);
+        }
+        AdmissionHold::Pressure(PressureHold::DiskPressure { free_gb, min_gb }) => {
+            held.free_disk_gb = Some(free_gb);
+            held.min_free_disk_gb = Some(min_gb);
+        }
+        // #2920: the sandbox floor rides the same two fields.
+        AdmissionHold::Pressure(PressureHold::SandboxFreeSpace { free_gb, min_gb }) => {
+            held.free_disk_gb = Some(free_gb);
+            held.min_free_disk_gb = Some(min_gb);
+        }
+    }
+    held
+}
+
 impl SessionManager {
+    /// Admission and its immediate disk-pressure response share one path, so
+    /// the store's memoized held-claim retry also observes the debounce.
+    pub(super) fn admit_manager_create(
+        &self,
+        key: Uuid,
+        since: chrono::DateTime<chrono::Utc>,
+        target: Option<Uuid>,
+    ) -> bool {
+        let admitted = self.host_load.admit_manager_create(key, since, target);
+        if !admitted && let Some(hold) = self.host_load.hold_for_create(key) {
+            self.request_launch_hold_reclaim(hold);
+        }
+        admitted
+    }
+
     /// Must be called explicitly after runtime restoration and before normal
     /// reconciliation. A lost running claim is surfaced as uncertain, even if
     /// its durable provider row is missing. Missing evidence is not permission.
@@ -264,11 +327,12 @@ impl SessionManager {
         // #1166: the coordinator breadcrumb lives exactly as long as this
         // single-flight pass; every exit (success, error, cancellation) clears it.
         let _phase = crate::launch_breadcrumbs::PhaseGuard::new(Uuid::nil(), "manager_actions");
-        let mut count = self
-            .store
-            .lock()
-            .await
-            .recover_abandoned_manager_action_claims()?;
+        let mut count = crate::store_lock::lock(
+            &self.store,
+            "manager_actions::reconcile_manager_actions_once",
+        )
+        .await
+        .recover_abandoned_manager_action_claims()?;
         // RME-S2A-003: Reconcile uncertain integrate claims against actual
         // refs so a crash after publish can be settled and the singleton
         // unblocked without duplicate publication.
@@ -280,16 +344,20 @@ impl SessionManager {
         // Reserved DB reviews journal their CreateSession before the claim
         // loop. After restart, they then compete for the same last slot as
         // already-queued children, ahead of automatic lead recovery.
-        let (reviews_changed, review_notice_jobs) = self
-            .store
-            .lock()
-            .await
-            .reconcile_reserved_manager_reviews_once()?;
+        let (reviews_changed, review_notice_jobs) = crate::store_lock::lock(
+            &self.store,
+            "manager_actions::reconcile_manager_actions_once",
+        )
+        .await
+        .reconcile_reserved_manager_reviews_once()?;
         count += reviews_changed;
         for job_id in review_notice_jobs {
             self.event_bus
                 .publish(DaemonEvent::ManagerNoticeQueued { job_id });
         }
+        // #1930: relaunch capacity-failed Issue workers so the claim loop
+        // below picks the admitted `create_session` up in this pass.
+        count += self.reconcile_issue_worker_capacity_retries().await;
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut completed = 0usize;
         let mut drained = false;
@@ -311,19 +379,23 @@ impl SessionManager {
                 // Admit the oldest eligible create through the shared queue.
                 // The synchronous callback never accesses the Store; a held
                 // create leaves recovery and continuations claimable.
-                let admit =
-                    |key, since, target| self.host_load.admit_manager_create(key, since, target);
+                let admit = |key, since, target| self.admit_manager_create(key, since, target);
                 let claim = if inflight.is_empty() {
-                    self.store
-                        .lock()
-                        .await
-                        .claim_manager_action_with_create_admission(
-                            self.program_run_boot_id,
-                            self.deploy_drain.is_draining(),
-                            &admit,
-                        )?
+                    crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::reconcile_manager_actions_once",
+                    )
+                    .await
+                    .claim_manager_action_with_create_admission(
+                        self.program_run_boot_id,
+                        self.deploy_drain.is_draining(),
+                        &admit,
+                    )?
                 } else {
-                    let Ok(store) = self.store.try_lock() else {
+                    let Some(store) = crate::store_lock::try_lock(
+                        &self.store,
+                        "manager_actions::reconcile_manager_actions_once",
+                    ) else {
                         drained = true;
                         break;
                     };
@@ -370,11 +442,12 @@ impl SessionManager {
         if let Some(error) = first_error {
             return Err(error);
         }
-        let (reviews_changed, review_notice_jobs) = self
-            .store
-            .lock()
-            .await
-            .reconcile_manager_review_assignments_once()?;
+        let (reviews_changed, review_notice_jobs) = crate::store_lock::lock(
+            &self.store,
+            "manager_actions::reconcile_manager_actions_once",
+        )
+        .await
+        .reconcile_manager_review_assignments_once()?;
         count += reviews_changed;
         for job_id in review_notice_jobs {
             self.event_bus
@@ -410,13 +483,32 @@ impl SessionManager {
             // runs after the deploy settles (or is re-admitted by a
             // restart); it is never blocked or made uncertain.
             if crate::deploy_drain::is_draining_error(&error)
-                && self
-                    .store
-                    .lock()
-                    .await
-                    .requeue_held_manager_action(&claim)?
+                && crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::run_claimed_manager_action",
+                )
+                .await
+                .requeue_held_manager_action(&claim)?
             {
                 self.deploy_drain.note_manager_action_held();
+                return Ok(false);
+            }
+            // #2920: the sandbox allocator refused for free space, a condition that
+            // clears on its own. The refusal latched a `sandbox_free_space` hold
+            // (`HostLoadAdmission::note_sandbox_free_space`), so the action goes
+            // back to the queue and starts once space returns, as a host-load or
+            // disk-pressure hold does; it is never blocked.
+            if is_sandbox_free_space_error(&error)
+                && crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::run_claimed_manager_action",
+                )
+                .await
+                .requeue_held_manager_action(&claim)?
+            {
+                if let Some(hold) = self.host_load.hold_for_create(claim.id()) {
+                    self.request_launch_hold_reclaim(hold);
+                }
                 return Ok(false);
             }
             let code = if drain_pending {
@@ -429,8 +521,12 @@ impl SessionManager {
             // reconcile against actual refs after dropping the store
             // lock (git_ref is async). For all other actions, finish
             // immediately inside the store lock.
-            let needs_integrate_reconcile = {
-                let store = self.store.lock().await;
+            let (needs_integrate_reconcile, ended_launch) = {
+                let store = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::run_claimed_manager_action",
+                )
+                .await;
                 let op = store.manager_action_operation(claim.id())?;
                 let Some(op) = op else {
                     tracing::warn!(operation_id=%claim.id(),error=%error,
@@ -438,6 +534,7 @@ impl SessionManager {
                     return Ok(false);
                 };
                 let effect_started = op.effect_started;
+                let mut ended_launch = false;
                 let needs_reconcile = is_integrate
                     && effect_started
                     && op.receipt.state == ManagerActionStateV2::Running;
@@ -451,6 +548,9 @@ impl SessionManager {
                                 // #1335: the queuing seat retired with no
                                 // successor to inherit the action.
                                 | "manager_v2_actor_seat_retired"
+                                // #1716: another session was appointed over
+                                // the queuing seat; nothing launched.
+                                | "manager_v2_actor_seat_replaced"
                                 | "manager_review_assignment_terminal"
                                 | "manager_v2_policy_changed"
                                 | "manager_v2_capability_denied"
@@ -462,10 +562,15 @@ impl SessionManager {
                             ManagerActionStateV2::Blocked
                         };
                         store.finish_manager_action(&claim, state, code)?;
+                        ended_launch = true;
                     }
                 }
-                needs_reconcile
+                (needs_reconcile, ended_launch)
             };
+            if ended_launch {
+                self.settle_ended_issue_worker_launch(&claim.operation, code)
+                    .await;
+            }
             if needs_integrate_reconcile {
                 // Same-boot path: the claim is still Running with the
                 // original boot_id, so finish_manager_action works.
@@ -484,7 +589,11 @@ impl SessionManager {
                 } else {
                     None
                 };
-                let store = self.store.lock().await;
+                let store = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::run_claimed_manager_action",
+                )
+                .await;
                 let state = if let Some(ref_oid) = resolved {
                     match store.reconcile_integrate_claim(&claim, &ref_oid)? {
                         ManagerActionStateV2::Succeeded => ManagerActionStateV2::Succeeded,
@@ -503,9 +612,7 @@ impl SessionManager {
             }
             tracing::warn!(operation_id=%claim.id(),error=%error,"manager lifecycle action did not establish a confirmed result");
         }
-        match self
-            .store
-            .lock()
+        match crate::store_lock::lock(&self.store, "manager_actions::run_claimed_manager_action")
             .await
             .reconcile_manager_action_notice(claim.id())
         {
@@ -529,18 +636,219 @@ impl SessionManager {
         *self.manager_launch_step_deadline.lock().unwrap()
     }
 
+    /// Test-only: expire the current launch step's deadline of every bounded
+    /// action running on this manager now (#2285), instead of waiting it out.
+    /// It reaches only runs already waiting; a later action is unaffected.
     #[cfg(test)]
-    pub(crate) fn set_manager_launch_step_deadline(&self, deadline: std::time::Duration) {
-        *self.manager_launch_step_deadline.lock().unwrap() = deadline;
+    pub(crate) fn expire_manager_launch_step_deadline(&self) {
+        self.manager_launch_deadline_trigger.notify_waiters();
+    }
+
+    #[cfg(test)]
+    async fn manager_launch_deadline_forced(&self) {
+        let notified = self.manager_launch_deadline_trigger.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        notified.await;
+    }
+
+    #[cfg(not(test))]
+    async fn manager_launch_deadline_forced(&self) {
+        std::future::pending().await
     }
 
     async fn execute_manager_action_bounded(&self, claim: &ManagerActionClaimV2) -> Result<()> {
         bound_launch_steps(
             self.manager_launch_step_deadline(),
             claim.id(),
+            self.manager_launch_deadline_forced(),
             self.execute_manager_action(claim),
         )
         .await
+    }
+
+    /// The `create_session` / `replace_lead` / `retry_lead` arm of
+    /// [`Self::execute_manager_action`], built by a non-async `#[inline(never)]`
+    /// helper so its large temporaries are not part of the caller's poll frame
+    /// (the manager-intent race scenario runs on a small stack, #985, #2908).
+    #[inline(never)]
+    fn boxed_execute_manager_launch_action<'a>(
+        &'a self,
+        claim: &'a ManagerActionClaimV2,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            use ManagerActionV2::*;
+            // #1073: a create waits behind a draining deploy before the
+            // predecessor guard, fork or any other effect.
+            self.deploy_drain
+                .refuse_if_draining(claim.operation.context.target_session_id, true)?;
+            note_launch_step("predecessor_guard");
+            // #1143: same-parent creates serialize at runtime too (the
+            // claim predicate already fences them transactionally).
+            let _parent_guard = match claim.action() {
+                CreateSession { parent_id, .. } => Some(
+                    super::spawn_single_flight::acquire_spawn_guard(
+                        manager_create_parent_guard_key(*parent_id),
+                    )
+                    .await,
+                ),
+                _ => None,
+            };
+            let predecessor = action_fence(claim.action()).and_then(|f| f.lead_session_id);
+            // Held until CAS: an operator/worker continuation cannot restart
+            // the old process between quiescence and assignment.
+            let _predecessor_guard = if let Some(id) = predecessor {
+                Some(super::spawn_single_flight::acquire_spawn_guard(id).await)
+            } else {
+                None
+            };
+            note_launch_step("runtime_check");
+            self.check_manager_action_runtime(claim, false).await?;
+            note_launch_step("settle_predecessor");
+            if let Some(id) = predecessor {
+                self.settle_manager_predecessor(claim, id).await?;
+            }
+            let frozen = claim
+                .operation
+                .context
+                .source
+                .as_ref()
+                .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            let source = crate::store_lock::lock(
+                &self.store,
+                "manager_actions::boxed_execute_manager_launch_action",
+            )
+            .await
+            .get_session(frozen.session_id)?
+            .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            note_launch_step("prepare_fork");
+            let runtime = self.custody_execution_runtime();
+            // #1195: an explicit or default create source names its
+            // commit; only legacy pinned sources follow the source HEAD.
+            let fork = if frozen.historical_commit {
+                runtime
+                    .prepare_manager_review_fork_at(&source, &frozen.commit)
+                    .await?
+            } else if frozen.forks_at_frozen_commit() {
+                runtime
+                    .prepare_manager_action_fork_at(&source, &frozen.commit)
+                    .await?
+            } else {
+                runtime
+                    .prepare_manager_action_fork_pinned(
+                        &source,
+                        &frozen.commit,
+                        frozen.branch.as_deref(),
+                    )
+                    .await?
+            };
+            if source.working_dir != frozen.working_dir
+                || source.sandbox_root != frozen.sandbox_root
+                || fork.fork_commit() != frozen.commit
+            {
+                return Err(refused("manager_v2_source_changed"));
+            }
+            note_launch_step("launch_candidate");
+            // #1254: a `continue_from` Issue launch continues its
+            // predecessor's lineage and display identity.
+            let continued = match claim
+                .operation
+                .context
+                .issue_binding
+                .as_ref()
+                .and_then(|binding| binding.continue_from)
+            {
+                Some(id) => Some(
+                    crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::boxed_execute_manager_launch_action",
+                    )
+                    .await
+                    .get_session(id)?
+                    .ok_or_else(|| refused("manager_v2_source_unavailable"))?,
+                ),
+                None => None,
+            };
+            // #1640: a lead handover whose predecessor has no forkable
+            // sandbox forks from the Epic's published rolling instead, so
+            // the launch identity (kind, role, ordinal, tags) still comes
+            // from the predecessor, not from the fork source.
+            // The lineage row is scoped to this block so the large
+            // `Session` is not kept in the launch future's state across
+            // the awaits below (#985, #2774).
+            let config = {
+                let lineage = match predecessor {
+                    Some(id) if id != source.id => crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::boxed_execute_manager_launch_action",
+                    )
+                    .await
+                    .get_session(id)?
+                    .ok_or_else(|| refused("manager_v2_source_unavailable"))?,
+                    _ => source.clone(),
+                };
+                manager_launch_config(claim, &lineage, continued.as_ref())?
+            };
+            if let Some(model) = config.model.as_deref() {
+                self.preflight_manager_action_model(
+                    config.provider.unwrap_or(SessionProvider::Claude),
+                    model,
+                )
+                .await?;
+            }
+            let target = claim
+                .operation
+                .context
+                .target_session_id
+                .expect("reserved candidate");
+            let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            self.boxed_launch_manager_action_candidate(
+                config,
+                ManagerActionLaunchContext {
+                    claim: claim.clone(),
+                    fork,
+                    generation: generation.clone(),
+                },
+            )
+            .await?;
+            let generation = generation.load(Ordering::Acquire);
+            note_launch_step("confirm_candidate");
+            let result = async {
+                #[cfg(test)]
+                super::launch::pause_controller_candidate_test(
+                    target,
+                    super::launch::ControllerCandidateTestPhase::ManagerActionConfirming,
+                )
+                .await;
+                self.confirm_manager_candidate(claim, target, generation)
+                    .await?;
+                if predecessor.is_some() {
+                    self.commit_manager_assignment(claim, Some(generation))
+                        .await
+                } else {
+                    // #1115: the caller's terminal watch commits with the
+                    // launch success, never after it.
+                    // #2114: resolve the watch owner under the commit's own
+                    // lock hold so succession cannot publish in between.
+                    let store = crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::boxed_execute_manager_launch_action",
+                    )
+                    .await;
+                    let watch = Self::issue_worker_watch_candidate_locked(&store, claim);
+                    store.commit_manager_created_session_with_watch(claim, watch.as_ref())
+                }
+            }
+            .await;
+            if result.is_err() {
+                // Keep the allocated source and durable uncertain result;
+                // stop a losing candidate instead of leaving an unowned writer.
+                self.boxed_stop_manager_candidate(target, generation)
+                    .await?;
+            }
+            result?;
+            Ok(())
+        })
     }
 
     pub(super) async fn execute_manager_action(&self, claim: &ManagerActionClaimV2) -> Result<()> {
@@ -572,8 +880,7 @@ impl SessionManager {
                 tags,
             } => {
                 let working_dir = if let Some(parent) = parent_id {
-                    self.store
-                        .lock()
+                    crate::store_lock::lock(&self.store, "manager_actions::execute_manager_action")
                         .await
                         .get_session(*parent)?
                         .ok_or_else(|| refused("manager_v2_target_unavailable"))?
@@ -608,11 +915,10 @@ impl SessionManager {
                     working_dir,
                     normalized,
                 );
-                let (session, _) = self
-                    .store
-                    .lock()
-                    .await
-                    .apply_manager_container_action(claim, Some(&session))?;
+                let (session, _) =
+                    crate::store_lock::lock(&self.store, "manager_actions::execute_manager_action")
+                        .await
+                        .apply_manager_container_action(claim, Some(&session))?;
                 self.project_manager_container(session, claim.action())
                     .await;
             }
@@ -625,11 +931,10 @@ impl SessionManager {
             UpdateContainer { container_id, .. } | DeleteContainer { container_id, .. } => {
                 // K2 authority gate: Delete clears the container's lead.
                 let _lead_guards = self.container_lead_guards(*container_id).await?;
-                let (session, _) = self
-                    .store
-                    .lock()
-                    .await
-                    .apply_manager_container_action(claim, None)?;
+                let (session, _) =
+                    crate::store_lock::lock(&self.store, "manager_actions::execute_manager_action")
+                        .await
+                        .apply_manager_container_action(claim, None)?;
                 self.project_manager_container(session, claim.action())
                     .await;
             }
@@ -638,11 +943,13 @@ impl SessionManager {
                     .await?;
                 // The continuation holds the guard through installation. Its
                 // success is a confirmed start, not proof of task completion.
-                self.store.lock().await.finish_manager_action(
-                    claim,
-                    ManagerActionStateV2::Succeeded,
-                    "lead_resumed",
-                )?;
+                crate::store_lock::lock(&self.store, "manager_actions::execute_manager_action")
+                    .await
+                    .finish_manager_action(
+                        claim,
+                        ManagerActionStateV2::Succeeded,
+                        "lead_resumed",
+                    )?;
             }
             PauseLead { .. } => {
                 let predecessor = action_fence(claim.action())
@@ -652,156 +959,14 @@ impl SessionManager {
                 self.check_manager_action_runtime(claim, false).await?;
                 self.settle_manager_predecessor(claim, predecessor).await?;
                 self.check_manager_action_runtime(claim, false).await?;
-                self.store.lock().await.finish_manager_action(
-                    claim,
-                    ManagerActionStateV2::Succeeded,
-                    "lead_paused",
-                )?;
+                crate::store_lock::lock(&self.store, "manager_actions::execute_manager_action")
+                    .await
+                    .finish_manager_action(claim, ManagerActionStateV2::Succeeded, "lead_paused")?;
             }
             CreateSession { .. } | ReplaceLead { .. } | RetryLead { .. } => {
-                // #1073: a create waits behind a draining deploy before the
-                // predecessor guard, fork or any other effect.
-                self.deploy_drain
-                    .refuse_if_draining(claim.operation.context.target_session_id, true)?;
-                note_launch_step("predecessor_guard");
-                // #1143: same-parent creates serialize at runtime too (the
-                // claim predicate already fences them transactionally).
-                let _parent_guard = match claim.action() {
-                    CreateSession { parent_id, .. } => Some(
-                        super::spawn_single_flight::acquire_spawn_guard(
-                            manager_create_parent_guard_key(*parent_id),
-                        )
-                        .await,
-                    ),
-                    _ => None,
-                };
-                let predecessor = action_fence(claim.action()).and_then(|f| f.lead_session_id);
-                // Held until CAS: an operator/worker continuation cannot restart
-                // the old process between quiescence and assignment.
-                let _predecessor_guard = if let Some(id) = predecessor {
-                    Some(super::spawn_single_flight::acquire_spawn_guard(id).await)
-                } else {
-                    None
-                };
-                note_launch_step("runtime_check");
-                self.check_manager_action_runtime(claim, false).await?;
-                note_launch_step("settle_predecessor");
-                if let Some(id) = predecessor {
-                    self.settle_manager_predecessor(claim, id).await?;
-                }
-                let frozen = claim
-                    .operation
-                    .context
-                    .source
-                    .as_ref()
-                    .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
-                let source = self
-                    .store
-                    .lock()
-                    .await
-                    .get_session(frozen.session_id)?
-                    .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
-                note_launch_step("prepare_fork");
-                let runtime = self.custody_execution_runtime();
-                // #1195: an explicit or default create source names its
-                // commit; only legacy pinned sources follow the source HEAD.
-                let fork = if frozen.historical_commit {
-                    runtime
-                        .prepare_manager_review_fork_at(&source, &frozen.commit)
-                        .await?
-                } else if frozen.forks_at_frozen_commit() {
-                    runtime
-                        .prepare_manager_action_fork_at(&source, &frozen.commit)
-                        .await?
-                } else {
-                    runtime
-                        .prepare_manager_action_fork_pinned(
-                            &source,
-                            &frozen.commit,
-                            frozen.branch.as_deref(),
-                        )
-                        .await?
-                };
-                if source.working_dir != frozen.working_dir
-                    || source.sandbox_root != frozen.sandbox_root
-                    || fork.fork_commit() != frozen.commit
-                {
-                    return Err(refused("manager_v2_source_changed"));
-                }
-                note_launch_step("launch_candidate");
-                // #1254: a `continue_from` Issue launch continues its
-                // predecessor's lineage and display identity.
-                let continued = match claim
-                    .operation
-                    .context
-                    .issue_binding
-                    .as_ref()
-                    .and_then(|binding| binding.continue_from)
-                {
-                    Some(id) => Some(
-                        self.store
-                            .lock()
-                            .await
-                            .get_session(id)?
-                            .ok_or_else(|| refused("manager_v2_source_unavailable"))?,
-                    ),
-                    None => None,
-                };
-                let config = manager_launch_config(claim, &source, continued.as_ref())?;
-                if let Some(model) = config.model.as_deref() {
-                    self.preflight_manager_action_model(
-                        config.provider.unwrap_or(SessionProvider::Claude),
-                        model,
-                    )
-                    .await?;
-                }
-                let target = claim
-                    .operation
-                    .context
-                    .target_session_id
-                    .expect("reserved candidate");
-                let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                self.boxed_launch_manager_action_candidate(
-                    config,
-                    ManagerActionLaunchContext {
-                        claim: claim.clone(),
-                        fork,
-                        generation: generation.clone(),
-                    },
-                )
-                .await?;
-                let generation = generation.load(Ordering::Acquire);
-                note_launch_step("confirm_candidate");
-                let result = async {
-                    #[cfg(test)]
-                    super::launch::pause_controller_candidate_test(
-                        target,
-                        super::launch::ControllerCandidateTestPhase::ManagerActionConfirming,
-                    )
-                    .await;
-                    self.confirm_manager_candidate(claim, target, generation)
-                        .await?;
-                    if predecessor.is_some() {
-                        self.commit_manager_assignment(claim, Some(generation))
-                            .await
-                    } else {
-                        // #1115: the caller's terminal watch commits with the
-                        // launch success, never after it.
-                        let watch = self.issue_worker_watch_candidate(claim).await;
-                        self.store
-                            .lock()
-                            .await
-                            .commit_manager_created_session_with_watch(claim, watch.as_ref())
-                    }
-                }
-                .await;
-                if result.is_err() {
-                    // Keep the allocated source and durable uncertain result;
-                    // stop a losing candidate instead of leaving an unowned writer.
-                    self.boxed_stop_manager_candidate(target, generation)
-                        .await?;
-                }
-                result?;
+                // Boxed (#2908): the launch arm's temporaries stay out of this
+                // fn's poll frame (debug test threads run on a 2 MiB stack).
+                self.boxed_execute_manager_launch_action(claim).await?;
             }
             AssignLead { session_id, .. } => {
                 let predecessor = action_fence(claim.action()).and_then(|f| f.lead_session_id);
@@ -832,11 +997,12 @@ impl SessionManager {
     /// The durable pending state is exactly that pair; a live launch keeps its
     /// spawn guard, so it is never raced.
     async fn reconcile_failed_manager_launch_cleanup(&self) -> usize {
-        let targets = match self
-            .store
-            .lock()
-            .await
-            .manager_launch_cleanup_candidates(32)
+        let targets = match crate::store_lock::lock(
+            &self.store,
+            "manager_actions::reconcile_failed_manager_launch_cleanup",
+        )
+        .await
+        .manager_launch_cleanup_candidates(32)
         {
             Ok(targets) => targets,
             Err(error) => {
@@ -867,9 +1033,7 @@ impl SessionManager {
         &self,
         container_id: Uuid,
     ) -> Result<Vec<super::spawn_single_flight::SpawnGuard>> {
-        let lead = self
-            .store
-            .lock()
+        let lead = crate::store_lock::lock(&self.store, "manager_actions::container_lead_guards")
             .await
             .get_session(container_id)?
             .and_then(|container| container.lead_session_id);
@@ -883,11 +1047,12 @@ impl SessionManager {
     async fn execute_manager_container_cascade(&self, claim: &ManagerActionClaimV2) -> Result<()> {
         match claim.action() {
             ManagerActionV2::ArchiveContainer { container_id, .. } => {
-                let mut tree = self
-                    .store
-                    .lock()
-                    .await
-                    .manager_action_container_tree_ids(*container_id)?;
+                let mut tree = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_container_cascade",
+                )
+                .await
+                .manager_action_container_tree_ids(*container_id)?;
                 tree.sort();
                 let mut spawn_guards = Vec::with_capacity(tree.len());
                 for id in &tree {
@@ -909,28 +1074,31 @@ impl SessionManager {
                         return Err(refused("manager_v2_human_or_recovery_owner"));
                     }
                 }
-                let (_, ids) = self
-                    .store
-                    .lock()
-                    .await
-                    .apply_manager_container_action(claim, None)?;
+                let (_, ids) = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_container_cascade",
+                )
+                .await
+                .apply_manager_container_action(claim, None)?;
                 self.project_manager_cascade(ids, false).await?;
                 drop(spawn_guards);
             }
             ManagerActionV2::RestoreContainer { container_id, .. } => {
-                let recorded = self
-                    .store
-                    .lock()
-                    .await
-                    .manager_action_cascade_archive_ids(*container_id)?;
+                let recorded = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_container_cascade",
+                )
+                .await
+                .manager_action_cascade_archive_ids(*container_id)?;
                 let Some(record) = recorded else {
                     // K2 authority gate: a restore clears the container lead.
                     let _lead_guards = self.container_lead_guards(*container_id).await?;
-                    let (session, _) = self
-                        .store
-                        .lock()
-                        .await
-                        .apply_manager_container_action(claim, None)?;
+                    let (session, _) = crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::execute_manager_container_cascade",
+                    )
+                    .await
+                    .apply_manager_container_action(claim, None)?;
                     self.project_manager_container(session, claim.action())
                         .await;
                     return Ok(());
@@ -951,11 +1119,12 @@ impl SessionManager {
                         return Err(refused("manager_v2_target_active"));
                     }
                 }
-                let (_, transitioned) = self
-                    .store
-                    .lock()
-                    .await
-                    .apply_manager_container_action(claim, None)?;
+                let (_, transitioned) = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_container_cascade",
+                )
+                .await
+                .apply_manager_container_action(claim, None)?;
                 self.project_manager_cascade(transitioned, true).await?;
                 drop(spawn_guards);
             }
@@ -991,25 +1160,30 @@ impl SessionManager {
                 {
                     return Err(refused("manager_v2_human_or_recovery_owner"));
                 }
-                self.store
-                    .lock()
-                    .await
-                    .apply_manager_session_action(claim)?;
+                crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_session_action",
+                )
+                .await
+                .apply_manager_session_action(claim)?;
                 self.project_manager_cascade(vec![id], false).await?;
             }
             ManagerActionV2::RestoreSession { .. } => {
-                self.store
-                    .lock()
-                    .await
-                    .apply_manager_session_action(claim)?;
+                crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_session_action",
+                )
+                .await
+                .apply_manager_session_action(claim)?;
                 self.project_manager_cascade(vec![id], true).await?;
             }
             ManagerActionV2::UpdateSession { patch, .. } => {
-                let session = self
-                    .store
-                    .lock()
-                    .await
-                    .apply_manager_session_action(claim)?;
+                let session = crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::execute_manager_session_action",
+                )
+                .await
+                .apply_manager_session_action(claim)?;
                 let project = |target: &mut Session| {
                     if patch.title.is_some() {
                         target.title.clone_from(&session.title);
@@ -1064,7 +1238,10 @@ impl SessionManager {
             if restore {
                 let store = self.store.clone();
                 let (mut session, events, turn_metrics) = tokio::task::spawn_blocking(move || {
-                    let store = store.blocking_lock();
+                    let store = crate::store_lock::blocking_lock(
+                        &store,
+                        "manager_actions::project_manager_cascade",
+                    );
                     let session = store
                         .get_session(id)?
                         .ok_or(DaemonError::SessionNotFound(id))?;
@@ -1077,7 +1254,9 @@ impl SessionManager {
                 .map_err(|error| DaemonError::Store(error.to_string()))??;
                 session.context_fill_pct =
                     super::monitor::context_fill_pct_from_persisted(&session);
-                self.completed.write().await.insert(
+                super::cohort_settlement::publish_completed_from_store(
+                    &self.completed,
+                    &self.store,
                     id,
                     CompletedSession {
                         session,
@@ -1087,8 +1266,10 @@ impl SessionManager {
                         retry_fired_at: None,
                         superseded_by_retry: None,
                         events_hydrated: true,
+                        store_writes: Default::default(),
                     },
-                );
+                )
+                .await;
                 self.event_bus
                     .publish(DaemonEvent::SessionUnarchived { session_id: id });
             } else {
@@ -1132,6 +1313,7 @@ impl SessionManager {
                     retry_fired_at: None,
                     superseded_by_retry: None,
                     events_hydrated: true,
+                    store_writes: Default::default(),
                 },
             );
             self.event_bus
@@ -1166,8 +1348,7 @@ impl SessionManager {
             manager_action_source_gate(&self.custody_execution_runtime(), &self.store, claim)
                 .await?;
         }
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "manager_actions::check_manager_action_runtime")
             .await
             .manager_action_runtime_gate(claim, effect)
     }
@@ -1225,15 +1406,16 @@ impl SessionManager {
         // the exact daemon-owned cohort to a bounded two-empty-pass fixed point.
         let orphan_store = std::sync::Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let turns = orphan_store
-                .blocking_lock()
-                .list_active_provider_turn_custody()?;
+            let turns = crate::store_lock::blocking_lock(
+                &orphan_store,
+                "manager_actions::settle_manager_predecessor",
+            )
+            .list_active_provider_turn_custody()?;
             super::reaper::reap_orphans_for_session(predecessor, turns)
         })
         .await
         .map_err(|_| refused("manager_v2_predecessor_unsettled"))??;
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "manager_actions::settle_manager_predecessor")
             .await
             .manager_action_accept_settled_fence(claim)
     }
@@ -1250,11 +1432,12 @@ impl SessionManager {
     /// cancelled or was superseded can never record its receipt. Stop any such
     /// reviewer process still running so it does not keep spending money.
     pub(super) async fn halt_orphaned_manager_reviewers(&self) -> Result<usize> {
-        let reviewers = self
-            .store
-            .lock()
-            .await
-            .manager_review_orphaned_reviewers()?;
+        let reviewers = crate::store_lock::lock(
+            &self.store,
+            "manager_actions::halt_orphaned_manager_reviewers",
+        )
+        .await
+        .manager_review_orphaned_reviewers()?;
         let mut halted = 0;
         for reviewer in reviewers {
             let generation = self
@@ -1395,9 +1578,11 @@ impl SessionManager {
         }
         let orphan_store = std::sync::Arc::clone(&self.store);
         match tokio::task::spawn_blocking(move || {
-            let turns = orphan_store
-                .blocking_lock()
-                .list_active_provider_turn_custody()?;
+            let turns = crate::store_lock::blocking_lock(
+                &orphan_store,
+                "manager_actions::drain_manager_launch_candidate",
+            )
+            .list_active_provider_turn_custody()?;
             super::reaper::reap_orphans_for_session(target, turns)
         })
         .await
@@ -1426,11 +1611,12 @@ impl SessionManager {
     /// reaped) before the candidate rows settle and the debt clears. A target
     /// back in `active` (an operator continuation) is never touched.
     async fn reconcile_manager_launch_drain_debt(&self) -> usize {
-        let targets = match self
-            .store
-            .lock()
-            .await
-            .manager_launch_drain_pending_targets(32)
+        let targets = match crate::store_lock::lock(
+            &self.store,
+            "manager_actions::reconcile_manager_launch_drain_debt",
+        )
+        .await
+        .manager_launch_drain_pending_targets(32)
         {
             Ok(targets) => targets,
             Err(error) => {
@@ -1451,11 +1637,12 @@ impl SessionManager {
                 tracing::warn!(session_id = %target, %error, "manager launch drain settlement remains owed");
                 continue;
             }
-            match self
-                .store
-                .lock()
-                .await
-                .clear_manager_launch_drain_pending(target)
+            match crate::store_lock::lock(
+                &self.store,
+                "manager_actions::reconcile_manager_launch_drain_debt",
+            )
+            .await
+            .clear_manager_launch_drain_pending(target)
             {
                 Ok(_) => cleared += 1,
                 Err(error) => {
@@ -1512,9 +1699,11 @@ impl SessionManager {
         }
         let orphan_store = std::sync::Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            let turns = orphan_store
-                .blocking_lock()
-                .list_active_provider_turn_custody()?;
+            let turns = crate::store_lock::blocking_lock(
+                &orphan_store,
+                "manager_actions::stop_manager_candidate",
+            )
+            .list_active_provider_turn_custody()?;
             super::reaper::reap_orphans_for_session(target, turns)
         })
         .await
@@ -1532,7 +1721,11 @@ impl SessionManager {
         // finish_manager_action, which requires a Running claim with the
         // original boot_id — the crashed boot's id is gone.
         let uncertain_ops: Vec<crate::store::manager_actions::ManagerActionOperationV2> = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_actions::reconcile_uncertain_integrate_claims",
+            )
+            .await;
             let mut stmt = store.conn.prepare(
                 "SELECT id FROM harness_manager_v2_operations
                  WHERE kind='lifecycle_action' AND state='uncertain'
@@ -1573,7 +1766,11 @@ impl SessionManager {
             };
             let repo = self.resolve_project_working_dir(project_id).await?;
             let resolved = git_ref(&repo, &target_ref).await;
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_actions::reconcile_uncertain_integrate_claims",
+            )
+            .await;
             if let Some(ref_oid) = resolved {
                 match store.reconcile_integrate_claim(
                     &crate::store::manager_actions::ManagerActionClaimV2 {
@@ -1643,8 +1840,7 @@ impl SessionManager {
             _ => return Err(refused("manager_v2_not_integrate_action")),
         };
         // Pre-effect gate: verify claim, authority, scope, policy.
-        self.store
-            .lock()
+        crate::store_lock::lock(&self.store, "manager_actions::execute_integrate_action")
             .await
             .manager_v2_integrate_runtime_gate(claim, false)?;
         let repo = self
@@ -1676,11 +1872,13 @@ impl SessionManager {
         .await?;
         match prepared {
             Prepared::AlreadyIntegrated => {
-                self.store.lock().await.finish_manager_action(
-                    claim,
-                    ManagerActionStateV2::Succeeded,
-                    "already_integrated",
-                )?;
+                crate::store_lock::lock(&self.store, "manager_actions::execute_integrate_action")
+                    .await
+                    .finish_manager_action(
+                        claim,
+                        ManagerActionStateV2::Succeeded,
+                        "already_integrated",
+                    )?;
                 Ok(())
             }
             Prepared::Candidate(candidate) => {
@@ -1692,7 +1890,11 @@ impl SessionManager {
                 // before `discard_candidate` awaits so the MutexGuard does not
                 // live across the async cleanup.
                 let gate_result = {
-                    let store = self.store.lock().await;
+                    let store = crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::execute_integrate_action",
+                    )
+                    .await;
                     store.manager_v2_integrate_runtime_gate(claim, true)
                 };
                 if let Err(error) = gate_result {
@@ -1702,7 +1904,11 @@ impl SessionManager {
                 // RME-S2A-002: Persist the candidate OID so crash recovery can
                 // determine whether publish succeeded.
                 {
-                    let store = self.store.lock().await;
+                    let store = crate::store_lock::lock(
+                        &self.store,
+                        "manager_actions::execute_integrate_action",
+                    )
+                    .await;
                     store.persist_integrate_candidate(claim, &candidate.oid)?;
                 }
                 // RME-S2A-002: Verify target ref hasn't moved between prepare
@@ -1711,7 +1917,11 @@ impl SessionManager {
                 let resolved_ref = git_ref(&repo, &target_ref).await;
                 if let Some(ref_oid) = resolved_ref {
                     let custody_result = {
-                        let store = self.store.lock().await;
+                        let store = crate::store_lock::lock(
+                            &self.store,
+                            "manager_actions::execute_integrate_action",
+                        )
+                        .await;
                         store.verify_integrate_custody(claim, &ref_oid)
                     };
                     if let Err(error) = custody_result {
@@ -1731,11 +1941,13 @@ impl SessionManager {
                 // Best-effort cleanup of the candidate worktree.
                 let _ = integration::discard_candidate(&config, &repo, &candidate.handle).await;
                 publish_result?;
-                self.store.lock().await.finish_manager_action(
-                    claim,
-                    ManagerActionStateV2::Succeeded,
-                    "source_integrated",
-                )?;
+                crate::store_lock::lock(&self.store, "manager_actions::execute_integrate_action")
+                    .await
+                    .finish_manager_action(
+                        claim,
+                        ManagerActionStateV2::Succeeded,
+                        "source_integrated",
+                    )?;
                 Ok(())
             }
         }
@@ -1769,8 +1981,7 @@ impl SessionManager {
             }
             // Scope revocation stops the candidate; it never wins the lead CAS.
             let scope_gate = {
-                self.store
-                    .lock()
+                crate::store_lock::lock(&self.store, "manager_actions::confirm_manager_candidate")
                     .await
                     .manager_action_runtime_gate(claim, false)
             };
@@ -1828,7 +2039,11 @@ impl SessionManager {
         // Match custody and model invocation while the active incarnation is
         // locked; a stale or merely allocated Starting row cannot win a lead.
         let mut active = self.active.write().await;
-        let mut store = self.store.lock().await;
+        let mut store = crate::store_lock::lock(
+            &self.store,
+            "manager_actions::commit_manager_assignment_once",
+        )
+        .await;
         if let Some(target) = target {
             let candidate = store
                 .get_session(target)?
@@ -1867,7 +2082,7 @@ impl SessionManager {
                     return Err(refused("manager_v2_candidate_unconfirmed"));
                 }
                 let tokens = self.agent_tokens.read().await;
-                if tokens.token_for_session(target).is_none() {
+                if tokens.binding_for_session(target).is_none() {
                     return Err(refused("manager_v2_candidate_unconfirmed"));
                 }
             } else if require_established
@@ -1927,8 +2142,7 @@ pub(super) async fn manager_action_source_gate(
     let Some(frozen) = claim.operation.context.source.as_ref() else {
         return Ok(());
     };
-    let source = store
-        .lock()
+    let source = crate::store_lock::lock(&store, "manager_actions::manager_action_source_gate")
         .await
         .get_session(frozen.session_id)?
         .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
@@ -1952,7 +2166,8 @@ pub(super) async fn manager_action_source_gate(
         return Err(refused("manager_v2_source_changed"));
     }
     if let Some(generation) = frozen.custody_generation {
-        let store = store.lock().await;
+        let store =
+            crate::store_lock::lock(&store, "manager_actions::manager_action_source_gate").await;
         let current = if frozen.historical_commit {
             store
                 .manager_review_reclaimed_source(&source)?
@@ -2041,6 +2256,12 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_review_assignment_terminal",
     "manager_review_reclaimed_source_unavailable",
     "manager_v2_actor_seat_retired",
+    // #1716: the queuing seat was replaced by another appointment while its
+    // create was held; and the raw authority denials, so a stored action that
+    // fails them any other way still names its real class.
+    "manager_v2_actor_seat_replaced",
+    "manager_scope_denied",
+    "manager_current_session_required",
     "manager_v2_scope_changed",
     "manager_v2_policy_changed",
     "manager_v2_capability_denied",
@@ -2115,6 +2336,18 @@ fn launch_refusal_code(error: &DaemonError) -> Option<&'static str> {
         DaemonError::ExecutionScratchUnavailable(_) => {
             Some("manager_v2_execution_scratch_unavailable")
         }
+        // #2920: the sandbox capacity gate keeps its own typed class. A free-space
+        // shortfall is requeued and held before it gets here (only a refusal after
+        // the effect began ends the action); a root count at the cap is genuinely
+        // unsatisfiable until a sandbox is released.
+        DaemonError::StructuredRpc {
+            rpc_code: -32029,
+            data,
+            ..
+        } if data["kind"] == "sandbox_capacity" => Some(match data["code"].as_str() {
+            Some("source_root_limit") => "manager_v2_sandbox_source_root_limit",
+            _ => "manager_v2_sandbox_free_space_limit",
+        }),
         DaemonError::ClaudeBinaryNotFound => Some("manager_v2_claude_binary_not_found"),
         DaemonError::CodexBinaryNotFound => Some("manager_v2_codex_binary_not_found"),
         DaemonError::AgyBinaryNotFound => Some("manager_v2_agy_binary_not_found"),
@@ -2136,11 +2369,37 @@ fn launch_refusal_code(error: &DaemonError) -> Option<&'static str> {
                 Some("manager_v2_provider_credential_missing_bedrock")
             } else if text.contains("Pioneer credential") {
                 Some("manager_v2_provider_credential_missing_pioneer")
+            } else if text.contains("model_unavailable: provider") {
+                // #2735: the provider refused the model; the receipt keeps the typed
+                // code instead of a generic lifecycle-unconfirmed class.
+                Some("model_unavailable")
+            } else if text.contains("provider_login_required: the ") {
+                // #2753: the provider CLI is logged out on the host; the receipt
+                // keeps the typed code (the fix is the operator's login).
+                Some("provider_login_required")
+            } else if text
+                .contains("the installed codex-cli does not trust the sandbox custody hook")
+            {
+                // #2755: the Codex custody hook is not trusted; the receipt keeps
+                // the typed reason (the fix is RSI's hook trust for this codex-cli).
+                rsi_common::provider_contract::CODEX_CUSTODY_REASONS
+                    .into_iter()
+                    .find(|reason| text.contains(&format!("{reason}: ")))
             } else {
                 None
             }
         }
     }
+}
+
+/// #2920: whether `error` is the sandbox allocator's free-space refusal (not the
+/// root-count cap, which stays a refusal).
+fn is_sandbox_free_space_error(error: &DaemonError) -> bool {
+    matches!(
+        error,
+        DaemonError::StructuredRpc { rpc_code: -32029, data, .. }
+            if data["kind"] == "sandbox_capacity" && data["code"] == "free_space_limit"
+    )
 }
 
 pub(super) fn safe_action_error(error: &DaemonError) -> &'static str {
@@ -2275,5 +2534,6 @@ fn manager_launch_config(
         topology_node_id: None,
         topology_iteration: 0,
         closure_selector: None,
+        structured_handoff: false,
     })
 }

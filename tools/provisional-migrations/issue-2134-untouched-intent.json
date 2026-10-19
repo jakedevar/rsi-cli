@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "version": 173,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v173.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:278c00682c05ca0f484e5cbe66da2a706ab02e81d8cb87746d64303f27382f4e",
+      "sites": [
+        {
+          "anchor": "fn migrate_v173(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 173 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 173)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/cohort_settlement/untouched_intent.rs",
+      "path_template": "crates/rsid-store/src/store/cohort_settlement/untouched_intent.rs",
+      "source_blob": "sha256:5d97cad8cec10d2cd335b6e3f8b58359ea6f16aa16cb90805c0b1ef68759857f",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v173-settlement-untouched-intent",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-untouched-intent",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v173-settlement-untouched-intent",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-untouched-intent",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:a8b1a63af1c50765ad8b653757c2fd3aa249ca110acfcc956247a870cb15c267",
+      "sites": [
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-BEGIN: v173-settlement-untouched-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-BEGIN: v${VERSION}-settlement-untouched-altered-objects",
+          "scope": "unit"
+        },
+        {
+          "anchor": "(173, &[\"settlement_completion_retries_insert\"]),",
+          "replacement": "(${VERSION}, &[\"settlement_completion_retries_insert\"]),",
+          "scope": "unit"
+        },
+        {
+          "anchor": "// RSI-RELEASED-MIGRATION-END: v173-settlement-untouched-altered-objects",
+          "replacement": "// RSI-RELEASED-MIGRATION-END: v${VERSION}-settlement-untouched-altered-objects",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:cd63a8bcd9cb89ec2021e22dae10f673147b32628121aa42175f915b71a95639",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 173;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 173 && target < 173 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 173 - 1).unwrap();",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION} - 1).unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 173,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "docs/cohort-settlement.md",
+      "path_template": "docs/cohort-settlement.md",
+      "source_blob": "sha256:686b8e5eb55123c51346d790a141bf682ae2816ec3953435cf03e6b7be258d2b",
+      "sites": [
+        {
+          "anchor": "V173 also admits the exact retained-intent fence",
+          "replacement": "V${VERSION} also admits the exact retained-intent fence",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

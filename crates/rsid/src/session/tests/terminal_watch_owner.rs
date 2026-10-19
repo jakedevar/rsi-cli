@@ -64,6 +64,11 @@ async fn terminal_watch_holds_own_wakes_and_excludes_pending_siblings_until_fina
                         &WakeWhenState {
                             predicate: WakePredicate {
                                 sha_on_rolling: None,
+                                issue_closed: None,
+                                todo_closed: None,
+                                topology_execution_settled: None,
+                                health_anomaly: None,
+                                settlement_run_settled: None,
                                 jobs_terminal: Some(vec![job.id]),
                             },
                             armed_at: chrono::Utc::now(),
@@ -692,4 +697,77 @@ async fn explicit_name_rearm_after_continue_delivers_next_terminal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_child_watch_rearm_after_continue_delivers_next_terminal() {
     rearm_after_continue_delivers_next_terminal(false).await;
+}
+
+/// #2501 fixture: an Interrupted launcher, a worker it launched, and the
+/// delivery watch the worker's message armed on that launcher.
+async fn launcher_notice_fixture(
+    manager: &SessionManager,
+    handoff: Option<&str>,
+    watch_name: &str,
+) -> (Uuid, rsi_common::types::ScheduledJob) {
+    let launcher = Uuid::new_v4();
+    let worker = Uuid::new_v4();
+    insert_row(manager, &bare_session(launcher)).await;
+    let mut row = bare_session(worker);
+    row.parent_id = Some(launcher);
+    insert_row(manager, &row).await;
+    {
+        let store = manager.store.lock().await;
+        store
+            .update_session_status(launcher, SessionStatus::Interrupted)
+            .unwrap();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        for (sequence, role, content) in [
+            (1, "User", "implement the issue"),
+            (2, "Assistant", handoff.unwrap_or("still waiting on my job")),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at)
+                     VALUES(?1,?2,'Message',?3,?4,?5)",
+                    rusqlite::params![worker.to_string(), sequence, role, content, now],
+                )
+                .unwrap();
+        }
+    }
+    let mut watch = mk_watch_job_for(launcher, worker, "launcher ended");
+    watch.name = watch_name.to_string();
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&watch)
+        .unwrap();
+    (worker, watch)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn finished_worker_is_not_resumed_when_its_launcher_goes_terminal_2501() {
+    let handoff = "PIPELINE HANDOFF — IMPLEMENTATION:\nstatus: complete";
+    for name in ["agent-message-x", "rsi-watch"] {
+        let (manager, _dir) = manager();
+        let (worker, watch) = launcher_notice_fixture(&manager, Some(handoff), name).await;
+        let plan = manager.plan_terminal_watch_fire(&watch).await.unwrap();
+        let WatchFirePlan::Abandon(reason) = plan else {
+            panic!("finished worker {worker} must retire the launcher watch ({name}): {plan:?}");
+        };
+        assert!(reason.starts_with(WATCH_ABANDON_OWNER_FINISHED), "{reason}");
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+#[tokio::test]
+async fn parked_worker_still_hears_its_launcher_go_terminal_2501() {
+    for name in ["agent-message-x", "rsi-watch"] {
+        let (manager, _dir) = manager();
+        let (_worker, watch) = launcher_notice_fixture(&manager, None, name).await;
+        let plan = manager.plan_terminal_watch_fire(&watch).await.unwrap();
+        assert!(
+            matches!(plan, WatchFirePlan::Deliver { .. }),
+            "unfinished worker must still be notified ({name}): {plan:?}"
+        );
+    }
 }

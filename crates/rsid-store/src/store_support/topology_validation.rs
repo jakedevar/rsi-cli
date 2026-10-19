@@ -383,11 +383,13 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
             .and_then(|node| node.step);
         let from_review = matches!(source_step, Some(TopologyStep::Review { .. }));
         match edge.when {
-            // A review that asked for changes still succeeds, so an
-            // unconditioned edge would also carry a rejected commit onward.
+            // A review that asked for changes still succeeds, so a plain
+            // success edge would also carry a rejected commit onward. Only
+            // `success` is refused here; verdict, `failure` and `completed`
+            // edges may leave a review node.
             EdgeWhen::Success if from_review => {
                 return Err(format!(
-                    "edge {} -> {}: edges leaving a review node must be verdict_accepted or verdict_changes_requested",
+                    "edge {} -> {}: a success edge cannot leave a review node; use verdict_accepted or verdict_changes_requested (failure and completed edges are also allowed)",
                     edge.from, edge.to
                 ));
             }
@@ -396,6 +398,14 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
                 if !matches!(source_step, Some(TopologyStep::Gate { .. })) {
                     return Err(format!(
                         "edge {} -> {}: gate_true/gate_false edges must leave a gate node",
+                        edge.from, edge.to
+                    ));
+                }
+            }
+            EdgeWhen::ReviewRequired => {
+                if !matches!(source_step, Some(TopologyStep::Land { .. })) {
+                    return Err(format!(
+                        "edge {} -> {}: review_required edges must leave a land node",
                         edge.from, edge.to
                     ));
                 }
@@ -421,7 +431,22 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
     }
     for node in nodes {
         match node.step {
-            None | Some(TopologyStep::Session { .. }) => {}
+            None => {}
+            // #2249: a verified session names the commit it verifies, so it
+            // must produce one.
+            Some(TopologyStep::Session {
+                expects_commit,
+                require_verified,
+                ..
+            }) => {
+                if *require_verified && !*expects_commit {
+                    return Err(format!(
+                        "node {}: require_verified needs expects_commit (a verified session \
+                         must produce the commit its scoped_test receipt names)",
+                        node.id
+                    ));
+                }
+            }
             // Rule 7: the op is in the catalog and its params validate.
             Some(TopologyStep::Command { op }) => op
                 .validate()
@@ -442,6 +467,7 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
             Some(TopologyStep::Land {
                 accepted,
                 test_filters,
+                ..
             }) => validate_land(node.id, accepted, test_filters, nodes, edges)?,
             // Rule 2: gate paths reference ancestors only.
             Some(TopologyStep::Gate { condition }) => {
@@ -513,10 +539,14 @@ fn validate_review(
     Ok(())
 }
 
-/// Rule 4 for a land node (#1641 S2): `accepted` names a review node, the
-/// queue filters are well formed, and the only input of the land node is the
-/// review's `verdict_accepted` edge (a land that also had another input, or a
-/// loop edge, could publish a commit nobody accepted or publish twice).
+/// Rule 4 for a land node (#1641 S2, #2249): `accepted` names a review node
+/// or a `require_verified` session node, the queue filters are well formed,
+/// and the only input of the land node is the accepted node's acceptance edge
+/// (a land that also had another input, or a loop edge, could publish a commit
+/// nobody accepted or publish twice). A review is accepted by its
+/// `verdict_accepted` edge; a verified session by its `success` edge, which
+/// is taken only when the daemon found its own `scoped_test` receipt for the
+/// result commit.
 fn validate_land(
     id: &str,
     accepted: &str,
@@ -534,27 +564,37 @@ fn validate_land(
             rsi_common::rolling_queue::ROLLING_QUEUE_MAX_TEST_FILTERS
         ));
     }
-    let Some(review) = nodes.iter().find(|node| node.id == accepted) else {
+    let Some(accepted_node) = nodes.iter().find(|node| node.id == accepted) else {
         return Err(format!(
             "node {id}: land.accepted names unknown node {accepted}"
         ));
     };
-    if !matches!(review.step, Some(TopologyStep::Review { .. })) {
-        return Err(format!(
-            "node {id}: land.accepted {accepted} must be a review node"
-        ));
-    }
+    let acceptance = match accepted_node.step {
+        Some(TopologyStep::Review { .. }) => EdgeWhen::VerdictAccepted,
+        Some(TopologyStep::Session {
+            require_verified: true,
+            ..
+        }) => EdgeWhen::Success,
+        _ => {
+            return Err(format!(
+                "node {id}: land.accepted {accepted} must be a review node or a session node \
+                 with require_verified"
+            ));
+        }
+    };
     let inputs: Vec<&StepEdge<'_>> = edges.iter().filter(|edge| edge.to == id).collect();
     let only_accepted = matches!(
         inputs.as_slice(),
-        [edge] if edge.from == accepted
-            && !edge.loop_edge
-            && edge.when == EdgeWhen::VerdictAccepted
+        [edge] if edge.from == accepted && !edge.loop_edge && edge.when == acceptance
     );
     if !only_accepted {
+        let edge = if acceptance == EdgeWhen::Success {
+            "success edge from verified session"
+        } else {
+            "verdict_accepted edge from review"
+        };
         return Err(format!(
-            "node {id}: a land node's only input must be the verdict_accepted edge from review \
-             node {accepted}"
+            "node {id}: a land node's only input must be the {edge} node {accepted}"
         ));
     }
     if edges.iter().any(|edge| edge.loop_edge && edge.from == id) {

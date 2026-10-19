@@ -9,6 +9,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::SessionManager;
+
+/// A periodic pass that keeps the shared Store this long is logged (#3021).
+const SLOW_STORE_HOLD_MS: u64 = 100;
 use crate::bus::DaemonEvent;
 use crate::error::Result;
 use crate::store::harness_manager_v2::refused;
@@ -25,7 +28,11 @@ impl SessionManager {
         request: AnswerHarnessManagerDecisionRequestV2,
     ) -> Result<ManagerMutationReceiptV2> {
         let receipt = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::answer_harness_manager_decision",
+            )
+            .await;
             store.manager_v2_prepare_decision_answer(&request, |config, key, version, digest| {
                 store.manager_v2_apply_operator_acceptance(config, key, version, digest)
             })?
@@ -41,20 +48,83 @@ impl SessionManager {
     }
 
     pub async fn reconcile_harness_managers_startup(&self) -> Result<usize> {
-        let recovered = self
-            .store
-            .lock()
-            .await
-            .manager_v2_recover_decision_deliveries(self.program_run_boot_id)?;
+        let recovered = crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::reconcile_harness_managers_startup",
+        )
+        .await
+        .manager_v2_recover_decision_deliveries(self.program_run_boot_id)?;
         let actions = self.reconcile_manager_actions_startup().await?;
         // A seat attempt claimed by an earlier boot has no owner now. It is
         // made uncertain, never relaunched (#669).
-        let seats = self
-            .store
-            .lock()
-            .await
-            .recover_manager_seat_claims(Some(self.program_run_boot_id))?;
+        let seats = crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::reconcile_harness_managers_startup",
+        )
+        .await
+        .recover_manager_seat_claims(Some(self.program_run_boot_id))?;
         Ok(recovered + actions + seats + self.reconcile_harness_managers_once().await?)
+    }
+
+    /// #2753: refresh the stale CLI login probes in the background (one probe
+    /// in flight per provider) and record one deduped notice per project for
+    /// each provider that went from `logged_in` to `logged_out`.
+    async fn reconcile_provider_login_notices(&self, projects: &[Uuid]) -> usize {
+        self.provider_login.spawn_refresh_stale();
+        let mut changed = 0;
+        for (provider, transitioned_at) in self.provider_login.logout_transitions() {
+            for project in projects {
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_provider_login_notices",
+                )
+                .await
+                .record_provider_login_required_notice(
+                    *project,
+                    provider,
+                    transitioned_at,
+                ) {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"provider login notice deferred");
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// #2755: re-run the provider CLI contract canary for any CLI whose version
+    /// changed since its last result (a stat of each binary; nothing runs
+    /// otherwise), and record one deduped notice per project for each provider
+    /// that is degraded, per episode.
+    async fn reconcile_provider_contract_notices(&self, projects: &[Uuid]) -> usize {
+        self.spawn_provider_contract_check();
+        let mut changed = 0;
+        for (provider, reason, since, detail) in self.provider_contract.degraded_episodes() {
+            for project in projects {
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_provider_contract_notices",
+                )
+                .await
+                .record_provider_contract_degraded_notice(
+                    *project,
+                    provider,
+                    &reason,
+                    detail.as_deref(),
+                    since,
+                ) {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"provider contract notice deferred");
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// One cursor/guard serializes startup, event hints and periodic backstop.
@@ -67,26 +137,32 @@ impl SessionManager {
         // the completed, optional Health projection.
         let worker_pressure = crate::process_scope::worker_slice_memory_pressure().await;
         let pressure_observed_at = chrono::Utc::now();
-        let projects = self
-            .store
-            .lock()
-            .await
-            .manager_v2_projects_after(*cursor, 8)?;
+        let projects = crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::reconcile_harness_managers_once",
+        )
+        .await
+        .manager_v2_projects_after(*cursor, 8)?;
         let closure_changes = self.retry_appserver_approval_closures().await?;
         let mut changed = closure_changes + {
             let live = super::pending_approvals::live_incarnations();
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await;
             // Synchronous under the guard already held: no extra await state.
             sweep_superseded_resume_wakes(&store);
             store.expire_appserver_approvals(&live)?
                 + store.manager_v2_recover_decision_deliveries(self.program_run_boot_id)?
                 + store.recover_manager_actions_startup(self.program_run_boot_id)?
         };
-        match self
-            .store
-            .lock()
-            .await
-            .recover_remote_answers(self.program_run_boot_id)
+        match crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::reconcile_harness_managers_once",
+        )
+        .await
+        .recover_remote_answers(self.program_run_boot_id)
         {
             Ok(recovered) => changed += recovered,
             Err(error) => tracing::warn!(%error, "remote answer recovery deferred"),
@@ -100,7 +176,11 @@ impl SessionManager {
             chrono::DateTime<chrono::Utc>,
             chrono::DateTime<chrono::Utc>,
         )> = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await;
             match store.provider_launch_stats(pressure_observed_at) {
                 Ok(stats) => stats
                     .into_iter()
@@ -118,13 +198,48 @@ impl SessionManager {
                 }
             }
         };
+        // #2735: models the provider withdrew; one deduped notice per episode.
+        let unavailable_models = {
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await;
+            match store.models_unavailable(pressure_observed_at) {
+                Ok(models) => models,
+                Err(error) => {
+                    tracing::warn!(error=%error,"unavailable model scan deferred");
+                    Vec::new()
+                }
+            }
+        };
+        // #2753: keep the CLI login probes fresh and notify the managers of a
+        // login loss (boxed: the coordinator future must not grow).
+        changed += Box::pin(self.reconcile_provider_login_notices(&projects)).await;
+        changed += Box::pin(self.reconcile_provider_contract_notices(&projects)).await;
         for project in &projects {
+            for episode in &unavailable_models {
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_harness_managers_once",
+                )
+                .await
+                .record_model_unavailable_notice(*project, episode)
+                {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"model unavailable notice deferred");
+                    }
+                }
+            }
             for (provider, started, last) in &auth_episodes {
-                match self
-                    .store
-                    .lock()
-                    .await
-                    .record_provider_auth_invalid_notice(*project, provider, *started, *last)
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_harness_managers_once",
+                )
+                .await
+                .record_provider_auth_invalid_notice(*project, provider, *started, *last)
                 {
                     Ok(Some(_)) => changed += 1,
                     Ok(None) => {}
@@ -134,7 +249,12 @@ impl SessionManager {
                 }
             }
             if let Some(pressure) = worker_pressure.as_ref() {
-                match self.store.lock().await.record_worker_slice_pressure_notice(
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_harness_managers_once",
+                )
+                .await
+                .record_worker_slice_pressure_notice(
                     *project,
                     pressure,
                     pressure_observed_at,
@@ -146,32 +266,29 @@ impl SessionManager {
                     }
                 }
             }
-            let reconciled = {
-                let store = self.store.lock().await;
-                store.reconcile_manager_intent(
-                    *project,
-                    self.runtime_config.retry_enabled.load(Ordering::Relaxed),
-                )
-            };
+            let reconciled = Box::pin(self.reconcile_manager_intent_off_lock(*project)).await;
             match reconciled {
                 Ok(result) => {
                     changed += result.changed;
                     if result.changed > 0 {
                         self.event_bus.publish(DaemonEvent::SystemMessage {level:if result.blocked>0 {"warn"} else {"info"}.into(),message:format!("Harness manager {project}: {} unfinished deliverables, {} blocked Epics, {} recovery actions admitted. Read the manager board for evidence and next actions.",result.unfinished,result.blocked,result.queued)});
                     }
-                    self.store
-                        .lock()
-                        .await
-                        .manager_v2_coordinator_error(*project, None)?;
+                    crate::store_lock::lock(
+                        &self.store,
+                        "manager_coordinator::reconcile_harness_managers_once",
+                    )
+                    .await
+                    .manager_v2_coordinator_error(*project, None)?;
                 }
                 Err(error) => {
                     // One malformed/oversized project must not starve others.
                     tracing::warn!(project_id=%project,error=%error,"manager intent reconciliation deferred");
-                    let new_evidence = self
-                        .store
-                        .lock()
-                        .await
-                        .manager_v2_coordinator_error(*project, Some(&error.to_string()))?;
+                    let new_evidence = crate::store_lock::lock(
+                        &self.store,
+                        "manager_coordinator::reconcile_harness_managers_once",
+                    )
+                    .await
+                    .manager_v2_coordinator_error(*project, Some(&error.to_string()))?;
                     if new_evidence {
                         self.event_bus.publish(DaemonEvent::SystemMessage {
                             level: "warn".into(),
@@ -182,32 +299,44 @@ impl SessionManager {
             }
             // Boxed: the seat executor must not grow the coordinator future.
             changed += Box::pin(self.reconcile_manager_seat(*project)).await;
-            let notice_config = self
-                .store
-                .lock()
-                .await
-                .get_harness_manager_notice_config(*project)?;
+            let notice_config = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await
+            .get_harness_manager_notice_config(*project)?;
             if let Some(config) = notice_config {
-                if let Err(error) = self
-                    .store
-                    .lock()
-                    .await
-                    .manager_v2_reconcile_notices(&config)
+                if let Err(error) = crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::manager_v2_reconcile_notices",
+                )
+                .await
+                .manager_v2_reconcile_notices(&config)
                 {
                     tracing::warn!(project_id=%project,error=%error,"manager notice deferred; durable board retains obligation");
                 }
             }
-            let config = self.store.lock().await.get_harness_manager(*project)?;
+            let config = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await
+            .get_harness_manager(*project)?;
             if let Some(config) = config {
                 for _ in 0..4 {
-                    let delivery = self
-                        .store
-                        .lock()
-                        .await
-                        .manager_v2_claim_decision_delivery(&config, self.program_run_boot_id)?;
+                    let delivery = crate::store_lock::lock(
+                        &self.store,
+                        "manager_coordinator::reconcile_harness_managers_once",
+                    )
+                    .await
+                    .manager_v2_claim_decision_delivery(&config, self.program_run_boot_id)?;
                     let Some(delivery) = delivery else { break };
                     let outcome = self.deliver_manager_decision(delivery.clone()).await;
-                    let store = self.store.lock().await;
+                    let store = crate::store_lock::lock(
+                        &self.store,
+                        "manager_coordinator::reconcile_harness_managers_once",
+                    )
+                    .await;
                     let Some(record) =
                         store.manager_v2_record(&config, "decision_delivery", &delivery.key)?
                     else {
@@ -248,11 +377,12 @@ impl SessionManager {
         // ceil(n / MANAGER_SEAT_V1_PAGE) passes.
         {
             let mut v1_cursor = self.manager_seat_v1_cursor.lock().await;
-            let v1_projects = self
-                .store
-                .lock()
-                .await
-                .manager_seat_v1_projects_after(*v1_cursor, MANAGER_SEAT_V1_PAGE)?;
+            let v1_projects = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_harness_managers_once",
+            )
+            .await
+            .manager_seat_v1_projects_after(*v1_cursor, MANAGER_SEAT_V1_PAGE)?;
             *v1_cursor = if v1_projects.len() < MANAGER_SEAT_V1_PAGE {
                 None
             } else {
@@ -275,6 +405,88 @@ impl SessionManager {
         Ok(changed)
     }
 
+    /// #2939: one project's intent pass without holding the shared Store lock
+    /// for its reads. Under the lock: reuse a memo whose inputs are unchanged,
+    /// else pin the input version. Off the lock: the read-only observation on
+    /// the coordinator's own connection. Under the lock again: the pass, which
+    /// uses the observation only if no input changed since the pin and reads
+    /// again otherwise. The hub's rsi project held the lock ~0.5 s every 10 s.
+    async fn reconcile_manager_intent_off_lock(
+        &self,
+        project: Uuid,
+    ) -> Result<crate::store::manager_intent::ManagerIntentReconciliationV2> {
+        let retry = self.runtime_config.retry_enabled.load(Ordering::Relaxed);
+        let (pin, path) = {
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_manager_intent_off_lock:pin",
+            )
+            .await;
+            if store.manager_intent_memoized(project)? {
+                return store.reconcile_manager_intent(project, retry);
+            }
+            (
+                store.manager_intent_input_pin()?,
+                store.database_path().map(std::path::PathBuf::from),
+            )
+        };
+        let observed = match (pin, path) {
+            (Some(pin), Some(path)) => {
+                let observer = std::sync::Arc::clone(&self.manager_intent_observer);
+                let observed = tokio::task::spawn_blocking(move || {
+                    let mut slot = observer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let observer = match slot.as_ref() {
+                        Some(observer) => observer,
+                        None => slot.insert(crate::store::Store::open_read_only_observer(&path)?),
+                    };
+                    let observed = observer.observe_manager_intent(project, pin);
+                    if observed.is_err() {
+                        // Reopen on the next pass rather than reuse a broken handle.
+                        *slot = None;
+                    }
+                    observed
+                })
+                .await;
+                match observed {
+                    Ok(Ok(observed)) => observed,
+                    Ok(Err(error)) => {
+                        tracing::debug!(project_id=%project,error=%error,"manager intent observation read under the Store lock instead");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"manager intent observation task failed");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let observation_offered = observed.is_some();
+        let guard = crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::reconcile_manager_intent_off_lock:apply",
+        )
+        .await;
+        let held_since = std::time::Instant::now();
+        let result = guard.reconcile_manager_intent_observed(project, retry, observed);
+        let held_ms = held_since.elapsed().as_millis() as u64;
+        drop(guard);
+        // #3021: a periodic pass that holds the shared Store for a long time
+        // says whether it had to re-read what the off-lock observation covers.
+        if held_ms >= SLOW_STORE_HOLD_MS {
+            tracing::warn!(
+                project_id = %project,
+                held_ms,
+                observation_offered,
+                read_under_lock = result.as_ref().is_ok_and(|r| r.read_under_lock),
+                "manager intent pass held the Store lock"
+            );
+        }
+        result
+    }
+
     /// Issue #669: classify the appointed manager seat, publish a
     /// `[manager-seat]` `SystemMessage` on each state change, and execute at
     /// most one claimed in-place resume of the SAME tip row and sandbox.
@@ -295,7 +507,11 @@ impl SessionManager {
             self.active.read().await.keys().copied().collect();
         let retry_enabled = self.runtime_config.retry_enabled.load(Ordering::Relaxed);
         let pass = {
-            let store = self.store.lock().await;
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::reconcile_manager_seat_inner",
+            )
+            .await;
             // The cursor excludes every other pass, so no live executor owns
             // a running claim here; an abandoned one becomes uncertain.
             let mut changed = store.recover_manager_seat_claims(None)?;
@@ -340,11 +556,12 @@ impl SessionManager {
                 ),
             );
             for _ in 0..20 {
-                let tip = match manager
-                    .store
-                    .lock()
-                    .await
-                    .get_harness_manager_notice_config(project)
+                let tip = match crate::store_lock::lock(
+                    &manager.store,
+                    "manager_coordinator::notify_manager_policy_revoked",
+                )
+                .await
+                .get_harness_manager_notice_config(project)
                 {
                     Ok(Some(config)) => config.current_session_id,
                     _ => None,
@@ -397,10 +614,12 @@ impl SessionManager {
             tracing::warn!(project_id=%project,session_id=%claim.tip_session_id,error=%error,"manager seat recovery attempt did not establish a continuation");
         }
         Ok(usize::from(
-            self.store.lock().await.finish_manager_seat_claim(
-                &claim,
-                outcome.as_ref().copied().map_err(String::as_str),
-            )?,
+            crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::execute_manager_seat_claim",
+            )
+            .await
+            .finish_manager_seat_claim(&claim, outcome.as_ref().copied().map_err(String::as_str))?,
         ))
     }
 
@@ -410,10 +629,12 @@ impl SessionManager {
     ) -> Result<()> {
         self.check_question_runtime(decision_session(delivery)?, &delivery.target)
             .await?;
-        self.store
-            .lock()
-            .await
-            .manager_v2_check_decision_target(delivery)?;
+        crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::check_manager_decision_runtime",
+        )
+        .await
+        .manager_v2_check_decision_target(delivery)?;
         Ok(())
     }
 
@@ -466,10 +687,12 @@ impl SessionManager {
     ) -> Result<()> {
         let target = decision_session(delivery)?;
         self.check_manager_decision_runtime(delivery).await?;
-        self.store
-            .lock()
-            .await
-            .clear_pending_question_exact(target, &delivery.target)
+        crate::store_lock::lock(
+            &self.store,
+            "manager_coordinator::clear_delivered_manager_question",
+        )
+        .await
+        .clear_pending_question_exact(target, &delivery.target)
     }
 }
 

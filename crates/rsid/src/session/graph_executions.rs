@@ -80,6 +80,7 @@ impl SessionManager {
             current_nodes: Vec::new(),
             on_call: None,
             rulings: Vec::new(),
+            node_attempts: Vec::new(),
             updates: Vec::new(),
         };
 
@@ -211,6 +212,10 @@ impl SessionManager {
             let store = session_manager.store.lock().await;
             crate::topology::starters::resolve_issue_input(&store, project_id, input)?
         };
+        // #2260: a `close_issue` land needs the Issue it closes.
+        if !dry_run {
+            crate::topology::starters::require_issue_input(&steps, input.as_ref())?;
+        }
 
         // #634: live executions are durable unless the operator kill switch
         // routes them to the legacy in-memory runner (rollback path).
@@ -261,6 +266,7 @@ impl SessionManager {
             current_nodes: Vec::new(),
             on_call: None,
             rulings: Vec::new(),
+            node_attempts: Vec::new(),
             updates: Vec::new(),
         };
 
@@ -479,48 +485,49 @@ impl SessionManager {
         })
     }
 
-    /// Startup: one bounded recovery pass, then a supervisor that adopts any
-    /// drivable execution without a live driver (plan §2.4) and sweeps
-    /// expired failure pins hourly.
+    /// Startup: one bounded lease-claim pass, then a supervisor that adopts
+    /// any drivable execution without a live driver (plan §2.4) and sweeps
+    /// expired failure pins hourly. Pending discards and settlement cleanup are
+    /// NOT run here (#2375), and neither is `advance` (#2526): an advance
+    /// launches node sessions (sandbox allocation, target seed, provider
+    /// spawn), so the daemon starts the claimed executions' drivers after
+    /// request readiness through [`Self::drive_recovered_topology_executions`]
+    /// and runs settlement recovery through
+    /// [`Self::recover_topology_settlements_after_restart`]. Only the lease
+    /// claim stays before readiness, because RPC admission must not see an
+    /// execution still owned by the previous boot. Returns the claimed ids.
     pub async fn start_topology_executor(
         self: Arc<Self>,
         max_executions: usize,
         time_budget: std::time::Duration,
-    ) {
+    ) -> Vec<Uuid> {
         // #633: native agent topology tools reach the executor from here on.
         let _ = self.topology_agent_self.set(Arc::downgrade(&self));
-        // #1641 S5a: the starter topologies exist before any agent lists them.
-        crate::topology::starters::seed_all(&*self.store.lock().await);
+        // #1641 S5a starter seeding runs after readiness (#2375), through
+        // `Self::seed_starter_topologies_after_restart`.
         let executor = self.topology_executor().await;
-        match crate::topology::recovery::recover_after_restart(
+        let claimed = match crate::topology::recovery::claim_recovery_leases(
             &executor,
             max_executions,
             time_budget,
         )
         .await
         {
-            Ok(report) => {
-                if !report.advanced.is_empty()
-                    || report.deferred
-                    || report.cleanup_steps > 0
-                    || report.discards_completed > 0
-                {
+            Ok(claimed) => {
+                if !claimed.ids.is_empty() || claimed.deferred {
                     tracing::info!(
-                        advanced = report.advanced.len(),
-                        deferred = report.deferred,
-                        cleanup_steps = report.cleanup_steps,
-                        discards_completed = report.discards_completed,
-                        "Topology executor restart recovery pass complete"
+                        claimed = claimed.ids.len(),
+                        deferred = claimed.deferred,
+                        "Topology executor restart recovery leases claimed; drivers start after request_ready"
                     );
                 }
-                for (execution_id, step) in report.advanced {
-                    if step == crate::topology::executor::Step::Wait {
-                        self.drive_topology_execution(executor.clone(), execution_id);
-                    }
-                }
+                claimed.ids
             }
-            Err(error) => tracing::warn!(%error, "Topology executor restart recovery deferred"),
-        }
+            Err(error) => {
+                tracing::warn!(%error, "Topology executor restart recovery deferred");
+                Vec::new()
+            }
+        };
         tokio::spawn(async move {
             let mut ticks: u64 = 0;
             loop {
@@ -551,6 +558,48 @@ impl SessionManager {
                 }
             }
         });
+        claimed
+    }
+
+    /// Post-readiness half of execution restart recovery (#2526): start the
+    /// driver of each execution whose lease [`Self::start_topology_executor`]
+    /// claimed. The driver's own first `advance` is what launches a node
+    /// session, so this is the single place that work begins after a restart.
+    /// Spawns and returns; never awaits a launch.
+    pub async fn drive_recovered_topology_executions(self: Arc<Self>, execution_ids: Vec<Uuid>) {
+        if execution_ids.is_empty() {
+            return;
+        }
+        let executor = self.topology_executor().await;
+        for execution_id in execution_ids {
+            self.drive_topology_execution(executor.clone(), execution_id);
+        }
+    }
+
+    /// Post-readiness half of topology restart recovery (#2375): complete
+    /// pending two-phase discards and run the settlement cleanup (pin and node
+    /// session release, whose git proofs are the slow part). Durable and
+    /// idempotent, and the supervisor loop already runs the same work beside
+    /// RPC traffic, so this must never gate request readiness.
+    pub async fn recover_topology_settlements_after_restart(self: Arc<Self>) {
+        let executor = self.topology_executor().await;
+        let mut report = crate::topology::recovery::RecoveryReport::default();
+        crate::topology::recovery::recover_settlements(&executor, &mut report).await;
+        if report.cleanup_steps > 0 || report.discards_completed > 0 {
+            tracing::info!(
+                cleanup_steps = report.cleanup_steps,
+                discards_completed = report.discards_completed,
+                "Post-readiness topology settlement recovery completed"
+            );
+        }
+    }
+
+    /// Post-readiness starter seeding (#1641 S5a, #2375): the bundled starter
+    /// topologies are inserted or refreshed right after request readiness
+    /// instead of holding the store on the readiness path (about 150 ms on a
+    /// hub). Idempotent, never fails the daemon.
+    pub async fn seed_starter_topologies_after_restart(self: Arc<Self>) {
+        crate::topology::starters::seed_all(&*self.store.lock().await);
     }
 }
 
@@ -696,6 +745,13 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         self.manager.topology_executor_enabled()
     }
 
+    async fn prepare_launch_identity(
+        &self,
+        config: &mut crate::claude::LaunchConfig,
+    ) -> Result<()> {
+        self.manager.freeze_launch_identity(config, false).await
+    }
+
     async fn launch(&self, request: crate::topology::executor::LaunchRequest) -> Result<Uuid> {
         self.manager
             .boxed_launch_session_with_retry_admission(
@@ -732,7 +788,8 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
             Err(error) => {
                 tracing::warn!(%session_id, %error, "topology session observation failed");
                 // A read failure supplies no usable recovery fence. Retain the
-                // ordinary session view; resume_cut_session defers, fail closed.
+                // ordinary session view for the preserve/retry fallback; the
+                // executor records a typed refusal instead of deferring forever.
                 let session = self.manager.get_session(session_id).await?;
                 return Some(crate::topology::executor::SessionObservation {
                     resumable: session.provider
@@ -748,13 +805,34 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
                 });
             }
         };
-        let ended = matches!(
-            durable.status,
-            rsi_common::types::SessionStatus::Interrupted
-                | rsi_common::types::SessionStatus::Failed
-        );
+        // A continuation (a restart-cut resume, a nudge) puts the session in
+        // `active` and persists `Starting` from a spawned task, so the durable
+        // row can still read terminal while the turn is already live. Only
+        // `active` can name that: the completed cache never does, so the
+        // terminal classification still cannot come from it. A live turn
+        // supersedes the stale terminal row and is observed as running.
+        let live = if durable.status.is_terminal() {
+            self.manager
+                .active
+                .read()
+                .await
+                .get(&session_id)
+                .map(|tracked| tracked.session.clone())
+                .filter(|session| !session.status.is_terminal())
+        } else {
+            None
+        };
+        let ended = live.is_none()
+            && matches!(
+                durable.status,
+                rsi_common::types::SessionStatus::Interrupted
+                    | rsi_common::types::SessionStatus::Failed
+            );
         // Live waits retain their in-memory, monotonic-clock projection.
-        let session = if durable.status.is_terminal() {
+        let durable_status = durable.status;
+        let mut session = if let Some(live) = live {
+            live
+        } else if durable.status.is_terminal() {
             durable
         } else {
             self.manager
@@ -762,6 +840,17 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
                 .await
                 .unwrap_or(durable)
         };
+        // #2617: a turn cut during a deploy drain ends in memory (active or
+        // completed cache) before its terminal status is persisted. The
+        // journal ownership and cursor above were read for the durable row, so
+        // a terminal in-memory view over a non-terminal row has no usable
+        // restart classification: reporting it would settle the node as
+        // `preserved_work` while the journal is about to resume it. The
+        // durable status wins until the store catches up (the next
+        // observation reads the terminal row with its restart intent).
+        if !durable_status.is_terminal() && session.status.is_terminal() {
+            session.status = durable_status;
+        }
         // This is the old classification -> cursor gap. The snapshot already
         // owns BOTH, so a real continuation here cannot refresh only the cursor.
         #[cfg(test)]
@@ -798,6 +887,22 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         {
             tracing::debug!(%session_id, %error, "topology node interrupt not delivered");
         }
+    }
+
+    async fn cancel_open_jobs(&self, session_id: Uuid) -> Result<()> {
+        let store = std::sync::Arc::clone(self.manager.store());
+        tokio::task::spawn_blocking(move || {
+            let store = store.blocking_lock();
+            crate::agent_jobs::cancel_open_jobs_of_owner(
+                &store,
+                &*crate::agent_jobs::platform_job_runtime(),
+                session_id,
+                chrono::Utc::now(),
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("topology job cancel: {error}")))?
     }
 
     async fn reclaim(&self, session_id: Uuid) {
@@ -848,6 +953,50 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
             });
     }
 
+    /// #2697: the share of the node wall time after which the owner is told
+    /// how the node is doing. `RSI_TOPOLOGY_WALL_TIME_NOTICE_PERCENT` (0-100,
+    /// read at each decision, `0` off) overrides the default.
+    fn wall_time_notice_percent(&self) -> u32 {
+        std::env::var("RSI_TOPOLOGY_WALL_TIME_NOTICE_PERCENT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map_or(
+                crate::topology::executor::WALL_TIME_NOTICE_PERCENT,
+                |value| value.min(100),
+            )
+    }
+
+    /// #2697: agent mail from the node's own session to the execution's owner;
+    /// an operator execution, or an owner that cannot take mail, gets the
+    /// operator's message bus instead.
+    async fn notify_owner(
+        &self,
+        owner: Option<Uuid>,
+        from_session: Uuid,
+        key: String,
+        message: String,
+    ) {
+        if let Some(owner) = owner {
+            let accepted = self.manager.store.lock().await.accept_agent_message(
+                from_session,
+                None,
+                &rsi_common::agent_coordination::AgentSendMessageRequestV1 {
+                    target_session_id: owner,
+                    message: message.clone(),
+                    idempotency_key: key,
+                    expires_at: Some(Utc::now() + Duration::hours(6)),
+                },
+            );
+            match accepted {
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(%owner, %error, "topology wall-time notice mail refused");
+                }
+            }
+        }
+        self.notify_operator("warn", message);
+    }
+
     /// #1715: the on-call ruling's answer continues the node's own session
     /// through the normal continue path, bound to the exact execution, attempt
     /// and decision and durably claimed before the provider effect.
@@ -866,6 +1015,22 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         self.manager.continue_session(session_id, prompt).await
     }
 
+    /// #2263: an unverified `require_verified` node's own session continues
+    /// with its missing evidence through the K2 fenced path, so a competing
+    /// continuation refuses one of the two (`continuation_target_busy`).
+    async fn continue_unverified(&self, session_id: Uuid, prompt: String) -> Result<()> {
+        let fence = self
+            .manager
+            .capture_exact_continuation_fence(
+                session_id,
+                crate::store::manager_actions::fence::ContinuationAuthorityV1::Automated,
+            )
+            .await?;
+        self.manager
+            .continue_fenced(session_id, prompt, fence)
+            .await
+    }
+
     /// #1728: the restart resume takes the K2 fenced continuation like a
     /// stall nudge, so a competing continuation of the same session refuses
     /// one of the two (`continuation_target_busy`) instead of racing it.
@@ -877,7 +1042,7 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
     ) -> Result<()> {
         let observed_restart_cut = observed_restart_cut.ok_or_else(|| {
             DaemonError::InvalidParam(
-                crate::store::manager_actions::fence::CONTINUATION_TURN_CHANGED.into(),
+                crate::topology::executor::RESTART_OBSERVATION_UNAVAILABLE.into(),
             )
         })?;
         // The cursor comes from the observation that classified the session
@@ -948,6 +1113,22 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
             .load(Ordering::Relaxed)
     }
 
+    fn structured_handoff_default(&self) -> bool {
+        self.manager
+            .runtime_config
+            .structured_handoff_default_enabled()
+    }
+
+    async fn session_provider(
+        &self,
+        session_id: Uuid,
+    ) -> Option<rsi_common::types::SessionProvider> {
+        self.manager
+            .get_session(session_id)
+            .await
+            .map(|session| session.provider)
+    }
+
     fn build_slot_held(
         &self,
         attempt: &crate::topology::store::AttemptRow,
@@ -972,15 +1153,22 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         unattended: bool,
         since: chrono::DateTime<chrono::Utc>,
         attempt: &crate::topology::store::AttemptRow,
-    ) -> bool {
+    ) -> Option<&'static str> {
         // #1641 S4b: the first launches of an operator-requested execution
-        // start when asked; every other node launch waits for the host.
-        unattended
-            && self
+        // start when asked; every other node launch waits for the host's load.
+        // #2562: host pressure (thermal, disk) holds every first launch, the
+        // operator's too, through the same gate (and queue) as manager creates.
+        if unattended {
+            return self
                 .manager
                 .host_load
                 .admit_waiter(attempt.id, since, Some(attempt.session_id))
-                .is_some()
+                .map(crate::host_load::AdmissionHold::reason);
+        }
+        self.manager
+            .host_load
+            .pressure_now()
+            .map(crate::host_pressure::PressureHold::reason)
     }
 
     /// #1641 S1b: a review node's request on the owning project manager's
@@ -1124,6 +1312,63 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         })
     }
 
+    async fn landed_source_tip(&self, repo: std::path::PathBuf, source: String) -> Option<String> {
+        tokio::task::spawn_blocking(move || crate::rolling_queue::landed_tip(&repo, &source))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn land_conflict_blockers(
+        &self,
+        repo: std::path::PathBuf,
+        project_id: Option<Uuid>,
+        entry_id: Uuid,
+    ) -> Vec<Uuid> {
+        let (source, ahead) = {
+            let store = self.manager.store.lock().await;
+            let Some(entry) = store.get_rolling_queue_entry(entry_id).ok().flatten() else {
+                return Vec::new();
+            };
+            let ahead: Vec<(Uuid, i64, String)> = store
+                .live_rolling_queue_sources(project_id, 32)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(id, sequence, _)| *id != entry_id && *sequence < entry.sequence)
+                .collect();
+            (entry.source_commit, ahead)
+        };
+        if ahead.is_empty() {
+            return Vec::new();
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::rolling_queue::conflicting_entries_ahead(
+                &repo,
+                &source,
+                &ahead,
+                crate::rolling_queue::LAND_CONFLICT_SCAN_BUDGET,
+            )
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn commit_off_rolling(&self, repo: std::path::PathBuf, commit: String) -> bool {
+        tokio::task::spawn_blocking(move || {
+            crate::rolling_queue::commit_off_rolling(&repo, &commit)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    async fn land_gate_receipt(
+        &self,
+        entry_id: Uuid,
+    ) -> Option<crate::topology::land::GateReceipt> {
+        let store = self.manager.store.lock().await;
+        crate::topology::land::gate_receipt(&store, entry_id)
+    }
+
     async fn record_oncall_acceptance(
         &self,
         acceptance: crate::topology::review::OncallAcceptance,
@@ -1139,6 +1384,45 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
                 decision_key: acceptance.decision_key,
             },
         )
+    }
+
+    async fn stop_reviewer(&self, assignment_id: Uuid) -> Option<Uuid> {
+        let reviewer = self
+            .manager
+            .store
+            .lock()
+            .await
+            .topology_review_reviewer_session(assignment_id);
+        let session_id = match reviewer {
+            Ok(Some(session_id)) => session_id,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(%assignment_id, %error, "topology reviewer session unreadable");
+                return None;
+            }
+        };
+        let live = self
+            .manager
+            .get_session(session_id)
+            .await
+            .is_some_and(|session| !session.status.is_terminal());
+        if !live {
+            return None;
+        }
+        match self
+            .manager
+            .interrupt_session_from(
+                session_id,
+                crate::terminal_cause::InterruptSource::GraphCancel,
+            )
+            .await
+        {
+            Ok(_) => Some(session_id),
+            Err(error) => {
+                tracing::debug!(%session_id, %error, "topology reviewer interrupt not delivered");
+                None
+            }
+        }
     }
 
     async fn review_status(&self, assignment_id: Uuid) -> crate::topology::review::ReviewStatus {
@@ -1658,6 +1942,33 @@ fn current_nodes(attempts: &[crate::topology::store::AttemptRow]) -> Vec<String>
     nodes
 }
 
+/// #1753: each node's latest attempt (highest iteration, then attempt number),
+/// sorted by node id; a skipped node never launched, so it has none. A retry raises `attempt_no`; a loop revisit raises
+/// `iteration`.
+fn node_attempts(
+    attempts: &[crate::topology::store::AttemptRow],
+) -> Vec<rsi_common::types::TopologyNodeAttemptView> {
+    let mut latest: std::collections::BTreeMap<&str, (u32, u32)> = Default::default();
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.status != crate::topology::store::AttemptStatus::Skipped)
+    {
+        let key = (attempt.iteration, attempt.attempt_no);
+        let entry = latest.entry(attempt.node_id.as_str()).or_insert(key);
+        *entry = (*entry).max(key);
+    }
+    latest
+        .into_iter()
+        .map(
+            |(node_id, (iteration, attempt_no))| rsi_common::types::TopologyNodeAttemptView {
+                node_id: node_id.to_owned(),
+                iteration,
+                attempt_no,
+            },
+        )
+        .collect()
+}
+
 /// The `topology:<execution>:` decisions among `records`, oldest first and
 /// capped at the newest [`MAX_SNAPSHOT_RULINGS`]. The answer is a digest, never
 /// the text.
@@ -1706,7 +2017,8 @@ fn ruling_views(
         .collect()
 }
 
-/// #1641 S6a: add the run-view fields (current nodes, on-call seat, rulings)
+/// #1641 S6a: add the run-view fields (current nodes, on-call seat, rulings,
+/// per-node attempts)
 /// to a durable execution snapshot. All three are re-derived from rows, so a
 /// restart changes nothing; a final execution has no current nodes and no
 /// on-call seat but keeps its rulings.
@@ -1718,8 +2030,10 @@ pub(crate) fn attach_run_view(
     let Some(execution) = rows::load_execution(store, snapshot.execution_id)? else {
         return Ok(());
     };
+    let attempts = rows::load_attempts(store, execution.id)?;
+    snapshot.node_attempts = node_attempts(&attempts);
     if !execution.status.is_final() {
-        snapshot.current_nodes = current_nodes(&rows::load_attempts(store, execution.id)?);
+        snapshot.current_nodes = current_nodes(&attempts);
         let named = oncall::seat_of(execution.input.as_ref());
         snapshot.on_call = Some(
             match oncall::resolve(store, execution.project_id, &named)? {
@@ -1768,7 +2082,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(&state.path().join("rsi.db")).unwrap(),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -1786,7 +2100,12 @@ mod tests {
             store.insert_session(&node).unwrap();
             store.publish_startup_ordinary(node.id).unwrap();
         }
-        // The operator's continuation already runs the session.
+        let effects = SessionNodeEffects {
+            manager: Arc::clone(&manager),
+        };
+        // The executor observes the cut first and holds its fence...
+        let fence = effects.session(node.id).await.unwrap().restart_cut_fence;
+        // ...then the operator's continuation starts running the session.
         let mut running = node.clone();
         running.status = rsi_common::types::SessionStatus::Running;
         manager
@@ -1802,15 +2121,8 @@ mod tests {
             .unwrap()
             .len();
 
-        let effects = SessionNodeEffects {
-            manager: Arc::clone(&manager),
-        };
         let refused = effects
-            .resume_cut_session(
-                node.id,
-                "resume".into(),
-                effects.session(node.id).await.unwrap().restart_cut_fence,
-            )
+            .resume_cut_session(node.id, "resume".into(), fence)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1838,6 +2150,14 @@ mod tests {
             .continue_session_operator(id, "operator continuation".into())
             .await
             .unwrap();
+        finish_scripted_restart_turn(manager, id, process).await
+    }
+
+    async fn finish_scripted_restart_turn(
+        manager: &Arc<SessionManager>,
+        id: Uuid,
+        process: super::super::launch::ControllerCandidateTestProcess,
+    ) -> Uuid {
         assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
         // The continuation returns after installing the provider, while its
         // monitor bootstrap binds the admitted invocation asynchronously.
@@ -1899,7 +2219,7 @@ mod tests {
             }
         })
         .await
-        .expect("real competing continuation terminalized");
+        .expect("real continuation terminalized");
         invocation
     }
 
@@ -1941,6 +2261,83 @@ mod tests {
         node
     }
 
+    /// #1766: a real restart-cut cursor survives both guarded checks in
+    /// continue_fenced and admits exactly one provider turn on the same UUID.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn restart_resume_with_a_real_fence_starts_and_completes_the_same_session() {
+        use crate::config::{Config, RuntimeConfig};
+        use crate::topology::executor::NodeEffects;
+        use rsi_common::types::SessionStatus;
+
+        for status in [SessionStatus::Interrupted, SessionStatus::Failed] {
+            let state = crate::test_support::disk_backed_tempdir("restart-resume-success");
+            restart_resume_repo(state.path());
+            let manager = Arc::new(
+                SessionManager::new(
+                    Arc::new(crate::bus::EventBus::new(16)),
+                    crate::store::Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
+                    false,
+                    state.path().join("daemon.sock"),
+                    None,
+                    Vec::new(),
+                    RuntimeConfig::from_config(&Config::from_env()),
+                    state.path().join("sandboxes"),
+                )
+                .unwrap(),
+            );
+            let mut node = resumable_restart_node(Uuid::new_v4(), state.path());
+            node.status = status;
+            if status == SessionStatus::Failed {
+                node.stop_reason = None; // An unjournaled crash.
+            }
+            {
+                let mut store = manager.store.lock().await;
+                store.insert_session(&node).unwrap();
+                store.publish_startup_ordinary(node.id).unwrap();
+            }
+            let effects = SessionNodeEffects {
+                manager: Arc::clone(&manager),
+            };
+            let observed = effects.session(node.id).await.unwrap();
+            assert!(observed.resumable && observed.cut_by_restart());
+            let fence = observed.restart_cut_fence.unwrap();
+            assert_eq!(fence.status, status);
+            assert_eq!(fence.stop_reason, node.stop_reason);
+            let process = super::super::launch::install_controller_candidate_test_process(node.id);
+            let prompt = rsi_common::daemon_message::wrap(
+                "daemon-restart",
+                "Continue the task from its durable state.",
+            );
+            effects
+                .resume_cut_session(node.id, prompt.clone(), Some(fence))
+                .await
+                .unwrap();
+            let invocation = finish_scripted_restart_turn(&manager, node.id, process).await;
+            let store = manager.store.lock().await;
+            let completed = store.get_session(node.id).unwrap().unwrap();
+            assert_eq!(completed.status, SessionStatus::Completed);
+            assert_eq!(
+                store.session_model_invocation_id(node.id).unwrap(),
+                Some(invocation)
+            );
+            assert!(
+                store
+                    .load_events(node.id)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.role == Some(rsi_common::types::Role::User)
+                        && event.content.contains(&prompt)),
+                "the restart prompt reached the real continued turn"
+            );
+            let admitted: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM model_invocations WHERE session_id=?1 AND admission_status='admitted'",
+                [node.id.to_string()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(admitted, 1, "one invocation on the original session");
+        }
+    }
+
     /// #1728: an operator continuation of the same session that starts AND
     /// completes after the executor's restart-cut observation but before the
     /// resume takes the guard leaves nothing active, yet the stale resume is
@@ -1958,7 +2355,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(&state.path().join("rsi.db")).unwrap(),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -2046,19 +2443,18 @@ mod tests {
         assert_eq!(admitted, 1);
     }
 
-    /// #1728 round 3: the real operator turn starts and terminalizes at the
-    /// old classification -> cursor boundary. Recovery must defer and follow
-    /// the next observation, without preserving or admitting another turn.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
-    #[tokio::test]
-    async fn restart_observation_defers_after_a_real_competing_turn_in_the_read_gap() {
+    async fn restart_observation_fixture(
+        label: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<SessionManager>,
+        Uuid,
+        rsi_common::types::Session,
+    ) {
         use crate::config::{Config, RuntimeConfig};
-        use crate::topology::{
-            executor::{Executor, Step},
-            store as rows,
-        };
+        use crate::topology::store as rows;
 
-        let state = crate::test_support::disk_backed_tempdir("restart-observation-race-");
+        let state = crate::test_support::disk_backed_tempdir(label);
         let base = restart_resume_repo(state.path());
         let runtime = RuntimeConfig::from_config(&Config::from_env());
         runtime
@@ -2067,7 +2463,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(crate::bus::EventBus::new(16)),
-                crate::store::Store::open(&state.path().join("rsi.db")).unwrap(),
+                crate::store::Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -2079,7 +2475,7 @@ mod tests {
         );
         let definition = WorkflowDefinition {
             version: "1.0".into(),
-            name: "restart race".into(),
+            name: "restart observation".into(),
             description: String::new(),
             nodes: vec![rsi_graph::format::NodeDef::action("A", "A")],
             edges: Vec::new(),
@@ -2141,6 +2537,131 @@ mod tests {
             store.publish_startup_ordinary(node.id).unwrap();
             node
         };
+        (state, manager, execution, node)
+    }
+
+    /// #1766: a persistent snapshot read failure records one typed refusal
+    /// and preserves diverged work instead of leaving the execution Running.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn restart_observation_read_error_records_resume_refusal_and_preserves_work() {
+        use crate::topology::{
+            executor::{Executor, NodeEffects, RESTART_OBSERVATION_UNAVAILABLE},
+            store as rows,
+        };
+
+        let (state, manager, execution, node) =
+            restart_observation_fixture("restart-observation-error-").await;
+        let sandbox = crate::test_support::disk_backed_tempdir("restart-observation-preserve-");
+        let cloned = std::process::Command::new("git")
+            .args(["clone", "-q"])
+            .arg(state.path())
+            .arg(sandbox.path())
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        std::fs::write(
+            sandbox.path().join("partial.txt"),
+            "durable unfinished work\n",
+        )
+        .unwrap();
+        let attempt =
+            {
+                let store = manager.store.lock().await;
+                let attempt = rows::load_attempts(&store, execution).unwrap().remove(0);
+                rows::record_sandbox_root(&store, attempt.id, sandbox.path()).unwrap();
+                // Corrupt only the snapshot's cursor field: ordinary session reads
+                // and the executor's writes continue to work, but every snapshot
+                // read fails SQLite's integer conversion. No one-shot fake.
+                assert_eq!(store.conn.execute(
+                "UPDATE session_execution_projections SET custody_generation='unreadable'
+                   WHERE session_id=?1", [node.id.to_string()],
+            ).unwrap(), 1);
+                assert!(store.restart_cut_observation(node.id).is_err());
+                attempt
+            };
+        let effects = Arc::new(SessionNodeEffects {
+            manager: Arc::clone(&manager),
+        });
+        for _ in 0..3 {
+            let observed = effects.session(node.id).await.unwrap();
+            assert!(observed.cut_by_restart());
+            assert!(observed.restart_cut_fence.is_none());
+        }
+        let refused = effects
+            .resume_cut_session(node.id, "resume".into(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, DaemonError::InvalidParam(ref code) if code == RESTART_OBSERVATION_UNAVAILABLE)
+        );
+        let provider = super::super::launch::install_controller_candidate_test_process(node.id);
+        let boot_id = Uuid::new_v4();
+        let executor = Executor::new(Arc::clone(&manager.store), effects, boot_id, Arc::default());
+        for _ in 0..3 {
+            executor.advance(execution).await.unwrap();
+        }
+        super::super::launch::drop_controller_candidate_test_process(node.id);
+        assert_eq!(provider.productive_start_count.load(Ordering::SeqCst), 0);
+        let store = manager.store.lock().await;
+        assert!(
+            store.restart_cut_observation(node.id).is_err(),
+            "the read failure persists"
+        );
+        assert!(rows::node_resume_tried(&store, attempt.id, boot_id).unwrap());
+        let preserved = rows::load_attempts(&store, execution).unwrap().remove(0);
+        // #2549: the first restart loss with diverged work settles the attempt
+        // interrupted (infrastructure, not the node budget) with the work
+        // preserved; the next attempt forks from the preserved commit.
+        assert_eq!(preserved.status, rows::AttemptStatus::Interrupted);
+        assert!(preserved.preserved_commit.is_some());
+        assert_ne!(
+            rows::load_execution(&store, execution)
+                .unwrap()
+                .unwrap()
+                .status,
+            rows::ExecutionStatus::Blocked,
+            "the one automatic retry is still pending"
+        );
+        let reasons: Vec<String> = store
+            .conn
+            .prepare(
+                "SELECT json_extract(payload_json,'$.detail.reason') FROM topology_events
+               WHERE attempt_id=?1 AND kind='node_resume_refused'",
+            )
+            .unwrap()
+            .query_map([attempt.id.to_string()], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(reasons.len(), 1, "one bounded resume refusal");
+        assert!(
+            reasons[0].contains(RESTART_OBSERVATION_UNAVAILABLE),
+            "{reasons:?}"
+        );
+        assert!(
+            store.load_events(node.id).unwrap().is_empty(),
+            "no continuation was delivered"
+        );
+    }
+
+    /// #1728 round 3: the real operator turn starts and terminalizes at the
+    /// old classification -> cursor boundary. Recovery must defer and follow
+    /// the next observation, without preserving or admitting another turn.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn restart_observation_defers_after_a_real_competing_turn_in_the_read_gap() {
+        use crate::topology::{
+            executor::{Executor, Step},
+            store as rows,
+        };
+
+        let (_state, manager, execution, node) =
+            restart_observation_fixture("restart-observation-race-").await;
         let effects = Arc::new(SessionNodeEffects {
             manager: Arc::clone(&manager),
         });
@@ -2266,7 +2787,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(&state.path().join("rsi.db")).unwrap(),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -2347,7 +2868,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(&state.path().join("rsi.db")).unwrap(),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -2459,6 +2980,7 @@ mod tests {
                 current_nodes: Vec::new(),
                 on_call: None,
                 rulings: Vec::new(),
+                node_attempts: Vec::new(),
                 updates: Vec::new(),
             },
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -2569,6 +3091,25 @@ mod tests {
         ];
         assert_eq!(current_nodes(&attempts), vec!["review".to_string()]);
 
+        // #1753: the latest attempt per node, by iteration then attempt number.
+        let mut revisited = attempt("review", AttemptStatus::Running);
+        revisited.iteration = 1;
+        revisited.attempt_no = 2;
+        let mut earlier = attempt("review", AttemptStatus::Failed);
+        earlier.iteration = 1;
+        let views = node_attempts(&[
+            revisited,
+            earlier,
+            attempt("review", AttemptStatus::Succeeded),
+            attempt("implement", AttemptStatus::Succeeded),
+            attempt("fix", AttemptStatus::Skipped),
+        ]);
+        let pairs: Vec<_> = views
+            .iter()
+            .map(|view| (view.node_id.as_str(), view.iteration, view.attempt_no))
+            .collect();
+        assert_eq!(pairs, vec![("implement", 0, 1), ("review", 1, 2)]);
+
         let run = Uuid::new_v4();
         let record = |key: String, n: usize, payload: serde_json::Value| ManagerRecordV2 {
             kind: "decision".into(),
@@ -2648,7 +3189,7 @@ mod tests {
         let manager = Arc::new(
             SessionManager::new(
                 Arc::new(EventBus::new(16)),
-                Store::open(&state.path().join("rsi.db")).unwrap(),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
                 false,
                 state.path().join("daemon.sock"),
                 None,
@@ -2696,10 +3237,12 @@ mod tests {
         let now = Utc::now();
         let (older_since, younger_since) = (now - Duration::minutes(5), now);
 
-        assert!(effects.launch_held(true, older_since, &older));
-        assert!(effects.launch_held(true, younger_since, &younger));
+        assert!(effects.launch_held(true, older_since, &older).is_some());
+        assert!(effects.launch_held(true, younger_since, &younger).is_some());
         assert!(
-            !effects.launch_held(false, younger_since, &younger),
+            effects
+                .launch_held(false, younger_since, &younger)
+                .is_none(),
             "an operator-requested execution is never held"
         );
         let status = manager.host_load().status(&[]);
@@ -2716,11 +3259,117 @@ mod tests {
 
         *load.lock().unwrap() = 10.0;
         assert!(
-            effects.launch_held(true, younger_since, &younger),
+            effects.launch_held(true, younger_since, &younger).is_some(),
             "the younger node does not overtake the older one"
         );
-        assert!(!effects.launch_held(true, older_since, &older));
-        assert!(!effects.launch_held(true, younger_since, &younger));
+        assert!(effects.launch_held(true, older_since, &older).is_none());
+        assert!(effects.launch_held(true, younger_since, &younger).is_none());
+        assert!(manager.host_load().status(&[]).held.is_empty());
+    }
+
+    /// #2562: the production effects hold a node launch while the host is over
+    /// the thermal ceiling or under the disk floor, an operator execution's first
+    /// node included, and release it oldest-first once the stubbed temperature
+    /// drops.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn host_pressure_holds_topology_launches_until_the_host_cools() {
+        use crate::bus::EventBus;
+        use crate::config::{Config, RuntimeConfig};
+        use crate::host_pressure::PressureHold;
+        use crate::store::Store;
+        use crate::topology::executor::NodeEffects;
+        use crate::topology::store::{AttemptRow, AttemptStatus};
+        use rsid_core::thermal_guard::ThermalHold;
+
+        let state = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(
+            SessionManager::new(
+                Arc::new(EventBus::new(16)),
+                Store::open_test_fixture(&state.path().join("rsi.db")).unwrap(),
+                false,
+                state.path().join("daemon.sock"),
+                None,
+                Vec::new(),
+                RuntimeConfig::from_config(&Config::from_env()),
+                state.path().join("sandboxes"),
+            )
+            .unwrap(),
+        );
+        let pressure = Arc::new(std::sync::Mutex::new(Some(PressureHold::Thermal(
+            ThermalHold {
+                temperature_c: 94.0,
+                ceiling_c: 85,
+            },
+        ))));
+        let shared = Arc::clone(&pressure);
+        manager
+            .host_load()
+            .set_pressure_source(Arc::new(move || *shared.lock().unwrap()));
+        let effects = SessionNodeEffects {
+            manager: Arc::clone(&manager),
+        };
+        let attempt = |node: &str| AttemptRow {
+            id: Uuid::new_v4(),
+            node_id: node.into(),
+            iteration: 0,
+            attempt_no: 1,
+            status: AttemptStatus::Reserved,
+            dedup_key: format!("topology.node:test:{node}:0:1"),
+            session_id: Uuid::new_v4(),
+            boot_id: None,
+            sandbox_root: None,
+            base_commit: "0".repeat(40),
+            result_commit: None,
+            input: serde_json::json!({}),
+            output: None,
+            failure_class: None,
+            error: None,
+            resolution: None,
+            preserved_ref: None,
+            preserved_commit: None,
+            started_at: None,
+            node_kind: "session".into(),
+            pre_head: None,
+            process_group_id: None,
+            review_assignment_id: None,
+            land_entry_id: None,
+        };
+        let (older, younger) = (attempt("older"), attempt("younger"));
+        let now = Utc::now();
+        let (older_since, younger_since) = (now - Duration::minutes(5), now);
+
+        assert_eq!(
+            effects.launch_held(true, older_since, &older),
+            Some("thermal")
+        );
+        assert_eq!(
+            effects.launch_held(true, younger_since, &younger),
+            Some("thermal")
+        );
+        assert_eq!(
+            effects.launch_held(false, younger_since, &younger),
+            Some("thermal"),
+            "an operator's first launch skips the load queue, never host pressure"
+        );
+        *pressure.lock().unwrap() = Some(PressureHold::DiskPressure {
+            free_gb: 9.0,
+            min_gb: 30,
+        });
+        assert_eq!(
+            effects.launch_held(true, older_since, &older),
+            Some("disk_pressure")
+        );
+
+        // The temperature drops: the older node goes first.
+        *pressure.lock().unwrap() = None;
+        assert!(
+            effects.launch_held(true, younger_since, &younger).is_some(),
+            "the younger node does not overtake the older one"
+        );
+        assert_eq!(effects.launch_held(true, older_since, &older), None);
+        assert_eq!(effects.launch_held(true, younger_since, &younger), None);
+        assert_eq!(effects.launch_held(false, younger_since, &younger), None);
         assert!(manager.host_load().status(&[]).held.is_empty());
     }
 }

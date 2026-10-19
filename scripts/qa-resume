@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Resume a timed-out package sweep through the declared qa-resume-rsid recipe.
+
+The manager's local TOML plan names a pinned child worktree and a completed-test
+TSV. Build once, isolate prior failures once, run unfinished library tests with
+exact names, then run each binary/integration target and doctests. No source or
+build settings are changed. Output stays in the daemon-owned job log.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import tomllib
+
+
+def check_source(repo, worktree, sha):
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("plan SHA must be a full commit id")
+    worktree = worktree.resolve()
+    if not worktree.is_relative_to(repo.resolve()) or worktree == repo.resolve():
+        raise ValueError("QA source must be a child worktree of this sandbox")
+    def git(path, *args):
+        return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
+    if git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir") != git(
+        worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ):
+        raise ValueError("QA source belongs to another repository")
+    if git(worktree, "rev-parse", "HEAD") != sha:
+        raise ValueError("QA source pin changed")
+    subprocess.run(["git", "-C", str(worktree), "diff", "--quiet", "HEAD"], check=True)
+
+
+def read_completed(path):
+    rows = {}
+    for line in path.read_text().splitlines():
+        name, state = line.split("\t")
+        if name in rows or state not in {"ok", "FAILED", "ignored"}:
+            raise ValueError("invalid completed-test row")
+        rows[name] = state
+    return rows
+
+
+def batches(names, limit=20000):
+    """Bound argv size for Windows as well as Unix (names are ASCII libtest ids)."""
+    batch, size = [], 0
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9_:]+", name) or len(name) + 4 > limit:
+            raise ValueError("invalid or oversized library test id")
+        cost = len(name) + 4
+        if batch and size + cost > limit:
+            yield batch
+            batch, size = [], 0
+        batch.append(name)
+        size += cost
+    if batch:
+        yield batch
+
+
+class Runner:
+    def __init__(self, worktree, seconds):
+        self.worktree = worktree
+        self.deadline = time.monotonic() + seconds
+
+    def run(self, argv, capture=False):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("QA continuation budget expired")
+        return subprocess.run(
+            argv, cwd=self.worktree, text=True,
+            stdout=subprocess.PIPE if capture else None,
+            timeout=remaining, check=False,
+        )
+
+
+def build_targets(output, package_id):
+    targets = {}
+    features = set()
+    for line in output.splitlines():
+        message = json.loads(line)
+        if message.get("reason") == "compiler-message":
+            rendered = message.get("message", {}).get("rendered")
+            if rendered:
+                print(rendered, end="", flush=True)
+        if message.get("reason") == "compiler-artifact" and message.get("package_id") == package_id:
+            features.update(message.get("features", []))
+        if (message.get("reason") != "compiler-artifact"
+                or message.get("package_id") != package_id
+                or not message.get("profile", {}).get("test")
+                or not message.get("executable")):
+            continue
+        target = message["target"]
+        kinds = target["kind"]
+        kind = next((k for k in ("lib", "bin", "test", "example", "bench") if k in kinds), None)
+        if kind:
+            targets[kind, target["name"]] = message["executable"]
+    return targets, features
+
+
+def resume(runner, package, completed, completed_targets=None):
+    completed_targets = completed_targets or {}
+    metadata = runner.run(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], True)
+    if metadata.returncode:
+        return metadata.returncode
+    matches = [p for p in json.loads(metadata.stdout)["packages"] if p["name"] == package]
+    if len(matches) != 1:
+        raise ValueError("package is not a unique workspace member")
+    built = runner.run(["cargo", "test", "--locked", "-p", package, "--no-run", "--message-format=json"], True)
+    if built.returncode:
+        # Compiler diagnostics still need rendering on a failed build.
+        build_targets(built.stdout, matches[0]["id"])
+        return built.returncode
+    targets, features = build_targets(built.stdout, matches[0]["id"])
+    expected = {
+        (kind, target["name"])
+        for target in matches[0]["targets"] if target.get("test")
+        and set(target.get("required-features", [])) <= features
+        for kind in target["kind"] if kind in {"lib", "bin", "test", "example", "bench"}
+    }
+    if set(targets) != expected:
+        raise ValueError("compiled targets do not match the testable target inventory")
+    resumable = {key for key in targets if key[0] != "lib"} | {("doc", package)}
+    resumable |= {("isolated", name) for name, state in completed.items() if state == "FAILED"}
+    if not set(completed_targets) <= resumable:
+        raise ValueError("completed target inventory changed")
+    libs = [exe for (kind, _), exe in targets.items() if kind == "lib"]
+    if len(libs) != 1:
+        raise ValueError("continuation requires exactly one library test executable")
+    listed = runner.run([libs[0], "--list"], True)
+    if listed.returncode:
+        return listed.returncode
+    inventory = {line[:-6] for line in listed.stdout.splitlines() if line.endswith(": test")}
+    if not set(completed) <= inventory:
+        raise ValueError("completed tests do not match the pinned library inventory")
+    failed = sorted(name for name, state in completed.items() if state == "FAILED")
+    pending = sorted(inventory - set(completed))
+    status = next((code for code in completed_targets.values() if code), 0)
+
+    def step(label, argv):
+        nonlocal status
+        print(f"QA_RESUME_START {label}", flush=True)
+        result = runner.run(argv)
+        print(f"QA_RESUME_DONE {label} exit={result.returncode}", flush=True)
+        if result.returncode:
+            status = result.returncode
+
+    lib_args = ["cargo", "test", "--locked", "-p", package, "--lib", "--no-fail-fast", "--"]
+    # One test per invocation: two failing names in one libtest is not isolation.
+    for name in failed:
+        if ("isolated", name) in completed_targets:
+            print(f"QA_RESUME_RETAIN isolated {name} exit={completed_targets['isolated', name]}", flush=True)
+        else:
+            step("isolated " + name, lib_args + [name, "--exact"])
+    for index, batch in enumerate(batches(pending), 1):
+        step(f"library-batch-{index} count={len(batch)}", lib_args + batch + ["--exact"])
+    for kind, name in sorted(targets):
+        if kind != "lib":
+            if (kind, name) in completed_targets:
+                print(f"QA_RESUME_RETAIN {kind} {name} exit={completed_targets[kind, name]}", flush=True)
+            else:
+                step(kind + " " + name, ["cargo", "test", "--locked", "-p", package,
+                     "--" + kind, name, "--no-fail-fast"])
+    if ("doc", package) not in completed_targets:
+        step("doctests", ["cargo", "test", "--locked", "-p", package, "--doc", "--no-fail-fast"])
+    print(f"QA_RESUME_FINISHED package={package} isolated={len(failed)} "
+          f"unfinished_lib={len(pending)} targets={len(targets)} exit={status}", flush=True)
+    return status
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", type=Path)
+    args = parser.parse_args()
+    repo = Path(__file__).resolve().parent.parent
+    plan_path = args.plan or Path.home() / ".rsi" / "mgr" / repo.name / "qa-resume.toml"
+    plan = tomllib.loads(plan_path.read_text())
+    if set(plan) - {"package", "worktree", "sha", "completed", "completed_targets", "timeout_seconds"}:
+        raise ValueError("unknown continuation plan field")
+    package = plan["package"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", package):
+        raise ValueError("invalid package name")
+    worktree = Path(plan["worktree"])
+    sha = plan["sha"]
+    check_source(repo, worktree, sha)
+    if not os.environ.get("CARGO_TARGET_DIR"):
+        raise ValueError("daemon-designated CARGO_TARGET_DIR is required")
+    target = Path(os.environ["CARGO_TARGET_DIR"]).resolve()
+    if target != (repo / "target").resolve():
+        raise ValueError("keep the daemon-designated sandbox target")
+    seconds = plan.get("timeout_seconds", 4800)
+    if not isinstance(seconds, int) or not 1 <= seconds <= 4800:
+        raise ValueError("continuation budget must be at most 4800 seconds")
+    completed_path = plan_path.parent / plan["completed"]
+    if completed_path.resolve().parent != plan_path.parent.resolve():
+        raise ValueError("completed inventory must be beside the local plan")
+    completed_targets = {}
+    if plan.get("completed_targets"):
+        path = plan_path.parent / plan["completed_targets"]
+        if path.resolve().parent != plan_path.parent.resolve():
+            raise ValueError("completed targets must be beside the local plan")
+        for line in path.read_text().splitlines():
+            kind, name, value = line.split("\t")
+            code = int(value)
+            if (kind, name) in completed_targets or not 0 <= code <= 255:
+                raise ValueError("invalid completed target row")
+            completed_targets[kind, name] = code
+    print(f"QA_RESUME_SOURCE {sha} package={package} worktree={worktree}", flush=True)
+    status = resume(Runner(worktree, seconds), package, read_completed(completed_path), completed_targets)
+    check_source(repo, worktree, sha)
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, subprocess.SubprocessError, TimeoutError) as error:
+        print(f"QA_RESUME_ERROR {error}", file=sys.stderr, flush=True)
+        sys.exit(124 if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else 2)

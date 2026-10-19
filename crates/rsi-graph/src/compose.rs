@@ -385,7 +385,6 @@ mod tests {
     fn state_imports_populate_inner_root_scope() {
         // This test verifies that state_imports copies values from input data
         // into the inner state store's root scope.
-        // We use a StateReaderNode that reads from state.
         let inner_topo = HorizontalGraph::new(vec![Box::new(AppendFieldNode::new(
             "inner",
             "inner_ran",

@@ -35,7 +35,17 @@ output_dir="$(cd "$output_dir" && pwd -P)"
   exit 1
 }
 cd "$repo_dir"
-target_dir="${CARGO_TARGET_DIR:-target}"
+# The directory cargo itself builds into, whatever sets it: CARGO_TARGET_DIR, a
+# global or per-directory `build.target-dir`, or the default ./target (#2177). Reading
+# `${CARGO_TARGET_DIR:-target}` instead looked in ./target while a global
+# `build.target-dir` made cargo build elsewhere, so an install of ./target (or of
+# another worktree's stale binaries) could replace this commit's artifacts.
+target_dir="$(cargo metadata --format-version 1 --no-deps --locked \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+[[ -n "$target_dir" ]] || {
+  echo 'Cannot resolve the cargo target directory.' >&2
+  exit 1
+}
 builder_mode="${RSI_ARTIFACT_BUILDER:-auto}"
 glibc_version="${RSI_ARTIFACT_GLIBC:-2.34}"
 case "$builder_mode" in

@@ -108,10 +108,7 @@ mod tests {
         std::path::PathBuf,
         UnixListener,
     ) {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-link-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-link-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();

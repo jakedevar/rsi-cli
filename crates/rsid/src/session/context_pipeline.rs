@@ -693,7 +693,7 @@ mod tests {
     use super::*;
 
     fn test_store() -> Arc<tokio::sync::Mutex<crate::store::Store>> {
-        let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
         Arc::new(tokio::sync::Mutex::new(store))
     }
 

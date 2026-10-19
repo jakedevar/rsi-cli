@@ -16,7 +16,7 @@ use crate::session::harness::tools::schedule_wake::{
 };
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
-fn wake(p: &Pilot, owner: Uuid, mode: &str, every_seconds: Option<i64>) -> Uuid {
+async fn wake(p: &Pilot, owner: Uuid, mode: &str, every_seconds: Option<i64>) -> Uuid {
     let job = build_agent_scheduled_job(ScheduleWakeRequest {
         message: "Continue the Epic".into(),
         in_seconds: Some(600),
@@ -33,7 +33,7 @@ fn wake(p: &Pilot, owner: Uuid, mode: &str, every_seconds: Option<i64>) -> Uuid 
     })
     .unwrap();
     let id = job.id;
-    let store = p.manager.store.try_lock().unwrap();
+    let store = p.manager.store.lock().await;
     store.insert_scheduled_job(&job).unwrap();
     id
 }
@@ -122,10 +122,10 @@ fn prepared_replace(p: &Pilot) -> AgentManagerPrepareControlRequestV2 {
 async fn manager_replace_of_idle_lead_with_resume_wake_retires_lineage_wakes_atomically() {
     let p = pilot().await;
     let older = earlier_hop(&p).await;
-    let own = wake(&p, p.lead, "resume", None);
-    let recurring = wake(&p, older, "resume", Some(600));
-    let child_watch = wake(&p, p.lead, "on_terminal", None);
-    let unrelated = wake(&p, p.owner, "resume", None);
+    let own = wake(&p, p.lead, "resume", None).await;
+    let recurring = wake(&p, older, "resume", Some(600)).await;
+    let child_watch = wake(&p, p.lead, "on_terminal", None).await;
+    let unrelated = wake(&p, p.owner, "resume", None).await;
 
     let receipt = p
         .admit("replace-idle-lead", replace(&p, p.fence().await))
@@ -168,7 +168,7 @@ async fn manager_replace_of_idle_lead_with_resume_wake_retires_lineage_wakes_ato
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_replace_of_lead_with_pending_question_stays_refused_and_keeps_its_wake() {
     let p = pilot().await;
-    let own = wake(&p, p.lead, "resume", None);
+    let own = wake(&p, p.lead, "resume", None).await;
     p.manager
         .store
         .lock()
@@ -206,7 +206,7 @@ async fn prepared_lead_handover_is_ready_despite_own_resume_wake_but_resume_stil
     use crate::store::manager_actions::OperatorPause;
 
     let p = pilot().await;
-    wake(&p, p.lead, "resume", None);
+    wake(&p, p.lead, "resume", None).await;
     let store = p.manager.store.lock().await;
     store.manager_lead_handover_human_gate(p.lead).unwrap();
     assert_eq!(
@@ -243,9 +243,9 @@ async fn prepared_lead_handover_is_ready_despite_own_resume_wake_but_resume_stil
 async fn manager_replace_retires_earlier_lineage_resume_wakes_in_the_lead_cas() {
     let p = pilot().await;
     let older = earlier_hop(&p).await;
-    let recurring = wake(&p, older, "resume", Some(600));
-    let child_watch = wake(&p, p.lead, "on_terminal", None);
-    let unrelated = wake(&p, p.owner, "resume", None);
+    let recurring = wake(&p, older, "resume", Some(600)).await;
+    let child_watch = wake(&p, p.lead, "on_terminal", None).await;
+    let unrelated = wake(&p, p.owner, "resume", None).await;
 
     let receipt = p
         .admit("replace-lineage-lead", replace(&p, p.fence().await))
@@ -288,11 +288,11 @@ async fn manager_replace_retires_earlier_lineage_resume_wakes_in_the_lead_cas() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_pause_lead_suspends_resume_wakes_and_resume_lead_restores_exactly_those() {
     let p = pilot().await;
-    let own = wake(&p, p.lead, "resume", None);
-    let recurring = wake(&p, p.lead, "resume", Some(600));
-    let already_off = wake(&p, p.lead, "resume", None);
-    let child_watch = wake(&p, p.lead, "on_terminal", None);
-    let unrelated = wake(&p, p.owner, "resume", None);
+    let own = wake(&p, p.lead, "resume", None).await;
+    let recurring = wake(&p, p.lead, "resume", Some(600)).await;
+    let already_off = wake(&p, p.lead, "resume", None).await;
+    let child_watch = wake(&p, p.lead, "on_terminal", None).await;
+    let unrelated = wake(&p, p.owner, "resume", None).await;
     p.manager
         .store
         .lock()
@@ -384,7 +384,7 @@ async fn manager_pause_lead_suspends_resume_wakes_and_resume_lead_restores_exact
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_pause_lead_with_pending_question_stays_refused_and_keeps_its_wake() {
     let p = pilot().await;
-    let own = wake(&p, p.lead, "resume", None);
+    let own = wake(&p, p.lead, "resume", None).await;
     p.manager
         .store
         .lock()

@@ -65,7 +65,7 @@ pub(super) fn is_symlink(stat: &FileStat) -> bool {
 }
 
 #[allow(clippy::unnecessary_cast)]
-fn is_regular(stat: &FileStat) -> bool {
+pub(super) fn is_regular(stat: &FileStat) -> bool {
     file_type_bits(stat) == SFlag::S_IFREG.bits() as u32
 }
 
@@ -315,29 +315,98 @@ pub(super) fn root_unchanged(root: &Path, uid: u32, pinned: &Pinned) -> bool {
 
 // ---- mounts -------------------------------------------------------------
 
-fn unescape_mount_field(field: &str) -> String {
+/// Undo the kernel's `\ooo` octal escapes in a mountinfo path. `None` for a
+/// backslash that is not a complete escape of one byte: the kernel escapes a
+/// literal backslash itself, so a stray one is not a row it wrote. Also `None`
+/// when the decoded bytes hold a NUL or are not UTF-8: neither is a path this
+/// scanner can address, and a lossy substitution would name a different path.
+fn unescape_mount_field(field: &str) -> Option<String> {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1..i + 4]
-                .iter()
-                .all(|b| (b'0'..=b'7').contains(b))
-        {
-            let value = (u32::from(bytes[i + 1] - b'0') << 6)
-                | (u32::from(bytes[i + 2] - b'0') << 3)
-                | u32::from(bytes[i + 3] - b'0');
-            #[allow(clippy::cast_possible_truncation)]
-            out.push(value as u8);
-            i += 4;
-        } else {
+        if bytes[i] != b'\\' {
             out.push(bytes[i]);
             i += 1;
+            continue;
         }
+        let digits = bytes.get(i + 1..i + 4)?;
+        if !digits.iter().all(|b| (b'0'..=b'7').contains(b)) {
+            return None;
+        }
+        let value = (u32::from(digits[0] - b'0') << 6)
+            | (u32::from(digits[1] - b'0') << 3)
+            | u32::from(digits[2] - b'0');
+        out.push(u8::try_from(value).ok()?);
+        i += 4;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if out.contains(&0) {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Per-mount options as the kernel writes them: `ro` or `rw` first, then zero or
+/// more non-empty comma-separated words. A path fragment shifted into this slot
+/// by an unescaped space is not `ro`/`rw`, so it is refused.
+fn is_mount_options(field: &str) -> bool {
+    let mut words = field.split(',');
+    matches!(words.next(), Some("ro" | "rw"))
+        && words.all(|w| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'='))
+        })
+}
+
+/// One optional propagation field: `unbindable`, or `shared:N`, `master:N`,
+/// `propagate_from:N`.
+fn is_optional_field(field: &str) -> bool {
+    field == "unbindable"
+        || field.split_once(':').is_some_and(|(tag, id)| {
+            matches!(tag, "shared" | "master" | "propagate_from") && is_decimal(id)
+        })
+}
+
+fn is_decimal(field: &str) -> bool {
+    !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_major_minor(field: &str) -> bool {
+    field
+        .split_once(':')
+        .is_some_and(|(major, minor)| is_decimal(major) && is_decimal(minor))
+}
+
+/// The mount point of one `mountinfo` row, or `None` when the row is not wholly
+/// understood. Linux `proc_pid_mountinfo(5)`:
+/// `id parent major:minor root mount-point options [optional...] - fstype source super-options`.
+/// Spaces inside a path are escaped, so a split on one space is exact, and a
+/// row that an unescaped space shifted is refused because its options or
+/// optional fields no longer parse. Every fixed field is required and checked;
+/// zero or more well-formed optional fields (`shared:N`, `master:N`, ...) may
+/// precede the `-` separator; exactly three fields (`fstype source
+/// super-options`) follow it; `root` and the mount point must be absolute.
+fn parse_mountinfo_line(line: &str) -> Option<PathBuf> {
+    let fields: Vec<&str> = line.split(' ').collect();
+    let separator = 6 + fields.get(6..)?.iter().position(|f| *f == "-")?;
+    let (head, tail) = (&fields[..separator], &fields[separator + 1..]);
+    let well_formed = is_decimal(head[0])
+        && is_decimal(head[1])
+        && is_major_minor(head[2])
+        && head[3].starts_with('/')
+        && head[4].starts_with('/')
+        && head.len() >= 6
+        && is_mount_options(head[5])
+        && head[6..].iter().all(|f| is_optional_field(f))
+        && tail.len() == 3
+        && tail.iter().all(|f| !f.is_empty());
+    if !well_formed {
+        return None;
+    }
+    unescape_mount_field(head[3])?;
+    let mount_point = unescape_mount_field(head[4])?;
+    Some(PathBuf::from(mount_point))
 }
 
 /// Mount points from `mountinfo`. `None` when it is unreadable, larger than
@@ -356,7 +425,7 @@ pub(super) fn read_mounts(mountinfo: &Path) -> Option<Vec<PathBuf>> {
     }
     let mut mounts = Vec::new();
     for line in text.lines() {
-        mounts.push(PathBuf::from(unescape_mount_field(line.split(' ').nth(4)?)));
+        mounts.push(parse_mountinfo_line(line)?);
     }
     (!mounts.is_empty()).then_some(mounts)
 }
@@ -998,6 +1067,7 @@ pub(super) fn try_flock(file: &std::fs::File, exclusive: bool) -> io::Result<boo
 }
 
 /// One name in a directory, as observed in a single stat of it.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Named {
     pub name: String,
@@ -1013,6 +1083,7 @@ pub(super) struct Named {
 }
 
 /// Why a directory inventory is not usable.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum InventoryError {
     /// A name changed or vanished while it was read: the directory was being
@@ -1040,7 +1111,7 @@ thread_local! {
 
 /// Stat `name` (no symlink followed) once for identity, birth time and mount,
 /// confirming both calls saw the same inode.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn named_stat(dir: RawFd, name: &str) -> Result<Named, InventoryError> {
     let stat = match stat_at(dir, name) {
         Ok(stat) => stat,
@@ -1100,7 +1171,7 @@ fn named_stat(dir: RawFd, name: &str) -> Result<Named, InventoryError> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn named_stat(_dir: RawFd, _name: &str) -> Result<Named, InventoryError> {
     Err(InventoryError::Unproven)
 }
@@ -1109,6 +1180,7 @@ fn named_stat(_dir: RawFd, _name: &str) -> Result<Named, InventoryError> {
 /// UTF-8, a failed stat or an exhausted budget is `Unproven`; a name that
 /// vanishes or changes between the listing and its stat is `Mutated` (a
 /// directory being modified is not inventoried, never skipped over).
+#[cfg(test)]
 pub(super) fn named_inventory(
     dir: &Pinned,
     budget: &mut Budget,
@@ -1145,16 +1217,6 @@ pub(super) fn named_inventory(
         return Err(InventoryError::Mutated);
     }
     Ok(out)
-}
-
-/// A directory's identity and modification stamps: changes whenever a name is
-/// created, removed or renamed in it (to the filesystem's timestamp grain).
-pub(super) fn dir_stamp(dir: &Pinned) -> io::Result<(Ident, i128, i128)> {
-    let stat = fstat_fd(dir.raw())?;
-    #[allow(clippy::unnecessary_cast)]
-    let ctime =
-        i128::from(stat.st_ctime as i64) * 1_000_000_000 + i128::from(stat.st_ctime_nsec as i64);
-    Ok((ident_of(&stat), mtime_ns(&stat), ctime))
 }
 
 /// Permissions of a regular file in a pinned directory.

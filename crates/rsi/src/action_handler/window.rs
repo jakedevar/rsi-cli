@@ -109,7 +109,8 @@ pub(super) fn dispatch(app: &mut App, action: LcAction) {
                 } else {
                     app.pre_prompt_creator_pane = Some(pane.clone());
                     *pane = Pane::PromptCreator;
-                    app.refresh_prompts();
+                    // The prompt list loads asynchronously right after this
+                    // dispatch (`dispatch_lc_action`).
                     app.prompt_creator_state.editing = false;
                     app.prompt_creator_viewer = None;
                     // Initialize model dropdown

@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn the_answer_form_posts_to_the_gateway_route_with_the_csrf_token() {
         let api = text("/api.js");
-        assert!(api.contains("/decisions/answer"));
+        assert!(api.contains("decisions/${request.pending ? 'answer-pending' : 'answer'}"));
         assert!(api.contains("/decision-targets"));
         assert!(api.contains("'x-rsi-csrf': csrf"));
         assert!(api.contains("idempotency_key: request.idempotencyKey"));

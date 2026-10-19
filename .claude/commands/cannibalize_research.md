@@ -84,7 +84,7 @@ Proceed immediately — do not wait for confirmation.
 
 ## Step 3: Worker Dispatch
 
-Spawn all three scouts in a **single message** using the `Agent` tool with `run_in_background: true`.
+Dispatch all three scouts in one batch, following `.claude/commands/_shared/team_dispatch.md`: RSI controls (`rsi_control_spawn` / `AgentSpawnChild`) inside an RSI session, native background agents only outside RSI. With no spawn authority, run the three scout checklists yourself in this session and do not claim scouts ran.
 
 ### scout-external [opus]
 
@@ -261,7 +261,7 @@ Max 1 extra field for focus area refinement.
 
 ## Step 4: Synthesis + Comparison
 
-After all three scouts report back via TaskOutput:
+After all three scouts report back (final messages read per `_shared/team_dispatch.md`):
 
 1. Parse all three reports
 2. For each of the five dimensions, build a side-by-side comparison:

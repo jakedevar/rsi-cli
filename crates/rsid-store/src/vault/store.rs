@@ -19,6 +19,8 @@ pub const VAULT_DIR_NAME: &str = "vault";
 pub const VAULT_FILE_NAME: &str = "credentials.json";
 const LEGACY_VAULT_FILE_VERSION: u32 = 1;
 pub const VAULT_FILE_VERSION: u32 = 2;
+pub const CUSTOM_PROVIDER_KEYS_FILE_NAME: &str = "custom-provider-keys.json";
+const CUSTOM_PROVIDER_KEYS_FILE_VERSION: u32 = 1;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
@@ -183,19 +185,16 @@ fn require_mode(
     Ok(())
 }
 
-/// Validate the directory (and file, if present) and load the vault. A
-/// missing directory or file is an empty vault; a looser mode, a symlink or
-/// malformed contents is a typed error naming the path.
-///
-/// # Errors
-///
-/// Returns a typed [`VaultStoreError`] naming the path.
-pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
+/// Validate the directory and the named file's modes and read the file. A
+/// missing directory or file is `None`; a looser mode or a symlink is a typed
+/// error naming the path.
+fn read_checked(
+    dir: &Path,
+    name: &str,
+) -> Result<Option<(PathBuf, zeroize::Zeroizing<Vec<u8>>)>, VaultStoreError> {
     let dir_meta = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(VaultFile::default());
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(dir)(error)),
     };
     if !dir_meta.is_dir() {
@@ -205,12 +204,10 @@ pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
         });
     }
     require_mode(dir, &dir_meta, DIR_MODE)?;
-    let path = dir.join(VAULT_FILE_NAME);
+    let path = dir.join(name);
     let file_meta = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(VaultFile::default());
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(&path)(error)),
     };
     if !file_meta.is_file() {
@@ -221,19 +218,38 @@ pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
     }
     require_mode(&path, &file_meta, FILE_MODE)?;
     let bytes = fs::read(&path).map_err(io_error(&path))?;
-    let bytes = zeroize::Zeroizing::new(bytes);
-    let file: VaultFile =
-        serde_json::from_slice(&bytes).map_err(|error| VaultStoreError::Malformed {
-            path: path.clone(),
-            // serde_json errors carry only a category and position, never
-            // the offending value.
-            reason: format!(
-                "{:?} at line {} column {}",
-                error.classify(),
-                error.line(),
-                error.column()
-            ),
-        })?;
+    Ok(Some((path, zeroize::Zeroizing::new(bytes))))
+}
+
+fn parse_checked<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<T, VaultStoreError> {
+    serde_json::from_slice(bytes).map_err(|error| VaultStoreError::Malformed {
+        path: path.to_path_buf(),
+        // serde_json errors carry only a category and position, never
+        // the offending value.
+        reason: format!(
+            "{:?} at line {} column {}",
+            error.classify(),
+            error.line(),
+            error.column()
+        ),
+    })
+}
+
+/// Validate the directory (and file, if present) and load the vault. A
+/// missing directory or file is an empty vault; a looser mode, a symlink or
+/// malformed contents is a typed error naming the path.
+///
+/// # Errors
+///
+/// Returns a typed [`VaultStoreError`] naming the path.
+pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
+    let Some((path, bytes)) = read_checked(dir, VAULT_FILE_NAME)? else {
+        return Ok(VaultFile::default());
+    };
+    let file: VaultFile = parse_checked(&path, &bytes)?;
     if file.version != 1 && file.version != VAULT_FILE_VERSION {
         return Err(VaultStoreError::Malformed {
             path,
@@ -250,17 +266,21 @@ pub fn load(dir: &Path) -> Result<VaultFile, VaultStoreError> {
 ///
 /// Returns a typed [`VaultStoreError`] naming the path.
 pub fn save(dir: &Path, file: &mut VaultFile) -> Result<(), VaultStoreError> {
-    ensure_dir(dir)?;
     file.version = persisted_version(file);
-    let path = dir.join(VAULT_FILE_NAME);
-    let bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(file).map_err(|_| {
+    write_atomic(dir, VAULT_FILE_NAME, file)
+}
+
+fn write_atomic<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<(), VaultStoreError> {
+    ensure_dir(dir)?;
+    let path = dir.join(name);
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec_pretty(value).map_err(|_| {
         VaultStoreError::Malformed {
             path: path.clone(),
             reason: "serialization failed".into(),
         }
     })?);
     let temp = dir.join(format!(
-        ".{VAULT_FILE_NAME}.{}.{}.tmp",
+        ".{name}.{}.{}.tmp",
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     ));
@@ -283,6 +303,60 @@ pub fn save(dir: &Path, file: &mut VaultFile) -> Result<(), VaultStoreError> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Custom-provider API keys (hub #3039), one entry per provider id. A file of
+/// its own beside `credentials.json`, with the same 0700/0600 custody and
+/// atomic write, so a vault an older daemon reads (its `VaultFile` refuses
+/// unknown fields) never changes shape when a custom-provider key is stored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomProviderKeyFile {
+    pub version: u32,
+    /// Keyed by the provider's lowercase UUID.
+    #[serde(default)]
+    pub entries: BTreeMap<String, StoredEntry>,
+}
+
+impl Default for CustomProviderKeyFile {
+    fn default() -> Self {
+        Self {
+            version: CUSTOM_PROVIDER_KEYS_FILE_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+/// Load the custom-provider key file; missing is empty.
+///
+/// # Errors
+///
+/// Returns a typed [`VaultStoreError`] naming the path.
+pub fn load_custom_provider_keys(dir: &Path) -> Result<CustomProviderKeyFile, VaultStoreError> {
+    let Some((path, bytes)) = read_checked(dir, CUSTOM_PROVIDER_KEYS_FILE_NAME)? else {
+        return Ok(CustomProviderKeyFile::default());
+    };
+    let file: CustomProviderKeyFile = parse_checked(&path, &bytes)?;
+    if file.version != CUSTOM_PROVIDER_KEYS_FILE_VERSION {
+        return Err(VaultStoreError::Malformed {
+            path,
+            reason: format!("unsupported version {}", file.version),
+        });
+    }
+    Ok(file)
+}
+
+/// Atomically persist the custom-provider key file.
+///
+/// # Errors
+///
+/// Returns a typed [`VaultStoreError`] naming the path.
+pub fn save_custom_provider_keys(
+    dir: &Path,
+    file: &mut CustomProviderKeyFile,
+) -> Result<(), VaultStoreError> {
+    file.version = CUSTOM_PROVIDER_KEYS_FILE_VERSION;
+    write_atomic(dir, CUSTOM_PROVIDER_KEYS_FILE_NAME, file)
 }
 
 fn ensure_dir(dir: &Path) -> Result<(), VaultStoreError> {

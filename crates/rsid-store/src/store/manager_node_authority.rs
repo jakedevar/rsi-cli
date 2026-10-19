@@ -309,10 +309,12 @@ fn grant_matches_policy(grant: &ManagerNodeGrantV1, policy: &ManagerPolicyV2) ->
             .iter()
             .all(|capability| policy.capabilities.contains(capability))
         && grant.allowed_launches.len() == policy.allowed_launches.len()
-        && grant
-            .allowed_launches
-            .iter()
-            .all(|choice| policy.allowed_launches.contains(choice))
+        && grant.allowed_launches.iter().all(|choice| {
+            policy
+                .allowed_launches
+                .iter()
+                .any(|entry| entry.allows(choice) && choice.allows(entry))
+        })
         && grant.allowance.max_created_containers == policy.max_created_containers
         && grant.allowance.max_created_sessions == policy.max_created_sessions
         && grant.allowance.max_active_sessions == policy.max_active_sessions

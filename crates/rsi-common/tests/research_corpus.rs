@@ -13,7 +13,7 @@ use rsi_common::research_schema::validate_research_json;
 
 fn corpus_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR is `crates/rsi-common`. Climb to repo root.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(rsi_common::manifest_dir!());
     manifest
         .parent()
         .and_then(|p| p.parent())

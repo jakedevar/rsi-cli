@@ -69,6 +69,9 @@ pub struct IssueLocalFilters {
     pub unassigned: bool,
     #[serde(default)]
     pub labels_all: Vec<String>,
+    /// #2381: keep an Issue that carries at least one of these labels.
+    #[serde(default)]
+    pub labels_any: Vec<String>,
     #[serde(default)]
     pub provenance: Vec<IssueWorkspaceProvenanceV1>,
     #[serde(default)]
@@ -77,6 +80,33 @@ pub struct IssueLocalFilters {
     pub archive: IssueArchiveFilterV1,
     #[serde(default)]
     pub sort: IssueWorkspaceSortV1,
+}
+
+/// The labels that mark an Issue the operator asked for or must decide (#2381).
+pub const OPERATOR_REQUEST_LABEL: &str = "operator-request";
+pub const OPERATOR_DECISION_LABEL: &str = "operator-decision";
+
+impl IssueLocalFilters {
+    /// Whether the one-key operator filter (`O`) is on: exactly the two
+    /// operator labels, matched as "any of".
+    #[must_use]
+    pub fn operator_only(&self) -> bool {
+        self.labels_any.len() == 2
+            && self.labels_any.iter().any(|l| l == OPERATOR_REQUEST_LABEL)
+            && self.labels_any.iter().any(|l| l == OPERATOR_DECISION_LABEL)
+    }
+
+    /// Turn the operator filter on or off, leaving every other filter alone.
+    pub fn toggle_operator_only(&mut self) {
+        if self.operator_only() {
+            self.labels_any.clear();
+        } else {
+            self.labels_any = vec![
+                OPERATOR_REQUEST_LABEL.to_string(),
+                OPERATOR_DECISION_LABEL.to_string(),
+            ];
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +182,8 @@ pub enum IssueWorkspaceDataKind {
     BlockedBy,
     Blocks,
     Events,
+    /// #2420: the stored handoff records of the inspected Issue.
+    Handoffs,
     DependencyCandidates,
     AssociatedSession,
     Dispatched,
@@ -182,6 +214,9 @@ pub enum IssueWorkspaceRequestIdentity {
     Events {
         issue_id: Uuid,
         after_sequence: Option<i64>,
+    },
+    Handoffs {
+        issue_id: Uuid,
     },
     DependencyCandidates {
         issue_id: Uuid,
@@ -277,8 +312,42 @@ pub struct IssueWorkspaceCachedPage {
     pub page: IssueWorkspacePageV1,
 }
 
+/// Parse an Issue number as the operator types it: `2377`, `#2377` or the
+/// `issue:#2377` link form (#2381). `None` for anything else, including `0`.
+#[must_use]
+pub fn parse_issue_number(input: &str) -> Option<i64> {
+    let text = input.trim();
+    let text = text.strip_prefix("issue:").unwrap_or(text);
+    let text = text.strip_prefix('#').unwrap_or(text);
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<i64>().ok().filter(|number| *number >= 1)
+}
+
+/// A go-to-number request in flight (#2381): the Local page was narrowed to
+/// `#N` across every status and archive state, and the row with that number is
+/// selected and opened when the page arrives. The filters it replaced come back
+/// when the number does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueNumberJump {
+    pub number: i64,
+    pub restore_filters: IssueLocalFilters,
+    pub restore_saved_view: Option<IssueWorkspaceSavedView>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueWorkspaceTransient {
+    /// #2381: the focused item of the inspector (a collapsible section or a
+    /// related Issue) and the sections opened so far, keyed by Issue.
+    pub detail_cursor: usize,
+    pub detail_cursor_issue: Option<Uuid>,
+    pub detail_expanded: BTreeSet<(Uuid, usize)>,
+    /// Set when a key moved the cursor, so the next render scrolls it into view.
+    pub detail_follow: bool,
+    /// Issue numbers left behind by following a related link, for `B`.
+    pub detail_history: Vec<i64>,
+    pub pending_number_jump: Option<IssueNumberJump>,
     pub data_states: BTreeMap<IssueWorkspaceDataKind, IssueWorkspaceDataState>,
     pub page_cache: Vec<IssueWorkspaceCachedPage>,
     pub current_page: Option<IssueWorkspacePageV1>,
@@ -293,6 +362,11 @@ pub struct IssueWorkspaceTransient {
     pub events_target: Option<Uuid>,
     pub events_after_sequence: Option<i64>,
     pub events_next_after_sequence: Option<i64>,
+    /// #2420: stored handoff records of `handoffs_target`, oldest first, and how
+    /// many the Issue holds in all (the page may be shorter).
+    pub handoffs: Vec<rsi_common::types::IssueHandoffV1>,
+    pub handoffs_target: Option<Uuid>,
+    pub handoffs_total: i64,
     pub blocked_by_cursor: Option<IssueDependencyCursorV1>,
     pub blocks_cursor: Option<IssueDependencyCursorV1>,
     pub dispatched: Vec<IssueDispatchRecordV1>,

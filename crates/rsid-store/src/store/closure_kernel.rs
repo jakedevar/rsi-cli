@@ -190,6 +190,7 @@ impl Store {
         .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) fn replay_launch_closure_source(
         &self,
         request: &LaunchClosureSourceRequestV1,

@@ -14,10 +14,35 @@
 //! - changes requested: `succeeded`, verdict `changes_requested` (findings
 //!   attached), unless this was the node's last round (its `max_rounds`, or
 //!   the loop's own bound): `blocked(review_rounds_exhausted)`;
-//! - no usable verdict (request refused, superseded, wrong commit): the first
-//!   time `failed(review_unsettled)` earns one new assignment; the second time
-//!   `blocked(review_unsettled)`.
+//! - no usable verdict (request refused, superseded, wrong commit, a reviewer
+//!   that submitted `blocked`): the first time `failed(review_unsettled)` earns
+//!   one new assignment; the second time `blocked(review_unsettled)`;
+//! - a receipt whose only blocking findings report that a check could not run
+//!   (`infra_*` finding keys, #2570): `failed(review_infrastructure)`, an
+//!   infrastructure loss retried with a fresh review up to
+//!   [`REVIEW_INFRASTRUCTURE_RETRIES`] times. It is no verdict on the code,
+//!   spends no review round and is not charged against the attempt cap.
+//!
+//! - a `blocked` receipt from a reviewer a hub deploy cut off
+//!   (`interrupt_workers`, #2809): the same infrastructure class and budget,
+//!   with the reason `manager_review_reviewer_interrupted_by_deploy` recorded
+//!   in the attempt's error. The review ledger does not count that receipt as
+//!   a spent round, so the retry is never refused `review_round_unavailable`.
+//!
+//! Settling `review_unsettled` also stops the assignment's reviewer if its
+//! session is still alive (#2423: an immutable `blocked` receipt does not end
+//! the session) and records the interruption in the attempt's error.
+//!
+//! The new assignment is a fresh review (#2280). It runs under the review
+//! ledger's own round policy (`NodeEffects::review_extra_round`: the closing
+//! round needs a reviewer no earlier round used), so the ledger never refuses
+//! it after the fact, and it waits out [`REVIEW_CAPACITY_BACKOFF`] first when
+//! the failure looks like host capacity. A blocked review is resolved with
+//! `AgentTopologyResolveAttempt` `retry` (another fresh review of the same
+//! commit) or `accept` (the owning manager's recorded ruling, see
+//! `resolve.rs`); there is nothing to `discard`.
 
+use rsi_common::harness_manager_v2::{REVIEW_INFRASTRUCTURE_REASON, REVIEW_INTERRUPTED_REASON};
 use rsi_common::types::ReviewerLaunch;
 use rsi_graph::data::Value as GraphValue;
 use uuid::Uuid;
@@ -25,6 +50,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::topology::executor::{Executor, NodeEffects, failed, node_data};
 use crate::topology::graph::{GraphShape, RegionDecision};
+use crate::topology::land::GateReceipt;
 use crate::topology::store::{
     self as rows, AttemptRow, AttemptStatus, ExecutionRow, ExecutionStatus, Settlement, failure,
 };
@@ -34,6 +60,29 @@ const REVIEW_NO_MANAGER_LEDGER: &str = "review_no_manager_ledger";
 
 /// Largest findings text recorded in an attempt error.
 const FINDINGS_ERROR_MAX: usize = 1_500;
+
+/// How long an automatic review retry waits after a capacity-shaped failure
+/// (a reviewer that ended `blocked`, usually because build admission timed out
+/// on a busy host) before it asks for a new reviewer (#2280). The retry must
+/// not spend its budget in the same instant the host was found full.
+pub(crate) const REVIEW_CAPACITY_BACKOFF: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// The unsettled reason of a reviewer that submitted a `blocked` receipt.
+const REVIEW_BLOCKED_REASON: &str = "manager_review_blocked";
+
+/// How many fresh reviews follow a receipt that only reported unavailable
+/// infrastructure before the node blocks for a ruling (#2570).
+pub(crate) const REVIEW_INFRASTRUCTURE_RETRIES: usize = 2;
+
+/// Whether an unsettled reason looks like host capacity rather than a verdict
+/// problem: the reviewer could not finish its required checks, or admission
+/// timed out.
+fn capacity_shaped(reason: &str) -> bool {
+    reason.contains(REVIEW_BLOCKED_REASON)
+        || reason.contains(REVIEW_INFRASTRUCTURE_REASON)
+        || reason.contains("admission")
+        || reason.contains("capacity")
+}
 
 /// One review request: everything the review service needs to open an
 /// assignment for the commit under review.
@@ -122,7 +171,7 @@ pub(crate) enum ReviewStatus {
 }
 
 /// Typed attempt output of a review node.
-fn review_output(
+pub(crate) fn review_output(
     request_round: u32,
     assignment: Uuid,
     verdict: &str,
@@ -203,6 +252,20 @@ impl<E: NodeEffects> Executor<E> {
             .await)
     }
 
+    /// The round policy for a new review after one that gave no usable verdict
+    /// (#2280). An execution with no project has no review ledger to ask (its
+    /// review request is refused outright), so nothing is pre-checked.
+    pub(crate) async fn review_retry_round(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+    ) -> Result<ExtraRound> {
+        if execution.project_id.is_none() {
+            return Ok(ExtraRound::Same);
+        }
+        self.review_extra_round(execution, attempt).await
+    }
+
     pub(crate) async fn drive_review(
         &self,
         execution: &ExecutionRow,
@@ -247,7 +310,7 @@ impl<E: NodeEffects> Executor<E> {
         }
     }
 
-    fn review_spec(
+    pub(super) fn review_spec(
         execution: &ExecutionRow,
         node: &str,
     ) -> Result<(String, ReviewerLaunch, u8, GraphShape)> {
@@ -299,34 +362,78 @@ impl<E: NodeEffects> Executor<E> {
                 return Ok(true);
             }
         };
-        // The reopened round of an exhausted review runs under the store's
-        // own round policy: it may need a different (closing) reviewer.
-        let reopened = attempts.iter().any(|other| {
+        // An automatic retry of a review that gave no usable verdict waits out
+        // a capacity-shaped failure first (#2280).
+        if self
+            .review_retry_backoff_pending(&attempts, attempt)
+            .await?
+        {
+            return Ok(false);
+        }
+        // The reopened round of an exhausted review, and the new review of one
+        // that gave no usable verdict, run under the store's own round policy:
+        // each may need a different (closing) reviewer, and a reviewer the
+        // ledger would refuse is never requested (#2280).
+        let same_instance = |other: &&AttemptRow, class: &str| {
             other.node_id == attempt.node_id
                 && other.iteration == attempt.iteration
-                && other.failure_class.as_deref() == Some(failure::REVIEW_REOPENED)
-        });
-        let reviewer = if reopened {
-            match self.review_extra_round(execution, attempt).await? {
-                ExtraRound::Same => reviewer,
-                ExtraRound::Closure(closing) => closing,
-                ExtraRound::Unavailable(reason) => {
-                    self.settle(
-                        execution,
-                        attempt,
-                        AttemptStatus::Blocked,
-                        failed(
-                            failure::REVIEW_ROUNDS_EXHAUSTED,
-                            &format!("the extra review round is unavailable: {reason}"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(true);
-                }
-            }
-        } else {
-            reviewer
+                && other.failure_class.as_deref() == Some(class)
         };
+        let reopened = attempts
+            .iter()
+            .any(|other| same_instance(&other, failure::REVIEW_REOPENED));
+        let retried = attempts
+            .iter()
+            .any(|other| same_instance(&other, failure::REVIEW_UNSETTLED));
+        let round = if reopened {
+            Some(self.review_extra_round(execution, attempt).await?)
+        } else if retried {
+            Some(self.review_retry_round(execution, attempt).await?)
+        } else {
+            None
+        };
+        let reviewer = match round {
+            None | Some(ExtraRound::Same) => reviewer,
+            Some(ExtraRound::Closure(closing)) => closing,
+            Some(ExtraRound::Unavailable(reason)) => {
+                let (class, text) = if reopened {
+                    (
+                        failure::REVIEW_ROUNDS_EXHAUSTED,
+                        format!("the extra review round is unavailable: {reason}"),
+                    )
+                } else {
+                    (
+                        failure::REVIEW_UNSETTLED,
+                        format!("the review retry round is unavailable: {reason}"),
+                    )
+                };
+                self.settle(
+                    execution,
+                    attempt,
+                    AttemptStatus::Blocked,
+                    failed(class, &text),
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
+        let mut query = context.query;
+        if let Some(producer) = producer(&attempts, &attempt.base_commit) {
+            let store = self.store.lock().await;
+            query.push_str(&super::review_receipts::source_receipt_text(
+                &store,
+                execution,
+                producer,
+                &attempt.base_commit,
+            )?);
+        }
+        // #2570: a published commit already passed the merge-queue gate; show
+        // the reviewer that receipt so it does not re-run the gate's tests.
+        if let Some(entry) = published_land_entry(&attempts, &attempt.base_commit)
+            && let Some(gate) = self.effects.land_gate_receipt(entry).await
+        {
+            query.push_str(&gate_receipt_text(&attempt.base_commit, entry, &gate));
+        }
         let request = ReviewRequest {
             execution_id: execution.id,
             attempt_id: attempt.id,
@@ -343,8 +450,15 @@ impl<E: NodeEffects> Executor<E> {
             author_session_id: context.author,
             extra_contributors: context.extra_contributors,
             previous_assignment: context.previous_assignment,
-            query: context.query,
+            query,
         };
+        tracing::debug!(
+            execution_id = %request.execution_id,
+            node_id = %request.node_id,
+            of_node = %request.of_node,
+            round = request.round,
+            "topology review requested"
+        );
         match self.effects.request_review(request).await {
             Ok(assignment) => {
                 let update = {
@@ -380,7 +494,16 @@ impl<E: NodeEffects> Executor<E> {
         attempt: &AttemptRow,
         reason: &str,
     ) -> Result<()> {
+        // #2809: a reviewer a hub deploy cut off gave no verdict either; it
+        // shares the infrastructure budget and spends no review round.
+        let infrastructure =
+            reason == REVIEW_INFRASTRUCTURE_REASON || reason == REVIEW_INTERRUPTED_REASON;
         let prior = {
+            let class = if infrastructure {
+                failure::REVIEW_INFRASTRUCTURE
+            } else {
+                failure::REVIEW_UNSETTLED
+            };
             let store = self.store.lock().await;
             rows::load_attempts(&store, execution.id)?
                 .iter()
@@ -388,22 +511,67 @@ impl<E: NodeEffects> Executor<E> {
                     other.node_id == attempt.node_id
                         && other.iteration == attempt.iteration
                         && other.id != attempt.id
-                        && other.failure_class.as_deref() == Some(failure::REVIEW_UNSETTLED)
+                        && other.failure_class.as_deref() == Some(class)
                 })
                 .count()
         };
-        let status = if prior == 0 {
-            AttemptStatus::Failed
+        // A reviewer that reported unavailable infrastructure earns its own,
+        // larger retry budget; once spent the node blocks like any other
+        // review that cannot settle (#2570).
+        let (status, class) = if infrastructure && prior < REVIEW_INFRASTRUCTURE_RETRIES {
+            (AttemptStatus::Failed, failure::REVIEW_INFRASTRUCTURE)
+        } else if !infrastructure && prior == 0 {
+            (AttemptStatus::Failed, failure::REVIEW_UNSETTLED)
         } else {
-            AttemptStatus::Blocked
+            (AttemptStatus::Blocked, failure::REVIEW_UNSETTLED)
         };
-        self.settle(
-            execution,
-            attempt,
-            status,
-            failed(failure::REVIEW_UNSETTLED, reason),
+        // #2423: a reviewer can outlive its verdict (an immutable `blocked`
+        // receipt does not end the session). The topology has given up on this
+        // assignment, so stop the reviewer and record that beside the reason.
+        let stopped = match attempt.review_assignment_id {
+            Some(assignment) => self.effects.stop_reviewer(assignment).await,
+            None => None,
+        };
+        let recorded = match stopped {
+            Some(session) => format!("{reason} (reviewer session {session} interrupted)"),
+            None => reason.to_owned(),
+        };
+        self.settle(execution, attempt, status, failed(class, &recorded))
+            .await
+    }
+
+    /// Whether `attempt` is an automatic retry still inside the backoff that
+    /// follows a capacity-shaped `review_unsettled` (#2280). A retry the
+    /// operator or manager asked for (`resolution` set on its predecessor) is
+    /// never delayed.
+    async fn review_retry_backoff_pending(
+        &self,
+        attempts: &[AttemptRow],
+        attempt: &AttemptRow,
+    ) -> Result<bool> {
+        let Some(previous) = attempts.iter().find(|other| {
+            other.node_id == attempt.node_id
+                && other.iteration == attempt.iteration
+                && other.attempt_no.saturating_add(1) == attempt.attempt_no
+        }) else {
+            return Ok(false);
+        };
+        if !matches!(
+            previous.failure_class.as_deref(),
+            Some(failure::REVIEW_UNSETTLED | failure::REVIEW_INFRASTRUCTURE)
+        ) || previous.resolution.is_some()
+            || !capacity_shaped(previous.error.as_deref().unwrap_or_default())
+        {
+            return Ok(false);
+        }
+        let finished = {
+            let store = self.store.lock().await;
+            rows::attempt_finished_at(&store, previous.id)?
+        };
+        Ok(
+            finished
+                .is_some_and(|finished| chrono::Utc::now() < finished + REVIEW_CAPACITY_BACKOFF),
         )
-        .await
     }
 
     async fn observe_review(&self, execution: &ExecutionRow, attempt: &AttemptRow) -> Result<bool> {
@@ -532,6 +700,71 @@ impl<E: NodeEffects> Executor<E> {
     }
 }
 
+/// #2677: where a topology reviewer reports a finding. One finding becomes
+/// exactly one Issue, so the reviewer never files it: the receipt carries it and
+/// the topology (the post-land follow-up node) files and dedupes the Issues.
+/// A process problem about the review itself is still a kaizen Issue.
+const REVIEW_FINDINGS_RULE: &str = "\n\nFindings: report every finding in your receipt only. Do \
+not file a finding as an Issue (no AgentCreateIssue for a code or test defect): the topology turns \
+the receipt findings into deduped follow-up Issues, and a second Issue for the same finding is a \
+duplicate. A kaizen Issue about the review process itself is still allowed.";
+
+/// What every topology reviewer is told about tests (#2570): the verified
+/// receipts are the test evidence, a reviewer reviews code, and a check that
+/// cannot run is reported as infrastructure instead of as a code finding.
+const REVIEW_TEST_EVIDENCE_RULES: &str = "\n\nTest evidence: the author's verified `scoped_test` \
+    receipt snapshot attached below (and, for a published commit, the merge-queue gate receipt) is the test evidence for \
+    this change. Do not re-run those tests and do not run `scripts/scoped-test`: a run waits for a \
+    build slot and proves nothing the receipt does not. Read the snapshot directly; AgentGetJob \
+    and AgentListJobs remain own-job only. For a pre-merge review, only trust `trust: verified` for this exact source; \
+    `untrusted` or `absent` does not meet the test minimum and must remain blocked with an \
+    `infra_` finding. For a published source, the merge-queue gate receipt remains test evidence. \
+    Do not substitute an author's self-reported receipt. You may submit at most one exact-name test \
+    job to prove one specific finding. If a check you need cannot run (no build slot, a missing \
+    runner), do not file it as a code finding: submit verdict `blocked` with a blocking finding \
+    whose key starts with `infra_` (for example `infra_tests_unavailable`). The topology treats \
+    that as an infrastructure retry, not as a verdict on the code, and it spends no review round.";
+
+/// Longest filter list quoted from a gate receipt.
+const GATE_FILTERS_MAX: usize = 1_500;
+
+/// The post-land reviewer's view of the gate that already tested the source
+/// (#2570): the filters it ran, that the entry published, and where the log is.
+fn gate_receipt_text(commit: &str, entry: Uuid, gate: &GateReceipt) -> String {
+    let filters = if gate.test_filters.is_empty() {
+        "no focused filters were recorded for it".to_owned()
+    } else {
+        format!(
+            "it ran {} derived filter(s): {}",
+            gate.test_filters.len(),
+            clip(&gate.test_filters.join(", "), GATE_FILTERS_MAX)
+        )
+    };
+    let log = gate.log_glob.as_deref().map_or_else(String::new, |glob| {
+        format!(" The gate log with each test's result is `{glob}`.")
+    });
+    format!(
+        "\n\nMerge-queue gate receipt for source {commit} (queue entry {entry}, state {}): \
+         {filters}. The entry published, so those tests passed.{log} Do not re-run what the gate \
+         selected; run only an exact-name test the gate did not select, and only to prove a \
+         specific finding.",
+        gate.state
+    )
+}
+
+/// The queue entry of the land node that published `commit` in this execution.
+fn published_land_entry(attempts: &[AttemptRow], commit: &str) -> Option<Uuid> {
+    attempts
+        .iter()
+        .filter(|other| {
+            other.node_kind == "land"
+                && other.status == AttemptStatus::Succeeded
+                && other.base_commit == commit
+        })
+        .filter_map(|land| land.land_entry_id)
+        .next_back()
+}
+
 /// Longest author task text quoted to the reviewer.
 const AUTHOR_QUERY_MAX: usize = 4_000;
 
@@ -549,6 +782,25 @@ struct ReviewContext {
     query: String,
 }
 
+/// The published SHA of the merge-queue landing of `commit` in this execution,
+/// when a land node has already published it (#2565).
+fn published_sha<'a>(attempts: &'a [AttemptRow], commit: &str) -> Option<&'a str> {
+    attempts
+        .iter()
+        .filter(|other| {
+            other.node_kind == "land"
+                && other.status == AttemptStatus::Succeeded
+                && other.base_commit == commit
+        })
+        .filter_map(|land| {
+            land.output
+                .as_ref()?
+                .pointer("/fields/landed_sha")?
+                .as_str()
+        })
+        .next_back()
+}
+
 /// The session attempt that produced `commit` in this execution.
 pub(crate) fn producer<'a>(attempts: &'a [AttemptRow], commit: &str) -> Option<&'a AttemptRow> {
     attempts.iter().rev().find(|other| {
@@ -558,7 +810,7 @@ pub(crate) fn producer<'a>(attempts: &'a [AttemptRow], commit: &str) -> Option<&
     })
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
     }
@@ -623,7 +875,7 @@ fn review_context(
         })
         .and_then(|review| review.review_assignment_id);
     let task = clip(author.query(), AUTHOR_QUERY_MAX);
-    let query = format!(
+    let mut query = format!(
         "Independent review of commit {commit} from topology execution `{name}` (review node \
          `{node}`, round {round}). The commit was produced by node `{producer}` for this task:\n\n\
          {task}\n\nCheck the change against that task: correctness, tests that assert the stated \
@@ -635,6 +887,20 @@ fn review_context(
         round = attempt.iteration.saturating_add(1),
         producer = current.node_id,
     );
+    // #2565: a post-land review reads work that is already published. Name
+    // both identities so the reviewer examines what is on rolling, and so its
+    // findings are understood as follow-ups rather than a veto.
+    if let Some(published) = published_sha(attempts, &attempt.base_commit) {
+        query.push_str(&format!(
+            "\n\nThis commit has already been published to rolling as {published} (the merge \
+             queue's published commit for source commit {commit}). Review the published change; \
+             each real defect you report in your receipt becomes a follow-up Issue that the \
+             topology files and dedupes, and does not revert the landing.",
+            commit = attempt.base_commit,
+        ));
+    }
+    query.push_str(REVIEW_TEST_EVIDENCE_RULES);
+    query.push_str(REVIEW_FINDINGS_RULE);
     Ok(ReviewContext {
         author: author.session_id,
         extra_contributors,

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:hooks": {
+      "status": "done",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": ":hooks opens the hooks list (ListClaudeHooks); add and delete save with PutClaudeHooks; Remove all is DeleteClaudeHooks. Same daemon RPCs as the TUI, so both read one hooks block"
+    },
+    "overlay-ref:hook-form": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Add and edit-in-place hook form (event, matcher, command, timeout) over PutClaudeHooks: a desktop form with Enter/Esc in place of the TUI's five-key edit overlay; changing the event or matcher moves the hook, like the TUI's HookEdit"
+    },
+    "overlay-ref:hook-save-conflict": {
+      "status": "done",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "A stale save (claude_hooks_conflict) asks to overwrite; overwrite re-reads the revision and puts the same block again. Cancel keeps the file; reopening :hooks reloads"
+    },
+    "overlay-ref:provider-form": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Custom provider form (name, base URL, default model) over PutCustomProvider, list, delete (DeleteCustomProvider) and role routes (SetCustomProviderRoute, current route read with ListCustomProviderRoutes) from the View menu or palette; the same daemon store the TUI uses, so both frontends list the same providers"
+    },
+    "overlay-ref:provider-key-form": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "The API key is a password field in the provider form: blank keeps the stored key, typing sets it, a checkbox removes it. Only the key state and fingerprint are ever shown; the key goes to the daemon vault and is never read back"
+    },
+    "overlay-ref:message-bridge-form": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Signal and iMessage bridge form (enabled, account, allow-from, working dir) over PutMessageBridge, with remove (DeleteMessageBridge), from the View menu or palette"
+    },
+    "module:ui/overlay/hook_form.rs": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Desktop hook form and save conflict over the daemon's operator RPCs (hub #3039)"
+    },
+    "module:ui/overlay/message_bridge_form.rs": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Desktop message bridge form over the daemon's operator RPCs (hub #3039)"
+    },
+    "module:ui/overlay/provider_credential_form.rs": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Desktop provider key field over the daemon's operator RPCs (hub #3039)"
+    },
+    "module:ui/overlay/provider_form.rs": {
+      "status": "substitute",
+      "location": "src/actions/operatorconfig-spec.ts, src/actions/operatorconfig.ts, src/operator-config-model.ts, src/operator-config-api.ts, src-tauri/src/operator_config.rs",
+      "note": "Desktop provider form over the daemon's operator RPCs (hub #3039)"
+    }
+  }
+}

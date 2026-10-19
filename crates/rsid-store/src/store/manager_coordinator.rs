@@ -10,6 +10,7 @@ use rsi_common::types::SessionStatus;
 use rusqlite::{Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::Store;
@@ -56,13 +57,6 @@ pub struct ManagerDeliveryTopologyV2 {
 
 /// Live keys of one kind in a scope, read from the live-row index so archived
 /// history never enters the scanned range.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "shares manager_v2_records_of_kind's reachability in the non-test lib"
-    )
-)]
 pub(super) const LIVE_KIND_KEYS_SQL: &str =
     "SELECT record_key FROM harness_manager_v2_records INDEXED BY harness_manager_v2_live_records
      WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind=?4 AND archived=0
@@ -154,25 +148,83 @@ impl Store {
         Ok(true)
     }
 
+    /// The members of `ids` a question refresh can change: those holding a
+    /// pending question, and those with a live or settled question projection
+    /// (a `decision` or `intent` record keyed `question:<id>`).
+    fn manager_v2_question_candidates(
+        &self,
+        config: &HarnessManagerConfigV1,
+        ids: &[Uuid],
+    ) -> Result<HashSet<Uuid>> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT s.id FROM sessions s
+             WHERE s.id IN (SELECT value FROM json_each(?1))
+               AND (s.pending_question_json IS NOT NULL
+                 OR EXISTS(SELECT 1 FROM harness_manager_v2_records r
+                    WHERE r.project_id=?2 AND r.manager_session_id=?3 AND r.scope_version=?4
+                      AND r.kind IN ('decision','intent')
+                      AND r.record_key='question:'||s.id))",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    serde_json::to_string(ids)?,
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|id| {
+                Uuid::parse_str(id).map_err(|_| refused("manager_v2_invalid_stored_identity"))
+            })
+            .collect()
+    }
+
     /// Only an exact, producer-published event is answerable. Legacy and
     /// interrupted publications remain visible unresolved decision gates.
     pub fn manager_v2_question_target(&self, session_id: Uuid) -> Result<Option<Value>> {
         self.pending_question_target(session_id)
     }
 
-    #[allow(clippy::too_many_lines)] // Bounded terminal selection and the existing decision projection share one transaction.
     pub fn manager_v2_refresh_question_decisions(
         &self,
         config: &HarnessManagerConfigV1,
     ) -> Result<usize> {
         let cohort = self.manager_v2_cohort(config)?;
-        let approval_changed = self.manager_v2_refresh_approval_decisions(config)?;
+        self.manager_v2_refresh_question_decisions_in(config, &cohort)
+    }
+
+    /// [`Self::manager_v2_refresh_question_decisions`] over a cohort the caller
+    /// already read (#2494): one reconcile pass reads it once.
+    #[allow(clippy::too_many_lines)] // Bounded terminal selection and the existing decision projection share one transaction.
+    pub(crate) fn manager_v2_refresh_question_decisions_in(
+        &self,
+        config: &HarnessManagerConfigV1,
+        cohort: &[ManagerCohortMemberV2],
+    ) -> Result<usize> {
+        let approval_changed = self.manager_v2_refresh_approval_decisions_in(config, cohort)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let mut changed = approval_changed;
         let mut sessions = std::collections::BTreeMap::new();
+        // #2494: a leaf with no pending question and no question projection
+        // (decision or intent record) has nothing to refresh, so it is never
+        // read as a Session again. Only the rows that can change reach the loop.
+        let leaf_ids: Vec<Uuid> = cohort
+            .iter()
+            .filter(|m| m.epic_id.is_some() && rsi_common::is_leaf_kind(m.session.session_kind))
+            .map(|m| m.session.id)
+            .collect();
+        let questioned = self.manager_v2_question_candidates(config, &leaf_ids)?;
         for member in cohort
             .iter()
             .filter(|m| m.epic_id.is_some() && rsi_common::is_leaf_kind(m.session.session_kind))
+            .filter(|m| questioned.contains(&m.session.id))
         {
             sessions.insert(member.session.id, member.session.clone());
         }

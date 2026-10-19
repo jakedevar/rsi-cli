@@ -1,18 +1,24 @@
-//! Global manager workspace (#1213, #1231): render the full-screen operator
-//! console. The seat list sits on the left and the selected seat's live
-//! conversation on the right, drawn by the shared session-detail renderer
-//! (`ui::prepare_session_detail` / `ui::render_session_conversation`). Below
-//! `SPLIT_MIN_WIDTH` the two take turns: the list while it has focus, the
-//! conversation while it or its input bar does.
+//! Global manager workspace (#1213, #1231, #2237): render the full-screen
+//! operator console in the session list's visual language. A scope header
+//! (breadcrumb and count) sits over a signal band that carries the grant (or
+//! the node's grant, fleet and escalations); the seat list below it uses the
+//! list's column header, `★ SECTION n ────` rules, status glyphs, the accent
+//! rail and selected-row band; the selected seat's live conversation sits on
+//! the right under its own signal band, drawn by the shared session-detail
+//! renderer (`ui::prepare_session_detail` / `ui::render_session_conversation`).
+//! The last row names the keys. Below `SPLIT_MIN_WIDTH` the list and the
+//! conversation take turns: the list while it has focus, the conversation while
+//! it or its input bar does.
 
 use crate::app::App;
 use crate::overlay::global_manager_workspace::{
-    APPOINT_HINT, GlobalManagerWorkspaceState, LAUNCH_HINT, SPLIT_MIN_WIDTH, SeatEntry, SeatHealth,
-    SeatLevel, WorkspaceFocus, seat_header, seat_health, seat_row_text, seat_summary,
+    APPOINT_HINT, GlobalManagerWorkspaceState, LAUNCH_HINT, SPLIT_MIN_WIDTH, SeatColumn, SeatEntry,
+    SeatHealth, SeatLevel, WorkspaceFocus, WorkspaceRow, seat_cells, seat_header, seat_health,
+    seat_summary,
 };
 use crate::overlay::global_manager_workspace_launch::{LaunchField, LaunchForm, LaunchRole};
 use crate::types::OverlayState;
-use crate::ui::theme;
+use crate::ui::{glyphs, session, theme};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -35,10 +41,26 @@ fn health_color(health: SeatHealth) -> Color {
     }
 }
 
+/// The one-cell status glyph of a seat, from the session list's vocabulary.
+fn health_glyph(health: SeatHealth) -> &'static str {
+    match health {
+        SeatHealth::Active => "●",
+        SeatHealth::Idle => glyphs::DONE,
+        SeatHealth::Waiting => glyphs::NEEDS_YOU,
+        SeatHealth::Paused => glyphs::SOFT_PAUSE,
+        SeatHealth::Stopped => glyphs::FAILED,
+        SeatHealth::Missing => "○",
+        SeatHealth::Revoked => glyphs::ROTATION_OFF,
+    }
+}
+
 /// Where each part of the console goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConsoleAreas {
-    pub preamble: Rect,
+    /// The breadcrumb and count row.
+    pub header: Rect,
+    /// The signal band: the grant, or the node's grant, fleet and escalations.
+    pub signal: Rect,
     /// The seat list, when shown.
     pub seats: Option<Rect>,
     /// The vertical rule between the halves (split layout only).
@@ -47,42 +69,64 @@ pub(crate) struct ConsoleAreas {
     pub detail: Option<Rect>,
     /// The error/notice line, only while there is one.
     pub status: Option<Rect>,
+    /// The key hints, the last row.
+    pub footer: Option<Rect>,
 }
 
 /// The seat list's width in the split layout.
 #[must_use]
 pub(crate) fn seat_list_width(inner_width: u16) -> u16 {
-    (inner_width * 43 / 100).clamp(46, 96)
+    (inner_width * 43 / 100).clamp(47, 96)
 }
 
 pub(crate) fn console_areas(
     inner: Rect,
     state: &GlobalManagerWorkspaceState,
-    preamble_height: u16,
+    signal_height: u16,
 ) -> ConsoleAreas {
+    let header_height = 1u16.min(inner.height);
+    let footer_height = u16::from(inner.height >= 8);
     let has_status = state.error.is_some() || state.notice.is_some();
-    let preamble_height = preamble_height.min(inner.height);
-    let status_height = u16::from(has_status && inner.height > preamble_height + 1);
+    let status_height = u16::from(has_status && inner.height > header_height + footer_height + 2);
+    let signal_height = signal_height.min(
+        inner
+            .height
+            .saturating_sub(header_height + footer_height + status_height),
+    );
+    let top = header_height + signal_height;
     let body = Rect::new(
         inner.x,
-        inner.y + preamble_height,
+        inner.y + top,
         inner.width,
-        inner.height.saturating_sub(preamble_height + status_height),
+        inner
+            .height
+            .saturating_sub(top + footer_height + status_height),
     );
-    let status = (status_height == 1)
+    let header = Rect::new(inner.x, inner.y, inner.width, header_height);
+    let signal = Rect::new(inner.x, inner.y + header_height, inner.width, signal_height);
+    let status = (status_height == 1).then(|| {
+        Rect::new(
+            inner.x,
+            inner.y + inner.height - footer_height - 1,
+            inner.width,
+            1,
+        )
+    });
+    let footer = (footer_height == 1)
         .then(|| Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1));
-    let preamble = Rect::new(inner.x, inner.y, inner.width, preamble_height);
     // Without a grant (or a node snapshot) there are no seats: the empty
     // state (or the launch form) takes the whole body.
     let no_grant = state.snapshot.is_some() && !state.has_seats();
     if no_grant || state.snapshot.is_none() {
         let form = state.launch.is_some();
         return ConsoleAreas {
-            preamble,
+            header,
+            signal,
             seats: (!form).then_some(body),
             rule: None,
             detail: form.then_some(body),
             status,
+            footer,
         };
     }
     if inner.width >= SPLIT_MIN_WIDTH {
@@ -96,52 +140,70 @@ pub(crate) fn console_areas(
             body.height,
         );
         return ConsoleAreas {
-            preamble,
+            header,
+            signal,
             seats: Some(seats),
             rule: Some(rule),
             detail: Some(detail),
             status,
+            footer,
         };
     }
     let detail_first = state.launch.is_some() || state.focus != WorkspaceFocus::Seats;
     ConsoleAreas {
-        preamble,
+        header,
+        signal,
         seats: (!detail_first).then_some(body),
         rule: None,
         detail: detail_first.then_some(body),
         status,
+        footer,
     }
 }
 
-/// The fixed lines above both halves.
-fn preamble(app: &App, state: &GlobalManagerWorkspaceState) -> Vec<Line<'static>> {
-    let bold = Style::default().add_modifier(Modifier::BOLD);
+/// `text` split at ` · ` into styled facts: the first bold, `active` and
+/// `revoked` states coloured, the separators dim. The characters are exactly
+/// `text`'s, so the line reads the same as the plain string.
+fn facts_line(text: &str, bg: Color) -> Line<'static> {
+    let base = Style::default().fg(theme::text()).bg(bg);
+    let sep = Style::default().fg(theme::dim_metadata()).bg(bg);
+    let mut spans = Vec::new();
+    for (index, segment) in safe(text).split(" · ").enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", sep));
+        }
+        let style = if segment.ends_with(" active") {
+            base.fg(theme::status_running())
+                .add_modifier(Modifier::BOLD)
+        } else if segment.ends_with(" revoked") {
+            base.fg(theme::error_status()).add_modifier(Modifier::BOLD)
+        } else if index == 0 {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        spans.push(Span::styled(segment.to_string(), style));
+    }
+    Line::from(spans)
+}
+
+/// The signal band's lines: the grant for the global console; the node's
+/// location, grant, fleet and escalations for a node console.
+fn signal_lines(app: &App, state: &GlobalManagerWorkspaceState) -> Vec<Line<'static>> {
+    let bg = theme::selected_row_bg();
     let mut lines = Vec::new();
-    let freshness = match (&state.loaded_at, &state.error) {
-        (_, Some(_)) if state.snapshot.is_some() => "stale".to_string(),
-        (Some(at), _) => format!("as of {}", at.format("%H:%M:%S")),
-        (None, _) => "loading".to_string(),
-    };
     if state.target.is_some() {
         // #1240: a node console.
-        lines.push(Line::from(vec![
-            Span::styled(
-                state
-                    .node
-                    .as_ref()
-                    .map_or_else(|| "Manager node".to_string(), |node| safe(&node.label)),
-                bold,
-            ),
-            Span::styled(
-                format!(" · {freshness} · Enter opens a child · Backspace goes up · ? keys"),
-                Style::default().fg(theme::dim_metadata()),
-            ),
-        ]));
         for line in state.node_lines(&app.projects) {
-            lines.push(Line::from(Span::styled(
-                safe(&line),
-                Style::default().fg(theme::text()),
-            )));
+            let text = safe(&line);
+            if text.contains("escalation") {
+                lines.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(theme::warning_status()).bg(bg),
+                )));
+            } else {
+                lines.push(facts_line(&text, bg));
+            }
         }
         if state
             .node
@@ -150,33 +212,93 @@ fn preamble(app: &App, state: &GlobalManagerWorkspaceState) -> Vec<Line<'static>
         {
             lines.push(Line::from(Span::styled(
                 "Revoked: this node holds no authority.".to_string(),
-                Style::default().fg(theme::error_status()),
+                Style::default()
+                    .fg(theme::error_status())
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
             )));
         }
         return lines;
     }
-    lines.push(Line::from(vec![
-        Span::styled("Above all projects", bold),
-        Span::styled(
-            format!(" · same view from every tab · {freshness} · ? keys"),
-            Style::default().fg(theme::dim_metadata()),
-        ),
-    ]));
     if let Some(snapshot) = &state.snapshot
         && let Some(grant) = &snapshot.grant
     {
-        lines.push(Line::from(Span::styled(
-            safe(&state.grant_line(&app.projects)),
-            Style::default().fg(theme::text()),
-        )));
+        lines.push(facts_line(&state.grant_line(&app.projects), bg));
         if seat_health(grant, snapshot.seat.as_ref()) == SeatHealth::Revoked {
             lines.push(Line::from(Span::styled(
                 format!("Revoked: the seat holds no authority. Appoint a new one: {LAUNCH_HINT}"),
-                Style::default().fg(theme::error_status()),
+                Style::default()
+                    .fg(theme::error_status())
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
             )));
         }
     }
     lines
+}
+
+/// The breadcrumb row, like the session list's scope header: where the view
+/// sits on the left, the count and freshness on the right.
+fn scope_header(state: &GlobalManagerWorkspaceState, width: u16) -> Line<'static> {
+    let name = if state.target.is_some() {
+        state
+            .node
+            .as_ref()
+            .map_or_else(|| "Manager node".to_string(), |node| safe(&node.label))
+    } else {
+        "Above all projects".to_string()
+    };
+    let freshness = match (&state.loaded_at, &state.error) {
+        (_, Some(_)) if state.snapshot.is_some() => "stale".to_string(),
+        (Some(at), _) => format!("as of {}", at.format("%H:%M:%S")),
+        (None, _) => "loading".to_string(),
+    };
+    let count = state.seats().len();
+    let sep = Style::default().fg(theme::overlay1());
+    let left = vec![
+        Span::raw(" "),
+        Span::styled(
+            name,
+            Style::default()
+                .fg(theme::green())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" / ", sep),
+        Span::styled(
+            "Seats",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let hint = if state.target.is_some() {
+        " · Backspace goes up"
+    } else {
+        " · same view from every tab"
+    };
+    let right = vec![
+        Span::styled(
+            count.to_string(),
+            Style::default()
+                .fg(theme::text())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{} · {freshness}{hint} ",
+                if count == 1 { " seat" } else { " seats" }
+            ),
+            Style::default().fg(theme::dim_metadata()),
+        ),
+    ];
+    let used = Line::from(left.clone()).width() + Line::from(right.clone()).width();
+    let pad = usize::from(width).saturating_sub(used);
+    let mut spans = left;
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(right);
+    }
+    Line::from(spans)
 }
 
 /// The empty state (no grant): how to appoint the first manager.
@@ -191,7 +313,7 @@ fn empty_lines() -> Vec<Line<'static>> {
             text,
         )),
         Line::from(Span::styled(
-            "and the projects it oversees, then talk to it in this view.",
+            "and the projects it oversees, set what it may do (the grant), then talk to it in this view.",
             text,
         )),
         Line::default(),
@@ -200,6 +322,113 @@ fn empty_lines() -> Vec<Line<'static>> {
             Style::default().fg(theme::dim_metadata()),
         )),
     ]
+}
+
+/// The section a seat opens in the list, when it opens one: a rule line like
+/// the session list's `★ MANAGERS 1 ────`.
+fn section_of(seat: &SeatEntry) -> Option<(String, &'static str, Color)> {
+    if matches!(seat.row, WorkspaceRow::Predecessor { .. }) || seat.depth >= 2 {
+        return None;
+    }
+    Some(match seat.level {
+        SeatLevel::Global => ("GLOBAL".to_string(), glyphs::MANAGERS, theme::accent()),
+        SeatLevel::Portfolio if seat.depth == 0 => (
+            seat.tier
+                .as_deref()
+                .map_or_else(|| "NODE".to_string(), str::to_uppercase),
+            glyphs::MANAGERS,
+            theme::accent(),
+        ),
+        SeatLevel::Portfolio => (
+            "CHILD NODES".to_string(),
+            glyphs::GROUP_CONTAINER,
+            theme::accent(),
+        ),
+        SeatLevel::Project => ("PROJECT MANAGERS".to_string(), "●", theme::status_running()),
+        SeatLevel::Area => ("AREAS".to_string(), glyphs::EPIC_CONTAINER, theme::blue()),
+    })
+}
+
+fn cell_style(column: SeatColumn, seat: &SeatEntry, text: &str) -> Style {
+    let dim = Style::default().fg(theme::dim_metadata());
+    let count = |n: Option<i64>, hot: Color| match n {
+        Some(n) if n > 0 => Style::default().fg(hot).add_modifier(Modifier::BOLD),
+        _ => dim,
+    };
+    match column {
+        SeatColumn::Name => {
+            if matches!(seat.row, WorkspaceRow::Predecessor { .. }) {
+                dim
+            } else {
+                Style::default().fg(theme::text())
+            }
+        }
+        SeatColumn::Health => Style::default()
+            .fg(health_color(seat.health))
+            .add_modifier(Modifier::BOLD),
+        SeatColumn::Context => {
+            if text.trim() == "-" {
+                dim
+            } else if seat.context_fill_pct.is_some_and(|pct| pct >= 85.0) {
+                Style::default().fg(theme::warning_status())
+            } else {
+                Style::default().fg(theme::count_text())
+            }
+        }
+        SeatColumn::Issues => {
+            if seat.issues.is_some_and(|(_, _, requests)| requests > 0) {
+                Style::default().fg(theme::warning_status())
+            } else if seat.issues.is_some() {
+                Style::default().fg(theme::count_text())
+            } else {
+                dim
+            }
+        }
+        SeatColumn::Model => Style::default().fg(theme::model_text()),
+        SeatColumn::Running => count(seat.activity.map(|a| a.0), theme::status_running()),
+        SeatColumn::Waiting => count(seat.activity.map(|a| a.1), theme::status_waiting()),
+        SeatColumn::Questions => count(seat.activity.map(|a| a.2), theme::status_waiting()),
+        SeatColumn::Approvals => count(seat.activity.map(|a| a.3), theme::status_waiting()),
+        SeatColumn::Updated => Style::default().fg(theme::time_text()),
+    }
+}
+
+/// One seat's list row in the session list's shape: accent rail, status glyph,
+/// then the aligned cells; the selected row sits on the list's selected band.
+fn seat_row_line(seat: &SeatEntry, width: usize, selected: bool, focused: bool) -> Line<'static> {
+    let bg = selected.then(theme::selected_row_bg);
+    let on = |style: Style| bg.map_or(style, |bg| style.bg(bg));
+    let rail = match (selected, focused) {
+        (true, true) => "▌",
+        (true, false) => "│",
+        _ => " ",
+    };
+    let mut spans = vec![
+        Span::styled(
+            rail,
+            on(Style::default()
+                .fg(theme::active_row_rail())
+                .add_modifier(Modifier::BOLD)),
+        ),
+        Span::styled(
+            health_glyph(seat.health),
+            on(Style::default().fg(health_color(seat.health))),
+        ),
+        // A space between the glyph and the name, like the list's columns.
+        Span::styled(" ", on(Style::default())),
+    ];
+    for (column, text) in seat_cells(seat, width) {
+        let mut style = cell_style(column, seat, &text);
+        if selected && column == SeatColumn::Name {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(safe(&text), on(style)));
+    }
+    let line = Line::from(spans);
+    match bg {
+        Some(bg) => line.style(Style::default().bg(bg)),
+        None => line,
+    }
 }
 
 /// Every line of the seat list and the line index of the selected row.
@@ -214,34 +443,52 @@ pub(crate) fn seat_lines(
     if !state.has_seats() {
         return (empty_lines(), None);
     }
+    // One column wider than the plain header: rail, glyph and a gap lead each row.
     let mut lines = vec![Line::from(Span::styled(
-        seat_header(width),
+        format!(" {}", seat_header(width)),
         Style::default()
             .fg(theme::table_header_text())
             .add_modifier(Modifier::BOLD),
     ))];
+    let seats = state.seats();
+    // How many seats each section holds, for its header's count.
+    let mut sections: Vec<(String, usize)> = Vec::new();
+    for seat in &seats {
+        match section_of(seat) {
+            Some((name, ..)) if sections.last().is_none_or(|(last, _)| *last != name) => {
+                sections.push((name, 1));
+            }
+            _ => {
+                if let Some(last) = sections.last_mut() {
+                    last.1 += 1;
+                }
+            }
+        }
+    }
+    let mut section_index = 0;
+    let mut opened: Option<String> = None;
     let mut selected_line = None;
-    for (index, seat) in state.seats().iter().enumerate() {
+    for (index, seat) in seats.iter().enumerate() {
+        if let Some((name, glyph, color)) = section_of(seat)
+            && opened.as_deref() != Some(name.as_str())
+        {
+            let count = sections.get(section_index).map_or(0, |(_, n)| *n);
+            section_index += 1;
+            lines.push(session::section_header_line(
+                glyph,
+                &name,
+                &format!("  {count}  "),
+                color,
+                theme::overlay_bg(),
+                width,
+            ));
+            opened = Some(name);
+        }
         let selected = index == state.selected;
-        let marker = if selected { "> " } else { "  " };
-        let style = if selected && focused {
-            Style::default()
-                .fg(theme::text())
-                .add_modifier(Modifier::REVERSED)
-        } else if selected {
-            Style::default()
-                .fg(health_color(seat.health))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(health_color(seat.health))
-        };
         if selected {
             selected_line = Some(lines.len());
         }
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{}", safe(&seat_row_text(seat, width))),
-            style,
-        )));
+        lines.push(seat_row_line(seat, width, selected, focused));
     }
     (lines, selected_line)
 }
@@ -269,7 +516,7 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
             if form.cap_confirm {
                 "y confirm lower project caps · n back to the form · Esc cancel"
             } else {
-                "j/k field · h/l change (seat, host) · Space/a scope · Enter launch · Esc cancel"
+                "j/k field · h/l change (seat, host) · Space/a scope · Enter launch (on Grant: edit) · Esc cancel"
             },
             dim,
         )),
@@ -309,6 +556,15 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
                     lines.push(Line::from(spans));
                 }
             }
+            LaunchField::Grant => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{marker}{:<9} {}", field.label(), safe(&form.value(field))),
+                        style,
+                    ),
+                    Span::styled(if focused { "   Enter edits" } else { "" }, dim),
+                ]));
+            }
             LaunchField::Scope => {
                 lines.push(Line::from(Span::styled(
                     format!("{marker}{:<9} {}", field.label(), form.value(field)),
@@ -342,7 +598,7 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
     }
     if let LaunchRole::Project(_) = form.role {
         lines.push(Line::from(Span::styled(
-            "  Scope: the whole project, Execute policy (change later with :manager policy)",
+            "  Scope: the whole project; the policy comes from Grant (Execute by default; change later with :manager policy)",
             dim,
         )));
     }
@@ -354,6 +610,12 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
         ),
         dim,
     )));
+    if let Some(note) = &form.prefill_note {
+        lines.push(Line::default());
+        for row in wrap_words(&safe(note), width.saturating_sub(2).max(10)) {
+            lines.push(Line::from(Span::styled(format!("  {row}"), dim)));
+        }
+    }
     if let Some(error) = &form.error {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
@@ -389,7 +651,38 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The grant editor's heading above the shared editor view.
+fn grant_heading(form: &LaunchForm) -> Vec<Line<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    vec![
+        Line::from(Span::styled(
+            format!("Grant · {}", safe(&form.role_label())),
+            bold,
+        )),
+        Line::from(Span::styled(
+            "j/k row · h/l change · Space toggle · digits type a number · Esc back to the form",
+            Style::default().fg(theme::dim_metadata()),
+        )),
+        Line::default(),
+    ]
+}
+
 fn render_form(frame: &mut Frame, area: Rect, form: &LaunchForm) {
+    if form.grant_open {
+        let heading = grant_heading(form);
+        let used = u16::try_from(heading.len()).unwrap_or(3).min(area.height);
+        frame.render_widget(
+            Paragraph::new(heading),
+            Rect::new(area.x, area.y, area.width, used),
+        );
+        super::grant_editor::render_grant(
+            frame,
+            Rect::new(area.x, area.y + used, area.width, area.height - used),
+            &form.grant,
+            theme::overlay_bg(),
+        );
+        return;
+    }
     let lines = form_lines(form, usize::from(area.width));
     let selected = lines.iter().position(|line| {
         line.spans
@@ -410,25 +703,34 @@ enum Detail {
     },
 }
 
+/// The selected seat's signal band: who it is and how it is doing, then its
+/// portfolio signals and what the operator can do about it.
 fn seat_header_lines(seat: &SeatEntry) -> Vec<Line<'static>> {
+    let bg = theme::selected_row_bg();
+    let health = seat.health.label();
     let mut lines: Vec<Line<'static>> = seat_summary(seat)
         .into_iter()
         .enumerate()
         .map(|(index, line)| {
-            let style = if index == 0 {
-                Style::default()
-                    .fg(theme::text())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::text())
-            };
-            Line::from(Span::styled(safe(&line), style))
+            let mut facts = facts_line(&line, bg);
+            if index == 0 {
+                // The health word keeps its seat colour, like the list.
+                for span in &mut facts.spans {
+                    if span.content == health {
+                        span.style = span
+                            .style
+                            .fg(health_color(seat.health))
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+            }
+            facts
         })
         .collect();
     if let Some(action) = seat.health.action() {
         lines.push(Line::from(Span::styled(
             action.to_string(),
-            Style::default().fg(health_color(seat.health)),
+            Style::default().fg(health_color(seat.health)).bg(bg),
         )));
     }
     lines
@@ -448,6 +750,7 @@ fn detail(app: &App, state: &GlobalManagerWorkspaceState) -> Detail {
             Vec::new()
         });
     };
+    let bg = theme::selected_row_bg();
     let mut header = seat_header_lines(&seat);
     // #1627: the global seat lives in one host project; name it.
     if seat.level == SeatLevel::Global {
@@ -457,15 +760,12 @@ fn detail(app: &App, state: &GlobalManagerWorkspaceState) -> Detail {
         {
             header.push(Line::from(Span::styled(
                 safe(&format!("Host project {}", host.name)),
-                Style::default().fg(theme::text()),
+                Style::default().fg(theme::text()).bg(bg),
             )));
         }
     }
     if let Some(caps) = state.selected_cap_line() {
-        header.push(Line::from(Span::styled(
-            safe(&caps),
-            Style::default().fg(theme::text()),
-        )));
+        header.push(facts_line(&caps, bg));
     }
     match seat.session_id {
         Some(session_id) => Detail::Conversation {
@@ -493,6 +793,127 @@ fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
+/// A signal band: the accent rail down its left edge, `lines` beside it on the
+/// selected-row band (the session list's selected-signal panel).
+fn render_band(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    if area.height == 0 || area.width < 3 {
+        return;
+    }
+    let bg = theme::selected_row_bg();
+    session::fill_area(frame, area, bg);
+    frame.render_widget(
+        Paragraph::new(vec![Line::from("▌"); usize::from(area.height)]).style(
+            Style::default()
+                .fg(theme::active_row_rail())
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Rect::new(area.x, area.y, 1, area.height),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(bg)),
+        Rect::new(area.x + 2, area.y, area.width - 2, area.height),
+    );
+}
+
+/// The key hints for what has focus, `key text · key text`: keys bright, text dim.
+fn hint_segments(state: &GlobalManagerWorkspaceState) -> &'static [&'static str] {
+    if state.launch.as_ref().is_some_and(|form| form.grant_open) {
+        return &[
+            "j/k row",
+            "h/l change",
+            "Space toggle",
+            "0-9 type a number",
+            "Esc back",
+        ];
+    }
+    if state.launch.is_some() {
+        return &[
+            "j/k field",
+            "h/l change",
+            "Space scope",
+            "Enter launch",
+            "Esc cancel",
+        ];
+    }
+    match state.focus {
+        WorkspaceFocus::Input => &["Enter send", "Esc stop typing"],
+        WorkspaceFocus::Conversation => &[
+            "j/k scroll",
+            "Ctrl-D/U half page",
+            "g/G ends",
+            "i type",
+            "Tab back to seats",
+            "? keys",
+        ],
+        WorkspaceFocus::Seats => &[
+            "j/k move",
+            "Enter open",
+            "i type",
+            "t talk",
+            "n new manager",
+            "b budget",
+            "s status",
+            "x halt",
+            "p project",
+            "T tree",
+            "F fleet",
+            "Tab conversation",
+            "r refresh",
+            "? keys",
+            "Esc close",
+        ],
+    }
+}
+
+/// The last row: as many key hints as fit, always ending on `? keys` /
+/// `Esc` so the way out and the help stay visible.
+fn footer_line(state: &GlobalManagerWorkspaceState, width: u16) -> Line<'static> {
+    let segments = hint_segments(state);
+    let tail = segments.len().saturating_sub(2);
+    let mut chosen: Vec<&str> = Vec::new();
+    // The closing segments (help and the way out) are always kept, so their
+    // room is reserved before any other hint is placed.
+    let mut used = 1 + segments[tail..]
+        .iter()
+        .map(|segment| segment.chars().count() + 3)
+        .sum::<usize>();
+    let fits =
+        |used: usize, segment: &str| used + segment.chars().count() + 3 <= usize::from(width);
+    for segment in &segments[..tail] {
+        if fits(used, segment) {
+            used += segment.chars().count() + 3;
+            chosen.push(*segment);
+        }
+    }
+    chosen.extend(&segments[tail..]);
+    let mut spans = vec![Span::raw(" ")];
+    for (index, segment) in chosen.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                " · ",
+                Style::default().fg(theme::dim_metadata()),
+            ));
+        }
+        let (key, rest) = segment.split_once(' ').unwrap_or((segment, ""));
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(theme::subtext1())
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                format!(" {rest}"),
+                Style::default().fg(theme::dim_metadata()),
+            ));
+        }
+    }
+    Line::from(spans)
+}
+
 /// Render the console. Takes `&mut App` because the conversation pane updates
 /// the shown session's per-frame view state, like the detail pane does.
 pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -518,22 +939,38 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if inner.height < 3 {
         return;
     }
+    // #2502: the Budget panel replaces the console while it is open.
+    if let OverlayState::GlobalManagerWorkspace(state) = &app.overlay
+        && let Some(panel) = &state.budget
+    {
+        crate::ui::overlay::gm_budget::render(frame, inner, state, panel);
+        return;
+    }
     let (areas, detail, focus) = {
         let OverlayState::GlobalManagerWorkspace(state) = &app.overlay else {
             return;
         };
-        let preamble = preamble(app, state);
-        // One spacer row below the preamble once a snapshot is shown.
-        let spacer = u16::from(state.snapshot.is_some());
-        let areas = console_areas(
-            inner,
-            state,
-            wrapped_height(&preamble, inner.width) + spacer,
-        );
+        let signal = signal_lines(app, state);
+        // One spacer row below the band once a snapshot is shown.
+        let signal_height = if signal.is_empty() {
+            0
+        } else {
+            wrapped_height(&signal, inner.width.saturating_sub(2)) + 1
+        };
+        let areas = console_areas(inner, state, signal_height);
         frame.render_widget(
-            Paragraph::new(preamble).wrap(Wrap { trim: false }),
-            areas.preamble,
+            Paragraph::new(scope_header(state, areas.header.width)),
+            areas.header,
         );
+        if areas.signal.height > 0 {
+            let band = Rect::new(
+                areas.signal.x,
+                areas.signal.y,
+                areas.signal.width,
+                areas.signal.height.saturating_sub(1),
+            );
+            render_band(frame, band, signal);
+        }
         if let Some(seats) = areas.seats {
             let (lines, selected) = seat_lines(
                 state,
@@ -549,7 +986,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         if let Some(rule) = areas.rule {
             frame.render_widget(
                 Paragraph::new(vec![Line::from("│"); usize::from(rule.height)])
-                    .style(Style::default().fg(theme::overlay_border())),
+                    .style(Style::default().fg(theme::browser_decorative_separator())),
                 rule,
             );
         }
@@ -566,6 +1003,9 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                 ))),
                 status,
             );
+        }
+        if let Some(footer) = areas.footer {
+            frame.render_widget(Paragraph::new(footer_line(state, footer.width)), footer);
         }
         (areas, detail(app, state), state.focus)
     };
@@ -591,16 +1031,17 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             header,
             loaded,
         } => {
-            let header_height = wrapped_height(&header, detail_area.width)
+            let header_height = wrapped_height(&header, detail_area.width.saturating_sub(2))
                 .min(detail_area.height.saturating_sub(4));
-            frame.render_widget(
-                Paragraph::new(header).wrap(Wrap { trim: false }),
+            render_band(
+                frame,
                 Rect::new(
                     detail_area.x,
                     detail_area.y,
                     detail_area.width,
                     header_height,
                 ),
+                header,
             );
             let body = Rect::new(
                 detail_area.x,
@@ -894,6 +1335,7 @@ mod tests {
                 launch: self.launch.clone(),
                 target: self.target,
                 node: self.node.clone(),
+                budget: None,
             }
         }
     }
@@ -1078,15 +1520,144 @@ mod tests {
     }
 
     #[test]
-    fn no_hint_bar_is_reserved_and_status_lines_appear_only_when_set() {
+    fn a_status_line_sits_above_the_key_hints_and_appears_only_when_set() {
         let f = fixture();
         let mut app = app_with(&f, state_named(&f, "appointed-notice"));
         let text = screen(&mut app, 200, 50);
-        let last_inner = text.lines().nth(48).unwrap();
-        assert!(last_inner.contains("appointed (grant v4"), "{last_inner}");
+        let status = text.lines().nth(47).unwrap();
+        assert!(status.contains("appointed (grant v4"), "{status}");
+        let hints = text.lines().nth(48).unwrap();
+        assert!(
+            hints.contains("j/k move") && hints.contains("? keys"),
+            "{hints}"
+        );
         let mut app = app_with(&f, loaded(rich(&f)));
         let text = screen(&mut app, 200, 50);
-        assert!(text.contains("? keys"), "{text}");
+        assert!(
+            !text.lines().nth(47).unwrap().contains("appointed"),
+            "no status row while nothing was said:\n{text}"
+        );
+        assert!(text.lines().nth(48).unwrap().contains("? keys"), "{text}");
+    }
+
+    #[test]
+    fn the_list_reads_like_the_session_list() {
+        let f = fixture();
+        let mut app = app_with(&f, loaded(rich(&f)));
+        let text = screen(&mut app, 200, 50);
+        for needle in [
+            // The scope header: breadcrumb left, count and age right.
+            "Above all projects / Seats",
+            "7 seats",
+            // Section rules with the list's glyphs and counts.
+            "★ GLOBAL  1",
+            "● PROJECT MANAGERS  6",
+            // The selected row's rail and the seat's status glyph.
+            "▌✓",
+        ] {
+            assert!(text.contains(needle), "{needle} in\n{text}");
+        }
+        // One status glyph per health, from the list's vocabulary.
+        for glyph in ["✓", "!", "⏸", "○"] {
+            assert!(text.contains(glyph), "{glyph} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_selected_row_and_the_signal_band_use_the_lists_selected_band() {
+        let f = fixture();
+        let mut app = app_with(&f, loaded(rich(&f)));
+        let _theme = crate::ui::theme::pin_theme_state();
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::overlay::render_overlay(frame, frame.area(), &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let band = crate::ui::theme::selected_row_bg();
+        let row_of = |needle: &str| {
+            (0..50u16)
+                .find(|y| {
+                    (0..200u16)
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("a row contains {needle}"))
+        };
+        // The selected seat row: rail then the band behind its name.
+        let seat_row = row_of("▌✓");
+        let rail_x = (0..200u16)
+            .find(|x| buffer[(*x, seat_row)].symbol() == "▌")
+            .unwrap();
+        assert_eq!(buffer[(rail_x, seat_row)].bg, band);
+        assert_eq!(buffer[(rail_x + 6, seat_row)].bg, band);
+        // The grant sits in a signal band with the same rail and band.
+        let grant_row = row_of("Grant v3 active");
+        assert_eq!(buffer[(rail_x, grant_row)].symbol(), "▌");
+        assert_eq!(buffer[(rail_x + 4, grant_row)].bg, band);
+        // An unselected row has neither.
+        let other = row_of("PAUSED");
+        assert_ne!(buffer[(rail_x + 6, other)].bg, band);
+    }
+
+    #[test]
+    fn the_key_hints_follow_what_has_focus() {
+        let f = fixture();
+        let mut app = app_with(&f, loaded(rich(&f)));
+        let seats = screen(&mut app, 200, 50);
+        assert!(
+            seats.lines().nth(48).unwrap().contains("Enter open"),
+            "{seats}"
+        );
+        let mut app = app_with(
+            &f,
+            with_focus(loaded(rich(&f)), WorkspaceFocus::Conversation),
+        );
+        let conversation = screen(&mut app, 200, 50);
+        assert!(
+            conversation.lines().nth(48).unwrap().contains("j/k scroll"),
+            "{conversation}"
+        );
+        let mut app = app_with(&f, with_focus(loaded(rich(&f)), WorkspaceFocus::Input));
+        let typing = screen(&mut app, 200, 50);
+        assert!(
+            typing.lines().nth(48).unwrap().contains("Enter send"),
+            "{typing}"
+        );
+        // A narrow terminal drops hints from the middle but keeps the help.
+        let mut app = app_with(&f, loaded(rich(&f)));
+        let narrow = screen(&mut app, 60, 30);
+        let hints = narrow.lines().nth(28).unwrap();
+        assert!(
+            hints.contains("? keys") && hints.contains("Esc close"),
+            "{hints}"
+        );
+    }
+
+    #[test]
+    fn the_launch_form_offers_the_grant_and_its_editor() {
+        let f = fixture();
+        let mut app = app_with(&f, state_named(&f, "launch-global"));
+        let text = screen(&mut app, 200, 50);
+        for needle in ["Grant     ", "(defaults)"] {
+            assert!(text.contains(needle), "{needle} in\n{text}");
+        }
+        if let OverlayState::GlobalManagerWorkspace(state) = &mut app.overlay {
+            let form = state.launch.as_mut().unwrap();
+            form.field = LaunchField::Grant;
+            form.open_grant();
+        }
+        let text = screen(&mut app, 200, 50);
+        for needle in [
+            "Grant · Global manager",
+            "GRANT · ",
+            "AUTHORITY",
+            "▸ Preset",
+            "CAPABILITIES",
+            "Esc back",
+        ] {
+            assert!(text.contains(needle), "{needle} in\n{text}");
+        }
     }
 
     /// #1240: the node consoles, with every timestamp pinned for dumps.
@@ -1214,7 +1785,7 @@ mod tests {
     #[test]
     #[ignore = "writes visual-check artifacts"]
     fn node_console_visual_dump() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::Path::new(rsi_common::manifest_dir!())
             .join("../../thoughts/shared/research/2026-10-06-1240-visual");
         std::fs::create_dir_all(&dir).unwrap();
         let f = fixture();
@@ -1237,7 +1808,7 @@ mod tests {
     #[test]
     #[ignore = "writes visual-check artifacts"]
     fn global_manager_workspace_visual_dump() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::Path::new(rsi_common::manifest_dir!())
             .join("../../thoughts/shared/research/2026-10-05-1231-visual");
         std::fs::create_dir_all(&dir).unwrap();
         let f = fixture();

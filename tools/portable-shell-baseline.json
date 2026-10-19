@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "about": "Accepted non-portable shell forms per file under scripts/ (local #322, hub #2978). tools/check_portable_shell.py fails a file with more findings than its count here, a stale count, or a baseline above the merge base's. Lower counts as forms are fixed or marked; never raise them. Regenerate (lowering only) with python3 tools/check_portable_shell.py --refresh.",
+  "files": {
+    "scripts/cloud-gate.sh": 1,
+    "scripts/cloud-sweep.sh": 3,
+    "scripts/export-rsi-cli.sh": 2,
+    "scripts/model-scorecard.sh": 1,
+    "scripts/render-project-index.sh": 1,
+    "scripts/rsi-scratch-mkdir": 5,
+    "scripts/rsi-spill": 1,
+    "scripts/rsid-quiet-restart.sh": 2,
+    "scripts/rsid-supervisor.sh": 5,
+    "scripts/satellite/direct.sh": 2,
+    "scripts/satellite/install-direct.sh": 2,
+    "scripts/satellite/test-direct.sh": 3,
+    "scripts/satellite/test-remote-shell.sh": 1,
+    "scripts/test-suite-benchmark.sh": 6,
+    "scripts/tests/test_rsid_quiet_restart.sh": 2,
+    "scripts/verify-agent-issue-crud.sh": 1
+  }
+}

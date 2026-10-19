@@ -159,6 +159,7 @@ impl Store {
                     is_using_overage: row.is_using_overage != 0,
                     observed_at,
                     windows: vec![window],
+                    stale_reason: None,
                 }),
             }
         }

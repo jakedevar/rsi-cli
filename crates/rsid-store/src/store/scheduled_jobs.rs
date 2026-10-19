@@ -74,6 +74,7 @@ fn retention_last_activity(last_fired_at: Option<&str>, updated_at: &str) -> Opt
 }
 
 /// Mutable-field update payload for `update_scheduled_job()`.
+#[derive(Default)]
 pub struct ScheduledJobUpdate {
     pub name: Option<String>,
     pub message: Option<String>,
@@ -258,8 +259,12 @@ impl Store {
     /// Disable the caller's own scheduled job(s) selected by exactly one of
     /// `job_id` or `name`. Ownership is `wake_session_id == owner`; another
     /// session's job is reported as not found. Daemon-owned program guards and
-    /// manager watches are refused. Already-disabled owned rows are a no-op
-    /// success. Returns the ids that were newly disabled.
+    /// manager watches are refused with `wake_protected`. A selector that
+    /// matches only already-disabled rows is refused with `wake_already_disabled`
+    /// (#1632) rather than reported as a silent zero. Ownership follows
+    /// `wake_session_id`, so a wake transferred to a successor seat (#1553) is
+    /// cancellable by the seat that lists it. Returns the ids that were newly
+    /// disabled.
     pub fn cancel_owned_scheduled_jobs(
         &self,
         owner: Uuid,
@@ -275,6 +280,57 @@ impl Store {
     pub fn cancel_internal_process_wake(&self, owner: Uuid) -> Result<Vec<Uuid>> {
         let name = format!("{BACKGROUND_PROCESS_WAKE_PREFIX}{owner}");
         self.cancel_owned_scheduled_jobs_inner(owner, None, Some(&name), true)
+    }
+
+    /// #3038: withdraw every enabled wake the session owns (`wake_session_id ==
+    /// owner`): its `resume`, `when` and `on_terminal` wakes and its internal
+    /// background-process wake. Daemon-owned program guards and manager watches
+    /// are never touched. Used when a cancelling topology execution settles a
+    /// node whose session is parked on a wake, so nothing resumes the session
+    /// afterwards. Returns the ids newly disabled; an owner with none is a no-op.
+    pub fn disable_session_wakes(&self, owner: Uuid) -> Result<Vec<Uuid>> {
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM scheduled_jobs WHERE wake_session_id = ?1 AND enabled = 1",
+            )?;
+            stmt.query_map(params![owner.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut to_disable = Vec::with_capacity(ids.len());
+        for id in ids {
+            let id = Uuid::parse_str(&id)
+                .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))?;
+            if self.program_guard_owner_for_job_id(&id)?.is_none()
+                && !self.is_harness_manager_watch(id)?
+            {
+                to_disable.push(id);
+            }
+        }
+        disable_scheduled_jobs_conn(&tx, &to_disable)?;
+        tx.commit()?;
+        Ok(to_disable)
+    }
+
+    /// Owners that hold an enabled internal background-process wake
+    /// (`background-process-<owner>`), in one indexed read. Startup withdraws
+    /// exactly these instead of opening a write transaction per session (#2375).
+    pub fn internal_process_wake_owners(&self) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT wake_session_id FROM scheduled_jobs
+             WHERE enabled = 1
+               AND wake_session_id IS NOT NULL
+               AND name = ?1 || wake_session_id",
+        )?;
+        let owners = stmt
+            .query_map(params![BACKGROUND_PROCESS_WAKE_PREFIX], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(owners
+            .into_iter()
+            .filter_map(|owner| Uuid::parse_str(&owner).ok())
+            .collect())
     }
 
     fn cancel_owned_scheduled_jobs_inner(
@@ -294,17 +350,37 @@ impl Store {
         let (protected, cancellable): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|row| row.protected || (row.internal && !allow_internal));
-        if cancellable.is_empty() && !protected.is_empty() {
-            return Err(DaemonError::InvalidParam(
-                "wake_protected: daemon-owned program guards, manager watches and background-process wakes cannot be cancelled"
-                    .into(),
-            ));
-        }
+        let already_disabled: Vec<Uuid> = cancellable
+            .iter()
+            .filter(|row| !row.enabled)
+            .map(|row| row.id)
+            .collect();
         let to_disable: Vec<Uuid> = cancellable
             .into_iter()
             .filter(|row| row.enabled)
             .map(|row| row.id)
             .collect();
+        if to_disable.is_empty() && !protected.is_empty() {
+            return Err(DaemonError::InvalidParam(
+                "wake_protected: daemon-owned program guards, manager watches and background-process wakes cannot be cancelled"
+                    .into(),
+            ));
+        }
+        // #1632: the agent-facing verb never reports success for a selector
+        // that matched only wakes it could not newly disable. `AgentListWakes`
+        // can show a disabled wake (`include_disabled`), so a silent
+        // `cancelled_count` of 0 would disagree with the list. The daemon-side
+        // internal withdrawal keeps its no-op success.
+        if to_disable.is_empty() && !allow_internal {
+            let ids = already_disabled
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(DaemonError::InvalidParam(format!(
+                "wake_already_disabled: the matching scheduled job(s) of this session are already disabled: {ids}"
+            )));
+        }
         disable_scheduled_jobs_conn(&tx, &to_disable)?;
         tx.commit()?;
         Ok(to_disable)
@@ -342,6 +418,69 @@ impl Store {
                 || self.program_guard_owner_for_job_id(&job.id)?.is_some()
                 || self.is_harness_manager_watch(job.id)?;
             out.push((job, protected));
+        }
+        Ok(out)
+    }
+
+    /// `AgentListWakes` (#2389): the wakes owned by `owner`
+    /// (`wake_session_id == owner`, so a wake transferred to a successor seat
+    /// lists under the successor; `AgentListWakes` reaches another owner only
+    /// through `list_wake_views_for_reader`'s roster check, #2418),
+    /// each with its `when` predicate and deadline and the delivered message
+    /// (`manager_tier_messages` row sharing the wake's id, still `queued` or
+    /// `claimed`) waiting inside it. Soonest fire first, at most `limit` rows.
+    pub fn list_owned_wake_views(
+        &self,
+        owner: Uuid,
+        include_disabled: bool,
+        limit: usize,
+    ) -> Result<Vec<rsi_common::agent_wake_list::AgentWakeV1>> {
+        use rsi_common::agent_wake_list::{
+            AgentWakePendingMessageV1, AgentWakeV1, WAKE_PENDING_PREVIEW_CHARS,
+        };
+        let rows = self.list_owned_scheduled_jobs(owner, include_disabled, limit)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (job, protected) in rows {
+            let when_state = self.wake_when_state(job.id)?;
+            let (mode, watch_session_id) = match job.wake_mode {
+                _ if when_state.is_some() => ("when", None),
+                WakeMode::Fresh | WakeMode::AgentFresh => ("fresh", None),
+                WakeMode::Resume => ("resume", None),
+                WakeMode::OnTerminal(watched) => ("on_terminal", Some(watched)),
+            };
+            let pending: Option<(String, String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT kind, source_ref, state FROM manager_tier_messages
+                     WHERE id=?1 AND state IN ('queued','claimed')",
+                    params![job.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let pending_message = pending.map(|(kind, from, state)| AgentWakePendingMessageV1 {
+                message_id: job.id,
+                kind,
+                from,
+                state,
+                preview: job
+                    .message
+                    .chars()
+                    .take(WAKE_PENDING_PREVIEW_CHARS)
+                    .collect(),
+            });
+            out.push(AgentWakeV1 {
+                job_id: job.id,
+                name: job.name,
+                mode: mode.to_string(),
+                watch_session_id,
+                deadline: when_state.as_ref().and_then(|state| state.deadline),
+                when: when_state.map(|state| state.predicate),
+                next_fire_at: job.next_fire_at,
+                enabled: job.enabled,
+                created_at: job.created_at,
+                protected,
+                pending_message,
+            });
         }
         Ok(out)
     }
@@ -636,6 +775,20 @@ impl Store {
             .map_err(DaemonError::Database)
     }
 
+    /// Whether `session_id` still owns an enabled same-session resume wake
+    /// (a self-wake, a `when` job wake or a daemon nudge): its turn ended, but
+    /// the session will continue (#1783).
+    pub fn session_has_enabled_resume_wake(&self, session_id: Uuid) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scheduled_jobs \
+                 WHERE wake_session_id = ?1 AND wake_mode = 'resume' AND enabled = 1)",
+                params![session_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(DaemonError::Database)
+    }
+
     /// Resolve daemon-owned program identity from the deterministic job id,
     /// independently of every mutable field in the scheduled-job row.
     ///
@@ -775,6 +928,20 @@ impl Store {
         Ok(())
     }
 
+    /// True when `owner` ever armed an ordinary (non-manager-notice) terminal
+    /// watch on `watched`, enabled or already consumed (#1644). A manager that
+    /// launched an Issue worker holds one; an Epic lead reached only through
+    /// the manager's dedicated `to_manager` route does not.
+    pub fn owner_has_ordinary_terminal_watch(&self, owner: Uuid, watched: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
+             WHERE wake_session_id=?1 AND wake_mode=?2
+               AND NOT EXISTS (SELECT 1 FROM harness_manager_watches WHERE job_id=scheduled_jobs.id))",
+            params![owner.to_string(), format!("on_terminal:{watched}")],
+            |row| row.get(0),
+        )?)
+    }
+
     /// A continued child starts a new terminal epoch. An enabled ordinary
     /// watch may still carry the prior delivery's confirmation timestamp;
     /// clear it so unrelated owner output cannot retire the next completion.
@@ -886,7 +1053,7 @@ impl Store {
             // exhausted watch cannot restart with a fresh budget after a crash.
             "UPDATE scheduled_jobs SET enabled=0,last_fired_at=?2,updated_at=?2,
                  schedule_json=CASE WHEN json_valid(schedule_json)
-                     THEN json_remove(schedule_json,'$.continuation_retry','$.watch_refusal')
+                     THEN json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention')
                      ELSE schedule_json END
              WHERE id=?1 AND enabled=1 AND updated_at=?3
                AND last_fired_at IS ?4
@@ -986,15 +1153,131 @@ impl Store {
         })
     }
 
+    pub fn custody_contention(&self, id: Uuid) -> Result<Option<CustodyContentionV1>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(schedule_json)
+                        THEN json_extract(schedule_json,'$.custody_contention') END
+                 FROM scheduled_jobs WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Count one `root_busy` deferral of a retained wake (no retry budget is
+    /// spent). Returns the episode exactly once, when it first crosses
+    /// [`CUSTODY_CONTENTION_ESCALATE_AFTER`] deferrals or
+    /// [`CUSTODY_CONTENTION_ESCALATE_MINUTES`]; the `escalated` flag makes
+    /// every later deferral of the same episode return `None`. The episode is
+    /// cleared by delivery (`clear_continuation_retry`) and an operator
+    /// schedule edit (which rewrites the spec).
+    pub fn record_custody_contention(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CustodyContentionV1>> {
+        let previous = self.custody_contention(id)?;
+        let first_at = previous
+            .as_ref()
+            .and_then(|state| DateTime::parse_from_rfc3339(&state.first_at).ok())
+            .map_or(now, |at| at.with_timezone(&Utc));
+        let count = previous
+            .as_ref()
+            .map_or(0, |state| state.count)
+            .saturating_add(1);
+        let already = previous.as_ref().is_some_and(|state| state.escalated);
+        let crossed = !already
+            && (count >= CUSTODY_CONTENTION_ESCALATE_AFTER
+                || now - first_at
+                    >= chrono::Duration::minutes(CUSTODY_CONTENTION_ESCALATE_MINUTES));
+        let state = CustodyContentionV1 {
+            count,
+            first_at: first_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            escalated: already || crossed,
+        };
+        let json =
+            serde_json::to_string(&state).map_err(|error| DaemonError::Store(error.to_string()))?;
+        self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.custody_contention',json(?2))
+             WHERE id=?1 AND json_valid(schedule_json)",
+            params![id.to_string(), json],
+        )?;
+        Ok(crossed.then_some(state))
+    }
+
     /// Clear the retry state on delivery or terminal settlement.
     pub fn clear_continuation_retry(&self, id: Uuid) -> Result<()> {
         // An accepted delivery also resets the refusal count (#653).
         self.conn.execute(
             "UPDATE scheduled_jobs
-             SET schedule_json=json_remove(schedule_json,'$.continuation_retry','$.watch_refusal')
+             SET schedule_json=json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention','$.delivery_claim')
              WHERE id=?1 AND json_valid(schedule_json)
                AND (json_extract(schedule_json,'$.continuation_retry') IS NOT NULL
-                    OR json_extract(schedule_json,'$.watch_refusal') IS NOT NULL)",
+                    OR json_extract(schedule_json,'$.watch_refusal') IS NOT NULL
+                    OR json_extract(schedule_json,'$.custody_contention') IS NOT NULL
+                    OR json_extract(schedule_json,'$.delivery_claim') IS NOT NULL)",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// #797: the in-flight delivery claim of a scheduled resume, stored as the
+    /// daemon-owned `$.delivery_claim` key of `schedule_json` (no DDL).
+    pub fn delivery_claim(&self, id: Uuid) -> Result<Option<DeliveryClaimV1>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(schedule_json)
+                        THEN json_extract(schedule_json,'$.delivery_claim') END
+                 FROM scheduled_jobs WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// #797: durably claim the delivery of an enabled wake BEFORE the
+    /// continuation launches, so a crash between the provider effect and the
+    /// row's settlement cannot replay the wake. The claim touches neither
+    /// `enabled`, `next_fire_at` nor the row version (`updated_at`): the epoch
+    /// a racing delivery settles against is unchanged. Returns false when the
+    /// row is gone, disabled or malformed (nothing was claimed).
+    pub fn record_delivery_claim(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        let claim = serde_json::to_string(&DeliveryClaimV1 {
+            claimed_at: now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            effect: false,
+        })
+        .map_err(|error| DaemonError::Store(error.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.delivery_claim',json(?2))
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)",
+            params![id.to_string(), claim],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// #797: drop the claim of a delivery that provably did not happen (the
+    /// launcher refused it) or whose outcome the caller has settled.
+    pub fn clear_delivery_claim(&self, id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_remove(schedule_json,'$.delivery_claim')
+             WHERE id=?1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.delivery_claim') IS NOT NULL",
             params![id.to_string()],
         )?;
         Ok(())
@@ -1405,6 +1688,28 @@ fn is_background_process_wake_name(name: &str) -> bool {
     name.starts_with(BACKGROUND_PROCESS_WAKE_PREFIX)
 }
 
+/// How a `topology_execution_settled` arm treats the owner's other enabled
+/// settle wakes for the same execution (hub #2986).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleWakeDedupe {
+    /// No settle-specific rule (every other predicate, and legacy callers).
+    Off,
+    /// A manual arm: disable the other enabled settle wakes, whatever their
+    /// names, so the manual wake wins.
+    Replace,
+    /// The daemon's default arm: insert nothing when one already exists.
+    SkipIfCovered,
+}
+
+/// What [`Store::insert_wake_when_settle_deduped`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeWhenArmed {
+    /// Ids disabled by the name replacement and the settle dedupe.
+    pub replaced: Vec<Uuid>,
+    /// False only for [`SettleWakeDedupe::SkipIfCovered`] that found a wake.
+    pub armed: bool,
+}
+
 struct OwnedWakeRow {
     id: Uuid,
     enabled: bool,
@@ -1416,7 +1721,7 @@ struct OwnedWakeRow {
 
 /// Flip `enabled` to 0 for each id through the same witness bookkeeping as
 /// [`Store::update_scheduled_job`]; rows are never deleted.
-fn disable_scheduled_jobs_conn(conn: &Connection, ids: &[Uuid]) -> Result<()> {
+pub(crate) fn disable_scheduled_jobs_conn(conn: &Connection, ids: &[Uuid]) -> Result<()> {
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     for id in ids {
         let changed = conn.execute(
@@ -1695,7 +2000,9 @@ fn map_scheduled_job_row(row: &rusqlite::Row) -> Result<ScheduledJob> {
 /// deserializes into an update.
 impl Store {
     /// Arm a predicate wake in one immediate transaction: every job id the
-    /// predicate names must exist and belong to the wake's owner
+    /// predicate names must exist and belong to the wake's owner, or have
+    /// settled under a published rotation predecessor of the owner's live
+    /// manager seat (#132; [`Store::job_watchable_by`])
     /// (`wake_when_job_not_found` otherwise, so a foreign id is
     /// indistinguishable from an unknown one), the owner's enabled predicate
     /// wakes stay under the cap, an explicit name replaces the owner's earlier
@@ -1707,6 +2014,25 @@ impl Store {
         state: &rsi_common::wake_predicate::WakeWhenState,
         replace_name: bool,
     ) -> Result<Vec<Uuid>> {
+        Ok(self
+            .insert_wake_when_settle_deduped(job, state, replace_name, SettleWakeDedupe::Off)?
+            .replaced)
+    }
+
+    /// [`Store::insert_wake_when`] with the one-settle-wake-per-owner-and-
+    /// execution rule (hub #2986): inside the same immediate transaction, an
+    /// owner's other enabled `topology_execution_settled` wake for the same
+    /// execution (whatever its name) is disabled by a manual arm
+    /// ([`SettleWakeDedupe::Replace`], reported in `replaced`) or makes the
+    /// daemon's default arm a no-op ([`SettleWakeDedupe::SkipIfCovered`],
+    /// `armed: false`), so a race between the two cannot leave two rows.
+    pub fn insert_wake_when_settle_deduped(
+        &self,
+        job: &ScheduledJob,
+        state: &rsi_common::wake_predicate::WakeWhenState,
+        replace_name: bool,
+        dedupe: SettleWakeDedupe,
+    ) -> Result<WakeWhenArmed> {
         use rsi_common::wake_predicate as wp;
         let owner = job.wake_session_id.ok_or_else(|| {
             DaemonError::InvalidParam("mode 'when' requires a known origin session id".into())
@@ -1714,21 +2040,38 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
         if let Some(ids) = &state.predicate.jobs_terminal {
             for id in ids {
-                let owned: Option<String> = tx
-                    .query_row(
-                        "SELECT owner_session_id FROM agent_jobs WHERE id=?1",
-                        params![id.to_string()],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if owned.as_deref() != Some(owner.to_string().as_str()) {
+                if !self.job_watchable_by(owner, *id)? {
                     return Err(DaemonError::InvalidParam(
-                        wp::WAKE_WHEN_JOB_NOT_FOUND.into(),
+                        wp::wake_when_job_not_found_message(id),
                     ));
                 }
             }
         }
-        let replaceable: Vec<Uuid> = if replace_name {
+        if let Some(number) = state.predicate.issue_closed {
+            let known = match job.project_id {
+                Some(project) => Self::issue_status_by_number_conn(&tx, project, number)?.is_some(),
+                None => false,
+            };
+            if !known {
+                return Err(DaemonError::InvalidParam(
+                    wp::WAKE_WHEN_ISSUE_NOT_FOUND.into(),
+                ));
+            }
+        }
+        if let Some(todo_id) = state.predicate.todo_closed {
+            self.operator_todo_wake_authorize(owner, todo_id)?;
+        }
+        let settle_duplicates = match (dedupe, state.predicate.topology_execution_settled) {
+            (SettleWakeDedupe::Off, _) | (_, None) => Vec::new(),
+            (_, Some(execution_id)) => Self::enabled_settle_wakes_conn(&tx, owner, execution_id)?,
+        };
+        if dedupe == SettleWakeDedupe::SkipIfCovered && !settle_duplicates.is_empty() {
+            return Ok(WakeWhenArmed {
+                replaced: Vec::new(),
+                armed: false,
+            });
+        }
+        let mut replaceable: Vec<Uuid> = if replace_name {
             self.owned_wake_rows(&tx, owner, None, Some(&job.name), true)?
                 .into_iter()
                 .filter(|row| !row.protected)
@@ -1737,15 +2080,30 @@ impl Store {
         } else {
             Vec::new()
         };
+        for id in settle_duplicates {
+            if !replaceable.contains(&id) {
+                replaceable.push(id);
+            }
+        }
         disable_scheduled_jobs_conn(&tx, &replaceable)?;
+        // #3019: settle wakes are counted apart from every other predicate wake,
+        // each against its own cap.
+        let is_settle = state.predicate.topology_execution_settled.is_some();
         let held: i64 = tx.query_row(
             "SELECT COUNT(*) FROM scheduled_jobs
              WHERE wake_session_id=?1 AND enabled=1 AND json_valid(schedule_json)
-               AND json_extract(schedule_json,'$.wake_when') IS NOT NULL",
-            params![owner.to_string()],
+               AND json_extract(schedule_json,'$.wake_when') IS NOT NULL
+               AND (json_extract(schedule_json,'$.wake_when.predicate.topology_execution_settled')
+                    IS NOT NULL) = ?2",
+            params![owner.to_string(), is_settle],
             |row| row.get(0),
         )?;
-        if held >= wp::WAKE_WHEN_MAX_PER_SESSION as i64 {
+        let cap = if is_settle {
+            wp::WAKE_WHEN_MAX_SETTLE_PER_SESSION
+        } else {
+            wp::WAKE_WHEN_MAX_PER_SESSION
+        };
+        if held >= cap as i64 {
             return Err(DaemonError::InvalidParam(wp::WAKE_WHEN_CAP_REACHED.into()));
         }
         insert_scheduled_job_conn(&tx, job)?;
@@ -1758,7 +2116,62 @@ impl Store {
             params![job.id.to_string(), json],
         )?;
         tx.commit()?;
-        Ok(replaceable)
+        Ok(WakeWhenArmed {
+            replaced: replaceable,
+            armed: true,
+        })
+    }
+
+    /// The owner's enabled `topology_execution_settled` wakes for one
+    /// execution, whatever their names.
+    fn enabled_settle_wakes_conn(
+        conn: &Connection,
+        owner: Uuid,
+        execution_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM scheduled_jobs
+             WHERE wake_session_id=?1 AND enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when.predicate.topology_execution_settled')=?2",
+        )?;
+        let ids = stmt
+            .query_map(
+                params![owner.to_string(), execution_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))
+            })
+            .collect()
+    }
+
+    fn issue_status_by_number_conn(
+        conn: &Connection,
+        project_id: Uuid,
+        display_number: u32,
+    ) -> Result<Option<rsi_common::types::IssueStatus>> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT status FROM issues WHERE project_id=?1 AND display_number=?2",
+                params![project_id.to_string(), i64::from(display_number)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(|status| rsi_common::types::IssueStatus::parse(&status).map_err(DaemonError::Store))
+            .transpose()
+    }
+
+    /// Status of the project's Issue with this display number, for an
+    /// `issue_closed` wake predicate; `None` when no such Issue exists.
+    pub fn issue_status_by_number(
+        &self,
+        project_id: Uuid,
+        display_number: u32,
+    ) -> Result<Option<rsi_common::types::IssueStatus>> {
+        Self::issue_status_by_number_conn(&self.conn, project_id, display_number)
     }
 
     /// The predicate state of a wake row; `None` for every ordinary row.
@@ -2719,6 +3132,35 @@ pub struct ContinuationRetryV1 {
     pub last_tip: Option<Uuid>,
 }
 
+/// Daemon-owned delivery claim of a scheduled resume (`$.delivery_claim`,
+/// #797). Written before the continuation launches; `effect` flips to true in
+/// the continuation's own effect-claim transaction (the first durable write
+/// before any provider effect). A claim found at the next due scan with
+/// `effect == false` never reached an effect and is safe to deliver; one with
+/// `effect == true` may have delivered and is settled as uncertain, never
+/// replayed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryClaimV1 {
+    pub claimed_at: String,
+    #[serde(default)]
+    pub effect: bool,
+}
+
+/// Daemon-owned custody-contention episode of a retained wake
+/// (`$.custody_contention`, #1162): consecutive `root_busy` deferrals that
+/// spend no retry budget, so a persistent hold would otherwise be silent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CustodyContentionV1 {
+    pub count: u32,
+    pub first_at: String,
+    pub escalated: bool,
+}
+
+/// Consecutive `root_busy` deferrals, or minutes since the first, after which
+/// the episode escalates once.
+pub const CUSTODY_CONTENTION_ESCALATE_AFTER: u32 = 5;
+pub const CUSTODY_CONTENTION_ESCALATE_MINUTES: i64 = 10;
+
 /// Daemon-owned count of refused watch deliveries (`$.watch_refusal`, #653).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WatchRefusalV1 {
@@ -2801,13 +3243,15 @@ mod cancel_wake_tests {
         assert!(!enabled(&store, job.id));
         store.manager_action_human_gate(manager).unwrap();
 
-        // Cancelling again is an idempotent no-op on an owned, disabled row.
+        // #1632: cancelling again names the refusal instead of a silent zero.
+        let again = store
+            .cancel_owned_scheduled_jobs(manager, Some(job.id), None)
+            .unwrap_err();
         assert!(
-            store
-                .cancel_owned_scheduled_jobs(manager, Some(job.id), None)
-                .unwrap()
-                .is_empty()
+            matches!(&again, DaemonError::InvalidParam(code) if code.starts_with("wake_already_disabled")),
+            "{again:?}"
         );
+        assert!(!enabled(&store, job.id));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3007,6 +3451,8 @@ mod cancel_wake_tests {
         );
 
         store.delete_scheduled_job(&fresh.id).expect("retention");
+        assert!(store.session_has_wake_origin(successor.id).unwrap());
+        assert!(!store.session_has_wake_origin(resumed.id).unwrap());
         assert!(
             store
                 .wake_origin_authorizes_target(origin, root.id)

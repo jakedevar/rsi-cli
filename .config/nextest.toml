@@ -7,20 +7,69 @@ test-threads = 8
 status-level = "fail"
 final-status-level = "fail"
 slow-timeout = { period = "60s", terminate-after = 4 }
+# The slow tier (#2270): the rsid-store tests that re-prove RELEASED, immutable
+# migrations (.config/slow-tier.toml; about 47% of the summed rsid + rsid-store
+# library test time when measured) are left out of every profile that inherits this
+# one: rsid-fast (the merge-queue gate), test-timings and the default profile.
+# They still run in `ci-full` and `rsid-qa` (the full QA, `make
+# rolling-library-qa`), in `make test-slow-tier`, and in any gate or
+# scoped_test whose diff touches a trigger path (scripts/check-touched-shards
+# reports `slow_tier.mode`; the lander and scripts/scoped-test follow it).
+# `--ignore-default-filter` runs the full suite from any profile. The line below
+# is GENERATED, do not edit it by hand:
+#   python3 scripts/check-touched-shards --write-slow-tier-filter
+default-filter = 'not (package(rsid-store) & test(/^(?:store::agent_coordination::watch_repair_v123::tests::v121_upgrade_reaches_v123_and_reopen_rejects_catalog_drift|store::agent_jobs::tests::the_cloud_sweep_migration_keeps_the_autoincrement_high_water_mark|store::harness_manager::tests::harness_manager_v110_migration_preserves_legacy_selection_and_revocation|store::manager_ledger::tests::work_identity::v121_database_upgrade_carries_forward_the_newest_row_per_identity|store::manager_ledger::tests::work_identity::v121_upgrade_refuses_cross_epic_or_cross_work_key_collisions|store::manager_ledger::tests::work_identity::v121_upgrade_refuses_defective_carry_forward_instead_of_dropping_rows|store::manager_prepared_actions::tests::v115_fresh_upgrade_reopen_and_exact_rewind|store::manager_prepared_actions::tests::v116_forward_upgrade_preserves_exact_v115_and_reopens|store::manager_successions::tests::root_succession_drain_defers_same_occurrence_after_v110_migration_and_reopen|store::recursive_dag::tests::recursive_dag_live_v58_migration_preserves_existing_null_heartbeat_fields|store::recursive_dag::tests::recursive_dag_live_v59_migration_tightens_existing_v58_heartbeat_index|store::target_reclaim_sweep::tests::target_reclaim_sweep_v119_migration_faults_rollback_retry_and_reopen|store::tests::agent_coordination_v80_fresh_v79_failpoints_reopen_and_fingerprint|store::tests::agent_issue_legacy_create_adoption_replays_immutable_receipt_after_mutation_and_reopen|store::tests::approval_lifecycle_v107_migrates_without_inventing_a_writer_and_reopens|store::tests::cached_current_schema_fixture_matches_migrated_current_schema|store::tests::closure_v84_copied_v83_upgrades_twice_with_catalog_guards_intact|store::tests::d01_idea_kernel_copied_prior_upgrade_reopen_fault_and_rollback|store::tests::d02_idea_event_cas_tests::d02_idea_event_cas_copied_v75_schema_reopen_and_restore_are_unchanged|store::tests::d03_controller_store_tests::d03_controller_store_migration_v76_reopen_idempotency_and_query_plan|store::tests::d04_issue_linkage_copied_v76_upgrade_reopen_fault_rollback_and_fingerprint|store::tests::d04_v77_attributes_issues_with_no_creating_session_by_declaration|store::tests::d05_canonical_v78_baseline_is_untouched_by_the_repair|store::tests::d05_legacy_v78_baseline_repairs_forward_to_v79|store::tests::d05_v79_fresh_v77_v76_chain_failpoints_reopen_and_fingerprint|store::tests::deployed_additive_v114_catalog_converges_and_reaches_the_head|store::tests::every_recovered_migration_step_actually_executes|store::tests::file_fixture_matches_migration_schema_rows_and_reopens_without_replacing_data|store::tests::h1_fqrrev_v88_ordinary_open_phase_active_terminal_hostiles_refuse_before_every_seam|store::tests::h1_fqrrev_v88_ordinary_terminal_phase_active_terminal_hostiles_refuse_before_every_seam|store::tests::h1_fqrrev_v88_prebind_provider_cell_absence_hostiles_refuse_before_every_seam|store::tests::h1_fqrrev_v88_sandbox_open_phase_active_terminal_hostiles_refuse_before_every_seam|store::tests::h1_fqrrev_v88_sandbox_terminal_phase_active_terminal_hostiles_refuse_before_every_seam|store::tests::h1_qrrev_v88_active_authority_classifier_hostiles_refuse_before_every_seam|store::tests::h1_qrrev_v88_prebind_claimed_controls_migrate_and_remain_bindable|store::tests::h1_rb_full_v84_graph_is_nonempty_rewindable_and_replayable|store::tests::h1_rb_v91_terminal_pending_hostiles_refuse_before_every_seam|store::tests::h1_trrev_v88_ordinary_session_binding_classifier_hostiles_are_exact_and_non_mutating|store::tests::h1_trrev_v88_sandbox_session_binding_classifier_hostiles_are_exact_and_non_mutating|store::tests::h1_trrev_v88_session_binding_classifier_accepts_active_and_terminal_controls|store::tests::h1_trrev_v88_session_bound_live_phases_refuse_laundering_before_every_seam|store::tests::h1_v85_catalog_drift_refuses_before_ddl|store::tests::h1_v85_copied_v83_cross_domain_projection_refuses_atomically|store::tests::h1_v85_copied_v83_sandbox_history_uses_custody_events|store::tests::h1_v85_copied_v84_ordinary_matrix_is_deterministic|store::tests::h1_v85_data_bearing_upgrade_to_v86_is_atomic_reopenable_and_catalog_identical|store::tests::h1_v85_ordered_migration_failpoints_rollback_exact_v84_snapshot|store::tests::h1_v87_data_bearing_direct_deep_rewind_families_replay_cleanly|store::tests::h1_v87_session_fence_migration_is_atomic_reopenable_and_rewindable|store::tests::h1_v88_static_state_machine_data_bearing_migration_failpoints_rewind_and_replay|store::tests::h1_v91_active_terminal_controls_migrate_finalize_and_execute_unchanged_unbind|store::tests::h1_v91_ordinary_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam|store::tests::h1_v91_ordinary_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam|store::tests::h1_v91_refuses_catalog_integrity_and_foreign_key_drift_without_mutation|store::tests::h1_v91_sandbox_open_phase_terminal_predecessor_hostiles_refuse_before_every_seam|store::tests::h1_v91_sandbox_terminal_phase_terminal_predecessor_hostiles_refuse_before_every_seam|store::tests::h1_v91_schema_preserving_migration_is_atomic_rewindable_and_replayable|store::tests::h1_v92_migration_failpoints_restore_exact_v91_state|store::tests::harness_manager_fixture_rewinds_v102_v103_v104_v105_v106_v107_v108_v109_v110_v111_and_replays_the_exact_head_catalog|store::tests::issue_events_manager_actor_migration_copies_rows_verbatim_and_reopens_idempotently|store::tests::issue_v97_all_shipped_histories_share_exact_v96_issue_projection_and_migrate_stably|store::tests::issue_v97_every_fault_rolls_back_and_repairs_fresh_copied_and_large_fixtures|store::tests::issue_v97_fault_after_baseline_rolls_back_to_exact_v96_then_repairs_once|store::tests::issue_v97_hostile_v96_semantics_reject_before_ddl_then_repair_and_reopen_stably|store::tests::issue_v97_migration_backfills_deterministic_baseline_event|store::tests::issue_v97_rejects_malformed_v96_columns_indexes_foreign_keys_and_retained_catalog|store::tests::issue_v97_to_v96_rewind_preserves_exact_catalog_projection_dependencies_and_fks|store::tests::manager_decision_history_v108_upgrade_preserves_records_and_exact_catalog|store::tests::manager_decision_history_v109_upgrade_preserves_approval_mirrors_and_exact_catalog|store::tests::manager_notice_v117_migrates_exact_v116_and_reopens_idempotently|store::tests::migration_v39_to_latest_idempotent|store::tests::migration_v40_adds_parent_id_column_and_index|store::tests::migration_v41_adds_approval_wait_ms_column|store::tests::migration_v42_adds_lead_session_id_column_and_index|store::tests::migration_v43_adds_tag_column_and_topologies_tables|store::tests::migration_v44_adds_is_eval_column_and_index|store::tests::migration_v45_adds_capability_class_column|store::tests::migration_v46_adds_chain_iterations_table_and_indexes|store::tests::migration_v47_adds_topology_columns_and_index|store::tests::migration_v70_adds_work_time_ms_column|store::tests::migration_v73_repair_runs_on_reopened_partial_latest_schema|store::tests::pending_approval_v106_fixture_requires_exact_predecessor_preserves_legacy_and_reopens|store::tests::pending_question_v105_fixture_requires_exact_predecessor_and_preserves_legacy_display|store::tests::pre_v98_custody_fixture_insert_backfills_to_the_allocation_owner|store::tests::rewind_tears_down_the_non_idempotent_migration_tail|store::tests::session_diagnostics_v127_migration_installs_and_rewinds_catalog|store::tests::session_execution_projection_retention_migration_copy_parity_and_except_fail_closed|store::tests::session_execution_projection_retention_migration_failpoints_rollback_exact_prior_head|store::tests::session_execution_projection_retention_migration_rebuilds_prior_head_data_and_catalog|store::tests::session_execution_projection_retention_migration_refuses_bad_preflight_without_mutation|store::tests::store_open_accepts_the_latest_schema_and_migrates_an_older_one|store::tests::test_delete_project_preserves_appointments_and_revocations_across_v111_backfill|store::tests::test_delete_project_preserves_v111_seeded_rotation_history_without_appointment|store::tests::test_legacy_db_migration|store::tests::v100_forward_migration_preserves_windows_backfills_legacy_and_reopens|store::tests::v101_forward_migration_preserves_v100_tuple_and_new_writes_reopen_raw_configuration|store::tests::v111_branch_convergence_tests::a_detached_successor_keeps_its_manager_rotation_attribution|store::tests::v111_branch_convergence_tests::both_observed_branch_shapes_converge_and_reach_the_schema_head|store::tests::v111_branch_convergence_tests::converging_a_branched_v111_database_twice_is_a_no_op|store::tests::v112_v113_convergence_tests::exact_v111_sources_converge_to_one_v113_catalog_and_preserve_rows|store::tests::v112_v113_convergence_tests::historical_v111_data_bearing_upgrade_preserves_identity_custody_archive_and_backfills|store::tests::v112_v113_convergence_tests::v112_archive_faults_roll_back_and_retry|store::tests::v112_v113_convergence_tests::v112_identity_faults_roll_back_and_retry|store::tests::v112_v113_convergence_tests::v112_refuses_unknown_hybrid_without_mutation|store::tests::v112_v113_convergence_tests::v113_projection_faults_roll_back_and_retry|store::tests::v126_rewind_fixture_replays_bedrock_provider_constraint|store::tests::v72_idempotent_reopen|store::tests::v89_data_bearing_v88_migration_reopen_and_direct_rewind_replay|store::tests::v89_deployed_additive_v88_migration_preserves_data_and_reopens|store::tests::v89_migration_failpoints_restore_exact_v88_catalog_data_and_version|store::tests::v89_pre_antigravity_v88_migration_preserves_data_and_reopens|store::tests::v89_rejects_drifted_or_non_v88_sources_before_ddl|store::tests::v89_rejects_unpinned_pre_antigravity_catalog_variant|store::tests::v91_pre_antigravity_v90_descendant_matches_pinned_fingerprint|store::tests::v92_pre_antigravity_descendant_matches_pinned_fingerprint|store::tests::v94_authenticates_each_normalized_v93_history_before_ddl|store::tests::v94_migrated_database_reopens_without_catalog_or_row_drift|store::tests::v94_migration_failpoints_restore_exact_v93_state_then_converge|store::tests::v94_rejects_malformed_v93_dependency_catalogs_before_ddl|store::tests::v94_rewind_fixture_removes_and_replays_the_settlement_tail|store::tests::v95_authenticates_each_original_v94_history_before_hardening|store::tests::v95_backfill_generation_survives_vacuum_and_reopen|store::tests::v95_deployed_v94_bridge_faults_roll_back_exactly_then_retry|store::tests::v95_deployed_v94_bridge_reaches_schema_head_for_empty_and_data_bearing_journals|store::tests::v95_deployed_v94_bridge_rejects_hostile_catalog_and_row_before_writing|store::tests::v95_deployed_v94_v95_failpoints_roll_back_exactly_then_retry|store::tests::v95_empty_journal_rewinds_exactly_and_rejects_hostile_source_drift|store::tests::v95_migrated_split_journal_reopens_without_drift|store::tests::v95_migration_failpoints_restore_exact_v94_state_then_converge|store::tests::v95_normalizes_split_run_projection_and_preserves_item_evidence|store::tests::v95_rejects_authentic_v94_invalid_original_timestamp_before_hardening|store::tests::v95_rejects_authentic_v94_nil_run_authority_before_hardening|store::tests::v95_rejects_authentic_v94_oversized_text_before_any_hardening|store::tests::v95_rejects_authentic_v94_run_with_more_than_256_items|store::tests::v95_rejects_authentic_v94_wrong_text_storage_class_before_hardening|store::tests::v95_rejects_malformed_v94_catalog_before_any_hardening|store::tests::v95_source_row_auth_rejects_null_and_noncanonical_authority_ids|store::tests::v96_upgrade_from_v95_adds_columns_without_backfill)$/))'
 
 # The store H1/D05 migration matrices rebuild a database per hostile seam and
 # take 60-190 s on a busy host (h1_trrev_v88 is ~120 s idle). A 240 s kill
 # refused whole landing gates on load alone, so they get a bounded 600 s.
 # Default-profile overrides also apply to every profile that inherits it.
 [[profile.default.overrides]]
+filter = 'package(rsid) & test(=session::context_cap::tests::pm_recovery_bootstrap_is_compact_and_does_not_immediately_rotate)'
+# Retain all twelve recovery measurements as acceptance evidence on success.
+success-output = "immediate"
+
+[[profile.default.overrides]]
 filter = 'package(rsid-store) & test(/^store::tests::(h1_|d05_)/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# #2453: two more slow-tier migration-history tests replay every shipped migration
+# (`every_recovered_migration_step_actually_executes`) or rebuild a V76 issue-linkage
+# database per fault seam (`d04_issue_linkage_copied_v76_...`). A scoped_test run
+# with the hub thermal cap (a worker unit held at one core) ran 14 slow-tier tests
+# at once and killed both at the 240 s mark while every other slow test passed, with
+# no baseline red. Same bounded 600 s as the H1/D05 matrices, for the same reason
+# (a kill on load alone refuses a whole gate).
+[[profile.default.overrides]]
+filter = 'package(rsid-store) & (test(=store::tests::every_recovered_migration_step_actually_executes) | test(=store::tests::d04_issue_linkage_copied_v76_upgrade_reopen_fault_rollback_and_fingerprint))'
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [profile.rsid-fast]
 inherits = "default"
 retries = 0
 fail-fast = false
+# The merge-queue lander always passes `-j`, computed per gate as
+# clamp((host threads - 1-minute load) / 2, 4, 16) (#2086) and recorded as
+# `test_threads` in `gate_timing=`; this value only serves a hand-run profile.
 test-threads = 8
+
+# The rolling-library-qa run (`make rolling-library-qa`, #2092). It runs on the
+# project satellite, a CPU-capped laptop that is also doing other work (#2172:
+# load 9.6, five real-daemon tests red at once). Each of these tests starts a
+# real `rsid` process and asserts a wall-clock bound on it (SIGINT exit within
+# 3-10 s, health within 2 s of startup). A bound is only meaningful when the
+# test has the CPU, so each runs alone (`num-test-threads` takes every -j slot,
+# no other test runs beside it), and a breach must repeat once, alone, to be
+# red: a regression breaches every time, load does not.
+[profile.rsid-qa]
+inherits = "rsid-fast"
+# The full QA runs the slow tier (#2270).
+default-filter = "all()"
+
+[[profile.rsid-qa.overrides]]
+filter = 'binary_id(=rsid::bin/rsid) & (test(=tests::idle_daemon_exits_cleanly_within_three_seconds_of_sigint) | test(=tests::open_client_does_not_prevent_bounded_sigint_shutdown) | test(=tests::live_provider_settles_restart_intent_within_ten_seconds_of_sigint) | test(=tests::stuck_blocking_task_does_not_hold_process_after_shutdown_complete) | test(=tests::startup_real_daemon_accepts_health_while_reclaim_is_held_for_two_seconds))'
+threads-required = "num-test-threads"
+retries = 1
 
 [profile.ci-full]
 inherits = "default"
@@ -28,3 +77,16 @@ retries = 0
 fail-fast = false
 test-threads = 8
 slow-timeout = { period = "60s", terminate-after = 6 }
+# The full lane carries no filter: it runs the slow tier (#2270).
+default-filter = "all()"
+
+# Comparable per-test measurements for the daemon and store library suites.
+[profile.test-timings]
+inherits = "default"
+# Keep completed-test durations visible even if an outer job budget expires.
+status-level = "all"
+
+[profile.test-timings.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = false

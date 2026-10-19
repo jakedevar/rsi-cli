@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
         print!("{}", render_exclusion_markdown_table());
         return Ok(());
     }
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = PathBuf::from(rsi_common::manifest_dir!())
         .parent()
         .and_then(|path| path.parent())
         .ok_or_else(|| "failed to resolve repository root".to_string())?
@@ -117,7 +117,7 @@ mod tests {
     }
 
     fn production_fixture_root(name: &str) -> PathBuf {
-        let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let source_root = PathBuf::from(rsi_common::manifest_dir!())
             .join("../..")
             .canonicalize()
             .expect("repository root");
@@ -158,6 +158,39 @@ mod tests {
             purposes,
             boundaries,
             exclusions,
+        }
+    }
+
+    #[test]
+    fn unmatched_sink_hints_name_registration_and_generated_exclusion_table() {
+        for (kind, source, operation) in [
+            (
+                "CliSpawn",
+                "fn run() { Command::new(\"git\").spawn(); }",
+                "AllowedExclusionOperation::UtilityCliSpawn",
+            ),
+            (
+                "HttpPost",
+                "fn run() { client.post(\"https://example.com/webhook\").send(); }",
+                "AllowedExclusionOperation::NonModelHttpPost",
+            ),
+        ] {
+            let root = fixture_root(kind);
+            write(&root, "crates/rsid/src/provider.rs", source);
+            let error = validate_repository(input(&root, vec![], vec![], vec![]))
+                .expect_err("unregistered sink must explain its registration");
+            for expected in [
+                format!("{kind} sink joins 0 contracts"),
+                format!("needs a NON_INVOCATIONS row with {operation}"),
+                "crates/rsid-store/src/model_control/registry.rs".to_string(),
+                "regenerate the exclusion table in thoughts/shared/reference/model-invocation-registry.md"
+                    .to_string(),
+                "cargo run -p rsid --bin rsi-model-control-validate -- --print-exclusions".to_string(),
+                "crates/rsid-store/AGENTS.md".to_string(),
+            ] {
+                assert!(error.contains(&expected), "{kind}: missing {expected}: {error}");
+            }
+            fs::remove_dir_all(root).expect("cleanup");
         }
     }
 
@@ -1004,6 +1037,14 @@ fn execute(execution: CliExecutionCapability) {
                 "fn injected(binary: &str) { let mut runner = Command::new(binary); runner.spawn(); }",
             ),
             (
+                "scoped-command-local",
+                "fn injected(command: &Command) { let mut runner = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(command, invocation)?; runner.spawn(); }",
+            ),
+            (
+                "scoped-command-direct",
+                "fn injected(command: &Command) { crate::process_scope::ScopedWorkerCommand::wrap_unspawned(command, invocation)?.spawn(); }",
+            ),
+            (
                 "raw-send",
                 "fn injected(request: RequestBuilder) { request.send(); }",
             ),
@@ -1025,6 +1066,75 @@ fn execute(execution: CliExecutionCapability) {
             assert!(error.contains("injected.rs"), "{name}: {error}");
             fs::remove_dir_all(root).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn nested_test_helpers_inherit_the_declaring_module_cfg() {
+        for declaration in ["#[cfg(test)] mod tests;", "mod tests;"] {
+            let root = fixture_root("nested-test-helper");
+            write(&root, "crates/rsid/src/session.rs", declaration);
+            write(
+                &root,
+                "crates/rsid/src/session/tests.rs",
+                "mod turn_adoption;",
+            );
+            write(
+                &root,
+                "crates/rsid/src/session/tests/turn_adoption.rs",
+                "fn seed() { std::process::Command::new(\"claude\").spawn(); }",
+            );
+            let result = validate_repository(input(&root, vec![], vec![], vec![]));
+            if declaration.starts_with("#[cfg(test)]") {
+                result.expect("nested helpers belong to a declared test-only module");
+            } else {
+                let error =
+                    result.expect_err("production tests directory still requires a contract");
+                assert!(error.contains("turn_adoption.rs:seed: CliSpawn sink joins 0 contracts"));
+            }
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn detached_transport_preserves_registered_provider_spawn_boundaries() {
+        let root = production_fixture_root("detached-spawn-boundaries");
+        validate_repository(ValidationInput::production(root.clone()))
+            .expect("direct and detached transports share registered provider boundaries");
+
+        let spool_path = root.join("crates/rsid/src/claude/turn_spool.rs");
+        let spool = fs::read_to_string(&spool_path).expect("spool source");
+        let extra_spawn = spool.replacen(
+            "        Ok((wrapped, turn))",
+            "        let _extra = wrapped.spawn();\n        Ok((wrapped, turn))",
+            1,
+        );
+        assert_ne!(spool, extra_spawn);
+        fs::write(&spool_path, extra_spawn).expect("mutated spool source");
+        let error = validate_repository(ValidationInput::production(root.clone()))
+            .expect_err("transport preparation cannot introduce an unadmitted spawn");
+        assert!(error.contains("turn_spool.rs:prepare_command: CliSpawn sink joins 0 contracts"));
+        fs::write(&spool_path, spool).expect("restore spool source");
+
+        for (file, route) in [
+            ("claude.rs", "ClaudeCli"),
+            ("codex.rs", "CodexCli"),
+            ("agy.rs", "AntigravityCli"),
+        ] {
+            let path = root.join("crates/rsid/src").join(file);
+            let source = fs::read_to_string(&path).expect("provider source");
+            let wrong_route = source.replacen(
+                &format!(".bind_command(RuntimeExecutionRoute::{route}, cmd)"),
+                ".bind_command(RuntimeExecutionRoute::MemoryCli, cmd)",
+                1,
+            );
+            assert_ne!(source, wrong_route, "{file} route mutation");
+            fs::write(&path, wrong_route).expect("mutated provider route");
+            let error = validate_repository(ValidationInput::production(root.clone()))
+                .expect_err("each provider must consume the capability on its registered route");
+            assert!(error.contains("direct consume path(s)"), "{file}: {error}");
+            fs::write(&path, source).expect("restore provider source");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1088,8 +1198,8 @@ fn execute(execution: CliExecutionCapability) {
             ),
             (
                 "crates/rsid/src/bin/rsi-rolling-land/test_impact.rs",
-                "let mut child = Command::new(\"git\")",
-                "let mut child = Command::new(\"claude\")",
+                "let mut command = repo_git(repo);\n    let mut child = command",
+                "let mut command = Command::new(\"claude\");\n    let mut child = command",
             ),
             (
                 "crates/rsid/src/bin/rsi-rolling-land/canary_runner.rs",
@@ -1098,6 +1208,11 @@ fn execute(execution: CliExecutionCapability) {
             ),
             (
                 "crates/rsid/src/deploy.rs",
+                ".arg(\"--build-info\")",
+                ".arg(\"--model\")",
+            ),
+            (
+                "crates/rsid/src/local_build.rs",
                 ".arg(\"--build-info\")",
                 ".arg(\"--model\")",
             ),
@@ -1476,6 +1591,10 @@ fn excluded(client: &Client) {
         ));
         let error = validate_repository(validation).expect_err("Markdown drift");
         assert!(error.contains("Markdown drift"));
+        assert!(
+            error.contains("rsi-model-control-validate --print`"),
+            "{error}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -1498,6 +1617,10 @@ fn excluded(client: &Client) {
         ));
         let error = validate_repository(validation).expect_err("exclusion Markdown drift");
         assert!(error.contains("exclusion Markdown drift"), "{error}");
+        assert!(
+            error.contains("rsi-model-control-validate --print-exclusions"),
+            "{error}"
+        );
         assert!(!error.contains("registry Markdown drift"), "{error}");
         fs::remove_dir_all(root).expect("cleanup");
     }

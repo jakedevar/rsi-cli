@@ -16,7 +16,9 @@ use tui_textarea::CursorMove;
 
 mod standard;
 
-pub(crate) use standard::{enter_standard, has_selection, selected_text};
+#[cfg(test)]
+pub(crate) use standard::selected_text;
+pub(crate) use standard::{enter_standard, has_selection};
 
 /// Full context from a prompt compilation, preserved for persistence.
 #[derive(Debug, Clone)]
@@ -940,19 +942,6 @@ mod tests {
     }
 
     // ── Auto-wrap tests ──────────────────────────────────────────────
-
-    /// Helper: make a TextArea pre-populated with text, cursor at end.
-    fn textarea_with(text: &str) -> tui_textarea::TextArea<'static> {
-        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-        let mut ta = if lines.is_empty() {
-            tui_textarea::TextArea::default()
-        } else {
-            tui_textarea::TextArea::new(lines)
-        };
-        ta.move_cursor(tui_textarea::CursorMove::Bottom);
-        ta.move_cursor(tui_textarea::CursorMove::End);
-        ta
-    }
 
     #[test]
     fn test_normalize_pasted_text_no_newlines() {

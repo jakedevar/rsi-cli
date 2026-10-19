@@ -309,19 +309,6 @@ pub(super) async fn stdout_raw(
     Ok(output.stdout)
 }
 
-pub(super) async fn stdout_with_index(
-    config: &IntegrationConfig,
-    cwd: &Path,
-    args: &[&str],
-    index: &Path,
-) -> Result<String> {
-    let output = run_with_index(config, cwd, args, index).await?;
-    if !output.status.success() {
-        return Err(failed(args, &output));
-    }
-    text(args, output)
-}
-
 pub(super) async fn stdout_raw_with_index(
     config: &IntegrationConfig,
     cwd: &Path,

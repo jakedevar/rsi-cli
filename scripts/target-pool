@@ -1,0 +1,1564 @@
+#!/usr/bin/env python3
+"""Warm Cargo target pool shared by worker sandboxes (#1741).
+
+A pool is one clean build (`cargo test --workspace --no-run`) of one commit,
+made in its own detached worktree under ~/.rsi/target-pool (override with
+RSI_TARGET_POOL_ROOT). New pools reuse the nearest ready ancestor with the same
+build key, so Cargo rebuilds only what differs. A new worker sandbox starts from
+a pool instead of a cold build: `seed` fills its empty `target/` from the nearest
+pool whose commit is the sandbox HEAD or an ancestor of it, then Cargo's own fingerprints
+rebuild only what differs.
+
+Usage:
+  scripts/target-pool seed --sandbox ROOT [--target DIR] [--build-missing]
+  scripts/target-pool build --repo DIR [--sha SHA]
+  scripts/target-pool seed-from HOST --repo DIR [--sha SHA] [--dry-run]
+  scripts/target-pool gc [--repo DIR] [--keep N] [--pressure] [--json]
+  scripts/target-pool reclaim-idle [--min-interval SEC]
+  scripts/target-pool status [--repo DIR]
+  scripts/target-pool summary [--repo DIR] [--ref REF]
+  scripts/target-pool key [--repo DIR]
+
+Why this is safe (each rule has a test in scripts/tests/test_target_pool.py):
+- Nothing is shared by path. Every sandbox keeps its own target directory;
+  only file contents are shared, as hard links to the pool's immutable files.
+- Library outputs (`*.rlib`, `*.rmeta`) are hard-linked: rustc replaces them by
+  rename, never by writing into the old file.
+- Executables, split debuginfo (`*.dwo`) and `*.so` are written in place by
+  the linker, so they are hard-linked only when the build wrapper
+  `rsi-build-rustc` reports `unlink-outputs` (it unlinks a unit's shared
+  outputs before rustc runs). The pool marks them read-only, so a build without
+  the wrapper fails ("output file is not writeable") instead of writing into a
+  file other sandboxes share. Without the wrapper they are copied.
+- Everything Cargo rewrites in place (fingerprints, dep-info, build-script
+  output) is copied, never linked.
+- A unit that read CARGO_MANIFEST_DIR / CARGO_MANIFEST_PATH at compile time
+  (rustc dep-info `# env-dep:`) may have baked the pool's source path into its
+  code; Cargo does not track that variable, so such a unit is not seeded and the
+  sandbox rebuilds it.
+- Tracked files identical to the pool's commit get an old mtime and every other
+  file the current time, so Cargo rebuilds exactly the crates whose sources
+  differ from the pool.
+- A pool is never removed while a seed or a pool build reads it: readers hold a
+  shared lock on `<pool>.use` for the whole copy, and `gc` removes a pool only
+  after taking that lock exclusively (a busy pool is skipped, never waited on).
+- The detached pool build runs in the hub build slice `rsi-build.slice` (#2119) with a
+  CPUQuota (`RSI_TARGET_POOL_CPU_PERCENT`, default 400, never above the slice's own quota) and
+  a RuntimeMaxSec (`RSI_TARGET_POOL_MAX_SEC`, default 7200); without systemd it runs nice'd.
+- `gc` keeps the newest N ready pools (`--keep`, default `RSI_TARGET_POOL_KEEP`
+  or 2; under `--pressure`, disk pressure, only the newest one) and always the
+  newest complete pool as well, so a run of degraded pools never evicts the last
+  pool with test artifacts. Explicit `gc --keep 0` instead evicts all unused
+  ready pools, including the last complete one; reader locks still apply.
+  Retention after a successful build or seed keeps at least one pool.
+- A tip whose tests do not compile still advances the pool: the build retries
+  with `--keep-going`, and when the libraries and binaries build
+  (`cargo build --workspace`) the pool is `ready` with `"degraded": true`, so a
+  test-compile break never leaves sandboxes seeding from an old pool.
+- A pool never costs a worker its disk (#2773). A build starts only when the free space is at
+  least the floor plus the pool's expected size (the nearest ready ancestor's measured size,
+  else the newest pool's, else the last pool's remembered size, else
+  `RSI_TARGET_POOL_EXPECTED_GIB`, default 16); otherwise it is skipped with the typed reason
+  `pool_skipped_disk_headroom` naming both numbers. A build that drops the free space below the
+  workers' `cargo-slot` floor (`RSI_TARGET_POOL_WORKER_FLOOR_GIB`, the daemon's
+  `governor_min_free_disk_gb`) stops, removes its partial output and reports
+  `pool_aborted_disk_floor`. `reclaim-idle` evicts every pool no seed is reading, once per
+  `--min-interval`; `cargo-slot` calls it when a worker waits on the disk floor. Skips, aborts
+  and reclaims appear in `summary` (the daemon's target-pool status).
+- The pool key includes the toolchain (`rustc -vV`) and every build setting in
+  the environment that changes artifacts (profile, incremental, flags), so a
+  sandbox only ever uses a pool built the way it builds.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+RECIPE_VERSION = 1
+BUILD_COMMAND = ["cargo", "test", "--workspace", "--no-run"]
+# What a tip whose tests do not compile still gets (see `degraded` pools): every
+# test target that does compile, then the libraries and binaries.
+KEEP_GOING_COMMAND = ["cargo", "test", "--workspace", "--no-run", "--keep-going"]
+LIBRARY_COMMAND = ["cargo", "build", "--workspace"]
+DEFAULT_KEEP = 2
+# A seed uses a pool only within this many commits of its HEAD (#2707 uses the same
+# limit to collect pools no seed can use and to decide when to build a fresh one).
+DEFAULT_MAX_DISTANCE = 200
+DEFAULT_REF = "origin/rolling"
+REPO_FILE = "repo-path"  # the checkout this pool directory's builds come from
+OLD_MTIME = 946684800  # 2000-01-01T00:00:00Z: "unchanged since the pool commit"
+KEY_ENV_EXACT = (
+    "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS",
+    "RUSTDOCFLAGS", "CARGO_BUILD_TARGET", "CARGO_TARGET_APPLIES_TO_HOST", "RUSTUP_TOOLCHAIN",
+)
+KEY_ENV_PREFIXES = ("CARGO_PROFILE_",)
+MANIFEST_ENV_DEPS = ("# env-dep:CARGO_MANIFEST_DIR", "# env-dep:CARGO_MANIFEST_PATH")
+SEED_MARKER = ".rsi-target-pool.json"
+# Entries a fresh sandbox target may already hold (daemon scratch and markers).
+EMPTY_TARGET_ENTRIES = {".rsi-tmp", ".rsi-build-env.json", "CACHEDIR.TAG"}
+IN_PLACE_SUFFIXES = (".dwo", ".so", ".dylib", ".dll", ".exe", ".pdb")
+# `git -C` does not override an inherited worktree/index context.
+GIT_CONTEXT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+                   "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"}
+
+
+def log(message: str) -> None:
+    print(f"target-pool: {message}", file=sys.stderr, flush=True)
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                            env=git_environment())
+    if check and result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def git_environment() -> dict[str, str]:
+    return {name: value for name, value in os.environ.items() if name not in GIT_CONTEXT_ENV}
+
+
+def default_keep() -> int:
+    """Pools to keep: the operator's `target_pool_keep` setting, which the daemon
+    passes as RSI_TARGET_POOL_KEEP."""
+    try:
+        return max(1, int(os.environ.get("RSI_TARGET_POOL_KEEP", DEFAULT_KEEP)))
+    except ValueError:
+        return DEFAULT_KEEP
+
+
+def pool_root() -> Path:
+    configured = os.environ.get("RSI_TARGET_POOL_ROOT")
+    return Path(configured) if configured else Path.home() / ".rsi" / "target-pool"
+
+
+def repo_dir(repo: Path) -> Path:
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    return pool_root() / hashlib.sha256(str(common).encode()).hexdigest()[:12]
+
+
+def build_key(directory: Path, environ: dict[str, str] | None = None) -> str:
+    environ = dict(os.environ if environ is None else environ)
+    rustc = subprocess.run(["rustc", "-vV"], cwd=directory, capture_output=True, text=True,
+                           env=environ)
+    if rustc.returncode != 0:
+        raise RuntimeError(f"rustc -vV failed: {rustc.stderr.strip()}")
+    settings = {name: value for name, value in sorted(environ.items())
+                if name in KEY_ENV_EXACT or name.startswith(KEY_ENV_PREFIXES)}
+    material = json.dumps({"recipe": RECIPE_VERSION, "command": BUILD_COMMAND,
+                           "rustc": rustc.stdout, "env": settings}, sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
+def wrapper_unlinks_outputs(environ: dict[str, str] | None = None) -> bool:
+    """True when RUSTC_WRAPPER is an rsi-build-rustc that unlinks shared outputs."""
+    wrapper = (os.environ if environ is None else environ).get("RUSTC_WRAPPER", "")
+    if Path(wrapper).name not in ("rsi-build-rustc", "rsi-build-rustc.exe"):
+        return False
+    try:
+        probe = subprocess.run([wrapper, "--capabilities"], capture_output=True, text=True,
+                               timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and "unlink-outputs" in probe.stdout.split()
+
+
+def write_marker(marker: Path, record: dict) -> None:
+    """Publish a marker atomically (the temp name does not match `*.json`)."""
+    temporary = marker.with_name(marker.name + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(record) + "\n")
+    os.replace(temporary, marker)
+
+
+def is_ready(record: dict) -> bool:
+    """A ready marker whose pool still exists on disk."""
+    return record.get("state") == "ready" and Path(record.get("target", "")).is_dir()
+
+
+def ready_pools(directory: Path, key: str) -> list[dict]:
+    pools = []
+    if not directory.is_dir():
+        return pools
+    for marker in directory.glob(f"*-{key}.json"):
+        try:
+            record = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            continue
+        if is_ready(record):
+            pools.append(record)
+    return sorted(pools, key=lambda record: record.get("built_at", 0), reverse=True)
+
+
+def pool_distance(sandbox: Path, head: str, sha: str) -> int | None:
+    """Commits `sha` is behind `head`; None when `sha` is not an ancestor of it."""
+    if sha == head:
+        return 0
+    if subprocess.run(["git", "-C", str(sandbox), "merge-base", "--is-ancestor", sha, head],
+                      capture_output=True, env=git_environment()).returncode != 0:
+        return None
+    return int(git(sandbox, "rev-list", "--count", f"{sha}..{head}"))
+
+
+def choose_pool(sandbox: Path, head: str, pools: list[dict], max_distance: int) -> dict | None:
+    best = None
+    for record in pools:
+        distance = pool_distance(sandbox, head, record["sha"])
+        if distance is None:
+            continue
+        if distance == 0:
+            return {**record, "distance": 0}
+        if distance <= max_distance and (best is None or distance < best["distance"]):
+            best = {**record, "distance": distance}
+    return best
+
+
+def explain_no_pool(sandbox: Path, head: str, pools: list[dict], max_distance: int) -> dict:
+    """Why `choose_pool` found nothing: the skip reason and the nearest ancestor pool.
+    Reporting only; it never changes which pool is chosen."""
+    if not pools:
+        return {"reason": "no ready pool has this build key"}
+    nearest = None
+    for record in pools:
+        distance = pool_distance(sandbox, head, record["sha"])
+        if distance is not None and (nearest is None or distance < nearest["distance"]):
+            nearest = {"sha": record["sha"], "distance": distance}
+    if nearest is None:
+        return {"reason": f"none of {len(pools)} ready pool(s) is an ancestor of HEAD"}
+    return {"reason": f"nearest ancestor pool is {nearest['distance']} commits behind "
+                      f"(limit {max_distance})", "nearest_pool": nearest}
+
+
+def target_is_empty(target: Path) -> bool:
+    if not target.exists():
+        return True
+    return all(entry.name in EMPTY_TARGET_ENTRIES for entry in target.iterdir())
+
+
+def manifest_baking_units(pool_target: Path) -> set[tuple[str, str]]:
+    """(profile, unit stem) for every unit whose rustc dep-info read the manifest path."""
+    units = set()
+    for deps in pool_target.glob("*/deps"):
+        for depinfo in deps.glob("*.d"):
+            try:
+                text = depinfo.read_text(errors="replace")
+            except OSError:
+                continue
+            if any(marker in text for marker in MANIFEST_ENV_DEPS):
+                units.add((deps.parent.name, depinfo.name[:-2]))
+    return units
+
+
+def unit_hash(stem: str) -> str:
+    """The `-<hash>` extra filename that makes a `<crate>-<hash>` stem unique."""
+    return "-" + stem.rsplit("-", 1)[-1] if "-" in stem else stem
+
+
+def belongs_to(name: str, stems: set[str], hashes: set[str]) -> bool:
+    """Whether a deps/ file is an output of one of these units. rustc shortens
+    a too-long output name to `<hash>-<tail>`, keeping `-<unit hash>.`."""
+    stem = name.split(".", 1)[0]
+    if stem in stems or (stem.startswith("lib") and stem[3:] in stems):
+        return True
+    return any(f"{unit}." in name for unit in hashes)
+
+
+def link_kind(name: str, link_in_place: bool) -> str:
+    if name.endswith(".d"):
+        return "copy"
+    if name.endswith((".rlib", ".rmeta")):
+        return "link"
+    if link_in_place:
+        return "link"
+    return "copy"
+
+
+def copy_file(source: Path, destination: Path) -> None:
+    shutil.copy2(source, destination, follow_symlinks=False)
+    if not destination.is_symlink():
+        mode = destination.stat().st_mode
+        os.chmod(destination, mode | 0o200)
+
+
+def seed_tree(pool_target: Path, target: Path, link_in_place: bool) -> dict:
+    skipped_units = manifest_baking_units(pool_target)
+    links = copies = skipped = 0
+    linked_inodes: dict[tuple[int, int], Path] = {}
+    entries = [entry for entry in pool_target.iterdir()
+               if entry.is_dir() and (entry / "deps").is_dir()]
+    for top in ("CACHEDIR.TAG", ".rustc_info.json"):
+        if (pool_target / top).is_file() and not (target / top).exists():
+            copy_file(pool_target / top, target / top)
+    for profile in entries:
+        stems = {stem for owner, stem in skipped_units if owner == profile.name}
+        hashes = {unit_hash(stem) for stem in stems}
+        # deps/ first, so uplifted copies in the profile root can follow inodes.
+        walk = sorted(os.walk(profile), key=lambda item: (Path(item[0]).name != "deps", item[0]))
+        for root, _dirs, files in walk:
+            root_path = Path(root)
+            relative = root_path.relative_to(pool_target)
+            (target / relative).mkdir(parents=True, exist_ok=True)
+            in_deps = root_path.name == "deps" and root_path.parent == profile
+            for name in files:
+                if name == ".cargo-lock":
+                    continue
+                source = root_path / name
+                destination = target / relative / name
+                if in_deps and belongs_to(name, stems, hashes):
+                    skipped += 1
+                    continue
+                status = source.lstat()
+                inode = (status.st_dev, status.st_ino)
+                if in_deps and not source.is_symlink() and link_kind(name, link_in_place) == "link":
+                    os.link(source, destination)
+                    linked_inodes[inode] = destination
+                    links += 1
+                elif root_path == profile and inode in linked_inodes:
+                    # Cargo's uplifted copy (target/debug/<bin>) is a hard link
+                    # of a deps/ file; keep it one inode.
+                    os.link(source, destination)
+                    links += 1
+                else:
+                    copy_file(source, destination)
+                    copies += 1
+    return {"linked": links, "copied": copies, "skipped_outputs": skipped,
+            "rebuilt_units": sorted(stem for _profile, stem in skipped_units)}
+
+
+def normalise_mtimes(sandbox: Path, pool_sha: str) -> dict:
+    changed = set(git(sandbox, "diff", "--name-only", "-z", pool_sha, "HEAD").split("\0"))
+    status = git(sandbox, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    for record in status.split("\0"):
+        if len(record) > 3:
+            changed.add(record[3:])
+    changed.discard("")
+    now = time.time()
+    unchanged = fresh = 0
+    tracked = [name for name in git(sandbox, "ls-files", "-z").split("\0") if name]
+    for name in tracked:
+        path = sandbox / name
+        stamp = now if name in changed else OLD_MTIME
+        try:
+            os.utime(path, (stamp, stamp), follow_symlinks=False)
+        except (FileNotFoundError, NotImplementedError):
+            continue
+        if stamp == OLD_MTIME:
+            unchanged += 1
+        else:
+            fresh += 1
+    for name in changed:
+        path = sandbox / name
+        if path.exists() and not path.is_symlink():
+            os.utime(path, (now, now))
+    # A build script may watch a directory (`rerun-if-changed=src/migrations`)
+    # and Cargo then compares the directory's own mtime, which is the checkout
+    # time. Directories get the same rule as files: old unless a changed path
+    # (added, removed or edited) sits directly in them. Files first, since
+    # setting a file's times never touches its directory.
+    touched = {str(Path(name).parent) for name in changed}
+    directories = set()
+    for name in tracked:
+        parent = Path(name).parent
+        while str(parent) not in directories and str(parent) != ".":
+            directories.add(str(parent))
+            parent = parent.parent
+    for name in sorted(directories, key=len, reverse=True):
+        stamp = now if name in touched else OLD_MTIME
+        try:
+            os.utime(sandbox / name, (stamp, stamp), follow_symlinks=False)
+        except (FileNotFoundError, NotImplementedError):
+            continue
+    return {"unchanged_files": unchanged, "changed_files": fresh}
+
+
+def default_min_free_gib() -> float:
+    return float(os.environ.get("RSI_TARGET_POOL_MIN_FREE_GIB", "40"))
+
+
+# #2773: a cache build never pushes the host below the floor its own workers need.
+SKIP_HEADROOM = "pool_skipped_disk_headroom"
+ABORT_FLOOR = "pool_aborted_disk_floor"
+RECLAIM_FLOOR = "pool_reclaimed_for_disk_floor"
+DEFAULT_EXPECTED_POOL_GIB = 16.0
+DEFAULT_WORKER_FLOOR_GIB = 30.0  # cargo-slot's RSI_CARGO_MIN_FREE_GB / governor_min_free_disk_gb
+DEFAULT_WATCH_SECONDS = 5.0
+DEFAULT_RECLAIM_INTERVAL = 600.0
+EVENTS_FILE = "events.state"  # not *.json: gc and status read every marker of that name
+
+
+def worker_floor_gib(path: Path) -> float:
+    """The free-space floor `cargo-slot` holds a worker job to. The daemon passes its
+    `governor_min_free_disk_gb` as RSI_TARGET_POOL_WORKER_FLOOR_GIB; without it
+    RSI_CARGO_MIN_FREE_GB (the script's own default) and then 30. Capped, like the pool's
+    floor, at a quarter of the disk (the daemon caps its floor the same way)."""
+    for name in ("RSI_TARGET_POOL_WORKER_FLOOR_GIB", "RSI_CARGO_MIN_FREE_GB"):
+        try:
+            configured = float(os.environ[name])
+        except (KeyError, ValueError):
+            continue
+        return scaled_floor_gib(path, max(0.0, configured))
+    return scaled_floor_gib(path, DEFAULT_WORKER_FLOOR_GIB)
+
+
+def read_events(directory: Path) -> dict:
+    try:
+        events = json.loads((directory / EVENTS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return events if isinstance(events, dict) else {}
+
+
+def record_event(directory: Path, kind: str, fields: dict | None) -> None:
+    """Remember the latest `kind` event of this pool directory (None forgets it)."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        events = read_events(directory)
+        if fields is None:
+            events.pop(kind, None)
+        else:
+            events[kind] = {"at": time.time(), **fields}
+        write_marker(directory / EVENTS_FILE, events)
+    except OSError:
+        pass  # a status note must never fail a build or a gc
+
+
+def expected_pool_size(directory: Path, repo: Path, sha: str, key: str) -> tuple[int, str]:
+    """(bytes, where the number came from): the nearest ready ancestor's measured size, else
+    the newest ready pool's, else the size of the last pool built (remembered past a gc),
+    else RSI_TARGET_POOL_EXPECTED_GIB / 16."""
+    pools = ready_pools(directory, key)
+    nearest = choose_pool(repo, sha, pools, DEFAULT_MAX_DISTANCE) if pools else None
+    for record, source in ([(nearest, "nearest ready ancestor")] if nearest else []) + [
+            (record, "newest ready pool") for record in pools]:
+        size = pool_size(directory, record)
+        if size > 0:
+            return size, source
+    last = read_events(directory).get("last_pool", {}).get("size_bytes")
+    if isinstance(last, int) and last > 0:
+        return last, "last pool built"
+    default = positive_env("RSI_TARGET_POOL_EXPECTED_GIB", DEFAULT_EXPECTED_POOL_GIB)
+    return int(default * 2**30), "default"
+
+
+def admission_skip(directory: Path, repo: Path, sha: str, key: str,
+                   configured_floor: float) -> dict | None:
+    """None when a pool build may start; else the typed skip. Free space must cover the floor
+    (the larger of the pool floor and the workers' floor) plus the pool's expected size, so
+    finishing the build still leaves the workers their floor. A floor of 0 turns the check off."""
+    if configured_floor <= 0:
+        return None
+    floor = max(scaled_floor_gib(directory, configured_floor), worker_floor_gib(directory))
+    expected, source = expected_pool_size(directory, repo, sha, key)
+    expected_gib = expected / 2**30
+    free = free_gib(directory)
+    needed = floor + expected_gib
+    if free >= needed:
+        return None
+    return {"reason": SKIP_HEADROOM, "sha": sha, "free_gib": round(free, 1),
+            "floor_gib": round(floor, 1), "expected_gib": round(expected_gib, 1),
+            "needed_gib": round(needed, 1), "expected_source": source,
+            "detail": f"only {free:.1f} GiB free; needs {needed:.1f} GiB "
+                      f"(floor {floor:.1f} + expected pool {expected_gib:.1f}, {source})"}
+
+
+@dataclasses.dataclass
+class DiskGuard:
+    """What a running pool build must leave free on the pool's disk."""
+    path: Path
+    floor_gib: float
+    interval: float = DEFAULT_WATCH_SECONDS
+
+    def breach(self) -> float | None:
+        """The free GiB when it is below the floor, else None."""
+        free = free_gib(self.path)
+        return free if free < self.floor_gib else None
+
+
+class DiskFloorAbort(Exception):
+    def __init__(self, free: float, floor: float):
+        super().__init__(f"{free:.1f} GiB free < the workers' floor {floor:.1f} GiB")
+        self.free, self.floor = free, floor
+
+
+# #2715: the detached pool build is a cargo build the harness starts on its own, so it runs
+# inside the hub build budget like every build job (#2119), with a CPU cap and a bounded runtime.
+BUILD_SLICE = "rsi-build.slice"
+DEFAULT_POOL_CPU_PERCENT = 400.0
+DEFAULT_POOL_MAX_SEC = 7200.0
+
+
+def build_slice() -> str:
+    """The hub build slice; `RSI_BUILD_SLICE=` (empty) opts out, as for build jobs."""
+    return os.environ.get("RSI_BUILD_SLICE", BUILD_SLICE)
+
+
+def positive_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def slice_budget_percent(slice_name: str) -> float | None:
+    """The build slice's live CPUQuota in percent of one CPU (the operator's
+    `hub_build_cpu_percent`), or None when it is unknown or the slice has no quota."""
+    if not slice_name:
+        return None
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", slice_name, "-p", "CPUQuotaPerSecUSec", "--value"],
+            capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (shown.stdout or "").strip() if shown.returncode == 0 else ""
+    found = re.fullmatch(r"(\d+(?:\.\d+)?)(s|ms|us|min)?", text)
+    if not found:
+        return None  # "infinity" or empty: the slice carries no quota
+    scale = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, None: 1.0}[found[2]]
+    return float(found[1]) * scale * 100
+
+
+def pool_unit_limits(slice_name: str) -> tuple[float, float]:
+    """(CPUQuota percent, RuntimeMaxSec) of a pool build unit. The CPU cap is
+    RSI_TARGET_POOL_CPU_PERCENT (default 400), never above the build slice's own
+    budget; the runtime cap is RSI_TARGET_POOL_MAX_SEC (default 7200)."""
+    quota = positive_env("RSI_TARGET_POOL_CPU_PERCENT", DEFAULT_POOL_CPU_PERCENT)
+    budget = slice_budget_percent(slice_name)
+    if budget is not None:
+        quota = min(quota, max(100.0, budget))
+    return quota, positive_env("RSI_TARGET_POOL_MAX_SEC", DEFAULT_POOL_MAX_SEC)
+
+
+def request_build(sandbox: Path, head: str) -> str:
+    """Start a detached pool build for HEAD; never waits for it. A build that would
+    stop at the free-space floor is not started, and the reason is reported here
+    because the detached unit's own log line is not seen by anyone."""
+    directory = repo_dir(sandbox)
+    skip = admission_skip(directory, sandbox, head, build_key(sandbox), default_min_free_gib())
+    if skip is not None:
+        record_event(directory, "skip", skip)
+        return f"skipped: {skip['reason']}: {skip['detail']}"
+    record_event(directory, "skip", None)
+    script = Path(__file__).resolve()
+    command = [sys.executable, str(script), "build", "--repo", str(sandbox), "--sha", head]
+    if sys.platform.startswith("linux") and shutil.which("systemd-run"):
+        unit = f"rsi-target-pool-{head[:12]}-{os.getpid()}"
+        passthrough = [f"--setenv={name}={value}" for name, value in os.environ.items()
+                       if name in KEY_ENV_EXACT or name.startswith(KEY_ENV_PREFIXES)
+                       or name.startswith(("SCCACHE_", "RSI_BUILD_", "RSI_TARGET_POOL_"))
+                       or name in ("PATH", "HOME", "RUSTC_WRAPPER", "CARGO_BUILD_JOBS",
+                                   "CARGO_HOME", "RUSTUP_HOME")]
+        slice_name = build_slice()
+        cpu_quota, max_seconds = pool_unit_limits(slice_name)
+        result = subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                                 f"--unit={unit}", "--property=Nice=19",
+                                 # The hub build budget bounds every cargo unit (#2119),
+                                 # with a CPU cap and a bounded runtime (#2715).
+                                 *([f"--slice={slice_name}"] if slice_name else []),
+                                 f"--property=CPUQuota={cpu_quota:g}%",
+                                 f"--property=RuntimeMaxSec={max_seconds:g}",
+                                 # A transient service starts from the user manager's
+                                 # environment, not ours: the launch scratch (TMPDIR and
+                                 # friends), the session token and slot markers stay out
+                                 # because only the names above are passed through.
+                                 # systemd-run has no --unsetenv (#1808 follow-up).
+                                 *passthrough, "--",
+                                 *command], capture_output=True, text=True)
+        if result.returncode != 0:
+            return f"failed: {result.stderr.strip()[:200]}"
+        return f"started {unit}"
+    with open(os.devnull, "wb") as null:
+        # No systemd: no slice or CPU cap exists here, so the build at least runs nice'd.
+        subprocess.Popen(command, stdout=null, stderr=null, stdin=null, start_new_session=True,
+                         **({"preexec_fn": lambda: os.nice(19)} if hasattr(os, "nice") else {}))
+    return "started"
+
+
+def failed_pool(directory: Path, head: str, key: str) -> dict | None:
+    marker = directory / f"{head}-{key}.json"
+    try:
+        record = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return None
+    return record if record.get("state") == "failed" else None
+
+
+def cmd_seed(args) -> int:
+    sandbox = Path(args.sandbox).resolve()
+    target = Path(args.target).resolve() if args.target else sandbox / "target"
+    outcome = {"sandbox": str(sandbox), "target": str(target)}
+    if not (sandbox / "Cargo.toml").is_file():
+        outcome["result"] = "skipped: not a Cargo workspace"
+        print(json.dumps(outcome))
+        return 0
+    if not target_is_empty(target):
+        outcome["result"] = "skipped: target is not empty"
+        print(json.dumps(outcome))
+        return 0
+    head = git(sandbox, "rev-parse", "HEAD")
+    key = build_key(sandbox)
+    directory = repo_dir(sandbox)
+    # Pools imported before #2717 have no recorded checkout; the first seed of a
+    # sandbox of the repository records it (a no-op when already known).
+    remember_repo(directory, sandbox)
+    pools = ready_pools(directory, key)
+    chosen, in_use = claim_pool(
+        directory, pools, lambda left: choose_pool(sandbox, head, left, args.max_distance))
+    outcome.update({"head": head, "key": key})
+    failure = failed_pool(directory, head, key)
+    if failure is not None:
+        # Surface the durable failure (including diagnostics) on later launches
+        # and in `status`, rather than requiring the manager to find the unit.
+        outcome["build_failure"] = failure
+    if args.build_missing and (chosen is None or chosen["distance"] > 0):
+        outcome["build"] = request_build(sandbox, head)
+    if chosen is None:
+        outcome.update(explain_no_pool(sandbox, head, pools, args.max_distance))
+        outcome["result"] = "no pool"
+        print(json.dumps(outcome))
+        return 0
+    started = time.time()
+    target.mkdir(parents=True, exist_ok=True)
+    # Stage on the same filesystem and move into place last: a seed that is
+    # killed leaves an empty target (a cold build), never a partial one.
+    staging = target / ".rsi-tmp" / f"target-pool-seed-{os.getpid()}"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.parent.mkdir(mode=0o700, exist_ok=True)  # the daemon's private scratch
+    staging.mkdir()
+    try:
+        times = normalise_mtimes(sandbox, chosen["sha"])
+        tree = seed_tree(Path(chosen["target"]), staging, wrapper_unlinks_outputs())
+        for entry in staging.iterdir():
+            if not (target / entry.name).exists():
+                os.rename(entry, target / entry.name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        in_use.close()
+    outcome.update({"result": "seeded", "pool": chosen["name"], "pool_sha": chosen["sha"],
+                    "degraded": bool(chosen.get("degraded")),
+                    "distance": chosen["distance"], **tree, **times,
+                    "seconds": round(time.time() - started, 1)})
+    (target / SEED_MARKER).write_text(json.dumps(outcome, indent=1) + "\n")
+    print(json.dumps({key: value for key, value in outcome.items() if key != "rebuilt_units"}))
+    return 0
+
+
+def free_gib(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    return usage.free / 2**30
+
+
+# No free-space floor may demand more than this share of the disk (#1884); the
+# daemon caps `sandbox_min_free_gib` the same way (`effective_min_free_bytes`).
+MAX_FLOOR_PERCENT_OF_DISK = 25
+
+
+def scaled_floor_gib(path: Path, configured_gib: float) -> float:
+    """The configured floor, capped at a quarter of the disk holding `path`."""
+    path.mkdir(parents=True, exist_ok=True)
+    return min(configured_gib, shutil.disk_usage(path).total / 2**30
+               * MAX_FLOOR_PERCENT_OF_DISK / 100)
+
+
+def mark_shared_read_only(target: Path) -> None:
+    for deps in target.glob("*/deps"):
+        for entry in deps.iterdir():
+            if entry.is_file() and not entry.is_symlink() and not entry.name.endswith(".d"):
+                if entry.name.endswith(IN_PLACE_SUFFIXES) or "." not in entry.name:
+                    os.chmod(entry, entry.stat().st_mode & ~0o222)
+
+
+def lock(directory: Path):
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = open(directory / ".build.lock", "a+")
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:  # non-Unix: best effort, one builder per host is advisory
+        pass
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def use_lock(directory: Path, name: str, exclusive: bool):
+    """Take `<pool>.use` without waiting: shared by readers (seeds and pool builds
+    that copy from the pool), exclusive by gc. None when the other side holds it."""
+    path = directory / f"{name}.use"
+    try:
+        handle = open(path, "a+")
+    except OSError:
+        return None
+    try:
+        import fcntl
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+    except ImportError:  # non-Unix: best effort, as for the build lock
+        pass
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def claim_pool(directory: Path, pools: list[dict], choose) -> tuple[dict | None, object]:
+    """Choose a pool and hold its shared use lock; a pool gc is removing is not
+    offered again."""
+    candidates = list(pools)
+    while True:
+        chosen = choose(candidates)
+        if chosen is None:
+            return None, None
+        handle = use_lock(directory, chosen["name"], exclusive=False)
+        if handle is not None and Path(chosen.get("target", "")).is_dir():
+            return chosen, handle
+        if handle is not None:
+            handle.close()
+        candidates = [record for record in candidates if record["name"] != chosen["name"]]
+
+
+def remove_pool(directory: Path, name: str, repo: Path | None, keep_log: bool = False) -> None:
+    worktree = directory / name
+    if repo is not None and worktree.exists():
+        git(repo, "worktree", "remove", "--force", str(worktree), check=False)
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+    if repo is not None:
+        git(repo, "worktree", "prune", check=False)
+    (directory / f"{name}.json").unlink(missing_ok=True)
+    # `<name>.use` is never unlinked: its inode is the lock identity, and a
+    # waiter that opened it before a removal must exclude a seed that locks the
+    # rebuilt pool of the same name. It is an empty file.
+    if not keep_log:
+        (directory / f"{name}.log").unlink(missing_ok=True)
+
+
+def cmd_build(args) -> int:
+    repo = Path(args.repo).resolve()
+    sha = git(repo, "rev-parse", f"{args.sha or 'HEAD'}^{{commit}}")
+    directory = repo_dir(repo)
+    held = lock(directory)
+    if held is None:
+        log("another pool build is running; not starting a second")
+        return 0
+    remember_repo(directory, repo)
+    key = build_key(repo)
+    name = f"{sha}-{key}"
+    marker = directory / f"{name}.json"
+    if marker.exists():
+        record = json.loads(marker.read_text())
+        if is_ready(record) or (
+                record.get("state") == "failed"
+                and time.time() - record.get("built_at", 0) < args.retry_after):
+            log(f"pool {name} is {record.get('state')}; nothing to do")
+            return 0
+        remove_pool(directory, name, repo)
+    skip = admission_skip(directory, repo, sha, key, args.min_free_gib)
+    if skip is not None:
+        record_event(directory, "skip", skip)
+        log(f"{skip['reason']}: {skip['detail']}; not building")
+        return 0
+    guard = (DiskGuard(directory, worker_floor_gib(directory), watch_seconds())
+             if args.min_free_gib > 0 else None)
+    worktree = directory / name
+    git(repo, "worktree", "add", "--detach", str(worktree), sha)
+    if build_key(worktree) != key:
+        log("the pool commit uses another toolchain than the requesting sandbox")
+        remove_pool(directory, name, repo)
+        return 1
+    try:
+        target = worktree / "target"
+        started = time.time()
+        chosen, in_use = claim_pool(
+            directory, ready_pools(directory, key),
+            lambda left: choose_pool(worktree, sha, left, args.max_distance))
+        seed = None
+        if chosen is not None:
+            log(f"seeding pool {name} from {chosen['name']} ({chosen['distance']} commits behind)")
+            target.mkdir()
+            try:
+                times = normalise_mtimes(worktree, chosen["sha"])
+                tree = seed_tree(Path(chosen["target"]), target, wrapper_unlinks_outputs())
+            finally:
+                in_use.close()
+            seed = {"pool": chosen["name"], "pool_sha": chosen["sha"],
+                    "distance": chosen["distance"], **tree, **times,
+                    "seconds": round(time.time() - started, 1)}
+        if guard is not None and (free := guard.breach()) is not None:
+            raise DiskFloorAbort(free, guard.floor_gib)  # the seed's copies alone crossed it
+        slot = os.environ.get("RSI_CARGO_SLOT") or str(Path.home() / ".rsi" / "bin" / "cargo-slot")
+        wrap = [slot] if os.access(slot, os.X_OK) and not os.environ.get("RSI_CARGO_SLOT_HELD") else []
+        command = wrap + BUILD_COMMAND
+        log(f"building pool {name}: {' '.join(command)}")
+        build_log = directory / f"{name}.log"
+        # sccache starts its server with a second socket at TMPDIR/sccache*/sock,
+        # even when SCCACHE_SERVER_UDS is short. Keep scratch above the SHA-keyed
+        # worktree and discard any per-sandbox temporary-directory environment.
+        degraded = None
+        with pool_temporary_directory(directory) as temporary:
+            environ = pool_build_environment(target, Path(temporary))
+            with build_log.open("w") as output:
+                exit_code = run_logged(command, worktree, environ, output, guard)
+                if exit_code != 0:
+                    degraded = degraded_build(wrap, worktree, environ, output, build_log, exit_code,
+                                              guard)
+    except DiskFloorAbort as abort:
+        return abort_pool(directory, name, repo, marker, sha, key, abort)
+    record = {"name": name, "sha": sha, "key": key, "target": str(target),
+              "worktree": str(worktree), "built_at": time.time(),
+              "build_seconds": round(time.time() - started, 1), "command": command,
+              "log_path": str(build_log), "seed": seed}
+    if exit_code != 0 and degraded is None:
+        remove_pool(directory, name, repo, keep_log=True)
+        write_marker(marker, {**record, "state": "failed", "exit_code": exit_code,
+                              "error_tail": log_tail(build_log)})
+        log(f"pool build failed (exit {exit_code}); log: {build_log}")
+        return exit_code
+    mark_shared_read_only(target)
+    record["size_bytes"] = tree_size(target)
+    if degraded is not None:
+        record.update(degraded=True, **degraded)
+        log(f"pool {name}: tests do not compile (exit {exit_code}); "
+            "keeping the libraries and binaries that built")
+    write_marker(marker, {**record, "state": "ready"})
+    record_event(directory, "last_pool", {"size_bytes": record["size_bytes"], "sha": sha})
+    record_event(directory, "skip", None)
+    log(f"pool {name} ready in {record['build_seconds']}s")
+    gc(directory, max(1, args.keep), repo)
+    return 0
+
+
+def watch_seconds() -> float:
+    return positive_env("RSI_TARGET_POOL_WATCH_SEC", DEFAULT_WATCH_SECONDS)
+
+
+def stop_process_group(process: subprocess.Popen, grace: float = 15.0) -> None:
+    """TERM the build's process group (cargo-slot forwards it to cargo), then KILL it."""
+    def send(signum) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signum)
+            elif signum == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    send(signal.SIGTERM)
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        send(getattr(signal, "SIGKILL", signal.SIGTERM))
+        process.wait()
+
+
+def run_logged(command: list[str], cwd: Path, environ: dict[str, str], output,
+               guard: DiskGuard | None = None) -> int:
+    """Run a build, logging to `output`. With a `guard`, the build runs in its own process
+    group and is stopped (DiskFloorAbort) as soon as the free space falls below the floor."""
+    try:
+        process = subprocess.Popen(command, cwd=cwd, env=environ, stdout=output,
+                                   stderr=subprocess.STDOUT,
+                                   start_new_session=guard is not None)
+    except OSError as error:
+        output.write(f"pool build could not start: {error}\n")
+        return 1
+    if guard is None:
+        return process.wait()
+    while True:
+        try:
+            return process.wait(timeout=guard.interval)
+        except subprocess.TimeoutExpired:
+            pass
+        free = guard.breach()
+        if free is not None:
+            stop_process_group(process)
+            raise DiskFloorAbort(free, guard.floor_gib)
+
+
+def abort_pool(directory: Path, name: str, repo: Path, marker: Path, sha: str, key: str,
+               abort: DiskFloorAbort) -> int:
+    """Remove a build that crossed the workers' floor, partial output included, and keep a
+    typed `failed` marker: status names the reason, and the retry window applies."""
+    remove_pool(directory, name, repo, keep_log=True)
+    detail = f"stopped at {abort.free:.1f} GiB free; the workers' floor is {abort.floor:.1f} GiB"
+    write_marker(marker, {"name": name, "sha": sha, "key": key, "state": "failed",
+                          "reason": ABORT_FLOOR, "detail": detail, "built_at": time.time(),
+                          "free_gib": round(abort.free, 1), "floor_gib": round(abort.floor, 1)})
+    log(f"{ABORT_FLOOR}: {detail}; partial pool removed")
+    return 1
+
+
+def degraded_build(wrap: list[str], worktree: Path, environ: dict[str, str], output,
+                   build_log: Path, test_exit_code: int,
+                   guard: DiskGuard | None = None) -> dict | None:
+    """A tip whose tests do not compile still gets a pool from what compiled:
+    the test targets that build, then the libraries and binaries. None when even
+    those fail (a real build break, not a test-compile break)."""
+    tail = log_tail(build_log)
+    output.write("\ntarget-pool: tests do not compile; building what does\n")
+    output.flush()
+    run_logged(wrap + KEEP_GOING_COMMAND, worktree, environ, output, guard)
+    library_exit = run_logged(wrap + LIBRARY_COMMAND, worktree, environ, output, guard)
+    output.flush()
+    if library_exit != 0:
+        return None
+    return {"test_exit_code": test_exit_code, "test_error_tail": tail,
+            "scope": "libraries"}
+
+
+def tree_size(path: Path) -> int:
+    """Bytes on disk, counting each hard-linked inode once."""
+    seen = set()
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                status = (Path(root) / name).lstat()
+            except OSError:
+                continue
+            if (status.st_dev, status.st_ino) in seen:
+                continue
+            seen.add((status.st_dev, status.st_ino))
+            total += status.st_size
+    return total
+
+
+def ssh_command() -> list[str]:
+    return shlex.split(os.environ.get("RSI_TARGET_POOL_SSH", "ssh -o BatchMode=yes"))
+
+
+def remote_pools(host: str, remote_tool: str) -> list[dict]:
+    """Ready pool records of another host (its `target-pool status`, JSON lines)."""
+    result = subprocess.run([*ssh_command(), host, f"{remote_tool} status"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{host}: {remote_tool} status failed: {result.stderr.strip()[-300:]}")
+    records = []
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("state") == "ready" and record.get("target"):
+            records.append(record)
+    return records
+
+
+def choose_remote_pool(repo: Path, key: str, records: list[dict], sha: str | None) -> dict | None:
+    """Newest ready pool built the way this host builds, of a commit this repo has."""
+    usable = []
+    for record in records:
+        if record.get("key") != key:
+            continue
+        if sha and record["sha"] != sha:
+            continue
+        known = subprocess.run(["git", "-C", str(repo), "cat-file", "-e",
+                                f"{record['sha']}^{{commit}}"], capture_output=True,
+                               env=git_environment()).returncode == 0
+        if known:
+            usable.append(record)
+    return max(usable, key=lambda record: record.get("built_at", 0), default=None)
+
+
+def remote_size_bytes(host: str, target: str) -> int:
+    result = subprocess.run([*ssh_command(), host, f"du -sb {shlex.quote(target)}"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{host}: du failed: {result.stderr.strip()[-300:]}")
+    return int(result.stdout.split()[0])
+
+
+def stream_target(host: str, target: str, destination: Path, level: int) -> None:
+    """tar | zstd over ssh into `destination`: keeps hard links, modes and mtimes."""
+    parent, name = str(Path(target).parent), Path(target).name
+    remote = f"tar -C {shlex.quote(parent)} -cf - {shlex.quote(name)} | zstd -T0 -{level} -c"
+    sender = subprocess.Popen([*ssh_command(), host, remote], stdout=subprocess.PIPE)
+    decoder = subprocess.Popen(["zstd", "-dc"], stdin=sender.stdout, stdout=subprocess.PIPE)
+    sender.stdout.close()
+    unpacker = subprocess.Popen(["tar", "-xpf", "-", "-C", str(destination)],
+                                stdin=decoder.stdout)
+    decoder.stdout.close()
+    codes = [unpacker.wait(), decoder.wait(), sender.wait()]
+    if any(codes):
+        raise RuntimeError(f"transfer failed (tar {codes[0]}, zstd {codes[1]}, ssh {codes[2]})")
+
+
+def present(marker: Path) -> bool:
+    """Whether the marker describes a ready pool that is still on disk."""
+    try:
+        return is_ready(json.loads(marker.read_text()))
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_seed_from(args) -> int:
+    """Copy another host's newest matching ready pool in, instead of a cold build."""
+    repo = Path(args.repo).resolve()
+    key = build_key(repo)
+    directory = repo_dir(repo)
+    record = choose_remote_pool(repo, key, remote_pools(args.host, args.remote_tool), args.sha)
+    if record is None:
+        log(f"{args.host} has no ready pool with key {key} for a commit this repo has; "
+            "build one locally")
+        return 2
+    name = record["name"]
+    size = remote_size_bytes(args.host, record["target"])
+    floor = scaled_floor_gib(directory, args.min_free_gib)
+    free = free_gib(directory)
+    plan = {"host": args.host, "pool": name, "sha": record["sha"], "key": key,
+            "size_gib": round(size / 2**30, 1), "free_gib": round(free, 1),
+            "floor_gib": round(floor, 1)}
+    marker = directory / f"{name}.json"
+    if present(marker):
+        print(json.dumps({**plan, "result": "already present"}))
+        return 0
+    if args.dry_run:
+        print(json.dumps({**plan, "result": "dry run"}))
+        return 0
+    # The transfer must leave the workers their cargo-slot floor too (#2773).
+    headroom = max(args.min_headroom_gib, worker_floor_gib(directory) if floor > 0 else 0)
+    if free < floor or free - size / 2**30 < headroom:
+        log(f"{SKIP_HEADROOM}: {free:.0f} GiB free, pool is {size / 2**30:.1f} GiB, pool floor "
+            f"{floor:.0f} GiB, {headroom:.0f} GiB must remain; "
+            "settle sandboxes or reclaim caches first")
+        record_event(directory, "skip", {
+            "reason": SKIP_HEADROOM, "free_gib": round(free, 1), "floor_gib": round(headroom, 1),
+            "expected_gib": round(size / 2**30, 1),
+            "needed_gib": round(headroom + size / 2**30, 1), "expected_source": "remote pool",
+            "detail": f"only {free:.1f} GiB free; the transfer needs "
+                      f"{headroom + size / 2**30:.1f} GiB (floor {headroom:.1f} + remote pool "
+                      f"{size / 2**30:.1f})"})
+        return 3
+    held = lock(directory)
+    if held is None:
+        log("a pool build is running; not seeding alongside it")
+        return 0
+    # The exclusive use lock is the same one gc takes before removing a pool: while
+    # we hold it, a gc whose plan names this pool (a stale marker of the same name)
+    # skips it instead of deleting the directory we are filling.
+    in_use = use_lock(directory, name, exclusive=True)
+    if in_use is None:
+        log(f"pool {name} is in use; not seeding over it")
+        held.close()
+        return 0
+    started = time.time()
+    try:
+        if present(marker):
+            print(json.dumps({**plan, "result": "already present"}))
+            return 0
+        for leftover in directory.glob(".seed-*"):  # a killed seed's staging
+            shutil.rmtree(leftover, ignore_errors=True)
+        staging = directory / f".seed-{os.getpid()}"
+        staging.mkdir()
+        try:
+            stream_target(args.host, record["target"], staging, args.level)
+            if not (staging / "target").is_dir():
+                raise RuntimeError("transfer produced no target directory")
+            worktree = directory / name
+            marker.unlink(missing_ok=True)  # a stale marker must not describe the new tree
+            shutil.rmtree(worktree, ignore_errors=True)
+            worktree.mkdir()
+            os.rename(staging / "target", worktree / "target")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        seconds = round(time.time() - started, 1)
+        # The detached worktree is not copied: a seeded pool serves as a seed source
+        # only. `gc` removes the directory like any other pool.
+        mark_shared_read_only(worktree / "target")
+        ready = {"name": name, "sha": record["sha"], "key": key,
+                 "target": str(worktree / "target"), "worktree": str(worktree),
+                 "built_at": record.get("built_at", time.time()), "build_seconds": seconds,
+                 "command": record.get("command", BUILD_COMMAND), "log_path": None,
+                 "seed": None, "degraded": bool(record.get("degraded")),
+                 "size_bytes": tree_size(worktree / "target"),
+                 "seeded_from": {"host": args.host, "seconds": seconds, "bytes": size},
+                 "state": "ready"}
+        write_marker(marker, ready)  # last: nothing sees the pool before it is whole
+        record_event(directory, "last_pool", {"size_bytes": ready["size_bytes"],
+                                              "sha": record["sha"]})
+        # The pool has no worktree to name its repository: record the checkout so gc can
+        # count its age and a refresh without --repo can rebuild after it goes (#2717).
+        remember_repo(directory, repo)
+    finally:
+        in_use.close()
+        held.close()
+    print(json.dumps({**plan, "result": "seeded", "seconds": seconds,
+                      "mib_per_second": round(size / 2**20 / max(seconds, 0.1), 1)}))
+    gc(directory, max(1, args.keep if args.keep is not None else default_keep()), repo)
+    return 0
+
+
+def pool_temporary_directory(directory: Path):
+    # Custom pool roots can also be long. /var/tmp is disk-backed on the hub;
+    # use a private, automatically cleaned directory there in that case.
+    parent = directory
+    if os.name != "nt" and len(os.fsencode(directory)) + 44 >= 104:
+        parent = Path("/var/tmp")
+        if not parent.is_dir():
+            raise RuntimeError("pool scratch needs a shorter disk-backed RSI_TARGET_POOL_ROOT")
+    return tempfile.TemporaryDirectory(prefix=".rsi-tmp-", dir=parent)
+
+
+def pool_build_environment(target: Path, temporary: Path) -> dict[str, str]:
+    # Reserve space for sccache's temporary-directory suffix and socket name.
+    # macOS's sun_path is 104 bytes (Linux's is 108); leave a byte for NUL.
+    if os.name != "nt" and len(os.fsencode(temporary)) + 24 >= 104:
+        raise RuntimeError("pool scratch path is too long for sccache; "
+                           "set RSI_TARGET_POOL_ROOT to a shorter disk-backed path")
+    environ = git_environment()
+    for name in ("TMPDIR", "TMP", "TEMP", "RSI_SESSION_TOKEN",
+                 "RSI_CARGO_SLOT_HELD", "RSI_PROCESS_OWNERSHIP_NAMESPACE"):
+        environ.pop(name, None)
+    environ.update(CARGO_TARGET_DIR=str(target), TMPDIR=str(temporary),
+                   TMP=str(temporary), TEMP=str(temporary), RSI_CARGO_NO_POOL_RECLAIM="1")
+    return environ
+
+
+def log_tail(path: Path) -> str:
+    with path.open("rb") as output:
+        output.seek(max(0, path.stat().st_size - 4096))
+        return output.read().decode(errors="replace")
+
+
+def gc_plan(records: list[dict], keep: int, pressure: bool = False,
+            stale: frozenset[str] | set[str] = frozenset()) -> tuple[list[dict], list[dict]]:
+    """(kept, doomed) among the ready pools. Keep the newest `keep` (exactly one
+    under disk pressure) plus the newest complete pool, pressure or not, so a
+    run of degraded pools never evicts the last pool that has test artifacts.
+    A `stale` pool (beyond the seed distance of the tip, so no seed can use it) is
+    doomed whatever its rank and never counts toward `keep` (#2707)."""
+    ready = sorted((record for record in records if record.get("state") == "ready"),
+                   key=lambda record: record.get("built_at", 0), reverse=True)
+    # An explicit GC zero is an eviction request, including the otherwise
+    # protected last complete pool. Builds and seeds clamp their own retention.
+    if keep == 0:
+        return [], ready
+    usable = [record for record in ready if record["name"] not in stale]
+    keep = 1 if pressure else max(1, keep)
+    kept = usable[:keep]
+    if not any(not record.get("degraded") for record in kept):
+        complete = next((record for record in usable if not record.get("degraded")), None)
+        if complete is not None:
+            kept.append(complete)
+    names = {record["name"] for record in kept}
+    return kept, [record for record in ready if record["name"] not in names]
+
+
+def stale_pool_names(records: list[dict], ref: str, max_distance: int,
+                     repo: Path | None = None) -> set[str]:
+    """Ready pools more than `max_distance` commits behind `ref`: the seed refuses
+    them, so they only hold disk (and, below the build floor, keep a fresh pool from
+    being built at all). A pool whose age cannot be counted is not stale. `repo` is
+    the checkout that counts the age of a pool with no worktree of its own (#2717)."""
+    stale = set()
+    for record in records:
+        if record.get("state") != "ready":
+            continue
+        age = pool_age_commits(record, ref, repo)
+        if age is not None and age > max_distance:
+            stale.add(record["name"])
+    return stale
+
+
+def main_worktree(path: Path) -> Path | None:
+    """The repository's main checkout, as seen from any of its worktrees."""
+    listing = git(path, "worktree", "list", "--porcelain", check=False)
+    first = listing.splitlines()[0] if listing else ""
+    if not first.startswith("worktree "):
+        return None
+    main = Path(first[len("worktree "):])
+    return main if (main / "Cargo.toml").is_file() else None
+
+
+def remember_repo(directory: Path, path: Path) -> None:
+    """Record the checkout this directory's pools belong to, so a refresh can rebuild
+    after gc removed the last pool (and with it every worktree that names the repo)."""
+    main = main_worktree(path) if path.is_dir() else None
+    if main is not None and known_repo(directory) != main:
+        try:
+            (directory / REPO_FILE).write_text(str(main) + "\n")
+        except OSError:
+            pass
+
+
+def known_repo(directory: Path) -> Path | None:
+    try:
+        repo = Path((directory / REPO_FILE).read_text().strip())
+    except OSError:
+        return None
+    return repo if (repo / "Cargo.toml").is_file() else None
+
+
+def same_generation(directory: Path, planned: dict) -> bool:
+    """Whether the marker on disk still describes the pool gc planned to remove;
+    checked under the exclusive use lock, which a plan can outlive."""
+    try:
+        current = json.loads((directory / f"{planned['name']}.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return (current.get("state") == "ready"
+            and current.get("built_at") == planned.get("built_at"))
+
+
+def gc(directory: Path, keep: int, repo: Path | None, pressure: bool = False,
+       skipped: list[str] | None = None, ref: str | None = None,
+       max_distance: int = DEFAULT_MAX_DISTANCE,
+       filesystem: Path | None = None) -> list[str]:
+    """Remove the pools outside `gc_plan`; a pool a seed is reading is skipped. With a
+    `ref`, a pool more than `max_distance` commits behind it goes too (#2707)."""
+    records = []
+    for marker in directory.glob("*.json"):
+        try:
+            records.append(json.loads(marker.read_text()))
+        except (OSError, ValueError):
+            continue
+    removed = []
+    stale = (stale_pool_names(records, ref, max_distance, repo or known_repo(directory))
+             if ref else set())
+    _kept, doomed = gc_plan(records, keep, pressure, stale)
+    for record in doomed:
+        if filesystem is not None and not same_filesystem(record, filesystem):
+            continue
+        if record["name"] in stale:
+            # Before the worktree goes: it is the only thing naming the repository.
+            remember_repo(directory, Path(record.get("worktree", "")))
+        held = use_lock(directory, record["name"], exclusive=True)
+        if held is None:
+            if skipped is not None:
+                skipped.append(record["name"])
+            continue
+        try:
+            if not same_generation(directory, record):
+                continue  # removed or rebuilt since the plan was made
+            remove_pool(directory, record["name"], repo or known_repo(directory))
+        finally:
+            held.close()
+        removed.append(record["name"])
+    return removed
+
+
+def cmd_gc(args) -> int:
+    repo = Path(args.repo).resolve() if args.repo else None
+    directories = [repo_dir(repo)] if repo else [path for path in pool_root().glob("*")
+                                                 if path.is_dir()]
+    removed, skipped = [], []
+    keep = args.keep if args.keep is not None else default_keep()
+    for directory in directories:
+        if repo is not None:
+            remember_repo(directory, repo)
+        removed += gc(directory, keep, repo, args.pressure, skipped,
+                      ref=args.ref or None, max_distance=args.max_distance)
+    if args.json:
+        print(json.dumps({"removed": removed, "skipped_in_use": skipped}))
+    else:
+        for name in removed:
+            print(f"removed {name}")
+        for name in skipped:
+            print(f"skipped {name}: in use")
+    return 0
+
+
+def cmd_reclaim_idle(args) -> int:
+    """Evict every ready pool no seed or build is reading, for a worker waiting on the disk
+    floor (#2773): the pool exists to speed workers up, never to stall them. Bounded: a
+    directory reclaimed within `--min-interval` seconds is left alone. In-use pools are
+    skipped (the exclusive use lock), never waited on. Prints one JSON report."""
+    removed, skipped, throttled, freed = [], [], [], 0
+    now = time.time()
+    for directory in [path for path in pool_root().glob("*") if path.is_dir()]:
+        last = read_events(directory).get("reclaim")
+        if isinstance(last, dict) and now - last.get("at", 0) < args.min_interval:
+            throttled.append(directory.name)
+            continue
+        sizes = {}
+        for marker in directory.glob("*.json"):
+            try:
+                record = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                continue
+            if record.get("state") == "ready":
+                sizes[record["name"]] = pool_size(directory, record)
+        names = gc(directory, 0, None, skipped=skipped,
+                   filesystem=Path(args.filesystem) if getattr(args, "filesystem", None) else None)
+        if names:
+            bytes_freed = sum(sizes.get(name, 0) for name in names)
+            freed += bytes_freed
+            record_event(directory, "reclaim", {
+                "reason": RECLAIM_FLOOR, "removed": len(names), "freed_bytes": bytes_freed,
+                "detail": f"removed {len(names)} idle pool(s), {bytes_freed / 2**30:.1f} GiB, "
+                          "for a worker waiting on the disk floor"})
+        removed += names
+    print(json.dumps({"reason": RECLAIM_FLOOR, "removed": removed, "skipped_in_use": skipped,
+                      "throttled": throttled, "freed_bytes": freed}))
+    return 0
+
+
+def refresh_needed(nearest: int | None, max_distance: int) -> bool:
+    """Whether the pools trail far enough to build a fresh one: none within reach, or
+    the nearest is past half the seed distance (so a seed is never one step from the
+    limit when the next build starts)."""
+    return nearest is None or nearest > max_distance // 2
+
+
+def refresh_directory(directory: Path, repo: Path | None, ref: str, max_distance: int,
+                      retry_after: float) -> dict:
+    """Start a detached pool build at `ref`'s tip when `refresh_needed`; never waits."""
+    outcome = {"directory": directory.name}
+    repo = repo or known_repo(directory)
+    if repo is None:
+        return {**outcome, "result": "skipped: no checkout is known for these pools"}
+    tip = next((sha for candidate in (ref, "rolling")
+                if (sha := git(repo, "rev-parse", "--verify", "--quiet",
+                               f"{candidate}^{{commit}}", check=False))), None)
+    if tip is None:
+        return {**outcome, "result": f"skipped: {ref} does not resolve"}
+    key = build_key(repo)
+    distances = [d for record in ready_pools(directory, key)
+                 if (d := pool_distance(repo, tip, record["sha"])) is not None]
+    nearest = min(distances, default=None)
+    outcome.update({"tip": tip, "nearest": nearest})
+    if not refresh_needed(nearest, max_distance):
+        return {**outcome, "result": "fresh"}
+    failure = failed_pool(directory, tip, key)
+    if failure is not None and time.time() - failure.get("built_at", 0) < retry_after:
+        return {**outcome, "result": "skipped: the build of this tip failed recently"}
+    return {**outcome, "result": request_build(repo, tip)}
+
+
+def cmd_refresh(args) -> int:
+    repo = Path(args.repo).resolve() if args.repo else None
+    directories = ([repo_dir(repo)] if repo else [path for path in pool_root().glob("*")
+                                                  if path.is_dir()])
+    results = [refresh_directory(directory, repo, args.ref, args.max_distance,
+                                 args.retry_after) for directory in directories]
+    print(json.dumps({"refresh": results}))
+    return 0
+
+
+def pool_age_commits(record: dict, ref: str, repo: Path | None = None) -> int | None:
+    """Commits between the pool's commit and `ref`, read from the pool's own
+    worktree (it shares the repository's refs); None when it cannot be counted. A pool
+    imported by `seed-from` has only a target directory, no Git worktree, so its age
+    is read from `repo`, the checkout the pool directory belongs to (#2717)."""
+    worktree = Path(record.get("worktree", ""))
+    if not (worktree / ".git").exists():
+        worktree = repo if repo is not None and repo.is_dir() else worktree
+    if not worktree.is_dir():
+        return None
+    for candidate in (ref, "rolling"):
+        counted = git(worktree, "rev-list", "--count", f"{record['sha']}..{candidate}",
+                      check=False)
+        if counted.isdigit():
+            return int(counted)
+    return None
+
+
+def pool_size(directory: Path, record: dict) -> int:
+    size = record.get("size_bytes")
+    if isinstance(size, int):
+        return size
+    # Hold the shared use lock for the walk and the cache write: gc cannot remove
+    # the pool meanwhile, so the cache cannot resurrect a removed marker.
+    held = use_lock(directory, record["name"], exclusive=False)
+    if held is None:
+        return 0  # gc is removing it
+    try:
+        target = Path(record.get("target", ""))
+        if not target.is_dir():
+            return 0
+        size = tree_size(target)
+        marker = directory / f"{record['name']}.json"
+        try:  # cache it: a pool is immutable once ready
+            current = json.loads(marker.read_text())
+            if (current.get("state") == "ready" and target.is_dir()
+                    and current.get("built_at") == record.get("built_at")):
+                write_marker(marker, {**current, "size_bytes": size})
+        except (OSError, ValueError):
+            pass
+        return size
+    finally:
+        held.close()
+
+
+def same_filesystem(record: dict, filesystem: Path) -> bool:
+    try:
+        return Path(record["target"]).stat().st_dev == filesystem.stat().st_dev
+    except (OSError, KeyError):
+        return False
+
+
+def idle_pool_bytes(directory: Path, record: dict, filesystem: Path | None) -> int:
+    """An estimate only: exclusive use lock proves no seed/build is reading it now.
+    Reclaim takes that lock again; admission must remeasure free disk afterwards
+    (seeded targets can still hold hardlinks to these files)."""
+    if filesystem is not None and not same_filesystem(record, filesystem):
+        return 0
+    held = use_lock(directory, record["name"], exclusive=True)
+    if held is None:
+        return 0
+    try:
+        return record["size_bytes"] if same_generation(directory, record) else 0
+    finally:
+        held.close()
+
+
+def summarise(directories: list[Path], ref: str, filesystem: Path | None = None) -> dict:
+    """What the operator sees in Settings: the newest good pool, how many commits
+    it trails `ref`, whether newer builds failed, and the disk the pools hold."""
+    ready, failed, skips, reclaims = [], [], [], []
+    homes = {}  # id(record) -> the pool directory holding it
+    total = reclaimable = 0
+    for directory in directories:
+        for marker in directory.glob("*.json"):
+            try:
+                record = json.loads(marker.read_text())
+            except (OSError, ValueError):
+                continue
+            if is_ready(record):
+                record["size_bytes"] = pool_size(directory, record)
+                total += record["size_bytes"]
+                reclaimable += idle_pool_bytes(directory, record, filesystem)
+                ready.append(record)
+                homes[id(record)] = directory
+            elif record.get("state") == "failed":
+                failed.append(record)
+        for kind, slot in (("skip", skips), ("reclaim", reclaims)):
+            event = read_events(directory).get(kind)
+            if isinstance(event, dict):
+                slot.append(event)
+    ready.sort(key=lambda record: record.get("built_at", 0), reverse=True)
+    newest = ready[0] if ready else None
+    summary = {"pools": len(ready), "total_bytes": total,
+               "reclaimable_bytes": reclaimable, "newest": None,
+               "failed_newer": 0, "failed_latest": None, "last_skip": None,
+               "last_reclaim": None}
+    if newest is not None:
+        summary["newest"] = {
+            "sha": newest["sha"], "built_at": newest.get("built_at"),
+            "degraded": bool(newest.get("degraded")),
+            "size_bytes": newest["size_bytes"],
+            "age_commits": pool_age_commits(newest, ref, known_repo(homes[id(newest)]))}
+        newer = [record for record in failed
+                 if record.get("built_at", 0) > newest.get("built_at", 0)]
+        summary["failed_newer"] = len(newer)
+    latest = max(failed, key=lambda record: record.get("built_at", 0), default=None)
+    if latest is not None and (newest is None
+                               or latest.get("built_at", 0) > newest.get("built_at", 0)):
+        summary["failed_latest"] = {"sha": latest["sha"], "built_at": latest.get("built_at"),
+                                    "reason": latest.get("reason"),
+                                    "detail": latest.get("detail")}
+    # Why no pool was built (#2773): a skip older than the newest pool is history, not a cause.
+    built = newest.get("built_at", 0) if newest is not None else 0
+    skip = max((event for event in skips if event.get("at", 0) > built),
+               key=lambda event: event.get("at", 0), default=None)
+    summary["last_skip"] = skip
+    summary["last_reclaim"] = max(reclaims, key=lambda event: event.get("at", 0), default=None)
+    return summary
+
+
+def cmd_summary(args) -> int:
+    directories = ([repo_dir(Path(args.repo).resolve())] if args.repo
+                   else [path for path in pool_root().glob("*") if path.is_dir()])
+    print(json.dumps(summarise(directories, args.ref,
+                               Path(args.filesystem) if args.filesystem else None)))
+    return 0
+
+
+def cmd_status(args) -> int:
+    directories = ([repo_dir(Path(args.repo).resolve())] if args.repo
+                   else [path for path in pool_root().glob("*") if path.is_dir()])
+    for directory in directories:
+        for marker in sorted(directory.glob("*.json")):
+            print(marker.read_text().strip())
+    return 0
+
+
+def cmd_key(args) -> int:
+    print(build_key(Path(args.repo or ".").resolve()))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    seed = commands.add_parser("seed")
+    seed.add_argument("--sandbox", required=True)
+    seed.add_argument("--target")
+    seed.add_argument("--build-missing", action="store_true")
+    seed.add_argument("--max-distance", type=int, default=DEFAULT_MAX_DISTANCE)
+    build = commands.add_parser("build")
+    build.add_argument("--repo", required=True)
+    build.add_argument("--sha")
+    build.add_argument("--keep", type=int, default=default_keep())
+    build.add_argument("--min-free-gib", type=float,
+                       default=default_min_free_gib())
+    build.add_argument("--retry-after", type=float, default=3600)
+    build.add_argument("--max-distance", type=int, default=DEFAULT_MAX_DISTANCE)
+    seed_from = commands.add_parser("seed-from")
+    seed_from.add_argument("host")
+    seed_from.add_argument("--repo", default=".")
+    seed_from.add_argument("--sha")
+    seed_from.add_argument("--dry-run", action="store_true")
+    seed_from.add_argument("--keep", type=int)
+    seed_from.add_argument("--level", type=int, default=3, help="zstd level (1 is fastest)")
+    seed_from.add_argument("--remote-tool", default=".rsi/bin/target-pool")
+    seed_from.add_argument("--min-free-gib", type=float,
+                           default=default_min_free_gib())
+    seed_from.add_argument("--min-headroom-gib", type=float, default=5,
+                           help="free space that must remain after the transfer")
+    collect = commands.add_parser("gc")
+    collect.add_argument("--repo")
+    collect.add_argument("--keep", type=int,
+                         help="ready pools to retain; 0 evicts all unused ready pools")
+    collect.add_argument("--pressure", action="store_true",
+                         help="disk pressure: keep the newest pool and the newest complete one")
+    collect.add_argument("--json", action="store_true")
+    collect.add_argument("--ref", default=DEFAULT_REF,
+                         help="also remove pools more than --max-distance commits behind "
+                              "this ref (empty: keep stale pools)")
+    collect.add_argument("--max-distance", type=int, default=DEFAULT_MAX_DISTANCE)
+    reclaim = commands.add_parser("reclaim-idle")
+    reclaim.add_argument("--min-interval", type=float, default=DEFAULT_RECLAIM_INTERVAL,
+                         help="skip a pool directory reclaimed less than this many seconds ago")
+    reclaim.add_argument("--filesystem", help="reclaim only pools on this filesystem")
+    refresh = commands.add_parser("refresh")
+    refresh.add_argument("--repo")
+    refresh.add_argument("--ref", default=DEFAULT_REF)
+    refresh.add_argument("--max-distance", type=int, default=DEFAULT_MAX_DISTANCE)
+    refresh.add_argument("--retry-after", type=float, default=3600)
+    status = commands.add_parser("status")
+    status.add_argument("--repo")
+    summary = commands.add_parser("summary")
+    summary.add_argument("--repo")
+    summary.add_argument("--ref", default="origin/rolling")
+    summary.add_argument("--filesystem", help="count reclaimable bytes only on this filesystem")
+    key = commands.add_parser("key")
+    key.add_argument("--repo")
+    args = parser.parse_args(argv)
+    handler = {"seed": cmd_seed, "build": cmd_build, "gc": cmd_gc, "status": cmd_status,
+               "summary": cmd_summary, "key": cmd_key, "refresh": cmd_refresh,
+               "seed-from": cmd_seed_from, "reclaim-idle": cmd_reclaim_idle}[args.command]
+    try:
+        return handler(args)
+    except (RuntimeError, OSError) as error:
+        log(str(error))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -6,6 +6,7 @@
 #[cfg(test)]
 use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::rpc::{
+    AGENT_ISSUE_LIST_LABEL_MAX_BYTES, AGENT_ISSUE_LIST_LABELS_MAX_COUNT,
     AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES, AgentArchiveIssueRequestV1, AgentGetIssueRequestV1,
     AgentIssueValidationClassV1, AgentIssueValidationFieldV1, AgentIssueValidationV1,
     AgentListIssuesRequestV1, AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1,
@@ -53,6 +54,8 @@ impl AgentIssueRequestKind {
                 "ready",
                 "order",
                 "title_contains",
+                "labels",
+                "fields",
             ],
             Self::Get => &["project_id", "issue_id", "display_number"],
             Self::Update => &[
@@ -61,6 +64,7 @@ impl AgentIssueRequestKind {
                 "display_number",
                 "expected_row_version",
                 "idempotency_key",
+                "include_issue",
                 "title",
                 "body",
                 "labels",
@@ -68,6 +72,7 @@ impl AgentIssueRequestKind {
                 "clear_priority",
                 "assignee",
                 "clear_assignee",
+                "handoff",
             ],
             Self::UpdateStatus => &[
                 "project_id",
@@ -76,6 +81,8 @@ impl AgentIssueRequestKind {
                 "status",
                 "expected_row_version",
                 "idempotency_key",
+                "include_issue",
+                "note",
             ],
             Self::Archive | Self::Restore => &[
                 "project_id",
@@ -122,6 +129,8 @@ fn field(name: &str) -> Option<AgentIssueValidationFieldV1> {
         "order" => Some(AgentIssueValidationFieldV1::Order),
         "title_contains" => Some(AgentIssueValidationFieldV1::TitleContains),
         "project_id" => Some(AgentIssueValidationFieldV1::ProjectId),
+        "include_issue" => Some(AgentIssueValidationFieldV1::IncludeIssue),
+        "note" => Some(AgentIssueValidationFieldV1::Note),
         _ => None,
     }
 }
@@ -209,7 +218,7 @@ fn require_one_issue_target(
 pub(crate) fn decode_list(
     value: &Value,
 ) -> Result<AgentListIssuesRequestV1, AgentIssueValidationV1> {
-    let request: AgentListIssuesRequestV1 = decode(AgentIssueRequestKind::List, value)?;
+    let mut request: AgentListIssuesRequestV1 = decode(AgentIssueRequestKind::List, value)?;
     if request.title_contains.as_ref().is_some_and(|needle| {
         needle.is_empty() || needle.len() > AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES
     }) {
@@ -218,6 +227,20 @@ pub(crate) fn decode_list(
             Some(AgentIssueValidationFieldV1::TitleContains),
         ));
     }
+    if request.labels.len() > AGENT_ISSUE_LIST_LABELS_MAX_COUNT
+        || request.labels.iter().any(|label| {
+            label.trim().is_empty()
+                || label.len() > AGENT_ISSUE_LIST_LABEL_MAX_BYTES
+                || label.contains('\0')
+        })
+    {
+        return Err(hint(
+            AgentIssueValidationClassV1::InvalidField,
+            Some(AgentIssueValidationFieldV1::Labels),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(request.labels.len());
+    request.labels.retain(|label| seen.insert(label.clone()));
     Ok(request)
 }
 pub(crate) fn decode_get(value: &Value) -> Result<AgentGetIssueRequestV1, AgentIssueValidationV1> {
@@ -362,6 +385,31 @@ mod tests {
             assert_eq!(error.class, Class::InvalidField);
             assert_eq!(error.field, Some(Field::TitleContains));
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn list_bounds_and_deduplicates_labels() {
+        let accepted = (0..16)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>();
+        let request = decode_list(&serde_json::json!({"labels": accepted})).unwrap();
+        assert_eq!(request.labels.len(), 16);
+
+        let too_many = (0..17)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>();
+        let error = decode_list(&serde_json::json!({"labels": too_many})).unwrap_err();
+        assert_eq!(error.class, Class::InvalidField);
+        assert_eq!(error.field, Some(Field::Labels));
+
+        let error = decode_list(&serde_json::json!({"labels": ["x".repeat(65)]})).unwrap_err();
+        assert_eq!(error.class, Class::InvalidField);
+        assert_eq!(error.field, Some(Field::Labels));
+
+        let request = decode_list(&serde_json::json!({"labels": ["kaizen", "kaizen"]})).unwrap();
+        assert_eq!(request.labels, ["kaizen"]);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

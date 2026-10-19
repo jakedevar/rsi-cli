@@ -226,6 +226,12 @@ pub struct ManagerRootResourceOrigin {
     pub known_floor_usd: f64,
 }
 
+/// #2667: how many turns the predecessor may take after queueing its
+/// `succeed_manager` before the succession is refused as
+/// `manager_succession_predecessor_changed` (a settled predecessor that keeps
+/// being resumed is not handing the seat over).
+const MANAGER_SUCCESSION_MAX_INTERVENING_TURNS: i64 = 4;
+
 fn settled_status(status: SessionStatus) -> bool {
     matches!(
         status,
@@ -239,7 +245,41 @@ fn same_source(a: &Session, b: &Session) -> Result<bool> {
 }
 
 impl Store {
+    /// The persisted operator choice that guarded succession honours: the one
+    /// Store predicate behind the Overview denial and the admission/effect
+    /// gate. A missing row reads as enabled here because the Store cannot see
+    /// the live default; the daemon overlays the live RuntimeConfig value on
+    /// Overview (`manager_ledger.rs`) and rechecks it at admission and effect.
+    fn context_rotation_persisted_disabled(&self) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM daemon_settings WHERE key='context_rotation_enabled' AND value<>'true')", [], |r| r.get(0))?)
+    }
+
+    /// Read-only Overview readiness: lineage eligibility, then the same
+    /// rotation policy admission enforces. Eligibility publishes fences only;
+    /// admission still rechecks SelfSuccession, policy, custody and handoff.
     pub fn manager_succession_preflight(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    ) -> Result<ManagerSuccessionPreflightV2> {
+        let lineage = self.manager_succession_lineage_preflight(config)?;
+        let ManagerSuccessionPreflightV2::Eligible { observation } = &lineage else {
+            return Ok(lineage);
+        };
+        // An in-flight succession stays visible whatever the rotation setting
+        // is: its pointer is the only way to find it, and a denial has no field
+        // for it. A new occurrence is refused by admission regardless.
+        if observation.unresolved_operation_id.is_some()
+            || !self.context_rotation_persisted_disabled()?
+        {
+            return Ok(lineage);
+        }
+        Ok(ManagerSuccessionPreflightV2::rotation_disabled(
+            observation.logical_manager_session_id,
+            observation.current_session_id,
+        ))
+    }
+
+    fn manager_succession_lineage_preflight(
         &self,
         config: &rsi_common::harness_manager::HarnessManagerConfigV1,
     ) -> Result<ManagerSuccessionPreflightV2> {
@@ -301,7 +341,9 @@ impl Store {
         if !manager {
             return Err(refused("manager_succession_root_required"));
         }
-        match self.manager_succession_preflight(&config)? {
+        // Lineage only: a disabled rotation policy must reach the policy gate
+        // and refuse as `manager_succession_rotation_disabled`, not here.
+        match self.manager_succession_lineage_preflight(&config)? {
             ManagerSuccessionPreflightV2::Eligible { observation }
                 if observation.current_session_id == caller =>
             {
@@ -365,8 +407,7 @@ impl Store {
             return Err(refused("manager_v2_policy_paused"));
         }
         self.manager_launch_policy_gate(&authority.config, &policy.allowed_launches, launch)?;
-        let disabled: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM daemon_settings WHERE key='context_rotation_enabled' AND value<>'true')", [], |r| r.get(0))?;
-        if disabled {
+        if self.context_rotation_persisted_disabled()? {
             return Err(refused("manager_succession_rotation_disabled"));
         }
         self.manager_succession_human_gate(predecessor)?;
@@ -412,6 +453,40 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// The stored receipt of an identical-key `succeed_manager` retry, or None
+    /// for a new occurrence. It runs the same caller/scope authorization and
+    /// replay check as `enqueue_manager_succession`, before any policy gate, so
+    /// the daemon can answer a retry of an already-queued succession whatever
+    /// the live rotation setting is (a replay never executes its old proof).
+    pub fn replay_manager_succession(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerControlRequestV2,
+    ) -> Result<Option<ManagerActionReceiptV2>> {
+        let ManagerActionV2::SucceedManager {
+            expected, handoff, ..
+        } = &request.operation
+        else {
+            return Err(refused("manager_succession_action_required"));
+        };
+        request.fence.validate().map_err(refused)?;
+        expected.validate().map_err(refused)?;
+        handoff.validate().map_err(refused)?;
+        text(&request.idempotency_key, 128).map_err(refused)?;
+        let auth = self.manager_v2_authorize(
+            caller,
+            &request.fence,
+            Some(ManagerCapabilityV2::SelfSuccession),
+        )?;
+        self.manager_succession_observation(caller)?;
+        let payload =
+            json!({"origin": ManagerActionOriginV2::Agent { caller }, "request": request});
+        self.manager_v2_replay(&auth.config, &request.idempotency_key, &payload)?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Admission binds exact agent origin and public payload, freezes source and
@@ -507,6 +582,7 @@ impl Store {
             deduplicated: false,
             operator_result: None,
             sandbox_source: None,
+            cancelled_wakes: None,
         };
         let stamp = now();
         self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at)
@@ -716,10 +792,22 @@ impl Store {
             .ok_or_else(|| refused("manager_session_unavailable"))?;
         if proof.boot_id != claim.action.boot_id
             || proof.invocation_id != invocation
-            || invocation != root.frozen.predecessor_invocation_id
             || !settled_status(current.status)
             || proof.session.status != current.status
             || !same_source(&proof.session, &current)?
+        {
+            return Err(refused("manager_succession_predecessor_changed"));
+        }
+        // #2667: the predecessor may have taken a turn after the handoff was
+        // queued (a decision-class notice is never held back from a manager).
+        // That turn changed only the session's current invocation: the source
+        // (`manager_succession_authority`, above) and the committed handoff
+        // (`prepare_manager_handoff`, re-verified by the runtime) are checked
+        // exactly as before, and the candidate still descends from the frozen
+        // invocation that authored the handoff. A bounded number of later,
+        // settled turns is accepted instead of refusing the succession.
+        if invocation != root.frozen.predecessor_invocation_id
+            && !self.manager_succession_predecessor_continues(&root, invocation)?
         {
             return Err(refused("manager_succession_predecessor_changed"));
         }
@@ -731,6 +819,34 @@ impl Store {
         let result = self.refreshed_manager_succession_claim(claim)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// #2667: `current` is a later turn-bearing invocation of the predecessor
+    /// than the one the succession froze, and at most
+    /// [`MANAGER_SUCCESSION_MAX_INTERVENING_TURNS`] such turns ran since. A
+    /// legacy reservation (no frozen invocation) never qualifies.
+    fn manager_succession_predecessor_continues(
+        &self,
+        root: &ManagerRootSuccession,
+        current: Option<Uuid>,
+    ) -> Result<bool> {
+        let (Some(frozen), Some(current)) = (root.frozen.predecessor_invocation_id, current) else {
+            return Ok(false);
+        };
+        let predecessor = root.predecessor_session_id.to_string();
+        let helpers =
+            rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array();
+        let (current_follows, later): (bool, i64) = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_invocations cur JOIN model_invocations fz ON fz.id=?2
+                           WHERE cur.id=?3 AND cur.session_id=?1 AND fz.session_id=?1
+                             AND cur.created_at>fz.created_at),
+                    (SELECT count(*) FROM model_invocations later JOIN model_invocations fz ON fz.id=?2
+                      WHERE later.session_id=?1 AND fz.session_id=?1 AND later.created_at>fz.created_at
+                        AND later.purpose NOT IN (SELECT value FROM json_each(?4)))",
+            params![predecessor, frozen.to_string(), current.to_string(), helpers],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(current_follows && later <= MANAGER_SUCCESSION_MAX_INTERVENING_TURNS)
     }
 
     /// #1390: a predecessor is live while it owns a running or cancelling
@@ -748,6 +864,29 @@ impl Store {
             ],
             |r| r.get(0),
         )?)
+    }
+
+    /// #2667: the typed refusal code of the newest `succeed_manager` this
+    /// session queued as predecessor, while that succession is finally refused
+    /// (`blocked`, `failed` or `revoked`) and no later succession exists. The
+    /// seat is then still on this session with nothing handing it over, so the
+    /// overviews show the code instead of leaving a silent `blocked` row.
+    pub fn manager_succession_refusal(&self, predecessor: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(json_extract(o.outcome_json,'$.outcome'), r.reason)
+                 FROM manager_root_successions r
+                 JOIN harness_manager_v2_operations o ON o.id=r.operation_id
+                 WHERE r.predecessor_session_id=?1 AND r.state IN ('blocked','failed','revoked')
+                   AND NOT EXISTS(SELECT 1 FROM manager_root_successions n
+                                  WHERE n.predecessor_session_id=?1 AND n.created_at>r.created_at)
+                 ORDER BY r.created_at DESC LIMIT 1",
+                [predecessor.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// #1390: true while a root succession that replaces `session_id` is
@@ -1030,7 +1169,17 @@ impl Store {
         self.conn.execute("UPDATE manager_root_successions SET state='established',establishment_json=?2,row_version=row_version+1,updated_at=?3 WHERE operation_id=?1",params![root.operation_id.to_string(),evidence,now()])?;
         // The effect gate above requires the operator to have cleared both
         // pauses. Never overwrite either marker as part of succession.
+        // The publication hands the seat's wakes to the candidate; what it
+        // cannot hand over is retired with the displaced seat in this same
+        // transaction, so a rollback below restores every wake untouched.
+        let seat_wakes = self.succession_carried_wake_ids_on(root.predecessor_session_id)?;
         self.finalize_distinct_manager_predecessor_on(&tx, &root)?;
+        self.settle_succession_displaced_wakes_on(
+            &claim.action,
+            root.predecessor_session_id,
+            root.candidate_session_id,
+            &seat_wakes,
+        )?;
         // Prove the existing bounded resolver actually reaches the candidate.
         // A fork/limit refusal rolls back archival, receipt and epoch together.
         let published = self
@@ -1232,3 +1381,5 @@ fn parse_id(value: &str) -> Result<Uuid> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wake_tests; // #2652: kept out of `tests.rs`, whose changes select the slow tier

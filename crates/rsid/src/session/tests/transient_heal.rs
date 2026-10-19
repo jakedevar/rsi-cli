@@ -62,7 +62,21 @@ fn session(f: &Fixture) -> Session {
     row
 }
 
-async fn fail(f: &Fixture, mut row: Session, reason: &str) {
+async fn fail(f: &Fixture, row: Session, reason: &str) {
+    fail_with(
+        f,
+        row,
+        vec![StreamEvent {
+            event_type: "result".into(),
+            data: serde_json::json!({"subtype": reason, "terminal_reason": reason,
+            "is_error": true, "result": "", "num_turns": 1}),
+        }],
+    )
+    .await;
+}
+
+/// Fail `row` the way its provider stream ends: the given events, then EOF.
+async fn fail_with(f: &Fixture, mut row: Session, events: Vec<StreamEvent>) {
     row.status = SessionStatus::Running;
     row.terminal_reason = None;
     row.stop_reason = None;
@@ -83,15 +97,10 @@ async fn fail(f: &Fixture, mut row: Session, reason: &str) {
         .get_mut(&row.id)
         .unwrap()
         .stop_tx = stop_tx;
-    let (provider_tx, provider_rx) = mpsc::channel(1);
-    provider_tx
-        .send(StreamEvent {
-            event_type: "result".into(),
-            data: serde_json::json!({"subtype": reason, "terminal_reason": reason,
-            "is_error": true, "result": "", "num_turns": 1}),
-        })
-        .await
-        .unwrap();
+    let (provider_tx, provider_rx) = mpsc::channel(events.len().max(1));
+    for event in events {
+        provider_tx.send(event).await.unwrap();
+    }
     drop(provider_tx);
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -332,6 +341,80 @@ async fn aborted_streaming_child_heals_without_manual_resume() {
     stop(&f, child.id).await;
 }
 
+/// #2109: the real Codex capacity failure (terminal `Selected model is at
+/// capacity` process error) is resumed in the SAME session by the daemon, on
+/// the same model, with no manager turn: the finalizer arms the capacity
+/// resume, the scheduler fires it and the fake provider starts the same
+/// session again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn provider_capacity_failure_resumes_the_same_session_on_a_fake_provider() {
+    let f = fixture();
+    let mut child = session(&f);
+    let mut owner = session(&f);
+    owner.session_kind = SessionKind::Epic;
+    child.session_kind = SessionKind::Task;
+    // A worker that already ran has a provider thread to resume.
+    child.claude_session_id = Some(format!("provider-{}", child.id));
+    f.manager.store.lock().await.insert_session(&owner).unwrap();
+    child.parent_id = Some(owner.id);
+    let before = Utc::now();
+    fail_with(
+        &f,
+        child.clone(),
+        vec![StreamEvent {
+            event_type: "process_error".into(),
+            data: serde_json::json!({
+                "source": "codex_event",
+                "provider_event_type": "turn.failed",
+                "terminal": true,
+                "error": "Selected model is at capacity. Please try a different model.",
+            }),
+        }],
+    )
+    .await;
+    assert_eq!(
+        f.manager
+            .store
+            .lock()
+            .await
+            .get_session(child.id)
+            .unwrap()
+            .unwrap()
+            .stop_reason
+            .as_deref(),
+        Some("provider_error:codex:Selected model is at capacity. Please try a different model.")
+    );
+    let id = transient_heal_job_id(child.id);
+    let heal = job(&f, id).await;
+    assert!(heal.enabled);
+    assert_eq!(heal.wake_session_id, Some(child.id), "the same session");
+    assert!(
+        heal.message.starts_with("capacity: resumed"),
+        "{}",
+        heal.message
+    );
+    assert!(heal.next_fire_at >= before + Duration::seconds(60));
+    assert!(heal.next_fire_at <= Utc::now() + Duration::seconds(60));
+    let state = f
+        .manager
+        .store
+        .lock()
+        .await
+        .capacity_resume_state(child.id)
+        .unwrap()
+        .expect("the capacity resume is armed");
+    assert_eq!((state.attempts, state.exhausted), (1, false));
+
+    let process = install_controller_candidate_test_process(child.id);
+    fire_due(&f, id).await;
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    assert!(f.manager.active.read().await.contains_key(&child.id));
+    assert!(!job(&f, id).await.enabled);
+    assert_running_again(&f, child.id).await;
+    stop(&f, child.id).await;
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn capacity_refused_lead_heals_without_manual_resume() {
@@ -477,7 +560,7 @@ async fn transient_heal_sixty_minute_budget_survives_daemon_restart() {
     ).unwrap();
     // Reopen the actual SQLite database; the scheduler has no volatile retry state.
     let restarted = Arc::new(tokio::sync::Mutex::new(
-        Store::open(&f._dir.path().join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&f._dir.path().join("rsi.db")).unwrap(),
     ));
     let process = install_controller_candidate_test_process(lead.id);
     let launcher: Arc<dyn SessionLauncher> = f.manager.clone();
@@ -749,7 +832,7 @@ async fn transient_heal_pending_job_resumes_after_daemon_restart_without_complet
     let row = session(&f);
     fail(&f, row.clone(), "aborted_streaming").await;
     let id = transient_heal_job_id(row.id);
-    let store = Store::open(&f._dir.path().join("rsi.db")).unwrap();
+    let store = Store::open_test_fixture(&f._dir.path().join("rsi.db")).unwrap();
     f.manager = Arc::new(
         SessionManager::new(
             Arc::new(EventBus::new(16)),
@@ -820,5 +903,87 @@ fn heal_bootstrap_treats_any_non_system_non_user_event_as_an_effect() {
         let mut events = quiet.to_vec();
         events.push(effect);
         assert!(!super::super::lifecycle::heal_bootstrap_events_have_no_effect(&events));
+    }
+
+    // #2109: Codex's recorded capacity failure (two Assistant messages marked
+    // `provider_diagnostic`) is not an effect to replay; the agent's own
+    // Assistant output beside it still is.
+    let diagnostic = |terminal| {
+        let mut e = event(EventType::Message, Some(Role::Assistant));
+        e.metadata = Some(Box::new(
+            rsi_common::agent_session_events::provider_diagnostic_metadata("codex_event", terminal),
+        ));
+        e
+    };
+    let mut failed_at_launch = quiet.to_vec();
+    failed_at_launch.extend([diagnostic(false), diagnostic(true)]);
+    assert!(super::super::lifecycle::heal_bootstrap_events_have_no_effect(&failed_at_launch));
+    failed_at_launch.push(event(EventType::Message, Some(Role::Assistant)));
+    assert!(!super::super::lifecycle::heal_bootstrap_events_have_no_effect(&failed_at_launch));
+}
+
+/// #2811: Claude writes its retry notice as `type: "system"`,
+/// `subtype: "api_retry"`. Fed through the real monitor loop as wire lines, a
+/// notice naming an auth or billing class types the generic error result that
+/// ends the retries, and an auth class probes the provider login again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn a_system_api_retry_auth_class_types_the_generic_error_result_through_the_monitor() {
+    use crate::store_support::provider_defaults::{
+        PROVIDER_AUTH_INVALID_STOP_REASON, PROVIDER_BILLING_ERROR_STOP_REASON,
+        PROVIDER_LOGIN_REQUIRED_STOP_REASON,
+    };
+    let f = fixture();
+    let wire = |line: String| serde_json::from_str::<StreamEvent>(&line).unwrap();
+    for (error, stop, reprobes) in [
+        ("billing_error", PROVIDER_BILLING_ERROR_STOP_REASON, false),
+        (
+            "authentication_failed",
+            PROVIDER_LOGIN_REQUIRED_STOP_REASON,
+            true,
+        ),
+        ("account_on_hold", PROVIDER_AUTH_INVALID_STOP_REASON, true),
+    ] {
+        let row = session(&f);
+        let id = row.id;
+        let login = crate::provider_login::ProviderLoginService::global();
+        let probes_before = login.probes_started();
+        fail_with(
+            &f,
+            row,
+            vec![
+                wire(format!(
+                    r#"{{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":402,"error":"{error}"}}"#
+                )),
+                wire(
+                    r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"","num_turns":1}"#
+                        .to_string(),
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            f.manager
+                .store
+                .lock()
+                .await
+                .get_session(id)
+                .unwrap()
+                .unwrap()
+                .stop_reason
+                .as_deref(),
+            Some(stop),
+            "{error}"
+        );
+        if reprobes {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while login.probes_started() <= probes_before && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                login.probes_started() > probes_before,
+                "{error}: the auth stop probes the login again"
+            );
+        }
     }
 }

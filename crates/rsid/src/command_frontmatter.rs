@@ -300,7 +300,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn registry_loads_all_commands_with_class() {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = std::path::PathBuf::from(rsi_common::manifest_dir!());
         // Walk up: crates/rsid -> crates -> repo root
         let repo_root = manifest_dir
             .ancestors()

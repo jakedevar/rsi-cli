@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::io::{BufRead as _, Write as _};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;

@@ -3,6 +3,48 @@
 # (Makefile targets of the same name); the daemon wraps it in cargo-slot.
 version = 1
 
+# Opt-in watchdog challenge latency under one, then two rsid lib compiles.
+[recipes.watchdog-pressure]
+runner = "make"
+target = "watchdog-pressure"
+timeout_minutes = 20
+cpu_quota_percent = 800
+
+# Per-test durations for the rsid and rsid-store library suites (#2085): nextest
+# profile test-timings prints every completed test's duration, even when the
+# outer job budget expires first. A worker may submit it without
+# timeout_minutes: the daemon defaults this recipe to 90 minutes (#2089); this
+# declaration can only lower that.
+[recipes.test-timings]
+runner = "make"
+target = "test-timings"
+timeout_minutes = 90
+# Match the eight nextest test threads for comparable before/after measurements.
+cpu_quota_percent = 800
+
+# Automatic coverage after a bounded rolling gate (#2092). One shared library
+# build; fail-fast is disabled so a red does not hide the rest of either crate.
+# agent_jobs derives the actual CPU quota from half the host threads, clamped
+# to 2..12 cores (#2087), and supplies the same ceiling to nextest's -j.
+[recipes.rolling-library-qa]
+runner = "make"
+target = "rolling-library-qa"
+timeout_minutes = 180
+cpu_quota_percent = 1200
+
+# Scoped verification uses params.scoped_test, not a recipe (#1954).
+# The daemon selects the rolling-tip tool and records the copy in its receipt.
+# Resume a pinned child-worktree package from the manager's local completed-test
+# inventory. Source/configuration stays outside the pinned QA tree; no rerun of
+# completed passing library tests. See scripts/qa-resume --help.
+[recipes.qa-resume-rsid]
+runner = "make"
+target = "qa-resume-rsid"
+timeout_minutes = 90
+cpu_quota_percent = 200
+
+# Standard single pass: tmpfs test scratch where available, host scratch with
+# parity reported unavailable otherwise. Builds retain the host TMPDIR (#1910).
 [recipes.scoped-test]
 runner = "make"
 target = "scoped-test"
@@ -13,14 +55,21 @@ cpu_quota_percent = 200
 # (PACKAGE=FILTER, at most 16) as RSI_SCOPED_TEST_FILTERS; `make` passes them
 # `--total-max-sec` below this cap so sequential package budgets fit inside it.
 
-# Lander tmpfs parity (#1577): the same derived filters, with the test binaries
-# run under a private tmpfs TMPDIR. Reports `TMPFS_PARITY unavailable` and exits 0
-# where no tmpfs exists.
+# Explicit parity-only compatibility recipe (#1577). The default scoped-test
+# already uses tmpfs where available; do not submit this as a second pass.
+# Reports `TMPFS_PARITY unavailable` and exits 0 where no tmpfs exists.
 [recipes.scoped-test-tmpfs]
 runner = "make"
 target = "scoped-test-tmpfs"
 timeout_minutes = 20
 cpu_quota_percent = 200
+
+# #2421: 20 consecutive runs of the editing-mode live-switch e2e test.
+[recipes.e2e-editing-mode-live-switch-repeat]
+runner = "make"
+target = "e2e-editing-mode-live-switch-repeat"
+timeout_minutes = 90
+cpu_quota_percent = 800
 
 [recipes.check-touched-shards]
 runner = "make"
@@ -28,8 +77,29 @@ target = "check-touched-shards"
 timeout_minutes = 20
 cpu_quota_percent = 200
 
+# Pool builds can be measured through the durable job's systemd CPU accounting.
+[recipes.target-pool-build]
+runner = "make"
+target = "target-pool-build"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
 [recipes.deploy-migration-backup]
 runner = "make"
 target = "test-deploy-migration-backup"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# Cross-compile the portable holder and inherited listener sources/tests.
+[recipes.socket-activation-macos]
+runner = "make"
+target = "check-socket-activation-macos"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# Regenerate and check the operator manual after settings/keybinding changes.
+[recipes.manual]
+runner = "make"
+target = "manual"
 timeout_minutes = 20
 cpu_quota_percent = 200

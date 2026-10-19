@@ -321,7 +321,7 @@ pub enum CapacityDeliveryPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CapacityDeliveryReceipt {
+pub struct CapacityDeliveryReceipt {
     pub invocation_id: Uuid,
     pub phase: CapacityDeliveryPhase,
 }
@@ -387,7 +387,7 @@ pub fn test_fail_next_settlement(fault: CapacitySettlementFault) {
     SETTLEMENT_FAULT.with(|slot| *slot.borrow_mut() = Some(fault));
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn test_fail_next_admission(seam: &'static str) {
     ADMISSION_FAULT.with(|slot| *slot.borrow_mut() = Some(seam));
 }

@@ -1,5 +1,6 @@
 // Session actions from the detail pane.
 import { api } from './api.js';
+import { deliver } from './operator-messages.js';
 import { refreshEvents } from './conversation.js';
 import { $, toast } from './dom.js';
 import { refreshSessions } from './sessions.js';
@@ -9,12 +10,14 @@ export async function sendMessage(): Promise<void> {
   const id = state.selectedId;
   const box = $<HTMLTextAreaElement>('message');
   const text = box.value;
-  if (!id || !text.trim() || isReadOnly(selected())) return;
+  const s = selected();
+  if (!id || !s || !text.trim() || isReadOnly(s)) return;
   box.disabled = true;
   try {
-    await api.sendMessage(id, text);
+    const how = await deliver(s, text);
     box.value = '';
-    toast('Sent', true);
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    if (how === 'sent') toast('Sent', true);
     void refreshSessions();
     void refreshEvents();
   } catch (e) {

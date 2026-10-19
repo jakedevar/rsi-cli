@@ -10,6 +10,7 @@ use crate::model_control::{
 use crate::process_control::{
     CaptureError, CaptureLimits, CapturedOutput, capture_bounded_with_spawn,
 };
+use crate::session::harness::compatible_table::ReasoningEffortWire;
 use crate::session::harness::provider::{ApiProvider, resolve_provider};
 use crate::session::harness::providers::openai_api::OpenAiApiProvider;
 use crate::session::harness::types::{ChatMessage, ChatRequest, ProviderQuirks};
@@ -371,6 +372,7 @@ pub async fn admit_and_generate_text(
     request.model = Some(resolved.target.model.clone());
     request.backend = Some(backend.to_string());
     let dedup_key = request.dedup_key.clone();
+    let helper_purpose = request.purpose.as_str();
 
     let permit = match MemoryWorkContext::interruptible(admit_invocation(store, request, event_bus))
         .await?
@@ -411,12 +413,51 @@ pub async fn admit_and_generate_text(
         }
         result
     };
-    settle_memory_execution_with_usage(
+    let result = settle_memory_execution_with_usage(
         store, event_bus, &permit, execution, &cancel, purpose, &usage,
     )
-    .await
+    .await;
+    note_helper_outcome(store, helper_purpose, &result).await;
+    result
 }
 
+/// Feed the failure tracker and, when a streak of one purpose is due, record
+/// its friction event. Cancellation and policy denials are not model failures.
+async fn note_helper_outcome(
+    store: &Arc<Mutex<Store>>,
+    helper_purpose: &str,
+    result: &Result<String>,
+) {
+    use crate::memory::helper_failure::{HelperFailureTracker, helper_failure_event};
+    let tracker = HelperFailureTracker::global();
+    let error = match result {
+        Ok(_) => return tracker.record_success(helper_purpose),
+        Err(error) => error,
+    };
+    if matches!(
+        classify_error_class(error).as_str(),
+        "cancelled" | "policy_denied"
+    ) {
+        return;
+    }
+    if let Some(consecutive) = tracker.record_failure(helper_purpose, Instant::now()) {
+        let reasoning_budget = error.to_string().contains(REASONING_BUDGET_CAUSE);
+        tracing::error!(
+            purpose = helper_purpose,
+            consecutive,
+            reasoning_budget,
+            %error,
+            "helper LLM calls keep failing; recording a friction event"
+        );
+        crate::friction::note(
+            store,
+            helper_failure_event(helper_purpose, reasoning_budget),
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
 async fn settle_memory_execution<T>(
     store: &Arc<Mutex<Store>>,
     event_bus: &Arc<EventBus>,
@@ -549,6 +590,19 @@ async fn generate_text_cancellable_resolved(
         LlmExecutionPath::AgyCli => {
             generate_agy_cli(_permit, target, prompt, purpose, cancel).await
         }
+        // A Local-provider target with its own base URL is still the local
+        // route: it gets the same no-reasoning request (#2603).
+        LlmExecutionPath::OpenAiCompatibleApi
+            if target.provider == SessionProvider::Local && target.base_url.is_some() =>
+        {
+            let execution =
+                _permit.claim_model_execution(RuntimeExecutionRoute::SessionHarnessOpenAiHttp)?;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(DaemonError::ChannelClosed),
+                result = generate_local_or_custom_api(target, prompt, max_tokens, execution, usage) => result,
+            }
+        }
         LlmExecutionPath::OpenAiCompatibleApi => {
             tokio::select! {
                 biased;
@@ -591,6 +645,7 @@ async fn generate_harness_api(
         &target.model,
         prompt,
         max_tokens,
+        None,
         execution,
         usage,
     )
@@ -616,17 +671,32 @@ async fn generate_local_or_custom_api(
     let provider = OpenAiApiProvider::with_config(
         base_url,
         crate::session::harness::api_key::ApiCredential::explicit(api_key.as_deref()),
-        ProviderQuirks::default(),
+        local_helper_quirks(),
     )?;
     generate_api(
         Box::new(provider),
         &target.model,
         prompt,
         max_tokens,
+        Some(LOCAL_HELPER_REASONING_EFFORT),
         execution,
         usage,
     )
     .await
+}
+
+/// A helper call wants a short answer, not thinking: a local reasoning model
+/// (gemma4, qwen3, ...) otherwise spends the whole `max_tokens` on reasoning
+/// and returns empty content (#2603).
+const LOCAL_HELPER_REASONING_EFFORT: &str = "none";
+
+/// The Local/custom OpenAI-compatible route's wire profile: it takes a
+/// top-level `reasoning_effort` that accepts `none`.
+fn local_helper_quirks() -> ProviderQuirks {
+    ProviderQuirks {
+        reasoning_effort: ReasoningEffortWire::OpenAiWithNone,
+        ..ProviderQuirks::default()
+    }
 }
 
 async fn generate_api(
@@ -634,6 +704,7 @@ async fn generate_api(
     model: &str,
     prompt: &str,
     max_tokens: u32,
+    reasoning_effort: Option<&str>,
     execution: ModelExecutionCapability,
     usage: &HelperUsage,
 ) -> Result<String> {
@@ -646,8 +717,9 @@ async fn generate_api(
                 max_tokens: Some(max_tokens),
                 tools: Vec::new(),
                 stream: false,
-                reasoning_effort: None,
+                reasoning_effort: reasoning_effort.map(str::to_string),
                 context_editing: false,
+                tool_choice_none: false,
             },
             execution,
         )
@@ -655,12 +727,35 @@ async fn generate_api(
     usage.record_reported(&response.usage);
     let text = response.content.trim().to_string();
     if text.is_empty() {
-        return Err(DaemonError::Store(format!(
-            "{} returned empty response",
-            provider.name()
+        return Err(DaemonError::Store(empty_response_message(
+            provider.name(),
+            &response,
         )));
     }
     Ok(text)
+}
+
+/// Marker in the error of a reply whose whole budget went to reasoning; the
+/// failure tracker keys its cause on it.
+const REASONING_BUDGET_CAUSE: &str = "model spent the token budget on reasoning";
+
+/// Why a reply had no content. Empty content next to reasoning that hit the
+/// length cap names the cause (#2603) instead of a bare "empty response".
+fn empty_response_message(
+    provider: &str,
+    response: &crate::session::harness::types::ChatResponse,
+) -> String {
+    let reasoned = response
+        .reasoning_content
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    if reasoned && response.stop_reason.as_deref() == Some("length") {
+        format!(
+            "{provider} returned empty content: {REASONING_BUDGET_CAUSE} (finish_reason length); raise max_tokens or request no reasoning"
+        )
+    } else {
+        format!("{provider} returned empty response")
+    }
 }
 
 async fn generate_claude_cli(
@@ -904,7 +999,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use uuid::Uuid;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn target(provider: SessionProvider, model: &str) -> MemoryLlmTarget {
@@ -1240,6 +1335,136 @@ mod tests {
             checked > 20,
             "the table must exercise real targets: {checked}"
         );
+    }
+
+    fn local_gemma_target(server: &MockServer) -> MemoryLlmTarget {
+        MemoryLlmTarget {
+            provider: SessionProvider::Local,
+            model: "gemma4:e4b".to_string(),
+            base_url: Some(format!("{}/v1", server.uri())),
+            api_key: None,
+        }
+    }
+
+    /// #2603: a helper call on the Local route asks for no reasoning on the
+    /// wire (the mock only answers a request carrying the field), so a
+    /// reasoning model returns content instead of spending the budget thinking.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn local_helper_request_carries_reasoning_effort_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gemma4:e4b",
+                "reasoning_effort": "none"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"content": "**Fix Deploy Timeout Bug Now**"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target = local_gemma_target(&server);
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let bus = Arc::new(EventBus::new(8));
+        let permit = admitted_http_permit(&store, &bus, &target, "local-effort-none").await;
+
+        let title = generate_text(&permit, &target, "title this", 200, "Local effort none")
+            .await
+            .expect("local helper reply");
+
+        assert_eq!(title, "**Fix Deploy Timeout Bug Now**");
+        server.verify().await;
+    }
+
+    /// #2603: empty content, reasoning present and `finish_reason: length`
+    /// names the cause instead of "returned empty response".
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn empty_content_from_a_reasoning_overrun_names_the_cause() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"content": "", "reasoning": "Let me think about the title"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 200, "total_tokens": 212}
+            })))
+            .mount(&server)
+            .await;
+        let target = local_gemma_target(&server);
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let bus = Arc::new(EventBus::new(8));
+        let permit = admitted_http_permit(&store, &bus, &target, "local-reasoning-overrun").await;
+
+        let error = generate_text(&permit, &target, "title this", 200, "Reasoning overrun")
+            .await
+            .expect_err("empty content must fail");
+
+        let message = error.to_string();
+        assert!(message.contains(REASONING_BUDGET_CAUSE), "{message}");
+        assert!(!message.contains("returned empty response"), "{message}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[test]
+    fn empty_content_without_reasoning_or_length_keeps_the_plain_message() {
+        use crate::session::harness::types::ChatResponse;
+        let mut response = ChatResponse {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            usage: Default::default(),
+            reasoning_content: Some("thinking".into()),
+            stop_reason: Some("stop".into()),
+        };
+        assert_eq!(
+            empty_response_message("openai", &response),
+            "openai returned empty response"
+        );
+        response.stop_reason = Some("length".into());
+        response.reasoning_content = None;
+        assert_eq!(
+            empty_response_message("openai", &response),
+            "openai returned empty response"
+        );
+    }
+
+    /// #2603: ten consecutive failures of one helper purpose record one
+    /// `helper_llm` friction event; further failures inside the interval add none.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn a_repeated_helper_failure_records_one_friction_event() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let purpose = "memory.test_streak_2603";
+        let failure: Result<String> = Err(DaemonError::Store(format!(
+            "openai returned empty content: {REASONING_BUDGET_CAUSE} (finish_reason length)"
+        )));
+        let count = |store: &Store| -> u32 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM friction_events WHERE signature = ?1",
+                    ["helper_llm:memory_test_streak_2603:reasoning_budget"],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for _ in 0..(crate::memory::helper_failure::HELPER_FAILURE_THRESHOLD - 1) {
+            note_helper_outcome(&store, purpose, &failure).await;
+        }
+        assert_eq!(count(&*store.lock().await), 0);
+        for _ in 0..5 {
+            note_helper_outcome(&store, purpose, &failure).await;
+        }
+        assert_eq!(count(&*store.lock().await), 1);
+        note_helper_outcome(&store, purpose, &Ok("fine".to_string())).await;
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]

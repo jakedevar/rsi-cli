@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Compile a package's lib test harness for shard features, one shard after another (#2692).
+
+The daemon runs this for an `AgentSubmitJob` build job `{"command":"test_no_run", ...}` inside
+`rsi-build.slice`, so a worker never self-launches cargo to verify the shard features:
+
+    shard-feature-sweep --package rsid --shard store-01 --shard other-02
+    shard-feature-sweep --package rsid --no-default-features --feature test-shard-store-01
+
+Each configuration runs `cargo test -p PACKAGE --lib --no-run --message-format=json` (a shard adds
+`--no-default-features --features test-shard-NAME`). After every configuration the package's test
+artifacts are cleaned (`cargo clean -p PACKAGE --profile test`, the shard runner's cleanup), so the
+target holds one shard's harness at a time instead of one per shard. A failed shard does not stop
+the sweep: every shard is built and the receipt names each one.
+
+The compiler warnings of each build are counted with `scripts/scoped-test`'s warning collector and
+judged against `tools/warning-baseline.json` by the same gate (#1897) over the whole sweep. The last
+line is `SHARD_SWEEP_RECEIPT {json}`; the exit code is 0 only when every shard built, every clean
+succeeded and the warning gate did not fail.
+"""
+
+import argparse
+import json
+import os
+import re
+import runpy
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+RECEIPT_PREFIX = "SHARD_SWEEP_RECEIPT "
+TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+FAILING_GATE = ("new_warnings", "baseline_raised", "unavailable")
+WARNING_KEY_CAP = 20
+
+
+def configurations(args):
+    """The builds to run: (label, features, no_default_features)."""
+    if args.shards:
+        return [(shard, [f"test-shard-{shard}"], True) for shard in args.shards]
+    label = ",".join(args.features) or "default"
+    return [(label, list(args.features), args.no_default_features)]
+
+
+def cargo_command(package, features, no_default_features):
+    command = ["cargo", "test", "-p", package, "--lib", "--no-run", "--message-format=json"]
+    if no_default_features:
+        command.append("--no-default-features")
+    if features:
+        command += ["--features", ",".join(features)]
+    return command
+
+
+def build(command, collector, errors):
+    """Run one cargo build, feeding its JSON stream to the warning collector; its exit code."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, errors="replace")
+    try:
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                collector.text(line.rstrip("\n"))
+                continue
+            reason = message.get("reason") if isinstance(message, dict) else None
+            if reason == "compiler-artifact":
+                collector.artifact(message)
+            elif reason == "compiler-message":
+                collector.diagnostic(message)
+                detail = message.get("message") or {}
+                if detail.get("level") in ("error", "warning") and detail.get("rendered"):
+                    print(detail["rendered"], end="", file=sys.stderr, flush=True)
+                    if detail.get("level") == "error":
+                        errors.append(str(detail.get("message", ""))[:200])
+        return process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+
+
+def warning_counts(payload, package):
+    """Distinct warnings per package in one build's payload, always naming the swept package."""
+    counts = {name: len(keys) for name, keys in sorted(payload["warnings"].items())}
+    counts.setdefault(package, 0)
+    return counts
+
+
+def sweep(args, scoped):
+    package = args.package
+    entries, payloads, clean_failed = [], [], False
+    receipt = {"ok": False, "partial": True, "package": package, "shards": entries, "warnings": None}
+    try:
+        for label, features, no_default in configurations(args):
+            collector = scoped["WarningCollector"](args.repo)
+            command = cargo_command(package, features, no_default)
+            print(f"shard-feature-sweep: {label}: {' '.join(command)}", flush=True)
+            errors = []
+            code = build(command, collector, errors)
+            payload = collector.payload()
+            payloads.append(payload)
+            entry = {"shard": label, "features": features, "no_default_features": no_default,
+                     "exit_code": code, "warnings": warning_counts(payload, package),
+                     "degraded": payload["degraded"]}
+            if errors:
+                entry["errors"] = errors[:5]
+            print(f"shard-feature-sweep: {label}: exit {code}, warnings {entry['warnings']}", flush=True)
+            if not args.keep_artifacts:
+                clean = subprocess.run(["cargo", "clean", "-p", package, "--profile", "test"])
+                entry["clean_exit_code"] = clean.returncode
+                clean_failed |= clean.returncode != 0
+            entries.append(entry)
+        gate = scoped["warning_gate"](args.repo, args.base, payloads)
+        if gate is not None:
+            receipt["warnings"] = gate_summary(gate)
+            for name, item in sorted(gate["packages"].items()):
+                if item["status"] == "new_warnings":
+                    for new in item["new"]:
+                        print(f"shard-feature-sweep: new warning x{new['count']}: {new['key']}", flush=True)
+        gate_failed = bool(gate) and gate["status"] in FAILING_GATE
+        built = all(entry["exit_code"] == 0 for entry in entries) and bool(entries)
+        receipt["ok"] = built and not clean_failed and not gate_failed
+        receipt["partial"] = False
+        return 0 if receipt["ok"] else 1
+    finally:
+        print(RECEIPT_PREFIX + json.dumps(receipt, separators=(",", ":")), flush=True)
+
+
+def gate_summary(gate):
+    """The warning-baseline verdict, bounded: status plus each baselined package's counts."""
+    packages = {}
+    for name, item in sorted(gate["packages"].items()):
+        entry = {key: item[key] for key in ("status", "observed", "baseline", "new_total") if key in item}
+        if item.get("new"):
+            entry["new"] = item["new"][:WARNING_KEY_CAP]
+        packages[name] = entry
+    summary = {"status": gate["status"], "packages": packages}
+    for key in ("refusals", "unavailable"):
+        if gate.get(key):
+            summary[key] = gate[key][:WARNING_KEY_CAP]
+    return summary
+
+
+def token(value):
+    if not TOKEN.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"not a plain name: {value!r}")
+    return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--package", required=True, type=token)
+    parser.add_argument("--shard", action="append", dest="shards", default=[], type=token, metavar="NAME",
+                        help="build feature test-shard-NAME with --no-default-features; repeatable, in order")
+    parser.add_argument("--feature", action="append", dest="features", default=[], type=token,
+                        help="enable this feature in one build; repeatable")
+    parser.add_argument("--no-default-features", action="store_true")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--base", default="origin/rolling", help="ref whose warning baseline the gate compares against")
+    parser.add_argument("--keep-artifacts", action="store_true", help="do not clean the package between shards")
+    args = parser.parse_args(argv)
+    args.repo = os.path.abspath(args.repo)
+    if args.shards and args.features:
+        parser.error("--shard and --feature are exclusive")
+    # A one-off build never reuses incremental state (#1063); an explicit value wins.
+    os.environ.setdefault("CARGO_INCREMENTAL", "0")
+    scoped = runpy.run_path(str(Path(__file__).resolve().with_name("scoped-test")))
+    # A stop from the daemon unwinds through the receipt line instead of dying silently.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        return sweep(args, scoped)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

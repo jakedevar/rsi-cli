@@ -156,18 +156,26 @@ impl App {
     }
 
     pub(crate) fn model_effort_ladder(&self, provider: SessionProvider, model: &str) -> Vec<&str> {
-        if let Some(capabilities) = self
-            .model_effort_capabilities
-            .get(&provider)
-            .and_then(|models| models.iter().find(|entry| entry.model == model))
-        {
-            return capabilities
-                .supported_efforts
-                .iter()
-                .map(String::as_str)
-                .collect();
+        if let Some(ladder) = self.live_effort_ladder(provider, model) {
+            return ladder.iter().map(String::as_str).collect();
         }
         model_utils::effort_ladder(model).to_vec()
+    }
+
+    /// The ladder `provider`'s discovered catalog reported for `model`
+    /// (#2768: Claude `supportedEffortLevels`, Codex
+    /// `supportedReasoningEfforts`), or `None` when discovery did not describe
+    /// it and the compiled ladder applies.
+    pub(crate) fn live_effort_ladder(
+        &self,
+        provider: SessionProvider,
+        model: &str,
+    ) -> Option<&[String]> {
+        self.model_effort_capabilities
+            .get(&provider)?
+            .iter()
+            .find(|entry| entry.model == model)
+            .map(|entry| entry.supported_efforts.as_slice())
     }
 
     pub(crate) fn model_default_effort(

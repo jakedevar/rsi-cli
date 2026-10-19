@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 async fn fixture() -> (SessionManager, tempfile::TempDir, AnswerPendingDecisionV1) {
     let dir = crate::test_support::disk_backed_tempdir("remote-answer-delivery");
-    let store = Store::open(&dir.path().join("answers.db")).unwrap();
+    let store = Store::open_test_fixture(&dir.path().join("answers.db")).unwrap();
     let stamp = chrono::Utc::now();
     let project = Project {
         id: Uuid::new_v4(),
@@ -419,4 +419,24 @@ async fn remote_question_transient_retry_budget_is_bounded_and_permanent_refusal
         );
         assert_eq!(manager.reconcile_remote_answers_once().await.unwrap(), 0);
     }
+}
+
+/// #333: a whole-store aggregate read does not wait for the shared Store lock.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn usage_aggregate_reads_without_the_store_lock_333() {
+    let (manager, _dir, _request) = fixture().await;
+    let held = manager.store.lock().await;
+    let off_lock = tokio::time::timeout(
+        Duration::from_secs(20),
+        manager.read_aggregate_off_store_lock(|store| store.usage_stats(None)),
+    )
+    .await
+    .expect("the aggregate must not wait for the Store lock")
+    .unwrap();
+    let locked = held.usage_stats(None).unwrap();
+    assert_eq!(
+        serde_json::to_value(&off_lock).unwrap(),
+        serde_json::to_value(&locked).unwrap()
+    );
 }

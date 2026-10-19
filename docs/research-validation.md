@@ -22,6 +22,26 @@ Stdout is pretty-printed `Validation` JSON (`{ valid, errors[], schema_version,
 mode }`). Stderr carries one human-readable line per error:
 `Field <field> failed rule <rule>: <message>`.
 
+## Sidecars versus raw evidence (pre-commit hook)
+
+`thoughts/shared/research/` also holds raw measurement or evidence JSON (CPU/I/O
+captures and similar) that is not a research sidecar and has no sidecar schema.
+The pre-commit hook (`tools/git-hooks/pre-commit`, `is_research_sidecar`) runs
+`rsi-research-validate --strict` only on a staged `thoughts/shared/research/*.json`
+that is a sidecar, which is any of:
+
+- a name ending in `.research.json`;
+- a same-stem `.md` research doc beside it (`<doc>.md` + `<doc>.json`);
+- a file carrying the sidecar's `"research_question"` key (the schema marker).
+
+A name ending in `.evidence.json` or `.measurements.json` is always raw evidence
+and is never validated, even beside a same-stem `.md`. Any other JSON that matches
+none of the three markers is also treated as raw evidence. A malformed file that
+carries a sidecar marker is still rejected; the hook has no bypass. Name raw
+evidence `<topic>.evidence.json` or `<topic>.measurements.json` (or keep it as
+`.txt`) so the intent is explicit. Cases:
+`tools/test_pre_commit_research_sidecar.py`.
+
 ## Modes
 
 The default mode is **lenient** (resume-time tolerance for the historical

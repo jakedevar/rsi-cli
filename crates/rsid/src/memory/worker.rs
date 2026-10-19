@@ -1481,7 +1481,7 @@ mod tests {
         let main_db = dir.path().join("flywheel.db");
         // Create the main store so it exists on disk
         let main_store = Arc::new(tokio::sync::Mutex::new(
-            crate::store::Store::open(&main_db).unwrap(),
+            crate::store::Store::open_test_fixture(&main_db).unwrap(),
         ));
 
         let provider = Arc::new(EmbeddingProviderResult {
@@ -1821,7 +1821,8 @@ mod tests {
             Err(DaemonError::PolicyDenied(_))
         ));
         // Reopen the on-disk store: failure must remain durably retryable.
-        let mut reopened = crate::store::Store::open(&dir.path().join("flywheel.db")).unwrap();
+        let mut reopened =
+            crate::store::Store::open_test_fixture(&dir.path().join("flywheel.db")).unwrap();
         assert_eq!(
             reopened
                 .archive_cleanup_projection_consumer_state(
@@ -2217,7 +2218,7 @@ mod tests {
 
         let main_db = dir.path().join("flywheel.db");
         let main_store = Arc::new(tokio::sync::Mutex::new(
-            crate::store::Store::open(&main_db).unwrap(),
+            crate::store::Store::open_test_fixture(&main_db).unwrap(),
         ));
 
         let provider = Arc::new(EmbeddingProviderResult {

@@ -4,8 +4,14 @@
 //! - `:manager global` shows the active grant;
 //! - `:manager global appoint [project names...]` appoints the focused session
 //!   over the named projects (comma-separated, or space-separated single
-//!   words; default: every project), with the allowlist defaulting to the
-//!   operator's model directive and the PM policy to the Execute preset;
+//!   words). Replacing a seat keeps the active grant's projects, launches and
+//!   PM policy; named projects explicitly replace its coverage. After a revoke
+//!   the new grant is prefilled from the most recent revoked root grant over
+//!   the same coverage (#1902) and the notice shows the diff from defaults;
+//!   `--defaults` starts from the first-appointment defaults instead. A first
+//!   appointment defaults to every project and the Execute preset;
+//! - `:manager global prefill [project names...]` previews that prefill
+//!   without writing anything;
 //! - `:manager global add-project <names...>` adds named projects to the
 //!   active grant (the same CAS-fenced request as the one-key offer made when
 //!   an agent creates a project, #1626);
@@ -25,7 +31,10 @@ use rsi_common::harness_manager::HarnessManagerScopeModeV1;
 use rsi_common::harness_manager_presets::{
     ManagerPolicyOrigin, ManagerPolicyPreset, ManagerPresetContext, apply_manager_policy_preset,
 };
-use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+use rsi_common::harness_manager_v2::{ManagerCapabilityV2, ManagerLaunchChoiceV2, ManagerPolicyV2};
+use rsi_common::portfolio_nodes::{
+    PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS, PortfolioGrantPrefillV1, prefill_from_revoked_root,
+};
 use rsi_common::types::{Project, SessionProvider};
 use uuid::Uuid;
 
@@ -35,14 +44,14 @@ use crate::app::App;
 pub(crate) const CAP_CONFIRM_NOTICE: &str =
     "This lowers project caps: review the preview, y confirms, Esc cancels.";
 
-const USAGE: &str = "Use :manager global [appoint [project names...]|add-project <names...>|revoke|set <field> <value> [confirm]|configure <JSON>].";
+const USAGE: &str = "Use :manager global [appoint [--defaults] [project names...]|prefill [project names...]|add-project <names...>|revoke|set <field> <value> [confirm]|configure <JSON>].";
 const SET_USAGE: &str = "Use :manager global set <active|sessions|containers|spend|groups> <value> [confirm] (spend: USD or none; groups: on|off).";
 
 /// The caps of a grant's per-project policy the operator edits directly
 /// (#1401): the same fields the `:manager tree` editor and `:manager global
 /// set` change, with the bounds `ManagerPolicyV2::validate` enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapField {
+pub enum CapField {
     Active,
     Sessions,
     Containers,
@@ -83,7 +92,7 @@ impl CapField {
 
 /// The editable cap values of one policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct GrantCaps {
+pub struct GrantCaps {
     pub max_active_sessions: u16,
     pub max_created_sessions: u16,
     pub max_created_containers: u16,
@@ -288,7 +297,7 @@ fn grant_summary(grant: &GlobalManagerGrantV1, projects: &[Project]) -> String {
                 "{:?}/{}/{}",
                 launch.provider,
                 launch.model,
-                launch.effort.as_deref().unwrap_or("default")
+                launch.effort_label()
             )
         })
         .collect();
@@ -503,6 +512,116 @@ pub(crate) async fn dispatch_global_command(app: &mut App, command: &str) {
     app.mark_dirty();
 }
 
+/// Appended to the appoint notice when a revoked grant exists but none
+/// overlaps the new coverage (or `--defaults` was given).
+const DEFAULTS_NOTE: &str = ". Started from the first-appointment defaults (no revoked root grant over these projects was used); use `set` or `configure` to edit them.";
+
+/// #1902: the most recent revoked root grant over `project_ids`, or `None`
+/// (defaults). A listing failure is an error: silently falling back to the
+/// defaults is the trap this prefill closes.
+pub(crate) async fn revoked_prefill(
+    app: &mut App,
+    project_ids: &[Uuid],
+) -> Result<Option<PortfolioGrantPrefillV1>, String> {
+    let nodes = app
+        .client
+        .list_portfolio_nodes(true)
+        .await
+        .map_err(|error| format!("Global manager: could not read the revoked grants: {error}"))?;
+    Ok(prefill_from_revoked_root(&nodes, project_ids))
+}
+
+fn capability_name(capability: ManagerCapabilityV2) -> String {
+    serde_json::to_value(capability)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{capability:?}"))
+}
+
+/// The diff of a prefill from the first-appointment defaults, one line per
+/// changed facet; empty when it matches the defaults.
+pub(crate) fn prefill_diff(prefill: &PortfolioGrantPrefillV1) -> Vec<String> {
+    let default_policy = default_project_policy();
+    let default_launches = default_allowed_launches();
+    let mut lines = Vec::new();
+    let names = |from: &[ManagerCapabilityV2], not_in: &[ManagerCapabilityV2], sign: char| {
+        from.iter()
+            .filter(|capability| !not_in.contains(capability))
+            .map(|capability| format!("{sign}{}", capability_name(*capability)))
+            .collect::<Vec<_>>()
+    };
+    let mut capabilities = names(
+        &prefill.policy.capabilities,
+        &default_policy.capabilities,
+        '+',
+    );
+    capabilities.extend(names(
+        &default_policy.capabilities,
+        &prefill.policy.capabilities,
+        '-',
+    ));
+    if !capabilities.is_empty() {
+        lines.push(format!("capabilities {}", capabilities.join(" ")));
+    }
+    let added = prefill
+        .allowed_launches
+        .iter()
+        .filter(|launch| !default_launches.contains(launch))
+        .map(ManagerLaunchChoiceV2::display)
+        .collect::<Vec<_>>();
+    let dropped = default_launches
+        .iter()
+        .filter(|launch| !prefill.allowed_launches.contains(launch))
+        .count();
+    if !added.is_empty() || dropped > 0 {
+        lines.push(format!(
+            "launches +{} ({}) -{dropped}",
+            added.len(),
+            added.join(", ")
+        ));
+    }
+    let (new_caps, old_caps) = (
+        GrantCaps::from_policy(&prefill.policy),
+        GrantCaps::from_policy(&default_policy),
+    );
+    for field in CapField::ALL {
+        let (new, old) = (new_caps.describe(field), old_caps.describe(field));
+        if new != old {
+            lines.push(format!("{} {old} → {new}", field.label()));
+        }
+    }
+    if prefill.child_policy.is_some() {
+        lines.push("child policy kept".into());
+    }
+    if prefill.max_direct_reports != PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS {
+        lines.push(format!(
+            "direct reports {PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS} → {}",
+            prefill.max_direct_reports
+        ));
+    }
+    lines
+}
+
+/// "Prefilled from grant vN ..." plus the diff from defaults.
+pub(crate) fn prefill_summary(prefill: &PortfolioGrantPrefillV1) -> String {
+    let diff = prefill_diff(prefill);
+    format!(
+        "Prefilled from grant v{} of revoked node {} ({} coverage); {}",
+        prefill.source_grant_version,
+        &prefill.source_node_id.to_string()[..8],
+        if prefill.exact_coverage {
+            "same"
+        } else {
+            "overlapping"
+        },
+        if diff.is_empty() {
+            "no difference from defaults".to_string()
+        } else {
+            format!("differs from defaults: {}", diff.join("; "))
+        }
+    )
+}
+
 async fn active_version(app: &mut App) -> Result<Option<GlobalManagerGrantV1>, String> {
     app.client
         .get_global_manager()
@@ -570,25 +689,69 @@ async fn run_global_command(app: &mut App, command: &str) -> Result<String, Stri
     {
         return set_cap(app, raw).await;
     }
-    let Some(args) = command
-        .strip_prefix("appoint")
-        .filter(|rest| rest.is_empty() || rest.starts_with(' '))
-    else {
-        return Err(USAGE.into());
+    let word_rest = |word: &str| {
+        command
+            .strip_prefix(word)
+            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
     };
-    let session_id = app
-        .selected_session_id()
-        .ok_or_else(|| "Focus the session to appoint as the global manager.".to_string())?;
-    let project_ids = resolve_projects(&app.projects, args)?;
-    let expected_grant_version = active_version(app)
-        .await?
-        .map_or(0, |grant| grant.grant_version);
+    let (preview, args) = match (word_rest("prefill"), word_rest("appoint")) {
+        (Some(args), _) => (true, args),
+        (None, Some(args)) => (false, args),
+        (None, None) => return Err(USAGE.into()),
+    };
+    let session_id = if preview {
+        None
+    } else {
+        Some(
+            app.selected_session_id()
+                .ok_or_else(|| "Focus the session to appoint as the global manager.".to_string())?,
+        )
+    };
+    let current = active_version(app).await?;
+    // #1902: a revoked grant is carried forward as the prefill of the next
+    // one: the new grant starts from the most recent revoked root grant over
+    // the same coverage, not the first-appointment defaults. `--defaults`
+    // opts out.
+    let revoked = current
+        .as_ref()
+        .is_some_and(|grant| grant.state != "active");
+    let active = current.filter(|grant| grant.state == "active");
+    let use_defaults = args.split_whitespace().any(|word| word == "--defaults");
+    let args = args.replace("--defaults", "");
+    let project_ids = match &active {
+        Some(grant) if args.trim().is_empty() => grant.project_ids.clone(),
+        _ => resolve_projects(&app.projects, &args)?,
+    };
+    let prefill = if active.is_none() && revoked && !use_defaults {
+        revoked_prefill(app, &project_ids).await?
+    } else {
+        None
+    };
+    let Some(session_id) = session_id else {
+        if active.is_some() {
+            return Ok(
+                "A grant is active: appointing keeps its policy (nothing to prefill).".into(),
+            );
+        }
+        return Ok(prefill.as_ref().map_or_else(
+            || "No revoked root grant over these projects: an appointment starts from the defaults.".to_string(),
+            prefill_summary,
+        ));
+    };
     let request = ConfigureGlobalManagerRequestV1 {
         session_id,
         project_ids,
-        allowed_launches: default_allowed_launches(),
-        project_policy: default_project_policy(),
-        expected_grant_version,
+        allowed_launches: match (&active, &prefill) {
+            (Some(grant), _) => grant.allowed_launches.clone(),
+            (None, Some(prefill)) => prefill.allowed_launches.clone(),
+            (None, None) => default_allowed_launches(),
+        },
+        project_policy: match (&active, &prefill) {
+            (Some(grant), _) => grant.project_policy.clone(),
+            (None, Some(prefill)) => prefill.policy.clone(),
+            (None, None) => default_project_policy(),
+        },
+        expected_grant_version: active.as_ref().map_or(0, |grant| grant.grant_version),
         idempotency_key: Uuid::new_v4().to_string(),
     };
     let grant = match app.client.configure_global_manager(request.clone()).await {
@@ -610,10 +773,17 @@ async fn run_global_command(app: &mut App, command: &str) -> Result<String, Stri
             return Err(format!("Global manager: {error}"));
         }
     };
-    Ok(format!(
+    let mut notice = format!(
         "Global manager appointed: {}",
         grant_summary(&grant, &app.projects)
-    ))
+    );
+    if let Some(prefill) = &prefill {
+        notice.push_str(". ");
+        notice.push_str(&prefill_summary(prefill));
+    } else if revoked {
+        notice.push_str(DEFAULTS_NOTE);
+    }
+    Ok(notice)
 }
 
 #[cfg(test)]

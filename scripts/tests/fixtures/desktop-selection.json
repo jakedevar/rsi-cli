@@ -1,0 +1,297 @@
+{
+  "files": {
+    "Cargo.toml": "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2021\"\n[workspace.dependencies]\nshared = { path = \"crates/shared\" }\nserde = \"1\"\n",
+    "desktop/src-tauri/Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[workspace]\n[dependencies]\ndirect = { path = \"../../crates/direct\", optional = true }\n[dev-dependencies]\nkit = { path = \"../../crates/kit\" }\n[build-dependencies]\nbuild = { path = \"../../crates/build\" }\n[target.'cfg(windows)'.dependencies]\nwin = { path = \"../../crates/win\" }\n",
+    "crates/direct/Cargo.toml": "[package]\nname = \"direct\"\nversion = \"0.1.0\"\n[dependencies]\ndeep = { path = \"../deep\" }\nshared.workspace = true\nserde.workspace = true\n",
+    "crates/deep/Cargo.toml": "[package]\nname = \"deep\"\nversion = \"0.1.0\"\n[dependencies]\ndirect = { path = \"../direct\" }\n",
+    "README.md": "# readme\n",
+    "docs/other.md": "# doc\n",
+    "docs/keybindings.md": "# keys\n",
+    "desktop/src/app.ts": "// app\n",
+    "crates/rsi/src/ui/mod.rs": "// tui\n",
+    "crates/shared/Cargo.toml": "[package]\nname = \"shared\"\nversion = \"0.1.0\"\n",
+    "crates/kit/Cargo.toml": "[package]\nname = \"kit\"\nversion = \"0.1.0\"\n",
+    "crates/build/Cargo.toml": "[package]\nname = \"build\"\nversion = \"0.1.0\"\n",
+    "crates/win/Cargo.toml": "[package]\nname = \"win\"\nversion = \"0.1.0\"\n",
+    "crates/unrelated/Cargo.toml": "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\n",
+    "crates/direct/src/lib.rs": "// base\n",
+    "crates/deep/src/lib.rs": "// base\n",
+    "crates/shared/src/lib.rs": "// base\n",
+    "crates/kit/src/lib.rs": "// base\n",
+    "crates/build/src/lib.rs": "// base\n",
+    "crates/win/src/lib.rs": "// base\n",
+    "crates/unrelated/src/lib.rs": "// base\n"
+  },
+  "cases": [
+    {
+      "name": "root-workspace-dependency",
+      "path": "Cargo.toml",
+      "contents": "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2021\"\n[workspace.dependencies]\nshared = { path = \"crates/shared\" }\nserde = \"2\"\n",
+      "selector": "present",
+      "expected": "selected",
+      "overrides": {}
+    },
+    {
+      "name": "root-workspace-edition",
+      "path": "Cargo.toml",
+      "contents": "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2024\"\n[workspace.dependencies]\nshared = { path = \"crates/shared\" }\nserde = \"1\"\n",
+      "selector": "present",
+      "expected": "selected",
+      "overrides": {}
+    },
+    {
+      "name": "root-without-selector",
+      "path": "Cargo.toml",
+      "contents": "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nedition = \"2021\"\n[workspace.dependencies]\nshared = { path = \"crates/shared\" }\nserde = \"1\"\n\n# changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "desktop",
+      "path": "desktop/src/app.ts",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "keybindings",
+      "path": "docs/keybindings.md",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "tui",
+      "path": "crates/rsi/src/ui/mod.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "direct",
+      "path": "crates/direct/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "transitive-cycle",
+      "path": "crates/deep/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "workspace-inherited",
+      "path": "crates/shared/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "dev-optional",
+      "path": "crates/kit/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "build",
+      "path": "crates/build/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "target",
+      "path": "crates/win/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "readme-present",
+      "path": "README.md",
+      "contents": "// changed\n",
+      "selector": "present",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "docs-present",
+      "path": "docs/other.md",
+      "contents": "// changed\n",
+      "selector": "present",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "unrelated-present",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "present",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "readme-absent",
+      "path": "README.md",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "docs-absent",
+      "path": "docs/other.md",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "unrelated-absent",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "empty",
+      "overrides": {}
+    },
+    {
+      "name": "delete-selector",
+      "path": "scripts/desktop-test-gate.py",
+      "contents": null,
+      "selector": "delete",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "rename-selector",
+      "path": "scripts/desktop-test-gate.py",
+      "contents": null,
+      "selector": "rename",
+      "expected": "refused",
+      "overrides": {}
+    },
+    {
+      "name": "missing-dependency-manifest",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/deep/Cargo.toml": null
+      }
+    },
+    {
+      "name": "malformed-manifest",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "[broken"
+      }
+    },
+    {
+      "name": "unresolved-workspace-dependency",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "[dependencies]\nunknown.workspace = true\n"
+      }
+    },
+    {
+      "name": "external-dependency",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "[dependencies]\nexternal = { path = \"../../../external\" }\n"
+      }
+    },
+    {
+      "name": "explicit-workspace",
+      "path": "crates/shared/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "[package]\nname = \"direct\"\nversion = \"0.1.0\"\nworkspace = \"../..\"\n[dependencies]\ndeep = { path = \"../deep\" }\nshared.workspace = true\nserde.workspace = true\n"
+      }
+    },
+    {
+      "name": "nested-workspace",
+      "path": "crates/shared/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/Cargo.toml": "[workspace]\n[workspace.dependencies]\nshared = { path = \"shared\" }\nserde = \"1\"\n"
+      }
+    },
+    {
+      "name": "malformed-dependency-table",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "dependencies = 1\n"
+      }
+    },
+    {
+      "name": "malformed-target-table",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "crates/direct/Cargo.toml": "[target]\nwindows = 1\n"
+      }
+    },
+    {
+      "name": "no-desktop-manifest",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "empty",
+      "overrides": {
+        "desktop/src-tauri/Cargo.toml": null
+      }
+    },
+    {
+      "name": "patched-dependency",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "desktop/src-tauri/Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[workspace]\n[dependencies]\ndirect = { path = \"../../crates/direct\", optional = true }\n[dev-dependencies]\nkit = { path = \"../../crates/kit\" }\n[build-dependencies]\nbuild = { path = \"../../crates/build\" }\n[target.'cfg(windows)'.dependencies]\nwin = { path = \"../../crates/win\" }\n\n[patch.crates-io]\npatched = { path = \"../../crates/unrelated\" }\n"
+      }
+    },
+    {
+      "name": "replaced-dependency",
+      "path": "crates/unrelated/src/lib.rs",
+      "contents": "// changed\n",
+      "selector": "absent",
+      "expected": "refused",
+      "overrides": {
+        "desktop/src-tauri/Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[workspace]\n[dependencies]\ndirect = { path = \"../../crates/direct\", optional = true }\n[dev-dependencies]\nkit = { path = \"../../crates/kit\" }\n[build-dependencies]\nbuild = { path = \"../../crates/build\" }\n[target.'cfg(windows)'.dependencies]\nwin = { path = \"../../crates/win\" }\n\n[replace]\n\"patched:0.1.0\" = { path = \"../../crates/unrelated\" }\n"
+      }
+    }
+  ]
+}

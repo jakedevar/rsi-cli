@@ -5,7 +5,7 @@ use super::types::{
 };
 use crate::error::{DaemonError, Result};
 use crate::profiling;
-use crate::store::Store;
+use crate::store::{SessionWriteStamp, Store};
 use rsi_common::types::{
     Project, SandboxCleanupState, Session, SessionKind, SessionStatus, TurnMetric, WorkflowStage,
 };
@@ -210,6 +210,14 @@ impl PersistenceHandle {
             .await
     }
 
+    /// The monitor's start-of-turn `Running` write (#277): queued like any
+    /// status write, but a row another writer ended in the meantime keeps its
+    /// terminal status (`Store::mark_session_running_unless_ended`).
+    pub(super) async fn mark_running(&self, session_id: Uuid) -> Result<()> {
+        self.send(StoreCommand::MarkSessionRunning { session_id })
+            .await
+    }
+
     /// Persist a terminal status with its cause atomically (#588).
     pub(super) async fn update_terminal_status(
         &self,
@@ -295,18 +303,6 @@ impl PersistenceHandle {
                 source: DaemonError::ChannelClosed,
             },
         )?
-    }
-
-    pub(super) async fn update_pending_question_json(
-        &self,
-        session_id: Uuid,
-        pending_question_json: Option<String>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdatePendingQuestion {
-            session_id,
-            pending_question_json,
-        })
-        .await
     }
 
     pub(super) async fn insert_snapshot(&self, session_id: Uuid, tokens: u64) -> Result<()> {
@@ -417,30 +413,52 @@ impl PersistenceHandle {
         .await
     }
 
+    /// Send one session-metadata write and wait for the `updated_at` stamp it
+    /// wrote (#257). A failed write is logged by the writer task and answers
+    /// `None`, so callers keep their fire-and-forget error behaviour.
+    async fn send_stamped(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Option<SessionWriteStamp>>) -> StoreCommand,
+    ) -> Result<Option<SessionWriteStamp>> {
+        let (respond_to, rx) = oneshot::channel();
+        self.send(command(respond_to)).await?;
+        rx.await.map_err(|_| DaemonError::ChannelClosed)
+    }
+
     pub(super) async fn update_session_project(
         &self,
         session_id: Uuid,
         project_id: Option<Uuid>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionProject {
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionProject {
             session_id,
             project_id,
+            respond_to,
         })
         .await
     }
 
-    pub(super) async fn update_session_title(&self, session_id: Uuid, title: String) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionTitle { session_id, title })
-            .await
+    pub(super) async fn update_session_title(
+        &self,
+        session_id: Uuid,
+        title: String,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionTitle {
+            session_id,
+            title,
+            respond_to,
+        })
+        .await
     }
 
     /// Await the outcome of a generated-title fill so the caller learns whether
-    /// it supplied the title or an explicit one was already present.
+    /// it supplied the title (`Some` stamp) or an explicit one was already
+    /// present (`None`).
     pub(super) async fn fill_session_title_if_absent(
         &self,
         session_id: Uuid,
         title: String,
-    ) -> Result<bool> {
+    ) -> Result<Option<SessionWriteStamp>> {
         let (respond_to, rx) = oneshot::channel();
         self.send(StoreCommand::FillSessionTitleIfAbsent {
             session_id,
@@ -455,10 +473,11 @@ impl PersistenceHandle {
         &self,
         session_id: Uuid,
         description: String,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionDescription {
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionDescription {
             session_id,
             description,
+            respond_to,
         })
         .await
     }
@@ -467,19 +486,24 @@ impl PersistenceHandle {
         &self,
         session_id: Uuid,
         rating: Option<i16>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionRating { session_id, rating })
-            .await
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionRating {
+            session_id,
+            rating,
+            respond_to,
+        })
+        .await
     }
 
     pub(super) async fn update_session_active_task(
         &self,
         session_id: Uuid,
         active_task: Option<String>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionActiveTask {
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionActiveTask {
             session_id,
             active_task,
+            respond_to,
         })
         .await
     }
@@ -606,10 +630,11 @@ impl PersistenceHandle {
         &self,
         session_id: Uuid,
         workflow_id: Option<Uuid>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionWorkflow {
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionWorkflow {
             session_id,
             workflow_id,
+            respond_to,
         })
         .await
     }
@@ -668,10 +693,11 @@ impl PersistenceHandle {
         &self,
         session_id: Uuid,
         group_id: Option<Uuid>,
-    ) -> Result<()> {
-        self.send(StoreCommand::UpdateSessionLabel {
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.send_stamped(|respond_to| StoreCommand::UpdateSessionLabel {
             session_id,
             group_id,
+            respond_to,
         })
         .await
     }
@@ -758,15 +784,6 @@ impl PersistenceHandle {
         state: Option<SandboxCleanupState>,
     ) -> Result<()> {
         self.send(StoreCommand::UpdateSandboxCleanupState { session_id, state })
-            .await
-    }
-
-    /// Atomically tombstone the sandbox metadata after a successful destroy:
-    /// clears `sandbox_root`/`sandbox_branch` and stamps
-    /// `sandbox_cleanup_state = 'Purged'` in a single UPDATE. Prevents future
-    /// readers from picking up a stale on-disk path whose worktree is gone.
-    pub(super) async fn mark_sandbox_purged(&self, session_id: Uuid) -> Result<()> {
-        self.send(StoreCommand::MarkSandboxPurged { session_id })
             .await
     }
 }
@@ -873,6 +890,24 @@ fn spawn_persistence_worker(
                             session_id = %session_id,
                             "Failed to update session status"
                         );
+                    }
+                }
+                StoreCommand::MarkSessionRunning { session_id } => {
+                    match run_store_op(store.clone(), move |s| {
+                        s.mark_session_running_unless_ended(session_id)
+                    })
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::info!(
+                            session_id = %session_id,
+                            "Session ended before its monitor's Running write; kept its status (#277)"
+                        ),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            session_id = %session_id,
+                            "Failed to mark session running"
+                        ),
                     }
                 }
                 StoreCommand::UpdateTerminalSessionStatus {
@@ -1012,31 +1047,32 @@ fn spawn_persistence_worker(
                 StoreCommand::UpdateSessionProject {
                     session_id,
                     project_id,
+                    respond_to,
                 } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_project(session_id, project_id)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to update session project"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to update session project",
+                    ));
                 }
-                StoreCommand::UpdateSessionTitle { session_id, title } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                StoreCommand::UpdateSessionTitle {
+                    session_id,
+                    title,
+                    respond_to,
+                } => {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_title(session_id, &title)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to persist session title"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to persist session title",
+                    ));
                 }
                 StoreCommand::FillSessionTitleIfAbsent {
                     session_id,
@@ -1044,7 +1080,7 @@ fn spawn_persistence_worker(
                     respond_to,
                 } => {
                     let res = run_store_op(store.clone(), move |s| {
-                        s.fill_session_title_if_absent(session_id, &title)
+                        s.fill_session_title_if_absent_stamped(session_id, &title)
                     })
                     .await;
                     let _ = respond_to.send(res);
@@ -1052,47 +1088,47 @@ fn spawn_persistence_worker(
                 StoreCommand::UpdateSessionDescription {
                     session_id,
                     description,
+                    respond_to,
                 } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_description(session_id, &description)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to persist session description"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to persist session description",
+                    ));
                 }
-                StoreCommand::UpdateSessionRating { session_id, rating } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                StoreCommand::UpdateSessionRating {
+                    session_id,
+                    rating,
+                    respond_to,
+                } => {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_rating(session_id, rating)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to persist session rating"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to persist session rating",
+                    ));
                 }
                 StoreCommand::UpdateSessionActiveTask {
                     session_id,
                     active_task,
+                    respond_to,
                 } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_active_task(session_id, active_task.as_deref())
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to persist session active_task"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to persist session active_task",
+                    ));
                 }
                 StoreCommand::DeleteSession {
                     session_id,
@@ -1207,18 +1243,17 @@ fn spawn_persistence_worker(
                 StoreCommand::UpdateSessionWorkflow {
                     session_id,
                     workflow_id,
+                    respond_to,
                 } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_workflow(session_id, workflow_id)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            error = %e,
-                            "Failed to update session workflow_id"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to update session workflow_id",
+                    ));
                 }
                 StoreCommand::InsertRotationEvent {
                     session_id,
@@ -1286,18 +1321,17 @@ fn spawn_persistence_worker(
                 StoreCommand::UpdateSessionLabel {
                     session_id,
                     group_id,
+                    respond_to,
                 } => {
-                    if let Err(e) = run_store_op(store.clone(), move |s| {
+                    let result = run_store_op(store.clone(), move |s| {
                         s.update_session_label(session_id, group_id)
                     })
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            session_id = %session_id,
-                            "Failed to update session label"
-                        );
-                    }
+                    .await;
+                    let _ = respond_to.send(stamp_or_warn(
+                        result,
+                        session_id,
+                        "Failed to update session label",
+                    ));
                 }
                 StoreCommand::UpdatePendingArchive {
                     session_id,
@@ -1426,10 +1460,32 @@ fn spawn_persistence_worker(
             let elapsed_ms = start.elapsed().as_millis() as u64;
             last_command_duration_ms.store(elapsed_ms, Ordering::Relaxed);
             if elapsed_ms >= 100 {
-                tracing::warn!(elapsed_ms, "persistence worker: slow command detected");
+                let holder = crate::store_lock::contention_since(start);
+                tracing::warn!(
+                    elapsed_ms,
+                    lock_holder = holder.map_or("none", |holder| holder.label),
+                    lock_holder_held_ms = holder.map_or(0, |holder| holder.held_ms),
+                    "persistence worker: slow command detected"
+                );
             }
         }
     });
+}
+
+/// The stamp a session-metadata write answers with (#257): its own stamp, or
+/// `None` after logging the failure the fire-and-forget arm used to log.
+fn stamp_or_warn(
+    result: Result<Option<SessionWriteStamp>>,
+    session_id: Uuid,
+    failure: &'static str,
+) -> Option<SessionWriteStamp> {
+    match result {
+        Ok(stamp) => stamp,
+        Err(e) => {
+            tracing::warn!(error = %e, session_id = %session_id, "{failure}");
+            None
+        }
+    }
 }
 
 pub(super) async fn run_store_op<F, T>(store: Arc<tokio::sync::Mutex<Store>>, op: F) -> Result<T>
@@ -1438,8 +1494,7 @@ where
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut guard = store.blocking_lock();
-        op(&mut guard)
+        crate::store_lock::run_timed_blocking(&store, "persistence::run_store_op", op)
     })
     .await
     .map_err(|e| DaemonError::Process(format!("Store worker join error: {}", e)))?
@@ -1454,7 +1509,7 @@ where
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut guard = store.blocking_lock();
+        let mut guard = crate::store_lock::blocking_lock(&store, "persistence::run_c5_store_op");
         op(&mut guard)
     })
     .await
@@ -1599,7 +1654,8 @@ mod tests {
     async fn store_with_session() -> (Arc<tokio::sync::Mutex<Store>>, tempfile::TempDir, Session) {
         let dir = tempfile::tempdir().expect("create persistence test directory");
         let store = Arc::new(tokio::sync::Mutex::new(
-            Store::open(&dir.path().join("rsi.db")).expect("open persistence test store"),
+            Store::open_test_fixture(&dir.path().join("rsi.db"))
+                .expect("open persistence test store"),
         ));
         let session = test_session(Uuid::new_v4());
         store
@@ -1657,6 +1713,72 @@ mod tests {
             .insert_project(project)
             .await
             .expect_err("duplicate project insertion must report the store failure");
+    }
+
+    /// #277: the monitor's start-of-turn `Running` write is queued. When a
+    /// writer that goes straight to the Store ends the session before the
+    /// queue applies it, the row keeps that end state; a new turn, which
+    /// writes `Starting` through the same queue first, still becomes `Running`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn queued_running_write_keeps_an_ended_status_and_a_new_turn_still_runs() {
+        let (store, _dir, session) = store_with_session().await;
+        let ended = [
+            SessionStatus::Completed,
+            SessionStatus::Failed,
+            SessionStatus::Interrupted,
+            SessionStatus::Archived,
+            SessionStatus::Deleted,
+        ];
+        let (tx, rx) = mpsc::channel(16);
+        let handle = PersistenceHandle {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            last_command_duration_ms: Arc::new(AtomicU64::new(0)),
+            capacity: 16,
+        };
+        // No worker yet, so the monitor's write waits in the queue while the
+        // session ends through the Store directly.
+        handle.mark_running(session.id).await.unwrap();
+        store
+            .lock()
+            .await
+            .update_session_status(session.id, SessionStatus::Completed)
+            .unwrap();
+        spawn_persistence_worker(
+            store.clone(),
+            rx,
+            handle.pending.clone(),
+            handle.last_command_duration_ms.clone(),
+        );
+        handle.barrier().await.unwrap();
+        let status = |store: &Store| store.get_session(session.id).unwrap().unwrap().status;
+        assert_eq!(status(&*store.lock().await), SessionStatus::Completed);
+
+        for end in ended {
+            store
+                .lock()
+                .await
+                .conn
+                .execute(
+                    "UPDATE sessions SET status=?2 WHERE id=?1",
+                    rusqlite::params![session.id.to_string(), format!("{end:?}")],
+                )
+                .unwrap();
+            handle.mark_running(session.id).await.unwrap();
+            handle.barrier().await.unwrap();
+            assert_eq!(status(&*store.lock().await), end);
+        }
+
+        // A new turn (launch, continue, rotation) writes Starting first, and
+        // the monitor's write then moves the row to Running as before.
+        handle
+            .update_status(session.id, SessionStatus::Starting)
+            .await
+            .unwrap();
+        handle.mark_running(session.id).await.unwrap();
+        handle.barrier().await.unwrap();
+        assert_eq!(status(&*store.lock().await), SessionStatus::Running);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -1910,7 +2032,7 @@ mod tests {
         let original = test_session(Uuid::new_v4());
         let runtime = context_budget(258_400, CapabilitySource::RuntimeTelemetry);
         {
-            let store = Store::open(&database).expect("open initial store");
+            let store = Store::open_test_fixture(&database).expect("open initial store");
             store.insert_session(&original).expect("insert session");
             assert!(
                 store
@@ -1947,7 +2069,7 @@ mod tests {
         let mut runtime = context_budget(380_000, CapabilitySource::RuntimeTelemetry);
         runtime.capacity.configured_tokens = Some(400_000);
         {
-            let store = Store::open(&database).expect("open initial store");
+            let store = Store::open_test_fixture(&database).expect("open initial store");
             store.insert_session(&original).expect("insert session");
             assert!(
                 store

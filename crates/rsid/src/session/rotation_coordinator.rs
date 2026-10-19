@@ -31,26 +31,19 @@ pub(crate) enum RotationState {
 #[derive(Debug)]
 pub(super) enum RotationEvent {
     /// Token usage updated.
-    ThresholdCheck {
-        pct: f64,
-    },
-    ThresholdCheckConfigured {
-        pct: f64,
-        threshold_pct: f64,
-    },
+    #[cfg(test)]
+    ThresholdCheck { pct: f64 },
+    #[cfg(test)]
+    ThresholdCheckConfigured { pct: f64, threshold_pct: f64 },
     /// User explicitly requested manual rotation.
     /// This bypasses auto-rotation enablement.
     ManualTrigger,
     /// A handoff filepath was detected in Write tool_use or assistant text.
-    HandoffFileDetected {
-        path: String,
-    },
+    HandoffFileDetected { path: String },
     /// The current rotation phase deadline elapsed.
     DeadlineElapsed,
     /// The monitor loop exited.
-    MonitorCompleted {
-        break_reason: MonitorBreakReason,
-    },
+    MonitorCompleted { break_reason: MonitorBreakReason },
 }
 
 /// Actions the monitor loop must execute in response to a coordinator decision.
@@ -208,6 +201,7 @@ impl RotationCoordinator {
     pub(super) fn advance(&mut self, event: RotationEvent) -> RotationAction {
         match (&self.state, event) {
             // ── Threshold check ──
+            #[cfg(test)]
             (
                 RotationState::Idle,
                 RotationEvent::ThresholdCheckConfigured { pct, threshold_pct },
@@ -221,6 +215,7 @@ impl RotationCoordinator {
                 }
             }
 
+            #[cfg(test)]
             (RotationState::Idle, RotationEvent::ThresholdCheck { pct }) if self.enabled => self
                 .advance(RotationEvent::ThresholdCheckConfigured {
                     pct,

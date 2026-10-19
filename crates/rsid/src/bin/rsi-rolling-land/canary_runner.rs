@@ -391,6 +391,7 @@ impl LanderCanaryGate {
             tmpfs_min_free_gb: TMPFS_MIN_FREE_GB,
             disk_scratch_shards: BTreeSet::new(),
             expected_tip: None,
+            fixes_tests: Vec::new(),
         }
     }
 

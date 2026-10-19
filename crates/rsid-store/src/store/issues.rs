@@ -15,7 +15,7 @@ use super::daemon_settings::{
 use super::row_mappers::parse_timestamp;
 use crate::error::{
     DaemonError, Result, agent_issue_bound_field_not_allowed, agent_issue_error,
-    issue_workspace_error,
+    agent_issue_invalid_request, issue_workspace_error,
 };
 use chrono::{SecondsFormat, Utc};
 use rsi_common::issue_workspace::{
@@ -25,9 +25,10 @@ use rsi_common::issue_workspace::{
     IssueWorkspaceCursorV1, IssueWorkspaceErrorCodeV1, IssueWorkspacePageV1,
     IssueWorkspaceProvenanceV1, IssueWorkspaceReadinessFilterV1, IssueWorkspaceReadinessV1,
     IssueWorkspaceRowV1, IssueWorkspaceSortV1, ListIssueDependenciesRequestV1,
-    ListIssueEventsV2RequestV1, ListIssuesPageRequestV1, NullablePatchV1,
-    OperatorIssueMutationResultV1, PageDirectionV1, RestoreIssueRequestV1, UpdateIssueRequestV1,
-    UpdateIssueStatusV2RequestV1, operator_issue_create_id, operator_issue_mutation_event_id,
+    ListIssueEventsV2RequestV1, ListIssueHandoffsRequestV1, ListIssueHandoffsResultV1,
+    ListIssuesPageRequestV1, NullablePatchV1, OperatorIssueMutationResultV1, PageDirectionV1,
+    RestoreIssueRequestV1, UpdateIssueRequestV1, UpdateIssueStatusV2RequestV1,
+    operator_issue_create_id, operator_issue_mutation_event_id,
 };
 use rsi_common::program_runs::canonical_program_run_json;
 use rsi_common::rpc::{
@@ -36,15 +37,25 @@ use rsi_common::rpc::{
     AgentUpdateIssueStatusRequestV1,
 };
 use rsi_common::types::{
-    AgentGetIssueResultV1, AgentIssueDependencyRefV1, Issue, IssueActorKindV1,
-    IssueArchiveFilterV1, IssueContentPatchV1, IssueCreateSemanticV1, IssueDep,
-    IssueEventOperationV1, IssueEventPageRequestV1, IssueEventPageV1, IssueEventV1, IssueFilter,
-    IssueListCursorV1, IssuePageV1, IssueSemanticOperationV1, IssueSemanticRequestV1,
-    IssueSourceFindingRef, IssueStatus, IssueStatusTransitionErrorV1, IssueUpdate, NewIssue,
-    Recurrence, ScheduledJob, WakeMode,
+    AgentGetIssueResultV1, AgentIssueDependencyRefV1, AgentIssuePageV1, AgentIssueSummaryPageV1,
+    AgentIssueSummaryV1, Issue, IssueActorKindV1, IssueArchiveFilterV1, IssueContentPatchV1,
+    IssueCreateSemanticV1, IssueDep, IssueEventOperationV1, IssueEventPageRequestV1,
+    IssueEventPageV1, IssueEventV1, IssueFilter, IssueListCursorV1, IssuePageV1,
+    IssueSemanticOperationV1, IssueSemanticRequestV1, IssueSourceFindingRef, IssueStatus,
+    IssueStatusTransitionErrorV1, IssueUpdate, NewIssue, Recurrence, ScheduledJob, WakeMode,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
+
+/// #2679: the durable caller/key -> Issue record of a title dedupe, stored as
+/// the `daemon_settings` value `agent_issue_dedupe:v1:<caller>:<key>` in the
+/// transaction that deduped. `fingerprint` is the create request's semantic
+/// fingerprint, so a changed payload under the key is a conflict.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AgentIssueDedupeReceipt {
+    issue_id: Uuid,
+    fingerprint: String,
+}
 
 /// Result of deterministic issue creation. The existing row is returned on a
 /// replay; callers decide whether a mismatched replay is a conflict.
@@ -120,7 +131,18 @@ thread_local! {
     static ISSUE_WRITE_FAULT: std::cell::Cell<Option<IssueWriteFault>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+/// #2677: the comparison key of an Issue title for duplicate detection:
+/// lowercase alphanumeric words joined by one space.
+fn equivalent_title_key(title: &str) -> String {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
 pub(crate) fn fail_next_issue_write(fault: IssueWriteFault) {
     ISSUE_WRITE_FAULT.with(|armed| armed.set(Some(fault)));
 }
@@ -432,6 +454,30 @@ pub(crate) struct AgentIssueAuthority {
     pub caller_session_id: Uuid,
     pub project_id: Uuid,
     pub(super) actor: AgentIssueActor,
+}
+
+/// #2391: whether `text` holds the token `#<number>`: a `#` not glued to a
+/// preceding word character, then exactly the digits of `number` and no more
+/// digits or word characters (`#2307`, `(#2307)` and `#2307.` match;
+/// `#23070`, `a#2307` and `#2307x` do not).
+fn text_cites_issue_number(text: &str, number: i64) -> bool {
+    let digits = number.to_string();
+    let bytes = text.as_bytes();
+    let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('#') {
+        let hash = from + offset;
+        let start = hash + 1;
+        let end = start + digits.len();
+        if (hash == 0 || !word(bytes[hash - 1]))
+            && text[start..].starts_with(&digits)
+            && bytes.get(end).is_none_or(|byte| !word(*byte))
+        {
+            return true;
+        }
+        from = start;
+    }
+    false
 }
 
 fn canonical_timestamp(timestamp: chrono::DateTime<Utc>) -> String {
@@ -2304,6 +2350,7 @@ impl Store {
     /// Create an issue at a caller-supplied deterministic UUID. This is the
     /// durable idempotency primitive for C5; operator `create_issue` remains
     /// intentionally UUIDv4-backed above.
+    #[cfg(test)]
     pub(crate) fn create_issue_idempotent(
         &self,
         id: Uuid,
@@ -2326,6 +2373,7 @@ impl Store {
     /// Attributed creation rechecks the server-bound Session project in the
     /// same transaction as deterministic UUID replay. A caller cannot retain
     /// a stale project snapshot across a Session reassignment.
+    #[cfg(test)]
     pub(crate) fn create_agent_issue_idempotent(
         &self,
         caller_session_id: Uuid,
@@ -2342,7 +2390,14 @@ impl Store {
         new: &NewIssue,
         idempotency_key: &str,
     ) -> Result<IdempotentIssueCreate> {
-        self.create_agent_issue_idempotent_inner(caller_session_id, id, new, idempotency_key, false)
+        self.create_agent_issue_idempotent_inner(
+            caller_session_id,
+            id,
+            new,
+            idempotency_key,
+            false,
+            false,
+        )
     }
 
     /// The authenticated creator's original create receipt, never the current
@@ -2387,18 +2442,141 @@ impl Store {
         new: &NewIssue,
         idempotency_key: &str,
     ) -> Result<IdempotentIssueCreate> {
-        self.create_agent_issue_idempotent_inner(caller_session_id, id, new, idempotency_key, true)
+        self.create_agent_issue_idempotent_inner(
+            caller_session_id,
+            id,
+            new,
+            idempotency_key,
+            true,
+            false,
+        )
     }
 
-    fn create_agent_issue_idempotent_inner(
+    /// #2677/#2678/#2679: `create_agent_issue_idempotent_with_key` for a caller
+    /// that files review findings (an active reviewer or a live topology node). One
+    /// finding becomes one Issue: an open Issue of the target project with an
+    /// equivalent title is returned instead of a second one. The target
+    /// project is authorized first, in the same transaction, so a dedupe never
+    /// reads an Issue outside the caller's grant; and the dedupe is recorded as
+    /// a durable caller/key -> Issue receipt with the request fingerprint in
+    /// that transaction, so a replay returns the same Issue (whatever became of
+    /// it) and a changed payload under the key is `create_fields_match: false`.
+    pub fn create_agent_issue_idempotent_with_title_dedupe(
         &self,
         caller_session_id: Uuid,
         id: Uuid,
         new: &NewIssue,
         idempotency_key: &str,
-        harness_target: bool,
     ) -> Result<IdempotentIssueCreate> {
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.create_agent_issue_idempotent_inner(
+            caller_session_id,
+            id,
+            new,
+            idempotency_key,
+            false,
+            true,
+        )
+    }
+
+    /// The recorded-dedupe half of the title dedupe (#2686): the caller/key ->
+    /// Issue receipt a successful title dedupe saved (#2679). It is resolved on
+    /// EVERY create route (ordinary, harness, title-dedupe), after the project
+    /// fence, so a key that deduplicated in one project is first-write-wins on
+    /// a later filing under the same key into another (a changed payload is
+    /// `create_fields_match: false`, never a second Issue). `None` means no
+    /// receipt exists for the caller/key.
+    fn agent_issue_dedupe_receipt_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        id: Uuid,
+        new: &NewIssue,
+        idempotency_key: &str,
+    ) -> Result<Option<IdempotentIssueCreate>> {
+        let setting_key = format!("agent_issue_dedupe:v1:{caller_session_id}:{idempotency_key}");
+        // A recorded dedupe wins over everything else, including a review
+        // authority that has since ended and an Issue that was closed.
+        let recorded: Option<String> = tx
+            .query_row(
+                "SELECT value FROM daemon_settings WHERE key=?1",
+                params![setting_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = recorded {
+            let fingerprint = issue_create_semantic_request(id, new)
+                .fingerprint()
+                .map_err(DaemonError::InvalidParam)?;
+            let receipt: AgentIssueDedupeReceipt = serde_json::from_str(&raw)
+                .map_err(|e| DaemonError::Store(format!("Invalid Issue dedupe receipt: {e}")))?;
+            let issue = Self::get_issue_tx(tx, receipt.issue_id)?.ok_or_else(|| {
+                DaemonError::Store(format!(
+                    "Issue dedupe receipt names a missing Issue {}",
+                    receipt.issue_id
+                ))
+            })?;
+            return Ok(Some(IdempotentIssueCreate {
+                issue,
+                deduplicated: true,
+                create_fields_match: receipt.fingerprint == fingerprint,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// The fresh-lookup half of [`Self::create_agent_issue_idempotent_with_title_dedupe`],
+    /// run after the project fence and after [`Self::agent_issue_dedupe_receipt_tx`]
+    /// found no receipt. `None` means "create as usual".
+    fn agent_issue_title_dedupe_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        id: Uuid,
+        new: &NewIssue,
+        idempotency_key: &str,
+    ) -> Result<Option<IdempotentIssueCreate>> {
+        let setting_key = format!("agent_issue_dedupe:v1:{caller_session_id}:{idempotency_key}");
+        let fingerprint = issue_create_semantic_request(id, new)
+            .fingerprint()
+            .map_err(DaemonError::InvalidParam)?;
+        // A key that already created its Issue keeps the create replay path.
+        if Self::get_issue_tx(tx, id)?.is_some()
+            || (Self::live_review_assignment_project_on(tx, caller_session_id)?.is_none()
+                && Self::live_topology_node_project_on(tx, caller_session_id)?.is_none())
+        {
+            return Ok(None);
+        }
+        let Some(existing) =
+            Self::find_open_issue_with_equivalent_title(tx, new.project_id, &new.title, id)?
+        else {
+            return Ok(None);
+        };
+        let value = serde_json::to_string(&AgentIssueDedupeReceipt {
+            issue_id: existing.id,
+            fingerprint,
+        })
+        .map_err(|e| DaemonError::Store(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO daemon_settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![setting_key, value, now_nanos()],
+        )?;
+        Ok(Some(IdempotentIssueCreate {
+            issue: existing,
+            deduplicated: true,
+            create_fields_match: true,
+        }))
+    }
+
+    /// The project-authority fence of an attributed Issue create: the creator
+    /// is the authenticated caller and a project other than its own needs the
+    /// active global seat whose grant covers it (#1235), or is the harness
+    /// project for a create-only harness filing (#1389). Every read of an
+    /// existing Issue on the create path (a title dedupe, #2678) goes behind
+    /// this same check in the same transaction.
+    fn agent_issue_project_fence_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        new: &NewIssue,
+        harness_target: bool,
+    ) -> Result<()> {
         let project_id: Option<String> = tx
             .query_row(
                 "SELECT s.project_id FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
@@ -2422,7 +2600,7 @@ impl Store {
             if !project_exists
                 || (!harness_target
                     && super::harness_manager_v2::global_issue_authority_on(
-                        &tx,
+                        tx,
                         caller_session_id,
                         new.project_id,
                         true,
@@ -2433,6 +2611,38 @@ impl Store {
                     rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE.into(),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn create_agent_issue_idempotent_inner(
+        &self,
+        caller_session_id: Uuid,
+        id: Uuid,
+        new: &NewIssue,
+        idempotency_key: &str,
+        harness_target: bool,
+        title_dedupe: bool,
+    ) -> Result<IdempotentIssueCreate> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::agent_issue_project_fence_tx(&tx, caller_session_id, new, harness_target)?;
+        let deduped = match Self::agent_issue_dedupe_receipt_tx(
+            &tx,
+            caller_session_id,
+            id,
+            new,
+            idempotency_key,
+        )? {
+            Some(outcome) => Some(outcome),
+            None if title_dedupe => {
+                Self::agent_issue_title_dedupe_tx(&tx, caller_session_id, id, new, idempotency_key)?
+            }
+            None => None,
+        };
+        if let Some(outcome) = deduped {
+            issue_write_before_commit()?;
+            tx.commit()?;
+            return Ok(outcome);
         }
         let outcome = Self::idempotent_issue_in_tx(
             &tx,
@@ -2709,6 +2919,73 @@ impl Store {
         })
     }
 
+    /// #2167: the Issue of `project_id` with `display_number`, if any.
+    pub fn get_issue_by_display_number(
+        &self,
+        project_id: Uuid,
+        display_number: i64,
+    ) -> Result<Option<Issue>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM issues WHERE project_id=?1 AND display_number=?2",
+                params![project_id.to_string(), display_number],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.get_issue(
+                Uuid::parse_str(&id)
+                    .map_err(|error| DaemonError::Store(format!("Invalid Issue id: {error}")))?,
+            ),
+            None => Ok(None),
+        }
+    }
+
+    /// #2677: the oldest open (`Open`/`InProgress`, not archived) Issue of
+    /// `project_id` other than `exclude` whose title equals `title` once case,
+    /// punctuation and spacing are ignored. One finding becomes one Issue: the
+    /// review reporter that files a finding the topology also files finds the
+    /// existing number instead of a second Issue.
+    fn find_open_issue_with_equivalent_title(
+        conn: &rusqlite::Connection,
+        project_id: Uuid,
+        title: &str,
+        exclude: Uuid,
+    ) -> Result<Option<Issue>> {
+        let wanted = equivalent_title_key(title);
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, title FROM issues \
+             WHERE project_id=?1 AND status IN ('Open','InProgress') AND archived_at IS NULL \
+               AND id<>?2 \
+             ORDER BY display_number ASC LIMIT 2000",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![project_id.to_string(), exclude.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, candidate) in rows {
+            if equivalent_title_key(&candidate) == wanted {
+                let id = Uuid::parse_str(&id)
+                    .map_err(|error| DaemonError::Store(format!("Invalid Issue id: {error}")))?;
+                let mut stmt =
+                    conn.prepare(&format!("SELECT {ISSUE_COLUMNS} FROM issues WHERE id = ?1"))?;
+                let mut rows = stmt.query_map(params![id.to_string()], map_issue_row)?;
+                return match rows.next() {
+                    Some(Ok(row)) => Ok(Some(row.into_issue()?)),
+                    Some(Err(e)) => Err(DaemonError::Database(e)),
+                    None => Ok(None),
+                };
+            }
+        }
+        Ok(None)
+    }
+
     /// Get an issue by ID.
     pub fn get_issue(&self, id: Uuid) -> Result<Option<Issue>> {
         let mut stmt = self
@@ -2857,6 +3134,17 @@ impl Store {
                 "EXISTS(SELECT 1 FROM json_each(i.labels) label WHERE label.value={bind})"
             ));
         }
+        if !request.labels_any.is_empty() {
+            let binds = request
+                .labels_any
+                .iter()
+                .map(|label| bind_value(&mut values, label.clone()))
+                .collect::<Vec<_>>()
+                .join(",");
+            clauses.push(format!(
+                "EXISTS(SELECT 1 FROM json_each(i.labels) label WHERE label.value IN ({binds}))"
+            ));
+        }
         if !request.provenance.is_empty() {
             let operator = bind_value(
                 &mut values,
@@ -2898,8 +3186,38 @@ impl Store {
             ));
         }
         if let Some(query) = &request.query {
-            let bind = bind_value(&mut values, format!("%{query}%"));
-            clauses.push(format!("(i.title LIKE {bind} OR i.body LIKE {bind})"));
+            // #2381: the search covers the number, title, labels and body.
+            // `#2377` names that Issue alone; a bare `2377` also finds text
+            // that mentions it.
+            let trimmed = query.trim();
+            let (exact_number, digits) = match trimmed.strip_prefix('#') {
+                Some(rest) => (true, rest),
+                None => (false, trimmed),
+            };
+            let number = (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| digits.parse::<i64>().ok())
+                .flatten();
+            match number {
+                Some(number) if exact_number => {
+                    let bind = bind_value(&mut values, number);
+                    clauses.push(format!("i.display_number={bind}"));
+                }
+                _ => {
+                    let bind = bind_value(&mut values, format!("%{query}%"));
+                    let mut matches = vec![
+                        format!("i.title LIKE {bind}"),
+                        format!("i.body LIKE {bind}"),
+                        format!(
+                            "EXISTS(SELECT 1 FROM json_each(i.labels) label WHERE label.value LIKE {bind})"
+                        ),
+                    ];
+                    if let Some(number) = number {
+                        let bind = bind_value(&mut values, number);
+                        matches.push(format!("i.display_number={bind}"));
+                    }
+                    clauses.push(format!("({})", matches.join(" OR ")));
+                }
+            }
         }
 
         const OPEN_BLOCKERS: &str = "SELECT COUNT(*) FROM issue_deps d \
@@ -3310,6 +3628,83 @@ impl Store {
         })
     }
 
+    /// `ListIssueHandoffs` (#2420): an ascending, project-scoped page of the
+    /// append-only `issue_handoffs` records, so the operator surface can show what
+    /// `AgentUpdateIssue {handoff}` stored.
+    pub fn list_issue_workspace_handoffs(
+        &self,
+        request: &ListIssueHandoffsRequestV1,
+    ) -> Result<ListIssueHandoffsResultV1> {
+        request.validate().map_err(|_| {
+            issue_workspace_error(
+                IssueWorkspaceErrorCodeV1::InvalidRequest,
+                Some(request.issue_id),
+                None,
+                None,
+            )
+        })?;
+        let tx = self.conn.unchecked_transaction()?;
+        if Self::get_issue_in_project_tx(&tx, request.project_id, request.issue_id)?.is_none() {
+            return Err(issue_workspace_error(
+                IssueWorkspaceErrorCodeV1::NotFoundInProject,
+                Some(request.issue_id),
+                None,
+                None,
+            ));
+        }
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM issue_handoffs WHERE project_id=?1 AND issue_id=?2",
+            params![request.project_id.to_string(), request.issue_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let rows = tx
+            .prepare(
+                "SELECT sequence, author_session_id, body, created_at FROM issue_handoffs
+                 WHERE project_id=?1 AND issue_id=?2 AND sequence>?3
+                 ORDER BY sequence ASC LIMIT ?4",
+            )?
+            .query_map(
+                params![
+                    request.project_id.to_string(),
+                    request.issue_id.to_string(),
+                    request.after_sequence.unwrap_or(0),
+                    i64::from(request.limit) + 1,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.commit()?;
+        let mut handoffs = Vec::with_capacity(rows.len());
+        for (sequence, author, body, created_at) in rows {
+            handoffs.push(rsi_common::types::IssueHandoffV1 {
+                sequence,
+                author_session_id: Uuid::parse_str(&author)
+                    .map_err(|_| DaemonError::Store("invalid issue handoff author".into()))?,
+                body,
+                created_at: parse_timestamp(&created_at)
+                    .map_err(|_| DaemonError::Store("invalid issue handoff timestamp".into()))?,
+            });
+        }
+        let next_after_sequence = if handoffs.len() > request.limit as usize {
+            handoffs.pop();
+            handoffs.last().map(|handoff| handoff.sequence)
+        } else {
+            None
+        };
+        Ok(ListIssueHandoffsResultV1 {
+            handoffs,
+            next_after_sequence,
+            total,
+        })
+    }
+
     /// Apply an [`IssueUpdate`] patch (see its docs for the clear-vs-skip
     /// encoding) and bump `updated_at`. Unknown id is an error, not a no-op.
     /// Status changes go through [`Store::update_issue_status`].
@@ -3398,6 +3793,78 @@ impl Store {
         Ok(updated)
     }
 
+    /// The open (`Open` or `InProgress`), unarchived Issues of `project_id`
+    /// that carry `label`, lowest display number first. Read inside the
+    /// caller's transaction so a decision made on it commits with its write.
+    pub(crate) fn open_labelled_issues_tx(
+        tx: &Transaction<'_>,
+        project_id: Uuid,
+        label: &str,
+    ) -> Result<Vec<Issue>> {
+        let mut statement = tx.prepare(&format!(
+            "SELECT {ISSUE_COLUMNS} FROM issues
+             WHERE project_id=?1 AND status IN ('Open','InProgress') AND archived_at IS NULL
+               AND EXISTS (SELECT 1 FROM json_each(issues.labels) WHERE value=?2)
+             ORDER BY display_number"
+        ))?;
+        let rows = statement
+            .query_map(params![project_id.to_string(), label], map_issue_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(IssueRow::into_issue).collect()
+    }
+
+    /// Append `section` to the end of `issue`'s body as the system actor
+    /// `label`, with the same CAS, version bump and `ContentUpdated` event as
+    /// every other content write. `None` (nothing written) when the grown body
+    /// would pass the 65536-byte ceiling.
+    pub(crate) fn append_issue_body_as_system_tx(
+        tx: &Transaction<'_>,
+        issue: &Issue,
+        section: &str,
+        label: &str,
+    ) -> Result<Option<Issue>> {
+        let body = format!("{}{section}", issue.body);
+        if body.len() > 65536 {
+            return Ok(None);
+        }
+        let now = now_nanos();
+        let changed = tx.execute(
+            "UPDATE issues SET body = ?1, updated_at = ?2, row_version = row_version + 1
+             WHERE id = ?3 AND row_version = ?4",
+            params![&body, &now, issue.id.to_string(), issue.row_version],
+        )?;
+        if changed != 1 {
+            return Err(DaemonError::Store(
+                "Issue body append lost row-version CAS".into(),
+            ));
+        }
+        issue_projection_written()?;
+        let mut updated = issue.clone();
+        updated.body = body.clone();
+        updated.updated_at = parse_timestamp(&now).map_err(DaemonError::Store)?;
+        updated.row_version += 1;
+        let event = build_issue_event(
+            updated.clone(),
+            updated.row_version,
+            IssueEventOperationV1::ContentUpdated,
+            &IssueWriteActor::System {
+                label: label.to_string(),
+            },
+            issue.row_version,
+            IssueSemanticRequestV1::new(IssueSemanticOperationV1::ContentUpdated {
+                issue_id: issue.id,
+                expected_row_version: issue.row_version,
+                patch: IssueContentPatchV1 {
+                    body: Some(body),
+                    ..IssueContentPatchV1::default()
+                },
+            }),
+            updated.updated_at,
+        )?;
+        insert_issue_event_tx(tx, &event)?;
+        Ok(Some(updated))
+    }
+
     /// Transition an issue's status. Entering `Closed`/`Cancelled` sets
     /// `closed_at` (preserved across terminal→terminal moves); leaving a
     /// terminal status clears it. Bumps `updated_at`. Unknown id is an error.
@@ -3460,6 +3927,7 @@ impl Store {
                 issue_id: id,
                 expected_row_version: current.row_version,
                 status,
+                note: None,
             }),
             updated.updated_at,
         )?;
@@ -4810,15 +5278,16 @@ impl Store {
         }
     }
 
-    /// Bounded, project-scoped Issue list for the authenticated owning-Epic
-    /// lead or approved manager coordinator. The transaction covers persisted
-    /// topology/policy resolution and the page snapshot so a caller cannot
+    /// Bounded, project-scoped Issue list: full records for an owning-Epic
+    /// lead or approved manager (summaries for a title search or
+    /// `fields: "summary"`), summaries for a live Issue-bound worker.
+    /// The transaction covers persisted topology/policy resolution and the page snapshot so a caller cannot
     /// inject a project scope through JSON.
     pub fn agent_list_issues(
         &self,
         caller_session_id: Uuid,
         request: &AgentListIssuesRequestV1,
-    ) -> Result<IssuePageV1> {
+    ) -> Result<AgentIssuePageV1> {
         let limit = request.validated_limit().map_err(|_| {
             agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
@@ -4827,8 +5296,71 @@ impl Store {
             )
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority =
-            Self::resolve_agent_issue_authority(&tx, caller_session_id, request.project_id, false)?;
+        let (project_id, summary) = match Self::resolve_agent_issue_authority(
+            &tx,
+            caller_session_id,
+            request.project_id,
+            false,
+        ) {
+            // #2052: a title search is a dedupe lookup, so it returns
+            // summary rows unless the caller asks for `fields: "full"`.
+            Ok(authority) => (
+                authority.project_id,
+                match request.fields {
+                    Some(rsi_common::rpc::IssueListFieldsV1::Summary) => true,
+                    Some(rsi_common::rpc::IssueListFieldsV1::Full) => false,
+                    None => request.title_contains.is_some(),
+                },
+            ),
+            Err(error) => {
+                // #2448: a live topology session node holds the same
+                // dedupe read as an Issue-bound worker, for its execution's
+                // project.
+                let project_id =
+                    match Self::live_issue_binding_for_worker_on(&tx, caller_session_id)? {
+                        Some((project_id, _, _)) => project_id,
+                        None => {
+                            match Self::live_topology_node_project_on(&tx, caller_session_id)? {
+                                Some(project_id) => project_id,
+                                // #2677: an active reviewer holds the same
+                                // title-search dedupe read for its project.
+                                None => match Self::live_review_assignment_project_on(
+                                    &tx,
+                                    caller_session_id,
+                                )? {
+                                    Some(project_id) => project_id,
+                                    None => return Err(error),
+                                },
+                            }
+                        }
+                    };
+                // Workers derive their scope from the live launch, never JSON.
+                if request.project_id.is_some() {
+                    return Err(agent_issue_error(
+                        rsi_common::rpc::AgentIssueErrorCodeV1::AuthorityDenied,
+                        None,
+                        None,
+                    ));
+                }
+                if request
+                    .title_contains
+                    .as_ref()
+                    .is_none_or(|title| title.trim().is_empty())
+                {
+                    // #2425: name the missing field; a bare invalid_request
+                    // left callers guessing which parameter to correct.
+                    return Err(agent_issue_invalid_request(
+                        rsi_common::rpc::AgentIssueValidationV1 {
+                            class: rsi_common::rpc::AgentIssueValidationClassV1::MissingField,
+                            field: Some(
+                                rsi_common::rpc::AgentIssueValidationFieldV1::TitleContains,
+                            ),
+                        },
+                    ));
+                }
+                (project_id, true)
+            }
+        };
         let status = request.status.map(|status| status.as_str().to_string());
         let archive_filter = match request.archive {
             IssueArchiveFilterV1::Active => 0,
@@ -4884,18 +5416,24 @@ impl Store {
                    AND (?3=2 OR (?3=0 AND i.archived_at IS NULL) OR (?3=1 AND i.archived_at IS NOT NULL))
                    AND {cursor_filter}
                    AND (?7 IS NULL OR lower(i.title) LIKE ?7 ESCAPE '\\')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM json_each(?8) wanted
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM json_each(i.labels) present
+                       WHERE present.value=wanted.value))
                    {ready_filter}
                  {order_by} LIMIT ?6"
             ))?
             .query_map(
                 params![
-                    authority.project_id.to_string(),
+                    project_id.to_string(),
                     status,
                     archive_filter,
                     cursor_display_number,
                     cursor_issue_id,
                     i64::from(limit + 1),
                     title_pattern,
+                    serde_json::to_string(&request.labels)?,
                 ],
                 map_issue_row,
             )?
@@ -4916,17 +5454,38 @@ impl Store {
             None
         };
         tx.commit()?;
-        Ok(IssuePageV1 {
-            issues,
-            next_cursor,
-        })
+        if summary {
+            Ok(AgentIssuePageV1::Summary(AgentIssueSummaryPageV1 {
+                issues: issues
+                    .into_iter()
+                    .map(|issue| AgentIssueSummaryV1 {
+                        display_number: issue.display_number,
+                        id: issue.id,
+                        title: issue.title,
+                        labels: issue.labels,
+                        status: issue.status,
+                        priority: issue.priority,
+                        created_at: issue.created_at,
+                        updated_at: issue.updated_at,
+                    })
+                    .collect(),
+                next_cursor,
+            }))
+        } else {
+            Ok(AgentIssuePageV1::Full(IssuePageV1 {
+                issues,
+                next_cursor,
+            }))
+        }
     }
 
     /// The project and Issue an `AgentGetIssue` caller may read. A lead or
     /// coordinating manager reads any Issue of its project; a worker bound to
     /// one Issue by `AgentManagerLaunchIssueWorker` (#1100) reads only that
-    /// Issue, and every other target (existing or not) is `AuthorityDenied`.
-    fn agent_get_issue_scope_tx(
+    /// Issue, its review Issues (#1845) and the same-project Issues it
+    /// references or the launch attached (#218); every other target (existing
+    /// or not, in this or another project) is `AuthorityDenied`.
+    pub(super) fn agent_get_issue_scope_tx(
         tx: &Transaction<'_>,
         caller_session_id: Uuid,
         request: &AgentGetIssueRequestV1,
@@ -4955,10 +5514,25 @@ impl Store {
                     request.display_number,
                 )
                 .map_err(|_| denied())?;
-                if target != bound_issue {
-                    return Err(denied());
+                // #1845: a bound worker also reads the Issues a review worker
+                // was launched on for its own Issue (`review_of`), read-only.
+                // #218: and the same-project Issues its launch attached or
+                // its bound Issue references (body, handoffs, launch brief);
+                // #2391: and the Issues its own Issue cites as `#N`.
+                if target == bound_issue
+                    || Self::issue_is_review_of(tx, project_id, target, bound_issue)?
+                    || Self::issue_cites_issue(tx, project_id, bound_issue, target)?
+                    || Self::issue_is_referenced_by_binding(
+                        tx,
+                        caller_session_id,
+                        project_id,
+                        bound_issue,
+                        target,
+                    )?
+                {
+                    return Ok((project_id, target));
                 }
-                return Ok((project_id, target));
+                return Err(denied());
             }
         };
         let issue_id = Self::resolve_agent_issue_target_tx(
@@ -4968,6 +5542,57 @@ impl Store {
             request.display_number,
         )?;
         Ok((authority.project_id, issue_id))
+    }
+
+    /// #2391: whether the text of `citing` (its body, or any of its
+    /// handoffs) mentions `candidate` as `#N` (N is `candidate`'s display
+    /// number), in `project`. One level only, read authority only: it lets a
+    /// worker bound to `citing` read the Issues its own Issue names as context.
+    pub(crate) fn issue_cites_issue(
+        conn: &rusqlite::Connection,
+        project: Uuid,
+        citing: Uuid,
+        candidate: Uuid,
+    ) -> Result<bool> {
+        let Some(display_number) = conn
+            .query_row(
+                "SELECT display_number FROM issues WHERE id=?1 AND project_id=?2",
+                params![candidate.to_string(), project.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let Some(body) = conn
+            .query_row(
+                "SELECT body FROM issues WHERE id=?1 AND project_id=?2",
+                params![citing.to_string(), project.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if text_cites_issue_number(&body, display_number) {
+            return Ok(true);
+        }
+        // Every handoff, not only the newest: SQL prefilters on the `#N` text
+        // and rows stream one at a time, stopping at the first real citation
+        // (the boundary check keeps `#12` from matching `#123`).
+        let mut statement = conn.prepare(
+            "SELECT body FROM issue_handoffs
+             WHERE issue_id=?1 AND instr(body, ?2) > 0
+             ORDER BY sequence DESC",
+        )?;
+        let mut rows =
+            statement.query(params![citing.to_string(), format!("#{display_number}")])?;
+        while let Some(row) = rows.next()? {
+            if text_cites_issue_number(&row.get::<_, String>(0)?, display_number) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn agent_get_issue(
@@ -5042,6 +5667,22 @@ impl Store {
              WHERE d.project_id=?1 AND d.depends_on_id=?2
              ORDER BY i.display_number ASC,i.id ASC LIMIT ?3",
         )?)?;
+        let (handoffs, handoffs_total) =
+            Self::issue_handoffs_page_tx(&tx, issue_id, rsi_common::types::ISSUE_HANDOFF_PAGE_V1)?;
+        // #2329: the note of the newest status change, read from the event's
+        // canonical request JSON (no schema change).
+        let status_note: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(request_json,'$.note') FROM issue_events
+                 WHERE project_id=?1 AND issue_id=?2 AND operation='status_updated'
+                 ORDER BY sequence DESC LIMIT 1",
+                params![project_id.to_string(), issue_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let body_bytes_remaining =
+            (rsi_common::types::ISSUE_HANDOFF_MAX_BYTES_V1 as i64) - issue.body.len() as i64;
         tx.commit()?;
         Ok(AgentGetIssueResultV1 {
             issue,
@@ -5049,6 +5690,10 @@ impl Store {
             blocked_by_truncated,
             blocks,
             blocks_truncated,
+            handoffs,
+            handoffs_total,
+            status_note,
+            body_bytes_remaining: body_bytes_remaining.max(0),
         })
     }
 
@@ -5176,6 +5821,141 @@ impl Store {
         issue_write_before_commit()?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// #1750: an Issue-bound worker's complete handoff as its own append-only
+    /// record, so it publishes even when the Issue body is at its ceiling.
+    /// Only the worker's live binding authorises it, for its bound Issue; the
+    /// Issue row is untouched (no row_version bump, no event). A replay under
+    /// the same key and text returns the original record; the same key with
+    /// other text is `idempotency_conflict`.
+    pub fn agent_append_issue_handoff(
+        &self,
+        caller_session_id: Uuid,
+        request: &AgentUpdateIssueRequestV1,
+    ) -> Result<rsi_common::types::AgentIssueHandoffReceiptV1> {
+        use rsi_common::rpc::AgentIssueErrorCodeV1 as Code;
+        let invalid = || agent_issue_error(Code::InvalidRequest, None, None);
+        request.validate().map_err(|_| invalid())?;
+        let handoff = request.handoff.as_deref().ok_or_else(invalid)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some((project_id, issue_id, _operation)) =
+            Self::live_issue_binding_for_worker_on(&tx, caller_session_id)?
+        else {
+            let code = if Self::bound_issue_for_worker_on(&tx, caller_session_id)?.is_some() {
+                Code::BoundIssueBindingNotLive
+            } else {
+                Code::AuthorityDenied
+            };
+            return Err(agent_issue_error(code, None, None));
+        };
+        let wrong_issue = || agent_issue_error(Code::BoundIssueWrongIssue, None, None);
+        if request
+            .project_id
+            .is_some_and(|project| project != project_id)
+        {
+            return Err(wrong_issue());
+        }
+        let target = Self::resolve_agent_issue_target_tx(
+            &tx,
+            project_id,
+            request.issue_id,
+            request.display_number,
+        )
+        .map_err(|_| wrong_issue())?;
+        if target != issue_id {
+            return Err(wrong_issue());
+        }
+        let issue = Self::get_issue_in_project_tx(&tx, project_id, issue_id)?
+            .ok_or_else(|| agent_issue_error(Code::NotFoundInScope, None, None))?;
+        let receipt =
+            |sequence: i64, deduplicated: bool| rsi_common::types::AgentIssueHandoffReceiptV1 {
+                issue_id,
+                display_number: issue.display_number,
+                row_version: issue.row_version,
+                handoff_sequence: sequence,
+                handoff_bytes: handoff.len() as i64,
+                deduplicated,
+            };
+        let replay: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT issue_id, sequence, body FROM issue_handoffs
+                 WHERE author_session_id=?1 AND idempotency_key=?2",
+                params![caller_session_id.to_string(), &request.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((prior_issue, sequence, body)) = replay {
+            if prior_issue == issue_id.to_string() && body == handoff {
+                return Ok(receipt(sequence, true));
+            }
+            return Err(agent_issue_error(Code::IdempotencyConflict, None, None));
+        }
+        if issue.archived_at.is_some() {
+            return Err(agent_issue_error(Code::Archived, None, None));
+        }
+        let sequence: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM issue_handoffs WHERE issue_id=?1",
+            params![issue_id.to_string()],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO issue_handoffs
+                 (issue_id, sequence, project_id, author_session_id, idempotency_key, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                issue_id.to_string(),
+                sequence,
+                project_id.to_string(),
+                caller_session_id.to_string(),
+                &request.idempotency_key,
+                handoff,
+                canonical_timestamp(Utc::now()),
+            ],
+        )?;
+        issue_write_before_commit()?;
+        tx.commit()?;
+        Ok(receipt(sequence, false))
+    }
+
+    /// The newest `limit` handoff records of an Issue, oldest first, and how
+    /// many it holds (#1750).
+    pub(crate) fn issue_handoffs_page_tx(
+        conn: &rusqlite::Connection,
+        issue_id: Uuid,
+        limit: i64,
+    ) -> Result<(Vec<rsi_common::types::IssueHandoffV1>, i64)> {
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issue_handoffs WHERE issue_id=?1",
+            params![issue_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut statement = conn.prepare(
+            "SELECT sequence, author_session_id, body, created_at FROM issue_handoffs
+             WHERE issue_id=?1 ORDER BY sequence DESC LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![issue_id.to_string(), limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut handoffs = Vec::with_capacity(rows.len());
+        for (sequence, author, body, created_at) in rows.into_iter().rev() {
+            handoffs.push(rsi_common::types::IssueHandoffV1 {
+                sequence,
+                author_session_id: Uuid::parse_str(&author)
+                    .map_err(|_| DaemonError::Store("invalid issue handoff author".into()))?,
+                body,
+                created_at: parse_timestamp(&created_at)
+                    .map_err(|_| DaemonError::Store("invalid issue handoff timestamp".into()))?,
+            });
+        }
+        Ok((handoffs, total))
     }
 
     pub(super) fn agent_update_issue_in_tx(
@@ -5891,3 +6671,7 @@ impl Store {
         rows.into_iter().map(|row| row.into_issue()).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "issue_handoff_list_tests.rs"]
+mod handoff_list_tests;

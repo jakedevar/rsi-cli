@@ -1,6 +1,7 @@
 //! D01 Idea reads and the single D02 event-plus-projection transaction kernel.
 
 use super::Store;
+use super::rotation_abandon::RotationControllerMove;
 use super::row_mappers::{
     CAPTURE_COLUMNS, IDEA_COLUMNS, IDEA_EVENT_COLUMNS, IDEA_RELATIONSHIP_COLUMNS, map_capture_row,
     map_idea_event_row, map_idea_relationship_row, map_idea_row, str_to_session_provider,
@@ -34,6 +35,7 @@ use rsi_common::types::{
     idea_controller_assign_stage_key, idea_controller_assigned_release_stage_key,
     idea_controller_candidate_session_id, idea_controller_event_id, idea_controller_reservation_id,
     idea_controller_reservation_release_stage_key, idea_controller_reserve_stage_key,
+    idea_controller_rotation_transfer_stage_key,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
@@ -89,7 +91,7 @@ macro_rules! d04_link_fault {
     };
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 macro_rules! d04_link_constraint_fault {
     () => {
         d04_link_constraint_fault_impl()
@@ -465,7 +467,7 @@ impl Store {
             .map_err(IdeaControlError::InvalidRequest)?;
         let event_id = deterministic_event_id(request.idea_id, &request.idempotency_key);
         let tx = immediate_transaction(&self.conn)?;
-        #[cfg(any(test, feature = "test-seam"))]
+        #[cfg(test)]
         d04_link_constraint_fault!()?;
         let issue = Self::get_issue_tx(&tx, request.issue_id)
             .map_err(|error| IdeaControlError::StorageFailure(error.to_string()))?
@@ -937,38 +939,89 @@ impl Store {
         confirmation: &IdeaControllerLaunchConfirmationV1,
         now: DateTime<Utc>,
     ) -> IdeaResult<IdeaControllerControlResultV1> {
-        reservation
-            .validate(authority.idea_id())
-            .map_err(IdeaControlError::InvalidRequest)?;
-        confirmation
-            .validate(reservation, authority.project_id())
-            .map_err(|_| IdeaControlError::LaunchNotConfirmed)?;
-        if authority.actor_kind() != IdeaActorKind::System {
-            return Err(IdeaControlError::ForbiddenActor);
-        }
-        let stage_key = idea_controller_assign_stage_key(reservation.reservation_id);
-        let request = IdeaControllerControlRequestV1 {
-            domain: IDEA_CONTROLLER_CONTROL_V1.to_string(),
-            project_id: authority.project_id(),
-            idea_id: authority.idea_id(),
-            actor_kind: IdeaActorKind::System,
-            actor_id: authority.actor_id().to_string(),
-            operation: IdeaControllerControlOperationV1::Assign {
-                reservation: reservation.clone(),
-                confirmation: confirmation.clone(),
-            },
-        };
-        request
-            .validate()
-            .map_err(IdeaControlError::InvalidRequest)?;
-
+        let (request, stage_key) =
+            controller_assignment_request_v1(authority, reservation, confirmation)?;
         let tx = immediate_transaction(&self.conn)?;
         if let Some(replay) = load_controller_control_replay_tx(&tx, &request, &stage_key)? {
             tx.commit().map_err(map_sql_error)?;
             return Ok(replay);
         }
-        let idea = require_same_project_idea_tx(&tx, authority.project_id(), authority.idea_id())?;
-        let tail = require_live_reservation_tail_tx(&tx, &idea, reservation, now)?;
+        match self.apply_controller_assignment_tx(
+            &tx,
+            authority,
+            reservation,
+            confirmation,
+            request,
+            &stage_key,
+            now,
+        ) {
+            Ok(result) => {
+                d03_fault!(IdeaControllerWriteFault::AssignBeforeCommit)?;
+                tx.commit().map_err(map_sql_error)?;
+                Ok(result)
+            }
+            Err(AssignApplyError::StaleBase { expected, actual }) => {
+                drop(tx);
+                let _ = self.release_controller_reservation_snapshot_v1(
+                    authority.project_id(),
+                    authority.idea_id(),
+                    IdeaActorKind::System,
+                    authority.actor_id(),
+                    reservation,
+                    ControllerReleaseReasonV1::StaleAssignmentBase,
+                    now,
+                );
+                Err(IdeaControlError::StaleVersion { expected, actual })
+            }
+            Err(AssignApplyError::Failed(error)) => Err(error),
+        }
+    }
+
+    /// #1186: the same assignment, applied inside the caller's transaction so a
+    /// rotation publication commits the controller, the Epic lead pointer and
+    /// the global grant together. Nothing is committed here: a stale base or
+    /// any other refusal leaves the reservation to the caller, whose
+    /// transaction rolls back and which releases it.
+    pub(crate) fn assign_idea_controller_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        authority: &BoundIdeaControllerTransferAuthority,
+        reservation: &IdeaControllerReservationV1,
+        confirmation: &IdeaControllerLaunchConfirmationV1,
+        now: DateTime<Utc>,
+    ) -> IdeaResult<IdeaControllerControlResultV1> {
+        let (request, stage_key) =
+            controller_assignment_request_v1(authority, reservation, confirmation)?;
+        self.apply_controller_assignment_tx(
+            tx,
+            authority,
+            reservation,
+            confirmation,
+            request,
+            &stage_key,
+            now,
+        )
+        .map_err(|error| match error {
+            AssignApplyError::StaleBase { expected, actual } => {
+                IdeaControlError::StaleVersion { expected, actual }
+            }
+            AssignApplyError::Failed(error) => error,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_controller_assignment_tx(
+        &self,
+        tx: &Transaction<'_>,
+        authority: &BoundIdeaControllerTransferAuthority,
+        reservation: &IdeaControllerReservationV1,
+        confirmation: &IdeaControllerLaunchConfirmationV1,
+        request: IdeaControllerControlRequestV1,
+        stage_key: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<IdeaControllerControlResultV1, AssignApplyError> {
+        let idea = require_same_project_idea_tx(tx, authority.project_id(), authority.idea_id())?;
+        let tail = require_live_reservation_tail_tx(tx, &idea, reservation, now)?;
         d03_fault!(IdeaControllerWriteFault::AssignAfterTailRead)?;
         let reserved_row_version =
             reservation.base_row_version.checked_add(1).ok_or_else(|| {
@@ -977,35 +1030,25 @@ impl Store {
                 )
             })?;
         if tail.id != reservation.reserved_event_id {
-            return Err(IdeaControlError::ControllerReservationResolved);
+            return Err(IdeaControlError::ControllerReservationResolved.into());
         }
         if idea.current_controller_session_id != reservation.base_controller_session_id
             || idea.controller_epoch != reservation.base_controller_epoch
             || idea.row_version != reserved_row_version
         {
-            drop(tx);
-            let _ = self.release_controller_reservation_snapshot_v1(
-                authority.project_id(),
-                authority.idea_id(),
-                IdeaActorKind::System,
-                authority.actor_id(),
-                reservation,
-                ControllerReleaseReasonV1::StaleAssignmentBase,
-                now,
-            );
-            return Err(IdeaControlError::StaleVersion {
+            return Err(AssignApplyError::StaleBase {
                 expected: reserved_row_version,
                 actual: idea.row_version,
             });
         }
-        require_confirmed_session_row_tx(&tx, reservation, confirmation)?;
+        require_confirmed_session_row_tx(tx, reservation, confirmation)?;
         if !reservation.is_live_at(now) {
-            return Err(IdeaControlError::ControllerReservationExpired);
+            return Err(IdeaControlError::ControllerReservationExpired.into());
         }
         let sequence = idea.next_event_sequence;
-        let event_id = idea_controller_event_id(idea.id, &stage_key);
+        let event_id = idea_controller_event_id(idea.id, stage_key);
         let changed = update_idea_controller_projection_tx(
-            &tx,
+            tx,
             &idea,
             Some(reservation.candidate_session_id),
             reservation.proposed_epoch,
@@ -1014,7 +1057,8 @@ impl Store {
             now,
         )?;
         if changed != 1 {
-            return stale_version_after_failed_cas(&tx, &idea, idea.row_version);
+            return stale_version_after_failed_cas(tx, &idea, idea.row_version)
+                .map_err(AssignApplyError::from);
         }
         d03_fault!(IdeaControllerWriteFault::AssignAfterProjection)?;
         let mut committed_idea = idea;
@@ -1032,25 +1076,23 @@ impl Store {
                 reservation: Some(reservation.clone()),
             },
         };
-        let event = build_controller_control_event(&payload, &stage_key)?;
+        let event = build_controller_control_event(&payload, stage_key)?;
         insert_controller_event_tx(
-            &tx,
+            tx,
             &event,
             &payload
                 .canonical_json()
                 .map_err(IdeaControlError::InvalidRequest)?,
         )?;
         rebind_active_program_run_for_controller_assignment_tx(
-            &tx,
-            reservation,
+            tx,
+            &ControllerRebind::from(reservation),
             &committed_idea,
             event_id,
             self.program_run_boot_id(),
             now,
         )?;
         d03_fault!(IdeaControllerWriteFault::AssignAfterEvent)?;
-        d03_fault!(IdeaControllerWriteFault::AssignBeforeCommit)?;
-        tx.commit().map_err(map_sql_error)?;
         Ok(IdeaControllerControlResultV1 {
             idea: committed_idea,
             event,
@@ -1614,10 +1656,271 @@ impl Store {
     }
 }
 
+impl Store {
+    /// #1186: move the Idea controller assigned to `former` to `successor`
+    /// inside the caller's rotation-publication transaction, so the controller,
+    /// the Epic lead pointer and the global grant all follow the seat in one
+    /// commit. `None` when `former` controls no Idea (or `successor` is not a
+    /// session of that Idea's project, which can never hold its controller).
+    ///
+    /// The move is a typed `TransferToRotationSuccessor` controller event
+    /// (`controller_assigned`) at the next epoch, and it rebinds an active
+    /// `ProgramRun` exactly as an ordinary assignment does. It supersedes any
+    /// unresolved reservation, which can no longer be assigned. The caller
+    /// holds both spawn guards and proved `successor` is the exact row
+    /// `rotation_id` reserved, so no reservation or provider confirmation is
+    /// required: the published lineage is the evidence.
+    ///
+    /// # Errors
+    /// `Store` for a corrupt controller tail, a lost compare-and-swap, or a
+    /// `ProgramRun` bound to a different controller; the caller's transaction
+    /// then rolls back and nothing is published.
+    pub(super) fn transfer_assigned_idea_controller_for_rotation_on(
+        &self,
+        tx: &Transaction<'_>,
+        former: Uuid,
+        successor: Uuid,
+        rotation_id: &str,
+    ) -> Result<Option<RotationControllerMove>> {
+        self.transfer_assigned_idea_controller_for_rotation_inner(
+            tx,
+            former,
+            successor,
+            rotation_id,
+            Utc::now(),
+        )
+        .map_err(|error| {
+            DaemonError::Store(format!(
+                "rotation_controller_transfer_failed:{former}:{successor}:{error}"
+            ))
+        })
+    }
+
+    fn transfer_assigned_idea_controller_for_rotation_inner(
+        &self,
+        tx: &Transaction<'_>,
+        former: Uuid,
+        successor: Uuid,
+        rotation_id: &str,
+        now: DateTime<Utc>,
+    ) -> IdeaResult<Option<RotationControllerMove>> {
+        let mut assigned = Vec::new();
+        {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT {IDEA_COLUMNS}
+                     FROM ideas
+                     WHERE current_controller_session_id = ?1
+                     ORDER BY project_id, id
+                     LIMIT 2"
+                ))
+                .map_err(map_sql_error)?;
+            let rows = statement
+                .query_map(params![former.to_string()], map_idea_row)
+                .map_err(map_sql_error)?;
+            for row in rows {
+                assigned.push(
+                    row.map_err(map_sql_error)?
+                        .into_idea()
+                        .map_err(corrupt_event)?,
+                );
+            }
+        }
+        if assigned.len() > 1 {
+            return Err(corrupt_event(
+                "one Session is assigned to more than one Idea",
+            ));
+        }
+        let Some(idea) = assigned.pop() else {
+            return Ok(None);
+        };
+        let successor_project = tx
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id = ?1",
+                [successor.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_sql_error)?
+            .flatten()
+            .and_then(|value| Uuid::parse_str(&value).ok());
+        if successor_project != Some(idea.project_id) {
+            tracing::warn!(
+                %former,
+                %successor,
+                idea_id = %idea.id,
+                "Rotation successor is outside the Idea's project; the controller stays with its holder"
+            );
+            return Ok(None);
+        }
+        if let Some(tail) = load_latest_controller_event_tx(tx, idea.id)? {
+            let payload = tail
+                .controller_control_payload_v1()
+                .map_err(corrupt_event)?;
+            if !controller_tail_matches_projection(&payload, &idea) {
+                return Err(corrupt_event(
+                    "latest controller event disagrees with assigned projection",
+                ));
+            }
+        }
+        let proposed_epoch = idea
+            .controller_epoch
+            .checked_add(1)
+            .ok_or(IdeaControlError::ControllerEpochExhausted)?;
+        let transfer_intent_key = format!("rotation-succession:{former}:{successor}");
+        let stage_key = idea_controller_rotation_transfer_stage_key(idea.id, &transfer_intent_key);
+        let event_id = idea_controller_event_id(idea.id, &stage_key);
+        let sequence = idea.next_event_sequence;
+        let expected_row_version = idea.row_version;
+        let request = IdeaControllerControlRequestV1 {
+            domain: IDEA_CONTROLLER_CONTROL_V1.to_string(),
+            project_id: idea.project_id,
+            idea_id: idea.id,
+            actor_kind: IdeaActorKind::System,
+            actor_id: "rsid:controller-transfer".to_string(),
+            operation: IdeaControllerControlOperationV1::TransferToRotationSuccessor {
+                transfer_intent_key,
+                expected_row_version,
+                observed_controller_epoch: idea.controller_epoch,
+                former_controller_session_id: former,
+                successor_session_id: successor,
+                rotation_id: rotation_id.to_string(),
+                proposed_epoch,
+            },
+        };
+        request
+            .validate()
+            .map_err(IdeaControlError::InvalidRequest)?;
+        let changed = update_idea_controller_projection_tx(
+            tx,
+            &idea,
+            Some(successor),
+            proposed_epoch,
+            expected_row_version,
+            sequence,
+            now,
+        )?;
+        if changed != 1 {
+            return stale_version_after_failed_cas(tx, &idea, expected_row_version);
+        }
+        let mut committed_idea = idea.clone();
+        committed_idea.current_controller_session_id = Some(successor);
+        committed_idea.controller_epoch = proposed_epoch;
+        advance_idea_counters(&mut committed_idea, now)?;
+        let payload = IdeaControllerEventPayloadV1 {
+            request,
+            outcome: IdeaControllerControlOutcomeV1 {
+                idea: committed_idea.clone(),
+                event_id,
+                sequence,
+                resulting_row_version: committed_idea.row_version,
+                occurred_at: now,
+                reservation: None,
+            },
+        };
+        let event = build_controller_control_event(&payload, &stage_key)?;
+        insert_controller_event_tx(
+            tx,
+            &event,
+            &payload
+                .canonical_json()
+                .map_err(IdeaControlError::InvalidRequest)?,
+        )?;
+        rebind_active_program_run_for_controller_assignment_tx(
+            tx,
+            &ControllerRebind {
+                former_controller_session_id: Some(former),
+                former_epoch: idea.controller_epoch,
+                candidate_session_id: successor,
+                proposed_epoch,
+            },
+            &committed_idea,
+            event_id,
+            self.program_run_boot_id(),
+            now,
+        )?;
+        Ok(Some(RotationControllerMove {
+            project_id: idea.project_id,
+            idea_id: idea.id,
+            former_session_id: former,
+            successor_session_id: successor,
+            controller_epoch: proposed_epoch,
+            event_id,
+        }))
+    }
+}
+
+/// Why [`Store::apply_controller_assignment_tx`] refused. A stale base is the
+/// one refusal that also resolves the reservation, which only the caller that
+/// owns the transaction can do.
+enum AssignApplyError {
+    StaleBase { expected: i64, actual: i64 },
+    Failed(IdeaControlError),
+}
+
+impl From<IdeaControlError> for AssignApplyError {
+    fn from(error: IdeaControlError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Validate an assignment and build its semantic request and stage key.
+fn controller_assignment_request_v1(
+    authority: &BoundIdeaControllerTransferAuthority,
+    reservation: &IdeaControllerReservationV1,
+    confirmation: &IdeaControllerLaunchConfirmationV1,
+) -> IdeaResult<(IdeaControllerControlRequestV1, String)> {
+    reservation
+        .validate(authority.idea_id())
+        .map_err(IdeaControlError::InvalidRequest)?;
+    confirmation
+        .validate(reservation, authority.project_id())
+        .map_err(|_| IdeaControlError::LaunchNotConfirmed)?;
+    if authority.actor_kind() != IdeaActorKind::System {
+        return Err(IdeaControlError::ForbiddenActor);
+    }
+    let stage_key = idea_controller_assign_stage_key(reservation.reservation_id);
+    let request = IdeaControllerControlRequestV1 {
+        domain: IDEA_CONTROLLER_CONTROL_V1.to_string(),
+        project_id: authority.project_id(),
+        idea_id: authority.idea_id(),
+        actor_kind: IdeaActorKind::System,
+        actor_id: authority.actor_id().to_string(),
+        operation: IdeaControllerControlOperationV1::Assign {
+            reservation: reservation.clone(),
+            confirmation: confirmation.clone(),
+        },
+    };
+    request
+        .validate()
+        .map_err(IdeaControlError::InvalidRequest)?;
+    Ok((request, stage_key))
+}
+
+/// The controller hand-over an active `ProgramRun` follows: the former owner
+/// and epoch it must still be bound to, and the new owner and epoch.
+struct ControllerRebind {
+    former_controller_session_id: Option<Uuid>,
+    former_epoch: i64,
+    candidate_session_id: Uuid,
+    proposed_epoch: i64,
+}
+
+impl From<&IdeaControllerReservationV1> for ControllerRebind {
+    fn from(reservation: &IdeaControllerReservationV1) -> Self {
+        Self {
+            former_controller_session_id: reservation.base_controller_session_id,
+            former_epoch: reservation.base_controller_epoch,
+            candidate_session_id: reservation.candidate_session_id,
+            proposed_epoch: reservation.proposed_epoch,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn rebind_active_program_run_for_controller_assignment_tx(
     tx: &Transaction<'_>,
-    reservation: &IdeaControllerReservationV1,
+    rebind: &ControllerRebind,
     committed_idea: &Idea,
     idea_event_id: Uuid,
     daemon_boot_id: Uuid,
@@ -1661,11 +1964,11 @@ fn rebind_active_program_run_for_controller_assignment_tx(
     else {
         return Ok(());
     };
-    let base_controller = reservation
-        .base_controller_session_id
+    let base_controller = rebind
+        .former_controller_session_id
         .map(|value| value.to_string());
     if Some(former_controller.as_str()) != base_controller.as_deref()
-        || former_epoch != reservation.base_controller_epoch
+        || former_epoch != rebind.former_epoch
     {
         return Err(IdeaControlError::ControllerMismatch);
     }
@@ -1676,10 +1979,10 @@ fn rebind_active_program_run_for_controller_assignment_tx(
     let transition_id = deterministic_program_run_transition_id(run_uuid, &idempotency_key);
     let request_json = canonical_program_run_json(&serde_json::json!({
         "program_run_id": run_uuid,
-        "former_controller_session_id": reservation.base_controller_session_id,
-        "candidate_session_id": reservation.candidate_session_id,
-        "former_epoch": reservation.base_controller_epoch,
-        "proposed_epoch": reservation.proposed_epoch,
+        "former_controller_session_id": rebind.former_controller_session_id,
+        "candidate_session_id": rebind.candidate_session_id,
+        "former_epoch": rebind.former_epoch,
+        "proposed_epoch": rebind.proposed_epoch,
         "idea_event_id": idea_event_id,
     }))
     .map_err(IdeaControlError::InvalidRequest)?;
@@ -1689,7 +1992,7 @@ fn rebind_active_program_run_for_controller_assignment_tx(
         "UPDATE idea_program_runs SET controller_session_id=?1,controller_epoch=?2,idea_row_version=?3,
          row_version=row_version+1,next_transition_sequence=next_transition_sequence+1,updated_at=?4
          WHERE id=?5 AND row_version=?6 AND controller_session_id=?7 AND controller_epoch=?8",
-        params![reservation.candidate_session_id.to_string(), reservation.proposed_epoch,
+        params![rebind.candidate_session_id.to_string(), rebind.proposed_epoch,
             committed_idea.row_version, canonical_timestamp(now), run_id, row_version,
             former_controller, former_epoch],
     ).map_err(map_sql_error)?;
@@ -1704,8 +2007,8 @@ fn rebind_active_program_run_for_controller_assignment_tx(
          expires_at=CASE WHEN state='held' THEN ?5 ELSE NULL END
          WHERE program_run_id=?6 AND state IN ('requested','held')",
         params![
-            reservation.candidate_session_id.to_string(),
-            reservation.proposed_epoch,
+            rebind.candidate_session_id.to_string(),
+            rebind.proposed_epoch,
             daemon_boot_id.to_string(),
             canonical_timestamp(now),
             canonical_timestamp(now + chrono::Duration::seconds(30)),
@@ -1726,8 +2029,8 @@ fn rebind_active_program_run_for_controller_assignment_tx(
          claim_expires_at=CASE WHEN state IN ('published','acknowledged') THEN ?5 ELSE NULL END,
          updated_at=?6 WHERE program_run_id=?7 AND state IN ('reserved','claimed','published','acknowledged')",
         params![
-            reservation.candidate_session_id.to_string(),
-            reservation.proposed_epoch,
+            rebind.candidate_session_id.to_string(),
+            rebind.proposed_epoch,
             daemon_boot_id.to_string(),
             row_version + 1,
             canonical_timestamp(now + chrono::Duration::seconds(30)),
@@ -1745,7 +2048,7 @@ fn rebind_active_program_run_for_controller_assignment_tx(
          VALUES (?1,?2,?3,'controller_rebound',?4,?4,?5,?6,?7,?5,?6,?7,?8,?8,'system',NULL,
                  ?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![transition_id.to_string(), run_id, sequence, status, cursor_ordinal, cursor_key,
-            cursor_phase, revision_no, reservation.proposed_epoch, row_version, row_version + 1,
+            cursor_phase, revision_no, rebind.proposed_epoch, row_version, row_version + 1,
             committed_idea.row_version - 1, committed_idea.row_version, idea_event_id.to_string(),
             idempotency_key, request_json, fingerprint, canonical_timestamp(now)],
     ).map_err(map_sql_error)?;
@@ -1859,9 +2162,13 @@ pub(crate) enum IssueLinkWriteFault {
     AfterIssueUpdate,
     AfterEventInsert,
     BeforeCommit,
+    #[cfg(test)]
     ConstraintForeignKey,
+    #[cfg(test)]
     ConstraintCheck,
+    #[cfg(test)]
     ConstraintNotNull,
+    #[cfg(test)]
     ConstraintUniquePrimary,
 }
 
@@ -1875,7 +2182,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[allow(
     clippy::redundant_pub_crate,
     reason = "D02 fault injection is intentionally visible only to crate test modules"
@@ -1893,7 +2200,7 @@ pub fn inject_d03_idea_controller_write_fault(fault: IdeaControllerWriteFault) {
     D03_IDEA_CONTROLLER_WRITE_FAULT.with(|slot| slot.set(Some(fault)));
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn inject_d04_issue_link_write_fault(fault: IssueLinkWriteFault) {
     D04_ISSUE_LINK_WRITE_FAULT.with(|slot| slot.set(Some(fault)));
 }
@@ -1955,7 +2262,7 @@ fn d04_link_fault_impl(fault: IssueLinkWriteFault) -> IdeaResult<()> {
 /// Test-only transaction-seam injection for `SQLite`'s four stable integrity
 /// identities. This enters the link transaction after `BEGIN IMMEDIATE`; the
 /// synthetic `SQLite` message must never cross the RPC boundary.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 fn d04_link_constraint_fault_impl() -> IdeaResult<()> {
     let extended_code = D04_ISSUE_LINK_WRITE_FAULT.with(|slot| match slot.get() {
         Some(IssueLinkWriteFault::ConstraintForeignKey) => {
@@ -2136,6 +2443,14 @@ fn controller_tail_matches_projection(
         } => {
             current.current_controller_session_id.is_none()
                 && current.controller_epoch == *controller_epoch
+        }
+        IdeaControllerControlOperationV1::TransferToRotationSuccessor {
+            successor_session_id,
+            proposed_epoch,
+            ..
+        } => {
+            current.current_controller_session_id == Some(*successor_session_id)
+                && current.controller_epoch == *proposed_epoch
         }
     }
 }
@@ -3920,6 +4235,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_d01_event_fixture(
         &self,
         event: &rsi_common::types::IdeaEvent,
@@ -3958,6 +4274,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_d01_collection_fixture(
         &self,
         collection: &rsi_common::types::IdeaCollection,
@@ -3980,6 +4297,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_d01_relationship_fixture(
         &self,
         relationship: &rsi_common::types::IdeaRelationship,
@@ -4004,6 +4322,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_d01_membership_fixture(
         &self,
         membership: &rsi_common::types::IdeaCollectionMembership,
@@ -4024,6 +4343,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_d01_compatibility_fixture(
         &self,
         mapping: &rsi_common::types::IdeaCompatibilityMapping,

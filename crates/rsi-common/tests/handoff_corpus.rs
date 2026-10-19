@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use rsi_common::handoff_schema::{ValidationMode, validate};
 
 fn handoffs_dir() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(rsi_common::manifest_dir!());
     // crates/rsi-common -> repo root -> thoughts/shared/handoffs/general
     manifest
         .parent()

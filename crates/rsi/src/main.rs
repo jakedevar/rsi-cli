@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ENV_TUI_NO_AUTO_START_DAEMON: &str = "RSI_TUI_NO_AUTO_START_DAEMON";
+#[cfg(target_os = "linux")]
 const RSID_SCOPE_SETTINGS_FILE: &str = "rsid-scope.env";
+#[cfg(target_os = "linux")]
 const RSID_SCOPE_PREFIX: &str = "rsid-tui";
 /// Where `scripts/install-release.sh` installs the supervised daemon set
 /// (`~/.rsi/install`): `rsid` and `rsid-supervisor.sh`.
@@ -15,6 +17,7 @@ const SUPERVISOR_SCRIPT: &str = "rsid-supervisor.sh";
 #[cfg(target_os = "linux")]
 const WORKER_SLICE: &str = "rsi-workers.slice";
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerScopeSettings {
     memory_high_mib: u64,
@@ -23,6 +26,7 @@ struct WorkerScopeSettings {
     cpu_weight: u32,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl WorkerScopeSettings {
     fn defaults() -> Self {
         let (memory_high_mib, memory_max_mib) = rsi_common::worker_memory::default_limits_mib();
@@ -47,6 +51,7 @@ impl WorkerScopeSettings {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RsidScopeSettings {
     memory_high_mib: u64,
@@ -56,7 +61,9 @@ struct RsidScopeSettings {
     worker: WorkerScopeSettings,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 impl RsidScopeSettings {
+    #[cfg(target_os = "linux")]
     fn defaults() -> Self {
         Self {
             memory_high_mib: 6 * 1024,
@@ -535,8 +542,18 @@ fn managed_rsid_service_enabled() -> bool {
 
 #[cfg(target_os = "linux")]
 fn start_managed_rsid_service(socket_path: &Path) -> color_eyre::Result<()> {
+    start_managed_rsid_service_with(socket_path, managed_rsid_unit_active)
+}
+
+#[cfg(target_os = "linux")]
+fn start_managed_rsid_service_with(
+    socket_path: &Path,
+    unit_active: impl Fn(&str) -> bool,
+) -> color_eyre::Result<()> {
     if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-        if managed_rsid_service_active() {
+        // A connect to rsid.socket triggers activation; rsid.service can still
+        // be inactive while systemd dispatches that request.
+        if unit_active("rsid.service") || unit_active("rsid.socket") {
             return Ok(());
         }
         return Err(color_eyre::eyre::eyre!(
@@ -554,7 +571,7 @@ fn start_managed_rsid_service(socket_path: &Path) -> color_eyre::Result<()> {
     let started = std::time::Instant::now();
     while started.elapsed() < std::time::Duration::from_secs(90) {
         if std::os::unix::net::UnixStream::connect(socket_path).is_ok()
-            && managed_rsid_service_active()
+            && (unit_active("rsid.service") || unit_active("rsid.socket"))
         {
             tracing::info!("connected to managed rsid.service");
             return Ok(());
@@ -577,9 +594,9 @@ fn start_managed_rsid_service(socket_path: &Path) -> color_eyre::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn managed_rsid_service_active() -> bool {
+fn managed_rsid_unit_active(unit: &str) -> bool {
     Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "rsid.service"])
+        .args(["--user", "is-active", "--quiet", unit])
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -1013,6 +1030,20 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_socket_connect_succeeds_while_service_activation_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        super::start_managed_rsid_service_with(&path, |unit| unit == "rsid.socket").unwrap();
+        let (_activation_connection, _) = listener.accept().unwrap();
+        // Preserve the legacy-launcher refusal when neither managed unit owns
+        // the front door, while a running service still succeeds.
+        assert!(super::start_managed_rsid_service_with(&path, |_| false).is_err());
+        super::start_managed_rsid_service_with(&path, |unit| unit == "rsid.service").unwrap();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

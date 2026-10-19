@@ -21,7 +21,7 @@ fn fixture() -> Fixture {
     use crate::store::Store;
 
     let dir = tempfile::TempDir::new().unwrap();
-    let store = Store::open(&dir.path().join("rsi.db")).expect("open store");
+    let store = Store::open_test_fixture(&dir.path().join("rsi.db")).expect("open store");
     let runtime_config = RuntimeConfig::from_config(&Config::from_env());
     let bus = std::sync::Arc::new(EventBus::new(16));
     let manager = std::sync::Arc::new(

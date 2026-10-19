@@ -41,61 +41,59 @@
 //!   stoppable. Such a process can also edit `~/rsi` directly, so the fence's
 //!   value is against accidental redirection and non-racing aliases, not
 //!   against an actively racing same-uid attacker.
-//! * First creation (#1170, ACCEPTED RESIDUAL): the worktree is registered by
-//!   `git worktree add --no-checkout --detach --force`, preceded by
-//!   `git worktree prune`, run unfenced in the source repository (hooks,
-//!   fsmonitor and attributes are off on its command line, the environment is
-//!   the allowlist, and nothing is checked out; the population that follows is
-//!   pinned and fenced). The registration write and the prune resolve their
-//!   paths by name, so a slot, `worktrees` directory or `.git` swapped inside
-//!   that window redirects them, and the add cannot be fenced because it must
-//!   write the operator's common directory. A hand-written registration writer
-//!   (handle-relative, exclusive creates) was built and REMOVED after two
-//!   review rounds: it writes and deletes in the operator's repository, and
-//!   every round found a new hole. The findings are the reasons a separate
-//!   design is needed: (1) publication must follow git's init-lock protocol
-//!   (the entry is visible to a concurrent prune or gc between `mkdir` and the
-//!   `locked` file, and an empty replacement cannot be told from our own);
-//!   (2) the ownership marker must be bound to ONE slot and creator with a
-//!   liveness check (a global marker lets another queue workspace sharing the
-//!   same common directory retire a live initialization, since `stable_key`
-//!   hashes only the common path); (3) repair of a dangling slot must prove the
-//!   pointer's target and be race-safe against a concurrent repair; (4) a crash
-//!   after the slot's `.git` and before the lock release must not leave
-//!   `locked` forever; (5) every removal must be non-recursive, through
-//!   validated handles, with operator-repository ownership proofs. Until then
-//!   the residual is the path-based registration write under `~/.rsi/queue`.
-//! * The source fetch (#1170): `fetch_rolling` in the parent module runs git in
-//!   the source repository unfenced, with hooks, maintenance, `FETCH_HEAD`,
-//!   submodules, tags and `ext::` off on the command line. Fencing it was
-//!   evaluated and rejected: the transport children write their own state
-//!   (`known_hosts`, control sockets, credential caches) and would inherit the
-//!   fence; a ref update needs the `packed-refs` lock in the common directory
-//!   root, which only a grant on the whole directory (config and hooks too)
-//!   gives; and a read-only copy into a private directory leaves the fetched
-//!   commits out of the shared store the lander and the queue worktree read. The
-//!   transport settings of the source (`core.sshCommand`, `core.gitProxy`,
-//!   `remote.origin.uploadpack`, `credential.helper`, `url.*.insteadOf`) are
-//!   left to its config on purpose: they carry the operator's authentication,
-//!   and a source whose config is attacker-controlled is the same-uid case
-//!   above, where the attacker already runs as the daemon's user.
-//! * The lander subprocess (#1170, design only, nothing implemented): it is NOT
-//!   a writer of the shared repository. `rsi-rolling-land` clones the queue
-//!   worktree it is given with `git clone --shared --no-checkout` into a fresh
-//!   0700 scratch directory and runs every merge, `update-ref`, commit, apply,
-//!   `worktree add` and `push` there (the only commands it runs against the
-//!   given repository are `remote get-url --push`, the clone's read of its
-//!   objects and ref reads), publishing over the `publish` remote. Its writes
-//!   are the scratch directory, the cargo target directory and the network. The
-//!   gate it runs executes the accepted sources' whole test suite, which needs
-//!   unrestricted writes, so the whole process cannot sit under this fence. The
-//!   enforcement that would fit is a fence on the lander's own git calls into
-//!   the given repository only (granting nothing: all of them are reads, and
-//!   the clone writes only inside the scratch directory): wrap `git_ok(&repo,
-//!   ..)`/`git_text(&repo, ..)` for the pre-clone calls in a no-write ruleset
-//!   and give the clone a ruleset naming only the scratch handle. It needs the
-//!   same ABI policy and a typed refusal in the lander's report, so it is a
-//!   change to the lander (a separate issue), not to this runner.
+//! * The queue's checkout is a queue-owned private clone, not a linked worktree
+//!   (#1170 residuals). The first version registered the checkout with
+//!   `git worktree add` in the operator repository, which wrote
+//!   `<common>/worktrees/<name>` by path outside any fence, and fetched into
+//!   the operator repository with the same lack of a fence. A hand-written
+//!   registration writer was tried and removed after two review rounds: it
+//!   still wrote and deleted in the operator's repository, and every round
+//!   found a new hole (init-lock publication, ownership of the marker across
+//!   queue workspaces, repair of a dangling slot, a crash before the lock
+//!   release, non-recursive removals with ownership proofs). The design that
+//!   removes the class is to register nothing:
+//!   `<workspace>/worktrees/<key>` is a repository of its own (`.git`
+//!   DIRECTORY, built relative to the vetted `worktrees` handle with exclusive
+//!   creates and no git process), its `config` carries the source's resolved
+//!   `origin` URL (`remote get-url`, which already applies `insteadOf`) and the
+//!   few repository-local transport settings a fetch needs, and its
+//!   `objects/info/alternates` names the source's object store, which git only
+//!   ever reads. The queue's `origin/rolling` fetch (`fetch_rolling`) runs in
+//!   the CLONE, so the transport children (`ssh`, credential helpers) write
+//!   their own state and the clone's refs and objects, never the source: they
+//!   are not fenced because they must write outside any fence, and nothing they
+//!   can write is the operator's. The source is only READ (`rev-parse`,
+//!   `remote get-url`, `config --local --get-all`); no registration, ref, object,
+//!   hook, config or file of it is written. The clone's `config` and alternate
+//!   are rewritten from the source on every call by exclusive create plus
+//!   rename, so a replaced file heals, and a slot whose git directory does not
+//!   carry the queue's marker is refused with nothing touched. A slot an
+//!   earlier daemon registered as a linked worktree (a `.git` FILE whose
+//!   registration points back at it) is retired through the same vetted
+//!   handles; its registration in the source is left to git's own
+//!   `worktree prune`, because the queue no longer writes there. Behaviour
+//!   changes: the queue no longer advances the source's own
+//!   `refs/remotes/origin/rolling` as a side effect (callers that want a fresh
+//!   ref in their repository fetch it themselves), and the clone holds the
+//!   fetched objects itself instead of the source's store. The reset below still
+//!   works on a private git directory inside the clone's `.git` and still runs
+//!   under the fence, which now guards the clone against a slot or git
+//!   directory swapped for the operator checkout.
+//! * The lander subprocess (#1170): it is handed only the queue clone's path
+//!   (`--repo`, and its current directory), never a source path. It is NOT a
+//!   writer of that clone either: `rsi-rolling-land` runs `git clone --shared
+//!   --no-checkout` of it into a fresh 0700 scratch directory and runs every
+//!   merge, `update-ref`, commit, apply, `worktree add` and `push` there (the
+//!   only commands it runs against the given repository are `remote get-url
+//!   --push`, the clone's read of its objects and ref reads), publishing over the
+//!   `publish` remote. The scratch clone's alternate chain (scratch, queue
+//!   clone, source objects) is read-only, so no object or ref of the source can
+//!   be written through it. Its writes are the scratch directory, the cargo
+//!   target directory and the network. The gate it runs executes the accepted
+//!   sources' whole test suite, which needs unrestricted writes (Landlock grants
+//!   by allow-list, so "everything except the operator checkout" cannot be
+//!   expressed), so the whole process is not placed under this fence; what keeps
+//!   it off the operator checkout is that it is never given a path to it.
 //! * Deliberate behaviour changes of the private git directory: `clean -fd`
 //!   no longer reads the operator's `info/exclude` or `core.excludesFile`;
 //!   there is no per-worktree reflog; SHA-256 repositories and filter-driven

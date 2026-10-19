@@ -464,7 +464,7 @@ mod production_path_tests {
 
     fn manager() -> (Arc<SessionManager>, TempDir) {
         let directory = TempDir::new().expect("temporary directory");
-        let store = Store::open(&directory.path().join("rsi.db")).expect("store");
+        let store = Store::open_test_fixture(&directory.path().join("rsi.db")).expect("store");
         let runtime_config = RuntimeConfig::from_config(&Config::from_env());
         let manager = SessionManager::new(
             Arc::new(EventBus::new(32)),

@@ -13,9 +13,10 @@ use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::agent_deploy::{
     AgentRequestDeployReceiptV1, AgentRequestDeployRequestV1, DEPLOY_CANCELLED,
     DEPLOY_CAPABILITY_REQUIRED, DEPLOY_EXECUTE_REQUIRED, DEPLOY_NEEDS_SUPERVISOR,
-    DEPLOY_NOT_AUTHORIZED, skipped_binaries,
+    DEPLOY_NOT_AUTHORIZED, DeployState, skipped_binaries,
 };
 use rsi_common::harness_manager_v2::ManagerCapabilityV2;
+use rsi_common::rolling_queue::DeployQaWarningV1;
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteUuidV1};
 use rsi_common::satellite_dispatch::{SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeployRequestV1};
 use std::sync::Arc;
@@ -30,6 +31,10 @@ fn receipt(
     AgentRequestDeployReceiptV1 {
         interrupt_workers: interrupt.requested,
         interrupted_workers: interrupt.interrupted,
+        job_grace_secs: interrupt
+            .requested
+            .then_some(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS),
+        cancelled_jobs: interrupt.cancelled_jobs,
         deploy_id: row.id,
         state: row.state,
         sha: row.sha.clone(),
@@ -38,7 +43,30 @@ fn receipt(
         skipped: skipped_binaries(&row.manifest),
         replayed,
         reason: row.reason.clone(),
+        blockers: Vec::new(),
+        waiting_since: None,
+        qa_warnings: Vec::new(),
     }
+}
+
+/// #2056: the receipt of a deploy that may still be waiting, with what holds
+/// its quiet point read live (the deploy owner's way to ask "why staged?").
+pub(crate) fn receipt_with_blockers(
+    store: &Store,
+    row: &DeployRow,
+    interrupt: DeployInterrupt,
+    replayed: bool,
+) -> Result<AgentRequestDeployReceiptV1> {
+    let mut receipt = receipt(row, interrupt, replayed);
+    if row.state == DeployState::Staged
+        && let Some(owner) = row.owner_session_id
+    {
+        receipt.blockers = store.deploy_quiet_blocker_details_with(owner, true)?;
+        receipt.waiting_since = store
+            .agent_deploy_created_at(row.id)?
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Nanos, true));
+    }
+    Ok(receipt)
 }
 
 impl AgentControlHandle {
@@ -79,20 +107,32 @@ impl AgentControlHandle {
             let store = self.store.lock().await;
             authorize_deploy(&store, caller, request.project_id)?
         };
-        if request.is_cancel() {
-            return self.cancel_owned_deploy(caller, &request, now).await;
+        if request.is_cancel() && request.peer_id.is_none() {
+            return self
+                .cancel_owned_deploy(caller, &request, now, false, None)
+                .await;
         }
         if let Some(peer) = request.peer_id {
-            return self
+            let (sha, project, cancel) =
+                (request.sha.clone(), request.project_id, request.is_cancel());
+            let mut receipt = self
                 .request_satellite_deploy(caller, &request, peer.0, satellite_root)
-                .await;
+                .await?;
+            // #2772: a satellite deploy of a SHA the hub's latest full-library
+            // green does not cover warns exactly like a hub deploy; a cancel
+            // deploys nothing and warns of nothing.
+            if !cancel {
+                receipt.qa_warnings = self.deploy_qa_warnings(caller, project, &sha, now).await;
+            }
+            return Ok(receipt);
         }
         let authority = DeployAuthority {
             caller,
             project_id: request.project_id,
             fence: admitted,
         };
-        stage_owned_deploy(
+        let (sha, project) = (request.sha.clone(), request.project_id);
+        let mut receipt = stage_owned_deploy(
             &self.store,
             caller,
             None,
@@ -100,26 +140,109 @@ impl AgentControlHandle {
             service,
             now,
             Some(&authority),
+            self.deploy_drain
+                .as_deref()
+                .zip(self.runtime_config.as_deref()),
         )
+        .await?;
+        receipt.qa_warnings = self.deploy_qa_warnings(caller, project, &sha, now).await;
+        Ok(receipt)
+    }
+
+    /// #2743: a deploy of a SHA that the latest full-library-green SHA does
+    /// not cover is accepted with a `not_qa_green` warning that names the
+    /// project's open `qa` Issues; it is never refused, and never silent. A
+    /// failed read of the health is logged and adds nothing: the deploy is the
+    /// manager's call, the warning is information.
+    async fn deploy_qa_warnings(
+        &self,
+        caller: Uuid,
+        project: Option<Uuid>,
+        sha: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<DeployQaWarningV1> {
+        let (health, repo) = {
+            let store = self.store.lock().await;
+            let project = project.or_else(|| {
+                store
+                    .get_session(caller)
+                    .ok()
+                    .flatten()
+                    .and_then(|session| session.project_id)
+            });
+            let Some(project) = project else {
+                return Vec::new();
+            };
+            let health = match store.rolling_health_for_project(project, now) {
+                Ok(health) => health,
+                Err(error) => {
+                    tracing::warn!(%project, %error, "deploy qa warning unavailable");
+                    return Vec::new();
+                }
+            };
+            let repo = store
+                .get_project(project)
+                .ok()
+                .flatten()
+                .and_then(|project| project.path);
+            (health, repo)
+        };
+        let ancestry = {
+            let sha = sha.to_string();
+            move |green: &str| {
+                repo.as_deref().is_some_and(|repo| {
+                    crate::rolling_queue::source_descends_from(
+                        std::path::Path::new(repo),
+                        &sha,
+                        green,
+                    )
+                })
+            }
+        };
+        // `git` runs outside the store lock (above) and off the async threads.
+        let sha = sha.to_string();
+        tokio::task::spawn_blocking(move || {
+            DeployQaWarningV1::for_deploy(&sha, &health, ancestry)
+                .into_iter()
+                .collect()
+        })
         .await
+        .unwrap_or_default()
     }
 
     /// #1320/#1311: cancel the caller's own waiting deploy. It settles
     /// `failed` with `deploy_cancelled`, its staged copies are removed and its
     /// hold on new launches ends at once.
-    async fn cancel_owned_deploy(
+    pub(crate) async fn cancel_owned_deploy(
         &self,
         caller: Uuid,
         request: &AgentRequestDeployRequestV1,
         now: DateTime<Utc>,
+        require_waiting: bool,
+        scope: Option<&[Uuid]>,
     ) -> Result<AgentRequestDeployReceiptV1> {
         request
             .validate()
             .map_err(|code| DaemonError::InvalidParam(code.into()))?;
         let (row, interrupt) = {
             let store = self.store.lock().await;
-            let row =
-                store.cancel_agent_deploy(caller, &request.idempotency_key, &request.sha, now)?;
+            let row = if let Some(scope) = scope {
+                store.cancel_scoped_agent_deploy_if_waiting(
+                    scope,
+                    &request.idempotency_key,
+                    &request.sha,
+                    now,
+                )?
+            } else if require_waiting {
+                store.cancel_agent_deploy_if_waiting(
+                    caller,
+                    &request.idempotency_key,
+                    &request.sha,
+                    now,
+                )?
+            } else {
+                store.cancel_agent_deploy(caller, &request.idempotency_key, &request.sha, now)?
+            };
             let interrupt = store.agent_deploy_interrupt(row.id)?;
             (row, interrupt)
         };
@@ -159,7 +282,7 @@ impl AgentControlHandle {
                 && config.read_enabled
                 && config.dispatch_enabled
                 && config.expected_installation_id.is_some())
-                || store.satellite_peer_scope(peer_id)?.is_empty()
+                || !store.hub_peer_declares_scope(peer_id)?
             {
                 return Err(refused());
             }
@@ -179,6 +302,10 @@ impl AgentControlHandle {
                 binaries_dir: request.binaries_dir.clone().unwrap_or_default(),
                 idempotency_key: request.idempotency_key.clone(),
                 max_wait_secs: request.max_wait_secs,
+                // An explicit `false` asks for nothing: send no field, so an
+                // older satellite that denies unknown fields keeps working.
+                interrupt_workers: request.interrupts_workers().then_some(true),
+                cancel: request.cancel,
             };
             (crate::satellite::hub::registry_peer(value), wire)
         };
@@ -208,6 +335,10 @@ pub(crate) async fn stage_owned_deploy(
     service: &DeployService,
     now: DateTime<Utc>,
     authority: Option<&DeployAuthority>,
+    hold: Option<(
+        &crate::deploy_drain::DeployDrain,
+        &crate::config::RuntimeConfig,
+    )>,
 ) -> Result<AgentRequestDeployReceiptV1> {
     let live_schema = store.lock().await.schema_user_version()?;
     request
@@ -234,7 +365,7 @@ pub(crate) async fn stage_owned_deploy(
         };
         if let Some(row) = replay {
             let interrupt = store.agent_deploy_interrupt(row.id)?;
-            return Ok(receipt(&row, interrupt, true));
+            return receipt_with_blockers(&store, &row, interrupt, true);
         }
         if !service.is_supervised() {
             return Err(DaemonError::PolicyDenied(DEPLOY_NEEDS_SUPERVISOR.into()));
@@ -289,14 +420,21 @@ pub(crate) async fn stage_owned_deploy(
         now,
     );
     match inserted {
-        Ok(row) => Ok(receipt(
-            &row,
-            DeployInterrupt {
-                requested: interrupt_workers,
-                interrupted: Vec::new(),
-            },
-            false,
-        )),
+        Ok(row) => {
+            if let Some((drain, config)) = hold {
+                crate::deploy::engage_hold_at_stage(&store, &row, drain, config, now)?;
+            }
+            receipt_with_blockers(
+                &store,
+                &row,
+                DeployInterrupt {
+                    requested: interrupt_workers,
+                    interrupted: Vec::new(),
+                    cancelled_jobs: Vec::new(),
+                },
+                false,
+            )
+        }
         Err(error) => {
             remove_staged(&staged, id);
             Err(error)
@@ -390,3 +528,6 @@ fn diagnose(store: &crate::store::Store, caller: Uuid) -> &'static str {
         _ => DEPLOY_NOT_AUTHORIZED,
     }
 }
+
+#[path = "satellite_manager_policy_verb.rs"]
+mod satellite_manager_policy_verb;

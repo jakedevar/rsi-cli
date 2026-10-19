@@ -44,6 +44,7 @@ impl SessionManager {
         let boot = self.program_run_boot_id;
         tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
+            store.cleanup_ended_provider_turn_spools()?;
             let mut claimed = HashMap::new();
             for mut row in store.list_active_provider_turn_custody()? {
                 // A bad spool or a lost claim belongs to this turn alone. Keep

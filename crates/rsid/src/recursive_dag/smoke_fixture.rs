@@ -254,7 +254,7 @@ pub fn generate_smoke_fixture(options: SmokeFixtureOptions) -> Result<SmokeFixtu
         ));
     }
 
-    let store = Store::open(&paths.output_db)?;
+    let store = Store::open_test_fixture(&paths.output_db)?;
     if let Some(summary) = load_existing_fixture_summary(
         &store,
         &paths,
@@ -1725,7 +1725,7 @@ mod tests {
         );
         assert!(first.ids.live_dogfood_graph_id.is_none());
 
-        let store = Store::open(&dir.path().join("fixture.db")).expect("open fixture");
+        let store = Store::open_test_fixture(&dir.path().join("fixture.db")).expect("open fixture");
         assert!(
             store
                 .get_recursive_task_graph(deterministic_ids().live_dogfood_graph_id)
@@ -1887,7 +1887,7 @@ mod tests {
             .ids
             .live_dogfood_graph_id
             .expect("live dogfood graph id");
-        let store = Store::open(&dir.path().join("fixture.db")).expect("open fixture");
+        let store = Store::open_test_fixture(&dir.path().join("fixture.db")).expect("open fixture");
         let graph = store
             .get_recursive_task_graph(live_graph_id)
             .expect("live graph read")
@@ -1950,7 +1950,7 @@ mod tests {
             "upgrade should persist a refreshed fixture marker"
         );
 
-        let store = Store::open(&dir.path().join("fixture.db")).expect("open fixture");
+        let store = Store::open_test_fixture(&dir.path().join("fixture.db")).expect("open fixture");
         require_live_dogfood_graph(&store, live_graph_id).expect("live graph valid");
 
         let sidecar = std::fs::read_to_string(dir.path().join("recursive-dag-smoke-fixture.json"))
@@ -1974,7 +1974,7 @@ mod tests {
     fn recursive_dag_smoke_fixture_copies_source_without_mutating_it() {
         let source_dir = tempfile::tempdir().expect("source tempdir");
         let source_db = source_dir.path().join("source.db");
-        Store::open(&source_db).expect("seed source schema");
+        Store::open_test_fixture(&source_db).expect("seed source schema");
         let before = sha256_file(&source_db).expect("source hash before");
 
         let output_dir = tempfile::tempdir().expect("output tempdir");

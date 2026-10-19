@@ -37,7 +37,8 @@ cleanup() {
         fi
     fi
     if [[ -n $scratch_worktree ]]; then git worktree remove --force "$scratch_worktree" >/dev/null 2>&1 || :; fi
-    for dir in "${temp_dirs[@]}"; do
+    # bash < 4.4 (macOS /bin/bash 3.2) treats an empty "${a[@]}" as unbound under set -u.
+    for dir in ${temp_dirs[@]+"${temp_dirs[@]}"}; do
         if (( preserve_backup )) && [[ $dir == "$transaction_backup" ]]; then continue; fi
         rm -rf -- "$dir"
     done
@@ -63,6 +64,12 @@ worktree_namespace() {
     branch=${branch//[^A-Za-z0-9._-]/_}
     [[ -n $branch ]] || branch="_detached"
     printf 'refs/rsi-stash/%s-%s' "$branch" "$hash"
+}
+
+# Copy $1 over $2 replacing any existing destination (GNU `cp --remove-destination`
+# is unavailable on BSD/macOS cp).
+copy_replace() {
+    rm -f -- "$2" && cp -a -- "$1" "$2"
 }
 
 # Return the three trees in globals. Temporary indexes leave the caller's index intact.
@@ -117,7 +124,7 @@ rollback_paths() {
                 rmdir -- "$destination" 2>/dev/null || failed=1
             fi
             mkdir -p "$(dirname "$destination")" || failed=1
-            cp -a --remove-destination -- "$original" "$destination" || failed=1
+            copy_replace "$original" "$destination" || failed=1
         elif [[ -d "$transaction_backup/dirs/$path" ]]; then
             if [[ -e $destination || -L $destination ]]; then
                 rm -f -- "$destination" || failed=1
@@ -159,7 +166,7 @@ mirror_paths() {
                 rmdir -- "$destination" || fail "preflight path is a nonempty directory: $path"
             fi
             mkdir -p "$(dirname "$destination")"
-            cp -a --remove-destination -- "$root/$path" "$destination"
+            copy_replace "$root/$path" "$destination"
         elif [[ -e $destination || -L $destination ]]; then
             rm -f -- "$destination"
         fi
@@ -200,7 +207,9 @@ case $command in
             parents+=(-p "$untracked_commit")
         fi
         sha=$(printf '%s\n' "$message [$namespace]" | git commit-tree "$worktree_tree" "${parents[@]}")
+        # BSD date prints a literal N for %N; fall back to $RANDOM so refs stay unique.
         timestamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+        case $timestamp in *N*) timestamp=$(date -u +%Y%m%dT%H%M%S).$RANDOM$RANDOM$$Z ;; esac
         git update-ref "$namespace/$timestamp" "$sha" ""
 
         # Ref first; reject a changed source before any worktree mutation.

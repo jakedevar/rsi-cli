@@ -46,6 +46,181 @@ This is the Slice 8 descriptor and stamping substrate only. Slice 9 mount
 namespace containment and the Cargo guard are not yet claimed; environment
 stamping alone does not contain absolute `/tmp` writes or command overrides.
 
+## Warm target pool (#1741)
+
+Every sandbox builds in its own `<sandbox>/target`; no two sandboxes share a
+target directory. What they share is compiled work: a new worker sandbox's
+empty target is seeded from a *pool*, one clean `cargo test --workspace
+--no-run` of one commit, and Cargo's fingerprints then rebuild only the crates
+whose sources differ from that commit.
+
+- **Mechanism.** At a worker launch whose target is still empty, the daemon
+  runs `~/.rsi/bin/target-pool seed --sandbox <root> --build-missing` (installed
+  by `make release-install` from `scripts/target-pool`) with exactly the build
+  settings it stamps on the session. The seeder picks the nearest ready pool
+  whose commit is the sandbox `HEAD` or an ancestor (at most 200 commits back),
+  fills the target in ~1 s, and, when no pool is at `HEAD`, starts one pool
+  build for it as a detached `systemd-run` unit through `cargo-slot`. Pools
+  live in `~/.rsi/target-pool/<repo>/<sha>-<key>/` (a detached worktree plus
+  its `target/`); a builder keeps the newest two per repository and refuses to
+  build with less than 40 GiB free (`RSI_TARGET_POOL_MIN_FREE_GIB`). A seed
+  that fails, times out (120 s) or finds no pool leaves the target empty and
+  the session builds cold, as before. A `no pool` result carries its `reason`
+  (no ready pool for the build key, no ready pool is an ancestor of `HEAD`, or
+  the nearest ancestor is N commits behind the limit, with `nearest_pool`), and
+  `build` reads `skipped: only X GiB free (< floor)` when the free-space floor
+  would stop the pool build; the daemon logs the line as `warm target pool seed`.
+- **Incremental pool builds.** Before building, a new pool seeds its target
+  from the nearest ready ancestor with the same build key (at most 200 commits
+  back; `build --max-distance` overrides the limit). It uses the same safe
+  links, copies, manifest-path exclusions and source mtime rules as worker
+  seeding. With no matching ancestor it builds cold. The pool record's `seed`
+  reports the ancestor SHA, distance, file counts and seeding time, or `null`
+  for a cold build; `build_seconds` includes seeding.
+  Submit the `target-pool-build` durable job recipe to build the sandbox's HEAD
+  and measure CPU usage from its systemd unit accounting on Linux.
+- **Key.** A pool is used only by a sandbox that builds the same way: the key
+  hashes `rustc -vV` (the commit's toolchain), `CARGO_INCREMENTAL`, every
+  `CARGO_PROFILE_*` variable and the rustc flag variables.
+- **No clobbering, by construction.** Library outputs (`.rlib`, `.rmeta`)
+  are hard links; rustc replaces them by rename. Executables, `.dwo` and `.so`
+  are written in place by the linker, so they are hard links only behind
+  `rsi-build-rustc` (`RUSTC_WRAPPER`), which unlinks a unit's shared or
+  read-only outputs before compiling; the pool marks them read-only, so a build
+  without the wrapper stops (`not writeable` / `IO failure on output stream`)
+  instead of writing into another sandbox's file. Fingerprints, dep-info and
+  build-script output are copied. `scripts/tests/test_target_pool.py` builds
+  two sandboxes on different commits from one pool concurrently and checks the
+  pool's bytes are unchanged.
+- **Relocation.** Cargo does not rebuild a unit when `CARGO_MANIFEST_DIR`
+  changes, so a unit that read it at compile time would keep reading the
+  pool's checkout. The seeder rebuilds every unit whose rustc dep-info records
+  that variable, and workspace code uses `rsi_common::manifest_dir!()` (resolved
+  at run time) or a file-relative `include_str!` instead
+  (`crates/rsi-common/tests/manifest_dir_guard.rs`). Build scripts emit
+  package-relative `rerun-if-changed` paths. Tracked files identical to the
+  pool commit get an old mtime and every other file the current time, so Cargo
+  rebuilds exactly the crates that changed.
+- **Same settings everywhere.** The daemon records the settings it stamps in
+  `<sandbox>/.rsi-build-env.json`, outside Cargo's disposable `target` tree so
+  a full `cargo clean` preserves them; `AgentSubmitJob` units read it back
+  (`--setenv`), `scripts/scoped-test` passes them to its unit, and `cargo-slot`
+  runs its command as a child. A build in any of them reuses the shell's
+  artifacts instead of writing a second set. Sessions launched before this
+  layout still use their target-local record until their next launch stamps
+  the persistent record.
+- **If a seeded build fails** with `not writeable` or `IO failure on output
+  stream`, something built without the stamped `RUSTC_WRAPPER`: restore it, or
+  `rm -rf target` and build cold. Inspect pools with `target-pool status`,
+  trim them with `target-pool gc --keep N`; deleting a pool never breaks a
+  seeded sandbox (its links keep the bytes).
+- **Stale pools and refresh (#2707).** A seed refuses a pool more than 200
+  commits behind its HEAD. `target-pool gc` therefore also removes any ready
+  pool more than `--max-distance` (200) commits behind `--ref` (`origin/rolling`;
+  `--ref ""` turns it off), whatever the keep count; a pool a seed is reading is
+  still skipped. A stale pool otherwise held its disk below the build floor, so
+  no fresh pool could ever be built. `target-pool refresh` then starts a detached
+  build (in `rsi-build.slice`, only above the free-space floor) at the rolling tip
+  when no pool is within half the seed distance of it, using the checkout recorded
+  in the pool directory's `repo-path`. The daemon runs both after every sandbox
+  reclaim pass (startup, so after a deploy, and periodic; refresh is skipped under
+  disk pressure), on the hub and on a satellite alike.
+- **Pool failures.** `target-pool status --repo <sandbox>` reports a failed
+  build's exit code, persistent `log_path` and bounded `error_tail`. Later
+  launches include that record as `build_failure` in the seed summary, even
+  while the retry cooldown prevents another build. Logs live beside the pool
+  records and are removed with their pool. The detached unit discards launch
+  temporary-directory settings; the builder uses short private disk scratch
+  so sccache's separate startup socket fits the Unix socket path limit.
+- **Global target dir.** `~/.cargo/config.toml` `build.target-dir` (one target
+  for every checkout) is unsafe for concurrent checkouts on different commits
+  and is unnecessary now; sessions override it with `CARGO_TARGET_DIR`. Remove
+  that line on the host (the operator applies it; it is outside the repo).
+- **Release builds (#938).** `scripts/install-release.sh` still guards a shared
+  target (`scripts/release-target-guard.sh`): it records the worktree that last
+  built `release/` (`release/.rsi-release-source`), removes every workspace
+  crate's release artifacts before a build from another worktree, checks that
+  the built rsid embeds this checkout's commit (`rsid --build-info`), and
+  `--link-only` refuses binaries this worktree did not build from its current
+  sources: HEAD plus a git tree fingerprint of uncommitted edits and new files
+  (#2179; `--allow-foreign-build` overrides). Before any cleanup it repoints
+  installed links that resolve into `release/` (`~/.local/bin`, each worktree's
+  `target/release`) at kept copies in `~/.rsi/install-kept` (pruned once no
+  installed or recorded link resolves to them, #2188), and `--tui-only`
+  links a stable copy in `~/.rsi/install` (#2180). `scripts/install-desktop.sh`
+  sources the same guard with its own record (`release/.rsi-desktop-source`) and
+  cleans only the `rsi-desktop` crate (#2177); `scripts/build-aws-artifacts.sh`
+  packages the target directory cargo reports, not `./target`; and
+  `scripts/scoped-test` skips a tmpfs scratch parent that leaves this user under
+  12 GiB, quota included (`RSI_SCOPED_TEST_TMPFS_MIN_GB`). Landers build each side in its own
+  `<worktree>-cargo-target`; `cargo-slot` never changes `CARGO_TARGET_DIR` and
+  puts a lander's `TMPDIR` on `/dev/shm` only when this user's block quota
+  there (systemd: 80% of the mount) still leaves 12 GiB.
+
+### Small hosts and peer pools (#1884)
+
+**Free-space floors scale with the disk.** `sandbox_min_free_gib` (Settings,
+"Minimum free space (GiB)") is the one operator setting; it is an absolute
+number, tuned on the 775 GiB hub, so the daemon caps the floor it enforces at
+25% of the filesystem holding the sandbox base
+(`sandbox::effective_min_free_bytes`). A 60 GiB setting is 60 GiB on the hub and
+48 GiB on a 192 GiB laptop; 30 stays 30; 0 stays 0. A refusal reports the
+effective `min_free_bytes`, the `configured_min_free_bytes` and `total_bytes`,
+and `GetHealthStatus.launch_floor` reports the effective floor and its margin.
+`target-pool` applies the same cap to `RSI_TARGET_POOL_MIN_FREE_GIB` (40), so a
+small host builds and seeds pools with the headroom it can afford. Any
+automatic-settlement threshold (#1879) must read the effective floor, not the
+raw setting.
+
+**Seed a peer's pool instead of building cold.**
+`target-pool seed-from <host> --repo <checkout>` picks the newest *ready* pool on
+`<host>` with the same build key (same `rustc -vV` and build settings) whose
+commit this checkout has, streams its `target/` as `tar | zstd` over ssh
+(hard links, modes and mtimes survive; no rsync needed, the laptop has none),
+and registers it as a local ready pool with `seeded_from` in its record. The
+detached worktree is not copied, so the pool serves as a seed source only. It
+refuses when free space is below the floor or the transfer would leave under
+5 GiB (`--min-headroom-gib`). `--dry-run` prints the plan (pool, commit, size).
+`RSI_TARGET_POOL_SSH` overrides the ssh command (tests use a shim).
+It follows the pool protocol of #1882: it holds the build lock and the pool's
+exclusive `.use` lock while it fills the directory (a concurrent `gc` skips the
+pool), and publishes the marker last, atomically, with `size_bytes`, so no
+reader or `gc` sees a half-copied pool; `gc` then counts a seeded pool like any
+other (by `built_at`, kept by `--keep`).
+
+Measured 2026-10-12 (hub pool `aeff3e99`, laptop 192 GiB disk, 32 threads,
+tailnet): the pool is 11.1 GB on disk in 6.7 k files (2.5 k hard-linked), 2.3 GB
+as a zstd-3 stream (8 s to compress locally). Streaming it to the laptop and
+unpacking the listing took **36 s (about 64 MB/s on the wire)**. A cold pool
+build of the same commit took 185 s on the hub, with every core busy competing
+with QA. Seeding is about 5x faster, uses almost no CPU on the receiver, and
+leaves the same 11 GB footprint, so seed when a peer's pool is within
+`--max-distance` commits of your HEAD and build locally only when no peer has a
+matching key. Re-seed after the hub builds a newer pool; the second pool
+replaces the oldest (`--keep 2`).
+
+**Runbook (peer seat enabling the warm pool).**
+
+1. Pull the landed commit and `make release-install` (installs the new
+   `target-pool` and restarts rsid). Confirm `~/.rsi/bin/target-pool seed-from
+   --help` exists.
+2. Record the starting point: `df -h ~`.
+3. Settle merged sandboxes before the seed: run the sandbox storage reclaim
+   (`RunSandboxBuildCacheReclaim` preview, then actual) and the worktree
+   settlement the daemon offers (#1879 when landed). The seed needs the floor
+   plus the 11 GB pool.
+4. Set the floor for the host in Settings > "Minimum free space (GiB)" (60 is
+   fine on the laptop: it is capped to 48). Leave the cache pressure watermarks
+   at their percentages; they already scale with the disk.
+5. Seed: `scripts/target-pool seed-from <hub-host> --repo ~/rsi --dry-run`, then
+   without `--dry-run`. If it exits 2 (no matching key), compare
+   `target-pool key --repo ~/rsi` on both hosts (a differing `rustc -vV` or
+   `CARGO_*` setting is the cause) and fall back to a local build:
+   `target-pool build --repo ~/rsi`.
+6. Check the next worker or QA pin seeds: `target-pool status`, then a sandbox
+   `seed` reports `result: seeded`.
+7. Record `df -h ~` after, and the transfer's `seconds`, in the Issue.
+
 ## Controls
 
 Open Settings and use the Daemon Features section. The six persisted controls
@@ -113,7 +288,7 @@ The Sandbox storage row has five process-local states:
 Under disk pressure the appointed manager can use the same status and reclaim
 instead of removing caches by hand, when the operator grants it `StorageControl`
 in the manager policy (`:manager policy`, "Grant Storage control"; off by
-default). The manager calls `GetSandboxStorageStatus` or
+default, but the Full project control preset includes it). The manager calls `GetSandboxStorageStatus` or
 `RunSandboxBuildCacheReclaim` (`{"dry_run": true|false}`) through
 `AgentManagerControl` `operator_call`; both need Execute mode and an unpaused
 policy, run under the configured watermarks and limits, and are journaled like
@@ -124,6 +299,47 @@ Generations fence completions, so an older automatic preview cannot overwrite a
 newer operator action or its post-action result. These states and observation
 times are not persisted and introduce no daemon cache or wire contract. Every
 `GetSandboxStorageStatus` remains a fresh dry-run preview.
+
+### After a worker finishes: its own `target/` (#158)
+
+A worker or reviewer has no cleanup control for its own `target/`, and none is
+needed once you finish: do not delete it by hand (`rm -rf target`, a rename or
+a path-checked cleanup repeats the daemon's custody, Git, job and consumer checks without its
+descriptor pinning). Verify, commit, publish the handoff and end the turn. Once
+the session is terminal the daemon's startup/periodic pass (and the pressure
+lane for a session that finished after the sweep cursor passed, #2682) reclaims
+only the authenticated `target/`; the source worktree, branch and custody row
+stay. To ask for one bounded pass sooner, the operator calls
+`RunSandboxBuildCacheReclaim` (`{"dry_run": true}` first, then
+`{"dry_run": false}`) directly, and a manager with `StorageControl` calls it
+through `AgentManagerControl` `operator_call`; `GetSandboxStorageStatus` is
+reached the same two ways. The direct storage RPCs reject session-attributed
+callers and are not native agent verbs; only the manager wrapper is open to a
+session. A pass takes the next bounded page of candidates, not a named session.
+
+Eligibility is not immediate, and a kept `target/` is not a lifecycle failure:
+
+- **Idle TTL.** Outside pressure a candidate must be idle for the reclaim TTL
+  (default 6 hours). Inside the TTL it is still reclaimed when the worktree's
+  `HEAD` is already an ancestor of `refs/remotes/origin/rolling`, or the
+  session's newest merge-queue entry is `published` (#1684); otherwise the
+  attempt reports `idle_below_ttl`. Under disk pressure the TTL is bypassed,
+  but an unparseable timestamp and every check below still refuse.
+- **Live consumers** keep the target: `running_job` (a `queued` or `running`
+  daemon job owned by the session or running inside its sandbox),
+  `enabled_wake`, `restart_intent`, `manager_seat`, `manager_current_session`,
+  `process_uses_sandbox:<pid>` and a held cargo lock. They clear on their own
+  and the next pass retries; a session that parks on a job or wake therefore
+  keeps its target.
+- **Source safety.** The target is removed only after the sandbox root,
+  Git top level, branch, source-commit ancestry, common dir and worktree
+  registration still authenticate (`source_commit_not_ancestor` and the other
+  Git checks below). Unknown top-level entries keep the whole tree
+  (`target_unrecognized_content`, see below).
+
+Neither the periodic pass nor the preview promises a reclaim time or freed
+bytes: dry-run reports `eligible_candidates` without a capacity estimate, and
+only `reclaimed_bytes` from an actual pass is a measurement.
 
 ### Refusals are named (#1575)
 
@@ -139,6 +355,12 @@ include `git_toplevel_mismatch`, `git_branch_mismatch`, `source_commit_not_ances
 `process_uses_sandbox:<pid>` and `process_scan_unreadable:<pid>`. A reason with
 no finer check reports its own name (`target_absent`).
 
+`process_scan_unreadable:<pid>` fails closed only for an RSI-unit process whose
+`/proc/<pid>` entry stays unreadable. The scan covers every process of the user,
+and one caught mid-`exec` (or being torn down) can read as unreadable for a
+moment, so each unreadable entry is re-read three times, 10 ms apart, before the
+candidate is refused (#2163). A process that exits meanwhile is simply gone.
+
 A candidate withheld by a live consumer is counted too (`live_consumer`): it
 spent page budget like any other row.
 
@@ -148,7 +370,9 @@ The whole-target staging protocol moves the tree, so it runs only on a tree of
 Cargo output and RSI scratch: `debug`, `release`, `doc`, `package`, `tmp`,
 `cargo-timings`, `criterion`, `dhat`, `.rustc_info.json`, `CACHEDIR.TAG`,
 `.cargo-lock`, `.future-incompat-report.json`; the daemon's execution scratch
-(`.rsi-tmp`, the sandbox `TMPDIR`, present in every sandbox target); and the
+(`.rsi-tmp`, the sandbox `TMPDIR`, present in every sandbox target), its
+legacy build-settings record `.rsi-build-env.json` and the warm pool's seed marker
+`.rsi-target-pool.json` (#1741); and the
 repository's test-runner output (`rsid-test-shards`, `.rsid-test-shards.lock`
 and any `*-fixtures` directory). Entry types are exact: a symlink or special
 file never matches. Any other top-level entry may be a manager's or operator's
@@ -502,3 +726,37 @@ are all bounded and a large tree ends as `partial` rather than overrunning.
 `margin_bytes` above the `sandbox_min_free_gib` launch floor) and
 `agent_scratch_reclaim` (the last pass). Workers should still remove their own
 scratch before they finish.
+
+## Manager and legacy build targets (#1864, #1218)
+
+Worker and reviewer builds stay in their daemon-designated sandbox `target/`,
+including jobs: Cargo config cannot redirect a job outside that target. Do not
+assign ad-hoc `CARGO_TARGET_DIR` paths under `.cargo`, `.cache`, `staging` or
+`review-targets`.
+
+Submit manager integration builds through `AgentSubmitJob` with `worktree`.
+The daemon creates a registered target under
+`~/.rsi/build-targets/rsi-build-<hash-of-canonical-worktree-path>` and writes its
+path to the job log's `rsi-build-target` line. Different integration source paths
+remain isolated. Manager release builds use #1218's persistent
+`~/.rsi/staging/release-target` instead, serialized under its existing admission
+lock and bounded by its 16 GiB cap. The job inherits the
+manager sandbox's build settings; the existing sccache setting now applies to
+manager seats as well as workers, with incremental compilation disabled when
+sccache is available. Release output persists after settlement; only the job's
+private TMPDIR is removed. Registry allocation requires filesystem birth-time
+proof; a platform that cannot supply it refuses manager scratch allocation.
+The generic scratch sweep excludes #1218's `staging/release-target`: its own
+size-cap/reclaim path preserves the lock inodes between builds.
+
+The existing scratch sweep discovers these targets and the known legacy roots:
+`~/.rsi/mgr/*/target`, `review-targets/*`, `review-target-*`, `koplik-mgr/target`,
+`staging/*-target`, `cloud/artifact-target`, `.cargo/target-integ`, `target-integ2`,
+`sat-target-deploy`, `shared-target`, and `.cache/{rsi,koplik}-review-*`.
+Unrecorded targets are retained. The operator can inspect and adopt them through
+the existing Settings > Scratch reclaim view and its RPCs; adoption records
+provenance and deletes nothing. The sweep's existing three-day idle rule and
+complete holder, mount, Git and deletion-manifest proofs apply. Unknown target
+entries, symlinks, dirty nested worktrees and live consumers keep the target.
+Only Cargo output is eligible: manager seat files and source trees stay outside
+the allocation. No new setting or migration is introduced.

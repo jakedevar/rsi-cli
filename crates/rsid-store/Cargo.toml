@@ -25,13 +25,15 @@ tracing = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
 nix = { workspace = true }
-rusqlite = { workspace = true, features = ["load_extension", "functions", "blob", "hooks"] }
+rusqlite = { workspace = true, features = ["load_extension", "functions", "blob", "hooks", "backup"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 anyhow = "1"
 async-trait = "0.1"
 reqwest = { workspace = true }
 futures = { workspace = true }
 sha2 = "0.10"
+# #2384: cold-archive chunks are zstd frames (bundled C, builds on Linux/macOS/Windows).
+zstd = { version = "0.13", default-features = false }
 zeroize = "1"
 hex = "0.4"
 walkdir = "2"

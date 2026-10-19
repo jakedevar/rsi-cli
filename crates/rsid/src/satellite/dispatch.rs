@@ -3,10 +3,11 @@
 //! Runs after the registry tick, never as its own socket loop. A queued row is
 //! sent only while its peer is enabled, paired, read- and dispatch-enabled and
 //! the target is still in the operator-declared scope. Before every send the
-//! hub re-verifies the remote identity and reads the target's status fresh; a
-//! session that is not idle keeps the row queued until it expires. The
-//! satellite is the final arbiter: it re-checks its own policy and idleness and
-//! never interrupts a running session.
+//! hub re-verifies the remote identity and reads the target's status fresh. A
+//! running target is not waited on (#2566): the satellite queues the message
+//! for the target's next tool or turn boundary. An interrupted target keeps
+//! the row queued until it expires. The satellite is the final arbiter: it
+//! re-checks its own policy and never interrupts a running session.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,8 +20,9 @@ use rsi_common::satellite::SATELLITE_WIRE_VERSION_V1;
 use rsi_common::satellite::SatelliteUuidV1;
 use rsi_common::satellite_dispatch::{
     SATELLITE_BUSY, SATELLITE_MESSAGE_KEY_CONFLICT, SATELLITE_SENDER_LABEL_MAX_BYTES,
-    SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeliverOutcomeV1, SatelliteDeliverRequestV1,
-    satellite_launch_failure_class,
+    SATELLITE_TARGET_NOT_AUTHORIZED, SATELLITE_WAITING_PEER_UNREACHABLE,
+    SATELLITE_WAITING_REMOTE_BUSY, SatelliteDeliverOutcomeV1, SatelliteDeliverRequestV1,
+    find_remote_terminal, satellite_launch_failure_class,
 };
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
@@ -44,6 +46,33 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 pub(crate) struct DispatchState {
     next_try: HashMap<Uuid, Instant>,
+    notice_cursor: Option<Uuid>,
+    stall_cursor: Option<Uuid>,
+}
+
+/// Why a still-queued row was not delivered by the last attempt (#2566).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WaitReason {
+    /// The target cannot take the message now (interrupted, or a satellite
+    /// that answered `busy`).
+    RemoteBusy,
+    /// The target is failed, archived or deleted (#2744) and can take no turn
+    /// until it is repaired. Holds the satellite's typed
+    /// `remote_terminal|<status>|<stop reason>` token, stored whole.
+    RemoteTerminal(String),
+    /// The peer could not be reached or verified.
+    PeerUnreachable,
+}
+
+impl WaitReason {
+    /// The value stored as the row's transient wait reason.
+    pub(crate) fn stored(&self) -> &str {
+        match self {
+            Self::RemoteBusy => SATELLITE_WAITING_REMOTE_BUSY,
+            Self::RemoteTerminal(token) => token,
+            Self::PeerUnreachable => SATELLITE_WAITING_PEER_UNREACHABLE,
+        }
+    }
 }
 
 /// What one delivery attempt established.
@@ -55,8 +84,8 @@ pub(crate) enum DeliveryOutcome {
     /// cannot say whether it took effect. The row settles `failed` with
     /// `delivery_uncertain` and is never replayed (at most once, #1059).
     Uncertain,
-    /// Keep the row queued: the target is busy, or the peer is unreachable.
-    NotYet,
+    /// Keep the row queued, for the stated reason.
+    NotYet(WaitReason),
     /// A permanent refusal; the row settles `failed` with this class.
     Refused(&'static str),
 }
@@ -73,8 +102,12 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
 }
 
 fn classify_refusal(message: &str) -> DeliveryOutcome {
-    if message.contains(SATELLITE_BUSY) {
-        DeliveryOutcome::NotYet
+    // #2744: first, so a stop reason that happens to contain `busy` is never
+    // read as one.
+    if let Some(token) = find_remote_terminal(message) {
+        DeliveryOutcome::NotYet(WaitReason::RemoteTerminal(token.to_string()))
+    } else if message.contains(SATELLITE_BUSY) {
+        DeliveryOutcome::NotYet(WaitReason::RemoteBusy)
     } else if message.contains(SATELLITE_TARGET_NOT_AUTHORIZED) {
         DeliveryOutcome::Refused("target_not_authorized")
     } else if message.contains(SATELLITE_MESSAGE_KEY_CONFLICT) {
@@ -86,7 +119,7 @@ fn classify_refusal(message: &str) -> DeliveryOutcome {
     }
 }
 
-/// One custody-checked delivery. Errors and busy targets are `NotYet`.
+/// One custody-checked delivery. Errors and refused-busy targets are `NotYet`.
 pub(crate) async fn deliver_one(
     root: &Path,
     peer: &RegistryPeer,
@@ -106,25 +139,20 @@ pub(crate) async fn deliver_one(
         // snapshot, which carries no lineage. Absent and terminal targets are
         // therefore not judged here: the satellite resolves the declared
         // seat's current rotation tip (project-bound, unique, bounded) and
-        // answers `busy`, `target_not_authorized` or delivers. Only a seat
-        // the snapshot shows active or interrupted keeps the hub-side wait.
+        // answers `busy`, `target_not_authorized`, queues or delivers. Only a
+        // seat the snapshot shows interrupted keeps the hub-side wait.
         let snapshot_blocks = snapshot
             .sessions
             .iter()
             .find(|session| session.session_id.0 == target)
-            .is_some_and(|session| {
-                matches!(
-                    session.status,
-                    SessionStatus::Starting
-                        | SessionStatus::Running
-                        | SessionStatus::WaitingApproval
-                        | SessionStatus::Interrupted
-                )
-            });
+            .is_some_and(|session| matches!(session.status, SessionStatus::Interrupted));
         // Interrupted is not idle: hub mail waits (and may expire) rather
-        // than resuming a session the operator or a restart stopped.
+        // than resuming a session the operator or a restart stopped. A running
+        // target is NOT waited on (#2566): the satellite queues the message
+        // for its next tool or turn boundary, so a manager that is busy for an
+        // hour still gets the instruction.
         if snapshot_blocks {
-            return DeliveryOutcome::NotYet;
+            return DeliveryOutcome::NotYet(WaitReason::RemoteBusy);
         }
         let Ok(socket) = connect_owned_socket(root, &link.socket_path, RPC_DEADLINE).await else {
             continue;
@@ -154,7 +182,7 @@ pub(crate) async fn deliver_one(
                 identity.daemon_incarnation_id.0,
             ) != ContinuityResult::Matched
         {
-            return DeliveryOutcome::NotYet;
+            return DeliveryOutcome::NotYet(WaitReason::PeerUnreachable);
         }
         return match call_deliver_rpc(&mut rpc, request, RPC_DEADLINE).await {
             Ok(DeliverReply::Accepted(result)) => match result.outcome {
@@ -163,10 +191,10 @@ pub(crate) async fn deliver_one(
                 | SatelliteDeliverOutcomeV1::AlreadyDelivered => DeliveryOutcome::Delivered,
             },
             Ok(DeliverReply::Refused(message)) => classify_refusal(&message),
-            Err(_) => DeliveryOutcome::NotYet,
+            Err(_) => DeliveryOutcome::NotYet(WaitReason::PeerUnreachable),
         };
     }
-    DeliveryOutcome::NotYet
+    DeliveryOutcome::NotYet(WaitReason::PeerUnreachable)
 }
 
 /// Settle expired rows, then attempt each still-queued row once (paced).
@@ -180,6 +208,18 @@ pub(crate) async fn dispatch_round(
         if let Err(error) = guard.expire_satellite_messages(Utc::now()) {
             tracing::warn!("satellite dispatch: expiry settlement failed: {error}");
             return;
+        }
+        match guard.reconcile_satellite_message_notices(state.notice_cursor) {
+            Ok(cursor) => state.notice_cursor = cursor,
+            Err(error) => {
+                tracing::warn!("satellite dispatch: notice reconciliation failed: {error}")
+            }
+        }
+        match guard.notify_stalled_satellite_messages(Utc::now(), state.stall_cursor) {
+            Ok(cursor) => state.stall_cursor = cursor,
+            Err(error) => {
+                tracing::warn!("satellite dispatch: stalled-message notice failed: {error}")
+            }
         }
         match guard.queued_satellite_messages(ROUND_LIMIT) {
             Ok(rows) => rows,
@@ -201,12 +241,34 @@ pub(crate) async fn dispatch_round(
     }
 }
 
+/// The wire request for one queued row: the target travels with the project
+/// that authorized it (#1928), so the satellite checks the target against
+/// that project's live seat.
+pub(crate) fn deliver_request(
+    row: &QueuedSatelliteMessage,
+    hub_installation: Uuid,
+    sender_label: String,
+) -> SatelliteDeliverRequestV1 {
+    SatelliteDeliverRequestV1 {
+        wire_version: SATELLITE_WIRE_VERSION_V1,
+        message_id: row.id,
+        hub_installation_id: SatelliteUuidV1(hub_installation),
+        sender_label,
+        sender_session_id: row.owner_session_id,
+        remote_session_id: SatelliteUuidV1(row.remote_session_id),
+        scope_project_id: row.scope_project_id.map(SatelliteUuidV1),
+        message: row.payload.clone(),
+    }
+}
+
 async fn attempt(store: &Arc<Mutex<Store>>, root: &Path, row: &QueuedSatelliteMessage) {
     let prepared = {
         let guard = store.lock().await;
         // Re-read policy on every attempt so an operator switching dispatch
         // off, or narrowing scope, stops delivery immediately.
-        let Ok(Some(_)) = guard.dispatch_peer_facts(row.peer_id, row.remote_session_id) else {
+        let Ok(Some(_)) =
+            guard.dispatch_peer_facts(row.peer_id, row.remote_session_id, row.scope_project_id)
+        else {
             return;
         };
         let Ok(view) = guard.satellite_registry_view() else {
@@ -242,18 +304,10 @@ async fn attempt(store: &Arc<Mutex<Store>>, root: &Path, row: &QueuedSatelliteMe
         )
     };
     let (peer, hub_installation, label) = prepared;
-    let request = SatelliteDeliverRequestV1 {
-        wire_version: SATELLITE_WIRE_VERSION_V1,
-        message_id: row.id,
-        hub_installation_id: SatelliteUuidV1(hub_installation),
-        sender_label: label,
-        sender_session_id: row.owner_session_id,
-        remote_session_id: SatelliteUuidV1(row.remote_session_id),
-        message: row.payload.clone(),
-    };
+    let request = deliver_request(row, hub_installation, label);
     let outcome = tokio::time::timeout(DELIVERY_DEADLINE, deliver_one(root, &peer, &request))
         .await
-        .unwrap_or(DeliveryOutcome::NotYet);
+        .unwrap_or(DeliveryOutcome::NotYet(WaitReason::PeerUnreachable));
     let guard = store.lock().await;
     let now = Utc::now();
     let settled = match outcome {
@@ -264,7 +318,13 @@ async fn attempt(store: &Arc<Mutex<Store>>, root: &Path, row: &QueuedSatelliteMe
         DeliveryOutcome::Refused(class) => {
             guard.settle_satellite_message(row.id, "failed", Some(class), now)
         }
-        DeliveryOutcome::NotYet => return,
+        DeliveryOutcome::NotYet(reason) => {
+            // #2566: the sender can read why the message is still waiting.
+            if let Err(error) = guard.note_satellite_message_wait(row.id, reason.stored(), now) {
+                tracing::warn!(message_id = %row.id, "satellite dispatch: wait reason not recorded: {error}");
+            }
+            return;
+        }
     };
     if let Err(error) = settled {
         tracing::warn!(message_id = %row.id, "satellite dispatch: settlement failed: {error}");
@@ -285,7 +345,6 @@ mod tests {
         AgentSendSatelliteMessageRequestV1, SatelliteDeliverOutcomeV1, SatelliteDeliverResultV1,
     };
     use rsi_common::{SessionProvider, SessionStatus};
-    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex as StdMutex;
@@ -299,6 +358,8 @@ mod tests {
         status: Arc<StdMutex<SessionStatus>>,
         calls: Arc<AtomicUsize>,
         delivered: Arc<StdMutex<Vec<Uuid>>>,
+        /// `(remote_session_id, scope_project_id)` of every delivery on the wire.
+        wire: Arc<StdMutex<Vec<(Uuid, Option<Uuid>)>>>,
         refuse: Arc<StdMutex<Option<&'static str>>>,
         uncertain: Arc<StdMutex<bool>>,
         /// Whether the snapshot lists the target at all (a rotated seat is not).
@@ -316,10 +377,7 @@ mod tests {
     }
 
     async fn rig(dispatch_enabled: bool, status: SessionStatus) -> Rig {
-        let temp = tempfile::Builder::new()
-            .prefix("sat-disp-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let temp = crate::test_support::socket_tempdir("sat-disp-");
         let root = temp.path().join("satellites");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -333,14 +391,16 @@ mod tests {
             status: Arc::new(StdMutex::new(status)),
             calls: Arc::new(AtomicUsize::new(0)),
             delivered: Arc::new(StdMutex::new(Vec::new())),
+            wire: Arc::new(StdMutex::new(Vec::new())),
             refuse: Arc::new(StdMutex::new(None)),
             uncertain: Arc::new(StdMutex::new(false)),
             listed: Arc::new(StdMutex::new(true)),
         };
-        let (st, calls, delivered, refuse, uncertain, listed) = (
+        let (st, calls, delivered, wire, refuse, uncertain, listed) = (
             Arc::clone(&fake.status),
             Arc::clone(&fake.calls),
             Arc::clone(&fake.delivered),
+            Arc::clone(&fake.wire),
             Arc::clone(&fake.refuse),
             Arc::clone(&fake.uncertain),
             Arc::clone(&fake.listed),
@@ -350,10 +410,11 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (st, calls, delivered, refuse, uncertain, listed) = (
+                let (st, calls, delivered, wire, refuse, uncertain, listed) = (
                     Arc::clone(&st),
                     Arc::clone(&calls),
                     Arc::clone(&delivered),
+                    Arc::clone(&wire),
                     Arc::clone(&refuse),
                     Arc::clone(&uncertain),
                     Arc::clone(&listed),
@@ -423,6 +484,10 @@ mod tests {
                                     let params: SatelliteDeliverRequestV1 =
                                         serde_json::from_value(request.params.clone()).unwrap();
                                     delivered.lock().unwrap().push(params.message_id);
+                                    wire.lock().unwrap().push((
+                                        params.remote_session_id.0,
+                                        params.scope_project_id.map(|id| id.0),
+                                    ));
                                     RpcResponse::success(
                                         Some(request.id.clone().into()),
                                         serde_json::to_value(SatelliteDeliverResultV1 {
@@ -432,6 +497,7 @@ mod tests {
                                             } else {
                                                 SatelliteDeliverOutcomeV1::Delivered
                                             },
+                                            redirected: None,
                                         })
                                         .unwrap(),
                                     )
@@ -514,9 +580,11 @@ mod tests {
                 &AgentSendSatelliteMessageRequestV1 {
                     peer_id: SatelliteUuidV1(rig.peer),
                     remote_session_id: SatelliteUuidV1(rig.remote),
+                    scope_project_id: None,
                     message: "please rebase".into(),
                     idempotency_key: key.into(),
                     expires_at: None,
+                    issue_refs: Vec::new(),
                 },
                 Utc::now(),
             )
@@ -545,6 +613,80 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
         assert_eq!(*rig.fake.delivered.lock().unwrap(), vec![id]);
+    }
+
+    /// Review #1943: the project that authorized a session target travels with
+    /// it over the link, so the satellite can validate live ancestry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_project_bound_message_carries_its_project_to_the_satellite() {
+        let rig = rig(true, SessionStatus::Completed).await;
+        let (project, descendant) = (Uuid::new_v4(), Uuid::new_v4());
+        let id = {
+            let guard = rig.store.lock().await;
+            let revision = guard.satellite_registry_revision().unwrap();
+            guard
+                .put_satellite_peer_scope_entries(
+                    revision,
+                    rig.peer,
+                    &[],
+                    &[SatelliteUuidV1(project)],
+                )
+                .unwrap();
+            guard
+                .queue_satellite_message(
+                    rig.owner,
+                    &AgentSendSatelliteMessageRequestV1 {
+                        peer_id: SatelliteUuidV1(rig.peer),
+                        remote_session_id: SatelliteUuidV1(descendant),
+                        scope_project_id: Some(SatelliteUuidV1(project)),
+                        message: "please rebase".into(),
+                        idempotency_key: "k1".into(),
+                        expires_at: None,
+                        issue_refs: Vec::new(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap()
+                .message_id
+        };
+        let mut dispatch = DispatchState::default();
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "sent");
+        assert_eq!(
+            *rig.fake.wire.lock().unwrap(),
+            vec![(descendant, Some(project))]
+        );
+
+        // Narrowing the hub scope stops a queued bound message before it is sent.
+        let second = {
+            let guard = rig.store.lock().await;
+            let second = guard
+                .queue_satellite_message(
+                    rig.owner,
+                    &AgentSendSatelliteMessageRequestV1 {
+                        peer_id: SatelliteUuidV1(rig.peer),
+                        remote_session_id: SatelliteUuidV1(descendant),
+                        scope_project_id: Some(SatelliteUuidV1(project)),
+                        message: "second".into(),
+                        idempotency_key: "k2".into(),
+                        expires_at: None,
+                        issue_refs: Vec::new(),
+                    },
+                    Utc::now(),
+                )
+                .unwrap()
+                .message_id;
+            let revision = guard.satellite_registry_revision().unwrap();
+            guard
+                .put_satellite_peer_scope_entries(revision, rig.peer, &[], &[])
+                .unwrap();
+            second
+        };
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, second).await, "queued");
+        assert_eq!(rig.fake.wire.lock().unwrap().len(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -578,9 +720,11 @@ mod tests {
                 &AgentSendSatelliteMessageRequestV1 {
                     peer_id: SatelliteUuidV1(rig.peer),
                     remote_session_id: SatelliteUuidV1(rig.remote),
+                    scope_project_id: None,
                     message: "please rebase".into(),
                     idempotency_key: "k1".into(),
                     expires_at: None,
+                    issue_refs: Vec::new(),
                 },
                 Utc::now(),
             )
@@ -598,29 +742,110 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn running_target_waits_and_receives_after_it_goes_idle() {
+    async fn running_target_is_sent_to_the_satellite_without_waiting_for_idle() {
+        // #2566: the hub does not hold a message for a busy target; the
+        // satellite queues it for the target's next boundary and acknowledges.
         let rig = rig(true, SessionStatus::Running).await;
         let id = queue(&rig, "k1").await;
         let mut dispatch = DispatchState::default();
-        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
-        assert_eq!(state(&rig, id).await, "queued");
-        assert!(rig.fake.delivered.lock().unwrap().is_empty());
-        *rig.fake.status.lock().unwrap() = SessionStatus::Completed;
-        tokio::time::sleep(Duration::from_millis(40)).await;
         dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
         assert_eq!(state(&rig, id).await, "sent");
         assert_eq!(*rig.fake.delivered.lock().unwrap(), vec![id]);
     }
 
+    async fn replay_receipt(
+        rig: &Rig,
+        key: &str,
+    ) -> rsi_common::satellite_dispatch::AgentSendSatelliteMessageReceiptV1 {
+        rig.store
+            .lock()
+            .await
+            .queue_satellite_message(
+                rig.owner,
+                &AgentSendSatelliteMessageRequestV1 {
+                    peer_id: SatelliteUuidV1(rig.peer),
+                    remote_session_id: SatelliteUuidV1(rig.remote),
+                    scope_project_id: None,
+                    message: "please rebase".into(),
+                    idempotency_key: key.into(),
+                    expires_at: None,
+                    issue_refs: Vec::new(),
+                },
+                Utc::now(),
+            )
+            .unwrap()
+    }
+
+    /// #2744: a satellite that names a terminal target keeps the row queued
+    /// with the target's real status and stop reason, never `remote_busy`; a
+    /// stop reason that contains `busy` is not read as one.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn interrupted_target_is_not_idle_and_the_message_stays_queued() {
-        let rig = rig(true, SessionStatus::Interrupted).await;
+    async fn a_terminal_remote_target_is_reported_as_remote_terminal_not_busy() {
+        let rig = rig(true, SessionStatus::Completed).await;
         let id = queue(&rig, "k1").await;
+        *rig.fake.refuse.lock().unwrap() =
+            Some("remote_terminal|failed|provider_error:codex_busy_401");
         let mut dispatch = DispatchState::default();
         dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
         assert_eq!(state(&rig, id).await, "queued");
-        assert!(rig.fake.delivered.lock().unwrap().is_empty());
+        let waiting = replay_receipt(&rig, "k1").await;
+        assert_eq!(waiting.attempt_count, 1);
+        assert_eq!(waiting.waiting_for.as_deref(), Some("remote_terminal"));
+        assert_eq!(waiting.remote_status.as_deref(), Some("failed"));
+        assert_eq!(
+            waiting.remote_stop_reason.as_deref(),
+            Some("provider_error:codex_busy_401")
+        );
+        // A repaired target takes the message and the reason is gone.
+        *rig.fake.refuse.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        let sent = replay_receipt(&rig, "k1").await;
+        assert_eq!(sent.state, "sent");
+        assert_eq!((sent.waiting_for, sent.remote_status), (None, None));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_waiting_message_reports_why_and_how_many_attempts() {
+        let rig = rig(true, SessionStatus::Interrupted).await;
+        let id = queue(&rig, "k1").await;
+        let fresh = replay_receipt(&rig, "k1").await;
+        assert_eq!((fresh.attempt_count, fresh.waiting_for.clone()), (0, None));
+        let mut dispatch = DispatchState::default();
+        for _ in 0..3 {
+            dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(state(&rig, id).await, "queued");
+        let waiting = replay_receipt(&rig, "k1").await;
+        assert_eq!(waiting.state, "queued");
+        assert_eq!(waiting.attempt_count, 3);
+        assert_eq!(waiting.waiting_for.as_deref(), Some("remote_busy"));
+        assert_eq!(waiting.settled_error_class, None);
+        // Once it is delivered the reason is gone.
+        *rig.fake.status.lock().unwrap() = SessionStatus::Completed;
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        let sent = replay_receipt(&rig, "k1").await;
+        assert_eq!(sent.state, "sent");
+        assert_eq!(sent.waiting_for, None);
+        assert_eq!(sent.settled_error_class, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_unreachable_peer_is_reported_as_such_not_as_busy() {
+        let rig = rig(true, SessionStatus::Completed).await;
+        let id = queue(&rig, "k1").await;
+        // No listener answers: remove the peer's socket.
+        std::fs::remove_file(rig.root.join("peer.sock")).unwrap();
+        let mut dispatch = DispatchState::default();
+        dispatch_round(&rig.store, &rig.root, &mut dispatch).await;
+        assert_eq!(state(&rig, id).await, "queued");
+        let receipt = replay_receipt(&rig, "k1").await;
+        assert_eq!(receipt.waiting_for.as_deref(), Some("peer_unreachable"));
+        assert_eq!(receipt.attempt_count, 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -673,9 +898,11 @@ mod tests {
                 &AgentSendSatelliteMessageRequestV1 {
                     peer_id: SatelliteUuidV1(rig.peer),
                     remote_session_id: SatelliteUuidV1(rig.remote),
+                    scope_project_id: None,
                     message: "please rebase".into(),
                     idempotency_key: "k1".into(),
                     expires_at: None,
+                    issue_refs: Vec::new(),
                 },
                 Utc::now(),
             )
@@ -769,9 +996,11 @@ mod tests {
                 &AgentSendSatelliteMessageRequestV1 {
                     peer_id: SatelliteUuidV1(rig.peer),
                     remote_session_id: SatelliteUuidV1(rig.remote),
+                    scope_project_id: None,
                     message: "please rebase".into(),
                     idempotency_key: "k1".into(),
                     expires_at: None,
+                    issue_refs: Vec::new(),
                 },
                 Utc::now(),
             )
@@ -795,6 +1024,140 @@ mod tests {
             classify_refusal("Claude binary not found in PATH"),
             DeliveryOutcome::Refused("satellite_refused")
         ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn failed_remote_delivery_arms_one_current_sender_notice_without_replaying() {
+        use rsi_common::harness_manager::{
+            AgentManagerInboxRequestV1, ConfigureHarnessManagerRequestV1,
+        };
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerPolicyV2,
+        };
+        for class in ["target_not_authorized", "delivery_uncertain", "expired"] {
+            let rig = rig(true, SessionStatus::Completed).await;
+            let sender = {
+                let store = rig.store.lock().await;
+                let mut sender = store.get_session(rig.owner).unwrap().unwrap();
+                sender.project_id = Some(rsid_store::store::d04_test_project_id());
+                sender.status = SessionStatus::Completed;
+                store
+                    .update_session_project(sender.id, sender.project_id)
+                    .unwrap();
+                store
+                    .update_session_status(sender.id, sender.status)
+                    .unwrap();
+                let config = store
+                    .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                        project_id: sender.project_id.unwrap(),
+                        session_id: sender.id,
+                        epic_ids: None,
+                        group_ids: vec![],
+                        expected_row_version: 0,
+                    })
+                    .unwrap();
+                store
+                    .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                        project_id: config.project_id,
+                        expected_scope_version: config.row_version,
+                        expected_policy_version: 0,
+                        idempotency_key: "failure-policy".into(),
+                        policy: ManagerPolicyV2::default(),
+                    })
+                    .unwrap();
+                sender
+            };
+            let id = queue(&rig, "failure").await;
+            if class == "delivery_uncertain" {
+                *rig.fake.uncertain.lock().unwrap() = true;
+            } else if class == "target_not_authorized" {
+                *rig.fake.refuse.lock().unwrap() = Some(SATELLITE_TARGET_NOT_AUTHORIZED.into());
+            } else {
+                rig.store
+                    .lock()
+                    .await
+                    .expire_satellite_messages(Utc::now() + chrono::Duration::hours(1))
+                    .unwrap();
+            }
+            dispatch_round(&rig.store, &rig.root, &mut DispatchState::default()).await;
+            let next = {
+                let store = rig.store.lock().await;
+                let mut next = rsid_store::test_support::make_test_session();
+                next.project_id = sender.project_id;
+                next.parent_id = sender.parent_id;
+                next.continued_from = Some(sender.id);
+                next.rotation_depth = sender.rotation_depth + 1;
+                next.status = SessionStatus::Completed;
+                store.insert_session(&next).unwrap();
+                store
+                    .update_session_status(sender.id, SessionStatus::Archived)
+                    .unwrap();
+                assert!(
+                    store
+                        .record_harness_manager_rotation(sender.id, next.id)
+                        .unwrap()
+                );
+                let job = store
+                    .manager_notice_job_for_subject(
+                        "ledger_change",
+                        "satellite_message_failure",
+                        &id.to_string(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(store.get_scheduled_job(&job).unwrap().unwrap().enabled);
+                assert_eq!(
+                    store
+                        .harness_manager_watch_route(job)
+                        .unwrap()
+                        .map(|(_, target)| target),
+                    Some(next.id)
+                );
+                let inbox = store
+                    .manager_inbox(next.id, &AgentManagerInboxRequestV1::default())
+                    .unwrap();
+                let notices: Vec<_> = inbox
+                    .notices
+                    .iter()
+                    .filter(|n| n.subject_id == "satellite_message_failure")
+                    .collect();
+                assert_eq!(notices.len(), 1);
+                assert_eq!(notices[0].recipient_session_id, next.id);
+                assert_eq!(notices[0].state["message_id"], id.to_string());
+                assert_eq!(notices[0].state["peer_id"], rig.peer.to_string());
+                assert_eq!(
+                    notices[0].state["terminal_state"],
+                    if class == "expired" {
+                        "expired"
+                    } else {
+                        "failed"
+                    }
+                );
+                assert_eq!(
+                    notices[0].state["safe_error_class"],
+                    if class == "expired" {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(class)
+                    }
+                );
+                next
+            };
+            // A fresh dispatcher models process-local state loss at restart.
+            let calls = rig.fake.calls.load(Ordering::SeqCst);
+            dispatch_round(&rig.store, &rig.root, &mut DispatchState::default()).await;
+            assert_eq!(rig.fake.calls.load(Ordering::SeqCst), calls);
+            let store = rig.store.lock().await;
+            assert!(store.queued_satellite_messages(10).unwrap().is_empty());
+            assert!(
+                store
+                    .manager_inbox(next.id, &AgentManagerInboxRequestV1::default())
+                    .unwrap()
+                    .notices
+                    .is_empty()
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

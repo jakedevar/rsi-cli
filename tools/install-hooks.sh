@@ -11,6 +11,6 @@
 set -e
 
 cd "$(git rev-parse --show-toplevel)"
-chmod +x tools/git-hooks/pre-commit tools/git-hooks/pre-push
+chmod +x tools/git-hooks/pre-commit tools/git-hooks/commit-msg tools/git-hooks/pre-push
 git config core.hooksPath tools/git-hooks
-echo "Installed: core.hooksPath -> tools/git-hooks (pre-commit and pre-push active across all worktrees)"
+echo "Installed: core.hooksPath -> tools/git-hooks (pre-commit, commit-msg and pre-push active across all worktrees)"

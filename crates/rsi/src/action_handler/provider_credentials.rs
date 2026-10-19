@@ -38,6 +38,54 @@ pub async fn refresh_provider_credentials(app: &mut App) {
     }
 }
 
+/// Refresh `App::cached_provider_login` (#2753): the daemon's cached state, or
+/// with `probe` a fresh probe of both CLIs. Probing runs the CLIs' own status
+/// commands on the daemon host, so it never changes a login.
+#[allow(clippy::future_not_send)] // App is owned by the single-threaded event loop.
+pub async fn refresh_provider_login(app: &mut App, probe: bool) {
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let outcome = if probe {
+        app.client.refresh_provider_login_state().await
+    } else {
+        app.client.get_provider_login_state().await
+    };
+    match outcome {
+        Ok(result) => {
+            app.cached_provider_login = Some(result);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to refresh provider login state: {}", e);
+            app.notify(format!("Failed to refresh provider login state: {e}"));
+        }
+    }
+}
+
+/// Refresh `App::cached_provider_contract` (#2755): the daemon's cached canary
+/// result, or with `probe` a fresh run of the canary for both CLIs. The canary
+/// starts no model turn, so it costs nothing.
+#[allow(clippy::future_not_send)] // App is owned by the single-threaded event loop.
+pub async fn refresh_provider_contract(app: &mut App, probe: bool) {
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let outcome = if probe {
+        app.client.refresh_provider_contract_state().await
+    } else {
+        app.client.get_provider_contract_state().await
+    };
+    match outcome {
+        Ok(result) => {
+            app.cached_provider_contract = Some(result);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to refresh provider contract state: {}", e);
+            app.notify(format!("Failed to refresh provider contract state: {e}"));
+        }
+    }
+}
+
 /// Merge one slot's updated metadata into the cached list (insert if the
 /// list was never populated, replace the matching slot otherwise). Keeps
 /// the Provider Keys row list current without a full re-fetch after every

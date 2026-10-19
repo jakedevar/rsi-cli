@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "rows": {
+    "key:zM": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "acts on the pane that has the keys (actions/folds.ts): the transcript after Shift-Down, ]u or a click on an event, else the list. Slice 5: collapses every event in the transcript. Slice 4: closes every container in the list"
+    },
+    "key:zR": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "acts on the pane that has the keys (actions/folds.ts): the transcript after Shift-Down, ]u or a click on an event, else the list. Slice 5: expands every event in the transcript. Slice 4: opens every container in the list"
+    },
+    "key:za": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "acts on the pane that has the keys (actions/folds.ts): the transcript after Shift-Down, ]u, e or a click on an event, else the list. Slice 5: toggles the selected transcript event (a half-open tool group opens as one). Slice 4: toggles the cursor container"
+    },
+    "key:zc": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "acts on the pane that has the keys (actions/folds.ts): the transcript after Shift-Down, ]u, e or a click on an event, else the list. Slice 5: collapses the selected transcript event with its tool group. Slice 4: closes the cursor container and hides its inline descendants"
+    },
+    "key:zo": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "acts on the pane that has the keys (actions/folds.ts): the transcript after Shift-Down, ]u, e or a click on an event, else the list. Slice 5: expands the selected transcript event; a tool call and its result (paired by tool_use_id) move as one. Slice 4: opens the cursor container, whose children (Group → Epic → session) show inline beneath it. The desktop list starts expanded where the TUI starts with closed cards (a desktop default; zM closes them all)"
+    },
+    "section:folding-session-list-and-detail-view": {
+      "status": "done",
+      "location": "src/actions/folds.ts, src/actions/detail-spec.ts, src/actions/detail.ts, src/detail-model.ts, src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
+      "note": "zo / zc / za / zM / zR act on the pane that has the keys (actions/folds.ts): transcript events and tool groups (slice 5), list containers with their inline children (slice 4). The desktop list starts expanded where the TUI starts with closed cards (a desktop default)"
+    }
+  }
+}

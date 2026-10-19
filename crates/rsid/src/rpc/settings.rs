@@ -7,6 +7,18 @@ pub struct UpdateDaemonConfigParams {
     pub value: serde_json::Value,
 }
 
+/// RPC params for the atomic form of `UpdateDaemonConfig` (#2236): one request
+/// naming every field the operator applied from the Settings page. The request
+/// holds either `field` + `value` or `updates`, never both.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateDaemonConfigBatchParams {
+    pub updates: Vec<UpdateDaemonConfigParams>,
+}
+
+/// The most fields one atomic `UpdateDaemonConfig` may name.
+pub(super) const UPDATE_DAEMON_CONFIG_BATCH_MAX: usize = 128;
+
 pub(super) const RSID_SCOPE_CONFIG_FIELDS: [&str; 8] = [
     "rsid_scope_memory_high_mib",
     "rsid_scope_memory_max_mib",
@@ -150,11 +162,23 @@ impl RpcServer {
         let limit = (params.limit.unwrap_or(50) as usize)
             .clamp(1, rsi_common::rolling_queue::ROLLING_QUEUE_LIST_MAX);
         let state = params.state;
+        let mut entry_ids = params.entry_ids;
+        entry_ids.truncate(rsi_common::rolling_queue::ROLLING_QUEUE_WATCH_IDS_MAX);
         let store = self.session_manager.store().clone();
         let entries = tokio::task::spawn_blocking(move || {
-            store
-                .blocking_lock()
-                .list_rolling_queue_entries(state, limit)
+            let store = store.blocking_lock();
+            if entry_ids.is_empty() {
+                return store.list_rolling_queue_entries(state, limit);
+            }
+            // #2068: a watch names its entries; the newest page can scroll
+            // them away.
+            let mut found = Vec::new();
+            for id in entry_ids {
+                if let Some(entry) = store.get_rolling_queue_entry(id)? {
+                    found.push((entry, String::new()));
+                }
+            }
+            Ok(found)
         })
         .await
         .map_err(|e| DaemonError::Process(format!("Task join error: {e}")))??;
@@ -167,11 +191,32 @@ impl RpcServer {
                     .rolling_queue_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
                 batch_size: load(&self.runtime_config.rolling_queue_batch_size),
-                speculation_depth: load(&self.runtime_config.rolling_queue_speculation_depth),
                 gate_timeout_mins: load(&self.runtime_config.rolling_queue_gate_timeout_mins),
                 entries: entries.into_iter().map(|(entry, _)| entry).collect(),
             },
         )?)
+    }
+
+    /// Operator-only `EnqueueRollingQueueSource` (#2055): the operator's path
+    /// onto the merge queue, backed by the same enqueue logic as
+    /// `AgentEnqueueLandingSource`.
+    pub(super) async fn handle_enqueue_rolling_queue_source(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::rolling_queue::EnqueueRollingQueueSourceParams =
+            serde_json::from_value(request.params.clone())
+                .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {e}")))?;
+        let enabled = self
+            .runtime_config
+            .rolling_queue_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let response = self
+            .session_manager
+            .agent_control()
+            .operator_enqueue_landing_source(params, enabled)
+            .await?;
+        Ok(serde_json::to_value(response)?)
     }
 
     pub(super) async fn handle_restart_daemon_drain(
@@ -207,6 +252,24 @@ impl RpcServer {
         Ok(self.session_manager.drain_restart_status().await)
     }
 
+    pub(super) async fn handle_get_daemon_info(
+        &self,
+        _request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let schema = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .schema_user_version()?;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            crate::daemon_info::DaemonInfoService::global().snapshot(schema)
+        })
+        .await
+        .map_err(|error| DaemonError::Store(error.to_string()))?;
+        Ok(serde_json::to_value(snapshot)?)
+    }
+
     pub(super) async fn handle_get_health_status(
         &self,
         _request: &RpcRequest,
@@ -223,16 +286,18 @@ impl RpcServer {
             // #999: free space above the sandbox launch floor, so the manager
             // sees pressure before launches are refused, plus the latest scratch
             // reclaim pass.
-            let floor_bytes = self
+            let configured_floor_gib = self
                 .runtime_config
                 .sandbox_min_free_gib
-                .load(Ordering::Relaxed)
-                .saturating_mul(1024 * 1024 * 1024);
+                .load(Ordering::Relaxed);
             if let Ok(stats) =
                 nix::sys::statvfs::statvfs(self.session_manager.sandbox_allocator().base_dir())
             {
                 let available =
                     (stats.blocks_available() as u64).saturating_mul(stats.fragment_size() as u64);
+                let total = (stats.blocks() as u64).saturating_mul(stats.fragment_size() as u64);
+                let floor_bytes =
+                    crate::sandbox::effective_min_free_bytes(configured_floor_gib, total);
                 object.insert(
                     "launch_floor".to_string(),
                     serde_json::json!({
@@ -301,6 +366,12 @@ impl RpcServer {
         _request: &RpcRequest,
     ) -> Result<serde_json::Value> {
         let mut config = self.runtime_config.to_json();
+        config["coordinator_context_budgets"] = serde_json::to_value(
+            self.session_manager
+                .agent_control()
+                .coordinator_budgets()
+                .await?,
+        )?;
         // #1036: read-only summary for the Settings "Cloud spend" row.
         if let Some(map) = config.as_object_mut() {
             let report = self.cloud_spend_report();
@@ -336,6 +407,102 @@ impl RpcServer {
         Ok(serde_json::to_value(self.cloud_spend_report())?)
     }
 
+    /// hub #2765 / #281: check a `provider_launch_overrides` write against the
+    /// installed provider CLIs. A Claude flag the installed claude CLI rejects
+    /// as an unknown option, and a Codex config key the installed codex-cli does
+    /// not know, are refused `provider_launch_override_unknown_key`. Runs before
+    /// the config update lock (it may start a CLI). The static allowlist and
+    /// deny list are checked by `update_field`; a value they refuse is left to
+    /// them (the deny list stays authoritative: it never depends on the
+    /// installed CLI). A CLI that cannot answer fails open: nothing is refused
+    /// and the returned `launch_override_check` object says the Codex check was
+    /// degraded. `None` when the write is not for this field.
+    async fn check_launch_overrides_against_installed_cli(
+        &self,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>> {
+        use rsi_common::provider_launch_overrides as overrides;
+        if field != overrides::FIELD {
+            return Ok(None);
+        }
+        let Ok(parsed) = overrides::normalize(value) else {
+            return Ok(None);
+        };
+        let invalid = |error: overrides::LaunchOverrideError| {
+            DaemonError::InvalidParam(format!("Invalid value for field '{field}': {error}"))
+        };
+        let contract = self.session_manager.provider_contract();
+        if let Some(flag) = contract
+            .claude_flags_unknown_to_installed_cli(&parsed.claude_flags())
+            .await
+            .first()
+        {
+            return Err(invalid(
+                overrides::LaunchOverrideError::unknown_to_installed_claude(flag),
+            ));
+        }
+        let codex = contract
+            .codex_keys_unknown_to_installed_cli(&parsed.codex_keys())
+            .await;
+        if let Some(key) = codex.unknown.first() {
+            return Err(invalid(
+                overrides::LaunchOverrideError::unknown_to_installed_codex(key),
+            ));
+        }
+        if let Some(reason) = codex.degraded {
+            tracing::warn!(
+                reason,
+                "provider_launch_overrides Codex keys checked against the static allowlist only"
+            );
+        }
+        Ok(Some(codex.to_json()))
+    }
+
+    /// The `launch_override_check` note of a single or batch write, refusing the
+    /// write when the installed CLI does not know a key it names.
+    async fn launch_override_check_of(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<Option<serde_json::Value>> {
+        if request.params.get("updates").is_none() {
+            let Ok(params) =
+                serde_json::from_value::<UpdateDaemonConfigParams>(request.params.clone())
+            else {
+                return Ok(None);
+            };
+            return self
+                .check_launch_overrides_against_installed_cli(&params.field, &params.value)
+                .await;
+        }
+        let Ok(batch) =
+            serde_json::from_value::<UpdateDaemonConfigBatchParams>(request.params.clone())
+        else {
+            return Ok(None);
+        };
+        let mut note = None;
+        for update in &batch.updates {
+            let checked = self
+                .check_launch_overrides_against_installed_cli(&update.field, &update.value)
+                .await?;
+            note = note.or(checked);
+        }
+        Ok(note)
+    }
+
+    pub(super) async fn handle_update_daemon_config(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let note = self.launch_override_check_of(request).await?;
+        let mut response = self.apply_update_daemon_config(request).await?;
+        let (Some(note), Some(object)) = (note, response.as_object_mut()) else {
+            return Ok(response);
+        };
+        object.insert("launch_override_check".into(), note);
+        Ok(response)
+    }
+
     /// Update a single runtime-mutable daemon config field by name.
     ///
     /// String-valued fields validate their input — e.g. `codex_sandbox_mode`
@@ -349,13 +516,12 @@ impl RpcServer {
     /// `codex_sandbox_mode` that's the next fresh `CodexClient::launch()`
     /// (every Codex spawn re-reads at launch time; no daemon restart
     /// required).
-    pub(super) async fn handle_update_daemon_config(
-        &self,
-        request: &RpcRequest,
-    ) -> Result<serde_json::Value> {
+    async fn apply_update_daemon_config(&self, request: &RpcRequest) -> Result<serde_json::Value> {
+        if request.params.get("updates").is_some() {
+            return self.handle_update_daemon_config_batch(request).await;
+        }
         let params: UpdateDaemonConfigParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
-
         let _update_guard = self.session_manager.daemon_config_update.lock().await;
         if let Some(prepared) = self
             .runtime_config
@@ -414,6 +580,74 @@ impl RpcServer {
             self.session_manager
                 .publish_completed_transcript_cache_cap(cap)
                 .await;
+            return Ok(serde_json::json!({ "ok": true, "field": params.field }));
+        }
+
+        if params.field == "deploy_restarts_per_hour"
+            || params.field == "supervisor_shutdown_grace_secs"
+        {
+            let previous_value = self.runtime_config.to_json()[&params.field].clone();
+            self.runtime_config
+                .update_field(&params.field, &params.value)
+                .map_err(|error| {
+                    DaemonError::InvalidParam(format!(
+                        "Invalid value for field '{}': {}",
+                        params.field, error
+                    ))
+                })?;
+
+            let store = self.session_manager.store().clone();
+            let persist_result = {
+                let guard = store.lock().await;
+                crate::store::daemon_settings::persist_runtime_config_field(
+                    &guard,
+                    &self.runtime_config,
+                    &params.field,
+                )
+            };
+            if let Err(error) = persist_result {
+                self.runtime_config
+                    .update_field(&params.field, &previous_value)
+                    .expect("previously validated deploy budget remains valid");
+                return Err(DaemonError::Store(format!(
+                    "Failed to persist daemon config field '{}': {}",
+                    params.field, error
+                )));
+            }
+
+            let snapshot_path =
+                rsi_common::identity::data_path("deploy-restart-budget", "deploy-restart-budget");
+            if let Err(error) = crate::deploy::write_supervisor_restart_budget_snapshot(
+                &snapshot_path,
+                &self.runtime_config,
+            ) {
+                self.runtime_config
+                    .update_field(&params.field, &previous_value)
+                    .expect("previously validated deploy budget remains valid");
+                let rollback_db = {
+                    let guard = store.lock().await;
+                    crate::store::daemon_settings::persist_runtime_config_value(
+                        &guard,
+                        &params.field,
+                        &previous_value,
+                    )
+                };
+                let rollback_snapshot = crate::deploy::write_supervisor_restart_budget_snapshot(
+                    &snapshot_path,
+                    &self.runtime_config,
+                );
+                let rollback_details = match (rollback_db, rollback_snapshot) {
+                    (Ok(_), Ok(())) => String::new(),
+                    (db, snapshot) => format!(
+                        "; rollback db: {}; rollback snapshot: {}",
+                        db.err().map_or_else(|| "ok".into(), |e| e.to_string()),
+                        snapshot.map_or_else(|e| e.to_string(), |_| "ok".into()),
+                    ),
+                };
+                return Err(DaemonError::Store(format!(
+                    "Failed to refresh supervisor restart budget snapshot: {error}{rollback_details}"
+                )));
+            }
             return Ok(serde_json::json!({ "ok": true, "field": params.field }));
         }
 
@@ -555,6 +789,18 @@ impl RpcServer {
                         ))
                     })?;
                 }
+                if let Some(report) =
+                    crate::build_budget::after_setting_saved(&params.field, "setting").await
+                {
+                    // #2119: rewrite rsi-build.slice now, including for units
+                    // already running in it. The setting is saved either way;
+                    // the response says whether the slice carries it.
+                    return Ok(serde_json::json!({
+                        "ok": true,
+                        "field": params.field,
+                        "build_slice": report.to_json(),
+                    }));
+                }
                 if matches!(
                     params.field.as_str(),
                     "dream_enabled"
@@ -580,6 +826,352 @@ impl RpcServer {
                 params.field, e
             ))),
         }
+    }
+
+    /// The atomic form of `UpdateDaemonConfig`: `{"updates": [{"field", "value"}, ...]}`.
+    ///
+    /// All-or-nothing. Every value is validated before any live state moves
+    /// (a bad value, an unknown field, a duplicate field or an invalid
+    /// combination refuses the whole request and names the field). The
+    /// durable rows are written in ONE SQLite transaction, the live values
+    /// are published once, and each side effect that follows a save (the
+    /// supervisor and rsid-scope snapshot files, the spend-caps file, the
+    /// build CPU slice, the dreamer wake) runs at most once for the whole
+    /// request. A failure after the live values moved restores the previous
+    /// live values and durable rows before the error is returned.
+    pub(super) async fn handle_update_daemon_config_batch(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: UpdateDaemonConfigBatchParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {e}")))?;
+        let updates = params.updates;
+        if updates.is_empty() {
+            return Err(DaemonError::InvalidParam(
+                "Invalid params: updates must name at least one field".into(),
+            ));
+        }
+        if updates.len() > UPDATE_DAEMON_CONFIG_BATCH_MAX {
+            return Err(DaemonError::InvalidParam(format!(
+                "Invalid params: at most {UPDATE_DAEMON_CONFIG_BATCH_MAX} fields per update"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for update in &updates {
+            if !seen.insert(update.field.as_str()) {
+                return Err(DaemonError::InvalidParam(format!(
+                    "Invalid params: field '{}' is named more than once",
+                    update.field
+                )));
+            }
+        }
+        let invalid = |field: &str, error: String| {
+            DaemonError::InvalidParam(format!("Invalid value for field '{field}': {error}"))
+        };
+        let _update_guard = self.session_manager.daemon_config_update.lock().await;
+
+        // Phase 1: validate everything before any live state moves.
+        let scratch = RuntimeConfig::from_config(&crate::config::Config::default());
+        let scope_in_batch = updates
+            .iter()
+            .any(|update| is_rsid_scope_config_field(&update.field));
+        if scope_in_batch {
+            // The scope limits are checked as a set (high below max, ...), so
+            // the candidate starts from the live values.
+            let live = self.runtime_config.to_json();
+            for field in RSID_SCOPE_CONFIG_FIELDS {
+                if let Some(value) = live.get(field) {
+                    let _ = scratch.update_field(field, value);
+                }
+            }
+        }
+        let cache_before = self.runtime_config.sandbox_build_cache_reclaim_snapshot();
+        let mut cache_next = cache_before;
+        let mut cache_fields: Vec<&str> = Vec::new();
+        let mut transcript_cap: Option<u64> = None;
+        let mut codegraph: Option<bool> = None;
+        let mut generic: Vec<&UpdateDaemonConfigParams> = Vec::new();
+        for update in &updates {
+            match RuntimeConfig::apply_sandbox_build_cache_field(
+                cache_next,
+                &update.field,
+                &update.value,
+            ) {
+                Ok(Some(next)) => {
+                    cache_next = next;
+                    cache_fields.push(update.field.as_str());
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => return Err(invalid(&update.field, error)),
+            }
+            if update.field == "completed_transcript_cache_max_bytes" {
+                transcript_cap = Some(update.value.as_u64().ok_or_else(|| {
+                    invalid(&update.field, "expected non-negative integer".into())
+                })?);
+                continue;
+            }
+            if update.field == "codegraph_indexing_enabled" {
+                codegraph = Some(
+                    update
+                        .value
+                        .as_bool()
+                        .ok_or_else(|| invalid(&update.field, "expected bool".into()))?,
+                );
+                continue;
+            }
+            match scratch.update_field(&update.field, &update.value) {
+                Ok(true) => generic.push(update),
+                Ok(false) => {
+                    return Err(DaemonError::InvalidParam(format!(
+                        "Unknown config field: {}",
+                        update.field
+                    )));
+                }
+                Err(error) => return Err(invalid(&update.field, error)),
+            }
+        }
+        if !cache_fields.is_empty() {
+            // The watermark pair moves together: only the final combination
+            // has to satisfy low < high.
+            cache_next = cache_next.validate().map_err(|error| {
+                DaemonError::InvalidParam(format!(
+                    "Invalid value for fields {}: {error}",
+                    cache_fields.join(", ")
+                ))
+            })?;
+        }
+        if scope_in_batch {
+            validated_rsid_scope_settings_env(&scratch).map_err(|error| {
+                DaemonError::InvalidParam(format!("Invalid rsid scope settings: {error}"))
+            })?;
+        }
+
+        // Phase 2: move the live values, remembering how to put them back.
+        let live_before = self.runtime_config.to_json();
+        let mut applied: Vec<(&str, serde_json::Value)> = Vec::new();
+        let undo = |applied: &[(&str, serde_json::Value)]| {
+            for (field, previous) in applied.iter().rev() {
+                if let Err(error) = self.runtime_config.update_field(field, previous) {
+                    tracing::error!(
+                        %field,
+                        %error,
+                        "could not restore a daemon config field after a refused update"
+                    );
+                }
+            }
+        };
+        for update in &generic {
+            let previous = live_before
+                .get(&update.field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            match self
+                .runtime_config
+                .update_field(&update.field, &update.value)
+            {
+                Ok(true) => applied.push((update.field.as_str(), previous)),
+                Ok(false) => {
+                    undo(&applied);
+                    return Err(DaemonError::InvalidParam(format!(
+                        "Unknown config field: {}",
+                        update.field
+                    )));
+                }
+                Err(error) => {
+                    undo(&applied);
+                    return Err(invalid(&update.field, error));
+                }
+            }
+        }
+
+        // Phase 3: the durable rows, all in one transaction.
+        let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+        let mut previous_rows: Vec<(String, serde_json::Value)> = Vec::new();
+        for (field, previous) in &applied {
+            if let Some(value) = self.runtime_config.persisted_field_value(field) {
+                rows.push(((*field).to_string(), value));
+                previous_rows.push(((*field).to_string(), previous.clone()));
+            }
+        }
+        if !cache_fields.is_empty() {
+            rows.extend(
+                crate::store::daemon_settings::sandbox_build_cache_batch_rows(
+                    &cache_fields,
+                    &cache_next,
+                ),
+            );
+            previous_rows.extend(
+                crate::store::daemon_settings::sandbox_build_cache_batch_rows(
+                    &cache_fields,
+                    &cache_before,
+                ),
+            );
+        }
+        if let Some(cap) = transcript_cap {
+            rows.push((
+                "completed_transcript_cache_max_bytes".into(),
+                serde_json::json!(cap),
+            ));
+            previous_rows.push((
+                "completed_transcript_cache_max_bytes".into(),
+                serde_json::json!(
+                    self.runtime_config
+                        .completed_transcript_cache_max_bytes
+                        .load(Ordering::Relaxed)
+                ),
+            ));
+        }
+        if let Some(enabled) = codegraph {
+            rows.push((
+                "codegraph_indexing_enabled".into(),
+                serde_json::json!(enabled),
+            ));
+            previous_rows.push((
+                "codegraph_indexing_enabled".into(),
+                serde_json::json!(
+                    self.runtime_config
+                        .codegraph_indexing_enabled
+                        .load(Ordering::Acquire)
+                ),
+            ));
+        }
+        // OFF is acknowledged only after any publication already holding this
+        // gate has finished (the single-field rule).
+        let _publication_guard = if codegraph.is_some() {
+            Some(crate::codegraph::PUBLICATION_GATE.lock().await)
+        } else {
+            None
+        };
+        let store = self.session_manager.store().clone();
+        let persisted = {
+            let guard = store.lock().await;
+            crate::store::daemon_settings::persist_runtime_config_batch(&guard, &rows)
+        };
+        if let Err(error) = persisted {
+            undo(&applied);
+            return Err(DaemonError::Store(format!(
+                "Failed to persist daemon config fields: {error}; nothing was changed"
+            )));
+        }
+
+        // Phase 4: the snapshot files other processes read. A failure here
+        // rolls the whole request back.
+        let deploy_snapshot_path =
+            rsi_common::identity::data_path("deploy-restart-budget", "deploy-restart-budget");
+        let write_snapshots = |deploy: bool, scope: bool| -> std::result::Result<(), String> {
+            if deploy {
+                crate::deploy::write_supervisor_restart_budget_snapshot(
+                    &deploy_snapshot_path,
+                    &self.runtime_config,
+                )
+                .map_err(|error| {
+                    format!("Failed to refresh supervisor restart budget snapshot: {error}")
+                })?;
+            }
+            if scope {
+                write_rsid_scope_settings_snapshot(
+                    &self.rsid_scope_settings_path,
+                    &self.runtime_config,
+                )
+                .map_err(|error| {
+                    format!("Failed to refresh rsid scope settings snapshot: {error}")
+                })?;
+            }
+            Ok(())
+        };
+        let deploy_in_batch = generic.iter().any(|update| {
+            matches!(
+                update.field.as_str(),
+                "deploy_restarts_per_hour" | "supervisor_shutdown_grace_secs"
+            )
+        });
+        if let Err(message) = write_snapshots(deploy_in_batch, scope_in_batch) {
+            undo(&applied);
+            let rollback_db = {
+                let guard = store.lock().await;
+                crate::store::daemon_settings::persist_runtime_config_batch(&guard, &previous_rows)
+            };
+            let rollback_snapshot = write_snapshots(deploy_in_batch, scope_in_batch);
+            let details = match (rollback_db, rollback_snapshot) {
+                (Ok(_), Ok(())) => String::new(),
+                (db, snapshot) => format!(
+                    "; rollback db: {}; rollback snapshot: {}",
+                    db.err().map_or_else(|| "ok".into(), |e| e.to_string()),
+                    snapshot.err().unwrap_or_else(|| "ok".into()),
+                ),
+            };
+            return Err(DaemonError::Store(format!(
+                "{message}; the whole update was rolled back{details}"
+            )));
+        }
+
+        // Phase 5: publish what was held back until the rows were durable.
+        if !cache_fields.is_empty() {
+            self.runtime_config
+                .publish_sandbox_build_cache_config(cache_next);
+        }
+        if let Some(cap) = transcript_cap {
+            self.session_manager
+                .publish_completed_transcript_cache_cap(cap)
+                .await;
+        }
+        if let Some(enabled) = codegraph {
+            self.runtime_config
+                .codegraph_indexing_enabled
+                .store(enabled, Ordering::Release);
+        }
+
+        // Phase 6: once-per-request effects of a saved setting.
+        let mut fields: Vec<&str> = updates.iter().map(|update| update.field.as_str()).collect();
+        fields.sort_unstable();
+        if updates.iter().any(|update| {
+            matches!(
+                update.field.as_str(),
+                "cloud_spend_stop_line_usd" | "cloud_spend_daily_cap_usd"
+            )
+        }) {
+            crate::cloud_spend::write_caps_file(
+                &self.cloud_dir,
+                &self.runtime_config.cloud_spend_caps(),
+            )
+            .map_err(|error| {
+                DaemonError::Store(format!(
+                    "Saved the update but could not write the spend caps file: {error}; \
+                     the remote-gate scripts still use the previous caps"
+                ))
+            })?;
+        }
+        if updates.iter().any(|update| {
+            matches!(
+                update.field.as_str(),
+                "dream_enabled"
+                    | "dream_model"
+                    | "dream_model_provider"
+                    | "dream_model_base_url"
+                    | "dream_model_api_key"
+                    | "dream_observation_threshold"
+                    | "dream_idle_secs"
+                    | "dream_cooldown_secs"
+            )
+        }) && let Some(handle) = &self.dreamer_handle
+        {
+            handle.notify_control_change().await?;
+        }
+        let mut response = serde_json::json!({
+            "ok": true,
+            "fields": fields,
+            "count": updates.len(),
+        });
+        for update in &updates {
+            if let Some(report) =
+                crate::build_budget::after_setting_saved(&update.field, "setting").await
+            {
+                response["build_slice"] = report.to_json();
+                break;
+            }
+        }
+        Ok(response)
     }
 
     /// Return the most recent stall-classifier verdict + metadata for the

@@ -900,7 +900,7 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> bool {
         // Cycle direction: Ctrl+p = forward, Ctrl+Shift+p = backward.
         // Keep provider on a control chord so plain text-like keys stay free.
         // `e` cycles effort forward, `E` (Shift+e) backward.
-        // `s` toggles sandbox. `m` opens the model sub-overlay.
+        // `s` toggles sandbox, `R` read-only. `m` opens the model sub-overlay.
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Visibility-gated: also focuses the field if it's hidden, focus
             // is a no-op. Hidden-field guard via focus_field's contract.
@@ -972,6 +972,22 @@ async fn handle_normal_mode(app: &mut App, key: KeyEvent) -> bool {
                 *sandbox = !*sandbox;
             }
             auto_save_draft(app);
+            app.mark_dirty();
+            true
+        }
+        // #2758: `R` toggles launching read-only (the operator-only `cli_access`
+        // tool policy). The flag lives on the app, so it also covers the
+        // quick-new launch and stays on until it is turned off.
+        KeyCode::Char('R') => {
+            let kind = match &app.overlay {
+                OverlayState::CreateEntityForm { kind, .. } => *kind,
+                _ => return true,
+            };
+            if !visibility::is_visible(kind, CreateEntityField::Sandbox) {
+                return true;
+            }
+            focus_field(app, CreateEntityField::Sandbox, false);
+            app.launch_read_only = !app.launch_read_only;
             app.mark_dirty();
             true
         }
@@ -1368,6 +1384,25 @@ pub(crate) fn effort_ladder_for_selection(
     selected_provider: rsi_common::types::SessionProvider,
     selected_model: Option<&str>,
 ) -> &'static [&'static str] {
+    let (provider, effective_model) =
+        effort_target(provider, model, selected_provider, selected_model);
+    let ladder = rsi_common::model_utils::effort_ladder(effective_model);
+    if ladder.is_empty() {
+        rsi_common::model_utils::effort_ladder(default_effort_model(provider))
+    } else {
+        ladder
+    }
+}
+
+/// The provider and model whose ladder the form offers: the form's own
+/// choice, else the app's selection (same provider only), else the
+/// provider's default effort model.
+fn effort_target<'a>(
+    provider: Option<rsi_common::types::SessionProvider>,
+    model: Option<&'a str>,
+    selected_provider: rsi_common::types::SessionProvider,
+    selected_model: Option<&'a str>,
+) -> (rsi_common::types::SessionProvider, &'a str) {
     let use_selected_model = provider.is_none_or(|provider| provider == selected_provider);
     let provider = provider.unwrap_or(selected_provider);
     let effective_model = model
@@ -1379,54 +1414,63 @@ pub(crate) fn effort_ladder_for_selection(
                 .filter(|model| !model.is_empty())
         })
         .unwrap_or_else(|| default_effort_model(provider));
-    let ladder = rsi_common::model_utils::effort_ladder(effective_model);
-    if ladder.is_empty() {
-        rsi_common::model_utils::effort_ladder(default_effort_model(provider))
-    } else {
-        ladder
+    (provider, effective_model)
+}
+
+/// The levels the form offers (#2768): the live ladder the provider's
+/// discovered catalog reported for the effective model (an empty one offers
+/// only `none`), else [`effort_ladder_for_selection`]'s compiled ladder.
+/// Shared by effort cycling and the rendered Effort row.
+pub(crate) fn live_effort_ladder_for_selection(
+    app: &App,
+    provider: Option<rsi_common::types::SessionProvider>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let selected_model = app.selected_model.as_deref();
+    let (effective_provider, effective_model) =
+        effort_target(provider, model, app.selected_provider, selected_model);
+    if let Some(live) = app.live_effort_ladder(effective_provider, effective_model) {
+        return live.to_vec();
     }
+    effort_ladder_for_selection(provider, model, app.selected_provider, selected_model)
+        .iter()
+        .map(|level| (*level).to_string())
+        .collect()
 }
 
 /// Cycle `form.effort` through the levels supported by the selected provider/model.
 fn cycle_effort(app: &mut App, forward: bool) {
-    let selected_provider = app.selected_provider;
-    let selected_model = app.selected_model.clone();
-    if let OverlayState::CreateEntityForm {
-        effort,
-        provider,
-        model,
-        ..
-    } = &mut app.overlay
-    {
-        let ladder = effort_ladder_for_selection(
-            *provider,
-            model.as_deref(),
-            selected_provider,
-            selected_model.as_deref(),
-        );
-        if ladder.is_empty() {
-            *effort = None;
-            return;
-        }
+    let OverlayState::CreateEntityForm {
+        provider, model, ..
+    } = &app.overlay
+    else {
+        return;
+    };
+    let ladder = live_effort_ladder_for_selection(app, *provider, model.as_deref());
+    let OverlayState::CreateEntityForm { effort, .. } = &mut app.overlay else {
+        return;
+    };
+    *effort = next_effort(effort.as_deref(), &ladder, forward);
+}
 
-        *effort = match effort.as_deref() {
-            None if forward => ladder.first().map(|level| (*level).to_string()),
-            None => ladder.last().map(|level| (*level).to_string()),
-            Some(current) => ladder
-                .iter()
-                .position(|level| *level == current)
-                .and_then(|index| {
-                    if forward {
-                        ladder.get(index + 1)
-                    } else {
-                        index
-                            .checked_sub(1)
-                            .and_then(|previous| ladder.get(previous))
-                    }
-                })
-                .map(|level| (*level).to_string()),
+/// The level after (or before) `current` on `ladder`; `None` past either end
+/// or on an empty ladder.
+fn next_effort(current: Option<&str>, ladder: &[String], forward: bool) -> Option<String> {
+    let Some(current) = current else {
+        let edge = if forward {
+            ladder.first()
+        } else {
+            ladder.last()
         };
-    }
+        return edge.cloned();
+    };
+    let index = ladder.iter().position(|level| level == current)?;
+    let next = if forward {
+        index.checked_add(1)
+    } else {
+        index.checked_sub(1)
+    };
+    next.and_then(|next| ladder.get(next)).cloned()
 }
 
 /// Open the parent-picker sub-overlay from the form's `gp` chord (Phase 5,
@@ -1719,6 +1763,7 @@ fn leaf_launch_options(
         workflow_id: None,
         // workflow_id_override stays None per ticket §7 (Phase 4 leaf-topology work).
         workflow_id_override: None,
+        cli_access: app.launch_cli_access(),
     }
 }
 
@@ -1972,6 +2017,54 @@ mod tests {
             ladder(Codex, None),
             rsi_common::model_utils::effort_ladder("gpt-6-astra")
         );
+    }
+
+    /// #2768: the form offers the live ladder the provider reported for the
+    /// effective model (including `ultracode`, excluding what it omits, an
+    /// empty ladder offering only `none`), and the compiled ladder for a model
+    /// discovery did not describe. Cycling walks the same levels.
+    #[tokio::test]
+    async fn form_effort_ladder_follows_the_live_ladder_with_compiled_fallback() {
+        use rsi_common::model_utils::ModelEffortCapabilities;
+        use rsi_common::types::SessionProvider::Claude;
+        let mut app = test_app();
+        let entry = |model: &str, levels: &[&str]| ModelEffortCapabilities {
+            model: model.into(),
+            supported_efforts: levels.iter().map(|l| l.to_string()).collect(),
+            default_effort: None,
+        };
+        app.model_effort_capabilities.insert(
+            Claude,
+            vec![
+                entry("claude-opus-9", &["low", "high", "max", "ultracode"]),
+                entry("claude-sonnet-9", &["low", "medium", "high"]),
+                entry("claude-haiku-9", &[]),
+            ],
+        );
+        let ladder = |app: &App, model: &str| {
+            live_effort_ladder_for_selection(app, Some(Claude), Some(model))
+        };
+        assert_eq!(
+            ladder(&app, "claude-opus-9"),
+            ["low", "high", "max", "ultracode"]
+        );
+        assert_eq!(ladder(&app, "claude-sonnet-9"), ["low", "medium", "high"]);
+        assert_eq!(ladder(&app, "claude-haiku-9"), Vec::<String>::new());
+        assert_eq!(
+            ladder(&app, "claude-opus-5"),
+            rsi_common::model_utils::effort_ladder("claude-opus-5")
+        );
+
+        let opus = ladder(&app, "claude-opus-9");
+        assert_eq!(
+            next_effort(Some("max"), &opus, true).as_deref(),
+            Some("ultracode")
+        );
+        assert_eq!(
+            next_effort(None, &opus, false).as_deref(),
+            Some("ultracode")
+        );
+        assert_eq!(next_effort(Some("ultracode"), &opus, true), None);
     }
 
     fn test_app() -> App {

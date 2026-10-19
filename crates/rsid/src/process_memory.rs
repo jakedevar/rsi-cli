@@ -122,6 +122,10 @@ pub fn arena_count() -> Option<u32> {
 }
 
 /// Arenas in a `malloc_info` document: one `<heap nr="N">` element each.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_os = "linux", target_env = "gnu")
+))]
 fn count_arenas(malloc_info_xml: &str) -> u32 {
     u32::try_from(malloc_info_xml.matches("<heap nr=").count()).unwrap_or(u32::MAX)
 }
@@ -156,6 +160,7 @@ pub fn heap_stats() -> Option<HeapStats> {
 }
 
 /// Resident set size of this process, from `/proc/self/statm`.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn rss_bytes() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -163,6 +168,39 @@ pub fn rss_bytes() -> Option<u64> {
     // SAFETY: sysconf only reads a system constant.
     let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) };
     pages.checked_mul(u64::try_from(page_size).ok()?)
+}
+
+/// Resident set size of this process, from `proc_pidinfo(PROC_PIDTASKINFO)`
+/// (the current resident size, not the `getrusage` peak; #1229).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn rss_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<nix::libc::proc_taskinfo>::zeroed();
+    let size = i32::try_from(std::mem::size_of::<nix::libc::proc_taskinfo>()).ok()?;
+    // SAFETY: the buffer is a properly sized and aligned `proc_taskinfo` that
+    // outlives the call; proc_pidinfo writes at most `size` bytes into it.
+    let written = unsafe {
+        nix::libc::proc_pidinfo(
+            nix::libc::getpid(),
+            nix::libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    // SAFETY: proc_pidinfo filled the whole struct (checked above).
+    let resident = unsafe { info.assume_init() }.pti_resident_size;
+    (resident > 0).then_some(resident)
+}
+
+/// No portable resident-size source on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn rss_bytes() -> Option<u64> {
+    None
 }
 
 /// Trim free arena pages, then record the heap counters for health reads.
@@ -224,6 +262,32 @@ pub fn report() -> Option<ProcessMemoryReport> {
         thp_disabled: THP_DISABLED.load(Ordering::Relaxed).then_some(true),
         arena_count: (sampled && arena_count > 0).then_some(arena_count),
     })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod portable_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn rss_tracks_resident_memory_and_feeds_the_health_report() {
+        let before = rss_bytes().expect("linux and macos report RSS");
+        assert!(before > 0);
+        // Touch 64 MiB so the resident size must grow past it.
+        let block = vec![1_u8; 64 * 1024 * 1024];
+        let touched = block
+            .iter()
+            .step_by(4096)
+            .map(|&byte| u64::from(byte))
+            .sum::<u64>();
+        assert_eq!(touched, 64 * 1024 * 1024 / 4096);
+        let during = rss_bytes().expect("rss while the block is live");
+        assert!(during >= 32 * 1024 * 1024, "{during}");
+        drop(block);
+        let report = report().expect("a report whenever RSS is readable");
+        assert!(report.rss_bytes > 0);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -326,6 +390,8 @@ mod tests {
     #[test]
     fn health_payload_without_memory_block_still_parses() {
         let mut value = serde_json::to_value(rsi_common::rpc::HealthStatusResponse {
+            daemon_pid: None,
+            daemon_started_at: None,
             persistence_queue_depth: 0,
             persistence_queue_capacity: 1,
             last_command_duration_ms: 0,
@@ -354,6 +420,7 @@ mod tests {
             process_memory: report(),
             provider_credentials: None,
             supervisor_mode: None,
+            codegraph_unhealthy: Vec::new(),
         })
         .expect("serialize health");
         assert!(value["process_memory"]["rss_bytes"].as_u64().is_some());

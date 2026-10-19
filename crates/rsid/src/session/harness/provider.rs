@@ -133,6 +133,20 @@ pub(crate) trait ApiProvider: Send + Sync {
     /// Whether this provider supports native tool calling (structured JSON tool_calls).
     fn supports_native_tools(&self) -> bool;
 
+    /// The route's default per-call output budget, reasoning included
+    /// (#2253). The Harness loop lifts its generic per-call cap to this when
+    /// it is larger. `None` keeps the generic cap.
+    fn default_max_output_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether the route takes `tool_choice: "none"` next to `tools` while
+    /// the history holds `tool_calls` (#2253). When true the wrap-up and
+    /// final-answer turns keep `tools`; otherwise the loop clears them.
+    fn accepts_tool_choice_none(&self) -> bool {
+        false
+    }
+
     /// Whether the resolved model accepts image inputs on this provider route.
     fn supports_image_input(&self, _model: &str) -> bool {
         false

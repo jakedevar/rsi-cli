@@ -5,8 +5,10 @@ use crate::client::DaemonClient;
 use crate::settings::{
     DaemonFeatureEntry, DaemonFeatureValue, SystemPromptPreset, model_control_mode_slug,
 };
+use crate::settings_staging::{SYSTEM_PROMPT_FIELD, StagedValue, Step, row_value_of_entry};
 use rsi_common::daemon_config_catalog::ApplyClass;
 use rsi_common::model_control::ModelControlMode;
+use rsi_common::operator_config::CustomProviderRole;
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimReport;
 
 /// The restart-badge suffix for a saved-value toast (Epic M design D.5): the
@@ -27,6 +29,11 @@ fn restart_toast_suffix(field: &str) -> Option<&'static str> {
     }
 }
 
+/// How recent a settled storage preview must be for `refresh_daemon_features`
+/// to reuse it instead of asking the daemon again.
+const STORAGE_STATUS_EVENT_REFRESH_MIN_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// Refresh the cached daemon feature list from the daemon.
 ///
 /// Also synchronizes the `UserSettings.system_prompt_preset` cache from
@@ -38,9 +45,15 @@ pub async fn refresh_daemon_features(app: &mut App) {
     // bootstrap or replace its primary client/push stream: a completed
     // handshake remains launch-ready while this short-lived refresh runs.
     app.request_daemon_config_refresh();
-    // A fresh preview keeps its existing RPC semantics. Duplicate automatic
-    // refreshes coalesce in the bootstrap coordinator.
-    app.request_storage_status_refresh();
+    // Duplicate automatic refreshes coalesce in the bootstrap coordinator. A
+    // preview settled within the last 30 s is kept: this action also runs for
+    // every model-invocation event while a Settings panel is open, and the
+    // daemon's preview is a full scan of every sandbox target (#2604).
+    app.request_storage_status_refresh_if_stale(STORAGE_STATUS_EVENT_REFRESH_MIN_AGE);
+    // #2384: the Cold Storage tab shows the archive's own status.
+    if app.settings_state.section == crate::settings_registry::SettingsSection::ColdStorage {
+        crate::cold_storage::refresh_status(app).await;
+    }
 }
 
 /// Read, set, or clear one `OpenRouter` model's route from the TUI command line.
@@ -82,12 +95,12 @@ pub async fn set_openrouter_model_route(app: &mut App, args: &str) {
 
 /// #1005: read, set, or clear one provider or model override of the
 /// coordinator context cap from the TUI command line. The key is `<Provider>`
-/// or `<Provider>/<model>`; the daemon validates it and the token range.
+/// or `<Provider>/<model>`; the daemon validates it and the percentage or token range.
 #[allow(clippy::future_not_send)] // App belongs to the single-threaded event loop.
 pub async fn set_coordinator_context_cap(app: &mut App, args: &str) {
     let mut parts = args.split_whitespace();
     let (Some(key), tokens, None) = (parts.next(), parts.next(), parts.next()) else {
-        app.notify("Usage: :context-cap <Provider[/model]> [tokens|0|default]");
+        app.notify("Usage: :context-cap <Provider[/model]> [pct|tokens|0|default]");
         return;
     };
     if !require_authoritative_config(app) {
@@ -99,7 +112,7 @@ pub async fn set_coordinator_context_cap(app: &mut App, args: &str) {
             Ok(config) => {
                 let current = config[field.as_str()]
                     .as_u64()
-                    .map_or_else(|| "default".to_string(), |n| n.to_string());
+                    .map_or_else(|| "default".to_string(), coordinator_cap_display);
                 app.notify(format!("Coordinator context cap for {key}: {current}"));
             }
             Err(error) => app.notify(format!("Failed to read coordinator context cap: {error}")),
@@ -111,12 +124,22 @@ pub async fn set_coordinator_context_cap(app: &mut App, args: &str) {
     } else if let Ok(n) = tokens.parse::<u64>() {
         serde_json::json!(n)
     } else {
-        app.notify("Cap must be a token count, 0 (off), or default");
+        app.notify("Cap must be a percentage (1-100), a token count, 0 (off), or default");
         return;
     };
+    let display = value
+        .as_u64()
+        .map_or_else(|| "default".to_string(), coordinator_cap_display);
     match app.client.update_daemon_config(&field, value).await {
-        Ok(()) => app.notify_success(format!("Coordinator context cap for {key}: {tokens}")),
+        Ok(()) => app.notify_success(format!("Coordinator context cap for {key}: {display}")),
         Err(error) => app.notify(format!("Failed to update coordinator context cap: {error}")),
+    }
+}
+
+fn coordinator_cap_display(value: u64) -> String {
+    match value {
+        1..=100 => format!("{value}%"),
+        _ => value.to_string(),
     }
 }
 
@@ -198,6 +221,28 @@ pub async fn set_launch_model_allowlist(app: &mut App, args: &str) {
     }
 }
 
+/// Write a free-text daemon field (the cold-storage archive directory,
+/// #2384 / #2438, the SearXNG URL, #2393) through `UpdateDaemonConfig` and
+/// mirror it into the cached feature entry. The daemon validates the value
+/// (`update_field`); its refusal comes back as `Err` with the daemon's reason.
+/// `""` selects the field's default.
+pub async fn write_daemon_text_field(
+    app: &mut App,
+    field: &str,
+    value: &str,
+) -> Result<(), String> {
+    if !app.authoritative_config_ready() {
+        return Err(app.daemon_config_unavailable_reason());
+    }
+    app.client
+        .update_daemon_config(field, serde_json::json!(value))
+        .await
+        .map_err(|error| error.to_string())?;
+    let json = serde_json::json!({ field: value });
+    DaemonFeatureEntry::update_from_json(&mut app.daemon_features, &json);
+    Ok(())
+}
+
 /// Refresh the cached lifetime usage aggregate for the Settings -> Stats
 /// category (T8; 1:1 clone of `refresh_daemon_features`). Tab-scoped
 /// per-project filter (D1): reads `app.current_project_id` at fetch time,
@@ -253,16 +298,7 @@ pub async fn sync_title_model_config(app: &mut App) {
     let local = app.settings.title_model_local.clone();
     let fallback = app.settings.title_model_fallback.clone();
     let provider = app.settings.title_model_provider;
-    let custom = app
-        .settings
-        .title_model_custom_provider_id
-        .and_then(|id| {
-            app.settings
-                .custom_providers
-                .iter()
-                .find(|entry| entry.id == id)
-        })
-        .map(|entry| (entry.base_url.clone(), entry.api_key.clone()));
+    let custom = live_custom_provider_id(app, app.settings.title_model_custom_provider_id);
 
     if let Err(e) = app
         .client
@@ -279,18 +315,7 @@ pub async fn sync_title_model_config(app: &mut App) {
         tracing::warn!("Failed to sync title_model_fallback to daemon: {}", e);
     }
     sync_config_field(app, "title_model_provider", serde_json::json!(provider)).await;
-    sync_config_field(
-        app,
-        "title_model_base_url",
-        serde_json::json!(custom.as_ref().map(|entry| entry.0.clone())),
-    )
-    .await;
-    sync_config_field(
-        app,
-        "title_model_api_key",
-        serde_json::json!(custom.as_ref().map(|entry| entry.1.clone())),
-    )
-    .await;
+    sync_custom_provider_route(app, CustomProviderRole::TitleModel, custom).await;
 }
 
 /// Sync TUI-owned memory/dream model choices to daemon `RuntimeConfig`.
@@ -303,25 +328,19 @@ pub async fn sync_memory_model_config(app: &mut App) {
             tracing::warn!("Failed to sync {} to daemon: {}", field, e);
         }
     }
+    let memory =
+        live_custom_provider_id(app, app.settings.memory_model_fallback_custom_provider_id);
+    let dream = live_custom_provider_id(app, app.settings.dream_model_custom_provider_id);
+    sync_custom_provider_route(app, CustomProviderRole::MemoryModelFallback, memory).await;
+    sync_custom_provider_route(app, CustomProviderRole::DreamModel, dream).await;
 }
 
+/// The model fields the TUI owns. A custom provider's base URL and key are
+/// not among them: `SetCustomProviderRoute` makes the daemon resolve both
+/// (hub #3039).
 fn memory_model_sync_fields(
     settings: &crate::settings::UserSettings,
 ) -> Vec<(&'static str, serde_json::Value)> {
-    let memory_custom = settings
-        .memory_model_fallback_custom_provider_id
-        .and_then(|id| {
-            settings
-                .custom_providers
-                .iter()
-                .find(|entry| entry.id == id)
-        });
-    let dream_custom = settings.dream_model_custom_provider_id.and_then(|id| {
-        settings
-            .custom_providers
-            .iter()
-            .find(|entry| entry.id == id)
-    });
     vec![
         (
             "memory_model_local",
@@ -335,26 +354,10 @@ fn memory_model_sync_fields(
             "memory_model_fallback_provider",
             serde_json::json!(settings.memory_model_fallback_provider),
         ),
-        (
-            "memory_model_fallback_base_url",
-            serde_json::json!(memory_custom.map(|entry| entry.base_url.clone())),
-        ),
-        (
-            "memory_model_fallback_api_key",
-            serde_json::json!(memory_custom.map(|entry| entry.api_key.clone())),
-        ),
         ("dream_model", serde_json::json!(settings.dream_model)),
         (
             "dream_model_provider",
             serde_json::json!(settings.dream_model_provider),
-        ),
-        (
-            "dream_model_base_url",
-            serde_json::json!(dream_custom.map(|entry| entry.base_url.clone())),
-        ),
-        (
-            "dream_model_api_key",
-            serde_json::json!(dream_custom.map(|entry| entry.api_key.clone())),
         ),
     ]
 }
@@ -365,8 +368,7 @@ pub async fn sync_prompt_processor_config(app: &mut App) {
     }
     let model = app.settings.prompt_processor.model.clone();
     let provider = app.settings.prompt_processor.provider;
-    let base_url = app.settings.prompt_processor.custom_base_url.clone();
-    let api_key = app.settings.prompt_processor.custom_api_key.clone();
+    let custom = live_custom_provider_id(app, app.settings.prompt_processor.custom_provider_id);
     sync_config_field(app, "prompt_compile_model_local", serde_json::json!(model)).await;
     sync_config_field(
         app,
@@ -374,18 +376,65 @@ pub async fn sync_prompt_processor_config(app: &mut App) {
         serde_json::json!(provider),
     )
     .await;
-    sync_config_field(
-        app,
-        "prompt_compile_model_base_url",
-        serde_json::json!(base_url),
-    )
-    .await;
-    sync_config_field(
-        app,
-        "prompt_compile_model_api_key",
-        serde_json::json!(api_key),
-    )
-    .await;
+    sync_custom_provider_route(app, CustomProviderRole::PromptCompileModel, custom).await;
+}
+
+/// Point every daemon model role at the custom provider the settings select
+/// (after the provider list loads at connect). The daemon keeps the
+/// assignment and reapplies it itself after a restart.
+pub(super) async fn sync_custom_provider_routes(app: &mut App) {
+    let routes = [
+        (
+            CustomProviderRole::TitleModel,
+            app.settings.title_model_custom_provider_id,
+        ),
+        (
+            CustomProviderRole::MemoryModelFallback,
+            app.settings.memory_model_fallback_custom_provider_id,
+        ),
+        (
+            CustomProviderRole::DreamModel,
+            app.settings.dream_model_custom_provider_id,
+        ),
+        (
+            CustomProviderRole::PromptCompileModel,
+            app.settings.prompt_processor.custom_provider_id,
+        ),
+    ];
+    for (role, id) in routes {
+        let id = live_custom_provider_id(app, id);
+        sync_custom_provider_route(app, role, id).await;
+    }
+}
+
+/// A selected custom provider id that the daemon still lists. A stale id
+/// (deleted elsewhere) detaches the role instead of failing the sync.
+fn live_custom_provider_id(app: &App, id: Option<uuid::Uuid>) -> Option<uuid::Uuid> {
+    id.filter(|id| {
+        app.settings
+            .custom_providers
+            .iter()
+            .any(|entry| entry.id == *id)
+    })
+}
+
+/// Point a daemon model role at a custom provider (or detach it). The daemon
+/// writes the role's base URL and key from its store and vault.
+async fn sync_custom_provider_route(
+    app: &mut App,
+    role: CustomProviderRole,
+    id: Option<uuid::Uuid>,
+) {
+    if !app.authoritative_config_ready() {
+        return;
+    }
+    if let Err(e) = app.client.set_custom_provider_route(role, id).await {
+        tracing::warn!(
+            "Failed to sync the {} provider to daemon: {}",
+            role.as_str(),
+            e
+        );
+    }
 }
 
 async fn sync_config_field(app: &mut App, field: &str, value: serde_json::Value) {
@@ -490,11 +539,17 @@ impl App {
     }
 }
 
-/// Toggle (or cycle) the daemon feature at the given index.
+/// Step the daemon feature at the given index forward and send it at once.
+///
+/// The Settings panel no longer calls this for its switches and choices: those
+/// stage and go through [`apply_pending_settings`] (#2241). It remains for the
+/// action buttons (emergency stop, cache preview and reclaim) and for callers
+/// outside the panel that commit a single value on the spot.
 /// - `Bool` features flip their flag via RPC and update local state.
-/// - `Cycle` features advance to the next option in their list (wrapping)
-///   and dispatch `UpdateDaemonConfig` with the new JSON value.
-/// - `Display` features are read-only and no-op on Enter.
+/// - `Cycle` features advance one option with the shared stepping function
+///   (numeric lists clamp at their ends, enum lists wrap) and dispatch
+///   `UpdateDaemonConfig` with the new JSON value.
+/// - `Display` features are read-only and no-op.
 pub async fn toggle_daemon_feature(app: &mut App, idx: usize) {
     if !require_authoritative_config(app) {
         return;
@@ -513,104 +568,293 @@ pub async fn toggle_daemon_feature(app: &mut App, idx: usize) {
             "sandbox_build_cache_reclaim_now" => {
                 return run_sandbox_build_cache_reclaim(app, false).await;
             }
+            // #2384: the Cold Storage tab's rows. Enter on the status rows
+            // refreshes them and announces the state; the run row starts a pass.
+            crate::cold_storage::RUN_NOW_FIELD => {
+                return crate::cold_storage::run_pass(app, "stage").await;
+            }
+            crate::cold_storage::STATUS_FIELD | crate::cold_storage::LAST_RUN_FIELD => {
+                return crate::cold_storage::cold_archive_command(app, None).await;
+            }
             _ => {}
         }
     }
 
-    /// The pending mutation, decided before the RPC call so the immutable
-    /// borrow of `app.daemon_features[idx]` is released before we hit the
-    /// async `app.client` borrow.
-    enum Update {
-        Bool(String, bool),
-        Cycle {
-            field: String,
-            new_value: String,
-            options: Vec<String>,
-            new_current: usize,
-        },
+    // Display-only rows (and empty choice lists) have no value to step.
+    let Some(live) = app.daemon_features.get(idx).and_then(row_value_of_entry) else {
+        return;
+    };
+    let next = live.stepped(Step::Activate);
+    match write_daemon_value(app, idx, next.staged()).await {
+        Ok(message) => app.notify_success(&message),
+        Err(error) => app.notify(&format!("Failed to toggle feature: {error}")),
+    }
+}
+
+/// The text of option `staged` of the Cycle row at `idx`.
+fn daemon_choice_text(app: &App, idx: usize, staged: StagedValue) -> Result<String, String> {
+    let entry = app
+        .daemon_features
+        .get(idx)
+        .ok_or("the setting is no longer listed")?;
+    match (&entry.value, staged) {
+        (DaemonFeatureValue::Cycle { options, .. }, StagedValue::Choice(index)) => options
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "the staged choice is no longer offered".to_string()),
+        _ => Err("the staged value no longer fits this setting".to_string()),
+    }
+}
+
+/// A daemon row write ready to send: what the RPC carries, and the row value
+/// to cache once the daemon has accepted it.
+struct PreparedWrite {
+    idx: usize,
+    field: String,
+    label: String,
+    value_json: serde_json::Value,
+    new_value: DaemonFeatureValue,
+}
+
+/// Resolve `value` for the daemon feature at `idx` into its RPC form.
+fn prepare_daemon_write(
+    app: &App,
+    idx: usize,
+    value: StagedValue,
+) -> Result<PreparedWrite, String> {
+    let entry = app
+        .daemon_features
+        .get(idx)
+        .ok_or("the setting is no longer listed")?;
+    let (value_json, new_value) = match (&entry.value, value) {
+        (DaemonFeatureValue::Bool(_), StagedValue::Bool(on)) => {
+            (serde_json::json!(on), DaemonFeatureValue::Bool(on))
+        }
+        (DaemonFeatureValue::Cycle { options, .. }, StagedValue::Choice(index))
+            if index < options.len() =>
+        {
+            (
+                daemon_cycle_value_json(&options[index]),
+                DaemonFeatureValue::Cycle {
+                    options: options.clone(),
+                    current: index,
+                },
+            )
+        }
+        _ => return Err("the staged value no longer fits this setting".to_string()),
+    };
+    Ok(PreparedWrite {
+        idx,
+        field: entry.field.clone(),
+        label: entry.label.clone(),
+        value_json,
+        new_value,
+    })
+}
+
+/// Move the cached row and its mirrors to a value the daemon accepted. Returns
+/// the success message (with the restart suffix when the field needs one).
+fn finish_daemon_write(app: &mut App, write: PreparedWrite) -> String {
+    let PreparedWrite {
+        idx,
+        field,
+        label,
+        new_value,
+        ..
+    } = write;
+    let value_str = match &new_value {
+        DaemonFeatureValue::Bool(on) => if *on { "enabled" } else { "disabled" }.to_string(),
+        DaemonFeatureValue::Cycle { options, current } => options
+            .get(*current)
+            .cloned()
+            .unwrap_or_else(|| "?".to_string()),
+        DaemonFeatureValue::Display(_) => String::new(),
+    };
+    if field == SYSTEM_PROMPT_FIELD {
+        app.settings.system_prompt_preset = SystemPromptPreset::from_slug(&value_str);
+    }
+    if let Some(entry) = app.daemon_features.get_mut(idx) {
+        entry.value = new_value;
+    }
+    if field == rsi_common::provider_profile::PROVIDER_PROFILE_FIELD {
+        app.sync_provider_profile();
+    }
+    let suffix = restart_toast_suffix(&field).unwrap_or("");
+    format!("{label} → {value_str}{suffix}")
+}
+
+/// Send `value` for the daemon feature at `idx` through `UpdateDaemonConfig`
+/// and, once the daemon accepts it, move the cached row and its mirrors to it.
+/// Returns the success message (with the restart suffix when the field needs
+/// one); a rejected or failed update leaves the cache unchanged.
+async fn write_daemon_value(
+    app: &mut App,
+    idx: usize,
+    value: StagedValue,
+) -> Result<String, String> {
+    let write = prepare_daemon_write(app, idx, value)?;
+    if let Err(error) = app
+        .client
+        .update_daemon_config(&write.field, write.value_json.clone())
+        .await
+    {
+        tracing::warn!(
+            "Failed to update daemon config field '{}': {}",
+            write.field,
+            error
+        );
+        return Err(error.to_string());
+    }
+    Ok(finish_daemon_write(app, write))
+}
+
+/// Apply every pending Settings edit (#2241, #2236). The staged local
+/// preferences are committed and saved. The changed daemon rows go to the
+/// daemon as ONE atomic `UpdateDaemonConfig` carrying every final value: the
+/// daemon validates the set, persists it in one transaction and applies it in
+/// one pass, so either every row takes effect or none does and all stay
+/// pending, with the daemon's refusal (which names the field) in the error
+/// toast. The model-control mode is a policy, not a config field, so it keeps
+/// its own RPC.
+pub async fn apply_pending_settings(app: &mut App) {
+    let local = crate::settings_keys::commit_pending_local(app);
+    if local > 0 {
+        crate::state::PersistedState::capture(app).save();
+    }
+    let changes = app
+        .settings_state
+        .pending
+        .daemon_changes(&app.daemon_features);
+    app.mark_dirty();
+    if changes.is_empty() {
+        app.settings_state.pending.clear();
+        if local == 0 {
+            app.notify("No pending settings changes");
+        } else {
+            app.notify_success(applied_message(local, &[]));
+        }
+        return;
+    }
+    if !require_authoritative_config(app) {
+        if local > 0 {
+            app.notify_success(applied_message(local, &[]));
+        }
+        return;
     }
 
-    let update = {
-        let entry = match app.daemon_features.get(idx) {
-            Some(e) => e,
-            None => return,
-        };
-        match &entry.value {
-            DaemonFeatureValue::Bool(current) => Update::Bool(entry.field.clone(), !current),
-            DaemonFeatureValue::Display(_) => return, // display-only, not toggleable
-            DaemonFeatureValue::Cycle { options, current } => {
-                if options.is_empty() {
-                    return;
-                }
-                let new_current = (current + 1) % options.len();
-                Update::Cycle {
-                    field: entry.field.clone(),
-                    new_value: options[new_current].clone(),
-                    options: options.clone(),
-                    new_current,
-                }
+    let total = changes.len();
+    let mut applied = local;
+    let mut messages = Vec::new();
+    let mut failures = Vec::new();
+    let mut batch: Vec<PreparedWrite> = Vec::new();
+    let mut mode_change: Option<(usize, StagedValue)> = None;
+    for (idx, staged) in changes {
+        if app
+            .daemon_features
+            .get(idx)
+            .is_some_and(|entry| entry.field == "model_control_mode")
+        {
+            mode_change = Some((idx, staged));
+            continue;
+        }
+        match prepare_daemon_write(app, idx, staged) {
+            Ok(write) => batch.push(write),
+            Err(error) => {
+                let label = app
+                    .daemon_features
+                    .get(idx)
+                    .map(|entry| entry.label.clone())
+                    .unwrap_or_default();
+                failures.push(format!("{label}: {error}"));
             }
         }
-    };
+    }
 
-    let (field, value_json) = match &update {
-        Update::Bool(f, b) => (f.clone(), serde_json::json!(b)),
-        Update::Cycle {
-            field, new_value, ..
-        } => (field.clone(), daemon_cycle_value_json(new_value)),
-    };
-    let system_prompt_slug = match &update {
-        Update::Cycle {
-            field, new_value, ..
-        } if field == "system_prompt_preset" => Some(new_value.clone()),
-        _ => None,
-    };
-
-    match app.client.update_daemon_config(&field, value_json).await {
-        Ok(()) => {
-            // Update local cache optimistically.
-            if let Some(entry) = app.daemon_features.get_mut(idx) {
-                entry.value = match update {
-                    Update::Bool(_, b) => DaemonFeatureValue::Bool(b),
-                    Update::Cycle {
-                        options,
-                        new_current,
-                        ..
-                    } => DaemonFeatureValue::Cycle {
-                        options,
-                        current: new_current,
-                    },
-                };
-            }
-            if let Some(slug) = system_prompt_slug {
-                app.settings.system_prompt_preset = SystemPromptPreset::from_slug(&slug);
-            }
-            if field == rsi_common::provider_profile::PROVIDER_PROFILE_FIELD {
-                app.sync_provider_profile();
-            }
-            let label = app
-                .daemon_features
-                .get(idx)
-                .map(|e| e.label.as_str())
-                .unwrap_or("feature")
-                .to_string();
-            let value_str = match app.daemon_features.get(idx).map(|e| &e.value) {
-                Some(DaemonFeatureValue::Bool(b)) => {
-                    if *b { "enabled" } else { "disabled" }.to_string()
+    if !batch.is_empty() {
+        let updates: Vec<(String, serde_json::Value)> = batch
+            .iter()
+            .map(|write| (write.field.clone(), write.value_json.clone()))
+            .collect();
+        match app.client.update_daemon_config_batch(&updates).await {
+            Ok(()) => {
+                for write in batch {
+                    let field = write.field.clone();
+                    messages.push(finish_daemon_write(app, write));
+                    app.settings_state.pending.settle_daemon(&field);
+                    applied += 1;
                 }
-                Some(DaemonFeatureValue::Cycle { options, current }) => options
-                    .get(*current)
-                    .cloned()
-                    .unwrap_or_else(|| "?".to_string()),
-                _ => String::new(),
-            };
-            let suffix = restart_toast_suffix(&field).unwrap_or("");
-            app.notify_success(&format!("{} → {}{}", label, value_str, suffix));
+            }
+            Err(error) => {
+                tracing::warn!("Failed to update daemon config fields: {error}");
+                let labels: Vec<&str> = batch.iter().map(|write| write.label.as_str()).collect();
+                failures.push(format!(
+                    "none of {} were applied: {error}",
+                    labels.join(", ")
+                ));
+            }
         }
-        Err(e) => {
-            tracing::warn!("Failed to update daemon config field '{}': {}", field, e);
-            app.notify(&format!("Failed to toggle feature: {}", e));
+    }
+    if let Some((idx, staged)) = mode_change {
+        let (field, label) = app
+            .daemon_features
+            .get(idx)
+            .map(|entry| (entry.field.clone(), entry.label.clone()))
+            .unwrap_or_default();
+        match apply_model_control_mode(app, idx, staged).await {
+            Ok(message) => {
+                app.settings_state.pending.settle_daemon(&field);
+                applied += 1;
+                messages.push(message);
+            }
+            Err(error) => failures.push(format!("{label}: {error}")),
         }
+    }
+    app.settings_state
+        .pending
+        .prune_settled_daemon(&app.daemon_features);
+    app.mark_dirty();
+    if !messages.is_empty() || local > 0 {
+        app.notify_success(applied_message(applied, &messages));
+    }
+    if !failures.is_empty() {
+        app.notify_error(format!(
+            "{} of {} daemon settings were not applied and stay pending: {}",
+            total.saturating_sub(applied.saturating_sub(local)),
+            total,
+            failures.join("; ")
+        ));
+    }
+}
+
+/// The accepted model-control mode row of an apply.
+async fn apply_model_control_mode(
+    app: &mut App,
+    idx: usize,
+    staged: StagedValue,
+) -> Result<String, String> {
+    let slug = daemon_choice_text(app, idx, staged)?;
+    let message = set_model_control_mode(app, &slug).await?;
+    // Keep the row on the accepted mode even when no status snapshot is cached
+    // to refresh it from.
+    if let Some(entry) = app.daemon_features.get_mut(idx)
+        && let (DaemonFeatureValue::Cycle { current, .. }, StagedValue::Choice(index)) =
+            (&mut entry.value, staged)
+    {
+        *current = index;
+    }
+    Ok(message)
+}
+
+/// "Applied N settings" with the per-row messages when there are any; a single
+/// daemon row reads as that row's own message.
+fn applied_message(applied: usize, messages: &[String]) -> String {
+    match (applied, messages) {
+        (1, [only]) => only.clone(),
+        (_, []) => format!(
+            "Applied {applied} setting{}",
+            if applied == 1 { "" } else { "s" }
+        ),
+        _ => format!("Applied {applied} settings: {}", messages.join("; ")),
     }
 }
 
@@ -715,17 +959,22 @@ fn compact_binary_bytes(bytes: u64) -> String {
 }
 
 async fn cycle_model_control_mode(app: &mut App, idx: usize) {
-    let Some(entry) = app.daemon_features.get(idx) else {
+    let Some(live) = app.daemon_features.get(idx).and_then(row_value_of_entry) else {
         return;
     };
-    let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+    let Ok(next_slug) = daemon_choice_text(app, idx, live.stepped(Step::Activate).staged()) else {
         return;
     };
-    if options.is_empty() {
-        return;
+    match set_model_control_mode(app, &next_slug).await {
+        Ok(message) => app.notify_success(&message),
+        Err(error) => app.notify(&format!("Failed to update model control mode: {error}")),
     }
-    let next_slug = options[(current + 1) % options.len()].clone();
-    let mode = match next_slug.as_str() {
+}
+
+/// Set the model-control mode through its own RPC and refresh the cached
+/// status and the Settings row from the daemon's report.
+async fn set_model_control_mode(app: &mut App, slug: &str) -> Result<String, String> {
+    let mode = match slug {
         "pause-background" => ModelControlMode::PauseBackground,
         "deny-paid" => ModelControlMode::DenyPaid,
         "local-only" => ModelControlMode::LocalOnly,
@@ -743,15 +992,15 @@ async fn cycle_model_control_mode(app: &mut App, idx: usize) {
             if let Some(status) = app.cached_model_control_status.as_ref() {
                 DaemonFeatureEntry::update_model_control(&mut app.daemon_features, status);
             }
-            app.notify_success(&format!(
+            refresh_usage_stats(app).await;
+            Ok(format!(
                 "Model control mode: {}",
                 model_control_mode_slug(report.current_mode)
-            ));
-            refresh_usage_stats(app).await;
+            ))
         }
         Err(e) => {
             tracing::warn!("Failed to update model control mode: {}", e);
-            app.notify(&format!("Failed to update model control mode: {}", e));
+            Err(e.to_string())
         }
     }
 }
@@ -922,6 +1171,15 @@ fn daemon_cycle_value_json(new_value: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coordinator_cap_display_identifies_percentage_values() {
+        assert_eq!(super::coordinator_cap_display(1), "1%");
+        assert_eq!(super::coordinator_cap_display(60), "60%");
+        assert_eq!(super::coordinator_cap_display(100), "100%");
+        assert_eq!(super::coordinator_cap_display(0), "0");
+        assert_eq!(super::coordinator_cap_display(200_000), "200000");
+    }
+
     use super::{
         daemon_cycle_value_json, refresh_daemon_features, refresh_usage_stats,
         sandbox_cache_reclaim_failure_message, sandbox_cache_reclaim_success_message,
@@ -944,12 +1202,8 @@ mod tests {
             "memory_model_local",
             "memory_model_fallback",
             "memory_model_fallback_provider",
-            "memory_model_fallback_base_url",
-            "memory_model_fallback_api_key",
             "dream_model",
             "dream_model_provider",
-            "dream_model_base_url",
-            "dream_model_api_key",
         ]
         .into_iter()
         .collect();
@@ -1042,10 +1296,22 @@ mod tests {
                 panic!("fake daemon request is not valid JSON: {line}");
             };
             assert_eq!(request["method"], "UpdateDaemonConfig");
-            let Some(field) = request["params"]["field"].as_str() else {
-                panic!("UpdateDaemonConfig request carries a string field: {request}");
-            };
-            captured.push((field.to_string(), request["params"]["value"].clone()));
+            // One request is either a single `field`/`value` or the atomic
+            // `updates` list the Settings page applies with (#2236); both are
+            // recorded field by field.
+            if let Some(updates) = request["params"]["updates"].as_array() {
+                for update in updates {
+                    let Some(field) = update["field"].as_str() else {
+                        panic!("every field update carries a string field: {request}");
+                    };
+                    captured.push((field.to_string(), update["value"].clone()));
+                }
+            } else {
+                let Some(field) = request["params"]["field"].as_str() else {
+                    panic!("UpdateDaemonConfig request carries a string field: {request}");
+                };
+                captured.push((field.to_string(), request["params"]["value"].clone()));
+            }
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request["id"],
@@ -1162,9 +1428,48 @@ mod tests {
                 "{field} sent UpdateDaemonConfig"
             );
         }
-        assert!(
-            !captured_fields.contains(&"retry_max_default"),
-            "retry_max_default stays read-only (NotApplied), never toggled"
+    }
+
+    /// #3141 (f): both per-provider route fallback rows toggle through the
+    /// generic daemon-feature path and send their own field with the flipped
+    /// bool (OpenRouter off -> on, Bedrock on -> off).
+    #[tokio::test]
+    async fn per_provider_route_fallback_rows_toggle_and_send_their_field() {
+        use crate::client::DaemonClient;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(respond_to_update_daemon_config(listener, 2));
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = DaemonClient::new(socket);
+        app.client.connect().await.unwrap();
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        for field in [
+            "api_route.fallback.openrouter",
+            "api_route.fallback.bedrock",
+        ] {
+            let index = app
+                .daemon_features
+                .iter()
+                .position(|entry| entry.field == field)
+                .unwrap();
+            toggle_daemon_feature(&mut app, index).await;
+        }
+        let captured = server.await.unwrap();
+        assert_eq!(
+            captured,
+            vec![
+                (
+                    "api_route.fallback.openrouter".to_string(),
+                    serde_json::json!(true)
+                ),
+                (
+                    "api_route.fallback.bedrock".to_string(),
+                    serde_json::json!(false)
+                ),
+            ]
         );
     }
 
@@ -1184,14 +1489,21 @@ mod tests {
             .iter()
             .position(|entry| entry.field == "completed_transcript_cache_max_bytes")
             .unwrap();
-        if let DaemonFeatureValue::Cycle { options, current } =
-            &mut app.daemon_features[index].value
-        {
-            *current = options.len() - 1;
-        } else {
+        // Step the cap down to its "0" option and apply: numeric rows clamp at
+        // their ends, so zero is reached by stepping back rather than by a
+        // wrap from the maximum.
+        let DaemonFeatureValue::Cycle { options, current } = &mut app.daemon_features[index].value
+        else {
             panic!("completed transcript cap has a cycle editor");
-        }
-        toggle_daemon_feature(&mut app, index).await;
+        };
+        assert_eq!(options.first().map(String::as_str), Some("0"));
+        *current = 1;
+        app.settings_state.pending.stage_daemon(
+            "completed_transcript_cache_max_bytes",
+            crate::settings_staging::StagedValue::Choice(1),
+            crate::settings_staging::StagedValue::Choice(0),
+        );
+        super::apply_pending_settings(&mut app).await;
         let captured = server.await.unwrap();
         assert_eq!(
             captured,
@@ -1369,6 +1681,295 @@ mod tests {
         assert!(
             !app.storage_refresh_in_flight(),
             "storage remains automatically owned but waits for session admission"
+        );
+    }
+
+    // -- #2241: edits stage locally and apply once -----------------------------
+
+    type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A fake daemon that records every `(method, params)` it is sent and
+    /// answers `{"ok": true}`, until the client hangs up.
+    async fn recording_daemon(listener: tokio::net::UnixListener, log: RecordedRequests) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                return;
+            };
+            if let Ok(mut log) = log.lock() {
+                log.push((
+                    request["method"].as_str().unwrap_or_default().to_string(),
+                    request["params"].clone(),
+                ));
+            }
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"ok": true},
+            });
+            if write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    fn requests(log: &RecordedRequests) -> Vec<(String, serde_json::Value)> {
+        let Ok(log) = log.lock() else {
+            panic!("request log lock");
+        };
+        log.clone()
+    }
+
+    /// A connected Settings app on the daemon row `field` of `section`, with a
+    /// fake daemon recording what it is sent.
+    async fn settings_app_with_recording_daemon(
+        section: crate::settings_registry::SettingsSection,
+        field: &str,
+    ) -> (tempfile::TempDir, RecordedRequests, crate::app::App) {
+        let Ok(directory) = tempfile::tempdir() else {
+            panic!("failed to create temp dir for fake daemon socket");
+        };
+        let socket = directory.path().join("daemon.sock");
+        let Ok(listener) = tokio::net::UnixListener::bind(&socket) else {
+            panic!("failed to bind fake daemon socket at {socket:?}");
+        };
+        let log = RecordedRequests::default();
+        tokio::spawn(recording_daemon(listener, log.clone()));
+
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = crate::client::DaemonClient::new(socket);
+        let Ok(()) = app.client.connect().await else {
+            panic!("fake daemon connect failed");
+        };
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        let focused = app.active_tab().focused_pane;
+        let Some(pane) = app.active_tab_mut().layout.find_pane_mut(focused) else {
+            panic!("focused pane exists");
+        };
+        *pane = crate::types::Pane::Settings;
+        select_daemon_row(&mut app, section, field);
+        (directory, log, app)
+    }
+
+    fn select_daemon_row(
+        app: &mut crate::app::App,
+        section: crate::settings_registry::SettingsSection,
+        field: &str,
+    ) {
+        let Some(row) = crate::settings_keys::daemon_feature_rows_for_section(app, section)
+            .iter()
+            .position(|(_, vec_idx)| app.daemon_features[*vec_idx].field == field)
+        else {
+            panic!("{field} is a row of {section:?}");
+        };
+        app.settings_state.section = section;
+        app.settings_state.focus = crate::types::SettingsFocus::Items;
+        app.settings_state.selected_index = row;
+    }
+
+    fn press_keys(app: &mut crate::app::App, keys: &[crossterm::event::KeyCode]) {
+        for code in keys {
+            let key = crossterm::event::KeyEvent::new(*code, crossterm::event::KeyModifiers::NONE);
+            assert!(crate::settings_keys::handle_settings_key(app, key));
+        }
+    }
+
+    /// Acceptance (b): N keypresses on a row produce zero daemon updates, and
+    /// apply produces exactly one update carrying the final value.
+    #[tokio::test]
+    async fn many_keypresses_send_nothing_and_apply_sends_one_update_with_the_final_value() {
+        use crossterm::event::KeyCode::{Char, Enter};
+
+        let field = "sandbox_max_source_roots";
+        let (_directory, log, mut app) = settings_app_with_recording_daemon(
+            crate::settings_registry::SettingsSection::SandboxStorage,
+            field,
+        )
+        .await;
+        // The live row sits at 4096 (index 3 of 512..16384): 3 -> 0 (clamped),
+        // then up to 1, 2, 3 and back down to 2 = 2048.
+        press_keys(
+            &mut app,
+            &[
+                Char('-'),
+                Char('-'),
+                Char('-'),
+                Char('-'),
+                Char('+'),
+                Enter,
+                Char('+'),
+                Char('-'),
+            ],
+        );
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            app.pending_lc_actions.is_empty(),
+            "no key queued a daemon action: {:?}",
+            app.pending_lc_actions
+        );
+        assert!(
+            requests(&log).is_empty(),
+            "eight keypresses reached the daemon: {:?}",
+            requests(&log)
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+
+        super::apply_pending_settings(&mut app).await;
+
+        assert_eq!(
+            requests(&log),
+            vec![(
+                "UpdateDaemonConfig".to_string(),
+                serde_json::json!({"updates": [{"field": field, "value": 2048}]})
+            )],
+            "exactly one update, holding the final value after eight presses"
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+        assert!(app.settings_state.pending.is_empty());
+        let current = app
+            .daemon_features
+            .iter()
+            .find(|entry| entry.field == field)
+            .map(|entry| entry.value.clone());
+        assert!(
+            matches!(current, Some(DaemonFeatureValue::Cycle { current: 2, .. })),
+            "the live row moved to the applied value: {current:?}"
+        );
+    }
+
+    /// Several rows are applied by one action: ONE daemon update carries every
+    /// changed field with its final value, and nothing else is sent (#2236).
+    #[tokio::test]
+    async fn apply_sends_every_changed_field_in_one_daemon_update() {
+        use crate::settings_registry::SettingsSection;
+        use crossterm::event::KeyCode::{Char, Enter};
+
+        let (_directory, log, mut app) = settings_app_with_recording_daemon(
+            SettingsSection::SandboxStorage,
+            "sandbox_max_source_roots",
+        )
+        .await;
+        // 4096 -> 2048 -> 1024 -> 512, then back up one step: 1024.
+        press_keys(&mut app, &[Char('-'), Char('-'), Char('-'), Char('+')]);
+        select_daemon_row(&mut app, SettingsSection::RetriesRecovery, "retry_enabled");
+        press_keys(&mut app, &[Enter, Enter, Enter]);
+        // A third row that is stepped away and back is not an edit at all.
+        select_daemon_row(&mut app, SettingsSection::RetriesRecovery, "retry_on_stall");
+        press_keys(&mut app, &[Char('+'), Char('-')]);
+        assert_eq!(crate::settings_staging::pending_count(&app), 2);
+        assert!(requests(&log).is_empty());
+
+        super::apply_pending_settings(&mut app).await;
+
+        let sent = requests(&log);
+        assert_eq!(
+            sent.len(),
+            1,
+            "one daemon update for the whole apply: {sent:?}"
+        );
+        assert_eq!(sent[0].0, "UpdateDaemonConfig");
+        let Some(listed) = sent[0].1["updates"].as_array() else {
+            panic!("the update carries a list of field updates: {:?}", sent[0]);
+        };
+        let mut updates: Vec<(String, serde_json::Value)> = listed
+            .iter()
+            .map(|update| {
+                (
+                    update["field"].as_str().unwrap_or_default().to_string(),
+                    update["value"].clone(),
+                )
+            })
+            .collect();
+        updates.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            updates,
+            vec![
+                ("retry_enabled".to_string(), serde_json::json!(true)),
+                (
+                    "sandbox_max_source_roots".to_string(),
+                    serde_json::json!(1024)
+                ),
+            ]
+        );
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|n| n.message.starts_with("Applied 2 settings")),
+            "one summary toast: {:?}",
+            app.notifications.back()
+        );
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+    }
+
+    /// Esc leaves the panel and drops every staged edit: nothing is sent, now
+    /// or later.
+    #[tokio::test]
+    async fn escape_discards_staged_edits_so_nothing_is_ever_sent() {
+        use crossterm::event::KeyCode::{Char, Esc};
+
+        let field = "sandbox_max_source_roots";
+        let (_directory, log, mut app) = settings_app_with_recording_daemon(
+            crate::settings_registry::SettingsSection::SandboxStorage,
+            field,
+        )
+        .await;
+        press_keys(&mut app, &[Char('-'), Char('-')]);
+        assert_eq!(crate::settings_staging::pending_count(&app), 1);
+        press_keys(&mut app, &[Esc]);
+        assert_eq!(crate::settings_staging::pending_count(&app), 0);
+
+        super::apply_pending_settings(&mut app).await;
+        assert!(requests(&log).is_empty(), "{:?}", requests(&log));
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|n| n.message.contains("No pending settings changes"))
+        );
+    }
+
+    /// A row the daemon cannot take stays pending while the others apply.
+    #[tokio::test]
+    async fn a_failed_row_stays_pending_and_is_named() {
+        use crossterm::event::KeyCode::Char;
+
+        let field = "sandbox_max_source_roots";
+        let (_directory, _log, mut app) = settings_app_with_recording_daemon(
+            crate::settings_registry::SettingsSection::SandboxStorage,
+            field,
+        )
+        .await;
+        press_keys(&mut app, &[Char('-')]);
+        // The daemon goes away between staging and applying.
+        app.client = crate::client::DaemonClient::new(std::path::PathBuf::from(
+            "/nonexistent/rsi-daemon.sock",
+        ));
+
+        super::apply_pending_settings(&mut app).await;
+
+        assert_eq!(
+            crate::settings_staging::pending_count(&app),
+            1,
+            "the refused row is still pending"
+        );
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("Maximum sandbox roots")),
+            "the failure names the row: {:?}",
+            app.notifications
         );
     }
 }

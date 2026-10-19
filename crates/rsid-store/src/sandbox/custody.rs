@@ -12,7 +12,7 @@ use crate::sandbox::target_reclaim::{
 use crate::store::Store;
 use crate::store::custody_lock_order::{
     admission_wait, is_lock_order_busy_error, lock_store_then_optional_root, lock_store_then_root,
-    lock_store_then_root_within, lock_store_then_session_root,
+    lock_store_then_root_within, lock_store_then_session_root, lock_store_then_session_root_within,
 };
 use crate::store::sandbox_custody::{
     ArchivedRotationRestoration, CustodyCause, CustodyRootGuard, EffectReservation,
@@ -51,6 +51,22 @@ pub(crate) type CustodyStore = Arc<Mutex<Store>>;
 struct PhasedReclaimStore {
     store: CustodyStore,
     pass: Arc<crate::sandbox::target_reclaim::ReclaimPassState>,
+}
+
+/// What an owner still inside the idle TTL must show before its `target/` is
+/// reclaimed (#1684, hub #3026).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdleGate {
+    /// Past the TTL, under disk pressure or the accepted result settled: no
+    /// git proof is needed.
+    Open,
+    /// HEAD must be an ancestor of `origin/rolling`.
+    Landed,
+    /// A worker that ended with a final `PIPELINE HANDOFF`: HEAD must be on
+    /// `origin/rolling` or contained in a pushed `origin/*` branch (a
+    /// satellite worker's commit lands through the hub queue, so no local
+    /// queue entry ever settles).
+    LandedOrPublished,
 }
 
 /// One reclaim attempt: its outcome and, for a refusal, the exact check that
@@ -183,7 +199,16 @@ impl CustodyExecutionRuntime {
                 CustodyService::authorize_ordinary_for_transition(session, transition)
             }
             Ok(CustodyClassification::RequiresPersistedAuthentication) => {
-                let (mut store, root) = lock_store_then_session_root(&self.store, session.id).await;
+                let Some((mut store, root)) =
+                    lock_store_then_session_root_within(&self.store, session.id, admission_wait())
+                        .await
+                else {
+                    return Err(CustodyService::refusal(
+                        SandboxCustodyErrorCodeV1::RootBusy,
+                        Some(session.id),
+                        transition,
+                    ));
+                };
                 CustodyService::authorize_live_holding(
                     session,
                     &mut store,
@@ -1037,7 +1062,7 @@ impl CustodyExecutionRuntime {
     /// session row, no provider/context/config/target work).
     ///
     /// A live sandboxed emitter authenticates through its persisted
-    /// root/branch/Git identity (`authorize_live_nonmutating`); an ordinary
+    /// root/branch/Git identity (`authorize_live_nonmutating_holding`); an ordinary
     /// emitter authenticates through the verified `ordinary_unsandboxed`
     /// tuple classification. The clean-worktree fence and HEAD capture then
     /// run inside the authenticated effective cwd — the emitter's own sandbox
@@ -1476,7 +1501,7 @@ const EFFECT_SETTLEMENT_CAPACITY: usize = 64;
 static STARTUP_DIAGNOSTICS: std::sync::Mutex<Vec<(String, String)>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn take_startup_diagnostics_for_test() -> Vec<(String, String)> {
     std::mem::take(
         &mut *STARTUP_DIAGNOSTICS
@@ -1490,7 +1515,7 @@ pub(crate) fn take_startup_diagnostics_for_test() -> Vec<(String, String)> {
 #[cfg(any(test, feature = "test-seam"))]
 static STARTUP_SETTLEMENT_FAILURE: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) enum StartupSettlementFailureForTest {
     CustodyChanged,
@@ -1498,7 +1523,7 @@ pub(crate) enum StartupSettlementFailureForTest {
     UnknownStructured,
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn fail_next_startup_settlement_for_test(failure: StartupSettlementFailureForTest) {
     let encoded = match failure {
         StartupSettlementFailureForTest::CustodyChanged => 1,
@@ -1560,7 +1585,7 @@ pub(crate) fn after_startup_prefetch_for_test(sandbox_base: &Path) {
     }
 }
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn set_after_startup_prefetch_for_test(
     sandbox_base: &Path,
     hook: Box<dyn FnOnce() + Send>,
@@ -1580,7 +1605,7 @@ const fn after_startup_prefetch_for_test(_sandbox_base: &Path) {}
 static STARTUP_PROBE_REVERSAL: std::sync::Mutex<Option<(PathBuf, Vec<Uuid>)>> =
     std::sync::Mutex::new(None);
 
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn reverse_startup_probe_completion_for_test(sandbox_base: Option<&Path>) -> Vec<Uuid> {
     let mut hook = STARTUP_PROBE_REVERSAL
         .lock()
@@ -1669,12 +1694,12 @@ pub enum CustodyHandle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OrdinaryCustody {
+pub struct OrdinaryCustody {
     canonical_working_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SandboxedCustody {
+pub struct SandboxedCustody {
     session_id: Uuid,
     custody_id: Uuid,
     owner_generation: u64,
@@ -1710,6 +1735,10 @@ pub enum EffectKind {
 pub struct CustodyEffectPermit {
     effective_cwd: PathBuf,
     cargo_target_dir: Option<PathBuf>,
+    /// The repository's Git common directory as recorded in the persisted
+    /// custody row at allocation (never read back from the sandbox). `None`
+    /// for ordinary custody.
+    git_common_dir: Option<PathBuf>,
     kind: EffectKind,
     settlement: Option<PendingSettlement>,
 }
@@ -1726,10 +1755,12 @@ struct PendingSettlement {
 
 enum SettlementMessage {
     Release(EffectSettlement),
+    #[cfg(test)]
     Flush(oneshot::Sender<()>),
 }
 
 enum SettlementControl {
+    #[cfg(test)]
     Retry(oneshot::Sender<std::result::Result<usize, String>>),
     Drain(oneshot::Sender<std::result::Result<(), String>>),
 }
@@ -1762,7 +1793,6 @@ struct CustodySettlementState {
 /// producer handles can outlive effects, but only the manager owns joining and
 /// retry/drain control of the receiver task.
 pub struct CustodySettlementWorker {
-    state: Arc<CustodySettlementState>,
     control: mpsc::Sender<SettlementControl>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -1809,6 +1839,7 @@ impl CustodySettlementService {
                             Some(SettlementMessage::Release(settlement)) => {
                                 retain_or_settle_effect(&worker_state, settlement).await;
                             }
+                            #[cfg(test)]
                             Some(SettlementMessage::Flush(done)) => { let _ = done.send(()); }
                             None => {
                                 releases_open = false;
@@ -1816,6 +1847,7 @@ impl CustodySettlementService {
                             }
                         },
                         control = controls.recv() => match control {
+                            #[cfg(test)]
                             Some(SettlementControl::Retry(done)) => {
                                 let result = retry_failed_effects(&worker_state).await
                                     .map_err(|error| error.to_string());
@@ -1832,7 +1864,6 @@ impl CustodySettlementService {
         Ok((
             Self { producer },
             CustodySettlementWorker {
-                state,
                 control,
                 task: Mutex::new(Some(task)),
             },
@@ -1887,7 +1918,7 @@ impl CustodySettlementService {
             .take();
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) async fn flush_for_test(&self) {
         let (done, received) = oneshot::channel();
         let sender = self
@@ -1907,12 +1938,12 @@ impl CustodySettlementService {
             .expect("custody settlement flush must complete");
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) async fn failed_count(&self) -> usize {
         self.producer.state.failed.lock().await.len()
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn degrade_for_test(&self) {
         self.producer
             .state
@@ -1922,6 +1953,7 @@ impl CustodySettlementService {
 }
 
 impl CustodySettlementWorker {
+    #[cfg(test)]
     pub(crate) async fn retry(&self) -> Result<usize> {
         let (done, received) = oneshot::channel();
         self.control
@@ -2010,6 +2042,13 @@ impl CustodyEffectPermit {
         self.cargo_target_dir.as_deref()
     }
 
+    /// The Git common directory the custody row recorded for this sandbox's
+    /// repository (#2746): the daemon-owned anchor for the Git paths a
+    /// provider sandbox may write.
+    pub fn git_common_dir(&self) -> Option<&Path> {
+        self.git_common_dir.as_deref()
+    }
+
     /// Scratch construction is authorized only by the ContextRead effect
     /// whose authenticated cwd it consumes.  Keep the effect kind private;
     /// callers receive only the exact predicate needed by that boundary.
@@ -2017,7 +2056,7 @@ impl CustodyEffectPermit {
         matches!(self.kind, EffectKind::ContextRead)
     }
 
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn for_execution_scratch_test(
         effective_cwd: PathBuf,
         cargo_target_dir: Option<PathBuf>,
@@ -2026,6 +2065,7 @@ impl CustodyEffectPermit {
         Self {
             effective_cwd,
             cargo_target_dir,
+            git_common_dir: None,
             kind,
             settlement: None,
         }
@@ -2073,6 +2113,13 @@ impl CustodyService {
         pool: usize,
     ) -> Result<()> {
         const STARTUP_GROUP_BATCH: usize = 64;
+        let pass_started = std::time::Instant::now();
+        // The pass runs a few dozen distinct statements per root (#2354). The
+        // default of 16 cached statements would evict them in rotation and
+        // re-parse each one; 128 holds them all.
+        store.conn.set_prepared_statement_cache_capacity(128);
+        let changes_before = store.conn.total_changes();
+        let mut group_count = 0_usize;
         // Every aggregate reader below requires an allocation identity; a
         // legacy row without one used to abort the whole restore (and with it
         // restart-intent recovery) on every boot.
@@ -2113,6 +2160,7 @@ impl CustodyService {
                 break;
             };
             for group in groups {
+                group_count += 1;
                 if group.custody_id.is_some() {
                     Self::reconcile_startup_existing_aggregate(
                         store,
@@ -2146,6 +2194,14 @@ impl CustodyService {
         if let Err(error) = Self::log_retained_unowned_diagnostics(store, sandbox_base) {
             tracing::warn!(%error, "retained_unowned sandbox custody diagnostics skipped");
         }
+        // `rows_changed` is what the pass rewrote: a settled store changes
+        // none (#2354), so a large value on a steady boot points at drift.
+        tracing::info!(
+            groups = group_count,
+            rows_changed = store.conn.total_changes().saturating_sub(changes_before),
+            duration_ms = pass_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            "Startup custody classification pass complete"
+        );
         Ok(())
     }
 
@@ -2525,11 +2581,10 @@ impl CustodyService {
         };
         let allocation: Option<String> = store
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT to_owner_session_id FROM sandbox_custody_events WHERE custody_id=?1 AND sequence=1 AND event_kind='allocated'",
-                [root.custody_id.to_string()],
-                |row| row.get(0),
-            )
+            )?
+            .query_row([root.custody_id.to_string()], |row| row.get(0))
             .optional()?;
         let Some(allocation) = allocation
             .as_deref()
@@ -3044,6 +3099,7 @@ impl CustodyService {
             CustodyHandle::Ordinary(ordinary) => Ok(CustodyEffectPermit {
                 effective_cwd: ordinary.canonical_working_dir.clone(),
                 cargo_target_dir: None,
+                git_common_dir: None,
                 kind,
                 settlement: None,
             }),
@@ -3150,19 +3206,7 @@ impl CustodyService {
         )
     }
 
-    /// Retry preauthentication/bind validation must be observational: a
-    /// malformed or raced source is refused without rewriting its owner,
-    /// generation, immutable events, or projection.
-    fn authorize_live_nonmutating(
-        session: &Session,
-        store: &mut Store,
-        sandbox_base: &Path,
-        transition: SandboxCustodyTransitionV1,
-    ) -> Result<CustodyHandle> {
-        Self::authorize_live_nonmutating_holding(session, store, sandbox_base, transition, None)
-    }
-
-    /// [`authorize_live_nonmutating`] with the stripe already held (see
+    /// The live authorization check with the stripe already held (see
     /// [`authorize_live_holding`]).
     fn authorize_live_nonmutating_holding(
         session: &Session,
@@ -3747,8 +3791,10 @@ impl CustodyService {
                     let _ = store.settle_effect_locked(reservation, false);
                     return Err(error);
                 }
+                let git_common_dir = Some(PathBuf::from(&latest.repository_identity));
                 Ok(CustodyEffectPermit {
                     effective_cwd,
+                    git_common_dir,
                     cargo_target_dir: Some(
                         session
                             .sandbox_root
@@ -3824,23 +3870,31 @@ impl CustodyService {
         Self::compatibility_target_bytes(outcome)
     }
 
-    /// Authenticate and size a terminal target without deleting it. Dry-run
-    /// reporting deliberately shares every SQL, custody, Git, containment,
-    /// symlink, and generation check with the mutating operation.
-    pub(crate) fn inspect_terminal_target_bytes_locked(
+    /// [`Self::reclaim_terminal_target`] for a test that expects the removal:
+    /// a refusal comes back as the attempt with the exact check that refused
+    /// (#1575), so a red run is attributable instead of a bare `false` (#2163).
+    #[cfg(test)]
+    pub(crate) fn reclaim_terminal_target_or_refusal(
         store: &Store,
         custody_id: Uuid,
         expected_generation: u64,
         sandbox_base: &Path,
-    ) -> Result<Option<u64>> {
-        let outcome = Self::terminal_target_outcome_locked(
-            store,
+    ) -> Result<std::result::Result<u64, TerminalTargetAttempt>> {
+        let _root_guard = lock_custody_root(custody_id);
+        let mut access = store;
+        let attempt = Self::terminal_target_attempt_with_store(
+            &mut access,
+            None,
             custody_id,
             expected_generation,
             sandbox_base,
-            false,
+            true,
+            IdleGate::Open,
         )?;
-        Self::compatibility_target_bytes(outcome)
+        Ok(match Self::compatibility_target_bytes(attempt.outcome)? {
+            Some(bytes) => Ok(bytes),
+            None => Err(attempt),
+        })
     }
 
     pub fn reclaim_terminal_target_outcome_phased(
@@ -3860,7 +3914,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
-            false,
+            IdleGate::Open,
         )
         .map(|attempt| attempt.outcome)
     }
@@ -3875,7 +3929,7 @@ impl CustodyService {
         expected_generation: u64,
         sandbox_base: &Path,
         remove: bool,
-        require_landed: bool,
+        idle_gate: IdleGate,
     ) -> Result<TerminalTargetAttempt> {
         Self::terminal_target_attempt_with_store(
             &mut PhasedReclaimStore { store, pass },
@@ -3884,7 +3938,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
-            require_landed,
+            idle_gate,
         )
     }
 
@@ -3920,7 +3974,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
-            false,
+            IdleGate::Open,
         )
         .map(|attempt| attempt.outcome)
     }
@@ -3929,10 +3983,11 @@ impl CustodyService {
     /// inspect) its `target/`. A refusal names the exact check that failed
     /// (#1575): the report keeps it so no refusal is anonymous.
     ///
-    /// `require_landed` is set when the owner row is still inside the idle TTL
-    /// and no disk pressure is active (#1684): the target is then reclaimed
-    /// only when the worktree's HEAD is already an ancestor of
-    /// `origin/rolling`, so nothing unlanded depends on that build cache.
+    /// `idle_gate` is not `Open` when the owner row is still inside the idle
+    /// TTL and no disk pressure is active (#1684): the target is then
+    /// reclaimed only when the worktree's HEAD is already an ancestor of
+    /// `origin/rolling` (or, for `LandedOrPublished`, also published to an
+    /// origin branch), so nothing unlanded depends on that build cache.
     fn terminal_target_attempt_with_store(
         access: &mut impl ReclaimStoreAccess,
         active_owner: Option<&dyn Fn() -> std::result::Result<bool, ReclaimSkipReason>>,
@@ -3940,7 +3995,7 @@ impl CustodyService {
         expected_generation: u64,
         sandbox_base: &Path,
         remove: bool,
-        require_landed: bool,
+        idle_gate: IdleGate,
     ) -> Result<TerminalTargetAttempt> {
         use ReclaimSkipReason as Skip;
         let refuse = |reason: Skip, name: &'static str| {
@@ -4031,7 +4086,14 @@ impl CustodyService {
         if !has_matching_worktree_stanza(&registered, &root, &target.sandbox_branch) {
             return refuse(Skip::GitOrRootIdentityRefusal, "worktree_not_registered");
         }
-        if require_landed && !git_head_landed_on_rolling(&root) {
+        let past_idle_gate = match idle_gate {
+            IdleGate::Open => true,
+            IdleGate::Landed => git_head_landed_on_rolling(&root),
+            IdleGate::LandedOrPublished => {
+                git_head_landed_on_rolling(&root) || git_head_published_to_origin(&root)
+            }
+        };
+        if !past_idle_gate {
             return refuse(Skip::FreshOrInvalidTimestamp, "idle_below_ttl");
         }
         if let Err((reason, check)) = pinned.ensure_idle_cargo_target_checked() {
@@ -4939,6 +5001,29 @@ fn git_head_landed_on_rolling(root: &Path) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Whether the worktree's HEAD is contained in any `refs/remotes/origin/*`
+/// ref: on `origin/rolling`, or published on a branch the worker pushed (hub
+/// #3026). A satellite's worker lands through the hub queue, so its commit
+/// reaches the hub as a pushed branch long before `origin/rolling` holds it.
+/// The daemon keeps no per-SHA record of an `AgentReportToHub` (the obligation
+/// row keeps no report text), so this is the visibility test the report verb
+/// itself uses (`sha_on_origin`). An absent ref or any git failure is "not
+/// published" (fail closed).
+fn git_head_published_to_origin(root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains=HEAD",
+            "refs/remotes/origin",
+        ])
+        .current_dir(root)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
 }
 
 /// Epoch probes one reclaim attempt makes before it refuses. Each probe is one

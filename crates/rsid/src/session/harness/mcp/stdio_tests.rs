@@ -263,7 +263,7 @@ async fn debug_output_hides_environment_values() {
     let temp = TempDir::new().expect("temp dir");
     let test_spec = spec("basic", &temp).env_pair("MCP_TEST_TOKEN", "allowed-secret-canary");
     let spec_debug = format!("{test_spec:?}");
-    let mut client = StdioMcpClient::connect(&test_spec, quick_limits())
+    let client = StdioMcpClient::connect(&test_spec, quick_limits())
         .await
         .expect("connect");
     let client_debug = format!("{client:?}");

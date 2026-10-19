@@ -1,0 +1,272 @@
+// Trimmed copy of crates/rsid-remote-read/src/projection.rs (the #2441 coverage chain).
+
+/// After the Store transaction has been released, reread both runtime
+/// sources. Durable pending sources remain Unavailable for a runtime-only
+/// session: the saved-session-scoped readers cannot prove an empty set.
+pub fn finish_runtime_only_pending_sources(
+    selected: &SelectedRuntimeOnlySession,
+    capture: RuntimeOnlyPendingCapture,
+    recheck_question_slots: impl FnOnce(
+        &RuntimeQuestionSlotListSnapshot,
+    ) -> Result<RuntimeQuestionSlotListRecheckObservation>,
+    recheck_native: impl FnOnce(
+        &NativeRuntimeApprovalListSnapshot,
+    ) -> Result<NativeRuntimeApprovalListRecheckObservation>,
+) -> Result<RuntimeOnlyPendingSources> {
+    let (project, session, store_at) = selected.identity();
+    if capture.project != project || capture.session != session {
+        return Err(ReadError::InvalidSource);
+    }
+    for at in [
+        match &capture.question_slots {
+            PendingRead::Observed { at, .. }
+            | PendingRead::Busy { at }
+            | PendingRead::Unavailable { at } => *at,
+        },
+        match &capture.native_runtime {
+            PendingRead::Observed { at, .. }
+            | PendingRead::Busy { at }
+            | PendingRead::Unavailable { at } => *at,
+        },
+    ] {
+        if at > store_at {
+            return Err(ReadError::InvalidSource);
+        }
+    }
+    let question_was_observed = matches!(&capture.question_slots, PendingRead::Observed { .. });
+    let native_was_observed = matches!(&capture.native_runtime, PendingRead::Observed { .. });
+    let question_slots = pending_runtime_recheck(capture.question_slots, |before| {
+        let observation = recheck_question_slots(before)?;
+        if observation.active_observed_at < store_at || observation.completed_observed_at < store_at
+        {
+            return Err(ReadError::InvalidSource);
+        }
+        Ok((
+            observation.state,
+            observation
+                .active_observed_at
+                .max(observation.completed_observed_at),
+        ))
+    })?;
+    let native_runtime = pending_runtime_recheck(capture.native_runtime, |before| {
+        let observation = recheck_native(before)?;
+        if observation.observed_at < store_at {
+            return Err(ReadError::InvalidSource);
+        }
+        Ok((observation.state, observation.observed_at))
+    })?;
+    for (was_observed, at) in [
+        (
+            question_was_observed,
+            match &question_slots {
+                PendingRead::Observed { at, .. }
+                | PendingRead::Busy { at }
+                | PendingRead::Unavailable { at } => *at,
+            },
+        ),
+        (
+            native_was_observed,
+            match &native_runtime {
+                PendingRead::Observed { at, .. }
+                | PendingRead::Busy { at }
+                | PendingRead::Unavailable { at } => *at,
+            },
+        ),
+    ] {
+        if was_observed && at < store_at {
+            return Err(ReadError::InvalidSource);
+        }
+    }
+    let coverage = pending_source_coverage(PendingCoverageInputs {
+        questions: PendingRead::Unavailable { at: store_at },
+        question_slots: borrow_pending_rechecked(&question_slots),
+        fallback: PendingRead::Unavailable { at: store_at },
+        native_runtime: borrow_pending_rechecked(&native_runtime),
+        native_publications: PendingRead::Unavailable { at: store_at },
+        native_historical: PendingRead::Unavailable { at: store_at },
+        legacy: PendingRead::Unavailable { at: store_at },
+    })?;
+    Ok(RuntimeOnlyPendingSources {
+        question_slots,
+        native_runtime,
+        coverage,
+    })
+}
+
+fn coverage_from_read<T>(
+    source: SourceV1,
+    order: u32,
+    read: PendingRead<T>,
+    inspect: impl FnOnce(T) -> Result<(usize, bool, bool)>,
+) -> Result<SourceCoverageV1> {
+    let (state, count, has_more, at) = match read {
+        PendingRead::Observed { value, at } => {
+            let (count, has_more, available) = inspect(value)?;
+            (
+                if !available {
+                    CoverageStateV1::Unavailable
+                } else if has_more {
+                    CoverageStateV1::Limited
+                } else {
+                    CoverageStateV1::Complete
+                },
+                if available { count } else { 0 },
+                if available { has_more } else { false },
+                at,
+            )
+        }
+        PendingRead::Busy { at } => (CoverageStateV1::Busy, 0, false, at),
+        PendingRead::Unavailable { at } => (CoverageStateV1::Unavailable, 0, false, at),
+    };
+    Ok(SourceCoverageV1 {
+        source,
+        state,
+        has_more,
+        lower_bound: DecimalU64::new(count.to_string()).map_err(|_| ReadError::InvalidSource)?,
+        observed_at: Timestamp::new(at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .map_err(|_| ReadError::InvalidSource)?,
+        observation_order: order,
+    })
+}
+
+fn coverage_from_key_page(
+    source: SourceV1,
+    expected: PendingSource,
+    read: PendingRead<&PendingKeyPage>,
+    order: u32,
+) -> Result<SourceCoverageV1> {
+    coverage_from_read(source, order, read, |page| {
+        if !valid_candidates(&page.items, expected)
+            || page.has_more != page.next.is_some()
+            || (page.has_more && page.items.is_empty())
+        {
+            return Err(ReadError::InvalidSource);
+        }
+        Ok((page.items.len(), page.has_more, true))
+    })
+}
+
+/// Derive all eight required coverage rows from attempted bounded reads.
+/// Missing native writer or changed runtime rereads stay unavailable; a
+/// supplied key page with a tail stays limited. Callers still own acquisition,
+/// project authorization, response degradation and source-page cursors.
+pub fn pending_source_coverage(inputs: PendingCoverageInputs<'_>) -> Result<Vec<SourceCoverageV1>> {
+    let mut rows = Vec::with_capacity(8);
+    rows.push(coverage_from_key_page(
+        SourceV1::QuestionPublications,
+        PendingSource::Questions,
+        inputs.questions,
+        1,
+    )?);
+    for (source, mirror, order) in [
+        (
+            SourceV1::TrackedQuestionSlot,
+            QuestionSlotMirror::Tracked,
+            2,
+        ),
+        (
+            SourceV1::SessionQuestionSlot,
+            QuestionSlotMirror::Session,
+            3,
+        ),
+    ] {
+        rows.push(coverage_from_read(
+            source,
+            order,
+            inputs.question_slots,
+            |(snapshot, recheck)| {
+                if snapshot.slots.len() > 3
+                    || snapshot.slots.iter().any(|slot| match slot.generation {
+                        QuestionSlotGeneration::Spawn(generation) => {
+                            snapshot.active_generation != Some(generation)
+                        }
+                        QuestionSlotGeneration::Completed => {
+                            !snapshot.completed_found || slot.mirror == QuestionSlotMirror::Tracked
+                        }
+                    })
+                    || snapshot.slots.iter().enumerate().any(|(index, slot)| {
+                        snapshot.slots[index + 1..].iter().any(|other| {
+                            slot.generation == other.generation && slot.mirror == other.mirror
+                        })
+                    })
+                {
+                    return Err(ReadError::InvalidSource);
+                }
+                Ok((
+                    snapshot
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.mirror == mirror)
+                        .count(),
+                    false,
+                    recheck == RuntimeQuestionSlotRecheck::NoObservedChange,
+                ))
+            },
+        )?);
+    }
+    rows.push(coverage_from_read(
+        SourceV1::DurableQuestionFallback,
+        4,
+        inputs.fallback,
+        |row| {
+            if row.is_some_and(|row| row.state != "slot") {
+                return Err(ReadError::InvalidSource);
+            }
+            Ok((usize::from(row.is_some()), false, true))
+        },
+    )?);
+    rows.push(coverage_from_read(
+        SourceV1::NativeRuntime,
+        5,
+        inputs.native_runtime,
+        |(snapshot, recheck)| match &snapshot.state {
+            NativeRuntimeApprovalListState::Present(items) if items.len() <= 64 => {
+                if items.windows(2).any(|pair| pair[0].id >= pair[1].id)
+                    || items
+                        .iter()
+                        .any(|item| !item.writer_live || item.writer_capacity > 64)
+                    || items.first().is_some_and(|first| {
+                        items.iter().any(|item| {
+                            item.incarnation_id != first.incarnation_id
+                                || item.spawn_generation != first.spawn_generation
+                                || item.writer_capacity != first.writer_capacity
+                        })
+                    })
+                {
+                    return Err(ReadError::InvalidSource);
+                }
+                Ok((
+                    items.len(),
+                    false,
+                    recheck == NativeRuntimeApprovalRecheck::NoObservedChange,
+                ))
+            }
+            NativeRuntimeApprovalListState::Present(_) => Err(ReadError::InvalidSource),
+            NativeRuntimeApprovalListState::Missing
+            | NativeRuntimeApprovalListState::SourceChanged => Ok((0, false, false)),
+        },
+    )?);
+    for (source, expected, read, order) in [
+        (
+            SourceV1::NativePublications,
+            PendingSource::NativePublications,
+            inputs.native_publications,
+            6,
+        ),
+        (
+            SourceV1::NativeHistoricalFallback,
+            PendingSource::NativeHistorical,
+            inputs.native_historical,
+            7,
+        ),
+        (
+            SourceV1::LegacyApprovals,
+            PendingSource::LegacyApprovals,
+            inputs.legacy,
+            8,
+        ),
+    ] {
+        rows.push(coverage_from_key_page(source, expected, read, order)?);
+    }
+    Ok(rows)
+}

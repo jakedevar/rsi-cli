@@ -667,7 +667,20 @@ impl Store {
                     // sql-dynamic-ok: table from the static LEFT_BEHIND_TABLES list.
                     "SELECT COUNT(*) FROM \"{table}\""
                 );
-                let count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+                let mut count: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+                // The manifest records source row counts. A cold session's
+                // bulky rows are in the archive, so the table's count is the
+                // logical one (live rows plus the archived share): moving a
+                // session never changes what a bundle reports (#2384, S3).
+                if *table == crate::store::cold_archive::EVENTS_TABLE
+                    && self.table_exists("cold_archive_sessions")?
+                {
+                    count += self.conn.query_row(
+                        crate::store::cold_archive::LOGICAL_ARCHIVED_TOTAL_COUNT_SQL,
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                }
                 left_behind.insert((*table).to_string(), count);
             }
         }

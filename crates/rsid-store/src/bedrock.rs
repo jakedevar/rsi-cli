@@ -109,6 +109,31 @@ pub fn region_from(vault: &crate::vault::VaultHandle) -> Result<String, String> 
 }
 
 fn environment_region() -> Result<String, String> {
+    environment_region_with(rsid_core::offline::is_offline(), || {
+        static CLI_REGION: OnceLock<Option<String>> = OnceLock::new();
+        CLI_REGION
+            .get_or_init(|| {
+                let mut command = StdCommand::new("aws");
+                command.args(["configure", "get", "region"]);
+                crate::vault::scrub_std_credential_env(&mut command);
+                command
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(|value| value.trim().to_owned())
+            })
+            .clone()
+    })
+}
+
+/// [`environment_region`] with the offline mode (#130) and the `aws` CLI
+/// lookup injected: offline, the CLI (whose region lookup can reach the EC2
+/// metadata endpoint) never starts; only the environment answers.
+fn environment_region_with(
+    offline: bool,
+    cli_region: impl FnOnce() -> Option<String>,
+) -> Result<String, String> {
     let configured = std::env::var("AWS_REGION")
         .ok()
         .filter(|value| !value.is_empty())
@@ -117,22 +142,7 @@ fn environment_region() -> Result<String, String> {
                 .ok()
                 .filter(|value| !value.is_empty())
         })
-        .or_else(|| {
-            static CLI_REGION: OnceLock<Option<String>> = OnceLock::new();
-            CLI_REGION
-                .get_or_init(|| {
-                    let mut command = StdCommand::new("aws");
-                    command.args(["configure", "get", "region"]);
-                    crate::vault::scrub_std_credential_env(&mut command);
-                    command
-                        .output()
-                        .ok()
-                        .filter(|output| output.status.success())
-                        .and_then(|output| String::from_utf8(output.stdout).ok())
-                        .map(|value| value.trim().to_owned())
-                })
-                .clone()
-        })
+        .or_else(|| if offline { None } else { cli_region() })
         .ok_or_else(|| "Bedrock AWS region missing; set AWS_REGION".to_string())?;
     if !region_valid(&configured) {
         return Err("Bedrock AWS region is invalid".to_string());
@@ -368,6 +378,18 @@ fn slug_family(slug: &str) -> Option<((Vec<&str>, Vec<&str>), Vec<u32>)> {
 /// same bearer credential as launch rather than the AWS CLI, whose SigV4
 /// profile resolution is independent of (and can break without) that key.
 pub async fn discover_models() -> Result<Vec<(String, String)>, String> {
+    discover_models_gated(rsid_core::offline::is_offline()).await
+}
+
+/// [`discover_models`] with the offline mode (#130) injected: offline, no
+/// region lookup, credential resolution or request runs.
+async fn discover_models_gated(offline: bool) -> Result<Vec<(String, String)>, String> {
+    if offline {
+        return Err(format!(
+            "Bedrock model discovery skipped: {}",
+            rsid_core::offline::REASON_OFFLINE
+        ));
+    }
     let region = region()?;
     let credential = tokio::task::spawn_blocking(credential)
         .await
@@ -461,6 +483,24 @@ fn parse_profile_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #130: offline, the `aws configure get region` lookup never starts and
+    /// Bedrock model discovery returns before any lookup or request.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_offline_daemon_starts_no_aws_cli_and_no_bedrock_discovery() {
+        let mut asked = false;
+        let _ = environment_region_with(true, || {
+            asked = true;
+            Some("us-east-1".into())
+        });
+        assert!(!asked, "an offline region lookup started the aws CLI");
+        let error = discover_models_gated(true).await.unwrap_err();
+        assert!(
+            error.ends_with(rsid_core::offline::REASON_OFFLINE),
+            "{error}"
+        );
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]

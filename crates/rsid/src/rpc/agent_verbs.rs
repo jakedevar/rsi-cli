@@ -1,26 +1,32 @@
 use super::*;
 
 impl RpcServer {
-    /// Resolve a session-attributed caller's own session id from
-    /// `RpcRequest.session_token`. Shared by every `Agent*` handler — none of
-    /// them accept a caller id as a request field; it always comes from the
-    /// token, per the P0 threat model (design doc
-    /// `2026-06-30-agent-harness-control-via-rpc-cli.md`, "Threat model").
-    ///
-    /// The `agent_gate` in `handle_request_inner` already guarantees
-    /// `session_token.is_some()` for any method reachable here (unattributed
-    /// calls never reach an `Agent*` arm), but this resolves the *value*
-    /// (Option<String> -> String) and looks it up against the live
-    /// token->session map, which the gate does not do.
-    pub(super) async fn resolve_caller_session_id(&self, request: &RpcRequest) -> Result<Uuid> {
+    /// Resolve a copied caller incarnation; dispatch scopes the original
+    /// resolution across every await without retaining a registry guard.
+    pub(super) async fn resolve_bound_caller(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<crate::session::BoundAgentCaller> {
+        if let Some(admission) = crate::session::rpc_admission::current() {
+            return Ok(admission.caller);
+        }
         let token = request
             .session_token
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| DaemonError::InvalidParam("agent_verb_requires_session_token".into()))?;
         self.session_manager
-            .resolve_agent_token(token)
+            .resolve_bound_agent_caller(token.expose_for_transport())
             .await
-            .ok_or_else(|| DaemonError::InvalidParam("agent_verb_unknown_session_token".into()))
+            .ok_or_else(crate::session::rpc_admission::unknown_caller)
+    }
+
+    /// Compatibility for fresh launches only. An unfenced handler cannot
+    /// silently turn an adopted activation into bare-UUID authority (N3).
+    pub(super) async fn resolve_caller_session_id(&self, request: &RpcRequest) -> Result<Uuid> {
+        self.resolve_bound_caller(request)
+            .await?
+            .legacy_session_id()
+            .ok_or_else(crate::session::rpc_admission::unknown_caller)
     }
 
     /// The token-resolved caller of a read verb, or `None` for an
@@ -49,19 +55,17 @@ impl RpcServer {
         let Some(caller) = self.attributed_read_caller(request).await? else {
             return Ok(());
         };
-        let store = self.session_manager.store().clone();
-        tokio::task::spawn_blocking(move || {
-            let store = store.blocking_lock();
-            let scope = store.agent_read_scope(caller)?;
-            for target in targets {
-                if !store.agent_read_scope_admits(&scope, target, class)? {
-                    return Err(agent_read_scope_denied());
-                }
+        let store = self.session_manager.store().lock().await;
+        let scope = store.agent_read_scope(caller)?;
+        for target in targets {
+            if !store.agent_read_scope_admits(&scope, target, class)? {
+                return Err(agent_read_scope_denied());
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| DaemonError::Store(e.to_string()))?
+        }
+        // Scope/data preparation is private and Store still owns the scope.
+        // A6 is acquired last for the bounded snapshot admission itself.
+        let _admission = crate::session::rpc_admission::admit_current_rpc(caller).await?;
+        Ok(())
     }
 
     pub(super) async fn handle_agent_spawn_child(
@@ -115,7 +119,17 @@ impl RpcServer {
         let params: AgentGetProgressParamsV1 = if request.params.is_null() {
             AgentGetProgressParamsV1::default()
         } else {
-            serde_json::from_value(request.params.clone())
+            // #2312: session ids may be unique prefixes inside the caller's scope.
+            let expanded = self
+                .session_manager
+                .agent_control()
+                .expand_id_prefixes(
+                    caller_session_id,
+                    AgentControlVerbV1::GetProgress,
+                    request.params.clone(),
+                )
+                .await?;
+            serde_json::from_value(expanded)
                 .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?
         };
         let result = self
@@ -203,6 +217,25 @@ impl RpcServer {
         Ok(serde_json::to_value(confirmed)?)
     }
 
+    /// #2766: the session's own lifecycle hook reports `StopFailure`,
+    /// `PreCompact` or (hub #2919) `SessionStart`. Params carry the event and a
+    /// bounded summary only.
+    pub(super) async fn handle_record_provider_lifecycle_event(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller_session_id = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::provider_lifecycle_hooks::RecordProviderLifecycleEventParams =
+            serde_json::from_value(request.params.clone()).map_err(|_| {
+                DaemonError::InvalidParam("provider_lifecycle_event_invalid_request".into())
+            })?;
+        let recorded = self
+            .session_manager
+            .record_provider_lifecycle_event(caller_session_id, params)
+            .await;
+        Ok(serde_json::to_value(recorded)?)
+    }
+
     /// `AgentSubmitJob` (#1002): hand a typed long operation to the daemon.
     pub(super) async fn handle_agent_submit_job(
         &self,
@@ -230,8 +263,14 @@ impl RpcServer {
         request: &RpcRequest,
     ) -> Result<serde_json::Value> {
         let caller = self.resolve_caller_session_id(request).await?;
+        // #2312: the job id may be the unique prefix a notice prints.
+        let expanded = self
+            .session_manager
+            .agent_control()
+            .expand_id_prefixes(caller, AgentControlVerbV1::GetJob, request.params.clone())
+            .await?;
         let params: rsi_common::agent_jobs::AgentGetJobRequestV1 =
-            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+            rsi_common::harness_manager::decode_manager_request(expanded)
                 .map_err(|_| DaemonError::InvalidParam("job_invalid_request".into()))?;
         let job = self
             .session_manager
@@ -297,6 +336,75 @@ impl RpcServer {
         Ok(serde_json::to_value(receipt)?)
     }
 
+    /// `AgentListRollingQueue` (#1964).
+    pub(super) async fn handle_agent_list_rolling_queue(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::rolling_queue::AgentListRollingQueueRequestV1 =
+            if request.params.is_null() {
+                Default::default()
+            } else {
+                rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                    .map_err(|_| {
+                        DaemonError::InvalidParam(
+                            rsi_common::rolling_queue::QUEUE_INVALID_REQUEST.into(),
+                        )
+                    })?
+            };
+        let receipt = self
+            .session_manager
+            .agent_control()
+            .agent_list_rolling_queue(caller, params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// `AgentCancelRollingQueueEntry` (#1964).
+    pub(super) async fn handle_agent_cancel_rolling_queue_entry(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::rolling_queue::AgentCancelRollingQueueEntryRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone()).map_err(
+                |_| {
+                    DaemonError::InvalidParam(
+                        rsi_common::rolling_queue::QUEUE_INVALID_REQUEST.into(),
+                    )
+                },
+            )?;
+        let receipt = self
+            .session_manager
+            .agent_control()
+            .agent_cancel_rolling_queue_entry(caller, params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// `AgentCheckLandingCandidate` (#2310).
+    pub(super) async fn handle_agent_check_landing_candidate(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::agent_landing_candidate::AgentCheckLandingCandidateRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone()).map_err(
+                |_| {
+                    DaemonError::InvalidParam(
+                        rsi_common::agent_landing_candidate::CANDIDATE_INVALID_REQUEST.into(),
+                    )
+                },
+            )?;
+        let result = self
+            .session_manager
+            .agent_control()
+            .agent_check_landing_candidate(caller, params)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
     pub(super) async fn handle_agent_get_provider_status(
         &self,
         request: &RpcRequest,
@@ -336,6 +444,41 @@ impl RpcServer {
             .agent_get_daemon_info(caller)
             .await?;
         Ok(serde_json::to_value(result)?)
+    }
+
+    pub(super) async fn handle_agent_push_satellite_manager_policy(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::satellite_manager_policy::*;
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: AgentPushSatelliteManagerPolicyRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam(POLICY_INVALID.into()))?;
+        let receipt = self
+            .session_manager
+            .agent_control()
+            .agent_push_satellite_manager_policy(caller, params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
+    /// #2750: the hub manager's reseat of a paired satellite's failed seat.
+    pub(super) async fn handle_agent_reseat_satellite_manager(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        use rsi_common::manager_reseat::*;
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params: AgentReseatSatelliteManagerRequestV1 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam(SATELLITE_RESEAT_INVALID.into()))?;
+        let receipt = self
+            .session_manager
+            .agent_control()
+            .agent_reseat_satellite_manager(caller, params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
     }
 
     pub(super) async fn handle_agent_request_deploy(
@@ -420,7 +563,17 @@ impl RpcServer {
         let params: AgentGetStatusParams = if request.params.is_null() {
             AgentGetStatusParams::default()
         } else {
-            serde_json::from_value(request.params.clone())
+            // #2312: `session_id` may be a unique prefix inside the caller's scope.
+            let expanded = self
+                .session_manager
+                .agent_control()
+                .expand_id_prefixes(
+                    caller_session_id,
+                    AgentControlVerbV1::GetStatus,
+                    request.params.clone(),
+                )
+                .await?;
+            serde_json::from_value(expanded)
                 .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?
         };
         let target_session_id = params.session_id.unwrap_or(caller_session_id);
@@ -438,8 +591,18 @@ impl RpcServer {
         request: &RpcRequest,
     ) -> Result<serde_json::Value> {
         let caller_session_id = self.resolve_caller_session_id(request).await?;
+        // #2312: `session_id` may be a unique prefix inside the caller's scope.
+        let expanded = self
+            .session_manager
+            .agent_control()
+            .expand_id_prefixes(
+                caller_session_id,
+                AgentControlVerbV1::ReadSessionEvents,
+                request.params.clone(),
+            )
+            .await?;
         let params: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
-            serde_json::from_value(request.params.clone())
+            serde_json::from_value(expanded)
                 .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
         let result = self
             .session_manager
@@ -589,6 +752,23 @@ impl RpcServer {
             })?;
             let watched = Uuid::parse_str(raw)
                 .map_err(|e| DaemonError::InvalidParam(format!("invalid watch_session_id: {e}")))?;
+            // #2725: the caller's own queued Issue-worker launch has no session
+            // row yet, and the launch arms this very watch when it is
+            // established (or ends). Answer covered, not `session_not_found`.
+            if self
+                .session_manager
+                .agent_control()
+                .issue_worker_launch_watch_pending(caller_session_id, watched)
+                .await
+            {
+                return Ok(serde_json::json!({
+                    "deduplicated": true,
+                    "watch": "pending_launch",
+                    "wake_mode": { "on_terminal": watched },
+                    "wake_session_id": caller_session_id,
+                    "note": rsi_common::manager_issue_worker::ISSUE_WORKER_WATCH_PENDING_NOTE,
+                }));
+            }
             // Watched-subject scope = AgentGetStatus/AgentHalt scope
             // (self / direct child / child-of-led-Epic), self-watch rejected.
             self.session_manager
@@ -730,8 +910,9 @@ impl RpcServer {
         }))
     }
 
-    /// `AgentListWakes` — the caller's own scheduled jobs, bounded. The owner
-    /// is the resolved caller session, never a request field.
+    /// `AgentListWakes` — scheduled jobs visible to the caller, bounded. Caller
+    /// identity comes from the RPC transport; optional `session_id` defaults
+    /// to the caller and may target another session within the roster scope.
     pub(super) async fn handle_agent_list_wakes(
         &self,
         request: &RpcRequest,
@@ -739,49 +920,12 @@ impl RpcServer {
         let caller_session_id = self.resolve_caller_session_id(request).await?;
         let params: AgentListWakesParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
-        if !params.limit_is_valid() {
-            return Err(DaemonError::InvalidParam(
-                "limit must be between 1 and 256".into(),
-            ));
-        }
-        let limit = params.limit.unwrap_or(LIST_WAKES_DEFAULT_LIMIT) as usize;
-        let rows = {
-            let store = self.session_manager.store().lock().await;
-            // One extra row tells the caller whether the page was truncated.
-            store.list_owned_scheduled_jobs(
-                caller_session_id,
-                params.include_disabled,
-                limit + 1,
-            )?
-        };
-        let truncated = rows.len() > limit;
-        let wakes: Vec<serde_json::Value> = rows
-            .into_iter()
-            .take(limit)
-            .map(|(job, protected)| {
-                let (mode, watch_session_id) = match job.wake_mode {
-                    rsi_common::WakeMode::Fresh => ("fresh", None),
-                    rsi_common::WakeMode::AgentFresh => ("fresh", None),
-                    rsi_common::WakeMode::Resume => ("resume", None),
-                    rsi_common::WakeMode::OnTerminal(watched) => ("on_terminal", Some(watched)),
-                };
-                serde_json::json!({
-                    "job_id": job.id,
-                    "name": job.name,
-                    "mode": mode,
-                    "watch_session_id": watch_session_id,
-                    "next_fire_at": job.next_fire_at,
-                    "enabled": job.enabled,
-                    "created_at": job.created_at,
-                    "protected": protected,
-                })
-            })
-            .collect();
-        Ok(serde_json::json!({
-            "wakes": wakes,
-            "count": wakes.len(),
-            "truncated": truncated,
-        }))
+        let result = self
+            .session_manager
+            .agent_control()
+            .agent_list_wakes(caller_session_id, params)
+            .await?;
+        Ok(serde_json::to_value(&result)?)
     }
 
     /// `AgentCancelWake` — disable the caller's own scheduled job(s) by
@@ -802,6 +946,8 @@ impl RpcServer {
         }
         let cancelled = {
             let store = self.session_manager.store().lock().await;
+            let _admission =
+                crate::session::rpc_admission::admit_current_rpc(caller_session_id).await?;
             store.cancel_owned_scheduled_jobs(
                 caller_session_id,
                 params.job_id,

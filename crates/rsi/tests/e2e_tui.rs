@@ -18,6 +18,8 @@ mod agent_projects;
 mod editing_mode;
 #[path = "e2e_tui/fresh_install.rs"]
 mod fresh_install;
+#[path = "e2e_tui/issue_jump.rs"]
+mod issue_jump;
 #[path = "e2e_tui/manager_decisions.rs"]
 mod manager_decisions;
 #[path = "e2e_tui/manager_presets.rs"]
@@ -26,31 +28,114 @@ mod manager_presets;
 mod manager_seats;
 #[path = "e2e_tui/manager_surface.rs"]
 mod manager_surface;
+#[path = "e2e_tui/operator_todos.rs"]
+mod operator_todos;
+#[path = "e2e_tui/topology_run.rs"]
+mod topology_run;
 
 type E2eResult<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+/// Parse the selected row marker and the `n/total` focus counter off a frame.
+fn parse_settings_frame(screen: &str) -> Option<(String, usize, usize)> {
+    // Termwright exposes PTY chunks, which can contain a mixture of the old
+    // and new views. Only read markers and counters belonging to Settings:
+    // session rows also have a marker and their detail has a retry `0/0`.
+    screen.lines().find(|line| line.contains("≡ Settings  ›"))?;
+    let marker = screen.lines().find_map(|line| {
+        line.find("│▌ ").map(|index| {
+            line[index + '│'.len_utf8()..]
+                .split("  ")
+                .next()
+                .expect("selected marker has a first column")
+                .trim_end()
+                .to_string()
+        })
+    })?;
+    let (selected, total) = screen
+        .lines()
+        .filter(|line| line.contains('╭'))
+        .flat_map(str::split_whitespace)
+        .find_map(|token| {
+            let (selected, total) = token.split_once('/')?;
+            let selected = selected.parse::<usize>().ok()?;
+            let total = total.parse::<usize>().ok()?;
+            (selected > 0 && selected <= total).then_some((selected, total))
+        })?;
+    Some((marker, selected, total))
+}
+
+#[test]
+fn test_settings_frame_reads_settings_focus_from_mixed_pty_output() {
+    // Both views can coexist while a repaint is being read. The session's
+    // marker, retry count and unrelated fraction must not drive Settings.
+    let screen = "≡ Settings  ›  ⊡ Providers & Sandboxes  ›  Sandbox Storage
+▌ E2E authenticated cache fixture
+× failed   ↺ retry 0/0   • unread
+╭─ CATEGORIES ─╮ ╭─ ⊡ PROVIDERS & SANDBOXES ─ 23/29 ─╮
+│                 │ │▌ Preview cache reclaim  ·····  Preview  1/1 checked │";
+    assert_eq!(
+        parse_settings_frame(screen),
+        Some(("▌ Preview cache reclaim".to_string(), 23, 29))
+    );
+}
+
+#[test]
+fn test_settings_frame_waits_for_settings_header_and_border_counter() {
+    for screen in [
+        "All projects / Sessions\n▌ E2E authenticated cache fixture\n↺ retry 0/0\n│ │▌ Preview cache reclaim  ·····  Preview │",
+        "≡ Settings  ›  Sandbox Storage\n▌ E2E authenticated cache fixture\n↺ retry 0/0\n│ │▌ Preview cache reclaim  ·····  Preview │",
+        "≡ Settings  ›  Sandbox Storage\n╭─ ⊡ PROVIDERS & SANDBOXES ─ 0/0 ─╮\n│ │▌ Preview cache reclaim  ·····  Preview │",
+    ] {
+        assert_eq!(
+            parse_settings_frame(screen),
+            None,
+            "partial frame: {screen}"
+        );
+    }
+}
+
+/// Wait for Settings' own selected row and counter in the same snapshot.
+/// After navigation, both must advance: either alone can be from a PTY chunk
+/// partway through the repaint.
+async fn settled_settings_frame(
+    term: &Terminal,
+    target: &str,
+    step: usize,
+    advanced_from: Option<(&str, usize)>,
+) -> E2eResult<(String, String, usize, usize)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = term.screen().await.text();
+        if let Some((marker, selected, total)) = parse_settings_frame(&screen) {
+            if advanced_from
+                .is_none_or(|(previous, index)| marker != previous && selected == index + 1)
+            {
+                return Ok((screen, marker, selected, total));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(test_error(format!(
+                "settings target {target:?} did not reach a focused settings frame at step {step} after {advanced_from:?}; screen:\n{screen}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn select_settings_row(term: &Terminal, target: &str, max_steps: usize) -> E2eResult<()> {
     let mut observed = HashSet::new();
+    let mut advanced_from = None;
     let target_marker = format!("▌ {target}");
     for step in 0..=max_steps {
-        let screen = term.screen().await.text();
-        let marker = screen
-            .lines()
-            .find_map(|line| {
-                line.find("▌ ").map(|index| {
-                    line[index..]
-                        .split("  ")
-                        .next()
-                        .expect("selected marker has a first column")
-                        .trim_end()
-                        .to_string()
-                })
-            })
-            .ok_or_else(|| {
-                test_error(format!(
-                    "settings target {target:?} missing selected row at step {step}; screen:\n{screen}"
-                ))
-            })?;
+        let (screen, marker, selected_index, total_items) = settled_settings_frame(
+            term,
+            target,
+            step,
+            advanced_from
+                .as_ref()
+                .map(|(marker, index): &(String, usize)| (marker.as_str(), *index)),
+        )
+        .await?;
         if marker == target_marker {
             return Ok(());
         }
@@ -64,17 +149,6 @@ async fn select_settings_row(term: &Terminal, target: &str, max_steps: usize) ->
                 "settings target {target:?} exhausted {max_steps} steps; last selected {marker:?}; screen:\n{screen}"
             )));
         }
-        let (selected_index, total_items) = screen
-            .split_whitespace()
-            .find_map(|token| {
-                let (selected, total) = token.split_once('/')?;
-                Some((selected.parse::<usize>().ok()?, total.parse::<usize>().ok()?))
-            })
-            .ok_or_else(|| {
-                test_error(format!(
-                    "settings target {target:?} missing focus counter at step {step}; screen:\n{screen}"
-                ))
-            })?;
         if selected_index >= total_items {
             return Err(test_error(format!(
                 "settings target {target:?} is unreachable below final row {selected_index}/{total_items}; screen:\n{screen}"
@@ -83,46 +157,30 @@ async fn select_settings_row(term: &Terminal, target: &str, max_steps: usize) ->
         term.send_key(Key::Char('j'))
             .await
             .map_err(|error| test_error(format!("navigate to {target:?}: {error:?}")))?;
-        term.expect_gone(&marker)
-            .timeout(Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                test_error(format!(
-                    "settings target {target:?} did not advance from {marker:?}: {error:?}"
-                ))
-            })?;
-        let next_focus = format!("{}/{total_items}", selected_index + 1);
-        term.expect(&next_focus)
-            .timeout(Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                test_error(format!(
-                    "settings target {target:?} did not reach focus {next_focus} after {marker:?}: {error:?}"
-                ))
-            })?;
+        advanced_from = Some((marker, selected_index));
     }
     unreachable!("bounded settings traversal always returns")
 }
 
-/// Reach Settings > Providers & Sandboxes > Sandbox Storage and focus its
-/// items. The rail lists groups and each group carries section tabs (`j` moves
+/// Reach Settings > Host & Build > Build Cache (the tab that holds the sandbox
+/// storage status and the cache reclaim rows) and focus its items. The rail lists groups and each group carries section tabs (`j` moves
 /// groups, `]` moves tabs); both orders come from the registry so a reordered
 /// page stays reachable. A first open lands on the first group's first tab;
 /// a reopen remembers the last tab, so navigation is skipped when the
-/// breadcrumb already names Sandbox Storage.
+/// breadcrumb already names Build Cache.
 async fn focus_sandbox_storage_settings(term: &Terminal) -> E2eResult<()> {
     use rsi::settings_registry::{SettingsGroup, SettingsSection};
-    let group = SettingsSection::SandboxStorage.group();
+    let group = SettingsSection::BuildCache.group();
     let group_index = SettingsGroup::ALL
         .iter()
         .position(|candidate| *candidate == group)
-        .ok_or_else(|| test_error("Sandbox Storage group missing from registry"))?;
+        .ok_or_else(|| test_error("Build Cache group missing from registry"))?;
     let tab_index = SettingsSection::ALL
         .iter()
         .filter(|section| section.group() == group)
-        .position(|section| *section == SettingsSection::SandboxStorage)
-        .ok_or_else(|| test_error("Sandbox Storage tab missing from its group"))?;
-    let already_there = term.screen().await.text().contains("›  Sandbox Storage");
+        .position(|section| *section == SettingsSection::BuildCache)
+        .ok_or_else(|| test_error("Build Cache tab missing from its group"))?;
+    let already_there = term.screen().await.text().contains("›  Build Cache");
     if !already_there {
         for _ in 0..group_index {
             term.send_key(Key::Char('j'))
@@ -140,7 +198,7 @@ async fn focus_sandbox_storage_settings(term: &Terminal) -> E2eResult<()> {
         .map_err(|error| test_error(format!("focus settings rail: {error:?}")))?;
     term.send_key(Key::Char('l'))
         .await
-        .map_err(|error| test_error(format!("enter Sandbox Storage: {error:?}")))?;
+        .map_err(|error| test_error(format!("enter Build Cache: {error:?}")))?;
     // A reopen also remembers the selected row, so only the page is asserted;
     // callers move to their row with `select_settings_row`.
     if let Err(error) = term
@@ -150,7 +208,7 @@ async fn focus_sandbox_storage_settings(term: &Terminal) -> E2eResult<()> {
     {
         let screen = term.screen().await.text();
         return Err(test_error(format!(
-            "Sandbox Storage items not focused: {error:?}; screen:\n{screen}"
+            "Build Cache items not focused: {error:?}; screen:\n{screen}"
         )));
     }
     Ok(())
@@ -407,6 +465,7 @@ async fn test_e2e_startup_readiness_withheld_rpc() -> E2eResult<()> {
         .env("HOME", home_dir.to_string_lossy())
         .env("RSI_DAEMON_SOCKET_PATH", socket_path.to_string_lossy())
         .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+        .env("RSI_SESSION_TOKEN", "")
         .env("TERM", "xterm-256color")
         .env("LANG", "C.UTF-8")
         .env("TZ", "UTC")
@@ -593,6 +652,11 @@ impl E2eHarness {
             .parent()
             .ok_or_else(|| test_error("rsi binary path has no parent"))?
             .join("rsid");
+        require_prebuilt_siblings(
+            rsi_bin_path
+                .parent()
+                .ok_or_else(|| test_error("rsi binary path has no parent"))?,
+        )?;
 
         let original_path = std::env::var("PATH").unwrap_or_default();
         let isolated_path = format!("{}:{}", bin_dir.display(), original_path);
@@ -678,7 +742,7 @@ impl E2eHarness {
     }
 
     async fn wait_for_daemon(&mut self) -> E2eResult<DaemonClient> {
-        let mut client = DaemonClient::new(self.socket_path.clone());
+        let mut client = DaemonClient::new(self.socket_path.clone()).with_session_token(None);
 
         for _ in 0..50 {
             if let Some(daemon) = self.daemon.as_mut() {
@@ -691,7 +755,22 @@ impl E2eHarness {
 
             match client.connect().await {
                 Ok(_) => match client.get_health_status().await {
-                    Ok(_) => return Ok(client),
+                    Ok(_) => {
+                        // This is an ordinary rsid binary, so its admission
+                        // readers see the real host. Disable those holds only
+                        // in this isolated daemon, before seeding any work.
+                        client
+                            .update_daemon_config_batch(
+                                &[
+                                    "host_load_admission_threshold",
+                                    "governor_min_free_disk_gb",
+                                    "job_thermal_ceiling_c",
+                                ]
+                                .map(|field| (field.to_string(), serde_json::json!(0))),
+                            )
+                            .await?;
+                        return Ok(client);
+                    }
                     Err(_) => client.disconnect(),
                 },
                 Err(_) => {}
@@ -778,6 +857,7 @@ impl E2eHarness {
             .env("HOME", &home_str)
             .env("RSI_DAEMON_SOCKET_PATH", &socket_str)
             .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+            .env("RSI_SESSION_TOKEN", "")
             .env("PATH", &self.isolated_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -1349,6 +1429,18 @@ impl E2eHarness {
             )
             .await?,
         );
+        // The status RPC serves a daemon-side preview for 60 s (#2604), and
+        // the warm-up above filled that cache, so the TUI's own request would
+        // be a cache hit and never reach Git. A changed reclaim config is never
+        // served from the cache; the interval does not alter eligibility, so
+        // change only it to force the TUI's request to scan under the hold.
+        client
+            .update_daemon_config(
+                "sandbox_build_cache_reclaim_interval_secs",
+                serde_json::json!(3601),
+            )
+            .await
+            .map_err(|error| test_error(format!("invalidate warm preview: {error}")))?;
         client.disconnect();
         fs::write(&self.git_hold, b"hold\n")?;
 
@@ -1362,6 +1454,7 @@ impl E2eHarness {
             .env("HOME", &home_str)
             .env("RSI_DAEMON_SOCKET_PATH", &socket_str)
             .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+            .env("RSI_SESSION_TOKEN", "")
             .env("PATH", &self.isolated_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -1383,10 +1476,11 @@ impl E2eHarness {
                 spawn_started.elapsed().as_millis()
             );
 
-            for _ in 0..200 {
-                if self.git_entered.exists() {
-                    break;
-                }
+            // Wait on the real condition (the daemon's preview reached the
+            // held `git worktree list`) against a generous deadline: under a
+            // parallel nextest load the preview is scheduled late (#2839).
+            let git_deadline = Instant::now() + Duration::from_secs(30);
+            while !self.git_entered.exists() && Instant::now() < git_deadline {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             if !self.git_entered.exists() {
@@ -1646,6 +1740,7 @@ impl E2eHarness {
             .env("HOME", &home_str)
             .env("RSI_DAEMON_SOCKET_PATH", &socket_str)
             .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+            .env("RSI_SESSION_TOKEN", "")
             .env("PATH", &self.isolated_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -1710,6 +1805,7 @@ impl E2eHarness {
             .env("HOME", &home_str)
             .env("RSI_DAEMON_SOCKET_PATH", &socket_str)
             .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+            .env("RSI_SESSION_TOKEN", "")
             .env("PATH", &self.isolated_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -1730,7 +1826,7 @@ impl E2eHarness {
             term.send_key(Key::Char(','))
                 .await
                 .map_err(|error| test_error(format!("open settings: {error:?}")))?;
-            term.expect("Settings")
+            term.expect("≡ Settings  ›")
                 .timeout(Duration::from_secs(5))
                 .await
                 .map_err(|error| test_error(format!("settings did not open: {error:?}")))?;
@@ -1771,6 +1867,14 @@ impl E2eHarness {
             term.send_key(Key::Char('q'))
                 .await
                 .map_err(|error| test_error(format!("close settings after preview: {error:?}")))?;
+            // The preview notification is already visible before q. Wait for
+            // the root view so the reopen cannot match the old Settings frame.
+            term.expect("All projects / Sessions")
+                .timeout(Duration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    test_error(format!("session list after preview missing: {error:?}"))
+                })?;
             term.expect("Preview: 1 eligible of 1 checked; capacity estimate unavailable")
                 .timeout(Duration::from_secs(5))
                 .await
@@ -1788,7 +1892,7 @@ impl E2eHarness {
             term.send_key(Key::Char(','))
                 .await
                 .map_err(|error| test_error(format!("reopen settings for actual: {error:?}")))?;
-            term.expect("Settings")
+            term.expect("≡ Settings  ›")
                 .timeout(Duration::from_secs(5))
                 .await
                 .map_err(|error| test_error(format!("settings did not reopen: {error:?}")))?;
@@ -1812,6 +1916,12 @@ impl E2eHarness {
             term.send_key(Key::Char('q'))
                 .await
                 .map_err(|error| test_error(format!("close settings: {error:?}")))?;
+            term.expect("All projects / Sessions")
+                .timeout(Duration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    test_error(format!("session list after reclaim missing: {error:?}"))
+                })?;
             term.expect("Reclaim: 2 removed, 1 staged, 0 pending")
                 .timeout(Duration::from_secs(5))
                 .await
@@ -2039,6 +2149,7 @@ impl E2eHarness {
             .env("HOME", &home_str)
             .env("RSI_DAEMON_SOCKET_PATH", &socket_str)
             .env("RSI_TUI_NO_AUTO_START_DAEMON", "1")
+            .env("RSI_SESSION_TOKEN", "")
             .env("PATH", &self.isolated_path)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
@@ -2235,12 +2346,14 @@ impl E2eHarness {
     fn preserve_artifacts(&self, failure: Option<&str>) -> E2eResult<PathBuf> {
         self.write_required_artifacts(failure)?;
 
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = Path::new(rsi_common::manifest_dir!());
         let workspace_root = manifest_dir
             .parent()
             .and_then(Path::parent)
             .ok_or_else(|| test_error("failed to resolve workspace root"))?;
-        let e2e_artifacts_base = workspace_root.join("target").join("e2e-artifacts");
+        let e2e_artifacts_base = workspace_root
+            .join("target")
+            .join(rsi_common::sandbox_storage::E2E_ARTIFACTS_DIR_NAME);
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.6f");
         let dest_dir = e2e_artifacts_base.join(timestamp.to_string());
         fs::create_dir_all(&dest_dir)?;
@@ -2515,6 +2628,31 @@ fn assert_codex_capability_session(
         )));
     }
     Ok(())
+}
+
+/// #1757: the daemon looks its trusted siblings up next to itself. `cargo test
+/// -p rsi` builds only `rsi`, so a missing sibling used to surface as an
+/// unrelated assertion (a Codex launch failing with `provider_spawn_failed`).
+/// Fail at harness setup instead, naming the single shared prebuild list.
+fn require_prebuilt_siblings(bin_dir: &Path) -> E2eResult<()> {
+    let missing: Vec<&str> = include_str!("../../../scripts/e2e-prebuild-bins.txt")
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            line.split_whitespace().nth(1)
+        })
+        .filter(|binary| !bin_dir.join(binary).is_file())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(test_error(format!(
+        "e2e prebuild incomplete: {missing:?} not found in {}; build them first with scripts/e2e.sh or scripts/scoped-test (list: scripts/e2e-prebuild-bins.txt)",
+        bin_dir.display()
+    )))
 }
 
 fn find_executable(name: &str) -> E2eResult<PathBuf> {

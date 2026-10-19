@@ -67,6 +67,10 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 zeroize = "1"
 
+# proc_pidinfo for the daemon-resource counters on macOS (#1229).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true }
 criterion = { workspace = true }

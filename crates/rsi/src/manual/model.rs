@@ -232,11 +232,13 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::GraphEditField
         | C::GraphPicker
         | C::DagBrowser
+        | C::TodoPopup
         | C::Diagnostics
         | C::MemorySearch
         | C::Dialectic => "tools",
         C::ThemePicker | C::TextAreaBgEditor => "theming",
         C::ProviderForm
+        | C::DaemonTextEditor
         | C::ProviderCredentialForm
         | C::MessageBridgeForm
         | C::HookForm
@@ -453,7 +455,7 @@ fn settings_blocks() -> Vec<Block> {
                             what,
                             spec.kind.label().to_string(),
                             spec.owner.label(),
-                            spec.apply.label().to_string(),
+                            spec.apply_label().to_string(),
                         ]
                     })
                     .collect(),

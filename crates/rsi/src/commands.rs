@@ -57,6 +57,27 @@ pub fn parse_abandon_target(
     Ok((Some(provider), model.filter(|model| !model.is_empty())))
 }
 
+/// #2750: parse `:manager-reseat <provider>[/<model>] <reason>` into the
+/// successor's provider, optional model and the recorded reason. Both the
+/// target and the reason are required: the reason is the audit record.
+pub fn parse_reseat_args(
+    args: Option<&str>,
+) -> Result<(rsi_common::types::SessionProvider, Option<String>, String), String> {
+    const USAGE: &str = "Usage: :manager-reseat <provider>[/<model>] <reason>";
+    let args = args.map(str::trim).filter(|args| !args.is_empty());
+    let Some((target, reason)) = args.and_then(|args| args.split_once(char::is_whitespace)) else {
+        return Err(USAGE.to_string());
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    match parse_abandon_target(Some(target))? {
+        (Some(provider), model) => Ok((provider, model, reason.to_string())),
+        (None, _) => Err(USAGE.to_string()),
+    }
+}
+
 pub fn parse_command(input: &str) -> CommandResult {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -123,6 +144,16 @@ pub fn parse_command(input: &str) -> CommandResult {
         ActionId::RotateSession => CommandResult::LcAction(LcAction::RotateSession),
         ActionId::AbandonRotation => {
             CommandResult::LcAction(LcAction::AbandonRotation(args.map(str::to_string)))
+        }
+        ActionId::ReseatManager => {
+            CommandResult::LcAction(LcAction::ReseatManager(args.map(str::to_string)))
+        }
+
+        // :cold-restore — put the focused session's rows back from cold storage
+        ActionId::ColdRestore => CommandResult::LcAction(LcAction::ColdRestoreSession),
+        // :cold-archive [status|run|move|verify|compact] — the cold-storage archive
+        ActionId::ColdArchive => {
+            CommandResult::LcAction(LcAction::ColdArchive(args.map(str::to_string)))
         }
 
         // :archives — switch to archive zone
@@ -301,6 +332,9 @@ pub fn parse_command(input: &str) -> CommandResult {
         // :lead / :setlead — set focused leaf as lead of its parent Epic
         ActionId::Lead => CommandResult::LcAction(LcAction::SetEpicLead),
 
+        // #2055 :land — queue the focused session's branch (arm, then confirm)
+        ActionId::LandSession => CommandResult::LcAction(LcAction::LandSessionBranch),
+
         ActionId::Manager => match args {
             None => CommandResult::LcAction(LcAction::OpenHarnessManager),
             Some("tree") => CommandResult::LcAction(LcAction::ManagerNodeCommand("tree".into())),
@@ -405,6 +439,11 @@ pub fn parse_command(input: &str) -> CommandResult {
         },
         ActionId::Refresh => CommandResult::LcAction(LcAction::RefreshNavigation),
         ActionId::OpenIssuesWorkspace => CommandResult::LcAction(LcAction::OpenIssuesWorkspace),
+        // :issue [N] — open an Issue by number (#2381)
+        ActionId::OpenIssueNumber => CommandResult::LcAction(LcAction::OpenIssueNumber(
+            args.unwrap_or_default().to_string(),
+        )),
+        ActionId::TodoPanel => CommandResult::LcAction(LcAction::ToggleTodoPanel),
 
         // :rate / :r [N] — rate the focused session (1–10) or open rating overlay
         ActionId::Rate => match args {
@@ -495,6 +534,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn issue_command_carries_the_number_argument() {
+        assert_eq!(
+            parse_command("issue 2377"),
+            CommandResult::LcAction(LcAction::OpenIssueNumber("2377".into()))
+        );
+        assert_eq!(
+            parse_command("issue #2377"),
+            CommandResult::LcAction(LcAction::OpenIssueNumber("#2377".into()))
+        );
+        assert_eq!(
+            parse_command("issue"),
+            CommandResult::LcAction(LcAction::OpenIssueNumber(String::new()))
+        );
     }
 
     #[test]
@@ -916,6 +971,26 @@ mod tests {
         );
     }
 
+    // --- :cold-restore / :cold-archive (#2384) ---
+
+    #[test]
+    fn cold_commands_parse_to_their_actions() {
+        assert_eq!(
+            parse_command("cold-restore"),
+            CommandResult::LcAction(LcAction::ColdRestoreSession)
+        );
+        assert_eq!(
+            parse_command("cold-archive"),
+            CommandResult::LcAction(LcAction::ColdArchive(None))
+        );
+        for word in ["status", "run", "move", "verify", "compact"] {
+            assert_eq!(
+                parse_command(&format!("cold-archive {word}")),
+                CommandResult::LcAction(LcAction::ColdArchive(Some(word.to_string())))
+            );
+        }
+    }
+
     // --- :rotation-abandon (#1176) ---
 
     #[test]
@@ -943,6 +1018,42 @@ mod tests {
             Ok((Some(SessionProvider::Claude), None))
         );
         assert!(parse_abandon_target(Some("nosuch/x")).is_err());
+    }
+
+    // --- :manager-reseat (#2750) ---
+
+    #[test]
+    fn manager_reseat_parses_to_its_action_with_the_arguments() {
+        assert_eq!(
+            parse_command("manager-reseat claude/sonnet codex login expired"),
+            CommandResult::LcAction(LcAction::ReseatManager(Some(
+                "claude/sonnet codex login expired".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_command("manager-reseat"),
+            CommandResult::LcAction(LcAction::ReseatManager(None))
+        );
+    }
+
+    #[test]
+    fn manager_reseat_args_need_a_provider_and_a_reason() {
+        use rsi_common::types::SessionProvider;
+        assert_eq!(
+            parse_reseat_args(Some("claude/sonnet codex login expired")),
+            Ok((
+                SessionProvider::Claude,
+                Some("sonnet".to_string()),
+                "codex login expired".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_reseat_args(Some("CLAUDE outage")),
+            Ok((SessionProvider::Claude, None, "outage".to_string()))
+        );
+        for bad in [None, Some(""), Some("claude"), Some("nosuch outage")] {
+            assert!(parse_reseat_args(bad).is_err(), "{bad:?}");
+        }
     }
 
     // --- :group / :groups ---

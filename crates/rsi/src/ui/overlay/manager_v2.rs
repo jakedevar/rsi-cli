@@ -666,8 +666,18 @@ fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
         Constraint::Length(1),
     ])
     .split(area);
+    // #2502: this is the PM's own policy, not the portfolio grant above it.
     frame.render_widget(
-        Paragraph::new(state.identity.as_str()).style(Style::default().bold()),
+        Paragraph::new(Line::from(vec![
+            Span::styled(state.identity.clone(), Style::default().bold()),
+            Span::styled(
+                format!(
+                    " · governs {} only; caps above bind too (gm > b)",
+                    rsi_common::manager_budget::BudgetNodeKindV1::Project.governs()
+                ),
+                Style::default().fg(theme::overlay_title()),
+            ),
+        ])),
         parts[0],
     );
     frame.render_widget(
@@ -866,7 +876,7 @@ fn render_policy_picker(frame: &mut Frame, area: Rect, picker: &ManagerLaunchPic
             true,
         ),
         PickerStage::Effort => {
-            let mut lines = vec![ListItem::new("Default (no explicit effort)")];
+            let mut lines = vec![ListItem::new("any effort")];
             lines.extend(
                 picker
                     .effort_choices

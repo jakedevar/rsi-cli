@@ -81,6 +81,7 @@ impl SessionManager {
                 retry_fired_at: None,
                 superseded_by_retry: None,
                 events_hydrated: true,
+                store_writes: Default::default(),
             },
         );
 
@@ -136,14 +137,26 @@ impl SessionManager {
 
         self.update_parent_in_memory(session_id, new_parent_id)
             .await;
-        if let Err(e) = self
+        let stamp = match self
             .persist_update_session_parent(session_id, new_parent_id)
             .await
         {
-            self.update_parent_in_memory(session_id, old_parent_id)
-                .await;
-            return Err(e);
-        }
+            Ok(stamp) => stamp,
+            Err(e) => {
+                self.update_parent_in_memory(session_id, old_parent_id)
+                    .await;
+                return Err(e);
+            }
+        };
+        super::cohort_settlement::apply_store_write(
+            &self.active,
+            &self.completed,
+            session_id,
+            super::types::CompletedStoreField::Parent,
+            stamp,
+            |completed| completed.parent_id = new_parent_id,
+        )
+        .await;
 
         self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
             session_id,
@@ -271,6 +284,15 @@ impl SessionManager {
         if validate_lead_candidate(epic_id, candidate).is_err() {
             return Ok(false);
         }
+        // #2804: a topology or Issue-bound worker never becomes the lead.
+        if self
+            .store
+            .lock()
+            .await
+            .is_non_lead_worker_session(candidate.id)?
+        {
+            return Ok(false);
+        }
         let _lead_guards = lead_mutation_guards(
             &[candidate.id],
             held.map_or(LeadGuardMode::Acquire, LeadGuardMode::Held),
@@ -386,7 +408,16 @@ impl SessionManager {
             let valid = by_id
                 .get(&lead_id)
                 .is_some_and(|lead| validate_lead_candidate(epic.id, lead).is_ok());
-            if valid {
+            // #2805: a topology or Issue-bound worker (or a rotation child of
+            // one) is never a lead; a pointer written before #2791/#2804 is
+            // retired here, never re-pointed at another worker.
+            let worker = valid
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .is_non_lead_worker_session(lead_id)?;
+            if valid && !worker {
                 continue;
             }
 
@@ -472,16 +503,20 @@ impl SessionManager {
         Ok(index)
     }
 
+    /// Set a live session's parent ahead of the Store write. A terminal
+    /// session's parent is applied only by the post-commit mirror in
+    /// [`Self::set_session_parent`], together with the write's own stamp
+    /// (#258) and only when no later committed parent write was mirrored
+    /// first (#263, #265: by Store commit order). An unstamped pre-apply here
+    /// (or the restore of a failed write) could land after a newer committed
+    /// parent and overwrite it.
     async fn update_parent_in_memory(&self, session_id: Uuid, parent_id: Option<Uuid>) {
-        if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-            tracked.session.parent_id = parent_id;
-            tracked.session.updated_at = chrono::Utc::now();
+        let mut active = self.active.write().await;
+        let Some(tracked) = active.get_mut(&session_id) else {
             return;
-        }
-        if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-            completed.session.parent_id = parent_id;
-            completed.session.updated_at = chrono::Utc::now();
-        }
+        };
+        tracked.session.parent_id = parent_id;
+        tracked.session.updated_at = chrono::Utc::now();
     }
 
     /// Apply every mark a session earns by taking lead authority: the lead role
@@ -581,7 +616,7 @@ impl SessionManager {
         &self,
         session_id: Uuid,
         new_parent: Option<Uuid>,
-    ) -> Result<()> {
+    ) -> Result<Option<crate::store::SessionWriteStamp>> {
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
@@ -700,14 +735,14 @@ async fn pin_lead_session_runtime(
     let pinned = tokio::task::spawn_blocking(move || {
         store_for_pin
             .blocking_lock()
-            .pin_session_if_unpinned(lead_id)
+            .pin_session_if_unpinned_stamped(lead_id)
     })
     .await
     .map_err(|e| DaemonError::Store(e.to_string()))
     .and_then(|inner| inner);
 
-    let pinned_at = match pinned {
-        Ok(pinned_at) => pinned_at,
+    let (pinned_at, stamp) = match pinned {
+        Ok(pinned) => pinned,
         Err(e) => {
             tracing::warn!(
                 lead_id = %lead_id,
@@ -723,11 +758,15 @@ async fn pin_lead_session_runtime(
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc))
     });
-    if let Some(tracked) = active.write().await.get_mut(&lead_id) {
-        tracked.session.pinned_at = parsed;
-    } else if let Some(completed_session) = completed.write().await.get_mut(&lead_id) {
-        completed_session.session.pinned_at = parsed;
-    }
+    super::cohort_settlement::apply_store_write(
+        active,
+        completed,
+        lead_id,
+        super::types::CompletedStoreField::Pin,
+        stamp,
+        |session| session.pinned_at = parsed,
+    )
+    .await;
 
     event_bus.publish(DaemonEvent::SessionMetadataChanged {
         session_id: lead_id,
@@ -961,7 +1000,7 @@ mod tests {
     fn manager() -> (SessionManager, TempDir) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("rsi.db");
-        let store = Store::open(&db_path).expect("open store");
+        let store = Store::open_test_fixture(&db_path).expect("open store");
         let config = Config::from_env();
         let runtime_config = RuntimeConfig::from_config(&config);
         let manager = SessionManager::new(
@@ -1093,6 +1132,7 @@ mod tests {
                 retry_fired_at: None,
                 superseded_by_retry: None,
                 events_hydrated: true,
+                store_writes: Default::default(),
             },
         );
     }
@@ -1123,6 +1163,7 @@ mod tests {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
+            interrupt_evidence: Default::default(),
             pending_archive,
             rotation: crate::session::rotation_coordinator::RotationCoordinator::new(
                 session_id, 0, false,
@@ -1144,15 +1185,16 @@ mod tests {
             work_time_base_ms: 0,
             received_meaningful_output: true,
             exit_code: Some(0),
-            retry_attempt: 0,
             max_retries: 0,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
+            turn_tools: Default::default(),
             last_usage_update: None,
             last_mismatch_warn: None,
             last_classified_at: None,
             classification_count: 0,
             last_verdict: None,
+            store_fields: Default::default(),
         }
     }
 
@@ -1819,7 +1861,7 @@ mod tests {
             SessionStatus::Archived
         );
 
-        let reopened = Store::open(&database).unwrap();
+        let reopened = Store::open_test_fixture(&database).unwrap();
         let inbox = reopened
             .manager_inbox(principal.id, &AgentManagerInboxRequestV1::default())
             .unwrap();

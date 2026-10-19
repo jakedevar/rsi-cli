@@ -192,16 +192,21 @@ impl Store {
         &self,
         session_id: Uuid,
         workflow_id: Option<Uuid>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET workflow_id = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                workflow_id.map(|id| id.to_string()),
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    ) -> Result<Option<super::SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Workflow,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET workflow_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        workflow_id.map(|id| id.to_string()),
+                        stamped_at,
+                        session_id.to_string(),
+                    ],
+                )
+            },
+        )
     }
 
     /// Delete a workflow row by id (P1.12 §9 cascade support).

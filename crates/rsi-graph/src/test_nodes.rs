@@ -74,49 +74,6 @@ mod inner {
         }
     }
 
-    /// Reads a value from shared state and adds it to output.
-    /// Since Node::execute doesn't have direct store access, this test node
-    /// adds a marker field to show it executed with the requested state key.
-    pub struct StateReaderNode {
-        id: NodeId,
-        name: String,
-        state_key: String,
-        output_field: String,
-    }
-
-    impl StateReaderNode {
-        pub fn new(id: &str, state_key: &str, output_field: &str) -> Self {
-            Self {
-                id: NodeId::new(id),
-                name: format!("state-reader-{id}"),
-                state_key: state_key.to_string(),
-                output_field: output_field.to_string(),
-            }
-        }
-    }
-
-    impl Node for StateReaderNode {
-        fn id(&self) -> &NodeId {
-            &self.id
-        }
-
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn execute(
-            &self,
-            mut input: NodeData,
-            _ctx: &mut NodeContext,
-        ) -> Result<NodeData, GraphError> {
-            input.insert(
-                self.output_field.clone(),
-                Value::String(format!("state_reader_{}", self.state_key)),
-            );
-            Ok(input)
-        }
-    }
-
     /// A node that always fails.
     pub struct FailingNode {
         id: NodeId,

@@ -1,0 +1,14 @@
+/* Terminal overlay (slice 12): an xterm.js pane over the backend's PTY, placed like the TUI's popup (90% x 80%, centered). */
+.terminal-overlay {
+  position: fixed; z-index: 9; display: flex; flex-direction: column;
+  background: var(--base); border: 1px solid var(--surface1); border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5); overflow: hidden;
+}
+.terminal-overlay[hidden] { display: none; }
+.terminal-head { display: flex; align-items: center; gap: 10px; padding: 4px 8px 4px 12px; background: var(--mantle); border-bottom: 1px solid var(--surface0); font-size: 12px; }
+.terminal-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--subtext); }
+.terminal-mode { font-family: var(--mono); font-weight: 700; color: var(--green); }
+.terminal-mode.normal { color: var(--blue); }
+.terminal-body { position: relative; flex: 1; min-height: 0; padding: 4px 0 4px 6px; }
+.terminal-host { position: absolute; inset: 4px 0 4px 6px; }
+.terminal-host[hidden] { display: none; }

@@ -6,12 +6,14 @@
 //! settle writes nothing.
 
 use super::Store;
+use super::satellite_scope::DisplacedSeat;
 use super::scheduled_jobs::insert_scheduled_job_conn;
 use crate::error::{DaemonError, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rsi_common::agent_deploy::{
-    DEPLOY_CANCEL_TOO_LATE, DEPLOY_CANCELLED, DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT,
-    DEPLOY_NOT_FOUND, DeployBinaryV1, DeployState, skipped_binaries,
+    DEPLOY_BLOCKER_SUBJECTS_MAX, DEPLOY_CANCEL_TOO_LATE, DEPLOY_CANCELLED, DEPLOY_IN_PROGRESS,
+    DEPLOY_KEY_CONFLICT, DEPLOY_NOT_FOUND, DeployBinaryV1, DeployBlockerSubjectV1, DeployBlockerV1,
+    DeployState, skipped_binaries,
 };
 use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -19,6 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 // The provisional number is assigned at landing.
+#[cfg(test)]
 // RSI-RELEASED-MIGRATION-BEGIN: agent-deploys-migration
 /// Provisional schema version of the deploy catalog; the lander renumbers it.
 pub(crate) const AGENT_DEPLOYS_SCHEMA_VERSION: i32 = 146;
@@ -114,6 +117,8 @@ pub struct DeployInterrupt {
     pub requested: bool,
     /// Worker sessions still mid-turn when the restart began; empty until then.
     pub interrupted: Vec<Uuid>,
+    /// #2048: jobs this deploy stopped as `interrupted_by_deploy`, oldest first.
+    pub cancelled_jobs: Vec<Uuid>,
 }
 
 /// A stored deploy.
@@ -238,8 +243,9 @@ impl Store {
             .query_row(
                 &format!(
                     "SELECT {COLUMNS}, request_fingerprint FROM agent_deploys \
-                     WHERE (?1 IS NULL OR owner_session_id=?1) AND idempotency_digest=?2 \
-                     ORDER BY created_at LIMIT 1"
+                     WHERE (?1 IS NULL OR request_session_id=?1 OR owner_session_id=?1) \
+                     AND idempotency_digest=?2 \
+                     ORDER BY (request_session_id IS ?1) DESC, created_at LIMIT 1"
                 ),
                 params![owner.map(|id| id.to_string()), key_digest],
                 |row| Ok((map_deploy_row(row)?, row.get::<_, String>(9)?)),
@@ -278,7 +284,8 @@ impl Store {
         let inserted = self.conn.execute(
             "INSERT INTO agent_deploys (id, owner_session_id, idempotency_digest, \
              request_fingerprint, sha, manifest_json, state, created_at, deadline_at, \
-             interrupt_workers) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'staged', ?7, ?8, ?9)",
+             interrupt_workers, request_session_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'staged', ?7, ?8, ?9, ?2)",
             params![
                 new.id.to_string(),
                 new.owner_session_id.to_string(),
@@ -331,6 +338,22 @@ impl Store {
             .optional()?)
     }
 
+    /// The commits of the newest succeeded deploys, newest first and without
+    /// repeats (a redeploy of one commit counts once), at most `limit`. The
+    /// staging prune keeps the deployed build and the one before it (#2681).
+    pub fn recent_succeeded_deploy_shas(&self, limit: usize) -> Result<Vec<String>> {
+        // Distinct commits first, then the limit: a commit redeployed many
+        // times must not crowd the previous commit out of the window (#2701).
+        let mut stmt = self.conn.prepare(
+            "SELECT sha FROM agent_deploys WHERE state = 'succeeded' \
+             GROUP BY sha ORDER BY MAX(settled_at) DESC, MAX(created_at) DESC LIMIT ?1",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map([limit], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(Into::into)
+    }
+
     /// The newest deploy of any state (satellite health, #1017 slice 2).
     pub fn latest_agent_deploy(&self) -> Result<Option<DeployRow>> {
         Ok(self
@@ -350,6 +373,29 @@ impl Store {
             [stamp(since)],
             |row| row.get(0),
         )?)
+    }
+
+    /// Restart times inside the window, oldest first (budget guard and the
+    /// `retry_after` of a refusal, #1777).
+    pub fn agent_deploy_restart_times_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<DateTime<Utc>>> {
+        let mut statement = self.conn.prepare(
+            "SELECT restarted_at FROM agent_deploys \
+             WHERE restarted_at IS NOT NULL AND restarted_at>=?1 ORDER BY restarted_at",
+        )?;
+        let rows = statement.query_map([stamp(since)], |row| row.get::<_, String>(0))?;
+        let mut times = Vec::new();
+        for row in rows {
+            let text = row?;
+            times.push(
+                DateTime::parse_from_rfc3339(&text)
+                    .map_err(|error| DaemonError::Store(format!("restarted_at {text}: {error}")))?
+                    .with_timezone(&Utc),
+            );
+        }
+        Ok(times)
     }
 
     /// CAS `staged -> restarting`. False when the row was not `staged`.
@@ -382,7 +428,28 @@ impl Store {
                 .map(|text| parse_interrupted(&text))
                 .transpose()?
                 .unwrap_or_default(),
+            cancelled_jobs: self.deploy_cancelled_jobs(id)?,
         })
+    }
+
+    /// #2048: the jobs deploy `id` stopped: those settled `interrupted_by_deploy`
+    /// (linked through the `deploy_id` in the settled result) and, #2278, those it
+    /// stopped and put back in the queue (linked through `requeued_by_deploy`).
+    pub fn deploy_cancelled_jobs(&self, id: Uuid) -> Result<Vec<Uuid>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM agent_jobs WHERE (state='failed' \
+             AND json_extract(result_json,'$.deploy_id')=?1) \
+             OR json_extract(params_json,'$.requeued_by_deploy')=?1 ORDER BY sequence",
+        )?;
+        let ids = statement
+            .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                Uuid::parse_str(id)
+                    .map_err(|error| DaemonError::Store(format!("cancelled job id: {error}")))
+            })
+            .collect()
     }
 
     /// #1461: record the worker sessions this deploy's restart interrupts, once
@@ -396,6 +463,45 @@ impl Store {
              WHERE id=?1 AND state='restarting' AND interrupted_sessions IS NULL",
             params![id.to_string(), json],
         )? == 1)
+    }
+
+    /// #2371: the worker sessions the live `restarting` deploy named as
+    /// interrupted. Empty unless an `interrupt_workers` deploy is restarting and
+    /// has recorded its set; the DRAIN wait stops waiting for exactly these.
+    pub fn restarting_deploy_interrupted_workers(&self) -> Result<Vec<Uuid>> {
+        let texts: Vec<String> = self
+            .conn
+            .prepare(
+                "SELECT interrupted_sessions FROM agent_deploys \
+                 WHERE state='restarting' AND interrupt_workers=1 \
+                 AND interrupted_sessions IS NOT NULL",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut workers = Vec::new();
+        for text in texts {
+            workers.extend(parse_interrupted(&text)?);
+        }
+        Ok(workers)
+    }
+
+    /// When the deploy settled (`None` while it is staged or restarting).
+    pub fn agent_deploy_settled_at(&self, id: Uuid) -> Result<Option<DateTime<Utc>>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT settled_at FROM agent_deploys WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        text.map(|text| {
+            DateTime::parse_from_rfc3339(&text)
+                .map(|stamp| stamp.with_timezone(&Utc))
+                .map_err(|error| DaemonError::Store(format!("deploy settled_at: {error}")))
+        })
+        .transpose()
     }
 
     /// When the deploy was requested: the start of its launch hold (#1320).
@@ -432,27 +538,92 @@ impl Store {
         sha: &str,
         now: DateTime<Utc>,
     ) -> Result<DeployRow> {
+        self.cancel_agent_deploy_with_policy(
+            Some(owner),
+            &request_digest(None, key),
+            sha,
+            now,
+            false,
+        )
+    }
+
+    /// Peer cancellation is a one-shot remote action: once the satellite row
+    /// is no longer waiting, return the same stable refusal as a restart that
+    /// has begun instead of replaying a settled receipt.
+    pub fn cancel_agent_deploy_if_waiting(
+        &self,
+        owner: Uuid,
+        key: &str,
+        sha: &str,
+        now: DateTime<Utc>,
+    ) -> Result<DeployRow> {
+        self.cancel_agent_deploy_with_policy(
+            Some(owner),
+            &request_digest(None, key),
+            sha,
+            now,
+            true,
+        )
+    }
+
+    /// Satellite deploys use the declared scope root as part of their replay
+    /// namespace. A linked cancellation looks the row up exactly as the scoped
+    /// replay does (#2000): by the digest under any declared scope root, whoever
+    /// owns it now, because the seat that staged the deploy may have rotated (or
+    /// the first live root changed) while it waited. An operator deploy has no
+    /// scoped digest, so it can never match.
+    pub fn cancel_scoped_agent_deploy_if_waiting(
+        &self,
+        scopes: &[Uuid],
+        key: &str,
+        sha: &str,
+        now: DateTime<Utc>,
+    ) -> Result<DeployRow> {
+        for scope in scopes {
+            match self.cancel_agent_deploy_with_policy(
+                None,
+                &request_digest(Some(*scope), key),
+                sha,
+                now,
+                true,
+            ) {
+                Err(DaemonError::InvalidParam(code)) if code == DEPLOY_NOT_FOUND => {}
+                other => return other,
+            }
+        }
+        Err(DaemonError::InvalidParam(DEPLOY_NOT_FOUND.into()))
+    }
+
+    fn cancel_agent_deploy_with_policy(
+        &self,
+        owner: Option<Uuid>,
+        digest: &str,
+        sha: &str,
+        now: DateTime<Utc>,
+        require_waiting: bool,
+    ) -> Result<DeployRow> {
         let found = self
             .conn
             .query_row(
                 &format!(
                     "SELECT {COLUMNS} FROM agent_deploys \
-                     WHERE owner_session_id=?1 AND idempotency_digest=?2 \
-                     ORDER BY created_at LIMIT 1"
+                     WHERE (?1 IS NULL OR request_session_id=?1 OR owner_session_id=?1) \
+                     AND idempotency_digest=?2 AND sha=?3 \
+                     ORDER BY (state IN ('staged','restarting')) DESC, \
+                              (request_session_id IS ?1) DESC, created_at LIMIT 1"
                 ),
-                params![owner.to_string(), request_digest(None, key)],
+                params![owner.map(|id| id.to_string()), digest, sha],
                 map_deploy_row,
             )
             .optional()?;
-        let row = found
-            .filter(|row| row.sha == sha)
-            .ok_or_else(|| DaemonError::InvalidParam(DEPLOY_NOT_FOUND.into()))?;
+        let row = found.ok_or_else(|| DaemonError::InvalidParam(DEPLOY_NOT_FOUND.into()))?;
         match row.state {
             DeployState::Staged => {}
             DeployState::Restarting => {
                 return Err(DaemonError::PolicyDenied(DEPLOY_CANCEL_TOO_LATE.into()));
             }
-            _ => return Ok(row),
+            _ if !require_waiting => return Ok(row),
+            _ => return Err(DaemonError::PolicyDenied(DEPLOY_CANCEL_TOO_LATE.into())),
         }
         self.settle_agent_deploy_waking(
             row.id,
@@ -493,6 +664,15 @@ impl Store {
                 "deploy_settle_state_not_terminal".into(),
             ));
         }
+        // #272: the authority projection reads under its own snapshot, so the
+        // wake's recipient is resolved before the settle transaction opens.
+        let recipient = match self
+            .get_agent_deploy(id)?
+            .and_then(|row| row.owner_session_id)
+        {
+            Some(owner) => Some((owner, self.deploy_wake_recipient(owner)?)),
+            None => None,
+        };
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let Some(row) = tx
             .query_row(
@@ -539,7 +719,11 @@ impl Store {
         } else {
             format!(" Skipped (not in binaries_dir): {}.", skipped.join(", "))
         };
-        let interrupted = interrupted_note(&tx, id)?;
+        let interrupted = format!(
+            "{}{}",
+            interrupted_note(&tx, id)?,
+            cancelled_jobs_note(&tx, id)?
+        );
         let message = format!(
             "Deploy {id} {state}: sha {sha}{reason}.{skipped}{interrupted} Check AgentGetDaemonInfo for the running build.",
             state = terminal.as_str(),
@@ -549,6 +733,36 @@ impl Store {
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default(),
         );
+        // A row whose owner changed since the read above (#1553 hands a live
+        // deploy to a new seat) is woken as recorded.
+        let recipient = recipient
+            .filter(|(read, _)| *read == owner)
+            .map_or(WakeRecipient::Owner, |(_, recipient)| recipient);
+        let (wake_session, message, wake) = match recipient {
+            WakeRecipient::Owner => (owner, message, wake),
+            WakeRecipient::Seat(seat) => {
+                tracing::info!(deploy = %id, owner = %owner, seat = %seat,
+                    "deploy outcome wake redirected from a displaced seat to the current seat");
+                (
+                    seat,
+                    format!(
+                        "{message} Redirected (#272): deploy owner {owner} no longer holds its project's manager appointment; you are the current appointed seat."
+                    ),
+                    wake,
+                )
+            }
+            WakeRecipient::NoSeat(project) => {
+                tracing::warn!(deploy = %id, owner = %owner, project = %project,
+                    "deploy outcome wake not delivered: displaced owner and no live appointed seat");
+                (
+                    owner,
+                    format!(
+                        "{message} Not delivered (#272): deploy owner {owner} no longer holds project {project}'s manager appointment and the project has no live appointed seat; the settled deploy row is the record."
+                    ),
+                    false,
+                )
+            }
+        };
         insert_scheduled_job_conn(
             &tx,
             &ScheduledJob {
@@ -569,11 +783,31 @@ impl Store {
                 created_at: now,
                 updated_at: now,
                 wake_mode: WakeMode::Resume,
-                wake_session_id: Some(owner),
+                wake_session_id: Some(wake_session),
             },
         )?;
         tx.commit()?;
         Ok(Some(wake_id))
+    }
+
+    /// #272: the session a deploy's outcome wake reaches. An owner that still
+    /// holds manager authority (the project seat, a portfolio or node seat)
+    /// keeps it. An owner another session replaced as its project's seat (a
+    /// deposed manager still declared as a satellite scope root, whose deploy
+    /// no re-appointment handed over) is not resumed: the project's current
+    /// seat gets the wake, or, with no live seat, nobody does.
+    fn deploy_wake_recipient(&self, owner: Uuid) -> Result<WakeRecipient> {
+        let manager = self
+            .agent_authority_projection(owner)
+            .is_ok_and(|projection| projection.is_manager || projection.is_global_manager);
+        if manager {
+            return Ok(WakeRecipient::Owner);
+        }
+        Ok(match self.displaced_seat_route(owner)? {
+            DisplacedSeat::NotDisplaced => WakeRecipient::Owner,
+            DisplacedSeat::Reseated { seat, .. } => WakeRecipient::Seat(seat),
+            DisplacedSeat::NoLiveSeat { project } => WakeRecipient::NoSeat(project),
+        })
     }
 
     /// Quiet-point blockers, in a stable order; empty means quiet. A running
@@ -596,31 +830,154 @@ impl Store {
         caller: Uuid,
         workers_block: bool,
     ) -> Result<Vec<&'static str>> {
+        Ok(self
+            .quiet_blocker_subjects(caller, workers_block)?
+            .into_iter()
+            .map(|(kind, _, _)| kind)
+            .collect())
+    }
+
+    /// #2056: [`Self::deploy_quiet_blockers_with`] with the ids that name each
+    /// blocker (queue sequence and batch, job and owner, worker session). Both
+    /// come from one query set, so the names and the details cannot disagree.
+    pub fn deploy_quiet_blocker_details_with(
+        &self,
+        caller: Uuid,
+        workers_block: bool,
+    ) -> Result<Vec<DeployBlockerV1>> {
+        Ok(self
+            .quiet_blocker_subjects(caller, workers_block)?
+            .into_iter()
+            .map(|(kind, subjects, total)| DeployBlockerV1 {
+                kind: kind.to_string(),
+                subjects,
+                subjects_total: total,
+            })
+            .collect())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn quiet_blocker_subjects(
+        &self,
+        caller: Uuid,
+        workers_block: bool,
+    ) -> Result<Vec<(&'static str, Vec<DeployBlockerSubjectV1>, u32)>> {
         // Static SQL only: the p2_07 protected-writer audit (#392) must be able
         // to prove these reads write nothing.
+        const CAP: i64 = DEPLOY_BLOCKER_SUBJECTS_MAX as i64;
+        let uuid = |value: String, what: &str| {
+            Uuid::parse_str(&value)
+                .map_err(|error| DaemonError::Store(format!("deploy blocker {what}: {error}")))
+        };
         let mut blockers = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT sequence, state, batch_id, enqueued_at, COUNT(*) OVER () \
+             FROM rolling_queue_entries WHERE state IN ('admitted','gating') \
+             ORDER BY sequence LIMIT ?1",
+        )?;
+        let mut total = 0_u32;
+        let queue = stmt
+            .query_map([CAP], |row| {
+                total = u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX);
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !queue.is_empty() {
+            let subjects = queue
+                .into_iter()
+                .map(|(sequence, state, batch, since)| {
+                    Ok(DeployBlockerSubjectV1 {
+                        queue_sequence: Some(sequence),
+                        queue_state: Some(state),
+                        batch_id: batch.map(|batch| uuid(batch, "batch")).transpose()?,
+                        since: Some(since),
+                        ..DeployBlockerSubjectV1::default()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            blockers.push(("landing_in_progress", subjects, total));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, owner_session_id, started_at, COUNT(*) OVER () \
+             FROM agent_jobs WHERE state='running' \
+             AND kind NOT IN ('cloud_sweep','cloud_gate') ORDER BY sequence LIMIT ?1",
+        )?;
+        let mut total = 0_u32;
+        let jobs = stmt
+            .query_map([CAP], |row| {
+                total = u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX);
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !jobs.is_empty() {
+            let subjects = jobs
+                .into_iter()
+                .map(|(id, kind, owner, since)| {
+                    Ok(DeployBlockerSubjectV1 {
+                        job_id: Some(uuid(id, "job")?),
+                        job_kind: Some(kind),
+                        owner_session_id: Some(uuid(owner, "job owner")?),
+                        since,
+                        ..DeployBlockerSubjectV1::default()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            blockers.push(("job_running", subjects, total));
+        }
+        if workers_block {
+            let workers = self.deploy_mid_turn_workers(caller)?;
+            if !workers.is_empty() {
+                let total = u32::try_from(workers.len()).unwrap_or(u32::MAX);
+                let subjects = workers
+                    .into_iter()
+                    .take(DEPLOY_BLOCKER_SUBJECTS_MAX)
+                    .map(|id| DeployBlockerSubjectV1 {
+                        session_id: Some(id),
+                        ..DeployBlockerSubjectV1::default()
+                    })
+                    .collect();
+                blockers.push(("worker_mid_turn", subjects, total));
+            }
+        }
+        Ok(blockers)
+    }
+
+    /// #2190: the quiet-point blockers a deploy cannot preempt: an admitted or
+    /// gating queue landing (`landing_in_progress`) and a running local job that
+    /// is not a `test` job (`job_running`: a `build` or `landing` job). A running
+    /// `test` job is preemptible (it is stopped after its grace) and so is a
+    /// worker mid-turn (`interrupt_workers`), so neither is listed. While this is
+    /// non-empty, stopping test jobs gains the deploy nothing.
+    pub fn deploy_unpreemptible_blockers(&self) -> Result<Vec<&'static str>> {
+        // Static SQL only: the p2_07 protected-writer audit (#392).
         let landing: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rolling_queue_entries WHERE state IN ('admitted','gating'))",
+            "SELECT EXISTS(SELECT 1 FROM rolling_queue_entries \
+             WHERE state IN ('admitted','gating'))",
             [],
             |row| row.get(0),
         )?;
+        let job: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE state='running' \
+             AND kind NOT IN ('cloud_sweep','cloud_gate','test'))",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut blockers = Vec::new();
         if landing {
             blockers.push("landing_in_progress");
         }
-        let job: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE state='running' \
-             AND kind NOT IN ('cloud_sweep','cloud_gate'))",
-            [],
-            |row| row.get(0),
-        )?;
         if job {
             blockers.push("job_running");
-        }
-        if workers_block {
-            let worker = !self.deploy_mid_turn_workers(caller)?.is_empty();
-            if worker {
-                blockers.push("worker_mid_turn");
-            }
         }
         Ok(blockers)
     }
@@ -652,6 +1009,18 @@ impl Store {
     }
 }
 
+/// #272: who a settling deploy's outcome wake resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeRecipient {
+    /// The recorded owner.
+    Owner,
+    /// The current appointed seat that replaced a displaced owner.
+    Seat(Uuid),
+    /// The owner was displaced and this project has no live seat: the wake is
+    /// recorded disabled.
+    NoSeat(Uuid),
+}
+
 /// The most interrupted worker ids a settle wake names; the row keeps them all.
 const INTERRUPTED_NOTE_MAX: usize = 64;
 
@@ -661,6 +1030,24 @@ fn parse_interrupted(text: &str) -> Result<Vec<Uuid>> {
     ids.iter()
         .map(|id| Uuid::parse_str(id).map_err(|error| bad(error.to_string())))
         .collect()
+}
+
+/// #2549: a topology node session is named with its execution and node
+/// (` [topology node implement of execution <id>]`), so the manager reads the
+/// deploy outcome as "this execution's node was cut and resumes", not as a
+/// stray worker. Empty for any other session or on a read error.
+fn topology_node_label(tx: &Transaction<'_>, session: Uuid) -> String {
+    tx.query_row(
+        "SELECT node_id,execution_id FROM topology_node_attempts WHERE session_id=?1 \
+         ORDER BY created_at DESC LIMIT 1",
+        [session.to_string()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|(node, execution)| format!(" [topology node {node} of execution {execution}]"))
+    .unwrap_or_default()
 }
 
 /// #1461: the settle wake's account of the workers a restart interrupted
@@ -681,7 +1068,7 @@ fn interrupted_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
     let shown: Vec<String> = workers
         .iter()
         .take(INTERRUPTED_NOTE_MAX)
-        .map(Uuid::to_string)
+        .map(|worker| format!("{worker}{}", topology_node_label(tx, *worker)))
         .collect();
     let more = workers.len().saturating_sub(INTERRUPTED_NOTE_MAX);
     Ok(format!(
@@ -693,6 +1080,41 @@ fn interrupted_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
             String::new()
         }
     ))
+}
+
+/// #2048: the settle wake's account of the verification jobs the deploy
+/// stopped after its grace (empty when none), read in the settling transaction.
+/// #2278: a stopped test job is requeued under its own id, so the note names the
+/// requeued jobs apart from the ones that settled `interrupted_by_deploy`.
+fn cancelled_jobs_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
+    let stopped = tx
+        .prepare(
+            "SELECT id FROM agent_jobs WHERE state='failed' \
+             AND json_extract(result_json,'$.deploy_id')=?1 ORDER BY sequence",
+        )?
+        .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let requeued = tx
+        .prepare(
+            "SELECT id FROM agent_jobs \
+             WHERE json_extract(params_json,'$.requeued_by_deploy')=?1 ORDER BY sequence",
+        )?
+        .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut note = String::new();
+    if !requeued.is_empty() {
+        note.push_str(&format!(
+            " Running test jobs stopped after the grace were requeued under the same id, owner and wake and rerun on the new daemon; your wake for each fires once, when the rerun ends, #2278: {}.",
+            requeued.join(", ")
+        ));
+    }
+    if !stopped.is_empty() {
+        note.push_str(&format!(
+            " Running test jobs stopped as interrupted_by_deploy after the grace (resubmit them once on the new daemon, #2048): {}.",
+            stopped.join(", ")
+        ));
+    }
+    Ok(note)
 }
 
 #[cfg(test)]
@@ -748,6 +1170,186 @@ mod tests {
             .message
     }
 
+    /// A live session of the store's seeded project, idle between turns.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    fn project_session(store: &Store) -> Uuid {
+        let mut row = crate::store::tests::make_test_session();
+        row.status = rsi_common::SessionStatus::Completed;
+        store.insert_session(&row).unwrap();
+        row.id
+    }
+
+    /// The operator appoints `session` as the seeded project's manager.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    fn appoint(store: &Store, session: Uuid) {
+        let project = crate::store::d04_test_project_id();
+        let version = store
+            .get_harness_manager(project)
+            .unwrap()
+            .map_or(0, |config| config.row_version);
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: session,
+                    epic_ids: None,
+                    group_ids: Vec::new(),
+                    expected_row_version: version,
+                },
+            )
+            .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    fn wake_job(store: &Store, id: Uuid) -> ScheduledJob {
+        store
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == id)
+            .expect("the deploy's outcome wake")
+    }
+
+    /// #272: a deposed seat (still declared as a satellite scope root) owns a
+    /// deploy that no re-appointment handed over, because it was not the
+    /// replaced anchor's lineage. Its outcome wake reaches the session that
+    /// holds the appointment at settlement, after a further re-appointment,
+    /// and the wake names the original owner; the row keeps that owner as its
+    /// record. A deploy the current seat owns still wakes that seat.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_displaced_owner_s_deploy_wake_reaches_the_current_appointed_seat() {
+        let store = Store::open_in_memory().unwrap();
+        let deposed = project_session(&store);
+        appoint(&store, deposed);
+        let interim = project_session(&store);
+        appoint(&store, interim);
+        let row = staged(&store, deposed, "k-deposed", false);
+        let current = project_session(&store);
+        appoint(&store, current);
+
+        let wake = store
+            .settle_agent_deploy(row.id, DeployState::Succeeded, None, Utc::now())
+            .unwrap()
+            .expect("settled");
+        let job = wake_job(&store, wake);
+        assert_eq!(job.wake_session_id, Some(current));
+        assert!(job.enabled);
+        assert!(
+            job.message
+                .contains(&format!("deploy owner {deposed} no longer holds")),
+            "{}",
+            job.message
+        );
+        let settled = store.get_agent_deploy(row.id).unwrap().unwrap();
+        assert_eq!(settled.owner_session_id, Some(deposed));
+
+        let own = staged(&store, current, "k-current", false);
+        let wake = store
+            .settle_agent_deploy(own.id, DeployState::Succeeded, None, Utc::now())
+            .unwrap()
+            .expect("settled");
+        let job = wake_job(&store, wake);
+        assert_eq!(job.wake_session_id, Some(current));
+        assert!(job.enabled);
+        assert!(
+            job.message
+                .ends_with("Check AgentGetDaemonInfo for the running build.")
+        );
+    }
+
+    /// #272: with no live appointed seat to redirect to (the appointment that
+    /// displaced the owner was revoked), a displaced owner's outcome wake is
+    /// recorded disabled with the reason; the settled row is the record the
+    /// hub and operator read.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_displaced_owner_s_deploy_wake_with_no_live_seat_resumes_nobody() {
+        let store = Store::open_in_memory().unwrap();
+        let deposed = project_session(&store);
+        appoint(&store, deposed);
+        let current = project_session(&store);
+        appoint(&store, current);
+        let row = staged(&store, deposed, "k-orphan", false);
+        // The operator revokes the appointment: the seat is still published
+        // but no live seat resolves.
+        let project = crate::store::d04_test_project_id();
+        let version = store
+            .get_harness_manager(project)
+            .unwrap()
+            .unwrap()
+            .row_version;
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: current,
+                    epic_ids: Some(Vec::new()),
+                    group_ids: Vec::new(),
+                    expected_row_version: version,
+                },
+            )
+            .unwrap();
+
+        let wake = store
+            .settle_agent_deploy(row.id, DeployState::Failed, Some("boom"), Utc::now())
+            .unwrap()
+            .expect("settled");
+        let job = wake_job(&store, wake);
+        assert!(!job.enabled);
+        assert!(
+            job.message.contains("Not delivered (#272)"),
+            "{}",
+            job.message
+        );
+        let settled = store.get_agent_deploy(row.id).unwrap().unwrap();
+        assert_eq!(settled.state, DeployState::Failed);
+    }
+
+    /// #2880: a displaced owner whose replacement was archived (the appointment
+    /// stays published with no live tip) resumes nobody, and a never-appointed
+    /// owner beside its managed project keeps its own wake (#2881).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_deploy_wake_follows_who_held_the_appointment_when_the_seat_has_no_live_tip() {
+        let store = Store::open_in_memory().unwrap();
+        let deposed = project_session(&store);
+        appoint(&store, deposed);
+        let current = project_session(&store);
+        appoint(&store, current);
+        let bystander = project_session(&store);
+        let displaced_row = staged(&store, deposed, "k-displaced", false);
+        store
+            .update_session_status(current, rsi_common::SessionStatus::Archived)
+            .unwrap();
+
+        let wake = store
+            .settle_agent_deploy(
+                displaced_row.id,
+                DeployState::Failed,
+                Some("boom"),
+                Utc::now(),
+            )
+            .unwrap()
+            .expect("settled");
+        let job = wake_job(&store, wake);
+        assert!(!job.enabled);
+        assert!(
+            job.message.contains("Not delivered (#272)"),
+            "{}",
+            job.message
+        );
+
+        let bystander_row = staged(&store, bystander, "k-bystander", false);
+        let wake = store
+            .settle_agent_deploy(bystander_row.id, DeployState::Succeeded, None, Utc::now())
+            .unwrap()
+            .expect("settled");
+        let job = wake_job(&store, wake);
+        assert_eq!(job.wake_session_id, Some(bystander));
+        assert!(job.enabled);
+    }
+
     /// #1461: a request that does not interrupt workers keeps the fingerprint
     /// every earlier row was stored with; asking to interrupt is a different
     /// request, so a replay cannot flip the option.
@@ -784,7 +1386,8 @@ mod tests {
             store.agent_deploy_interrupt(asked.id).unwrap(),
             DeployInterrupt {
                 requested: true,
-                interrupted: Vec::new()
+                interrupted: Vec::new(),
+                cancelled_jobs: Vec::new(),
             }
         );
         assert_eq!(
@@ -886,7 +1489,8 @@ mod tests {
             store.agent_deploy_interrupt(row.id).unwrap(),
             DeployInterrupt {
                 requested: true,
-                interrupted: vec![a, b]
+                interrupted: vec![a, b],
+                cancelled_jobs: Vec::new(),
             }
         );
         store
@@ -945,6 +1549,55 @@ mod tests {
         );
     }
 
+    /// #2549: a topology node session the restart interrupted is named with its
+    /// execution and node, so the manager reads the outcome as that execution's
+    /// node being resumed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn the_settle_wake_names_the_topology_node_of_an_interrupted_worker() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = session(&store, "Running", None, "Task");
+        let row = staged(&store, owner, "topology-node", true);
+        let (node_session, plain) = (Uuid::new_v4(), Uuid::new_v4());
+        let execution = Uuid::new_v4();
+        store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO topology_node_attempts(id,execution_id,node_id,iteration,attempt_no,\
+                 node_kind,status,dedup_key,session_id,input_json,created_at,updated_at) \
+                 VALUES (?1,?2,'implement',0,1,'session','running','k',?3,'{}',?4,?4)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    execution.to_string(),
+                    node_session.to_string(),
+                    stamp(Utc::now())
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .mark_agent_deploy_restarting(row.id, Utc::now())
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_agent_deploy_interrupted(row.id, &[node_session, plain])
+                .unwrap()
+        );
+        store
+            .settle_agent_deploy(row.id, DeployState::Succeeded, None, Utc::now())
+            .unwrap();
+        let message = wake_message(&store, owner);
+        assert!(
+            message.contains(&format!(
+                "{node_session} [topology node implement of execution {execution}]"
+            )),
+            "{message}"
+        );
+        assert!(message.contains(&plain.to_string()), "{message}");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn a_settle_with_no_interrupted_workers_says_nothing_about_them() {
@@ -962,5 +1615,139 @@ mod tests {
             .unwrap();
         let message = wake_message(&store, owner);
         assert!(!message.contains("mid-turn"), "{message}");
+    }
+
+    /// #2701: many successful deploys of the current commit never push the
+    /// previous distinct commit out of the rollback window.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn recent_succeeded_shas_keep_the_previous_commit_after_many_redeploys() {
+        const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        let store = Store::open_in_memory().unwrap();
+        let owner = session(&store, "Running", None, "Task");
+        let base = Utc::now();
+        for n in 0..70_i64 {
+            let sha = if n == 0 { SHA } else { OTHER };
+            let at = base + Duration::seconds(n);
+            let row = store
+                .insert_agent_deploy(
+                    &NewDeploy {
+                        id: Uuid::new_v4(),
+                        owner_session_id: owner,
+                        idempotency_key: &format!("k{n}"),
+                        sha,
+                        fingerprint: deploy_fingerprint_with(sha, "x", 60, false),
+                        manifest: &[],
+                        max_wait_secs: 60,
+                        interrupt_workers: false,
+                    },
+                    at,
+                )
+                .unwrap();
+            store
+                .settle_agent_deploy(row.id, DeployState::Succeeded, None, at)
+                .unwrap()
+                .expect("settled");
+        }
+        assert_eq!(
+            store.recent_succeeded_deploy_shas(2).unwrap(),
+            vec![OTHER.to_string(), SHA.to_string()]
+        );
+        assert_eq!(
+            store.recent_succeeded_deploy_shas(1).unwrap(),
+            vec![OTHER.to_string()]
+        );
+    }
+
+    /// #2278: the settle wake names the test jobs the deploy stopped and
+    /// requeued, and says each owner's wake fires on the rerun.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn the_settle_wake_names_the_jobs_the_deploy_requeued() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = session(&store, "Running", None, "Task");
+        let row = staged(&store, owner, "requeue", true);
+        let job = Uuid::new_v4();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_jobs(id, owner_session_id, kind, params_json, cwd, \
+                 unit_name, log_path, status_path, state, created_at, row_version) \
+                 VALUES (?1,?2,'test','{}','/tmp','u','/tmp/l','/tmp/s','running',?3,1)",
+                params![job.to_string(), owner.to_string(), stamp(Utc::now())],
+            )
+            .unwrap();
+        assert!(store.requeue_agent_job_for_deploy(job, row.id).unwrap());
+        assert_eq!(
+            store.agent_deploy_interrupt(row.id).unwrap().cancelled_jobs,
+            [job]
+        );
+        store
+            .settle_agent_deploy(row.id, DeployState::TimedOut, None, Utc::now())
+            .unwrap();
+        let message = wake_message(&store, owner);
+        assert!(message.contains(&job.to_string()), "{message}");
+        assert!(message.contains("requeued"), "{message}");
+    }
+    /// #1572: the V180 rebuild gives every existing agent row its owner as
+    /// request identity and keeps every record.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn the_v180_rebuild_backfills_request_identity_from_the_owner_1572() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("deploys.sqlite");
+        let (done, live);
+        let owner;
+        {
+            let store = Store::open(&database).unwrap();
+            owner = session(&store, "Running", None, "Task");
+            done = staged(&store, owner, "settled", false);
+            store
+                .settle_agent_deploy(done.id, DeployState::Failed, Some("x"), Utc::now())
+                .unwrap();
+            live = staged(&store, owner, "live", true);
+            crate::store::tests::rewind_post_v121_tail_to(&store.conn, 179);
+            let rewound: bool = store
+                .conn
+                .query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM pragma_table_info('agent_deploys') \
+                     WHERE name='request_session_id')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(rewound);
+        }
+        let store = Store::open(&database).unwrap();
+        let identities: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT id, request_session_id FROM agent_deploys ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(identities.len(), 2);
+        for (id, identity) in identities {
+            assert!([done.id, live.id].contains(&Uuid::parse_str(&id).unwrap()));
+            assert_eq!(identity, owner.to_string());
+        }
+        assert_eq!(
+            store.get_agent_deploy(done.id).unwrap().unwrap().state,
+            DeployState::Failed
+        );
+        assert_eq!(
+            store.get_agent_deploy(live.id).unwrap().unwrap().state,
+            DeployState::Staged
+        );
+        // The request identity cannot be rewritten.
+        let error = store
+            .conn
+            .execute(
+                "UPDATE agent_deploys SET request_session_id=?2 WHERE id=?1",
+                params![live.id.to_string(), Uuid::new_v4().to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("request identity is immutable"));
     }
 }

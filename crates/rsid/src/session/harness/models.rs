@@ -14,6 +14,10 @@ fn harness_models_with(vault: &crate::vault::VaultHandle) -> Vec<(String, String
 
     if vault.resolvable(Slot::Inception) {
         models.push(("mercury-2".into(), "Mercury 2 (Inception Direct)".into()));
+        models.push((
+            "mercury-2.5".into(),
+            "Mercury 2.5 (Inception Direct)".into(),
+        ));
     }
 
     if vault.resolvable(Slot::Anthropic) {
@@ -42,6 +46,31 @@ fn harness_models_with(vault: &crate::vault::VaultHandle) -> Vec<(String, String
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// #2253: an Inception key lists both Mercury generations.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn harness_models_list_both_mercury_models_for_an_inception_key() {
+        let root = tempfile::tempdir().unwrap();
+        let vault =
+            crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+                .dir(root.path().join("vault"))
+                .env(|_| None)
+                .open()
+                .unwrap();
+        // Without a key only the local fallback is offered.
+        let ids = |models: &[(String, String)]| -> Vec<String> {
+            models.iter().map(|(id, _)| id.clone()).collect()
+        };
+        assert_eq!(ids(&harness_models_with(&vault)), ["local-model"]);
+        vault
+            .set(crate::vault::Slot::Inception, "inception-fake-key-for-menu")
+            .unwrap();
+        let models = harness_models_with(&vault);
+        assert_eq!(ids(&models), ["mercury-2", "mercury-2.5", "local-model"]);
+        assert_eq!(models[0].1, "Mercury 2 (Inception Direct)");
+        assert_eq!(models[1].1, "Mercury 2.5 (Inception Direct)");
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]

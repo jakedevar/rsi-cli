@@ -1739,15 +1739,12 @@ async fn foreign_refusal_never_settles_a_claimed_cap_request() -> anyhow::Result
     Ok(())
 }
 
-/// #1158: a coordinator cap rotation blocked on its failed, never-started
-/// successor (it holds the seat's sandbox custody) is finished by the
-/// operator's Continue: the exact reserved successor starts in a new thread,
-/// is published in this boot (Epic lead and global grant move to it), and the
-/// next cap passes settle the request on it without allocating another.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blocked_cap_rotation_settles_after_the_operator_continues_its_successor()
--> anyhow::Result<()> {
+async fn bound_cap_seat_before_restart() -> anyhow::Result<(
+    SessionManager,
+    tempfile::TempDir,
+    super::tests::SeatedParent,
+    Session,
+)> {
     let (manager, dir) = rotation_manager_with_context_rotation(true);
     manager
         .runtime_config
@@ -1792,6 +1789,29 @@ async fn blocked_cap_rotation_settles_after_the_operator_continues_its_successor
         "UPDATE sessions SET claude_session_id=NULL WHERE id=?1",
         [failed.id.to_string()],
     )?;
+    Ok((manager, dir, seat, failed))
+}
+
+/// #1158: a coordinator cap rotation blocked on its failed, never-started
+/// successor (it holds the seat's sandbox custody) is finished by the
+/// operator's Continue: the exact reserved successor starts in a new thread,
+/// is published in this boot (Epic lead and global grant move to it), and the
+/// next cap passes settle the request on it without allocating another.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_cap_rotation_settles_after_the_operator_continues_its_successor()
+-> anyhow::Result<()> {
+    let (manager, dir, seat, failed) = bound_cap_seat_before_restart().await?;
+    let parent = seat.fixture.parent.clone();
+    // A spawn was attempted but never acknowledged: absence of a provider id
+    // alone must not return custody. The existing operator Continue repairs it.
+    manager.store.lock().await.insert_rotation_event(
+        failed.id,
+        "ambiguous-launch",
+        "launch",
+        "provider_spawn_attempt",
+        Some("{}"),
+    )?;
     drop(manager); // the daemon dies after the bind, before the successor starts
 
     let restarted = restarted_under(&dir);
@@ -1828,5 +1848,243 @@ async fn blocked_cap_rotation_settles_after_the_operator_continues_its_successor
     );
     assert_eq!(successors_of(&store, parent.id), 1);
     assert_eq!(events_of(&store, parent.id, "completed"), 1);
+    Ok(())
+}
+
+/// A crash before any provider effect returns the exact reservation's custody
+/// to the original seat, atomically with refusing the cap request. Reopening the
+/// database must preserve both pointers, the new generation and one writer.
+/// #2043: the restored seat is re-armed and publishes a fresh cap successor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unstarted_cap_rotation_restores_custody_seat_and_grant_across_restarts()
+-> anyhow::Result<()> {
+    let (manager, dir, seat, failed) = bound_cap_seat_before_restart().await?;
+    let parent = seat.fixture.parent.id;
+    let generation = manager
+        .store
+        .lock()
+        .await
+        .live_custody_for_session(failed.id)?
+        .generation;
+    drop(manager);
+    for boot in 0..2 {
+        let restarted = restarted_under(&dir);
+        restarted.restore_sessions().await?;
+        if boot == 0 {
+            assert!(plan_now(&restarted, "restored-boot").await.is_empty());
+        }
+        assert_eq!(
+            cap_rotation(&*restarted.store.lock().await, parent)?
+                .expect("record")
+                .state,
+            CapState::Due
+        );
+        let store = restarted.store.lock().await;
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(parent), Some(parent))
+        );
+        let custody = store.live_custody_for_session(parent)?;
+        assert_eq!(custody.custody_id, seat.fixture.custody_id);
+        assert_eq!(custody.generation, generation + 1);
+        assert!(store.live_custody_for_session(failed.id).is_err());
+        let projection: (String, Option<String>) = store.conn.query_row(
+            "SELECT execution_state,effective_cwd FROM session_execution_projections WHERE session_id=?1",
+            [parent.to_string()], |row| Ok((row.get(0)?,row.get(1)?)),
+        )?;
+        assert_eq!(
+            projection,
+            (
+                "live_sandboxed".into(),
+                Some(seat.fixture.root.to_string_lossy().into_owned())
+            )
+        );
+        assert_eq!(
+            events_of(
+                &store,
+                parent,
+                "refused:successor_unstarted_custody_returned"
+            ),
+            1
+        );
+        assert!(store.latest_open_rotation_intent(parent)?.is_none());
+        assert_eq!(successors_of(&store, parent), 1);
+    }
+    let restarted = restarted_under(&dir);
+    restarted.restore_sessions().await?;
+    let successor = Uuid::new_v4();
+    install_rotation_child_id_for_test(parent, successor);
+    let _scripted = install_controller_candidate_test_process(successor);
+    assert_eq!(restarted.rotate_capped_coordinators().await?, 1);
+    wait_until("the re-armed cap successor to hold the seat", || async {
+        epic_lead(&restarted, seat.epic).await == Some(successor)
+    })
+    .await;
+    assert_eq!(
+        run_cap_passes(&restarted, process_boot_id(), parent, 1).await,
+        CapState::Rotated
+    );
+    let store = restarted.store.lock().await;
+    let record = cap_rotation(&store, parent)?.expect("record");
+    assert_eq!(record.successor, Some(successor));
+    assert_eq!(record.attempts, 2);
+    assert_eq!(
+        seat_holders(&store, seat.epic),
+        (Some(successor), Some(successor))
+    );
+    assert_eq!(
+        store.live_custody_for_session(successor)?.custody_id,
+        seat.fixture.custody_id
+    );
+    assert_eq!(successors_of(&store, parent), 2);
+    drop_controller_candidate_test_stream(successor);
+    Ok(())
+}
+
+/// A reserved successor that did settle live is published on restart instead
+/// of returning its custody. A second restart preserves that exact seat/grant.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_cap_successor_publishes_exact_seat_and_grant_across_restarts()
+-> anyhow::Result<()> {
+    let (manager, dir, seat, child) = bound_cap_seat_before_restart().await?;
+    let parent = seat.fixture.parent.id;
+    manager.store.lock().await.set_session_terminal_status(
+        child.id,
+        SessionStatus::Completed,
+        "completed",
+    )?;
+    drop(manager);
+    for _ in 0..2 {
+        let restarted = restarted_under(&dir);
+        restarted.restore_sessions().await?;
+        assert_eq!(
+            run_cap_passes(&restarted, "published-boot", parent, 2).await,
+            CapState::Rotated
+        );
+        let store = restarted.store.lock().await;
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(child.id), Some(child.id))
+        );
+        assert_eq!(
+            store.live_custody_for_session(child.id)?.custody_id,
+            seat.fixture.custody_id
+        );
+        assert!(store.live_custody_for_session(parent).is_err());
+        assert_eq!(
+            store.find_published_rotation_successor(parent)?,
+            Some(child.id)
+        );
+        assert_eq!(successors_of(&store, parent), 1);
+        assert_eq!(events_of(&store, parent, "completed"), 1);
+    }
+    Ok(())
+}
+
+/// Returning custody and refusing the intent are one commit. A failed receipt
+/// write must leave the failed successor as the only owner; restart retries it.
+/// #2042: the failed return still exposes the blocked Continue/abandon controls.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cap_custody_return_rolls_back_when_its_receipt_cannot_commit() -> anyhow::Result<()> {
+    let (manager, dir, seat, child) = bound_cap_seat_before_restart().await?;
+    let parent = seat.fixture.parent.id;
+    manager.store.lock().await.conn.execute_batch(
+        "CREATE TRIGGER reject_cap_return BEFORE INSERT ON rotation_events
+         WHEN NEW.event_type='refused:successor_unstarted_custody_returned'
+         BEGIN SELECT RAISE(ABORT,'injected return receipt failure'); END;",
+    )?;
+    drop(manager);
+    let restarted = restarted_under(&dir);
+    let mut events = restarted.event_bus.subscribe();
+    restarted.restore_sessions().await?;
+    {
+        let store = restarted.store.lock().await;
+        assert_eq!(
+            store.live_custody_for_session(child.id)?.custody_id,
+            seat.fixture.custody_id
+        );
+        assert!(store.live_custody_for_session(parent).is_err());
+        assert!(store.latest_open_rotation_intent(parent)?.is_some());
+        let blocked = store
+            .blocked_rotation_of(parent)?
+            .expect("blocked rotation");
+        assert_eq!(blocked.successor, child.id);
+        assert_eq!(
+            store.blocked_rotation_of_successor(child.id)?,
+            Some(blocked)
+        );
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(parent), Some(parent))
+        );
+        store.conn.execute_batch("DROP TRIGGER reject_cap_return")?;
+    }
+    let mut messages = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let crate::bus::DaemonEvent::SystemMessage { level, message } = &*event {
+            if level == "error" && message.contains("stopped after its sandbox moved") {
+                messages.push(message.clone());
+            }
+        }
+    }
+    assert_eq!(messages.len(), 1, "one blocked-rotation notice");
+    assert!(messages[0].contains(&format!("Continue {}", child.id)));
+    assert!(messages[0].contains(":rotation-abandon [provider[/model]]"));
+    drop(restarted);
+    let recovered = restarted_under(&dir);
+    recovered.restore_sessions().await?;
+    assert_eq!(
+        recovered
+            .store
+            .lock()
+            .await
+            .live_custody_for_session(parent)?
+            .custody_id,
+        seat.fixture.custody_id
+    );
+    Ok(())
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cap_custody_return_refuses_live_effects_and_changed_reservations() -> anyhow::Result<()> {
+    for changed_reservation in [false, true] {
+        let (manager, _dir, seat, child) = bound_cap_seat_before_restart().await?;
+        let parent = seat.fixture.parent.id;
+        let guards = crate::session::RotationPublicationGuards::acquire(parent, child.id).await;
+        let mut store = manager.store.lock().await;
+        store.set_session_terminal_status(child.id, SessionStatus::Failed, "crash")?;
+        let rotation_id = store
+            .latest_open_rotation_intent(parent)?
+            .expect("intent")
+            .rotation_id;
+        if changed_reservation {
+            store.insert_rotation_event(
+                parent,
+                &rotation_id,
+                "reserved",
+                "successor_reserved",
+                Some(&serde_json::json!({"successor_id": Uuid::new_v4()}).to_string()),
+            )?;
+        } else {
+            store.conn.execute(
+                "UPDATE sandbox_custody_roots SET active_effects=1,effect_boot_id=?2 WHERE custody_id=?1",
+                [seat.fixture.custody_id.to_string(), Uuid::new_v4().to_string()],
+            )?;
+        }
+        assert!(!store.restore_unstarted_cap_rotation_holding(&guards, &rotation_id, None)?);
+        assert_eq!(
+            store.live_custody_for_session(child.id)?.custody_id,
+            seat.fixture.custody_id
+        );
+        assert!(store.latest_open_rotation_intent(parent)?.is_some());
+        assert_eq!(
+            seat_holders(&store, seat.epic),
+            (Some(parent), Some(parent))
+        );
+    }
     Ok(())
 }

@@ -26,6 +26,36 @@ use uuid::Uuid;
 
 pub(crate) const MAX_OWNING_EPIC_HIERARCHY_DEPTH: usize = 64;
 
+/// The `updated_at` one Store session-metadata write replaced and the one it
+/// stored (#257).
+///
+/// The daemon keeps a runtime copy of every terminal session (`completed`),
+/// and source-worktree settlement only admits a root whose runtime copy agrees
+/// with the stored row on `updated_at`. A metadata writer that stamps the row
+/// returns this so the caller can advance the runtime copy to exactly the
+/// stamp it wrote, and only when that copy agreed with the value replaced: a
+/// write never hides an earlier Store change the runtime copy did not see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionWriteStamp {
+    /// The row's `updated_at` just before this write, read in the same
+    /// immediate transaction. `None` when the stored value is absent or does
+    /// not parse as RFC 3339.
+    pub previous_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `updated_at` this write stored.
+    pub stamped_at: chrono::DateTime<chrono::Utc>,
+    /// Store commit order (#265, hub #2818): allocated inside the write's
+    /// immediate transaction, so a larger value committed later whatever the
+    /// wall clock read. In-process only; never 0.
+    pub write_seq: u64,
+    /// The `write_seq` of the first write of the unbroken run of stamped
+    /// writes this one ends: each write of the run replaced exactly the value
+    /// the one before it stored, so no other Store write moved the row's
+    /// `updated_at` in between (#265).
+    pub run_seq: u64,
+    /// The `updated_at` the row held before that run's first write.
+    pub run_base: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Shared historical restore gate. Call through the current transaction so
 /// settlement and custody checks remain atomic with the status transition.
 pub(super) fn historical_session_restore_blocked_on(conn: &Connection, id: Uuid) -> Result<bool> {
@@ -111,6 +141,18 @@ const CODEGRAPH_READ_FENCE_MAX_ROWS: usize = 65_536;
 const CODEGRAPH_READ_FENCE_MAX_TIME: Duration = Duration::from_secs(30);
 pub(crate) type CodegraphCustodyRow = (Uuid, Uuid, PathBuf, PathBuf, i64);
 
+#[cfg(any(test, feature = "test-seam"))]
+thread_local! {
+    static CODEGRAPH_DIGEST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Registry digests this thread has computed (#306): lets a traversal test
+/// prove a full custody walk pays O(1) digests, not one per page.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn codegraph_registry_digest_count() -> usize {
+    CODEGRAPH_DIGEST_COUNT.with(std::cell::Cell::get)
+}
+
 pub struct CodegraphReadFence {
     local_changes: i64,
     external_version: i64,
@@ -118,6 +160,47 @@ pub struct CodegraphReadFence {
 }
 
 impl Store {
+    /// Run one session-row UPDATE that stamps `updated_at` with the text it is
+    /// given, and return its [`SessionWriteStamp`]; `None` when it changed no
+    /// row (#257). The prior value is read in the same immediate transaction,
+    /// so no other write can land between the read and the UPDATE, and the
+    /// write's `write_seq` and run are assigned there too, before the commit
+    /// (#265): assignment order is commit order.
+    pub(super) fn stamped_session_write(
+        &self,
+        session_id: Uuid,
+        field: super::SessionWriteField,
+        write: impl FnOnce(&Connection, &str) -> rusqlite::Result<usize>,
+    ) -> Result<Option<SessionWriteStamp>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT updated_at FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let stamped_at = super::session_write_order::session_write_clock(session_id);
+        let changed = write(&tx, &stamped_at.to_rfc3339())?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let previous_updated_at = previous
+            .as_deref()
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc));
+        let ordered = super::session_write_order::OrderedSessionWrite::begin(
+            session_id,
+            field,
+            previous_updated_at,
+            stamped_at,
+        );
+        tx.commit()?;
+        Ok(Some(ordered.committed()))
+    }
+
     fn codegraph_change_counters(&self) -> Result<(i64, i64)> {
         let local_changes = self
             .conn
@@ -131,6 +214,8 @@ impl Store {
     /// Hash only the Store fields that authorize Codegraph project and custody
     /// reads. Session events and accounting do not revoke a dormant read.
     fn codegraph_registry_digest(&self) -> Result<blake3::Hash> {
+        #[cfg(any(test, feature = "test-seam"))]
+        CODEGRAPH_DIGEST_COUNT.with(|count| count.set(count.get() + 1));
         let mut hasher = blake3::Hasher::new();
         let started = Instant::now();
         let mut scanned = 0usize;
@@ -197,6 +282,11 @@ impl Store {
         ))
     }
 
+    /// Re-check the fence. A traversal checks it once after its last page, not
+    /// before each page: the digest covers every authorization field, so a
+    /// change anywhere between the fence and that check is refused and no
+    /// mixed registry is accepted, while an unrelated write between two pages
+    /// no longer costs a full digest under the Store lock per page (#306).
     pub fn codegraph_read_fence_matches(&self, fence: &mut CodegraphReadFence) -> Result<bool> {
         self.codegraph_read_fence_matches_with(fence, Self::codegraph_registry_digest)
     }
@@ -517,6 +607,20 @@ impl Store {
         caller_session_id: Uuid,
         target_session_id: Uuid,
     ) -> Result<bool> {
+        self.wake_origin_matches_target(Some(caller_session_id), target_session_id)
+    }
+
+    /// Whether this exact rotation lineage was created by a fresh wake.
+    /// Admission uses the same validated, retained provenance as authority.
+    pub fn session_has_wake_origin(&self, target_session_id: Uuid) -> Result<bool> {
+        self.wake_origin_matches_target(None, target_session_id)
+    }
+
+    fn wake_origin_matches_target(
+        &self,
+        caller_session_id: Option<Uuid>,
+        target_session_id: Uuid,
+    ) -> Result<bool> {
         let mut parent_of = self
             .conn
             .prepare("SELECT continued_from FROM sessions WHERE id = ?1")?;
@@ -537,9 +641,10 @@ impl Store {
         }
         let mut owned = self.conn.prepare(
             "SELECT EXISTS(SELECT 1 FROM session_wake_origins
-                            WHERE session_id = ?1 AND origin_session_id = ?2)",
+                            WHERE session_id = ?1
+                              AND (?2 IS NULL OR origin_session_id = ?2))",
         )?;
-        let caller = caller_session_id.to_string();
+        let caller = caller_session_id.map(|id| id.to_string());
         for id in &lineage {
             if owned.query_row(params![id, caller], |row| row.get::<_, bool>(0))? {
                 return Ok(true);
@@ -705,7 +810,7 @@ impl Store {
 /// column added after it is nullable or carries a DEFAULT, so this insert is
 /// valid at every schema version from the base forward — which means the *next*
 /// `sessions` migration needs to touch none of these fixtures.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(super) fn insert_legacy_session_on(connection: &Connection, session: &Session) -> Result<()> {
     connection.execute(
         "INSERT INTO sessions (id, claude_session_id, provider, query, working_dir,
@@ -888,7 +993,7 @@ pub(super) fn insert_session_on(connection: &Connection, session: &Session) -> R
 
 /// Frozen pre-V99 Session row shape for migration fixtures. Production writes
 /// always use [`insert_session_on`] and therefore refuse a stale catalog.
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(super) fn insert_pre_v99_session_on(connection: &Connection, session: &Session) -> Result<()> {
     let pending_question_json = session
         .pending_question
@@ -1281,6 +1386,26 @@ impl Store {
         Ok(())
     }
 
+    /// The monitor's start-of-turn `Running` write (#277). It reaches the row
+    /// through the batched persistence queue, so it can land after a writer
+    /// that went straight to the Store has ended the session. A terminal
+    /// (`Completed`, `Failed`, `Interrupted`) or retired (`Archived`,
+    /// `Deleted`) row keeps its status: only a new turn moves it back, and every
+    /// new turn (launch, continue, rotation) first writes `Starting` through the
+    /// same queue. Returns whether the row became `Running`.
+    pub fn mark_session_running_unless_ended(&self, id: Uuid) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET status = 'Running', updated_at = ?1
+             WHERE id = ?2
+               AND status NOT IN ('Completed','Failed','Interrupted','Archived','Deleted')",
+            params![
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                id.to_string(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Terminal status plus its normalized cause in one statement (#588).
     /// `status` must be terminal and `cause` non-empty; both are refused
     /// otherwise, so a new terminal writer cannot forget the cause.
@@ -1471,16 +1596,21 @@ impl Store {
 
     /// Update a session's user rating (1–10 scale). None clears the rating.
     /// Rating-range validation is the caller's responsibility.
-    pub fn update_session_rating(&self, session_id: Uuid, rating: Option<i16>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET rating = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                rating.map(|v| v as i64),
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    pub fn update_session_rating(
+        &self,
+        session_id: Uuid,
+        rating: Option<i16>,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Rating,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET rating = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![rating.map(|v| v as i64), stamped_at, session_id.to_string()],
+                )
+            },
+        )
     }
 
     /// Compare-and-swap the persisted model/window/evidence tuple.
@@ -1629,10 +1759,52 @@ impl Store {
         Ok(ids)
     }
 
+    /// The newest session whose sandbox is on `branch` (#2055: an operator
+    /// landing names a branch, the queue needs the session that owns it).
+    pub fn find_session_by_sandbox_branch(&self, branch: &str) -> Result<Option<Session>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions WHERE sandbox_branch = ?1 \
+                 ORDER BY created_at DESC, id LIMIT 1",
+                params![branch],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id.and_then(|id| Uuid::parse_str(&id).ok()) {
+            Some(id) => self.get_session(id),
+            None => Ok(None),
+        }
+    }
+
+    /// `AgentGetStatus` and the other read verbs (#2312): the id of every
+    /// session whose id starts with `hex_prefix` (the id's lowercase hex digits
+    /// without hyphens), at most `limit`, in id order. The caller has validated
+    /// the prefix as hex and applies the caller's scope to the result.
+    pub fn session_ids_by_id_prefix(&self, hex_prefix: &str, limit: usize) -> Result<Vec<Uuid>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM sessions \
+             WHERE substr(replace(id, '-', ''), 1, length(?1)) = ?1 \
+             ORDER BY id LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![hex_prefix, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .collect())
+    }
+
     /// Get a single session by ID.
     /// Populates `short_summary` from the session_summaries table.
     pub fn get_session(&self, id: Uuid) -> Result<Option<Session>> {
-        let mut stmt = self.conn.prepare(&format!(
+        // Cached: startup custody classification loads a session per
+        // participant, and re-parsing this wide select each time cost more
+        // than the lookup itself (#2354).
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"
         ))?;
 
@@ -1716,6 +1888,31 @@ impl Store {
         if !super::sandbox_custody::prepare_session_execution_projection_for_purge(&tx, id)? {
             return Ok(());
         }
+        // #2384: a session whose chunk was only staged still has every row live;
+        // its index row points at a copy in the append-only archive, which stays.
+        // A session whose rows moved cannot be purged (the archive is not purged).
+        let cold_state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM cold_archive_sessions WHERE session_id = ?1",
+                [&id_str],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match cold_state.as_deref() {
+            None => {}
+            Some("staged" | "restored") => {
+                tx.execute(
+                    "DELETE FROM cold_archive_sessions WHERE session_id = ?1",
+                    params![&id_str],
+                )?;
+            }
+            Some(_) => {
+                return Err(DaemonError::InvalidParam(
+                    "session_cold_archived: the session's rows are in cold storage; restore it before a permanent purge"
+                        .into(),
+                ));
+            }
+        }
         tx.execute(
             "DELETE FROM model_segments WHERE session_id = ?1",
             params![&id_str],
@@ -1753,6 +1950,8 @@ impl Store {
         }
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])?;
         tx.commit()?;
+        // The row is gone for good: reclaim its write-order record (#2876).
+        super::session_write_order::retire_session_writes(id);
         Ok(())
     }
 
@@ -1813,23 +2012,17 @@ impl Store {
             return Ok(());
         }
 
-        // Build `?,?,?` placeholder list.
-        let ids: Vec<String> = sessions.iter().map(|s| s.id.to_string()).collect();
-        let placeholders: String = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "SELECT session_id, tag FROM session_tags WHERE session_id IN ({}) ORDER BY session_id, tag ASC",
-            placeholders
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        // One JSON array parameter keeps the statement text constant, so it is
+        // prepared once for any batch size (#2494: a list of every session
+        // used to build and parse an N-placeholder statement per call, and
+        // could exceed SQLite's variable limit).
+        let ids = serde_json::to_string(&sessions.iter().map(|s| s.id).collect::<Vec<_>>())?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT session_id, tag FROM session_tags
+             WHERE session_id IN (SELECT value FROM json_each(?1))
+             ORDER BY session_id, tag ASC",
+        )?;
+        let params_refs: [&dyn rusqlite::ToSql; 1] = [&ids];
 
         let mut map: HashMap<Uuid, Vec<String>> = HashMap::new();
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
@@ -1857,16 +2050,25 @@ impl Store {
     }
 
     /// Update a session's project_id.
-    pub fn update_session_project(&self, session_id: Uuid, project_id: Option<Uuid>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                project_id.map(|id| id.to_string()),
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    pub fn update_session_project(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Project,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        project_id.map(|id| id.to_string()),
+                        stamped_at,
+                        session_id.to_string(),
+                    ],
+                )
+            },
+        )
     }
 
     /// Stamp a fired scheduled job ID onto an existing session row.
@@ -1894,16 +2096,21 @@ impl Store {
     /// means to set the session's identity unconditionally.
     /// Generated-title enrichment must use [`Self::fill_session_title_if_absent`]
     /// instead so it cannot overwrite a title the operator chose.
-    pub fn update_session_title(&self, session_id: Uuid, title: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                title,
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    pub fn update_session_title(
+        &self,
+        session_id: Uuid,
+        title: &str,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Title,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![title, stamped_at, session_id.to_string()],
+                )
+            },
+        )
     }
 
     /// Fill a session's title only while it is still absent.
@@ -1922,20 +2129,34 @@ impl Store {
     /// session already had one or is being succeeded. A missing session is an error rather than a
     /// silent no-op so lost enrichment is visible.
     pub fn fill_session_title_if_absent(&self, session_id: Uuid, title: &str) -> Result<bool> {
-        let updated = self.conn.execute(
-            "UPDATE sessions SET title = ?1, updated_at = ?2
-             WHERE id = ?3 AND (title IS NULL OR trim(title) = '')
-               AND NOT EXISTS(SELECT 1 FROM manager_root_successions
-                 WHERE predecessor_session_id = ?3
-                   AND state IN ('reserved','executing','established','cleanup_required'))",
-            params![
-                title,
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
+        Ok(self
+            .fill_session_title_if_absent_stamped(session_id, title)?
+            .is_some())
+    }
+
+    /// [`Self::fill_session_title_if_absent`], returning the write's
+    /// [`SessionWriteStamp`] when this call supplied the title (#257).
+    pub fn fill_session_title_if_absent_stamped(
+        &self,
+        session_id: Uuid,
+        title: &str,
+    ) -> Result<Option<SessionWriteStamp>> {
+        let stamp = self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Title,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET title = ?1, updated_at = ?2
+                 WHERE id = ?3 AND (title IS NULL OR trim(title) = '')
+                   AND NOT EXISTS(SELECT 1 FROM manager_root_successions
+                     WHERE predecessor_session_id = ?3
+                       AND state IN ('reserved','executing','established','cleanup_required'))",
+                    params![title, stamped_at, session_id.to_string()],
+                )
+            },
         )?;
-        if updated > 0 {
-            return Ok(true);
+        if stamp.is_some() {
+            return Ok(stamp);
         }
         let exists: Option<()> = self
             .conn
@@ -1948,20 +2169,25 @@ impl Store {
         if exists.is_none() {
             return Err(DaemonError::SessionNotFound(session_id));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Update a session's description.
-    pub fn update_session_description(&self, session_id: Uuid, description: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET description = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                description,
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    pub fn update_session_description(
+        &self,
+        session_id: Uuid,
+        description: &str,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Description,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET description = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![description, stamped_at, session_id.to_string()],
+                )
+            },
+        )
     }
 
     /// Update a session's active task context.
@@ -1969,16 +2195,17 @@ impl Store {
         &self,
         session_id: Uuid,
         active_task: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET active_task = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                active_task,
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::ActiveTask,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET active_task = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![active_task, stamped_at, session_id.to_string()],
+                )
+            },
+        )
     }
 
     /// Load archived sessions from the preceding seven days, optionally filtered by project_id.
@@ -2087,15 +2314,72 @@ impl Store {
     }
 
     /// Update a session's label assignment (column `group_id` preserved).
-    pub fn update_session_label(&self, session_id: Uuid, group_id: Option<Uuid>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET group_id = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                group_id.map(|id| id.to_string()),
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
+    pub fn update_session_label(
+        &self,
+        session_id: Uuid,
+        group_id: Option<Uuid>,
+    ) -> Result<Option<SessionWriteStamp>> {
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Label,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET group_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        group_id.map(|id| id.to_string()),
+                        stamped_at,
+                        session_id.to_string(),
+                    ],
+                )
+            },
+        )
+    }
+
+    /// #2791: whether `session_id` is (or was) the session of a topology node
+    /// attempt. A node worker is bound to its execution, so it is never an
+    /// Epic's lead: the coordinator context cap would otherwise rotate it.
+    pub fn is_topology_node_session(&self, session_id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM topology_node_attempts WHERE session_id=?1)",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// #2804/#2805: whether `session_id` is a worker that may never be an
+    /// Epic's lead: a topology node session or an Issue-bound worker, either
+    /// itself or anywhere up its `continued_from` rotation lineage (a rotation
+    /// child inherits what its predecessor was). Walked with visited-node
+    /// detection, so a lineage cycle ends the walk instead of spinning.
+    pub fn is_non_lead_worker_session(&self, session_id: Uuid) -> Result<bool> {
+        let mut parent_of = self
+            .conn
+            .prepare("SELECT continued_from FROM sessions WHERE id = ?1")?;
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Some(session_id);
+        while let Some(id) = next {
+            if !seen.insert(id) {
+                break;
+            }
+            if self.is_topology_node_session(id)?
+                || Self::bound_issue_for_worker_on(&self.conn, id)?.is_some()
+            {
+                return Ok(true);
+            }
+            let parent: Option<Option<String>> = parent_of
+                .query_row([id.to_string()], |row| row.get::<_, Option<String>>(0))
+                .optional()?;
+            next = parent.flatten().and_then(|raw| Uuid::parse_str(&raw).ok());
+        }
+        Ok(false)
+    }
+
+    fn reject_non_lead_worker(&self, lead: Uuid) -> Result<()> {
+        if self.is_non_lead_worker_session(lead)? {
+            return Err(crate::error::DaemonError::PolicyDenied(format!(
+                "worker_session_cannot_lead:{lead}"
+            )));
+        }
         Ok(())
     }
 
@@ -2103,6 +2387,9 @@ impl Store {
     /// concurrent assignments via the WHERE clause when assigning.
     pub fn set_lead_session(&self, container_id: Uuid, lead: Option<Uuid>) -> Result<()> {
         self.reject_nonterminal_agent_successor_epic_lead_mutation(container_id)?;
+        if let Some(lead) = lead {
+            self.reject_non_lead_worker(lead)?;
+        }
         self.conn.execute(
             "UPDATE sessions SET lead_session_id = ?1, updated_at = ?2 WHERE id = ?3",
             params![
@@ -2148,6 +2435,9 @@ impl Store {
     /// caller had already won.
     pub fn try_promote_lead_if_unset(&self, container_id: Uuid, candidate: Uuid) -> Result<bool> {
         self.reject_nonterminal_agent_successor_epic_lead_mutation(container_id)?;
+        if self.is_non_lead_worker_session(candidate)? {
+            return Ok(false);
+        }
         let n = self.conn.execute(
             "UPDATE sessions SET lead_session_id = ?1, updated_at = ?2 \
              WHERE id = ?3 AND lead_session_id IS NULL",
@@ -2271,6 +2561,40 @@ impl Store {
         rotation_id: &str,
         metadata: &str,
     ) -> Result<super::rotation_abandon::RotationPublication> {
+        self.publish_rotation_successor_inner(guards, rotation_id, metadata, None)
+    }
+
+    /// [`Self::publish_rotation_successor_with_chain`] for a successor that is
+    /// the Idea-controller candidate of a live reservation (#1186). `assign`
+    /// runs inside the publication transaction, so the controller assignment,
+    /// the Epic lead pointer and the global grant commit together; if either
+    /// the assignment or the publication refuses, nothing is committed and the
+    /// predecessor keeps the controller, its epoch and the lead.
+    ///
+    /// # Errors
+    /// As [`Self::publish_rotation_successor_with_chain`], and whatever
+    /// `assign` returns.
+    pub(crate) fn publish_rotation_successor_assigning_controller(
+        &self,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
+        rotation_id: &str,
+        metadata: &str,
+        assign: &dyn Fn(
+            &Transaction<'_>,
+        ) -> Result<super::rotation_abandon::RotationControllerMove>,
+    ) -> Result<super::rotation_abandon::RotationPublication> {
+        self.publish_rotation_successor_inner(guards, rotation_id, metadata, Some(assign))
+    }
+
+    fn publish_rotation_successor_inner(
+        &self,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
+        rotation_id: &str,
+        metadata: &str,
+        assign: Option<
+            &dyn Fn(&Transaction<'_>) -> Result<super::rotation_abandon::RotationControllerMove>,
+        >,
+    ) -> Result<super::rotation_abandon::RotationPublication> {
         let predecessor = guards.predecessor();
         let successor = guards.successor();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -2381,6 +2705,31 @@ impl Store {
         // #1142 F3: the global manager grant follows the seat in the same
         // commit as the publication (a no-op unless the predecessor holds it).
         self.transfer_seat_node_in_tx(predecessor, successor)?;
+        // #1186: the Idea controller follows the seat in the same commit. A
+        // live rotation assigns its reserved candidate here (`assign`); a
+        // recovered, continued or abandoned rotation never reserved one, so
+        // the controller is still on a rotated-away holder and moves by the
+        // typed rotation transfer. Either way nothing is committed unless the
+        // publication is.
+        let mut controller_moves = Vec::new();
+        if let Some(assign) = assign {
+            controller_moves.push(assign(&tx)?);
+        }
+        for holder in &lead_holders {
+            if let Some(moved) = self.transfer_assigned_idea_controller_for_rotation_on(
+                &tx,
+                *holder,
+                successor,
+                rotation_id,
+            )? {
+                controller_moves.push(moved);
+            }
+        }
+        if controller_moves.len() > 1 {
+            return Err(DaemonError::PolicyDenied(format!(
+                "rotation_controller_ambiguous:{predecessor}:{rotation_id}"
+            )));
+        }
         tx.execute(
             "INSERT INTO rotation_events (session_id, rotation_id, phase, event_type, metadata, created_at)
              VALUES (?1, ?2, 'completed', 'completed', ?3, ?4)",
@@ -2404,6 +2753,7 @@ impl Store {
         Ok(super::rotation_abandon::RotationPublication {
             epics: affected,
             archived,
+            controller_moves,
         })
     }
 
@@ -2474,18 +2824,28 @@ impl Store {
     /// Reparent a session in the hierarchy (Group/Epic organizational tree).
     /// `new_parent = None` means "move to top-level". Callers should validate
     /// containment legality and cycle-freeness before calling this; this fn
-    /// performs the raw write only.
-    pub fn update_session_parent(&self, session_id: Uuid, new_parent: Option<Uuid>) -> Result<()> {
+    /// performs the raw write only. Returns the write's [`SessionWriteStamp`] so
+    /// a terminal session's runtime copy can mirror it (#258).
+    pub fn update_session_parent(
+        &self,
+        session_id: Uuid,
+        new_parent: Option<Uuid>,
+    ) -> Result<Option<SessionWriteStamp>> {
         self.reject_nonterminal_agent_successor_candidate_topology_mutation(session_id)?;
-        self.conn.execute(
-            "UPDATE sessions SET parent_id = ?1, updated_at = ?2 WHERE id = ?3",
-            params![
-                new_parent.map(|id| id.to_string()),
-                chrono::Utc::now().to_rfc3339(),
-                session_id.to_string(),
-            ],
-        )?;
-        Ok(())
+        self.stamped_session_write(
+            session_id,
+            super::SessionWriteField::Parent,
+            |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET parent_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        new_parent.map(|id| id.to_string()),
+                        stamped_at,
+                        session_id.to_string(),
+                    ],
+                )
+            },
+        )
     }
 
     /// List direct children of a hierarchy parent. `None` returns top-level
@@ -2674,31 +3034,42 @@ impl Store {
     /// original `pinned_at` also preserves pin ordering, which is what makes
     /// the pinned set readable as a succession line.
     pub fn pin_session_if_unpinned(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(self.pin_session_if_unpinned_stamped(id)?.0)
+    }
+
+    /// [`Self::pin_session_if_unpinned`] that also returns the write's
+    /// [`SessionWriteStamp`] (`None` when the session was already pinned), so a
+    /// terminal lead's runtime copy can mirror the `updated_at` the pin
+    /// stamped (#258).
+    pub fn pin_session_if_unpinned_stamped(
+        &self,
+        id: Uuid,
+    ) -> Result<(Option<String>, Option<SessionWriteStamp>)> {
         let id_str = id.to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        let rows = self.conn.execute(
-            "UPDATE sessions SET pinned_at = ?1, updated_at = ?2 \
-             WHERE id = ?3 AND pinned_at IS NULL",
-            params![&now, &now, &id_str],
-        )?;
-        if rows == 0 {
-            // Either already pinned or no such row; the read-back distinguishes.
-            let existing: Option<Option<String>> = self
-                .conn
-                .query_row(
-                    "SELECT pinned_at FROM sessions WHERE id = ?1",
-                    params![&id_str],
-                    |row| row.get(0),
+        let stamp =
+            self.stamped_session_write(id, super::SessionWriteField::Pin, |conn, stamped_at| {
+                conn.execute(
+                    "UPDATE sessions SET pinned_at = ?1, updated_at = ?1 \
+                 WHERE id = ?2 AND pinned_at IS NULL",
+                    params![stamped_at, &id_str],
                 )
-                .optional()?;
-            return match existing {
-                Some(pinned_at) => Ok(pinned_at),
-                None => Err(DaemonError::Store("session not found".to_string())),
-            };
+            })?;
+        if let Some(stamp) = stamp {
+            return Ok((Some(stamp.stamped_at.to_rfc3339()), Some(stamp)));
         }
-
-        Ok(Some(now))
+        // Either already pinned or no such row; the read-back distinguishes.
+        let existing: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT pinned_at FROM sessions WHERE id = ?1",
+                params![&id_str],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(pinned_at) => Ok((pinned_at, None)),
+            None => Err(DaemonError::Store("session not found".to_string())),
+        }
     }
 
     /// Toggle pin state. Returns the new pinned_at value.
@@ -3248,7 +3619,7 @@ mod active_session_inventory_tests {
     fn codegraph_read_fence_retries_change_during_digest_before_accepting() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("rsi.db");
-        let store = Store::open(&database).unwrap();
+        let store = Store::open_test_fixture(&database).unwrap();
         let external = rusqlite::Connection::open(&database).unwrap();
         let project_id = Uuid::new_v4();
         let first_root = tempfile::tempdir().unwrap();
@@ -3436,7 +3807,7 @@ mod active_session_inventory_tests {
     fn startup_process_authorization_enforces_remaining_deadline_under_database_lock() {
         let directory = tempfile::tempdir().expect("create Store directory");
         let database = directory.path().join("ownership-deadline.db");
-        let store = Store::open(&database).expect("open startup Store");
+        let store = Store::open_test_fixture(&database).expect("open startup Store");
         let mut session = make_test_session();
         session.status = SessionStatus::Completed;
         store

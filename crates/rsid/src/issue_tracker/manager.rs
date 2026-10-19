@@ -136,6 +136,7 @@ impl IssueTrackerManager {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        this.event_bus.record_lagged(missed);
                         tracing::warn!(
                             missed,
                             "issue tracker completion listener lagged on the event bus; \

@@ -2,7 +2,7 @@
 //! admission, runtime guards, event persistence, custody and restart hydration.
 use super::*;
 use crate::session::launch;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -224,22 +224,6 @@ async fn wait_terminal(p: &Pilot, id: Uuid, status: SessionStatus) {
     .await
     .unwrap();
 }
-async fn finish_turn(p: &Pilot, id: Uuid, process: &launch::ControllerCandidateTestProcess) {
-    launch::send_controller_candidate_test_event(
-        id,
-        crate::claude::StreamEvent {
-            event_type: "system".into(),
-            data: json!({"subtype":"init","session_id":format!("intent-provider-{id}")}),
-        },
-    )
-    .await;
-    launch::send_controller_candidate_test_event(id, crate::claude::StreamEvent {
-        event_type: "result".into(), data: json!({"subtype":"success", "is_error":false,"result":"ordinary completed turn", "duration_ms":1,"num_turns":1,"total_cost_usd":0.0}),
-    }).await;
-    process.alive.store(false, Ordering::SeqCst);
-    launch::drop_controller_candidate_test_stream(id);
-    wait_terminal(p, id, SessionStatus::Completed).await;
-}
 async fn stop(p: &Pilot, id: Uuid) {
     crate::session::lifecycle::interrupt_active_in_maps(&p.manager.active, id)
         .await
@@ -250,7 +234,7 @@ async fn stop(p: &Pilot, id: Uuid) {
 pub(super) async fn restart(p: &mut Pilot) {
     assert!(p.manager.active.read().await.is_empty());
     assert_eq!(p.manager.persistence.pending.load(Ordering::SeqCst), 0);
-    let store = Store::open(&p._dir.path().join("rsi.db")).unwrap();
+    let store = Store::open_test_fixture(&p._dir.path().join("rsi.db")).unwrap();
     let replacement = SessionManager::new(
         std::sync::Arc::new(EventBus::new(16)),
         store,
@@ -415,6 +399,464 @@ async fn manager_intent_nonempty_launch_allowlist_admits_recovery() {
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn intent_wake(p: &Pilot, mode: &str) -> Uuid {
+    use crate::session::harness::tools::schedule_wake::{
+        ScheduleWakeRequest, WakeWhenRequest, build_agent_scheduled_job, build_wake_when_job,
+    };
+    use rsi_common::wake_predicate::WakePredicate;
+
+    let predicate = match mode {
+        "jobs_terminal" => Some(WakePredicate {
+            jobs_terminal: Some(vec![Uuid::new_v4()]),
+            ..Default::default()
+        }),
+        "topology_execution_settled" => Some(WakePredicate {
+            topology_execution_settled: Some(Uuid::new_v4()),
+            ..Default::default()
+        }),
+        "sha_on_rolling" => Some(WakePredicate {
+            sha_on_rolling: Some("a".repeat(40)),
+            ..Default::default()
+        }),
+        _ => None,
+    };
+    let (job, when) = if let Some(predicate) = predicate {
+        let (job, when) = build_wake_when_job(WakeWhenRequest {
+            message: "Continue the Epic after settlement".into(),
+            name: None,
+            predicate,
+            timeout_seconds: Some(600),
+            working_dir: p.repo.clone(),
+            provider: Some(SessionProvider::Claude),
+            model: Some("manager-scripted-provider".into()),
+            project_id: Some(p.project),
+            origin_session_id: p.lead,
+        })
+        .unwrap();
+        (job, Some(when))
+    } else {
+        let job = build_agent_scheduled_job(ScheduleWakeRequest {
+            message: "Continue the Epic".into(),
+            in_seconds: Some(600),
+            at: None,
+            name: None,
+            every_seconds: None,
+            mode: Some(mode.into()),
+            working_dir: p.repo.clone(),
+            provider: Some(SessionProvider::Claude),
+            model: Some("manager-scripted-provider".into()),
+            project_id: Some(p.project),
+            origin_session_id: Some(p.lead),
+            watch_session_id: (mode == "on_terminal").then(Uuid::new_v4),
+        })
+        .unwrap();
+        (job, None)
+    };
+    let store = p.manager.store.lock().await;
+    store.insert_scheduled_job(&job).unwrap();
+    if let Some(when) = when {
+        store.set_wake_when_state_for_test(job.id, &when).unwrap();
+    }
+    job.id
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_completed_lead_with_own_wake_stays_parked_until_wake_disabled() {
+    for mode in [
+        "resume",
+        "on_terminal",
+        "jobs_terminal",
+        "topology_execution_settled",
+        "sha_on_rolling",
+    ] {
+        let p = pilot().await;
+        work(&p, "parked-product").await;
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+        let wake = intent_wake(&p, mode).await;
+        for _ in 0..4 {
+            let pass = reconcile(&p).await;
+            assert_eq!(
+                (pass.unfinished, pass.queued, pass.blocked),
+                (1, 0, 0),
+                "{mode}"
+            );
+            assert_eq!(intent(&p).await["state"], "parked", "{mode}");
+            assert_eq!(count_actions(&p).await, 0);
+            let store = p.manager.store.lock().await;
+            let config = store.get_harness_manager(p.project).unwrap().unwrap();
+            store.manager_v2_reconcile_notices(&config).unwrap();
+            let notices: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_manager_notices
+                 WHERE project_id=?1 AND direction='to_manager' AND kind='ledger_change'
+                   AND subject_id=?2",
+                    rusqlite::params![p.project.to_string(), format!("intent:{}", p.epic)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(notices, 0, "{mode}: parked intent needs no manager notice");
+        }
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_scheduled_job(
+                &wake,
+                &crate::store::scheduled_jobs::ScheduledJobUpdate {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(reconcile(&p).await.queued, 1, "{mode}");
+        assert_eq!(intent(&p).await["state"], "recovery_action");
+        let operation = operation(&p).await;
+        let action = p
+            .manager
+            .store
+            .lock()
+            .await
+            .manager_action_operation(operation)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            action.context.request.operation,
+            ManagerActionV2::ResumeLead { .. }
+        ));
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn intent_notice_count(p: &Pilot) -> i64 {
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    store.manager_v2_reconcile_notices(&config).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_manager_notices
+             WHERE project_id=?1 AND direction='to_manager' AND kind='ledger_change'
+               AND subject_id=?2 AND retired_at IS NULL",
+            rusqlite::params![p.project.to_string(), format!("intent:{}", p.epic)],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// #3209: a `when` wake of the lead armed `armed_secs_ago` ago, with a deadline
+/// `deadline_in_secs` from now (`None`: waits until the predicate settles).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn intent_when_wake(
+    p: &Pilot,
+    predicate: rsi_common::wake_predicate::WakePredicate,
+    armed_secs_ago: i64,
+    deadline_in_secs: Option<i64>,
+) -> Uuid {
+    use crate::session::harness::tools::schedule_wake::{WakeWhenRequest, build_wake_when_job};
+    let (job, mut when) = build_wake_when_job(WakeWhenRequest {
+        message: "Continue the Epic after settlement".into(),
+        name: None,
+        predicate,
+        timeout_seconds: None,
+        working_dir: p.repo.clone(),
+        provider: Some(SessionProvider::Claude),
+        model: Some("manager-scripted-provider".into()),
+        project_id: Some(p.project),
+        origin_session_id: p.lead,
+    })
+    .unwrap();
+    let now = chrono::Utc::now();
+    when.armed_at = now - chrono::Duration::seconds(armed_secs_ago);
+    when.deadline = deadline_in_secs.map(|secs| now + chrono::Duration::seconds(secs));
+    let store = p.manager.store.lock().await;
+    store.insert_scheduled_job(&job).unwrap();
+    store.set_wake_when_state_for_test(job.id, &when).unwrap();
+    job.id
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_unbounded_lead_wake_past_horizon_is_blocked_and_named() {
+    use rsi_common::wake_predicate::WakePredicate;
+    let predicates = [
+        WakePredicate {
+            sha_on_rolling: Some("a".repeat(40)),
+            ..Default::default()
+        },
+        WakePredicate {
+            issue_closed: Some(7),
+            ..Default::default()
+        },
+    ];
+    for predicate in predicates {
+        let key = serde_json::to_value(&predicate).unwrap();
+        let key = key.as_object().unwrap().keys().next().unwrap().clone();
+        let p = pilot().await;
+        work(&p, "unbounded-wake-product").await;
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+        // Inside the horizon a deadline-less wake still reads as parked.
+        let wake = intent_when_wake(&p, predicate.clone(), 600, None).await;
+        assert_eq!(reconcile(&p).await.blocked, 0, "{key}");
+        assert_eq!(intent(&p).await["state"], "parked", "{key}");
+        assert_eq!(intent_notice_count(&p).await, 0, "{key}");
+        // Past it, the manager is told which wake never settles.
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_scheduled_job(
+                &wake,
+                &crate::store::scheduled_jobs::ScheduledJobUpdate {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let wake = intent_when_wake(&p, predicate.clone(), 2 * 3600, None).await;
+        // The disabled parked wake no longer counts; only the stale one is armed.
+        let pass = reconcile(&p).await;
+        assert_eq!((pass.queued, pass.blocked), (0, 1), "{key}");
+        let state = intent(&p).await;
+        assert_eq!(state["state"], "blocked", "{key}");
+        assert!(
+            state["reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("lead_parked_on_unbounded_wake"),
+            "{key}: {state}"
+        );
+        assert_eq!(state["wake_id"], wake.to_string(), "{key}");
+        assert!(
+            state["wake_predicate"].as_str().unwrap().contains(&key),
+            "{key}: {state}"
+        );
+        assert_eq!(count_actions(&p).await, 0, "{key}");
+        assert_eq!(intent_notice_count(&p).await, 1, "{key}");
+        // A deadline bounds the same old wake again.
+        let store = p.manager.store.lock().await;
+        store
+            .update_scheduled_job(
+                &wake,
+                &crate::store::scheduled_jobs::ScheduledJobUpdate {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(store);
+        intent_when_wake(&p, predicate, 2 * 3600, Some(600)).await;
+        assert_eq!(reconcile(&p).await.blocked, 0, "{key}");
+        assert_eq!(intent(&p).await["state"], "parked", "{key}");
+    }
+}
+
+/// #3221: rewrite one wake row: `fire` is its `next_fire_at` (`None`: an empty,
+/// unreadable fire time, the `NOT NULL` column's stand-in for "never due") and
+/// `age_secs` how long ago it was created.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn set_wake_fire_and_age(p: &Pilot, wake: Uuid, fire: Option<i64>, age_secs: i64) {
+    let stamp = |offset: i64| {
+        (chrono::Utc::now() + chrono::Duration::seconds(offset))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    };
+    let store = p.manager.store.lock().await;
+    store
+        .conn
+        .execute(
+            "UPDATE scheduled_jobs SET next_fire_at=?2, created_at=?3 WHERE id=?1",
+            rusqlite::params![
+                wake.to_string(),
+                fire.map(stamp).unwrap_or_default(),
+                stamp(-age_secs)
+            ],
+        )
+        .unwrap();
+}
+
+/// #3221: a plain `resume` wake is certain to fire only through a readable
+/// `next_fire_at`; without one it is bounded only inside the horizon.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_resume_wake_without_fire_time_is_parked_only_inside_the_horizon() {
+    let p = pilot().await;
+    work(&p, "resume-no-fire-time-product").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(p.lead, SessionStatus::Completed)
+        .unwrap();
+    let wake = intent_wake(&p, "resume").await;
+    // A bounded wake (readable fire time) stays parked, however old its row.
+    set_wake_fire_and_age(&p, wake, Some(600), 2 * 3600).await;
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    assert_eq!(intent(&p).await["state"], "parked");
+    // Inside the horizon a wake with no fire time still reads as parked.
+    set_wake_fire_and_age(&p, wake, None, 60).await;
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    assert_eq!(intent(&p).await["state"], "parked");
+    // Past it the wake never fires: the manager is told which one.
+    set_wake_fire_and_age(&p, wake, None, 2 * 3600).await;
+    let pass = reconcile(&p).await;
+    assert_eq!((pass.queued, pass.blocked), (0, 1));
+    let state = intent(&p).await;
+    assert_eq!(state["state"], "blocked", "{state}");
+    assert!(
+        state["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("lead_parked_on_unbounded_wake"),
+        "{state}"
+    );
+    assert_eq!(state["wake_id"], wake.to_string());
+    assert_eq!(state["wake_predicate"], "resume");
+    assert_eq!(count_actions(&p).await, 0);
+    // The same row with a fire time reads parked again.
+    set_wake_fire_and_age(&p, wake, Some(600), 2 * 3600).await;
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    assert_eq!(intent(&p).await["state"], "parked");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_stale_lead_holding_an_old_wake_stays_stale_lead() {
+    let p = pilot().await;
+    work(&p, "stale-wake-product").await;
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                rusqlite::params![p.lead.to_string(), long_ago],
+            )
+            .unwrap();
+    }
+    intent_wake(&p, "resume").await;
+    assert_eq!(reconcile(&p).await.queued, 0);
+    let state = intent(&p).await;
+    assert_eq!(state["state"], "stale_lead", "{state}");
+    assert_eq!(state["reason"], "lead_idle_since_before_seat_appointment");
+    assert_eq!(count_actions(&p).await, 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_overdue_request_names_id_while_parked_and_genuinely_blocked() {
+    let p = pilot().await;
+    work(&p, "overdue-product").await;
+    policy(&p, |policy| policy.request_timeout_seconds = 30).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(p.lead, SessionStatus::Completed)
+        .unwrap();
+    intent_wake(&p, "resume").await;
+    let request = p
+        .manager
+        .store
+        .lock()
+        .await
+        .manager_send(
+            p.owner,
+            &AgentManagerSendRequestV1 {
+                epic_id: p.epic,
+                message: "Report the remaining work".into(),
+                idempotency_key: "overdue-intent-request".into(),
+                informational: false,
+            },
+        )
+        .unwrap();
+    // Messages are immutable: exercise the real deadline at the policy's
+    // minimum timeout instead of rewriting or hand-seeding a request row.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    assert_eq!(intent(&p).await["state"], "parked");
+    assert_eq!(
+        intent(&p).await["reason"],
+        format!(
+            "lead parked on its own wakes; it will see pending requests on its next wake; overdue requests: {}",
+            request.message_id,
+        )
+    );
+    // #3209: the overdue request reaches the manager once, however many
+    // passes see the same overdue set.
+    for _ in 0..3 {
+        assert_eq!(reconcile(&p).await.blocked, 0);
+        assert_eq!(intent_notice_count(&p).await, 1);
+    }
+    // A genuine pending archive still holds recovery even with an own wake.
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET pending_archive=1 WHERE id=?1",
+            [p.lead.to_string()],
+        )
+        .unwrap();
+    assert_eq!(reconcile(&p).await.blocked, 1);
+    assert_eq!(intent(&p).await["state"], "blocked");
+    assert_eq!(
+        intent(&p).await["reason"],
+        format!(
+            "lead awaiting archive; overdue requests: {}",
+            request.message_id,
+        )
+    );
+    assert_eq!(count_actions(&p).await, 0);
+    {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store.manager_v2_reconcile_notices(&config).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET pending_archive=0 WHERE id=?1",
+                [p.lead.to_string()],
+            )
+            .unwrap();
+    }
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    assert_eq!(intent(&p).await["state"], "parked");
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    store.manager_v2_reconcile_notices(&config).unwrap();
+    let retired: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_manager_notices
+         WHERE project_id=?1 AND kind='ledger_change' AND subject_id=?2 AND retired_at IS NOT NULL",
+            rusqlite::params![p.project.to_string(), format!("intent:{}", p.epic)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retired, 1,
+        "the previous block is superseded by the parked intent"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn manager_intent_torn_tail_queues_guarded_fresh_retry() {
     let p = pilot().await;
@@ -498,7 +940,7 @@ async fn manager_intent_restart_settles_uncertain_torn_tail_resume_then_admits_o
     let config = Config::from_env();
     let restarted = SessionManager::new(
         std::sync::Arc::new(EventBus::new(16)),
-        Store::open(&p._dir.path().join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&p._dir.path().join("rsi.db")).unwrap(),
         false,
         p._dir.path().join("restarted-daemon.sock"),
         None,
@@ -666,17 +1108,18 @@ async fn manager_intent_pause_carries_across_scope_and_manager_change_until_expl
         .agent_manager_control(
             new_manager_id,
             AgentManagerControlRequestV2 {
-                project_id: None,
-                fence: ManagerFenceV2 {
-                    scope_version,
-                    policy_version,
-                },
-                idempotency_key: "current-manager-explicit-resume".into(),
-                operation: ManagerActionV2::ResumeLead {
-                    epic_id: p.epic,
-                    expected: p.fence().await,
-                    message: "explicitly resume after reassignment".into(),
-                },
+                ..AgentManagerControlRequestV2::new(
+                    ManagerFenceV2 {
+                        scope_version,
+                        policy_version,
+                    },
+                    "current-manager-explicit-resume".into(),
+                    ManagerActionV2::ResumeLead {
+                        epic_id: p.epic,
+                        expected: p.fence().await,
+                        message: "explicitly resume after reassignment".into(),
+                    },
+                )
             },
         )
         .await
@@ -721,7 +1164,7 @@ async fn manager_intent_resumed_notice_requires_a_succeeded_effect() {
         store.manager_v2_reconcile_notices(&config).unwrap();
     }
     assert_eq!(intent_resumed_notice_count(&p).await, 0);
-    let process = launch::install_controller_candidate_test_process(p.lead);
+    let _process = launch::install_controller_candidate_test_process(p.lead);
     wait_due(&p, success).await;
     settle_action(&p, success).await;
     assert_eq!(
@@ -945,6 +1388,7 @@ async fn block_dependencies(p: &Pilot) {
             state: ManagerStageStateV2::Blocked,
             note: "upstream implementation required".into(),
             evidence: None,
+            job_evidence: None,
         },
     )
     .await;
@@ -1274,6 +1718,7 @@ async fn manager_intent_resolved_dependency_reconsiders_blocked_action_once() {
             state: ManagerStageStateV2::Blocked,
             note: "upstream work is still blocked".into(),
             evidence: None,
+            job_evidence: None,
         },
     )
     .await;
@@ -1452,6 +1897,7 @@ async fn manager_intent_scoped_action_pages_include_unpublished_candidates_and_v
             .agent_manager_inspect(
                 p.lead,
                 AgentManagerInspectRequestV2 {
+                    include_history: false,
                     project_id: None,
                     section: ManagerInspectSectionV2::Actions,
                     epic_id: Some(p.epic),

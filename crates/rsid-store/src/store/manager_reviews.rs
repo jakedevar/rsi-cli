@@ -26,16 +26,30 @@ use uuid::Uuid;
 
 mod contributors;
 mod topology;
+mod topology_settle;
 pub use topology::{
     REVIEW_NO_MANAGER_LEDGER, TOPOLOGY_ONCALL_ACCEPTANCE, TopologyExtraRound,
     TopologyExtraRoundQuery, TopologyOncallAcceptance, TopologyReviewOutcome,
     TopologyReviewRequest, topology_review_work_key,
 };
+pub use topology_settle::{TopologyOpenReviewWork, TopologyReviewWorkSettled};
 
 const MAX_ASSIGNMENTS_PER_WORK: i64 = 64;
 const MAX_REVIEW_ROUNDS_PER_REVISION: usize = 3;
 const REVIEW_RECONCILE_BATCH: usize = 16;
 const MAX_INFRA_RELAUNCHES: usize = 2;
+/// #2602: findings carried in a review notice, and the per-summary clip.
+const REVIEW_NOTICE_MAX_FINDINGS: usize = 16;
+const REVIEW_NOTICE_MAX_SUMMARY_CHARS: usize = 600;
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
 /// #967: how long an `allocating` assignment waits for its queued or running
 /// launch action to create the reviewer session before failing.
 const REVIEWER_ESTABLISHMENT_DEADLINE_MINUTES: i64 = 30;
@@ -386,6 +400,23 @@ struct ReviewAllocationRequest {
     /// infra-retry successors, so the executor can follow the chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topology_attempt_id: Option<Uuid>,
+    /// #2735: the reviewer the request named was unavailable, so `launch` is
+    /// the allowed alternative that replaced it. Set only by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_substitution: Option<ReviewModelSubstitution>,
+}
+
+/// #2735: why a review assignment's `launch` differs from the reviewer that
+/// was requested.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewModelSubstitution {
+    /// The requested reviewer launch.
+    pub from: ManagerLaunchChoiceV2,
+    /// Always `model_unavailable`.
+    pub reason: String,
+    /// The first refusal of the unavailable model's episode.
+    pub first_seen: DateTime<Utc>,
 }
 
 /// Inputs of the post-authorization half of a review reservation.
@@ -519,24 +550,25 @@ fn review_allocation_request(
         &query,
     );
     AgentManagerControlRequestV2 {
-        project_id: None,
-        fence: assignment.request.fence.clone(),
-        idempotency_key: format!(
-            "{}{assignment_id}",
-            super::manager_actions::REVIEW_ALLOCATION_KEY_PREFIX
-        ),
-        operation: ManagerActionV2::CreateSession {
-            parent_id: assignment.epic_id,
-            kind: SessionKind::Research,
-            query: prompt,
-            launch: assignment.request.launch.clone(),
-            sandbox_source: None,
-        },
+        ..AgentManagerControlRequestV2::new(
+            assignment.request.fence.clone(),
+            format!(
+                "{}{assignment_id}",
+                super::manager_actions::REVIEW_ALLOCATION_KEY_PREFIX
+            ),
+            ManagerActionV2::CreateSession {
+                parent_id: assignment.epic_id,
+                kind: SessionKind::Research,
+                query: prompt,
+                launch: assignment.request.launch.clone(),
+                sandbox_source: None,
+            },
+        )
     }
 }
 
 /// Review-terminal notice projection: project, Epic, work key, spec revision,
-/// source, state, failure code, reviewer, receipt, verdict, finding counts.
+/// source, state, failure code, reviewer, receipt, verdict, finding counts, topology-owned.
 type ReviewNoticeRow = (
     String,
     String,
@@ -550,6 +582,7 @@ type ReviewNoticeRow = (
     Option<String>,
     i64,
     i64,
+    bool,
 );
 
 /// Reviewer closeout budget stated in the launch prompt (#575 R1).
@@ -563,6 +596,10 @@ type ReviewNoticeRow = (
 const REVIEW_TARGET_MINUTES: u32 = 30;
 /// Hard closeout deadline: submit a receipt (`blocked` if unresolved) by then.
 const REVIEW_CLOSEOUT_DEADLINE_MINUTES: u32 = 60;
+/// Longest a foreground test run may wait for a build slot before the reviewer
+/// stops waiting and reports the admission delay as `infra_*` (#2271). Well
+/// under the target so the other required checks still close out.
+const REVIEW_SLOT_WAIT_MINUTES: u32 = 10;
 /// Tool-call budget stated to the reviewer.
 const REVIEW_TOOL_CALL_BUDGET: u32 = 150;
 
@@ -579,7 +616,11 @@ fn manager_review_launch_prompt(
     format!(
         "DB-native independent review assignment {assignment_id}. Review exact source {source_sha} for manager work `{work_key}` revision {spec_revision}. Do not create or commit review artifacts. Submit exactly one immutable receipt with AgentSubmitReviewReceipt (or rsi_control_submit_review_receipt) for assignment_id {assignment_id} during this model invocation.\n\n\
 Review contract (it precedes the caller request below; the budget bounds optional exploration only, never required checks):\n\
-1. Required checks first: the fixed minimum (review exact source {source_sha} and its diff, run the focused tests of the touched modules, and run the gates the change is subject to) plus every check the caller request below requires. Do all required checks before any optional exploration.\n\
+1. Required checks first: the fixed minimum (review exact source {source_sha} and its diff, run the focused tests of the touched modules, and run the gates the change is subject to) plus every check the caller request below requires. A docs-only diff (it touches no `.rs`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `rust-toolchain.toml`, `package.json` or package lockfile path) has no cargo tests to run: its required checks are the static gates it is subject to, and a cargo test never makes it `blocked`. Do all required checks before any optional exploration.\n\
+   Review diff: the source's own change is its delta against the current rolling tip, `git diff origin/rolling $(git merge-tree --write-tree origin/rolling {source_sha})` (that is what the queue lands; when merge-tree reports a conflict, use `git show {source_sha}` instead). Never take a merge-base SHA from the caller request as the diff base: `git merge-base origin/rolling {source_sha}` can report several bases, and a base older than an already-landed parent source mixes that source's code into the diff (#2240). If the caller's diff lists files the Issue does not touch, compare it with this diff before charging them to the source.\n\
+   Find the touched-module tests with `scripts/scoped-test --base <parent of {source_sha}> --dry-run` (it prints the derived plan; the merge queue derives the landing filters itself) and run them in the foreground with exact `cargo test` names or `scripts/scoped-test`. Exception: when the caller request below carries a `Test evidence:` policy (every topology review does), that policy replaces running the tests: the verified author and merge-queue gate receipts it names are the test evidence, so do not re-run those tests, do not run `scripts/scoped-test` (the `--dry-run` plan included), and treat the fixed minimum's test step as met by those receipts (read the receipt and the touched-module test list it records; the policy also says how to report a check that cannot run).\n\
+   Build-slot wait (#2271): a foreground test run queues for a build slot first (`scripts/scoped-test` logs `slot-wait`; `cargo-slot` holds it). A wait over {REVIEW_SLOT_WAIT_MINUTES} minutes is an admission delay, not a test result and not a code finding. Start the run early, and when the wait passes {REVIEW_SLOT_WAIT_MINUTES} minutes stop only your own run and do not queue it again: do the other required checks, then submit verdict `blocked` with a blocking finding whose key starts with `infra_` (for example `infra_tests_unavailable`) stating the minutes waited and the tests that did not run, so the delay is reported apart from any code problem and the closeout deadline below is still met.\n\
+   Copy the source SHA exactly from this prompt (all 40 characters). If `git cat-file -e {source_sha}` says the object is missing, compare the SHA you typed with this prompt character by character, and check the checkout's pinned review ref, before you submit `blocked`: the receipt is immutable and a misread digit settles a healthy review as unsettled.\n\
 2. Closeout budget: target {REVIEW_TARGET_MINUTES} minutes and at most {REVIEW_TOOL_CALL_BUDGET} tool calls; closeout deadline {REVIEW_CLOSEOUT_DEADLINE_MINUTES} minutes elapsed. This is a closeout rule, not a race: when you reach the target, stop optional work and submit; if required checks remain at the deadline, apply clause 5.\n\
 3. Receipt first: submit your receipt as soon as all required checks (fixed minimum and caller-required) are done. Optional exploration only after the receipt is submitted, and keep it brief.\n\
 4. Never run destructive cleanup (rm -rf, rm -f, git clean, forced worktree removal); the exec policy refuses it. Use cargo clean for build directories and leave scratch files in place.\n\
@@ -762,6 +803,9 @@ impl Store {
         raw.into_iter()
             .map(
                 |(id, state, launched, superseded_by, created_at, terminal_at, receipt, json)| {
+                    // #2570: a receipt that only reports an unavailable check
+                    // is no review of the code and spends no round.
+                    let receipt = receipt && self.review_has_substantive_receipt(&id)?;
                     Ok(ReviewAttemptRow {
                         assignment_id: parse_uuid(id)?,
                         state,
@@ -776,6 +820,62 @@ impl Store {
                 },
             )
             .collect()
+    }
+
+    /// Whether `assignment_id` has a receipt that is a verdict on the code: any
+    /// receipt but a non-accepting one whose only blocking findings report an
+    /// infrastructure outcome (#2570).
+    fn review_has_substantive_receipt(&self, assignment_id: &str) -> Result<bool> {
+        let mut receipts = self.conn.prepare(
+            "SELECT receipt_id,verdict FROM manager_review_receipts WHERE assignment_id=?1",
+        )?;
+        let receipts = receipts
+            .query_map([assignment_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut findings = self.conn.prepare(
+            "SELECT finding_key,blocking FROM manager_review_findings WHERE receipt_id=?1",
+        )?;
+        // #2809: a `blocked` receipt from a reviewer a hub deploy cut off is
+        // the closeout of an interrupted turn, not a verdict on the code.
+        let interrupted = self.review_reviewer_deploy_interrupted(assignment_id)?;
+        for (receipt_id, verdict) in receipts {
+            if interrupted && verdict == "blocked" {
+                continue;
+            }
+            let keys = findings
+                .query_map([receipt_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // An acceptance with nothing blocking is a verdict on the code.
+            if verdict == "accepted" && keys.iter().all(|(_, blocking)| !blocking) {
+                return Ok(true);
+            }
+            if !rsi_common::harness_manager_v2::review_receipt_is_infrastructure_only(
+                keys.iter().map(|(key, blocking)| (key.as_str(), *blocking)),
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// #2809: whether the reviewer session of `assignment_id` is one a hub
+    /// deploy recorded as interrupted mid-turn (`interrupt_workers`,
+    /// `agent_deploys.interrupted_sessions`). False for an assignment with no
+    /// reviewer session.
+    pub(crate) fn review_reviewer_deploy_interrupted(&self, assignment_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM manager_review_assignments a
+                  JOIN agent_deploys d ON d.interrupted_sessions IS NOT NULL
+                  JOIN json_each(d.interrupted_sessions) j ON j.value=a.reviewer_session_id
+                 WHERE a.assignment_id=?1)",
+            [assignment_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// #599 A1: the manager may supersede any row; anyone else only rows its
@@ -887,7 +987,7 @@ impl Store {
     fn manager_review_source_is_rotation_holder(
         &self,
         config: &HarnessManagerConfigV1,
-        epic: Uuid,
+        _epic: Uuid,
         author: &str,
         source: &super::manager_actions::ManagerActionSourceV2,
     ) -> Result<bool> {
@@ -914,10 +1014,11 @@ impl Store {
         work: &WorkRecord,
         source_sha: &str,
     ) -> Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_review_assignments
-              WHERE project_id=?1 AND epic_id=?2 AND work_key=?3
-                AND spec_revision=?4 AND source_sha=?5)",
+        // #2939: any assignment, current or superseded. The table's CHECK makes
+        // `superseded_by_assignment_id IS NULL` and `state='superseded'` an exact
+        // partition, so each half is an index search (the current one through
+        // the partial `one_current` index) instead of a table scan per work row.
+        Ok(self.conn.prepare_cached(REVIEW_ENROLLED_SQL)?.query_row(
             params![
                 config.project_id.to_string(),
                 work.epic_id.to_string(),
@@ -1101,6 +1202,15 @@ impl Store {
         } = *input;
         let expected_row_version = &expected_row_version;
         let delta_of = &delta_of;
+        // #2735: a reviewer model the provider refused is replaced by an
+        // allowed alternative before any check or launch; the assignment
+        // records the substitution.
+        let (substituted, substitution) =
+            match self.review_launch_substitute(config.project_id, launch)? {
+                Some((choice, substitution)) => (Some(choice), Some(substitution)),
+                None => (None, None),
+            };
+        let launch = substituted.as_ref().unwrap_or(launch);
         // #1493: a delta round may carry a revised commit. The ledger
         // observation already proved it sealed in the author's custody and
         // authored after the base; it replaces the Work's recorded source below
@@ -1297,6 +1407,7 @@ impl Store {
             delta_of: *delta_of,
             finding_keys: finding_keys.clone(),
             topology_attempt_id: topology.map(|topology| topology.attempt_id),
+            model_substitution: substitution,
         };
         let request_json = serde_json::to_value(&allocation)?;
         self.conn.execute(
@@ -1329,6 +1440,9 @@ impl Store {
                 1,
                 &{
                     let mut event = json!({"assignment_id":assignment_id,"work_key":work.key,"spec_revision":work.spec_revision,"source_commit":source_commit,"previous_source_commit":previous_source,"state":"reserved"});
+                    if let Some(substitution) = allocation.model_substitution.as_ref() {
+                        event["model_substitution"] = json!(substitution);
+                    }
                     if let Some(topology) = topology {
                         event["actor"] = topology.actor.clone();
                     }
@@ -1357,7 +1471,7 @@ impl Store {
 
     /// Test fixture: reserve the infra-retry successor exactly as an infra
     /// death does, without the live-custody seal probe.
-    #[cfg(any(test, feature = "test-seam"))]
+    #[cfg(test)]
     pub(crate) fn manager_review_infra_retry_for_test(&self, assignment_id: Uuid) -> Result<Uuid> {
         let assignment = self.manager_review_assignment(assignment_id)?;
         let config = self
@@ -1514,7 +1628,8 @@ impl Store {
                         COALESCE((SELECT count(*) FROM manager_review_findings f
                                   WHERE f.receipt_id=r.receipt_id),0),
                         COALESCE((SELECT count(*) FROM manager_review_findings f
-                                  WHERE f.receipt_id=r.receipt_id AND f.blocking=1),0)
+                                  WHERE f.receipt_id=r.receipt_id AND f.blocking=1),0),
+                        json_extract(a.request_json,'$.topology_attempt_id') IS NOT NULL
                    FROM manager_review_assignments a
                    LEFT JOIN manager_review_receipts r ON r.assignment_id=a.assignment_id
                   WHERE a.assignment_id=?1",
@@ -1533,6 +1648,7 @@ impl Store {
                         row.get(9)?,
                         row.get(10)?,
                         row.get(11)?,
+                        row.get(12)?,
                     ))
                 },
             )
@@ -1550,6 +1666,7 @@ impl Store {
             verdict,
             finding_count,
             blocking_finding_count,
+            topology_owned,
         )) = row
         else {
             return Ok(None);
@@ -1567,11 +1684,25 @@ impl Store {
             "failure_code":failure_code,
             "reviewer_session_id":reviewer,
         });
+        if topology_owned {
+            // #2606: a review a topology execution owns reaches the manager
+            // once, through that execution's settled wake and its outcome
+            // digest. The notice stays readable but never wakes by itself
+            // (`ROUTINE_NOTICE_PREDICATE`). A standalone review still wakes.
+            notice["topology_owned"] = json!(true);
+        }
         if state == "submitted" {
             notice["receipt_id"] = json!(receipt_id);
             notice["verdict"] = json!(verdict);
             notice["finding_count"] = json!(finding_count);
             notice["blocking_finding_count"] = json!(blocking_finding_count);
+            // #2602: the manager decides from the notice alone, so carry the
+            // findings (blocking first) instead of forcing a store query.
+            if let Some(receipt_id) = receipt_id.as_deref() {
+                let (findings, truncated) = self.review_notice_findings(receipt_id)?;
+                notice["findings"] = findings;
+                notice["findings_truncated"] = json!(truncated);
+            }
         }
         self.record_manager_review_notice(
             parse_uuid(project)?,
@@ -1580,6 +1711,37 @@ impl Store {
             &state,
             &notice,
         )
+    }
+
+    /// Bounded finding projection for a review notice: blocking findings
+    /// first, then by key, at most `REVIEW_NOTICE_MAX_FINDINGS` with a
+    /// truncation flag, each summary clipped to `REVIEW_NOTICE_MAX_SUMMARY_CHARS`.
+    fn review_notice_findings(&self, receipt_id: &str) -> Result<(Value, bool)> {
+        let mut statement = self.conn.prepare(
+            "SELECT finding_key,severity,blocking,summary,location
+               FROM manager_review_findings
+              WHERE receipt_id=?1
+              ORDER BY blocking DESC,finding_key
+              LIMIT ?2",
+        )?;
+        let mut findings = statement
+            .query_map(
+                params![receipt_id, REVIEW_NOTICE_MAX_FINDINGS as i64 + 1],
+                |row| {
+                    let summary: String = row.get(3)?;
+                    Ok(json!({
+                        "key":row.get::<_,String>(0)?,
+                        "severity":row.get::<_,String>(1)?,
+                        "blocking":row.get::<_,i64>(2)? == 1,
+                        "summary":clip_chars(&summary, REVIEW_NOTICE_MAX_SUMMARY_CHARS),
+                        "location":row.get::<_,Option<String>>(4)?,
+                    }))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let truncated = findings.len() > REVIEW_NOTICE_MAX_FINDINGS;
+        findings.truncate(REVIEW_NOTICE_MAX_FINDINGS);
+        Ok((Value::Array(findings), truncated))
     }
 
     /// Reserve a fresh V121 successor for an infrastructure death. The outer
@@ -1729,6 +1891,75 @@ impl Store {
         Ok(None)
     }
 
+    /// #2735: the allowed reviewer that replaces `launch` when the provider
+    /// refused its model, else `None`. Candidates are the manager policy's
+    /// allowed launches whose model is available: the requested reviewer's own
+    /// family first (a stronger independence guarantee than any other), then the
+    /// next allowed family; the reservation's family checks still apply to
+    /// whatever is chosen. The effort stays the requested one when the grant
+    /// admits it, otherwise the grant's own.
+    pub(crate) fn review_launch_substitute(
+        &self,
+        project_id: Uuid,
+        launch: &ManagerLaunchChoiceV2,
+    ) -> Result<Option<(ManagerLaunchChoiceV2, ReviewModelSubstitution)>> {
+        let at = Utc::now();
+        let unavailable = self.models_unavailable(at)?;
+        let is_unavailable = |provider: rsi_common::types::SessionProvider, model: &str| {
+            let provider = format!("{provider:?}");
+            let provider = if provider == "CodexAppServer" {
+                "Codex"
+            } else {
+                provider.as_str()
+            };
+            unavailable
+                .iter()
+                .find(|episode| episode.provider == provider && episode.model == model)
+        };
+        let Some(episode) = is_unavailable(launch.provider, &launch.model) else {
+            return Ok(None);
+        };
+        let Some(grant) = self.get_harness_manager_policy(project_id)? else {
+            return Ok(None);
+        };
+        let family = review_model_family(launch.provider, Some(launch.model.as_str()));
+        let usable = |choice: &&ManagerLaunchChoiceV2| {
+            is_unavailable(choice.provider, &choice.model).is_none()
+        };
+        let allowed = &grant.policy.allowed_launches;
+        let same_family = allowed.iter().filter(usable).filter(|choice| {
+            review_model_family(choice.provider, Some(choice.model.as_str())) == family
+        });
+        let other_family = allowed.iter().filter(usable).filter(|choice| {
+            review_model_family(choice.provider, Some(choice.model.as_str())) != family
+        });
+        let Some(chosen) = same_family.chain(other_family).next() else {
+            return Ok(None);
+        };
+        let requested = ManagerLaunchChoiceV2 {
+            provider: chosen.provider,
+            model: chosen.model.clone(),
+            effort: launch.effort.clone(),
+        };
+        let replacement = if chosen.allows(&requested) {
+            requested
+        } else {
+            ManagerLaunchChoiceV2 {
+                provider: chosen.provider,
+                model: chosen.model.clone(),
+                effort: chosen.effort.clone().or_else(|| launch.effort.clone()),
+            }
+        };
+        Ok(Some((
+            replacement,
+            ReviewModelSubstitution {
+                from: launch.clone(),
+                reason: crate::store_support::provider_defaults::MODEL_UNAVAILABLE_CODE.to_string(),
+                first_seen: episode.first_seen,
+            },
+        )))
+    }
+
     fn reserve_manager_review_retry_on(
         &self,
         assignment: &ReviewAssignment,
@@ -1752,6 +1983,14 @@ impl Store {
         )?;
         let mut request = assignment.request.clone();
         request.infra_retry_of = Some(assignment.assignment_id);
+        // #2735: never relaunch a reviewer model the provider has since refused.
+        if let Some((choice, substitution)) =
+            self.review_launch_substitute(assignment.project_id, &request.launch)?
+        {
+            request.launch = choice;
+            // Keep the original request's own record when it already has one.
+            request.model_substitution.get_or_insert(substitution);
+        }
         request.contributor_session_ids = contributors.sessions.iter().copied().collect();
         request.contributor_families = contributors.families.iter().cloned().collect();
         let request_json = serde_json::to_value(&request)?;
@@ -1784,7 +2023,8 @@ impl Store {
             1,
             &json!({"assignment_id":next_id,"infra_retry_of":assignment.assignment_id,
                 "work_key":assignment.work_key,"spec_revision":assignment.spec_revision,
-                "source_commit":assignment.source_sha,"state":"reserved"}),
+                "source_commit":assignment.source_sha,"state":"reserved",
+                "model_substitution":request.model_substitution}),
         )?;
         Ok(())
     }
@@ -2499,6 +2739,11 @@ impl Store {
     }
 
     /// Single representation-neutral admission seam consumed by integration.
+    /// The receipt is bound to its own completed invocation, the reviewer
+    /// session and the custody generation (#3218), not to the session's
+    /// current invocation: a later same-session turn (a nudge, a wake) that
+    /// submits no new receipt and leaves source and custody alone cannot
+    /// revoke an accepted, immutable receipt.
     /// Enrollment of this exact work/spec/source makes DB state authoritative;
     /// only never-enrolled sources delegate to the retained legacy projection.
     pub fn manager_v2_accepted_source(
@@ -2539,9 +2784,8 @@ impl Store {
                     AND r.reviewer_custody_generation=a.reviewer_custody_generation
                     AND a.reviewer_session_id!=a.author_session_id
                     AND reviewer.project_id=a.project_id AND reviewer.parent_id=a.epic_id
-                    AND reviewer.model_invocation_id=a.reviewer_invocation_id
                     AND reviewer.sandbox_custody_id=a.reviewer_custody_id
-                    AND reviewer.status='Completed'
+                    AND reviewer.status IN ('Completed','Starting','Running','WaitingApproval')
                     AND invocation.status='completed' AND invocation.completed_at IS NOT NULL
                     AND custody.custody_id=a.reviewer_custody_id
                     AND custody.generation=a.reviewer_custody_generation
@@ -2584,22 +2828,9 @@ impl Store {
         let Some(source) = work.source_commit.as_deref() else {
             return Ok(json!({"mode":"legacy","current":null,"historical":[]}));
         };
-        let mut statement = self.conn.prepare(
-            "SELECT a.assignment_id,a.source_sha,a.state,a.row_version,
-                    a.reviewer_session_id,a.reviewer_invocation_id,
-                    a.reviewer_custody_id,a.reviewer_custody_generation,
-                    a.superseded_by_assignment_id,a.failure_code,a.created_at,a.terminal_at,
-                    r.receipt_id,r.verdict,r.request_fingerprint,r.created_at,
-                    COALESCE((SELECT count(*) FROM manager_review_findings f
-                              WHERE f.receipt_id=r.receipt_id),0),
-                    COALESCE((SELECT count(*) FROM manager_review_findings f
-                              WHERE f.receipt_id=r.receipt_id AND f.blocking=1),0)
-               FROM manager_review_assignments a
-               LEFT JOIN manager_review_receipts r ON r.assignment_id=a.assignment_id
-              WHERE a.project_id=?1 AND a.epic_id=?2 AND a.work_key=?3
-                AND a.spec_revision=?4
-              ORDER BY a.created_at DESC,a.assignment_id DESC LIMIT ?5",
-        )?;
+        // #2939: the two halves of the CHECK-enforced partition (current,
+        // superseded) are index searches; the unrestricted key scanned the table.
+        let mut statement = self.conn.prepare_cached(REVIEW_PROJECTION_SQL)?;
         let raw = statement
             .query_map(
                 params![
@@ -2659,9 +2890,76 @@ impl Store {
     }
 }
 
+/// #2939: whether any assignment (current or superseded) exists for one exact
+/// work/spec/source. The table's CHECK makes `superseded_by_assignment_id IS
+/// NULL` and `state='superseded'` an exact partition, so each half is an index
+/// search (the current half through the partial `one_current` index). The
+/// unrestricted key scanned the whole table once per work row of every pass.
+const REVIEW_ENROLLED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM manager_review_assignments
+              WHERE project_id=?1 AND epic_id=?2 AND work_key=?3
+                AND spec_revision=?4 AND source_sha=?5
+                AND superseded_by_assignment_id IS NULL
+             UNION ALL SELECT 1 FROM manager_review_assignments
+              WHERE state='superseded' AND project_id=?1 AND epic_id=?2
+                AND work_key=?3 AND spec_revision=?4 AND source_sha=?5)";
+
+/// #2939: one work's assignments with their receipts, newest first; the same
+/// two-index partition as [`REVIEW_ENROLLED_SQL`].
+const REVIEW_PROJECTION_SQL: &str = "SELECT a.assignment_id,a.source_sha,a.state,a.row_version,
+                    a.reviewer_session_id,a.reviewer_invocation_id,
+                    a.reviewer_custody_id,a.reviewer_custody_generation,
+                    a.superseded_by_assignment_id,a.failure_code,a.created_at,a.terminal_at,
+                    r.receipt_id,r.verdict,r.request_fingerprint,r.created_at,
+                    COALESCE((SELECT count(*) FROM manager_review_findings f
+                              WHERE f.receipt_id=r.receipt_id),0),
+                    COALESCE((SELECT count(*) FROM manager_review_findings f
+                              WHERE f.receipt_id=r.receipt_id AND f.blocking=1),0)
+               FROM (SELECT * FROM manager_review_assignments
+                      WHERE project_id=?1 AND epic_id=?2 AND work_key=?3
+                        AND spec_revision=?4 AND superseded_by_assignment_id IS NULL
+                     UNION ALL SELECT * FROM manager_review_assignments
+                      WHERE state='superseded' AND project_id=?1 AND epic_id=?2
+                        AND work_key=?3 AND spec_revision=?4) a
+               LEFT JOIN manager_review_receipts r ON r.assignment_id=a.assignment_id
+              ORDER BY a.created_at DESC,a.assignment_id DESC LIMIT ?5";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2939: both review-assignment reads are index searches, never a scan
+    /// of the table (once per work row of every manager pass before).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn review_assignment_reads_never_scan_the_table_2939() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for sql in [REVIEW_ENROLLED_SQL, REVIEW_PROJECTION_SQL] {
+            let mut statement = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let count = statement.parameter_count();
+            let plan = statement
+                .query_map(
+                    rusqlite::params_from_iter((0..count).map(|_| rusqlite::types::Value::Null)),
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("manager_review_assignments_one_current")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.starts_with("SCAN manager_review_assignments")),
+                "{plan:?}"
+            );
+        }
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
@@ -2704,6 +3002,7 @@ mod tests {
                 delta_of: None,
                 finding_keys: vec![],
                 topology_attempt_id: None,
+                model_substitution: None,
             },
         }
     }
@@ -2845,6 +3144,19 @@ mod tests {
             "the budget bounds optional exploration only, never required checks".to_string(),
             "Required checks first: the fixed minimum".to_string(),
             "run the focused tests of the touched modules".to_string(),
+            "when the caller request below carries a `Test evidence:` policy (every topology review does), that policy replaces running the tests"
+                .to_string(),
+            "do not run `scripts/scoped-test` (the `--dry-run` plan included)".to_string(),
+            "Build-slot wait (#2271): a foreground test run queues for a build slot first".to_string(),
+            "A wait over 10 minutes is an admission delay, not a test result and not a code finding".to_string(),
+            "key starts with `infra_`".to_string(),
+            format!("scripts/scoped-test --base <parent of {source}> --dry-run"),
+            format!("git diff origin/rolling $(git merge-tree --write-tree origin/rolling {source})"),
+            "Never take a merge-base SHA from the caller request as the diff base".to_string(),
+            format!("Copy the source SHA exactly from this prompt (all 40 characters). If `git cat-file -e {source}` says the object is missing"),
+            "A docs-only diff (it touches no `.rs`, `Cargo.toml`".to_string(),
+            "its required checks are the static gates it is subject to, and a cargo test never makes it `blocked`"
+                .to_string(),
             "plus every check the caller request below requires".to_string(),
             "Do all required checks before any optional exploration.".to_string(),
             "if required checks remain at the deadline, apply clause 5".to_string(),

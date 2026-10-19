@@ -1,13 +1,18 @@
 use super::*;
 use crate::model_control::{ExpectedUsage, InvocationCompletion, ModelAdmissionRequest};
 use crate::store::StoreAdmissionOutcome;
+#[cfg(test)]
 use crate::store::manager_actions::ManagerActionOriginV2;
+#[cfg(test)]
 use crate::store::manager_coordinator::ManagerDecisionDeliveryV2;
 pub use crate::store::manager_coordinator::tests::{fixture, raise_question};
+#[cfg(test)]
 use rsi_common::harness_manager_v2::*;
 use rsi_common::model_control::{InvocationOwner, ModelInvocationPurpose, ModelTier};
+#[cfg(test)]
 use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
 
+#[cfg(test)]
 fn update_policy(
     store: &Store,
     config: &HarnessManagerConfigV1,
@@ -29,6 +34,7 @@ fn update_policy(
         .unwrap();
 }
 
+#[cfg(test)]
 fn group(store: &Store, config: &HarnessManagerConfigV1) -> Uuid {
     store
         .get_session(config.epic_ids[0])
@@ -38,6 +44,7 @@ fn group(store: &Store, config: &HarnessManagerConfigV1) -> Uuid {
         .unwrap()
 }
 
+#[cfg(test)]
 fn clone_session(store: &Store, base: &Session, parent: Uuid, kind: SessionKind) -> Session {
     let mut next = base.clone();
     next.id = Uuid::new_v4();
@@ -51,6 +58,7 @@ fn clone_session(store: &Store, base: &Session, parent: Uuid, kind: SessionKind)
     next
 }
 
+#[cfg(test)]
 fn completed_rotation(store: &Store, origin: &Session, cost: f64) -> Session {
     let mut next = origin.clone();
     next.id = Uuid::new_v4();
@@ -70,6 +78,7 @@ fn completed_rotation(store: &Store, origin: &Session, cost: f64) -> Session {
     next
 }
 
+#[cfg(test)]
 fn attribute(store: &Store, config: &HarnessManagerConfigV1, session: &Session) {
     let policy = store
         .get_harness_manager_policy(config.project_id)
@@ -160,6 +169,7 @@ pub fn complete(store: &Store, invocation: Uuid, cost: f64) {
         .unwrap();
 }
 
+#[cfg(test)]
 fn assert_denied(outcome: StoreAdmissionOutcome, code: &str) {
     assert!(
         matches!(outcome, StoreAdmissionOutcome::Denied { ref reason, .. } if reason.contains(code)),
@@ -167,6 +177,7 @@ fn assert_denied(outcome: StoreAdmissionOutcome, code: &str) {
     );
 }
 
+#[cfg(test)]
 fn queue_answer(
     store: &Store,
     config: &HarnessManagerConfigV1,
@@ -214,7 +225,7 @@ fn queue_answer(
 fn manager_v2_resources_historical_creation_cannot_authorize_reparented_answer_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("scope.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(&store, ManagerPolicyV2::default());
     attribute(&store, &config, &lead);
     let delivery = queue_answer(&store, &config, lead.id);
@@ -343,7 +354,7 @@ fn manager_v2_resources_answer_cannot_redirect_between_selected_epics() {
 fn manager_v2_resources_group_rotation_needs_receipt_and_retains_capacity_pause_and_history() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rotation.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -827,7 +838,7 @@ fn manager_v2_resources_refreshes_archived_approval_decision() {
 fn manager_v2_resources_cancellation_holds_capacity_until_actual_settlement_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("capacity.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -887,7 +898,7 @@ fn manager_v2_resources_cancellation_holds_capacity_until_actual_settlement_acro
 fn manager_v2_resources_first_invocation_preserves_legacy_floor_and_unknown_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("spend.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -934,7 +945,7 @@ fn manager_v2_resources_first_invocation_preserves_legacy_floor_and_unknown_cove
 fn manager_v2_resources_proven_zero_origin_allows_measured_ledger_cost_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("zero-origin.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -956,7 +967,8 @@ fn manager_v2_resources_proven_zero_origin_allows_measured_ledger_cost_after_reo
     drop(store);
     let store = Store::open(&path).unwrap();
     let next = admitted(&store, &lead);
-    complete(&store, next, 1.0);
+    // The row holds the session's running total (#2593): 1.0 + 1.0.
+    complete(&store, next, 2.0);
     assert_denied(admit(&store, &lead), "spend_exhausted");
 }
 
@@ -991,6 +1003,7 @@ fn manager_v2_resources_preexisting_telemetry_does_not_prove_legacy_coverage() {
     assert_denied(admit(&store, &worker), "spend_unknown");
 }
 
+#[cfg(test)]
 fn create_action(
     store: &Store,
     config: &HarnessManagerConfigV1,
@@ -1004,19 +1017,20 @@ fn create_action(
             caller: config.manager_session_id,
         },
         AgentManagerControlRequestV2 {
-            project_id: None,
-            fence: ManagerFenceV2 {
-                scope_version: config.row_version,
-                policy_version: policy.row_version,
-            },
-            idempotency_key: Uuid::new_v4().to_string(),
-            operation: ManagerActionV2::CreateSession {
-                parent_id: config.epic_ids[0],
-                kind: SessionKind::Task,
-                query: "Scoped resource launch".into(),
-                launch,
-                sandbox_source: None,
-            },
+            ..AgentManagerControlRequestV2::new(
+                ManagerFenceV2 {
+                    scope_version: config.row_version,
+                    policy_version: policy.row_version,
+                },
+                Uuid::new_v4().to_string(),
+                ManagerActionV2::CreateSession {
+                    parent_id: config.epic_ids[0],
+                    kind: SessionKind::Task,
+                    query: "Scoped resource launch".into(),
+                    launch,
+                    sandbox_source: None,
+                },
+            )
         },
     )
 }
@@ -1128,6 +1142,7 @@ fn manager_v2_resources_actions_share_scoped_capacity_cost_unknowns_and_provider
                     utilization: 1.0,
                     resets_at_epoch: Some(Utc::now().timestamp() + 3600),
                 }],
+                stale_reason: None,
             },
             None,
         )
@@ -1160,7 +1175,7 @@ fn manager_v2_resources_actions_share_scoped_capacity_cost_unknowns_and_provider
 fn manager_v2_resources_rotation_reserves_capacity_before_successor_publication() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rotation-admission.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -1273,7 +1288,7 @@ fn manager_v2_resources_unproved_rotation_is_unknown_but_proven_unrelated_origin
 fn manager_v2_resources_concurrent_store_admissions_reserve_one_scoped_slot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("race.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, first) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -1347,6 +1362,7 @@ fn manager_v2_resources_denied_attempt_cannot_certify_later_untracked_history_as
     assert_denied(admit(&store, &lead), "spend_unknown");
 }
 
+#[cfg(test)]
 fn unpublished_child(store: &Store, base: &Session) -> (Session, ManagerResourceLaunchOrigin) {
     let mut child = base.clone();
     child.id = Uuid::new_v4();
@@ -1363,6 +1379,7 @@ fn unpublished_child(store: &Store, base: &Session) -> (Session, ManagerResource
     (child, origin)
 }
 
+#[cfg(test)]
 fn admit_unpublished(
     store: &Store,
     child: &Session,
@@ -1430,7 +1447,7 @@ fn manager_v2_resources_unpublished_permit_replay_rechecks_current_policy() {
 fn manager_v2_resources_fresh_unpublished_admission_retains_capacity_and_cost_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unpublished.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -1722,7 +1739,7 @@ fn manager_v2_resources_fresh_origin_is_exact_and_unknown_settlement_stays_unkno
 fn manager_v2_resources_question_cleanup_reopen_preserves_unknown_usage_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cleanup.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (config, mut lead) = fixture(&store, ManagerPolicyV2::default());
     lead.cost_usd = Some(5.0);
     lead.total_input_tokens = Some(500);
@@ -1780,7 +1797,7 @@ fn manager_v2_resources_selected_pending_uuid_survives_scope_revision_and_reopen
     use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pending-scope.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open_test_fixture(&path).unwrap();
     let (scope, lead) = fixture(
         &store,
         ManagerPolicyV2 {
@@ -2011,7 +2028,7 @@ fn manager_v2_answer_reopen_preserves_only_exact_invocation_measurements() {
     }) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("answer.db");
-        let store = Store::open(&path).unwrap();
+        let store = Store::open_test_fixture(&path).unwrap();
         let (_, mut lead) = fixture(&store, ManagerPolicyV2::default());
         lead.cost_usd = Some(5.0);
         lead.total_input_tokens = Some(500);
@@ -2109,6 +2126,7 @@ fn manager_v2_resources_reports_created_session_usage_against_the_quota() {
     );
 }
 
+#[cfg(test)]
 fn helper_admission_request(session: &Session) -> ModelAdmissionRequest {
     // Paid background work is denied by default, so a helper is admitted
     // through the local (free) backend like the real title/memory callers.
@@ -2121,6 +2139,7 @@ fn helper_admission_request(session: &Session) -> ModelAdmissionRequest {
     }
 }
 
+#[cfg(test)]
 fn admit_helper(store: &Store, session: &Session) -> StoreAdmissionOutcome {
     let request = helper_admission_request(session);
     store
@@ -2178,13 +2197,15 @@ fn manager_v2_resources_helper_calls_obey_the_spend_cap() {
     let first = admitted(&store, &lead);
     complete(&store, first, 1.0);
     let second = admitted(&store, &lead);
-    complete(&store, second, 1.0);
+    // Launch/resume rows hold the session's running total (#2593): 1.0 + 1.0.
+    complete(&store, second, 2.0);
     assert_denied(admit(&store, &lead), "spend_exhausted");
     assert_denied(admit_helper(&store, &lead), "spend_exhausted");
 }
 
 /// A paid helper on the memory LLM's Remote HTTP path: provider label
 /// `Remote`, a non-loopback OpenAI-compatible endpoint (#1080).
+#[cfg(test)]
 fn admit_paid_remote_helper(store: &Store, session: &Session) -> StoreAdmissionOutcome {
     let request = ModelAdmissionRequest {
         purpose: ModelInvocationPurpose::MemoryObservationExtract,
@@ -2229,7 +2250,8 @@ fn manager_v2_resources_remote_paid_helper_obeys_the_spend_cap() {
     let first = admitted(&store, &lead);
     complete(&store, first, 1.0);
     let second = admitted(&store, &lead);
-    complete(&store, second, 1.0);
+    // Launch/resume rows hold the session's running total (#2593): 1.0 + 1.0.
+    complete(&store, second, 2.0);
     assert_denied(admit(&store, &lead), "spend_exhausted");
     assert_denied(admit_paid_remote_helper(&store, &lead), "spend_exhausted");
 }
@@ -2254,6 +2276,7 @@ fn manager_v2_resources_remote_paid_helper_obeys_provider_usage_limits() {
                     utilization: 1.0,
                     resets_at_epoch: Some(Utc::now().timestamp() + 3600),
                 }],
+                stale_reason: None,
             },
             None,
         )
@@ -2262,4 +2285,275 @@ fn manager_v2_resources_remote_paid_helper_obeys_provider_usage_limits() {
         admit_paid_remote_helper(&store, &lead),
         "provider_usage_limit",
     );
+}
+
+/// One manager-requested topology execution with `launches` charged session
+/// attempts (`boot_id` stamped), requested by `requester` at `scope_version`.
+#[cfg(test)]
+fn seed_topology_launches(
+    store: &Store,
+    project: Uuid,
+    requester: Uuid,
+    scope_version: i64,
+    launches: usize,
+) {
+    let execution = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id,definition_json,definition_digest,project_id,requested_by_kind,requested_by_session_id,scope_version,repo_root,base_commit,custody_plan_json,status,created_at,updated_at)
+             VALUES (?1,'usage','wf','{}','d',?2,'manager',?3,?4,'/tmp/repo','0000000000000000000000000000000000000000','{}','running',?5,?5)",
+            params![execution.to_string(), project.to_string(), requester.to_string(), scope_version, now],
+        )
+        .unwrap();
+    for n in 0..launches {
+        store
+            .conn
+            .execute(
+                "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no,node_kind,status,dedup_key,session_id,boot_id,input_json,created_at,updated_at)
+                 VALUES (?1,?2,?3,0,1,'session','running',?4,NULL,'boot','{}',?5,?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    execution.to_string(),
+                    format!("N{n}"),
+                    format!("dedup-{execution}-{n}"),
+                    now
+                ],
+            )
+            .unwrap();
+    }
+}
+
+/// #1283: a project manager and a global seat holding the same scope version
+/// in one project are each charged only for the topology launches they
+/// requested, and each snapshot shows its own principal's caps.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_resources_topology_usage_is_charged_to_the_requesting_principal() {
+    use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+    let store = Store::open_in_memory().unwrap();
+    let launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-sonnet-4-6".into(),
+        effort: None,
+    };
+    let (pm, _lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            capabilities: vec![ManagerCapabilityV2::SessionCreate],
+            max_created_sessions: 7,
+            allowed_launches: vec![launch.clone()],
+            ..Default::default()
+        },
+    );
+    let seat = Uuid::new_v4();
+    let mut row = crate::test_support::test_session(seat, std::path::PathBuf::from("/tmp/seat"));
+    row.status = SessionStatus::Completed;
+    store.insert_session(&row).unwrap();
+    store
+        .configure_global_manager(
+            &ConfigureGlobalManagerRequestV1 {
+                session_id: seat,
+                project_ids: vec![pm.project_id],
+                allowed_launches: vec![launch],
+                project_policy: ManagerPolicyV2 {
+                    capabilities: vec![ManagerCapabilityV2::SessionCreate],
+                    max_created_sessions: 11,
+                    ..Default::default()
+                },
+                expected_grant_version: 0,
+                idempotency_key: format!("grant-{seat}"),
+            },
+            "operator:test",
+        )
+        .unwrap();
+    let principal = store
+        .global_project_principal(seat, pm.project_id)
+        .unwrap()
+        .unwrap();
+    let global = store
+        .global_manager_authority_for(&principal, seat)
+        .unwrap()
+        .config;
+    // The two principals hold the same scope version in the same project.
+    assert_eq!(pm.row_version, global.row_version);
+    assert_ne!(pm.manager_session_id, global.manager_session_id);
+    // A rotation successor of the global seat requests as the same principal.
+    let successor = Uuid::new_v4();
+    let mut next = row.clone();
+    next.id = successor;
+    next.continued_from = Some(seat);
+    store.insert_session(&next).unwrap();
+
+    seed_topology_launches(
+        &store,
+        pm.project_id,
+        pm.manager_session_id,
+        pm.row_version,
+        2,
+    );
+    seed_topology_launches(&store, pm.project_id, seat, global.row_version, 1);
+    seed_topology_launches(&store, pm.project_id, successor, global.row_version, 3);
+    // Another scope version of the global seat is not this scope's usage.
+    seed_topology_launches(&store, pm.project_id, seat, global.row_version + 5, 4);
+
+    assert_eq!(store.manager_v2_created_usage(&pm, false).unwrap(), 2);
+    assert_eq!(store.manager_v2_created_usage(&global, false).unwrap(), 4);
+
+    let pm_snapshot = store.manager_v2_resource_snapshot(&pm).unwrap();
+    assert_eq!(pm_snapshot["created_sessions"]["used"], 2);
+    assert_eq!(pm_snapshot["created_sessions"]["limit"], 7);
+    assert_eq!(pm_snapshot["policy"]["policy"]["max_created_sessions"], 7);
+    let global_snapshot = store.manager_v2_resource_snapshot(&global).unwrap();
+    assert_eq!(global_snapshot["created_sessions"]["used"], 4);
+    assert_eq!(global_snapshot["created_sessions"]["limit"], 11);
+    assert_eq!(
+        global_snapshot["policy"]["policy"]["max_created_sessions"],
+        11
+    );
+}
+
+/// #289: a successor seat's Claude effort is judged by the CLI's live ladder,
+/// as a launch is (#2768): `ultracode` only when the injected ladder lists it,
+/// the compiled `low..max` list when the ladder is unknown.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn successor_seat_claude_effort_follows_the_injected_live_ladder() {
+    use super::launch_origin::validate_root_choice_with;
+    let choice = |effort: &str| ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-opus-9".into(),
+        effort: Some(effort.into()),
+    };
+    let ladder = |levels: &'static [&'static str]| {
+        move |model: &str| {
+            (model == "claude-opus-9").then(|| {
+                levels
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<String>>()
+            })
+        }
+    };
+    let with_ultracode = ladder(&["low", "medium", "high", "xhigh", "max", "ultracode"]);
+    let without_ultracode = ladder(&["low", "medium", "high", "xhigh", "max"]);
+    let unknown = |_: &str| None;
+
+    for effort in ["ultracode", "max"] {
+        assert_eq!(
+            validate_root_choice_with(&choice(effort), with_ultracode).ok(),
+            Some(()),
+            "{effort} is listed"
+        );
+    }
+    assert_eq!(
+        validate_root_choice_with(&choice("max"), without_ultracode).ok(),
+        Some(())
+    );
+    assert_eq!(
+        validate_root_choice_with(&choice("max"), unknown).ok(),
+        Some(())
+    );
+    for refusal in [
+        validate_root_choice_with(&choice("ultracode"), without_ultracode),
+        validate_root_choice_with(&choice("ultracode"), unknown),
+    ] {
+        assert_eq!(
+            refusal.unwrap_err().to_string(),
+            refused("manager_succession_launch_invalid").to_string()
+        );
+    }
+    // The production entry point with no daemon-installed source keeps the
+    // compiled list.
+    assert_eq!(
+        super::launch_origin::validate_root_choice(&choice("max")).ok(),
+        Some(())
+    );
+    assert_eq!(
+        super::launch_origin::validate_root_choice(&choice("ultracode"))
+            .unwrap_err()
+            .to_string(),
+        refused("manager_succession_launch_invalid").to_string()
+    );
+}
+
+/// #3066: the hold deadline of an exhausted plan window is its latest reset;
+/// a window with no reset time is re-checked after the short fallback, and a
+/// window that has reset (or is below full) holds nothing.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn usage_window_hold_until_is_the_latest_exhausted_reset() {
+    let store = Store::open_in_memory().unwrap();
+    let now = Utc::now();
+    let snapshot = |windows: Vec<ProviderRateLimitWindow>| ProviderRateLimitSnapshot {
+        provider: SessionProvider::Claude,
+        status: None,
+        rate_limit_type: None,
+        overage_status: None,
+        is_using_overage: false,
+        observed_at: now,
+        windows,
+        stale_reason: None,
+    };
+    let window = |key: &str, utilization: f64, reset: Option<i64>| ProviderRateLimitWindow {
+        window_key: key.into(),
+        utilization,
+        resets_at_epoch: reset,
+    };
+    assert_eq!(
+        store
+            .provider_usage_window_hold_until(SessionProvider::Claude, now)
+            .unwrap(),
+        None,
+        "no windows, no hold"
+    );
+    let five_hour_reset = now.timestamp() + 3 * 3600;
+    let seven_day_reset = now.timestamp() + 2 * 24 * 3600;
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &snapshot(vec![
+                window("five_hour", 1.0, Some(five_hour_reset)),
+                window("seven_day", 1.0, Some(seven_day_reset)),
+            ]),
+            None,
+        )
+        .unwrap();
+    let held = store
+        .provider_usage_window_hold_until(SessionProvider::Claude, now)
+        .unwrap()
+        .expect("held");
+    assert_eq!(held.timestamp(), seven_day_reset, "every window must clear");
+    assert_eq!(
+        store
+            .provider_usage_window_hold_until(SessionProvider::Codex, now)
+            .unwrap(),
+        None,
+        "another provider's account is not held"
+    );
+    // The five-hour window reset and the seven-day one is below full: free.
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &snapshot(vec![
+                window("five_hour", 1.0, Some(now.timestamp() - 1)),
+                window("seven_day", 0.4, Some(seven_day_reset)),
+            ]),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .provider_usage_window_hold_until(SessionProvider::Claude, now)
+            .unwrap(),
+        None
+    );
+    // A full window with no reset time is re-checked soon, never held forever.
+    store
+        .upsert_provider_rate_limit_snapshot(&snapshot(vec![window("five_hour", 1.0, None)]), None)
+        .unwrap();
+    let unknown = store
+        .provider_usage_window_hold_until(SessionProvider::Claude, now)
+        .unwrap()
+        .expect("held");
+    assert_eq!(unknown, now + chrono::Duration::minutes(5));
 }

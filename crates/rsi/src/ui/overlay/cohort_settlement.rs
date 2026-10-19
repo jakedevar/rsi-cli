@@ -86,6 +86,29 @@ pub(super) fn render_source_worktree_settlement(
         }
     }
 
+    if !state.recent_runs.is_empty() {
+        lines.push(Line::default());
+        lines.push(section(
+            "Recent settlement runs (automatic, agent and operator)",
+        ));
+        for run in &state.recent_runs {
+            let origin = attribution_label(run.attribution.as_ref());
+            lines.push(normal(format!(
+                "{} · {} · {:?} · settled {} · refused {} · recovery {}",
+                run.run_id,
+                origin,
+                run.state,
+                run.counts.settled,
+                run.counts.refused,
+                run.counts.recovery_required
+            )));
+            lines.push(normal(format!(
+                "    {} · {}",
+                run.created_at, run.repository_identity
+            )));
+        }
+    }
+
     if let Some(audit) = &state.audit {
         lines.push(Line::default());
         lines.push(section(if is_receipt_recovery_audit(state, audit) {
@@ -157,6 +180,10 @@ pub(super) fn render_source_worktree_settlement(
         lines.push(Line::default());
         lines.push(section("Durable receipt"));
         lines.push(normal(format!(
+            "origin {}",
+            attribution_label(receipt.attribution.as_ref())
+        )));
+        lines.push(normal(format!(
             "run {} · state {:?} · updated {}",
             receipt.run_id, receipt.state, receipt.updated_at
         )));
@@ -220,6 +247,26 @@ fn is_receipt_recovery_audit(
             })
 }
 
+fn attribution_label(
+    attribution: Option<&rsi_common::cohort_settlement::SourceWorktreeSettlementAttributionV1>,
+) -> String {
+    use rsi_common::cohort_settlement::SourceWorktreeSettlementOriginV1;
+    match attribution {
+        Some(value) => match value.origin {
+            SourceWorktreeSettlementOriginV1::Automatic => "automatic daemon".into(),
+            SourceWorktreeSettlementOriginV1::Operator => "operator".into(),
+            SourceWorktreeSettlementOriginV1::Agent => format!(
+                "agent {}",
+                value
+                    .agent_session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+            ),
+        },
+        None => "historical (unattributed)".into(),
+    }
+}
+
 fn key(value: &'static str) -> Span<'static> {
     Span::styled(
         value,
@@ -273,6 +320,7 @@ mod tests {
 
     fn empty_state(scroll_offset: usize) -> SourceWorktreeSettlementOverlayState {
         SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: Vec::new(),
             selected_index: 0,
             scroll_offset,
@@ -283,6 +331,48 @@ mod tests {
             idempotency_key: None,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn settlement_history_shows_automatic_run_origin_and_result() {
+        use rsi_common::cohort_settlement::{
+            SourceWorktreeSettlementAttributionV1, SourceWorktreeSettlementOriginV1,
+            SourceWorktreeSettlementRunSummaryV1,
+        };
+        let mut state = empty_state(0);
+        let run_id = uuid::Uuid::new_v4();
+        state
+            .recent_runs
+            .push(SourceWorktreeSettlementRunSummaryV1 {
+                run_id,
+                repository_identity: "repo:automatic-history".into(),
+                state: SourceWorktreeSettlementRunStateV1::Settled,
+                counts: SourceWorktreeSettlementCountsV1 {
+                    settled: 3,
+                    ..Default::default()
+                },
+                created_at: "2026-10-12T00:00:00.000000000Z".into(),
+                attribution: Some(SourceWorktreeSettlementAttributionV1 {
+                    origin: SourceWorktreeSettlementOriginV1::Automatic,
+                    agent_session_id: None,
+                }),
+            });
+        let backend = TestBackend::new(150, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_source_worktree_settlement(frame, frame.area(), &state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Recent settlement runs"));
+        assert!(text.contains("automatic daemon"));
+        assert!(text.contains("settled 3"));
+        assert!(text.contains(&run_id.to_string()));
     }
 
     #[test]
@@ -328,6 +418,7 @@ mod tests {
             counts: SourceWorktreeSettlementCountsV1::default(),
             items: Vec::new(),
             run_id: Some(uuid::Uuid::new_v4()),
+            last_run_retained_roots: Vec::new(),
             refusal: Some("source-worktree cohort exceeds bounded maximum of 256 roots".into()),
         }
         .validate_wire()
@@ -417,11 +508,13 @@ mod tests {
                 diagnostic: None,
             }],
             run_id: Some(run_id),
+            last_run_retained_roots: Vec::new(),
             refusal: None,
         }
         .validate_wire()
         .expect("wire-valid fresh live audit");
         let receipt = SourceWorktreeSettlementRunV1 {
+            attribution: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             run_id,
@@ -449,6 +542,7 @@ mod tests {
                 before_observation: None,
                 after_observation: Some("settled".into()),
             }],
+            retained_roots: Vec::new(),
             created_at: "2026-08-24T00:00:00.000000000Z".into(),
             updated_at: "2026-08-24T00:00:01.000000000Z".into(),
             finished_at: Some("2026-08-24T00:00:01.000000000Z".into()),
@@ -457,6 +551,7 @@ mod tests {
         .validate_wire()
         .expect("wire-valid historical receipt");
         let state = SourceWorktreeSettlementOverlayState {
+            recent_runs: Vec::new(),
             cohorts: vec![SourceWorktreeCohortSummaryV1 {
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
@@ -493,5 +588,57 @@ mod tests {
         assert!(text.contains(&phrase));
         assert!(text.contains("Durable receipt"));
         assert!(text.contains(&run_id.to_string()));
+    }
+
+    #[test]
+    fn refused_audit_renders_its_refusal_reason_and_the_apply_error() {
+        let identity = "/repo/.git".to_string();
+        let refusal = "source-worktree cohort exceeds bounded maximum of 256 roots";
+        let mut state = empty_state(0);
+        state.cohorts.push(SourceWorktreeCohortSummaryV1 {
+            schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+            policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+            repository_identity: identity.clone(),
+            canonical_repo_dir: "/repo".into(),
+            live_roots: 257,
+            terminal_roots: 0,
+        });
+        state.audit = Some(
+            SourceWorktreeCohortAuditV1 {
+                schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+                policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+                repository_identity: identity,
+                canonical_repo_dir: "/repo".into(),
+                target_ref: None,
+                target_oid: None,
+                plan_digest: Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+                authorization_phrase: None,
+                writes: 0,
+                applyable: false,
+                counts: SourceWorktreeSettlementCountsV1::default(),
+                items: Vec::new(),
+                run_id: None,
+                last_run_retained_roots: Vec::new(),
+                refusal: Some(refusal.into()),
+            }
+            .validate_wire()
+            .expect("wire-valid refused audit"),
+        );
+        state.last_error = Some(format!("Apply refused by audit: {refusal}"));
+
+        let backend = TestBackend::new(200, 50);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_source_worktree_settlement(frame, frame.area(), &state))
+            .expect("render refused audit");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains(&format!("cohort refusal: {refusal}")));
+        assert!(text.contains(&format!("Apply refused by audit: {refusal}")));
     }
 }

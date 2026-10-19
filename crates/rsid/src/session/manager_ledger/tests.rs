@@ -19,6 +19,7 @@ use std::{path::PathBuf, process::Command, sync::Arc};
 use tempfile::TempDir;
 
 mod bookkeeping_cas;
+mod job_evidence;
 mod local_only_git;
 mod review_end;
 mod review_infra_retry;
@@ -131,7 +132,7 @@ async fn fixture_with_merged_source(merge_rolling: bool) -> Fixture {
             &source_head,
         ],
     );
-    let mut store = Store::open(&dir.path().join("rsi.db")).unwrap();
+    let mut store = Store::open_test_fixture(&dir.path().join("rsi.db")).unwrap();
     let project = Uuid::new_v4();
     store
         .insert_project(&Project {
@@ -315,6 +316,12 @@ async fn inspect_with_queued_scope_edit(
     use std::task::{Context, Waker};
 
     let f = fixture().await;
+    // The Overview readiness honours the live rotation choice (#155); these
+    // fixtures assert an eligible seat, so rotation is on for them.
+    f.sessions
+        .runtime_config
+        .update_field("context_rotation_enabled", &serde_json::json!(true))
+        .unwrap();
     let guard = f.handle.store.lock().await;
     let project = guard
         .get_session(f.manager)
@@ -417,7 +424,7 @@ async fn manager_work_rechecks_scope_after_external_observation_boundary() {
 async fn reopen_mail_fixture(f: &mut Fixture) {
     let sessions = SessionManager::new(
         Arc::new(EventBus::new(16)),
-        Store::open(&f.dir.path().join("rsi.db")).unwrap(),
+        Store::open_test_fixture(&f.dir.path().join("rsi.db")).unwrap(),
         false,
         f.dir.path().join("unused.sock"),
         None,
@@ -476,6 +483,7 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "partial-source",
             ),
@@ -531,19 +539,25 @@ async fn rotated_request_consumers_track_current_reader_and_durable_execution_ev
     ] {
         reopen_mail_fixture(&mut f).await;
         f.sessions
-            .register_agent_token("mail-current".into(), successor)
+            .register_agent_token(
+                "3cab3bd8e63a15a1ed01c9c3caf3d2e836d96b23931099031636acbec4f46adb".into(),
+                successor,
+            )
             .await;
         f.sessions
-            .register_agent_token("mail-predecessor".into(), f.source)
+            .register_agent_token(
+                "973ad39ef26d6b71d54041eb4f05caba3b4419a7769d90b81eafd9afc4c96466".into(),
+                f.source,
+            )
             .await;
         let caller = f
             .sessions
-            .resolve_agent_token("mail-current")
+            .resolve_agent_token("3cab3bd8e63a15a1ed01c9c3caf3d2e836d96b23931099031636acbec4f46adb")
             .await
             .unwrap();
         let predecessor = f
             .sessions
-            .resolve_agent_token("mail-predecessor")
+            .resolve_agent_token("973ad39ef26d6b71d54041eb4f05caba3b4419a7769d90b81eafd9afc4c96466")
             .await
             .unwrap();
         let rows = f
@@ -804,11 +818,14 @@ async fn inherited_request_denies_reassignment_retired_ambiguous_and_revoked_rec
             }
         }
         f.sessions
-            .register_agent_token("invalidated-mail-caller".into(), caller)
+            .register_agent_token(
+                "6f76e22a3ad12dd1a635a2bbf072132ce1cd178f463468b81e7060bdeed742d7".into(),
+                caller,
+            )
             .await;
         let caller = f
             .sessions
-            .resolve_agent_token("invalidated-mail-caller")
+            .resolve_agent_token("6f76e22a3ad12dd1a635a2bbf072132ce1cd178f463468b81e7060bdeed742d7")
             .await
             .unwrap();
         assert!(
@@ -929,6 +946,7 @@ async fn record_db_review_source(f: &Fixture, idempotency_key: &str) {
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 &format!("{idempotency_key}-source"),
             ),
@@ -1630,6 +1648,7 @@ async fn archived_db_reviewed_source_integrates_from_exact_remote_repository() {
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "archive-stage-still-denied",
             ),
@@ -2273,6 +2292,505 @@ async fn infra_retry_reserves_when_untracked_status_exceeds_bounded_output() {
     assert_eq!(next_sha, f.source_head);
 }
 
+/// #2677: one finding becomes exactly one Issue. The active reviewer files one
+/// of two post-land findings itself; the topology's follow-up node (a live
+/// session node) then files both and ends with two open Issues, not three. The
+/// reviewer can search its project for the Issue first.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn reviewer_and_topology_follow_up_file_each_finding_once() {
+    use rsi_common::rpc::{AgentCreateIssueParams, AgentListIssuesRequestV1};
+    use rsi_common::types::{AgentIssuePageV1, IssueStatus};
+
+    let f = fixture().await;
+    request_and_activate_db_review(&f, "dedupe-findings").await;
+    let project = {
+        let store = f.handle.store.lock().await;
+        let project = store
+            .get_session(f.reviewer)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .expect("the reviewer belongs to the project");
+        let now = "2026-10-15T00:00:00.000000000Z";
+        let execution = Uuid::new_v4();
+        store
+            .conn
+            .execute(
+                "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id,definition_json,definition_digest,project_id,requested_by_kind,repo_root,base_commit,custody_plan_json,status,created_at,updated_at)
+                 VALUES (?1,'post-review','wf','{}','d',?2,'manager','/tmp/repo','0000000000000000000000000000000000000000','{}','running',?3,?3)",
+                rusqlite::params![execution.to_string(), project.to_string(), now],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no,node_kind,status,dedup_key,session_id,input_json,created_at,updated_at)
+                 VALUES (?1,?2,'followup',0,1,'session','running',?3,?4,'{}',?5,?5)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    execution.to_string(),
+                    format!("dedup-{execution}"),
+                    f.source.to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+        project
+    };
+    let params = |title: &str, key: &str| AgentCreateIssueParams {
+        project_id: None,
+        title: title.into(),
+        body: "finding".into(),
+        priority: None,
+        labels: vec!["bug".into(), "post-land-review".into()],
+        assignee: None,
+        idempotency_key: key.into(),
+        harness: false,
+        source_issue: None,
+    };
+
+    // The reviewer files finding 1 itself.
+    let reviewer_filed = f
+        .handle
+        .agent_create_issue(
+            f.reviewer,
+            params("Landing drops the tail event", "reviewer-finding-1"),
+        )
+        .await
+        .unwrap();
+    assert!(!reviewer_filed.deduplicated);
+
+    // A second reviewer filing of the same finding, worded differently in case
+    // and punctuation, returns the existing Issue.
+    let reviewer_again = f
+        .handle
+        .agent_create_issue(
+            f.reviewer,
+            params("landing drops the TAIL event.", "reviewer-finding-1-again"),
+        )
+        .await
+        .unwrap();
+    assert!(reviewer_again.deduplicated);
+    assert_eq!(reviewer_again.issue.id, reviewer_filed.issue.id);
+
+    // The reviewer's dedupe read finds it by title and returns summaries only.
+    let page = f
+        .handle
+        .agent_list_issues(
+            f.reviewer,
+            AgentListIssuesRequestV1 {
+                title_contains: Some("tail event".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let AgentIssuePageV1::Summary(page) = page else {
+        panic!("a reviewer title search returns summary rows");
+    };
+    assert_eq!(page.issues.len(), 1);
+    assert_eq!(page.issues[0].id, reviewer_filed.issue.id);
+    // The read is the title search and nothing wider.
+    assert!(
+        f.handle
+            .agent_list_issues(f.reviewer, AgentListIssuesRequestV1::default())
+            .await
+            .is_err()
+    );
+
+    // The topology follow-up files both findings.
+    let finding_one = f
+        .handle
+        .agent_create_issue(
+            f.source,
+            params("Landing drops the tail event", "post-land-review:abc:1"),
+        )
+        .await
+        .unwrap();
+    assert!(finding_one.deduplicated);
+    assert_eq!(finding_one.issue.id, reviewer_filed.issue.id);
+    let finding_two = f
+        .handle
+        .agent_create_issue(
+            f.source,
+            params(
+                "Land retry skips the gate receipt",
+                "post-land-review:abc:2",
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!finding_two.deduplicated);
+
+    let open: Vec<String> = f
+        .handle
+        .store
+        .lock()
+        .await
+        .list_issues(&rsi_common::types::IssueFilter {
+            project_id: Some(project),
+            status: Some(IssueStatus::Open),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|issue| issue.title)
+        .collect();
+    assert_eq!(
+        open,
+        vec![
+            "Landing drops the tail event".to_string(),
+            "Land retry skips the gate receipt".to_string()
+        ]
+    );
+}
+
+/// Shared setup of the #2678/#2679 tests: a live topology follow-up node for
+/// `f.source` in the reviewer's project. Returns the project and the attempt id.
+async fn live_followup_node(f: &Fixture) -> (Uuid, Uuid) {
+    let store = f.handle.store.lock().await;
+    let project = store
+        .get_session(f.reviewer)
+        .unwrap()
+        .unwrap()
+        .project_id
+        .expect("the reviewer belongs to the project");
+    let now = "2026-10-15T00:00:00.000000000Z";
+    let execution = Uuid::new_v4();
+    let attempt = Uuid::new_v4();
+    store
+        .conn
+        .execute(
+            "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id,definition_json,definition_digest,project_id,requested_by_kind,repo_root,base_commit,custody_plan_json,status,created_at,updated_at)
+             VALUES (?1,'post-review','wf','{}','d',?2,'manager','/tmp/repo','0000000000000000000000000000000000000000','{}','running',?3,?3)",
+            rusqlite::params![execution.to_string(), project.to_string(), now],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no,node_kind,status,dedup_key,session_id,input_json,created_at,updated_at)
+             VALUES (?1,?2,'followup',0,1,'session','running',?3,?4,'{}',?5,?5)",
+            rusqlite::params![
+                attempt.to_string(),
+                execution.to_string(),
+                format!("dedup-{execution}"),
+                f.source.to_string(),
+                now
+            ],
+        )
+        .unwrap();
+    (project, attempt)
+}
+
+fn dedupe_params(
+    title: &str,
+    key: &str,
+    project_id: Option<Uuid>,
+) -> rsi_common::rpc::AgentCreateIssueParams {
+    rsi_common::rpc::AgentCreateIssueParams {
+        project_id,
+        title: title.into(),
+        body: "finding".into(),
+        priority: None,
+        labels: vec!["bug".into()],
+        assignee: None,
+        idempotency_key: key.into(),
+        harness: false,
+        source_issue: None,
+    }
+}
+
+/// #2678: a title dedupe is behind the project-authority fence. A reviewer or
+/// topology node of project A that names project B (outside its grant) and the
+/// title of an open Issue in B is refused with the scope refusal and gets no
+/// Issue data; the same-project dedupe keeps working.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn title_dedupe_never_reads_an_issue_outside_the_callers_grant() {
+    use rsi_common::types::{IssueStatus, NewIssue};
+
+    let f = fixture().await;
+    request_and_activate_db_review(&f, "dedupe-fence").await;
+    let (project_a, _) = live_followup_node(&f).await;
+    let project_b = Uuid::new_v4();
+    let foreign_issue = {
+        let store = f.handle.store.lock().await;
+        let now = "2026-10-15T00:00:00.000000000Z";
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'other','#000000',?2,?2)",
+                rusqlite::params![project_b.to_string(), now],
+            )
+            .unwrap();
+        store
+            .create_issue(&NewIssue {
+                project_id: project_b,
+                title: "Secret finding in B".into(),
+                body: "private body of B".into(),
+                priority: None,
+                labels: vec![],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+    };
+    assert_eq!(foreign_issue.status, IssueStatus::Open);
+
+    for caller in [f.reviewer, f.source] {
+        let refused = f
+            .handle
+            .agent_create_issue(
+                caller,
+                dedupe_params(
+                    "secret FINDING in b.",
+                    "cross-project-probe",
+                    Some(project_b),
+                ),
+            )
+            .await
+            .expect_err("a project outside the grant is refused, not deduped");
+        assert!(
+            refused
+                .to_string()
+                .contains(rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE),
+            "{refused}"
+        );
+        assert!(!refused.to_string().contains("private body"), "{refused}");
+    }
+    // Nothing was created or recorded in either project.
+    let store = f.handle.store.lock().await;
+    let in_b = store
+        .list_issues(&rsi_common::types::IssueFilter {
+            project_id: Some(project_b),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(in_b.len(), 1);
+    let receipts: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM daemon_settings WHERE key LIKE 'agent_issue_dedupe:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 0);
+    drop(store);
+
+    // The same-project dedupe is unchanged.
+    let own = f
+        .handle
+        .agent_create_issue(f.reviewer, dedupe_params("Own finding", "own-1", None))
+        .await
+        .unwrap();
+    let again = f
+        .handle
+        .agent_create_issue(
+            f.source,
+            dedupe_params("own finding", "own-2", Some(project_a)),
+        )
+        .await
+        .unwrap();
+    assert!(again.deduplicated);
+    assert_eq!(again.issue.id, own.issue.id);
+}
+
+/// #2679: a dedupe is a durable caller/key -> Issue receipt with the request
+/// fingerprint. After the Issue is closed (or retitled) and the node's
+/// authority ended, the exact request returns the same Issue again and files
+/// nothing; a changed payload under the key is an idempotency conflict.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn title_dedupe_is_replayed_from_a_durable_receipt() {
+    use rsi_common::types::IssueStatus;
+
+    let f = fixture().await;
+    request_and_activate_db_review(&f, "dedupe-receipt").await;
+    let (project, attempt) = live_followup_node(&f).await;
+    let filed = f
+        .handle
+        .agent_create_issue(
+            f.reviewer,
+            dedupe_params("Tail event is dropped", "r-1", None),
+        )
+        .await
+        .unwrap();
+    let deduped = f
+        .handle
+        .agent_create_issue(
+            f.source,
+            dedupe_params("tail event is dropped!", "post-land-review:abc:1", None),
+        )
+        .await
+        .unwrap();
+    assert!(deduped.deduplicated);
+    assert_eq!(deduped.issue.id, filed.issue.id);
+
+    // The Issue is closed and the node's authority ends.
+    {
+        let store = f.handle.store.lock().await;
+        store
+            .update_issue_status(filed.issue.id, IssueStatus::Closed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET status='succeeded' WHERE id=?1",
+                [attempt.to_string()],
+            )
+            .unwrap();
+    }
+
+    // The exact replay resolves through the receipt: the same Issue, nothing new.
+    let replay = f
+        .handle
+        .agent_create_issue(
+            f.source,
+            dedupe_params("tail event is dropped!", "post-land-review:abc:1", None),
+        )
+        .await
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.issue.id, filed.issue.id);
+    assert_eq!(replay.issue.status, IssueStatus::Closed);
+
+    // A changed payload under the same key conflicts.
+    let mut changed = dedupe_params("tail event is dropped!", "post-land-review:abc:1", None);
+    changed.body = "a different finding".into();
+    let conflict = f
+        .handle
+        .agent_create_issue(f.source, changed)
+        .await
+        .expect_err("a changed payload under the key conflicts");
+    assert!(
+        conflict
+            .to_string()
+            .contains("agent_create_issue_idempotency_conflict"),
+        "{conflict}"
+    );
+    let all = f
+        .handle
+        .store
+        .lock()
+        .await
+        .list_issues(&rsi_common::types::IssueFilter {
+            project_id: Some(project),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(all.len(), 1);
+}
+
+/// #2686: the saved caller/key dedupe receipt is resolved on every create
+/// route. After an ordinary-project title dedupe, the same caller filing the
+/// same key through the harness route (or the plain keyed route) conflicts and
+/// creates no Issue; the exact original replay still returns the deduped Issue
+/// after it is closed and the node's authority ended.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn dedupe_receipt_binds_the_key_on_the_harness_and_plain_routes() {
+    use rsi_common::types::{IssueStatus, NewIssue};
+
+    let f = fixture().await;
+    request_and_activate_db_review(&f, "dedupe-receipt-routes").await;
+    let (project, attempt) = live_followup_node(&f).await;
+    let filed = f
+        .handle
+        .agent_create_issue(f.reviewer, dedupe_params("Route finding", "r-1", None))
+        .await
+        .unwrap();
+    let key = "post-land-review:routes:1";
+    let deduped = f
+        .handle
+        .agent_create_issue(f.source, dedupe_params("route finding!", key, None))
+        .await
+        .unwrap();
+    assert!(deduped.deduplicated);
+    assert_eq!(deduped.issue.id, filed.issue.id);
+
+    let harness_project = Uuid::new_v4();
+    let new_in = |project_id: Uuid, title: &str| NewIssue {
+        project_id,
+        title: title.into(),
+        body: "finding".into(),
+        priority: None,
+        labels: vec![],
+        created_by_session_id: Some(f.source),
+        assignee: None,
+        idea_id: None,
+        source_event_id: None,
+        source_finding_ref: None,
+    };
+    {
+        let store = f.handle.store.lock().await;
+        let now = "2026-10-15T00:00:00.000000000Z";
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'harness','#000000',?2,?2)",
+                rusqlite::params![harness_project.to_string(), now],
+            )
+            .unwrap();
+        store
+            .update_issue_status(filed.issue.id, IssueStatus::Closed)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET status='succeeded' WHERE id=?1",
+                [attempt.to_string()],
+            )
+            .unwrap();
+
+        // The harness route resolves the receipt: the key is first-write-wins
+        // and a different request under it files nothing.
+        let harness = store
+            .create_agent_harness_issue_idempotent(
+                f.source,
+                Uuid::new_v4(),
+                &new_in(harness_project, "route finding!"),
+                key,
+            )
+            .unwrap();
+        assert!(!harness.create_fields_match);
+        assert_eq!(harness.issue.id, filed.issue.id);
+        // So does the plain keyed route.
+        let plain = store
+            .create_agent_issue_idempotent_with_key(
+                f.source,
+                Uuid::new_v4(),
+                &new_in(project, "route finding!"),
+                key,
+            )
+            .unwrap();
+        assert!(!plain.create_fields_match);
+        assert_eq!(plain.issue.id, filed.issue.id);
+        let in_harness = store
+            .list_issues(&rsi_common::types::IssueFilter {
+                project_id: Some(harness_project),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(in_harness.is_empty());
+    }
+
+    // The exact original replay still returns the deduped Issue.
+    let replay = f
+        .handle
+        .agent_create_issue(f.source, dedupe_params("route finding!", key, None))
+        .await
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.issue.id, filed.issue.id);
+    assert_eq!(replay.issue.status, IssueStatus::Closed);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn rotated_manager_supersedes_active_review_and_old_reviewer_loses_authority() {
@@ -2522,7 +3040,7 @@ async fn db_review_restart_failpoints_preserve_one_assignment_receipt_and_effect
     }
 
     // A newly opened Store models daemon restart after reviewer termination.
-    let restarted = Store::open(&f.dir.path().join("rsi.db")).unwrap();
+    let restarted = Store::open_test_fixture(&f.dir.path().join("rsi.db")).unwrap();
     let (config, _) = restarted.manager_config_for_caller(f.manager).unwrap();
     let (_, work) = restarted.manager_v2_work(&config, "product").unwrap();
     manager_review_fail_next(ManagerReviewFault::BeforeAdmissionRead);
@@ -2576,7 +3094,7 @@ async fn reserved_review_journals_before_claim_after_restart_without_premature_f
         "reserved"
     );
 
-    let reopened = Store::open(&f.dir.path().join("rsi.db")).unwrap();
+    let reopened = Store::open_test_fixture(&f.dir.path().join("rsi.db")).unwrap();
     assert_eq!(
         reopened
             .reconcile_reserved_manager_reviews_once()
@@ -2848,6 +3366,7 @@ async fn ordinary_work_accepts_only_correlated_independent_committed_evidence() 
                         state: ManagerStageStateV2::Passed,
                         note: "independent proof".into(),
                         evidence: Some(evidence.clone()),
+                        job_evidence: None,
                     },
                     &format!("stage-{i}"),
                 ),
@@ -2943,6 +3462,7 @@ async fn independent_acceptance_and_combined_evidence_record_real_integration() 
                         state: ManagerStageStateV2::Passed,
                         note: "independent proof".into(),
                         evidence: Some(stage_evidence.clone()),
+                        job_evidence: None,
                     },
                     &format!("stage-{}", expected_row_version - 1),
                 ),
@@ -3139,7 +3659,7 @@ async fn migration_scratch(f: &Fixture) -> MigrationScratch {
         &root,
         &["remote", "add", "origin", remote.to_str().unwrap()],
     );
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = Path::new(rsi_common::manifest_dir!()).join("../..");
     let inventory_bytes = std::fs::read(repo.join("tools/released-migrations.json")).unwrap();
     let inventory: Value = serde_json::from_slice(&inventory_bytes).unwrap();
     let migration_dir = inventory["migration_dir"].as_str().unwrap().to_string();
@@ -3317,7 +3837,7 @@ async fn the_schema_head_follows_the_store_layout_of_the_revision() {
             ),
         ],
     );
-    let stale = scratch_store_repo(
+    let _stale = scratch_store_repo(
         &dir.path().join("stale"),
         &[
             ("tools/released-migrations.json", &manifest(8)),
@@ -3384,6 +3904,7 @@ async fn a_source_moved_out_of_scope_has_unknown_freshness_without_foreign_obser
                         artifact_commit: f.source_head.clone(),
                         closure_evidence_id: None,
                     }),
+                    job_evidence: None,
                 },
                 "source",
             ),
@@ -3467,6 +3988,7 @@ async fn accepted_work_survives_seat_move_and_successor_integrates_it() {
                         state: ManagerStageStateV2::Passed,
                         note: "independent proof".into(),
                         evidence: Some(proof.clone()),
+                        job_evidence: None,
                     },
                     &format!("seat-a-stage-{i}"),
                 ),
@@ -4039,6 +4561,18 @@ async fn review_submission_records_manager_notice_and_wakes_idle_manager() {
     assert_eq!(state["verdict"], "changes_requested");
     assert_eq!(state["finding_count"], 2);
     assert_eq!(state["blocking_finding_count"], 1);
+    // #2602: the notice carries the findings (blocking first) so the manager
+    // needs no store query to judge the verdict.
+    assert_eq!(state["findings_truncated"], false);
+    assert_eq!(
+        state["findings"],
+        json!([
+            {"key":"missing-test","severity":"error","blocking":true,
+             "summary":"No regression test","location":null},
+            {"key":"naming","severity":"info","blocking":false,
+             "summary":"Prefer a clearer name","location":null},
+        ])
+    );
     assert_eq!(queued_notice_jobs(&mut rx), vec![*job_id]);
 
     let job = f
@@ -4049,17 +4583,163 @@ async fn review_submission_records_manager_notice_and_wakes_idle_manager() {
         .get_scheduled_job(job_id)
         .unwrap()
         .unwrap();
-    let crate::session::WatchFirePlan::Deliver { tip, message, .. } =
-        f.sessions.plan_terminal_watch_fire(&job).await.unwrap()
-    else {
-        panic!("a submitted review must wake the idle manager");
+    let plan = f.sessions.plan_terminal_watch_fire(&job).await.unwrap();
+    let crate::session::WatchFirePlan::Deliver { tip, message, .. } = plan else {
+        panic!("a submitted review must wake the idle manager: {plan:?}");
     };
     assert_eq!(tip, f.manager);
+    // #2606: a standalone review is a real wake, not a routine notice.
+    assert_eq!(
+        f.handle
+            .store
+            .lock()
+            .await
+            .manager_notice_undelivered_wake_count(*job_id)
+            .unwrap(),
+        1
+    );
     assert!(
         message.contains(&format!(
             "ledger_change subject=review:{assignment_id} version=submitted"
         )),
         "{message}"
+    );
+}
+
+/// #2606: a review a topology execution owns informs the manager once,
+/// through that execution's settled wake. Its `review:*` notice is recorded
+/// and readable but is routine: it never wakes the manager by itself.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn topology_owned_review_notice_is_routine_and_never_wakes_the_manager() {
+    let f = fixture().await;
+    let assignment_id = request_and_activate_db_review(&f, "topology-review-notice").await;
+    {
+        // The request is immutable by trigger; tag it as the executor would
+        // have at reservation time, with the guards dropped for this fixture.
+        let store = f.handle.store.lock().await;
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER manager_review_assignments_v121_identity_immutable;
+                 DROP TRIGGER manager_review_assignments_v121_forward;",
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE manager_review_assignments
+                    SET request_json=json_set(request_json,'$.topology_attempt_id',?2)
+                  WHERE assignment_id=?1",
+                params![assignment_id.to_string(), Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+    }
+    f.handle
+        .agent_submit_review_receipt(
+            f.reviewer,
+            AgentSubmitReviewReceiptRequestV1 {
+                assignment_id,
+                verdict: ManagerReviewVerdictV1::ChangesRequested,
+                findings: vec![ManagerReviewFindingV1 {
+                    key: "missing-test".into(),
+                    severity: ManagerReviewFindingSeverityV1::Error,
+                    summary: "No regression test".into(),
+                    location: None,
+                    blocking: true,
+                }],
+                idempotency_key: "topology-review-notice-receipt".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let store = f.handle.store.lock().await;
+    let notices = review_notices(&store, assignment_id);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let (job_id, kind, _, version, state) = &notices[0];
+    assert_eq!(
+        (kind.as_str(), version.as_str()),
+        ("ledger_change", "submitted")
+    );
+    // The verdict stays in the notice (readable in the inbox).
+    assert_eq!(state["verdict"], "changes_requested");
+    assert_eq!(state["topology_owned"], json!(true));
+    assert_eq!(store.manager_notice_undelivered_count(*job_id).unwrap(), 1);
+    assert_eq!(
+        store
+            .manager_notice_undelivered_wake_count(*job_id)
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn review_notice_findings_reach_the_manager_inbox_bounded_and_scoped() {
+    let f = fixture().await;
+    let assignment_id = request_and_activate_db_review(&f, "review-inbox-findings").await;
+    let long = "x".repeat(2000);
+    let findings = (0..20)
+        .map(|n| ManagerReviewFindingV1 {
+            key: format!("f{n:02}"),
+            severity: ManagerReviewFindingSeverityV1::Warning,
+            summary: long.clone(),
+            location: Some(format!("src/lib.rs:{n}")),
+            // Only the last finding blocks: it must sort first and survive.
+            blocking: n == 19,
+        })
+        .collect();
+    f.handle
+        .agent_submit_review_receipt(
+            f.reviewer,
+            AgentSubmitReviewReceiptRequestV1 {
+                assignment_id,
+                verdict: ManagerReviewVerdictV1::ChangesRequested,
+                findings,
+                idempotency_key: "review-inbox-findings-receipt".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let inbox = f
+        .handle
+        .agent_manager_inbox(
+            f.manager,
+            rsi_common::harness_manager::AgentManagerInboxRequestV1::default(),
+        )
+        .await
+        .unwrap();
+    let subject = format!("review:{assignment_id}");
+    let notice = inbox
+        .notices
+        .iter()
+        .find(|notice| notice.subject_id == subject)
+        .unwrap_or_else(|| panic!("no review notice in {:?}", inbox.notices));
+    assert_eq!(notice.state["finding_count"], 20);
+    assert_eq!(notice.state["findings_truncated"], true);
+    let findings = notice.state["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 16);
+    assert_eq!(findings[0]["key"], "f19");
+    assert_eq!(findings[0]["blocking"], true);
+    assert_eq!(findings[0]["location"], "src/lib.rs:19");
+    assert_eq!(findings[1]["key"], "f00");
+    assert_eq!(
+        findings[1]["summary"].as_str().unwrap().chars().count(),
+        600
+    );
+
+    // A session that is not the owning manager is refused the inbox.
+    assert!(
+        f.handle
+            .agent_manager_inbox(
+                f.reviewer,
+                rsi_common::harness_manager::AgentManagerInboxRequestV1::default()
+            )
+            .await
+            .is_err(),
+        "a foreign session must not read the review findings"
     );
 }
 
@@ -4110,10 +4790,9 @@ async fn review_receipt_missing_records_manager_notice_and_wakes_idle_manager() 
         .get_scheduled_job(job_id)
         .unwrap()
         .unwrap();
-    let crate::session::WatchFirePlan::Deliver { tip, message, .. } =
-        f.sessions.plan_terminal_watch_fire(&job).await.unwrap()
-    else {
-        panic!("a failed review must wake the idle manager");
+    let plan = f.sessions.plan_terminal_watch_fire(&job).await.unwrap();
+    let crate::session::WatchFirePlan::Deliver { tip, message, .. } = plan else {
+        panic!("a failed review must wake the idle manager: {plan:?}");
     };
     assert_eq!(tip, f.manager);
     assert!(message.contains(&format!("subject=review:{assignment_id} version=failed")));

@@ -46,6 +46,12 @@ use uuid::Uuid;
 /// original persisted deadline and never recompute it.
 const AGENT_MESSAGE_DEFAULT_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
 
+/// #2411: allow a pending wake/job to finish even when mail arrives before the
+/// recipient's turn ends. Six hours is the bounded fallback for all pending
+/// waits, including missing deadlines and multiple wakes/jobs; never renew it
+/// on retry or let an indefinitely armed wake keep mail alive forever.
+const AGENT_MESSAGE_PARKED_DEFAULT_EXPIRY: chrono::Duration = chrono::Duration::hours(6);
+
 /// P2-06a: **the narrowed crash-window rule, in its single canonical form.**
 ///
 /// Held as a named constant rather than inlined so the rule has exactly one
@@ -551,6 +557,89 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// #2462: name why a session ended before any provider output. Sets
+    /// `terminal_reason` when it is empty and appends one System event with the
+    /// explanation, in one transaction, so a worker that fails within seconds
+    /// of creation is never silent. Only a terminal (`Failed`/`Interrupted`)
+    /// session whose `terminal_reason` is empty is written; any other state, or
+    /// a session already explained, is left alone. Returns whether it wrote.
+    /// `cause` and `explanation` are static strings, never provider text.
+    pub fn record_session_failure_cause(
+        &self,
+        session_id: Uuid,
+        cause: &str,
+        explanation: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let wrote = Self::record_failure_cause_in_tx(&tx, session_id, cause, explanation)?;
+        tx.commit()?;
+        Ok(wrote)
+    }
+
+    /// #3141: [`Self::record_session_failure_cause`] for a session that has
+    /// already been explained once. A continuation or rotation that a refused
+    /// OpenRouter Harness preflight ends Failed must name that cause even when
+    /// an earlier run left a `terminal_reason`, so this replaces it. Still only
+    /// a `Failed`/`Interrupted` session is written.
+    pub fn replace_session_failure_cause(
+        &self,
+        session_id: Uuid,
+        cause: &str,
+        explanation: &str,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE sessions SET terminal_reason=NULL
+             WHERE id=?1 AND status IN ('Failed','Interrupted')",
+            params![session_id.to_string()],
+        )?;
+        let wrote = Self::record_failure_cause_in_tx(&tx, session_id, cause, explanation)?;
+        tx.commit()?;
+        Ok(wrote)
+    }
+
+    /// [`Store::record_session_failure_cause`] inside a caller-owned transaction.
+    pub(super) fn record_failure_cause_in_tx(
+        tx: &Transaction<'_>,
+        session_id: Uuid,
+        cause: &str,
+        explanation: &str,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE sessions SET terminal_reason=?1
+             WHERE id=?2 AND status IN ('Failed','Interrupted')
+               AND COALESCE(TRIM(terminal_reason), '') = ''",
+            params![cause, session_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        let next_sequence: i32 = tx.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM conversation_events WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Self::insert_event_in_transaction(
+            tx,
+            &ConversationEvent {
+                id: 0,
+                session_id,
+                sequence: next_sequence,
+                event_type: EventType::System,
+                role: None,
+                content: explanation.into(),
+                tool_name: None,
+                tool_input: None,
+                tool_use_id: None,
+                offload_id: None,
+                metadata: Some(Box::new(serde_json::json!({ "failure_cause": cause }))),
+                created_at: Utc::now(),
+            },
+            None,
+        )?;
+        Ok(true)
     }
 
     /// Read only a terminal session's latest persisted sandbox observation.
@@ -1328,6 +1417,24 @@ impl Store {
         })
     }
 
+    /// Whether `owner_session_id` already accepted a message under
+    /// `idempotency_key`, whatever its payload. Lets a caller whose payload
+    /// carries changing evidence dedupe by key instead of tripping the
+    /// replay fingerprint.
+    pub(super) fn agent_message_key_accepted(
+        &self,
+        owner_session_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        let digest = agent_message_idempotency_digest(owner_session_id, idempotency_key);
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_messages
+             WHERE owner_session_id=?1 AND idempotency_digest=?2)",
+            params![owner_session_id.to_string(), digest],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Accept one `AgentSendMessage`, or exactly replay a prior acceptance
     /// under the same `(owner, idempotency key)` (P2-03).
     ///
@@ -1441,14 +1548,17 @@ impl Store {
         // snapshot can race a terminal transition or rotation, so bind a new
         // acceptance to the current durable lineage and authority while this
         // BEGIN IMMEDIATE transaction holds the SQLite write lock.
-        if validate_current_target {
+        let target_parked = if validate_current_target {
             validate_agent_message_live_target(
+                self,
                 &tx,
                 owner_session_id,
                 request.target_session_id,
                 manager_scope.is_some(),
-            )?;
-        }
+            )?
+        } else {
+            false
+        };
 
         // Caps count PENDING rows against the immutable logical root, never a
         // delivery tip.
@@ -1482,10 +1592,15 @@ impl Store {
         // Sample only for a new insert; an exact replay retains its first deadline.
         let now = acceptance_clock();
         let now_string = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let default_expiry = if target_parked {
+            AGENT_MESSAGE_PARKED_DEFAULT_EXPIRY
+        } else {
+            AGENT_MESSAGE_DEFAULT_EXPIRY
+        };
         let expires_string = Some(
             request
                 .expires_at
-                .unwrap_or(now + AGENT_MESSAGE_DEFAULT_EXPIRY)
+                .unwrap_or(now + default_expiry)
                 .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         );
 
@@ -1597,6 +1712,24 @@ impl Store {
         after: Option<AgentMessageDispatchCursor>,
         limit: usize,
     ) -> Result<DispatchableAgentMessagePage> {
+        self.list_dispatchable_agent_messages_within(after, limit, dispatch_scan_max_millis())
+    }
+
+    /// [`Self::list_dispatchable_agent_messages`] with the wall-clock bound
+    /// passed in rather than read from
+    /// [`AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS`] (#2207).
+    ///
+    /// The time bound is checked AFTER a row is resolved and pushed, so any
+    /// `max_scan_millis`, including `0`, still returns at least one row plus a
+    /// continuation cursor when more rows are queued: the progress guarantee
+    /// the reconciliation drain and the boundary pull rely on. A test about
+    /// page SHAPE passes `u64::MAX` so a loaded host cannot cut its page short.
+    pub fn list_dispatchable_agent_messages_within(
+        &self,
+        after: Option<AgentMessageDispatchCursor>,
+        limit: usize,
+        max_scan_millis: u64,
+    ) -> Result<DispatchableAgentMessagePage> {
         let limit = limit.clamp(1, AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS);
         let started = std::time::Instant::now();
         let now = Utc::now();
@@ -1705,6 +1838,15 @@ impl Store {
                     Some(facts) if terminal_recovery_pending_tx(&tx, delivery_session_id)? => {
                         AgentMessageDispatchEligibility::RecoveryPending(facts.status)
                     }
+                    Some(facts)
+                        if parked_delivery_tip_pending(
+                            self,
+                            delivery_session_id,
+                            facts.status,
+                        )? =>
+                    {
+                        AgentMessageDispatchEligibility::AwaitingResume(facts.status)
+                    }
                     Some(facts) => {
                         AgentMessageDispatchEligibility::DeliverySessionNotLive(facts.status)
                     }
@@ -1730,7 +1872,7 @@ impl Store {
                 eligibility,
             });
 
-            if started.elapsed().as_millis() >= u128::from(AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS) {
+            if started.elapsed().as_millis() >= u128::from(max_scan_millis) {
                 truncated_by_time = true;
                 break;
             }
@@ -2721,6 +2863,26 @@ impl Store {
         let attempt_rows = tx.execute(
             "UPDATE agent_message_delivery_attempts
                 SET boundary_value=?3,
+                    -- The ONLY production writer of `correlated` (#47). The
+                    -- acknowledging response carries the genuine provider turn
+                    -- id (`boundary_value` above), which IS the correlation: the
+                    -- turn the daemon dispatched is the turn the provider
+                    -- answered. It is a compare-and-swap on
+                    -- `correlation_pending`, so it is the same statement that
+                    -- seals the attempt acknowledged, and it never touches
+                    -- `not_applicable` (every non-AppServer provider) or
+                    -- `sealed_live_uncertain` (sealing is irreversible: a seal
+                    -- that won the race keeps its verdict, and the V81
+                    -- correlation-coherence trigger would refuse the move).
+                    -- That makes `correlated AND effect_acknowledged` -- the
+                    -- AppServer turn-gate-open precondition -- reachable from
+                    -- production.
+                    correlated_at=CASE WHEN correlation_state='correlation_pending'
+                        THEN ?5 ELSE correlated_at END,
+                    correlation_source=CASE WHEN correlation_state='correlation_pending'
+                        THEN 'app_server_response' ELSE correlation_source END,
+                    correlation_state=CASE WHEN correlation_state='correlation_pending'
+                        THEN 'correlated' ELSE correlation_state END,
                     admission_classification=COALESCE(admission_classification,
                         CASE WHEN ?4 THEN 'admitted_effect_possible' ELSE NULL END),
                     admission_recorded_at=COALESCE(admission_recorded_at,
@@ -3800,6 +3962,11 @@ impl Store {
                 "agent_message_terminal_settlement_recovery_pending:{delivery_session_id}"
             )));
         }
+        if parked_delivery_tip_pending(self, delivery_session_id, delivery.status)? {
+            return Err(DaemonError::Store(format!(
+                "agent_message_terminal_settlement_awaiting_resume:{delivery_session_id}"
+            )));
+        }
 
         let next_state_version = state_version
             .checked_add(1)
@@ -3893,6 +4060,7 @@ impl Store {
     /// `launched`, exceeds the frozen target cap, or when any affected-row
     /// count is not exactly one — every one of which rolls the whole
     /// transaction back.
+    #[cfg(test)]
     pub(crate) fn settle_reserved_child_failure(
         &self,
         spawn_request_id: Uuid,
@@ -3927,8 +4095,6 @@ impl Store {
         if request.state == AgentSpawnStateV1::Failed {
             tx.commit()?;
             return Ok(SettleReservedChildFailureOutcome {
-                spawn_request_id,
-                owner_session_id: request.owner_session_id,
                 child_session_id: request.child_session_id,
                 already_failed: true,
                 rows: Vec::new(),
@@ -4008,8 +4174,6 @@ impl Store {
 
         tx.commit()?;
         Ok(SettleReservedChildFailureOutcome {
-            spawn_request_id,
-            owner_session_id: request.owner_session_id,
             child_session_id: request.child_session_id,
             already_failed: false,
             rows,
@@ -5137,10 +5301,12 @@ pub enum PermitSettleOutcomeV1 {
 
 /// C-P2-18's frozen per-transaction target cap. Chosen so one settlement is a
 /// bounded unit of work; overflow is an error, never a silent truncation.
+#[cfg(test)]
 pub(crate) const AGENT_MESSAGE_SPAWN_SETTLEMENT_MAX_TARGETS: usize = 128;
 
 /// How one message addressed to a failed reservation was settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum SpawnSettlementDisposition {
     /// Never delivered: a null-attempt `spawn_settlement` edge to `failed`.
     QueuedFailed,
@@ -5156,6 +5322,7 @@ pub(crate) enum SpawnSettlementDisposition {
 
 /// One settled row, reported for post-commit publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SpawnSettlementRowOutcome {
     pub(crate) message_id: Uuid,
     pub(crate) disposition: SpawnSettlementDisposition,
@@ -5165,9 +5332,8 @@ pub(crate) struct SpawnSettlementRowOutcome {
 
 /// What one `settle_reserved_child_failure` call durably did.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct SettleReservedChildFailureOutcome {
-    pub(crate) spawn_request_id: Uuid,
-    pub(crate) owner_session_id: Uuid,
     pub(crate) child_session_id: Uuid,
     /// True when the reservation was already `failed`; the call was a
     /// read-only exact replay and settled nothing.
@@ -5181,6 +5347,7 @@ pub(crate) struct SettleReservedChildFailureOutcome {
 /// attempt, or refused trigger propagates as an error and rolls the entire
 /// settlement — including the spawn failure — back.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn settle_one_spawn_settlement_row(
     tx: &Transaction<'_>,
     message_id: Uuid,
@@ -5641,6 +5808,53 @@ pub const AGENT_MESSAGE_DISPATCH_SCAN_MAX_ROWS: usize = 64;
 /// whichever bound trips first and hands back a cursor.
 pub const AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS: u64 = 10;
 
+/// The wall-clock bound the production scan uses: the constant, always, except
+/// in test builds where [`override_dispatch_scan_max_millis_for_test`] has
+/// installed one for the current thread (#2207).
+#[cfg(not(any(test, feature = "test-seam")))]
+#[inline]
+fn dispatch_scan_max_millis() -> u64 {
+    AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn dispatch_scan_max_millis() -> u64 {
+    DISPATCH_SCAN_MAX_MILLIS_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(AGENT_MESSAGE_DISPATCH_SCAN_MAX_MILLIS)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+thread_local! {
+    static DISPATCH_SCAN_MAX_MILLIS_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous per-thread scan bound when dropped.
+#[cfg(any(test, feature = "test-seam"))]
+#[must_use = "the override ends when the guard is dropped"]
+pub struct DispatchScanMaxMillisGuard {
+    previous: Option<u64>,
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl Drop for DispatchScanMaxMillisGuard {
+    fn drop(&mut self) {
+        DISPATCH_SCAN_MAX_MILLIS_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Replace the dispatch scan's wall-clock bound on THIS thread until the guard
+/// drops, so a test that pins page shape through a caller that does not take
+/// the bound (the boundary pull, the reconciliation drain) cannot be cut short
+/// by machine speed. Production code never has this: it is compiled only under
+/// `test`/`test-seam` and the production default is unchanged (#2207).
+#[cfg(any(test, feature = "test-seam"))]
+pub fn override_dispatch_scan_max_millis_for_test(millis: u64) -> DispatchScanMaxMillisGuard {
+    let previous = DISPATCH_SCAN_MAX_MILLIS_OVERRIDE.with(|cell| cell.replace(Some(millis)));
+    DispatchScanMaxMillisGuard { previous }
+}
+
 /// Keyset position in the global `(created_at,id)` FIFO over queued mail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentMessageDispatchCursor {
@@ -5743,6 +5957,12 @@ pub enum AgentMessageDispatchEligibility {
     /// incident still owns recovery. Dispatch and terminal settlement both
     /// skip it until that owner resolves or admits a successor.
     RecoveryPending(SessionStatus),
+    /// #2144: the tip is a parked session (turn ended without a final report,
+    /// resumed by its own armed wake or running daemon job). Its mail stays
+    /// `queued`: dispatch and terminal settlement both skip it until the resume
+    /// makes the tip live, or the session reports or loses its wake and the
+    /// row settles as terminal-before-delivery (or expires).
+    AwaitingResume(SessionStatus),
     /// The tip exists but its status does not admit delivery. This is the guard
     /// that carries the rotated-away case.
     DeliverySessionNotLive(SessionStatus),
@@ -5943,7 +6163,10 @@ pub(super) fn arm_agent_message_watch_in_tx(
            FROM sessions s WHERE s.id=?7",
         params![
             job_id.to_string(),
-            format!("agent-message-{delivery_session_id}"),
+            format!(
+                "{}{delivery_session_id}",
+                super::worker_no_result::AGENT_MESSAGE_WATCH_NAME_PREFIX
+            ),
             format!("agent message delivery terminal watch {delivery_session_id}"),
             schedule_json,
             now_string,
@@ -6071,6 +6294,7 @@ impl AcceptAgentMessageOutcome {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn deduplicated(&self) -> bool {
         matches!(self, Self::Replayed(_))
     }
@@ -6514,12 +6738,18 @@ fn message_queue_summary(
     }))
 }
 
+/// Returns whether the accepted target is *parked* (#2144): a `Completed`
+/// delivery tip that has no final report and that the daemon will resume from
+/// its own wake or job. Such a target accepts mail; the mail stays `queued`
+/// until the resume makes the tip live. Any other non-live status is refused
+/// `TargetTerminal`.
 fn validate_agent_message_live_target(
+    store: &Store,
     tx: &Transaction<'_>,
     owner_session_id: Uuid,
     target_session_id: Uuid,
     manager_authorized: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let root_exists = tx
         .query_row(
             "SELECT 1 FROM sessions WHERE id=?1",
@@ -6543,7 +6773,7 @@ fn validate_agent_message_live_target(
             |row| row.get(0),
         )?;
         if reserved {
-            return Ok(());
+            return Ok(false);
         }
         return Err(crate::error::agent_message_error(
             AgentMessageErrorCodeV1::TargetUnknown,
@@ -6593,19 +6823,39 @@ fn validate_agent_message_live_target(
     }
 
     let status = str_to_session_status(&status_text)?;
-    if !matches!(
-        status,
-        SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval
-    ) {
-        return Err(crate::error::agent_message_error(
-            AgentMessageErrorCodeV1::TargetTerminal,
-            Some(format!("{delivery_tip}:{status_text}")),
-            None,
-            None,
-            None,
-        ));
+    if session_status_admits_delivery(status) {
+        // The worker can arm its wait before its provider turn has exited.
+        // Use the same pending-work predicate for its deadline in that window;
+        // this changes neither live-target authorization nor dispatch liveness.
+        return Ok(store.parked_session_pending(delivery_tip)?.is_some());
     }
-    Ok(())
+    if parked_delivery_tip_pending(store, delivery_tip, status)? {
+        return Ok(true);
+    }
+    Err(crate::error::agent_message_error(
+        AgentMessageErrorCodeV1::TargetTerminal,
+        Some(format!("{delivery_tip}:{status_text}")),
+        None,
+        None,
+        None,
+    ))
+}
+
+/// #2144: whether `status` is a *parked* tip, a `Completed` session whose turn
+/// ended without a final report but which owns an armed wake or a non-terminal
+/// daemon job, so the daemon resumes it ([`Store::parked_session_pending`], the
+/// predicate that keeps its Issue bound in #2212). Its mail is held `queued`
+/// and delivered once the resume makes the tip live; a session with a final
+/// report, or with nothing left to resume it, is terminal.
+fn parked_delivery_tip_pending(
+    store: &Store,
+    delivery_session_id: Uuid,
+    status: SessionStatus,
+) -> Result<bool> {
+    if status != SessionStatus::Completed {
+        return Ok(false);
+    }
+    Ok(store.parked_session_pending(delivery_session_id)?.is_some())
 }
 
 pub(super) fn resolve_lineage_tip(tx: &Transaction<'_>, origin: Uuid) -> Result<Uuid> {
@@ -7755,6 +8005,528 @@ mod tests {
         assert!(replayed.deduplicated());
         assert_eq!(replayed.receipt().message_id, receipt.message_id);
         assert_eq!(replayed.receipt().expires_at, receipt.expires_at);
+    }
+
+    /// #2144: a `Completed` worker parked on its own `resume` wake, with no final
+    /// report: the daemon will resume it, so it is live for mail.
+    fn park_on_resume_wake(store: &Store, session: Uuid, now: DateTime<Utc>) -> Uuid {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Completed' WHERE id=?1",
+                [session.to_string()],
+            )
+            .expect("complete the turn");
+        let wake = ScheduledJob {
+            id: Uuid::new_v4(),
+            name: "scoped-test-wake".into(),
+            message: "the job finished".into(),
+            schedule: ScheduleSpec {
+                recurrence: Recurrence::Once,
+                anchor: now + chrono::Duration::hours(1),
+            },
+            last_fired_at: None,
+            next_fire_at: now + chrono::Duration::hours(1),
+            enabled: true,
+            working_dir: None,
+            provider: None,
+            model: None,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+            wake_mode: WakeMode::Resume,
+            wake_session_id: Some(session),
+        };
+        store.insert_scheduled_job(&wake).expect("arm the wake");
+        wake.id
+    }
+
+    /// A parent-owned target the owner may mail through the guarded
+    /// acceptance path.
+    fn owned_target(store: &Store) -> (Uuid, Uuid) {
+        let owner = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        acceptance_owner(store, owner);
+        let mut row = test_session(target, std::path::PathBuf::from("/tmp"));
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.parent_id = Some(owner);
+        store.insert_session(&row).expect("insert target");
+        (owner, target)
+    }
+
+    fn assert_target_terminal(error: &DaemonError) {
+        let DaemonError::StructuredRpc { message, .. } = error else {
+            panic!("expected a typed messaging error, got: {error}");
+        };
+        assert!(
+            message.starts_with(AgentMessageErrorCodeV1::TargetTerminal.as_str()),
+            "{message}"
+        );
+    }
+
+    /// #2144: a worker parked on its own wake (turn ended, no final report)
+    /// accepts durable mail instead of refusing `target_terminal`. The mail
+    /// waits `queued` and is neither delivered nor failed while the worker is
+    /// parked, outlives the 30-minute default, and becomes deliverable the
+    /// moment the wake resumes the session.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_session_parked_on_its_wake_accepts_mail_that_waits_for_the_resume() {
+        let store = Store::open_in_memory().expect("open V81 store");
+        let (owner, target) = owned_target(&store);
+        park_on_resume_wake(&store, target, Utc::now());
+
+        let accepted_at = Utc::now();
+        let accepted = store
+            .accept_agent_message_inner(
+                owner,
+                None,
+                None,
+                &send_request(target, "parked-1", "heads up"),
+                true,
+                || accepted_at,
+            )
+            .expect("a parked session accepts mail");
+        let message_id = accepted.receipt().message_id;
+        assert_eq!(accepted.receipt().state, AgentMessageStateV1::Queued);
+        assert_eq!(
+            accepted.receipt().expires_at,
+            Some(accepted_at + AGENT_MESSAGE_PARKED_DEFAULT_EXPIRY)
+        );
+        // The same key replays the same message; mail is never queued twice.
+        let replay = store
+            .accept_authorized_agent_message(
+                owner,
+                None,
+                None,
+                &send_request(target, "parked-1", "heads up"),
+            )
+            .expect("replay");
+        assert!(replay.receipt().deduplicated);
+        assert_eq!(replay.receipt().message_id, message_id);
+
+        let eligibility = |store: &Store| {
+            let page = store
+                .list_dispatchable_agent_messages(None, 64)
+                .expect("select mail");
+            assert_eq!(page.messages.len(), 1);
+            page.messages[0].eligibility
+        };
+        assert_eq!(
+            eligibility(&store),
+            AgentMessageDispatchEligibility::AwaitingResume(SessionStatus::Completed)
+        );
+        // The reconciler leaves parked mail alone.
+        let report = crate::store::agent_message_reconciler::reconcile_agent_messages_pass(
+            &store,
+            Uuid::new_v4(),
+            crate::store::agent_message_reconciler::ReconciliationPassBudget::default(),
+        );
+        assert_eq!(
+            (report.expired, report.terminal_failed, report.errors),
+            (0, 0, 0)
+        );
+        let (state, attempts): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT state, attempt_count FROM agent_messages WHERE id=?1",
+                [message_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read parked mail");
+        assert_eq!((state.as_str(), attempts), ("queued", 0));
+
+        // The wake resumes the session: the same row is now deliverable.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Running' WHERE id=?1",
+                [target.to_string()],
+            )
+            .expect("resume");
+        assert_eq!(eligibility(&store), AgentMessageDispatchEligibility::Ready);
+    }
+
+    /// #2411: advance the acceptance clock by a simulated 60-minute job.
+    /// Exercise the real expiry reconciler, dispatcher selection, claim and
+    /// admission writers; no provider process or elapsed-time sleep is needed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn pending_job_mail_survives_sixty_minutes_and_is_injected_at_wake() {
+        use crate::store::agent_jobs::NewAgentJob;
+        use rsi_common::agent_jobs::{AgentJobResultV1, JobParams, JobState, JobWake};
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+
+        for status in [SessionStatus::Running, SessionStatus::Completed] {
+            for wait in ["resume", "when", "when_no_deadline", "job_only"] {
+                let store = Store::open_in_memory().expect("store");
+                let (owner, target) = owned_target(&store);
+                let wake_at = Utc::now();
+                let accepted_at = wake_at - chrono::Duration::minutes(60);
+                let mut jobs = Vec::new();
+                if wait != "resume" {
+                    // Two owned jobs also cover a batch whose last job wakes us.
+                    for _ in 0..2 {
+                        let id = Uuid::new_v4();
+                        let new = NewAgentJob {
+                            id,
+                            owner_session_id: target,
+                            project_id: None,
+                            name: None,
+                            params: JobParams::Test(
+                                serde_json::from_value(serde_json::json!({
+                                    "scoped_test": {"base": "origin/rolling"},
+                                    "timeout_minutes": 60
+                                }))
+                                .unwrap(),
+                            ),
+                            cwd: "/tmp".into(),
+                            unit_name: format!("fixture-{id}"),
+                            log_path: format!("/tmp/{id}.log"),
+                            status_path: format!("/tmp/{id}.status"),
+                            idempotency_key: None,
+                            wake: JobWake::None,
+                        };
+                        store.insert_agent_job(&new, accepted_at).unwrap();
+                        jobs.push(id);
+                    }
+                }
+                if wait != "job_only" {
+                    let id = park_on_resume_wake(&store, target, accepted_at);
+                    if wait.starts_with("when") {
+                        let mut wake = store.get_scheduled_job(&id).unwrap().unwrap();
+                        store.toggle_scheduled_job(&id).unwrap();
+                        wake.id = Uuid::new_v4();
+                        wake.created_at = accepted_at;
+                        wake.updated_at = accepted_at;
+                        wake.next_fire_at = accepted_at;
+                        store
+                            .insert_wake_when(
+                                &wake,
+                                &WakeWhenState {
+                                    predicate: WakePredicate {
+                                        jobs_terminal: Some(jobs.clone()),
+                                        sha_on_rolling: None,
+                                        issue_closed: None,
+                                        todo_closed: None,
+                                        topology_execution_settled: None,
+                                        health_anomaly: None,
+                                        settlement_run_settled: None,
+                                    },
+                                    armed_at: accepted_at,
+                                    deadline: (wait == "when").then_some(wake_at),
+                                    repo_dir: None,
+                                },
+                                false,
+                            )
+                            .unwrap();
+                    }
+                }
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET status=?2 WHERE id=?1",
+                        params![target.to_string(), session_status_to_str(status)],
+                    )
+                    .unwrap();
+                let request = send_request(target, "long-job", "revised plan");
+                let accepted = store
+                    .accept_agent_message_inner(owner, None, None, &request, true, || accepted_at)
+                    .expect("authorized pending recipient accepts");
+                let receipt = accepted.receipt();
+                assert_eq!(
+                    receipt.expires_at,
+                    Some(accepted_at + chrono::Duration::hours(6))
+                );
+
+                // Explicit caller deadlines win on both sides of the default.
+                for (key, duration) in [
+                    ("short", chrono::Duration::minutes(30)),
+                    ("long", chrono::Duration::hours(8)),
+                ] {
+                    let mut explicit = send_request(target, key, "caller deadline");
+                    explicit.expires_at = Some(accepted_at + duration);
+                    let first = store
+                        .accept_agent_message_inner(owner, None, None, &explicit, true, || {
+                            accepted_at
+                        })
+                        .unwrap();
+                    assert_eq!(first.receipt().expires_at, explicit.expires_at);
+                    let replay = store
+                        .accept_agent_message_inner(owner, None, None, &explicit, true, || {
+                            panic!("retry must not sample the clock")
+                        })
+                        .unwrap();
+                    assert_eq!(replay.receipt().expires_at, explicit.expires_at);
+                }
+                // Pending work grants no authority to another sender or scope.
+                let foreign = Uuid::new_v4();
+                acceptance_owner(&store, foreign);
+                let error = store
+                    .accept_authorized_agent_message(
+                        foreign,
+                        None,
+                        None,
+                        &send_request(target, "foreign", "denied"),
+                    )
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(AgentMessageErrorCodeV1::TargetNotAuthorized.as_str())
+                );
+                let error = store
+                    .accept_authorized_agent_message(foreign, None, Some(Uuid::new_v4()), &request)
+                    .unwrap_err();
+                assert!(error.to_string().contains("agent_verb_scope_denied"));
+
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET status='Completed' WHERE id=?1",
+                        [target.to_string()],
+                    )
+                    .unwrap();
+                let report = crate::store::agent_message_reconciler::reconcile_agent_messages_pass(
+                    &store,
+                    Uuid::new_v4(),
+                    crate::store::agent_message_reconciler::ReconciliationPassBudget::default(),
+                );
+                assert_eq!(
+                    (report.expired, report.terminal_failed, report.errors),
+                    (1, 0, 0)
+                );
+                let page = store
+                    .list_dispatchable_agent_messages_within(None, 64, u64::MAX)
+                    .unwrap();
+                assert_eq!(
+                    page.messages.len(),
+                    2,
+                    "only the explicit short deadline expired"
+                );
+                for message in &page.messages {
+                    assert_eq!(
+                        message.eligibility,
+                        AgentMessageDispatchEligibility::AwaitingResume(SessionStatus::Completed)
+                    );
+                }
+                // Settle the simulated jobs and resume, as the wake does. Mail
+                // must reach the real claim/admission seam at this boundary.
+                for id in jobs {
+                    store
+                        .settle_agent_job(
+                            id,
+                            JobState::Succeeded,
+                            &AgentJobResultV1::default(),
+                            false,
+                            wake_at,
+                        )
+                        .unwrap();
+                }
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET status='Running' WHERE id=?1",
+                        [target.to_string()],
+                    )
+                    .unwrap();
+                let replay = store
+                    .accept_agent_message_inner(owner, None, None, &request, true, || {
+                        panic!("wake/retry must preserve the first deadline")
+                    })
+                    .unwrap();
+                assert!(replay.deduplicated());
+                assert_eq!(replay.receipt().expires_at, receipt.expires_at);
+                let page = store
+                    .list_dispatchable_agent_messages_within(None, 64, u64::MAX)
+                    .unwrap();
+                let message = page
+                    .messages
+                    .iter()
+                    .find(|m| m.message_id == receipt.message_id)
+                    .unwrap();
+                assert_eq!(message.eligibility, AgentMessageDispatchEligibility::Ready);
+                let invocation = Uuid::new_v4();
+                store.conn.execute(
+                    "INSERT INTO model_invocations
+                     (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,provider,model,backend,model_tier,effort,trigger_source,session_id,created_at)
+                     VALUES (?1,'agent.deliver','orchestration','foreground','paid_capable','admitted','running','Claude','claude-sonnet-5','Claude','premium','high','test',?2,?3)",
+                    params![invocation.to_string(), target.to_string(), TRIGGER_TS],
+                ).unwrap();
+                let facts = message.delivery.as_ref().unwrap();
+                let provider = facts.provider_kind;
+                let claim = store
+                    .claim_agent_message_exact(&ClaimAgentMessageRequest {
+                        message_id: message.message_id,
+                        owner_session_id: owner,
+                        logical_root_session_id: target,
+                        expected_state_version: message.state_version,
+                        expected_current_attempt_number: message.current_attempt_number,
+                        delivery_session_id: target,
+                        expected_session_generation: facts.generation,
+                        expected_prior_model_invocation_id: facts.prior_model_invocation_id,
+                        delivery_model_invocation_id: invocation,
+                        delivery_boot_id: Uuid::new_v4(),
+                        claim_token: Uuid::new_v4(),
+                        provider_kind: provider,
+                        claim_expires_at: wake_at + chrono::Duration::minutes(5),
+                        authority_id: owner,
+                    })
+                    .unwrap();
+                let ClaimAgentMessageOutcome::Claimed(fence) = claim else {
+                    panic!("wake must claim mail: {claim:?}");
+                };
+                store
+                    .mark_agent_message_attempt_dispatching(&fence)
+                    .unwrap();
+                let outcome = store
+                    .record_agent_message_admission(
+                        &fence,
+                        &BoundaryAdmissionV1 {
+                            provider_kind: provider,
+                            capability_kind: provider.capability_kind(),
+                            delivery_session_id: target,
+                            session_generation: facts.generation,
+                            model_invocation_id: invocation,
+                            native_turn_id: None,
+                            classification: BoundaryClassificationV1::AdmittedEffectPossible,
+                            provider_error_class: None,
+                        },
+                        NoEffectDisposition::Failed,
+                        owner,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    RecordAdmissionOutcome::Recorded {
+                        state: AgentMessageStateV1::Injected,
+                        state_version: 2,
+                    }
+                );
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn unparked_authorized_mail_still_expires_after_thirty_minutes() {
+        let store = Store::open_in_memory().unwrap();
+        let (owner, target) = owned_target(&store);
+        let accepted_at = Utc::now() - chrono::Duration::minutes(60);
+        let accepted = store
+            .accept_agent_message_inner(
+                owner,
+                None,
+                None,
+                &send_request(target, "ordinary", "hello"),
+                true,
+                || accepted_at,
+            )
+            .unwrap();
+        assert_eq!(
+            accepted.receipt().expires_at,
+            Some(accepted_at + chrono::Duration::minutes(30))
+        );
+        let report = crate::store::agent_message_reconciler::reconcile_agent_messages_pass(
+            &store,
+            Uuid::new_v4(),
+            crate::store::agent_message_reconciler::ReconciliationPassBudget::default(),
+        );
+        assert_eq!(
+            (report.expired, report.terminal_failed, report.errors),
+            (1, 0, 0)
+        );
+    }
+
+    /// #2144: only a parked session is live for mail. A session whose final
+    /// handoff is written, or that no longer has a wake or job to resume it,
+    /// still refuses `target_terminal` at acceptance, and mail already queued
+    /// to it settles terminal-before-delivery instead of waiting forever.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn a_session_with_a_final_handoff_or_no_wake_still_refuses_mail() {
+        let store = Store::open_in_memory().expect("open V81 store");
+        let (owner, reported) = owned_target(&store);
+        park_on_resume_wake(&store, reported, Utc::now());
+        let queued = store
+            .accept_authorized_agent_message(
+                owner,
+                None,
+                None,
+                &send_request(reported, "before-handoff", "queued while parked"),
+            )
+            .expect("accepted while parked")
+            .receipt()
+            .message_id;
+
+        // The worker writes its final handoff: it is terminal now.
+        store
+            .insert_event(&rsi_common::types::ConversationEvent {
+                id: 0,
+                session_id: reported,
+                sequence: 1,
+                event_type: rsi_common::types::EventType::Message,
+                role: Some(rsi_common::types::Role::Assistant),
+                content: "PIPELINE HANDOFF — IMPLEMENTATION:\nFriction: none".into(),
+                tool_name: None,
+                tool_input: None,
+                created_at: Utc::now(),
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .expect("final handoff");
+        let error = store
+            .accept_authorized_agent_message(
+                owner,
+                None,
+                None,
+                &send_request(reported, "after-handoff", "too late"),
+            )
+            .expect_err("a reported worker is terminal");
+        assert_target_terminal(&error);
+
+        // A Completed session with nothing to resume it is terminal as well.
+        let (silent_owner, silent) = owned_target(&store);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Completed' WHERE id=?1",
+                [silent.to_string()],
+            )
+            .expect("complete");
+        let error = store
+            .accept_authorized_agent_message(
+                silent_owner,
+                None,
+                None,
+                &send_request(silent, "no-wake", "nobody will read this"),
+            )
+            .expect_err("no wake or job means terminal");
+        assert_target_terminal(&error);
+
+        // Mail queued while it was parked is no longer held: the reconciler
+        // settles it as terminal-before-delivery.
+        let report = crate::store::agent_message_reconciler::reconcile_agent_messages_pass(
+            &store,
+            Uuid::new_v4(),
+            crate::store::agent_message_reconciler::ReconciliationPassBudget::default(),
+        );
+        assert_eq!(
+            (report.expired, report.terminal_failed, report.errors),
+            (0, 1, 0)
+        );
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM agent_messages WHERE id=?1",
+                [queued.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read settled mail");
+        assert_eq!(state, "failed");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -8943,7 +9715,7 @@ mod tests {
     }
 
     fn post_bind_child_fixture() -> PostBindChild {
-        let mut store = Store::open_in_memory().expect("open store");
+        let store = Store::open_in_memory().expect("open store");
         let owner_id = Uuid::new_v4();
         let epic_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
@@ -9189,6 +9961,120 @@ mod tests {
                 .status,
             SessionStatus::Failed
         );
+    }
+
+    /// Releasing the Store during a custody wait lets another path advance the
+    /// child. Both root resolution and the transaction's invocation fence must
+    /// be checked again, so a stale failure cannot invalidate that launch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_bind_agent_child_failure_rechecks_launch_fences_after_a_held_stripe_wait() {
+        use crate::store::custody_lock_order::admission_contention_signal;
+        use crate::store::stripe_liveness_support::run_behind_held_stripes;
+        use std::time::Duration;
+
+        for advance_session in [true, false] {
+            let fixture = post_bind_child_fixture();
+            let store = std::sync::Arc::new(tokio::sync::Mutex::new(fixture.store));
+            let contended = admission_contention_signal(fixture.custody_id);
+            let advance = async {
+                tokio::task::spawn_blocking(move || {
+                    contended.recv_timeout(Duration::from_secs(20))
+                })
+                .await
+                .expect("contention observer joined")
+                .expect("settlement released the Store while waiting for custody");
+                let guard = store.lock().await;
+                if advance_session {
+                    guard
+                        .update_session_status(fixture.child_id, SessionStatus::Running)
+                        .expect("advance the child during the custody wait");
+                } else {
+                    guard
+                        .conn
+                        .execute(
+                            "UPDATE model_invocations SET status='completed' WHERE id=?1",
+                            [fixture.invocation_id.to_string()],
+                        )
+                        .expect("complete the invocation during the custody wait");
+                }
+            };
+            let run = run_behind_held_stripes(
+                &store,
+                Some(vec![fixture.custody_id]),
+                Duration::from_secs(3),
+                async {
+                    let (settled, ()) = tokio::join!(
+                        settle_post_bind_agent_child_failure_store_first(
+                            &store,
+                            fixture.request_id,
+                            fixture.child_id,
+                            fixture.invocation_id,
+                            "execution_scratch_unavailable",
+                        ),
+                        advance
+                    );
+                    settled
+                },
+            )
+            .await;
+            let error = run
+                .assert_store_stayed_free("post-bind failure after launch advancement")
+                .expect_err("a launch changed during the custody wait refuses stale settlement");
+            let expected_refusal = if advance_session {
+                "missing its Starting custody binding"
+            } else {
+                "lost Session/invocation/custody fence"
+            };
+            assert!(error.to_string().contains(expected_refusal), "{error}");
+
+            let guard = store.lock().await;
+            assert_eq!(
+                guard.get_session(fixture.child_id).unwrap().unwrap().status,
+                if advance_session {
+                    SessionStatus::Running
+                } else {
+                    SessionStatus::Starting
+                }
+            );
+            assert_eq!(
+                guard
+                    .get_agent_spawn_request(fixture.request_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AgentSpawnStateV1::Launched
+            );
+            let retained: (String, String, String, String, String) = guard
+                .conn
+                .query_row(
+                    "SELECT invocation.status,custody.state,projection.execution_state,
+                            projection.freshness,projection.effective_cwd
+                     FROM sessions AS child
+                     JOIN model_invocations AS invocation ON invocation.id=child.model_invocation_id
+                     JOIN sandbox_custody_roots AS custody ON custody.custody_id=child.sandbox_custody_id
+                     JOIN session_execution_projections AS projection ON projection.session_id=child.id
+                     WHERE child.id=?1",
+                    [fixture.child_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .expect("read the retained invocation, custody and executable projection");
+            assert_eq!(
+                retained,
+                (
+                    if advance_session {
+                        "running"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                    "live".into(),
+                    "live_sandboxed".into(),
+                    "verified".into(),
+                    fixture.child.sandbox_root.unwrap().display().to_string(),
+                )
+            );
+        }
     }
 
     // ---- P2-03 progress rooting and mailbox summary -------------------------

@@ -68,7 +68,7 @@ contains "$HOME/.config/rsi/satellites/fixture-direct.env" "RSI_SATELLITE_REMOTE
 RSI_SATELLITE_DIR="$HOME/.rsi/satellites" "$repo_root/scripts/satellite/hub-list.sh" >"$tmp/hub-list.out"
 contains "$tmp/hub-list.out" 'fixture-direct'
 contains "$tmp/hub-list.out" 'healthy'
-contains "$repo_root/scripts/satellite/rsi-satellite-direct@.service" 'StartLimitBurst=3'
+contains "$repo_root/scripts/satellite/rsi-satellite-direct@.service" 'StartLimitIntervalSec=0'
 
 # A listener alone does not prove that the remote rsid answers RPC.
 rm -f "$HOME/.rsi/satellites/fixture-direct.sock"

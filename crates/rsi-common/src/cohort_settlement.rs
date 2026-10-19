@@ -286,6 +286,29 @@ impl AuditSourceWorktreeCohortParams {
     }
 }
 
+/// Agent-only presentation options; the operator audit keeps its full contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAuditSourceWorktreeCohortParams {
+    pub repository_identity: String,
+    /// Omitted: summary when nothing is applyable, full otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<AgentSourceWorktreeAuditFieldsV1>,
+}
+
+impl AgentAuditSourceWorktreeCohortParams {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_identity(&self.repository_identity)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSourceWorktreeAuditFieldsV1 {
+    Summary,
+    Full,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplySourceWorktreeCohortParams {
@@ -378,6 +401,8 @@ pub enum SourceWorktreeDispositionV1 {
     TargetUnavailable,
     TargetAmbiguous,
     RetainedNonAncestor,
+    RetainedForeignOwner,
+    RetainedUnknownOwner,
     InvalidSourceRef,
     IncompleteEnumeration,
     BoundExceeded,
@@ -619,6 +644,40 @@ pub struct SourceWorktreeAuditItemV1 {
     pub diagnostic: Option<String>,
 }
 
+/// Shape check for a retained-root snapshot (#2635). `canonical` is the run
+/// record's own list (sequences `0..n`); the agent audit may hand back a scoped
+/// subset, so it only requires strictly increasing sequences.
+fn validate_retained_roots(
+    roots: &[SourceWorktreeRetainedRootV1],
+    canonical: bool,
+) -> Result<(), String> {
+    if roots.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS {
+        return Err("settlement retained roots exceed the bounded root count".into());
+    }
+    let mut previous: Option<u32> = None;
+    for (index, root) in roots.iter().enumerate() {
+        let in_order = if canonical {
+            root.sequence as usize == index
+        } else {
+            previous.is_none_or(|p| root.sequence > p)
+        };
+        if !in_order {
+            return Err("settlement retained root sequence is not canonical".into());
+        }
+        previous = Some(root.sequence);
+        validate_uuid(root.session_id)?;
+        validate_uuid(root.custody_id)?;
+        validate_bounded_text(&root.session_status, "retained root status", true)?;
+        validate_bounded_text(&root.sandbox_root, "retained root sandbox root", false)?;
+        validate_bounded_text(&root.source_ref, "retained root source ref", true)?;
+        validate_bounded_optional(&root.diagnostic, "retained root diagnostic")?;
+        if root.disposition.is_eligible() {
+            return Err("settlement retained root carries an eligible disposition".into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceWorktreeCohortAuditV1 {
@@ -640,11 +699,53 @@ pub struct SourceWorktreeCohortAuditV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub run_id: Option<Uuid>,
+    /// #2690: the roots the latest settlement run (`run_id`) retained, as that
+    /// run recorded them (its class and diagnostic at intent time). Distinct
+    /// from `items`, which is the fresh classification of the current roots: a
+    /// root's current state may have changed since. The agent audit lists only
+    /// the roots inside the caller's coverage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_run_retained_roots: Vec<SourceWorktreeRetainedRootV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }
 
 impl SourceWorktreeCohortAuditV1 {
+    /// Project only after the complete audit and caller scoping. The digest and
+    /// exact apply phrase still bind the original proof, never this projection.
+    pub fn into_agent_view(
+        self,
+        fields: Option<AgentSourceWorktreeAuditFieldsV1>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let summary = match fields {
+            Some(AgentSourceWorktreeAuditFieldsV1::Summary) => true,
+            Some(AgentSourceWorktreeAuditFieldsV1::Full) => false,
+            None => !self.applyable,
+        };
+        let mut value = serde_json::to_value(self)?;
+        if summary {
+            let mut dispositions = std::collections::BTreeMap::<String, u32>::new();
+            let items = value["items"].as_array_mut().expect("audit items array");
+            for item in items.iter() {
+                let disposition = item["disposition"].as_str().expect("audit disposition");
+                *dispositions.entry(disposition.to_owned()).or_default() += 1;
+            }
+            items.retain(|item| item["disposition"] == "eligible_integrated_ancestor");
+            let object = value.as_object_mut().expect("audit object");
+            let retained_count = object
+                .remove("last_run_retained_roots")
+                .and_then(|roots| roots.as_array().map(Vec::len))
+                .unwrap_or(0);
+            object.insert("view".into(), serde_json::json!("summary"));
+            object.insert(
+                "counts_by_disposition".into(),
+                serde_json::to_value(dispositions)?,
+            );
+            object.insert("last_run_retained_root_count".into(), retained_count.into());
+        }
+        Ok(value)
+    }
+
     pub fn validate_wire(self) -> Result<Self, String> {
         validate_version(self.schema_version, self.policy_version)?;
         validate_identity(&self.repository_identity)?;
@@ -656,6 +757,10 @@ impl SourceWorktreeCohortAuditV1 {
             return Err("audit report wrote state or exceeds the bounded root count".into());
         }
         validate_audit_counts(&self.counts, self.items.len())?;
+        validate_retained_roots(&self.last_run_retained_roots, false)?;
+        if !self.last_run_retained_roots.is_empty() && self.run_id.is_none() {
+            return Err("audit retained roots need the run that recorded them".into());
+        }
         validate_bounded_optional(&self.refusal, "audit refusal")?;
         if self.target_ref.is_some() != self.target_oid.is_some() {
             return Err("audit target ref/OID presence is inconsistent".into());
@@ -777,6 +882,80 @@ pub struct SourceWorktreeSettlementItemV1 {
     pub after_observation: Option<String>,
 }
 
+/// A root a settlement run observed and kept (#2635), snapshotted from the
+/// run's audit when its intent committed: identity, retention class
+/// (`disposition`) and the audit's diagnostic. Never accepted in a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceWorktreeRetainedRootV1 {
+    pub sequence: u32,
+    #[serde(with = "canonical_uuid_serde")]
+    pub session_id: Uuid,
+    #[serde(with = "canonical_uuid_serde")]
+    pub custody_id: Uuid,
+    pub session_status: String,
+    pub sandbox_root: String,
+    pub source_ref: String,
+    pub disposition: SourceWorktreeDispositionV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+/// Persisted by the daemon at intent commit; never accepted in an apply request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceWorktreeSettlementOriginV1 {
+    Operator,
+    Agent,
+    Automatic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceWorktreeSettlementAttributionV1 {
+    pub origin: SourceWorktreeSettlementOriginV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<Uuid>,
+}
+
+impl SourceWorktreeSettlementAttributionV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(id) = self.agent_session_id {
+            validate_uuid(id)?;
+        }
+        if (self.origin == SourceWorktreeSettlementOriginV1::Agent)
+            != self.agent_session_id.is_some()
+        {
+            return Err("settlement origin must match its agent identity".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceWorktreeSettlementRunSummaryV1 {
+    pub run_id: Uuid,
+    pub repository_identity: String,
+    pub state: SourceWorktreeSettlementRunStateV1,
+    pub counts: SourceWorktreeSettlementCountsV1,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<SourceWorktreeSettlementAttributionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListSourceWorktreeSettlementRunsParams {
+    /// Bounded recent history, default 20 and maximum 50.
+    #[serde(default = "default_settlement_run_limit")]
+    pub limit: u32,
+}
+
+fn default_settlement_run_limit() -> u32 {
+    20
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceWorktreeSettlementRunV1 {
@@ -792,7 +971,14 @@ pub struct SourceWorktreeSettlementRunV1 {
     pub idempotency_key: String,
     pub state: SourceWorktreeSettlementRunStateV1,
     pub counts: SourceWorktreeSettlementCountsV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<SourceWorktreeSettlementAttributionV1>,
     pub items: Vec<SourceWorktreeSettlementItemV1>,
+    /// The roots this run kept, with their retention class (#2635). Empty for a
+    /// run recorded before the snapshot existed; otherwise exactly
+    /// `counts.retained` rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_roots: Vec<SourceWorktreeRetainedRootV1>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -803,6 +989,9 @@ pub struct SourceWorktreeSettlementRunV1 {
 
 impl SourceWorktreeSettlementRunV1 {
     pub fn validate_wire(self) -> Result<Self, String> {
+        if let Some(attribution) = &self.attribution {
+            attribution.validate()?;
+        }
         validate_version(self.schema_version, self.policy_version)?;
         validate_uuid(self.run_id)?;
         validate_identity(&self.repository_identity)?;
@@ -888,6 +1077,12 @@ impl SourceWorktreeSettlementRunV1 {
         if actual != self.counts {
             return Err("settlement receipt counts do not match item phases".into());
         }
+        if !self.retained_roots.is_empty()
+            && self.retained_roots.len() != self.counts.retained as usize
+        {
+            return Err("settlement retained roots do not match the retained count".into());
+        }
+        validate_retained_roots(&self.retained_roots, true)?;
         let terminal = actual
             .settled
             .saturating_add(actual.refused)
@@ -1132,6 +1327,7 @@ mod tests {
     fn settlement_run() -> SourceWorktreeSettlementRunV1 {
         let timestamp = "2026-08-24T00:00:00.000000000Z".to_string();
         SourceWorktreeSettlementRunV1 {
+            attribution: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             run_id: Uuid::new_v4(),
@@ -1162,6 +1358,7 @@ mod tests {
                 before_observation: None,
                 after_observation: None,
             }],
+            retained_roots: Vec::new(),
             created_at: timestamp.clone(),
             updated_at: timestamp,
             finished_at: None,
@@ -1218,8 +1415,132 @@ mod tests {
                 diagnostic: None,
             }],
             run_id: None,
+            last_run_retained_roots: Vec::new(),
             refusal: None,
         }
+    }
+
+    #[test]
+    fn agent_audit_fields_are_optional_and_closed() {
+        let request = |fields: &str| json!({"repository_identity": "repo:test", "fields": fields});
+        let default: AgentAuditSourceWorktreeCohortParams =
+            serde_json::from_value(json!({"repository_identity": "repo:test"})).unwrap();
+        assert_eq!(default.fields, None);
+        for (name, fields) in [
+            ("summary", AgentSourceWorktreeAuditFieldsV1::Summary),
+            ("full", AgentSourceWorktreeAuditFieldsV1::Full),
+        ] {
+            let parsed: AgentAuditSourceWorktreeCohortParams =
+                serde_json::from_value(request(name)).unwrap();
+            parsed.validate().unwrap();
+            assert_eq!(parsed.fields, Some(fields));
+        }
+        assert!(
+            serde_json::from_value::<AgentAuditSourceWorktreeCohortParams>(request("tiny"))
+                .is_err()
+        );
+        let mut unknown = request("summary");
+        unknown["target_ref"] = json!("refs/heads/other");
+        assert!(serde_json::from_value::<AgentAuditSourceWorktreeCohortParams>(unknown).is_err());
+    }
+
+    #[test]
+    fn agent_audit_summary_bounds_retained_output_and_full_preserves_bytes() {
+        let mut audit = eligible_audit();
+        let eligible = audit.items[0].clone();
+        audit.run_id = Some(Uuid::new_v4());
+        for index in 0..100 {
+            let mut item = eligible.clone();
+            item.session_id = Uuid::new_v4();
+            item.custody_id = Uuid::new_v4();
+            item.sandbox_root = format!("/tmp/sandbox-retained-{index}");
+            item.source_ref = format!("refs/heads/rsi/retained-{index}");
+            item.proof = SourceWorktreeProofV1::None;
+            item.disposition = if index % 2 == 0 {
+                SourceWorktreeDispositionV1::DirtyWorktree
+            } else {
+                SourceWorktreeDispositionV1::RetainedNonAncestor
+            };
+            item.diagnostic = Some("retained evidence ".repeat(100));
+            audit
+                .last_run_retained_roots
+                .push(SourceWorktreeRetainedRootV1 {
+                    sequence: index,
+                    session_id: item.session_id,
+                    custody_id: item.custody_id,
+                    session_status: item.status.clone(),
+                    sandbox_root: item.sandbox_root.clone(),
+                    source_ref: item.source_ref.clone(),
+                    disposition: item.disposition.clone(),
+                    diagnostic: item.diagnostic.clone(),
+                });
+            audit.items.push(item);
+        }
+        audit.counts.observed = 101;
+        audit.counts.retained = 100;
+        audit.clone().validate_wire().unwrap();
+        // The old RPC and native tool both serialized the complete DTO to Value.
+        let old = serde_json::to_value(&audit).unwrap();
+        let full = audit
+            .clone()
+            .into_agent_view(Some(AgentSourceWorktreeAuditFieldsV1::Full))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&full).unwrap(),
+            serde_json::to_vec(&old).unwrap()
+        );
+        assert_eq!(audit.clone().into_agent_view(None).unwrap(), full);
+        let summary = audit
+            .clone()
+            .into_agent_view(Some(AgentSourceWorktreeAuditFieldsV1::Summary))
+            .unwrap();
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 4096);
+        assert_eq!(summary["view"], "summary");
+        assert_eq!(
+            summary["counts_by_disposition"],
+            json!({
+                "eligible_integrated_ancestor": 1, "dirty_worktree": 50, "retained_non_ancestor": 50
+            })
+        );
+        assert_eq!(summary["last_run_retained_root_count"], 100);
+        assert!(summary.get("last_run_retained_roots").is_none());
+        assert_eq!(summary["items"], json!([eligible]));
+        for key in [
+            "counts",
+            "plan_digest",
+            "authorization_phrase",
+            "applyable",
+            "run_id",
+        ] {
+            assert_eq!(summary[key], full[key], "preserve {key}");
+        }
+
+        audit.items.remove(0);
+        audit.counts.observed = 100;
+        audit.counts.eligible = 0;
+        audit.applyable = false;
+        audit.authorization_phrase = None;
+        audit.clone().validate_wire().unwrap();
+        let default = audit.clone().into_agent_view(None).unwrap();
+        assert_eq!(default["view"], "summary");
+        assert_eq!(default["items"], json!([]));
+        assert_eq!(default["last_run_retained_root_count"], 100);
+        assert!(serde_json::to_vec(&default).unwrap().len() < 2048);
+        let full = audit
+            .clone()
+            .into_agent_view(Some(AgentSourceWorktreeAuditFieldsV1::Full))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&full).unwrap(),
+            serde_json::to_vec(&serde_json::to_value(&audit).unwrap()).unwrap()
+        );
+        // Even a refusal with eligible observations defaults to summary when applyable is false.
+        let mut refused = eligible_audit();
+        refused.applyable = false;
+        refused.authorization_phrase = None;
+        refused.refusal = Some("target unavailable".into());
+        refused.clone().validate_wire().unwrap();
+        assert_eq!(refused.into_agent_view(None).unwrap()["view"], "summary");
     }
 
     #[test]
@@ -1355,6 +1676,57 @@ mod tests {
         let mut nil_custody = settlement_run();
         nil_custody.items[0].custody_id = Uuid::nil();
         assert!(nil_custody.validate_wire().is_err());
+    }
+
+    #[test]
+    fn settlement_receipt_retained_roots_match_the_retained_count_and_stay_retained() {
+        // #2635: the snapshot is empty (a run from before it) or exactly the
+        // retained count, in canonical order, and never carries an eligible class.
+        let root = |sequence: u32, disposition| SourceWorktreeRetainedRootV1 {
+            sequence,
+            session_id: Uuid::new_v4(),
+            custody_id: Uuid::new_v4(),
+            session_status: "Completed".into(),
+            sandbox_root: format!("/sandboxes/root-{sequence}"),
+            source_ref: format!("refs/heads/rsi/root-{sequence}"),
+            disposition,
+            diagnostic: None,
+        };
+        let mut run = settlement_run();
+        run.counts.observed = 3;
+        run.counts.retained = 2;
+        run.clone().validate_wire().unwrap();
+
+        let mut mixed = run.clone();
+        mixed.retained_roots = vec![
+            root(0, SourceWorktreeDispositionV1::DirtyWorktree),
+            root(1, SourceWorktreeDispositionV1::RetainedNonAncestor),
+        ];
+        let wire = serde_json::to_value(mixed.clone().validate_wire().unwrap()).unwrap();
+        assert_eq!(
+            wire["retained_roots"][1]["disposition"],
+            "retained_non_ancestor"
+        );
+        let parsed: SourceWorktreeSettlementRunV1 = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.retained_roots, mixed.retained_roots);
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        assert!(legacy.get("retained_roots").is_none());
+        legacy["counts"]["retained"] = json!(2);
+        assert!(serde_json::from_value::<SourceWorktreeSettlementRunV1>(legacy).is_ok());
+
+        let mut short = mixed.clone();
+        short.retained_roots.pop();
+        assert!(short.validate_wire().is_err());
+        let mut eligible = mixed.clone();
+        eligible.retained_roots[0].disposition =
+            SourceWorktreeDispositionV1::EligibleIntegratedAncestor;
+        assert!(eligible.validate_wire().is_err());
+        let mut unordered = mixed.clone();
+        unordered.retained_roots[1].sequence = 4;
+        assert!(unordered.validate_wire().is_err());
+        let mut nil = mixed;
+        nil.retained_roots[0].custody_id = Uuid::nil();
+        assert!(nil.validate_wire().is_err());
     }
 
     #[test]

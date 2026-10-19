@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 /// Sessions active this recently are retained by the delegated archive.
 const RETENTION_ACTIVITY_WINDOW_HOURS: i64 = 24;
+const RECENT_ACTIVITY_CODE: &str = "manager_v2_retention_recent_activity";
 
 /// The session a delegated EFFECT targets (for Epic pause/decision gates).
 pub(super) fn delegated_effect_session(action: &ManagerActionV2) -> Option<Uuid> {
@@ -96,7 +97,16 @@ impl Store {
                 let session = self.manager_action_project_target(authority, params.session_id)?;
                 if check_version {
                     self.delegated_effect_fence(authority, &session, expected)?;
-                    if let Some(code) = self.delegated_archive_blocker(&session, Utc::now())? {
+                    let now = Utc::now();
+                    if let Some(code) = self.delegated_archive_blocker(&session, now)? {
+                        // A recent-activity refusal names when the window ends
+                        // so the caller skips the session until then instead
+                        // of retrying it (#1794).
+                        if code == RECENT_ACTIVITY_CODE
+                            && let Some(at) = self.delegated_retention_eligible_at(&session, now)?
+                        {
+                            return Err(refused(&format!("{code}: eligible_at={}", stamp(at))));
+                        }
                         return Err(refused(&code));
                     }
                 }
@@ -248,12 +258,30 @@ impl Store {
                 .delegated_last_activity(session)?
                 .is_none_or(|at| at > now - Duration::hours(window_hours))
         {
-            return Ok(Some("manager_v2_retention_recent_activity".into()));
+            return Ok(Some(RECENT_ACTIVITY_CODE.into()));
         }
         if Self::manager_action_live_worktree_blocked(session) {
             return Ok(Some("manager_v2_retention_live_worktree".into()));
         }
         Ok(None)
+    }
+
+    /// When the retention window ends for a `Completed` session still inside
+    /// it: last activity plus the window. `None` when the session is past the
+    /// window, not `Completed`, or its event times are unparseable (fail
+    /// closed: no instant can be promised).
+    pub(crate) fn delegated_retention_eligible_at(
+        &self,
+        session: &Session,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        if session.status != SessionStatus::Completed {
+            return Ok(None);
+        }
+        Ok(self
+            .delegated_last_activity(session)?
+            .map(|at| at + Duration::hours(RETENTION_ACTIVITY_WINDOW_HOURS))
+            .filter(|eligible| *eligible > now))
     }
 
     /// Exact newest instant of the session's activity: its `updated_at` and
@@ -466,6 +494,9 @@ impl Store {
                 pinned: session.pinned_at.is_some(),
                 sandbox_cleanup_state: session.sandbox_cleanup_state,
                 archive_blocker: self.delegated_archive_blocker(&session, now)?,
+                eligible_at: self
+                    .delegated_retention_eligible_at(&session, now)?
+                    .map(stamp),
             });
             if page_bytes(&rows)? > DELEGATED_PAGE_MAX_BYTES {
                 rows.pop();
@@ -550,7 +581,7 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    const RECENT: Option<&str> = Some("manager_v2_retention_recent_activity");
+    const RECENT: Option<&str> = Some(RECENT_ACTIVITY_CODE);
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
@@ -580,6 +611,34 @@ mod tests {
                     (2, "2026-09-22T01:00:00.000100+01:00"),
                 ],
             ),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn retention_eligible_at_is_last_activity_plus_the_window() {
+        let store = Store::open_in_memory().unwrap();
+        let now = at("2026-09-23T12:00:00Z");
+        let mut session = crate::test_support::test_session(
+            Uuid::new_v4(),
+            std::path::PathBuf::from("/tmp/k14-eligible"),
+        );
+        session.status = SessionStatus::Completed;
+        session.updated_at = now - Duration::hours(2);
+        store.insert_session(&session).unwrap();
+        let session = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(
+            store
+                .delegated_retention_eligible_at(&session, now)
+                .unwrap(),
+            Some(at("2026-09-24T10:00:00Z"))
+        );
+        // Past the window there is nothing to wait for.
+        assert_eq!(
+            store
+                .delegated_retention_eligible_at(&session, now + Duration::hours(23))
+                .unwrap(),
             None
         );
     }

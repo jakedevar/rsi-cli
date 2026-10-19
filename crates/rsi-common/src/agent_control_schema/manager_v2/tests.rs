@@ -167,6 +167,17 @@ fn inspect_defaults_pages_and_provider_alias_follow_the_shared_contract() {
     use crate::harness_manager_v2::AgentManagerInspectRequestV2;
     let default: AgentManagerInspectRequestV2 = serde_json::from_value(json!({})).unwrap();
     assert!(default.validate().is_ok());
+    assert!(!default.include_history);
+    for include_history in [false, true] {
+        let value = json!({"section":"workers","include_history":include_history});
+        assert!(accepts(&inspect(), &value));
+        let request: AgentManagerInspectRequestV2 = serde_json::from_value(value).unwrap();
+        assert_eq!(request.include_history, include_history);
+        assert!(request.validate().is_ok());
+    }
+    let malformed = json!({"section":"workers","include_history":"all"});
+    assert!(!accepts(&inspect(), &malformed));
+    assert!(serde_json::from_value::<AgentManagerInspectRequestV2>(malformed).is_err());
     assert!(accepts(&inspect(), &serde_json::to_value(default).unwrap()));
     assert!(accepts(&inspect(), &json!({"section":"archive","limit":1})));
     assert!(accepts(&inspect(), &json!({"section":"health","limit":1})));
@@ -278,4 +289,80 @@ fn housekeeping_actions_are_control_only_and_prepared_subset_is_lifecycle_only()
         let semantic = json!({"action":name,"session_id":id});
         assert!(serde_json::from_value::<PreparedManagerActionV2>(semantic).is_err());
     }
+}
+
+#[test]
+fn stage_job_evidence_is_a_closed_job_reference_that_excludes_worker_evidence() {
+    let id = "5d73c05d-1040-49f7-92ab-0123456789ab";
+    let job = json!({"job_id":id,"source_commit":"a".repeat(40),"artifact_path":"thoughts/shared/qa/report.md","artifact_commit":"b".repeat(40)});
+    let worker = json!({"source_session_id":id,"source_commit":"a".repeat(40),"artifact_path":"proof.md","artifact_commit":"b".repeat(40)});
+    let stage = |extra: Value| {
+        let mut change = json!({"update":"stage","key":"w","expected_row_version":1,"stage":"verification","state":"failed","note":"red QA"});
+        change
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"fence":{"scope_version":1,"policy_version":2},"idempotency_key":"one","change":change})
+    };
+    let decode = |value: Value| serde_json::from_value::<AgentManagerUpdateRequestV2>(value);
+
+    let value = stage(json!({"job_evidence":job}));
+    assert!(accepts(&update(), &value));
+    let request = decode(value).unwrap();
+    assert!(request.validate().is_ok());
+    assert!(accepts(&update(), &serde_json::to_value(&request).unwrap()));
+    // A stage that names no job still decodes and serializes as before.
+    assert!(decode(stage(json!({"evidence":worker}))).is_ok());
+
+    // The reference is closed: it carries no session, no receipt, no verdict.
+    for injected in [
+        "source_session_id",
+        "receipt",
+        "outcome",
+        "owner_session_id",
+    ] {
+        let mut forged = job.clone();
+        forged[injected] = json!(id);
+        let value = stage(json!({ "job_evidence": forged }));
+        assert!(!accepts(&update(), &value), "{injected}");
+        assert!(decode(value).is_err(), "{injected}");
+    }
+    // Worker evidence and a job reference are two different proofs: one stage
+    // update carries at most one, and a nil job id is no job.
+    let both = decode(stage(json!({"evidence":worker,"job_evidence":job}))).unwrap();
+    assert_eq!(
+        both.validate().unwrap_err(),
+        "manager_v2_job_evidence_conflict"
+    );
+    let mut nil = job;
+    nil["job_id"] = json!(uuid::Uuid::nil());
+    let nil = decode(stage(json!({ "job_evidence": nil }))).unwrap();
+    assert_eq!(nil.validate().unwrap_err(), "manager_v2_invalid_update");
+}
+
+// #2145: a manager reads the settings it may propose from the schema, so it
+// never guesses a registry key and meets `manager_v2_daemon_setting_not_allowlisted`.
+#[test]
+fn propose_daemon_setting_key_is_the_curated_allowlist() {
+    let schema = operator_call();
+    let variant = schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["properties"]["method"]["enum"][0] == "ProposeDaemonSetting")
+        .expect("ProposeDaemonSetting variant");
+    let advertised: Vec<&str> = variant["properties"]["params"]["properties"]["key"]["enum"]
+        .as_array()
+        .expect("key is an enum")
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    let allowlist: Vec<&str> = crate::manager_daemon_settings::MANAGER_ADJUSTABLE_DAEMON_SETTINGS
+        .iter()
+        .map(|s| s.key)
+        .collect();
+    assert_eq!(advertised, allowlist);
+    let call = |key: &str| json!({"method":"ProposeDaemonSetting","params":{"key":key,"value":1,"reason":"r"}});
+    assert!(accepts(&schema, &call("hub_build_cpu_percent")));
+    assert!(!accepts(&schema, &call("worker_cpu_quota_percent")));
 }

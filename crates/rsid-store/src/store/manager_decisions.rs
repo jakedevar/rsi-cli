@@ -9,6 +9,7 @@ use uuid::Uuid;
 use super::Store;
 use super::harness_manager_v2::{fingerprint, refused};
 use super::manager_coordinator::{ManagerDecisionDeliveryV2, ManagerDeliveryTopologyV2};
+pub use super::manager_decision_rulings::scan_decision_gate;
 use crate::error::Result;
 
 /// Key prefix of the decision records the daemon files for topology nodes

@@ -16,7 +16,10 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["time"] }
+# `waitid(WEXITED | WNOWAIT)` where nix lacks it (macOS): the owned-group
+# leader is observed exited without being reaped (#2812).
+rustix = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
@@ -31,6 +34,7 @@ test-seam = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -716,6 +716,22 @@ impl Store {
                 expected_grant_version,
                 ..
             } => {
+                if *child == caller.node {
+                    // #2021: the seat hands its own seat on. The node keeps
+                    // its grantor (the operator's grant stays the operator's);
+                    // the launch is the caller's own allowance, checked above,
+                    // and a grant that changed under the call is stale.
+                    let grant = &caller.record.grant;
+                    if expected_grant_version.is_some_and(|version| version != grant.grant_version)
+                    {
+                        return Err(refused(MANAGER_NODE_STALE));
+                    }
+                    let launch = launch_project_id.unwrap_or(grant.project_ids[0]);
+                    if !grant.project_ids.contains(&launch) {
+                        return Err(refused(MANAGER_PROJECT_NOT_IN_SCOPE));
+                    }
+                    return Ok((ChildTargetRef::Portfolio(*child), launch));
+                }
                 let record = self.node_granted_descendant(caller.node, *child)?;
                 if record.parent_node_id != Some(caller.node) {
                     return Err(refused(MANAGER_NODE_NOT_IN_SCOPE));
@@ -827,8 +843,8 @@ impl Store {
         self.appointment_launch_admission(&delegating, &request.launch, launch_project_id, None)?;
         let now = stamp();
         self.conn.execute(
-            "INSERT INTO manager_portfolio_appointments(id,grantor_node_id,grantor_authority_epoch,target_ref,launch_project_id,caller_session_id,idempotency_key,request_digest,session_id,state,created_at,updated_at,reserved_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'launched',?10,?10,?10)",
+            "INSERT INTO manager_portfolio_appointments(id,grantor_node_id,grantor_authority_epoch,target_ref,launch_project_id,caller_session_id,idempotency_key,request_digest,session_id,state,created_at,updated_at,reserved_at,handoff)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'launched',?10,?10,?10,?11)",
             params![
                 id.to_string(),
                 delegating.node.to_string(),
@@ -840,6 +856,7 @@ impl Store {
                 request_digest,
                 session_id.to_string(),
                 now,
+                request.handoff,
             ],
         )?;
         tx.commit()?;
@@ -903,6 +920,16 @@ impl Store {
             ));
         };
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let handoff = appointment.grantor_node_id == child;
+        if handoff {
+            // #2021: the launch published the seat change, so the caller is no
+            // longer the seat when the verb completes; a recorded completion
+            // is returned as it is, never as a refusal.
+            if let Some(done) = self.child_appointment_by_id(appointment.id)?.appointed {
+                tx.commit()?;
+                return Ok(done);
+            }
+        }
         let delegating = self.appointment_grantor(caller, appointment)?;
         if let Some(done) = self.child_appointment_by_id(appointment.id)?.appointed {
             tx.commit()?;
@@ -936,6 +963,10 @@ impl Store {
                 )?;
             } else {
                 self.replace_portfolio_seat_in_tx(child, appointment.session_id, &key)?;
+                if handoff {
+                    // The node's pending deliverables follow its seat.
+                    self.transfer_seat_pending_on(caller, appointment.session_id)?;
+                }
             }
         }
         let epoch = node_row_on(&self.conn, child)?
@@ -1088,7 +1119,9 @@ impl Store {
                 match project {
                     Some(project)
                         if delegating.record.grant.project_ids.contains(&project)
-                            && self.global_live_manager(project)? == Some(target) =>
+                            && (self.global_live_manager(project)? == Some(target)
+                                || (!mutation
+                                    && self.project_manager_lineage_seat(project, target)?)) =>
                     {
                         !mutation || covering_node_on(&self.conn, project)? == Some(node)
                     }

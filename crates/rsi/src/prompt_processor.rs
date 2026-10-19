@@ -109,7 +109,9 @@ pub struct RpcPromptProcessor {
     model: String,
     provider: SessionProvider,
     base_url: Option<String>,
-    api_key: Option<String>,
+    /// hub #3039: a custom provider the daemon resolves (base URL, vault key);
+    /// this TUI never holds the key.
+    custom_provider_id: Option<Uuid>,
     /// Stable per-instance identity. Enables the daemon to supersede an
     /// in-flight compile when the user mashes Ctrl+Y a second time.
     caller_id: Uuid,
@@ -121,7 +123,7 @@ impl RpcPromptProcessor {
         model: String,
         provider: SessionProvider,
         base_url: Option<String>,
-        api_key: Option<String>,
+        custom_provider_id: Option<Uuid>,
         caller_id: Uuid,
     ) -> Self {
         Self {
@@ -129,7 +131,7 @@ impl RpcPromptProcessor {
             model,
             provider,
             base_url,
-            api_key,
+            custom_provider_id,
             caller_id,
         }
     }
@@ -154,12 +156,18 @@ impl PromptProcessor for RpcPromptProcessor {
         let model = self.model.clone();
         let provider = self.provider;
         let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
+        let custom_provider_id = self.custom_provider_id;
         let caller_id = self.caller_id;
         let input = input.to_string();
         Box::pin(async move {
             compile_via_rpc(
-                &path, &model, provider, base_url, api_key, caller_id, &input,
+                &path,
+                &model,
+                provider,
+                base_url,
+                custom_provider_id,
+                caller_id,
+                &input,
             )
             .await
         })
@@ -176,11 +184,20 @@ impl PromptProcessor for RpcPromptProcessor {
         let model = self.model.clone();
         let provider = self.provider;
         let base_url = self.base_url.clone();
-        let api_key = self.api_key.clone();
+        let custom_provider_id = self.custom_provider_id;
         let system = system_prompt.to_string();
         let user = user_message.to_string();
         Box::pin(async move {
-            generate_text_via_rpc(&path, &model, provider, base_url, api_key, &system, &user).await
+            generate_text_via_rpc(
+                &path,
+                &model,
+                provider,
+                base_url,
+                custom_provider_id,
+                &system,
+                &user,
+            )
+            .await
         })
     }
 }
@@ -223,7 +240,7 @@ async fn compile_via_rpc(
     model: &str,
     provider: SessionProvider,
     base_url: Option<String>,
-    api_key: Option<String>,
+    custom_provider_id: Option<Uuid>,
     caller_id: Uuid,
     input: &str,
 ) -> Result<CompileResult, PromptProcessorError> {
@@ -261,7 +278,8 @@ async fn compile_via_rpc(
         model: Some(model.to_string()),
         provider: Some(provider),
         base_url,
-        api_key,
+        api_key: None,
+        custom_provider_id,
         caller_id,
     };
     let params_value = serde_json::to_value(&params)
@@ -336,7 +354,7 @@ async fn generate_text_via_rpc(
     model: &str,
     provider: SessionProvider,
     base_url: Option<String>,
-    api_key: Option<String>,
+    custom_provider_id: Option<Uuid>,
     system: &str,
     user: &str,
 ) -> Result<String, PromptProcessorError> {
@@ -346,7 +364,8 @@ async fn generate_text_via_rpc(
         model: Some(model.to_string()),
         provider: Some(provider),
         base_url,
-        api_key,
+        api_key: None,
+        custom_provider_id,
     };
     let params_value = serde_json::to_value(&params)
         .map_err(|e| PromptProcessorError::OllamaError(e.to_string()))?;
@@ -375,7 +394,7 @@ pub fn build_processor(config: &PromptProcessorConfig) -> Option<Box<dyn PromptP
         config.model.clone(),
         config.provider,
         config.custom_base_url.clone(),
-        config.custom_api_key.clone(),
+        config.custom_provider_id,
         Uuid::new_v4(),
     )))
 }
@@ -383,9 +402,9 @@ pub fn build_processor(config: &PromptProcessorConfig) -> Option<Box<dyn PromptP
 /// Return a processor configuration targeted at a model selected for one prompt.
 ///
 /// The new-session modal's model picker is independent from the persistent
-/// processor preference. Preserve credentials only when selection identifies a
-/// configured custom endpoint; otherwise clear them so they cannot be sent to
-/// an unrelated provider.
+/// processor preference. A selected custom endpoint is named by id (the
+/// daemon resolves its key, hub #3039); otherwise the endpoint is cleared so
+/// nothing is sent to an unrelated provider. No key is ever copied here.
 pub fn config_for_selected_model(
     config: &PromptProcessorConfig,
     model: String,
@@ -398,7 +417,7 @@ pub fn config_for_selected_model(
     if let Some(custom_provider) = custom_provider {
         selected.custom_provider_id = Some(custom_provider.id);
         selected.custom_base_url = Some(custom_provider.base_url.clone());
-        selected.custom_api_key = Some(custom_provider.api_key.clone());
+        selected.custom_api_key = None;
     } else {
         selected.custom_provider_id = None;
         selected.custom_base_url = None;
@@ -475,13 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn selected_custom_model_keeps_its_endpoint_credentials() {
+    fn selected_custom_model_names_its_endpoint_and_carries_no_key() {
         let configured = PromptProcessorConfig::default();
         let custom = CustomProviderEntry {
             id: Uuid::new_v4(),
             name: "Example API".into(),
             base_url: "https://example.invalid/v1".into(),
-            api_key: "secret".into(),
+            api_key_set: true,
+            api_key_fingerprint: None,
             default_model: "example-model".into(),
         };
 
@@ -498,9 +518,6 @@ mod tests {
             selected.custom_base_url.as_deref(),
             Some(custom.base_url.as_str())
         );
-        assert_eq!(
-            selected.custom_api_key.as_deref(),
-            Some(custom.api_key.as_str())
-        );
+        assert_eq!(selected.custom_api_key, None);
     }
 }

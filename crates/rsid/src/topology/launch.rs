@@ -173,6 +173,7 @@ impl NodeLaunchBuilder<'_> {
             topology_node_id: Some(node.id.clone()),
             topology_iteration: options.iteration,
             closure_selector: None,
+            structured_handoff: false,
         }
     }
 }

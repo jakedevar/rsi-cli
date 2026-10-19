@@ -11,6 +11,8 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 use super::McpBridge;
+use super::bridge::{MAX_EXPOSED_TOOL_NAME_CHARS, exposed_tool_name};
+use std::collections::HashSet;
 
 const TEST_SERVER: &str = r#"
 import argparse
@@ -65,6 +67,12 @@ for line in sys.stdin:
                     '{"value":' * 20 + '"x"' + '}' * 20
                 )},
             ]
+        elif args.mode == "long_names":
+            tools = [
+                {"name": "t" * 100, "inputSchema": {"type": "object"}},
+                {"name": "t" * 99 + "u", "inputSchema": {"type": "object"}},
+                {"name": "short", "inputSchema": {"type": "object"}},
+            ]
         elif args.mode == "many":
             tools = [{
                 "name": f"tool-{index}",
@@ -76,6 +84,8 @@ for line in sys.stdin:
     elif method == "tools/call":
         if args.mode == "echo_env":
             text = json.dumps(dict(os.environ), sort_keys=True)
+        elif args.mode == "long_names":
+            text = "called " + message["params"]["name"]
         elif args.mode == "secret_keys":
             secret = os.environ.get("MCP_DOCS_TOKEN", "")
             send(identifier, {
@@ -98,7 +108,9 @@ for line in sys.stdin:
 
 const SECRET_CANARY: &str = "mcp-bridge-secret-canary-788";
 
-fn definition(
+/// The stdio fixture server as an operator definition; the S9 end-to-end
+/// scenario reuses it (#2259).
+pub(in crate::session::harness) fn definition(
     id: &str,
     mode: &str,
     count: usize,
@@ -149,7 +161,10 @@ async fn world() -> (
     (temp, store, vault)
 }
 
-async fn configure(store: &Arc<tokio::sync::Mutex<Store>>, definition: &McpServerDefinition) {
+pub(in crate::session::harness) async fn configure(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    definition: &McpServerDefinition,
+) {
     let store = store.lock().await;
     let raw = serde_json::to_string(definition).expect("definition json");
     store
@@ -589,4 +604,98 @@ async fn rebuilding_the_bridge_repeats_the_namespaced_tool() {
         assert_eq!(names, vec!["mcp__docs__echo"]);
         registry.shutdown_processes().await;
     }
+}
+
+/// #2253: OpenAI and Mercury cap a function name at 64 characters, so the
+/// bridge exposes a long MCP name shortened with a stable digest, keeps two
+/// names that share a long prefix apart, and still calls the server's own
+/// tool name.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn a_long_mcp_tool_name_is_capped_stable_and_dispatches_to_the_raw_name() {
+    let (temp, store, vault) = world().await;
+    configure(&store, &definition("docs", "long_names", 3, &temp, false)).await;
+
+    let mut exposed: Vec<Vec<String>> = Vec::new();
+    for _ in 0..2 {
+        let mut bridge = built_bridge(&store, &vault).await;
+        let mut registry = crate::session::harness::tools::HarnessToolRegistry::new();
+        bridge.register(&mut registry);
+        let events = bridge.events_json();
+        let mut names: Vec<String> = registry.specs().into_iter().map(|spec| spec.name).collect();
+        names.sort();
+        assert_eq!(names.len(), 3, "{names:?}");
+        for name in &names {
+            assert!(
+                name.chars().count() <= MAX_EXPOSED_TOOL_NAME_CHARS,
+                "{name} is {} characters",
+                name.len()
+            );
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
+                "{name}"
+            );
+        }
+        // The short name is untouched; the two long ones differ.
+        assert!(names.contains(&"mcp__docs__short".to_string()), "{names:?}");
+        let long: Vec<&String> = names.iter().filter(|name| name.len() > 20).collect();
+        assert_eq!(long.len(), 2);
+        assert_ne!(long[0], long[1]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["subtype"].as_str() == Some("mcp_tool_renamed"))
+                .count(),
+            2
+        );
+
+        // Each exposed name reaches the server's raw tool name.
+        let cancel = CancellationToken::new();
+        let mut called: Vec<String> = Vec::new();
+        for name in long {
+            let result = registry
+                .execute_cancellable(name, json!({}), Path::new("/tmp"), &cancel)
+                .await;
+            assert!(result.success, "{result:?}");
+            called.push(result.output);
+        }
+        called.sort();
+        assert_eq!(
+            called,
+            vec![
+                format!("called {}", "t".repeat(100)),
+                format!("called {}u", "t".repeat(99)),
+            ]
+        );
+        registry.shutdown_processes().await;
+        exposed.push(names);
+    }
+    assert_eq!(exposed[0], exposed[1], "the same tools get the same names");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[test]
+fn exposed_names_keep_short_names_and_deduplicate_a_colliding_digest() {
+    let none = HashSet::new();
+    assert_eq!(exposed_tool_name("docs", "echo", &none), "mcp__docs__echo");
+    let exactly_64 = "e".repeat(MAX_EXPOSED_TOOL_NAME_CHARS - "mcp__docs__".len());
+    assert_eq!(
+        exposed_tool_name("docs", &exactly_64, &none),
+        format!("mcp__docs__{exactly_64}")
+    );
+
+    let long = "x".repeat(90);
+    let first = exposed_tool_name("docs", &long, &none);
+    assert_eq!(first.len(), MAX_EXPOSED_TOOL_NAME_CHARS);
+    assert_eq!(first, exposed_tool_name("docs", &long, &none));
+    // The digest covers the server id, not only the shortened tool name.
+    assert_ne!(first, exposed_tool_name("other", &long, &none));
+
+    // A taken candidate takes more digest digits, still within the cap.
+    let taken: HashSet<&str> = [first.as_str()].into_iter().collect();
+    let second = exposed_tool_name("docs", &long, &taken);
+    assert_ne!(first, second);
+    assert_eq!(second.len(), MAX_EXPOSED_TOOL_NAME_CHARS);
+    assert_eq!(second, exposed_tool_name("docs", &long, &taken));
 }

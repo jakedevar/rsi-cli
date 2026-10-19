@@ -165,7 +165,7 @@ async fn run_command(
 }
 
 /// Whether an inherited environment variable is withheld from guard commands.
-pub(super) fn scrubbed(key: &str) -> bool {
+pub fn scrubbed(key: &str) -> bool {
     key.starts_with(SCRUBBED_ENV_PREFIX) || SCRUBBED_ENV.contains(&key)
 }
 

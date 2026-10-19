@@ -1,9 +1,14 @@
 //! Unit tests for session module.
 
+mod agent_transport;
+mod daemon_wait_drain;
 mod deploy_interrupt_resume;
 mod harness_idle_wake;
 mod harness_manager;
 mod manager_actions;
+mod manager_question_stall;
+mod provider_exit_settles;
+mod provider_stream_health;
 mod restart_recovery;
 mod terminal_cause;
 mod terminal_watch_owner;
@@ -44,7 +49,7 @@ fn disk_backed_tempdir() -> TempDir {
 fn manager() -> (SessionManager, TempDir) {
     let dir = disk_backed_tempdir();
     let db_path = dir.path().join("rsi.db");
-    let store = Store::open(&db_path).expect("open store");
+    let store = Store::open_test_fixture(&db_path).expect("open store");
     let config = Config::from_env();
     let runtime_config = RuntimeConfig::from_config(&config);
     // As in the launch tests: these tests are not about host capacity, so
@@ -451,6 +456,62 @@ fn test_convert_stream_event_final_answer_retry() {
     assert_eq!(events[0].sequence, 5);
     assert!(events[0].content.contains("retrying once"));
     assert!(events[0].content.contains("provider stop reason: length"));
+}
+
+/// #3163: a superseded model stream is a recognized Harness event that
+/// persists one visible System row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn test_convert_stream_event_stream_superseded() {
+    let stream = StreamEvent {
+        event_type: "stream_superseded".to_string(),
+        data: serde_json::json!({ "detail_code": "stream_idle_timeout", "retry": 2 }),
+    };
+    let mut seq = 7;
+    let events = SessionManager::convert_recognized_stream_event(&stream, Uuid::new_v4(), &mut seq)
+        .expect("stream_superseded must be a recognized stream event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, EventType::System);
+    assert_eq!(events[0].sequence, 8);
+    assert!(events[0].content.contains("stream_idle_timeout"));
+    assert!(events[0].content.contains("superseded"));
+}
+
+/// #2257: the repeated-failure nudge is a recognized Harness event that
+/// persists one visible System row.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn test_convert_stream_event_repeat_failure() {
+    let stream = StreamEvent {
+        event_type: "repeat_failure".to_string(),
+        data: serde_json::json!({
+            "name": "read_file",
+            "count": 3,
+            "error": "Error reading file: No such file or directory",
+        }),
+    };
+    let mut seq = 4;
+    let events = SessionManager::convert_recognized_stream_event(&stream, Uuid::new_v4(), &mut seq)
+        .expect("repeat_failure must be a recognized stream event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, EventType::System);
+    assert_eq!(events[0].sequence, 5);
+    assert!(
+        events[0]
+            .content
+            .contains("`read_file` failed the same way 3 times")
+    );
+    assert!(events[0].content.contains("No such file or directory"));
+    assert_eq!(
+        events[0].metadata.as_deref(),
+        Some(&serde_json::json!({
+            "repeat_failure": {
+                "name": "read_file",
+                "count": 3,
+                "error": "Error reading file: No such file or directory",
+            }
+        }))
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -897,6 +958,7 @@ async fn continue_failure_reinserts_completed_session() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     stub_codex_launch_for_missing_working_dir(&mut manager);
@@ -998,6 +1060,7 @@ async fn continue_retry_refusal_is_launch_time_and_not_a_started_provider() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     stub_codex_launch_for_missing_working_dir(&mut manager);
@@ -1039,6 +1102,7 @@ async fn topology_answer_continuation_is_fenced_by_its_exact_binding() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     stub_codex_launch_for_missing_working_dir(&mut manager);
@@ -1172,6 +1236,7 @@ async fn continue_orphan_reap_failure_precedes_admission_for_exact_retry() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     // Neutralize ambient host state (codex on PATH, the daemon-installed
@@ -1429,6 +1494,7 @@ async fn continue_hydrates_restored_placeholder_before_reinserting_on_failure() 
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: false,
+            store_writes: Default::default(),
         },
     );
     stub_codex_launch_for_missing_working_dir(&mut manager);
@@ -1469,24 +1535,53 @@ async fn remint_revokes_prior_token_and_registers_new() {
     // Seed a prior token for `sid` and an unrelated session's token that
     // must survive the re-mint untouched.
     manager
-        .register_agent_token("token-a".to_string(), sid)
+        .register_agent_token(
+            "a70bf50e531ce1a817561f2f5d5b6645d4e806becf58ccc5e8cf6b8045a090a8".to_string(),
+            sid,
+        )
         .await;
     manager
-        .register_agent_token("token-other".to_string(), other_sid)
+        .register_agent_token(
+            "d7e9f180b7683a1b689c2d63c1cb26ca4565db3ca683c7adaa39be75c9cda7c8".to_string(),
+            other_sid,
+        )
         .await;
 
+    let (old_witness, other_witness) = {
+        let registry = manager.agent_tokens.read().await;
+        (
+            registry.binding_for_session(sid).unwrap(),
+            registry.binding_for_session(other_sid).unwrap(),
+        )
+    };
     let new_token = manager.remint_session_token(sid).await;
+    let new_witness = {
+        let registry = manager.agent_tokens.read().await;
+        let witness = registry.binding_for_session(sid).unwrap();
+        assert_ne!(witness, old_witness);
+        assert!(registry.binding_matches(sid, witness));
+        assert!(!registry.binding_matches(sid, old_witness));
+        assert!(registry.binding_matches(other_sid, other_witness));
+        witness
+    };
     assert!(
-        manager.resolve_agent_token("token-a").await.is_none(),
+        manager
+            .resolve_agent_token("a70bf50e531ce1a817561f2f5d5b6645d4e806becf58ccc5e8cf6b8045a090a8")
+            .await
+            .is_none(),
         "re-mint must revoke the session's prior token"
     );
     assert_eq!(
-        manager.resolve_agent_token(&new_token).await,
+        manager
+            .resolve_agent_token(new_token.expose_for_transport())
+            .await,
         Some(sid),
         "re-minted token must resolve to the session"
     );
     assert_eq!(
-        manager.resolve_agent_token("token-other").await,
+        manager
+            .resolve_agent_token("d7e9f180b7683a1b689c2d63c1cb26ca4565db3ca683c7adaa39be75c9cda7c8")
+            .await,
         Some(other_sid),
         "other sessions' tokens must be untouched"
     );
@@ -1495,14 +1590,33 @@ async fn remint_revokes_prior_token_and_registers_new() {
     let fresh_sid = Uuid::new_v4();
     let fresh_token = manager.remint_session_token(fresh_sid).await;
     assert_eq!(
-        manager.resolve_agent_token(&fresh_token).await,
+        manager
+            .resolve_agent_token(fresh_token.expose_for_transport())
+            .await,
         Some(fresh_sid)
     );
 
     // Re-minting again keeps at most one live token per session.
     let second_token = manager.remint_session_token(sid).await;
-    assert!(manager.resolve_agent_token(&new_token).await.is_none());
-    assert_eq!(manager.resolve_agent_token(&second_token).await, Some(sid));
+    assert!(
+        manager
+            .resolve_agent_token(new_token.expose_for_transport())
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        manager
+            .resolve_agent_token(second_token.expose_for_transport())
+            .await,
+        Some(sid)
+    );
+    {
+        let registry = manager.agent_tokens.read().await;
+        let second_witness = registry.binding_for_session(sid).unwrap();
+        assert_ne!(second_witness, new_witness);
+        assert!(registry.binding_matches(sid, second_witness));
+        assert!(!registry.binding_matches(sid, new_witness));
+    }
     let live_for_sid = manager
         .agent_tokens
         .read()
@@ -1520,45 +1634,248 @@ fn d05_agent_token_registry_remint_rebinding_collision_and_revoke_stay_bijective
     let second = Uuid::new_v4();
     let mut registry = super::AgentTokenRegistry::default();
 
-    assert_eq!(registry.insert("first-a".into(), first), None);
-    assert_eq!(registry.insert("first-b".into(), first), None);
     assert_eq!(
-        registry.get("first-a"),
+        registry.insert(
+            "3677fb4898368119333794a70ae9570ac081b6ac509d9e8e7c80f1add5894d5a".into(),
+            first
+        ),
+        None
+    );
+    assert_eq!(
+        registry.insert(
+            "35682c14f73d441b8a586fba85b8a96d7adc14c8c2b6c49ca354ec527047b237".into(),
+            first
+        ),
+        None
+    );
+    assert_eq!(
+        registry.get("3677fb4898368119333794a70ae9570ac081b6ac509d9e8e7c80f1add5894d5a"),
         None,
         "same-session remint revokes forward mapping"
     );
-    assert_eq!(registry.get("first-b"), Some(&first));
-    assert_eq!(registry.token_for_session(first), Some("first-b"));
-
-    assert_eq!(registry.insert("second".into(), second), None);
-    assert_eq!(registry.insert("second".into(), first), Some(second));
     assert_eq!(
-        registry.get("first-b"),
+        registry.get("35682c14f73d441b8a586fba85b8a96d7adc14c8c2b6c49ca354ec527047b237"),
+        Some(&first)
+    );
+    assert_eq!(
+        registry.token_for_session(first),
+        Some("35682c14f73d441b8a586fba85b8a96d7adc14c8c2b6c49ca354ec527047b237")
+    );
+
+    assert_eq!(
+        registry.insert(
+            "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4".into(),
+            second
+        ),
+        None
+    );
+    assert_eq!(
+        registry.insert(
+            "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4".into(),
+            first
+        ),
+        Some(second)
+    );
+    assert_eq!(
+        registry.get("35682c14f73d441b8a586fba85b8a96d7adc14c8c2b6c49ca354ec527047b237"),
         None,
         "collision removes the old session token"
     );
-    assert_eq!(registry.get("second"), Some(&first));
-    assert_eq!(registry.token_for_session(first), Some("second"));
+    assert_eq!(
+        registry.get("16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"),
+        Some(&first)
+    );
+    assert_eq!(
+        registry.token_for_session(first),
+        Some("16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4")
+    );
     assert_eq!(
         registry.token_for_session(second),
         None,
         "same-token rebinding removes the displaced reverse mapping"
     );
-    assert_eq!(registry.by_token.len(), registry.by_session.len());
-    for (token, session_id) in &registry.by_token {
-        assert_eq!(registry.by_session.get(session_id), Some(token));
+    assert_eq!(registry.len(), 1);
+    for session_id in registry.values() {
+        let token = registry.token_for_session(*session_id).unwrap();
+        assert_eq!(registry.get(token), Some(session_id));
     }
 
     assert!(
-        !registry.revoke_session_if_token(first, "first-b"),
+        !registry.revoke_session_if_token(
+            first,
+            "35682c14f73d441b8a586fba85b8a96d7adc14c8c2b6c49ca354ec527047b237"
+        ),
         "stale cleanup must not revoke a newer incarnation's token"
     );
-    assert_eq!(registry.token_for_session(first), Some("second"));
-    assert!(registry.revoke_session_if_token(first, "second"));
+    assert_eq!(
+        registry.token_for_session(first),
+        Some("16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4")
+    );
+    assert!(registry.revoke_session_if_token(
+        first,
+        "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"
+    ));
     assert!(registry.is_empty());
-    assert!(registry.by_session.is_empty());
-    assert_eq!(registry.get("second"), None);
+    assert_eq!(
+        registry.get("16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"),
+        None
+    );
     assert_eq!(registry.token_for_session(first), None);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn agent_token_registry_witness_fences_remint_and_stale_cleanup() {
+    let session = Uuid::new_v4();
+    let mut registry = super::AgentTokenRegistry::default();
+    assert_eq!(registry.binding_for_session(session), None);
+
+    registry.remint(
+        "c97b5dcc05216258f281ee36279c1285d947ebc7e406cc3abafb3dc1162867ab".into(),
+        session,
+    );
+    let old_witness = registry.binding_for_session(session).unwrap();
+    assert!(registry.binding_matches(session, old_witness));
+
+    registry.remint(
+        "62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd".into(),
+        session,
+    );
+    let successor = registry.binding_for_session(session).unwrap();
+    assert_ne!(successor, old_witness);
+    assert!(!registry.binding_matches(session, old_witness));
+    assert!(registry.binding_matches(session, successor));
+    assert!(!registry.revoke_session_if_binding(session, old_witness));
+    assert!(registry.binding_matches(session, successor));
+    assert_eq!(
+        registry.get("c97b5dcc05216258f281ee36279c1285d947ebc7e406cc3abafb3dc1162867ab"),
+        None
+    );
+    assert_eq!(
+        registry.get("62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd"),
+        Some(&session)
+    );
+
+    assert!(!registry.revoke_session_if_token(
+        session,
+        "c97b5dcc05216258f281ee36279c1285d947ebc7e406cc3abafb3dc1162867ab"
+    ));
+    assert_eq!(registry.binding_for_session(session), Some(successor));
+    assert_eq!(
+        registry.token_for_session(session),
+        Some("62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd")
+    );
+    assert!(registry.revoke_session_if_token(
+        session,
+        "62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd"
+    ));
+    assert_eq!(registry.binding_for_session(session), None);
+    assert!(!registry.binding_matches(session, successor));
+    assert_eq!(
+        registry.get("62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd"),
+        None
+    );
+    assert!(!registry.revoke_session_if_token(
+        session,
+        "62f507557726723c32be031f1292bf528e12feb0e0e5cc9199e82fa2e0e753bd"
+    ));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn agent_token_registry_revoke_invalidates_only_current_witness() {
+    let session = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let mut registry = super::AgentTokenRegistry::default();
+    registry.remint(
+        "abfc412ce6e530df63b0dc9bf4e02bb3cb1719ab967c8f4ea3951ab5bae4ff3f".into(),
+        session,
+    );
+    registry.remint(
+        "3c02a0089bbcdd0d4a61bdee28c75541e693b252127e7e94d185a3f6aa18e35d".into(),
+        other,
+    );
+    let witness = registry.binding_for_session(session).unwrap();
+    let other_witness = registry.binding_for_session(other).unwrap();
+    assert!(!registry.binding_matches(other, witness));
+    assert!(!registry.binding_matches(session, other_witness));
+
+    registry.revoke_session(session);
+    registry.revoke_session(session);
+    registry.revoke_session(Uuid::new_v4());
+    assert_eq!(registry.binding_for_session(session), None);
+    assert!(!registry.binding_matches(session, witness));
+    assert_eq!(
+        registry.get("abfc412ce6e530df63b0dc9bf4e02bb3cb1719ab967c8f4ea3951ab5bae4ff3f"),
+        None
+    );
+    assert_eq!(registry.token_for_session(session), None);
+    assert!(registry.binding_matches(other, other_witness));
+    assert_eq!(
+        registry.get("3c02a0089bbcdd0d4a61bdee28c75541e693b252127e7e94d185a3f6aa18e35d"),
+        Some(&other)
+    );
+    assert_eq!(registry.len(), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn agent_token_registry_reinstall_and_token_rebinding_issue_new_witnesses() {
+    let session = Uuid::new_v4();
+    let displaced = Uuid::new_v4();
+    let mut registry = super::AgentTokenRegistry::default();
+    registry.insert(
+        "71b9fdb4cc45819404fbe7362ed0df95e5b494e3f4d04df430f75b5765c97de1".into(),
+        session,
+    );
+    let old_witness = registry.binding_for_session(session).unwrap();
+
+    let mut reinstalled = super::AgentTokenRegistry::default();
+    reinstalled.insert(
+        "71b9fdb4cc45819404fbe7362ed0df95e5b494e3f4d04df430f75b5765c97de1".into(),
+        session,
+    );
+    let reinstalled_witness = reinstalled.binding_for_session(session).unwrap();
+    assert_ne!(reinstalled_witness, old_witness);
+    assert!(!reinstalled.binding_matches(session, old_witness));
+    assert!(reinstalled.binding_matches(session, reinstalled_witness));
+
+    registry.insert(
+        "71b9fdb4cc45819404fbe7362ed0df95e5b494e3f4d04df430f75b5765c97de1".into(),
+        session,
+    );
+    let replacement = registry.binding_for_session(session).unwrap();
+    assert_ne!(replacement, old_witness);
+    assert!(!registry.binding_matches(session, old_witness));
+    registry.insert(
+        "f75c69132804cced9fe73fccc7623e78cd52e6570349076f3688f6e4c0291016".into(),
+        displaced,
+    );
+    let displaced_witness = registry.binding_for_session(displaced).unwrap();
+    assert_eq!(
+        registry.insert(
+            "f75c69132804cced9fe73fccc7623e78cd52e6570349076f3688f6e4c0291016".into(),
+            session
+        ),
+        Some(displaced)
+    );
+    let collision_witness = registry.binding_for_session(session).unwrap();
+    assert_ne!(collision_witness, replacement);
+    assert_ne!(collision_witness, displaced_witness);
+    assert_eq!(registry.binding_for_session(displaced), None);
+    assert!(!registry.binding_matches(displaced, displaced_witness));
+    assert!(!registry.binding_matches(session, replacement));
+    assert!(!registry.binding_matches(session, displaced_witness));
+    assert!(registry.binding_matches(session, collision_witness));
+    assert_eq!(
+        registry.get("71b9fdb4cc45819404fbe7362ed0df95e5b494e3f4d04df430f75b5765c97de1"),
+        None
+    );
+    assert_eq!(
+        registry.get("f75c69132804cced9fe73fccc7623e78cd52e6570349076f3688f6e4c0291016"),
+        Some(&session)
+    );
+    assert_eq!(registry.len(), 1);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -1586,12 +1903,16 @@ async fn continue_registers_working_agent_token() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
 
     // Stale token from the session's previous process (pre-continue).
     manager
-        .register_agent_token("stale-continue-token".to_string(), session_id)
+        .register_agent_token(
+            "0f4068d29758565c3e3a82a9a34e8ce5d26dbee528b0abefa828d8d0aedb138f".to_string(),
+            session_id,
+        )
         .await;
 
     manager
@@ -1601,7 +1922,7 @@ async fn continue_registers_working_agent_token() {
 
     assert!(
         manager
-            .resolve_agent_token("stale-continue-token")
+            .resolve_agent_token("0f4068d29758565c3e3a82a9a34e8ce5d26dbee528b0abefa828d8d0aedb138f")
             .await
             .is_none(),
         "continue must revoke the session's prior token (supersession)"
@@ -1655,14 +1976,34 @@ async fn continue_cancel_exhausts_retry_budget_in_store() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn continue_interrupts_live_retry_child_before_proceeding() {
-    let (manager, _dir) = manager();
+    // #2346: independent fixtures repeat under the job's CPU quota, without
+    // generating synthetic load or requiring a second verification job.
+    for _ in 0..20 {
+        continue_interrupts_live_retry_child_before_proceeding_once().await;
+    }
+}
+
+async fn continue_interrupts_live_retry_child_before_proceeding_once() {
+    let (mut manager, dir) = manager();
     let session_id = Uuid::new_v4();
     let retry_child_id = Uuid::new_v4();
     let mut parent = bare_session(session_id);
     parent.status = SessionStatus::Failed;
     parent.provider = SessionProvider::Codex;
     parent.claude_session_id = Some("resume-token".to_string());
-    parent.working_dir = std::path::PathBuf::from("/definitely/missing/rsi-session-dir");
+    parent.working_dir = dir.path().join("missing-provider-cwd");
+    // Existing executable paths let the launch reach the deliberately missing
+    // cwd on every platform, without depending on installed provider binaries.
+    let test_binary = std::env::current_exe().expect("test executable");
+    manager.codex_client = Some(
+        CodexClient::with_paths_for_test(
+            test_binary.clone(),
+            test_binary,
+            std::sync::Arc::clone(&manager.runtime_config),
+        )
+        .without_resume_history_validation_for_test(),
+    );
+    insert_row(&manager, &parent).await;
     let mut completed = CompletedSession::for_test(parent);
     completed.superseded_by_retry = Some(retry_child_id);
     manager
@@ -1673,16 +2014,18 @@ async fn continue_interrupts_live_retry_child_before_proceeding() {
 
     let mut child_session = bare_session(retry_child_id);
     child_session.status = SessionStatus::Running;
+    child_session.working_dir = dir.path().to_path_buf();
     let mut child = TrackedSession::new_for_test(child_session);
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
     child.stop_tx = stop_tx;
     manager.active.write().await.insert(retry_child_id, child);
 
     let mut bus_rx = manager.event_bus.subscribe();
-    manager
+    let error = manager
         .continue_session(session_id, "continue".to_string())
         .await
         .expect_err("continue should proceed to launch and fail");
+    assert_missing_working_dir_refusal(&error);
 
     stop_rx
         .try_recv()
@@ -1696,6 +2039,10 @@ async fn continue_interrupts_live_retry_child_before_proceeding() {
             .expect("retry child remains tracked until monitor finalizes")
             .interrupt_requested,
         "continue must mark the retry child as intentionally interrupted"
+    );
+    assert_eq!(
+        manager.active.read().await[&retry_child_id].interrupt_source,
+        Some(crate::terminal_cause::InterruptSource::RetrySuperseded),
     );
     let mut saw_system_message = false;
     while let Ok(ev) = bus_rx.try_recv() {
@@ -1983,7 +2330,10 @@ async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
                 assert_eq!(finalized.status, SessionStatus::Interrupted);
                 // The stale handoff reason is dropped; the interrupt (here with
                 // no recorded source) names its own cause (#588).
-                assert_eq!(row.stop_reason.as_deref(), Some("interrupted:unattributed"));
+                assert_eq!(
+                    row.stop_reason.as_deref(),
+                    Some("interrupted:unattributed:finalize_session")
+                );
             }
             "stall" => {
                 assert_eq!(finalized.status, SessionStatus::Failed);
@@ -2293,6 +2643,12 @@ impl crate::issue_tracker::poller::SessionLauncher for PersistedWatchLauncher {
     }
 }
 
+/// Upper bound for a scripted-monitor condition wait. These waits return the
+/// instant the observed state change happens, so the bound is only a hang
+/// guard; it is generous so a heavily loaded host cannot turn scheduling delay
+/// into a spurious failure.
+const SCRIPTED_MONITOR_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct ScriptedMonitorFixture {
     manager: SessionManager,
     _dir: TempDir,
@@ -2599,7 +2955,8 @@ async fn queued_operator_message_boundary(restart_after_claim: bool, crash_after
             .expect("queued message");
         assert_eq!(claimed.id, queued.id);
         drop(manager);
-        let store = Store::open(&dir.path().join("rsi.db")).expect("reopen after crash");
+        let store =
+            Store::open_test_fixture(&dir.path().join("rsi.db")).expect("reopen after crash");
         let config = Config::from_env();
         let recovered = SessionManager::new(
             std::sync::Arc::new(EventBus::new(16)),
@@ -2976,6 +3333,29 @@ async fn start_scripted_monitor_for_provider(
     process_alive: bool,
     exit_code: i32,
 ) -> ScriptedMonitorFixture {
+    start_scripted_monitor_with_dispatch(
+        provider,
+        prior_assistant,
+        queued_events,
+        process_alive,
+        exit_code,
+        None,
+    )
+    .await
+}
+
+/// `start_scripted_monitor_for_provider` with an optional test-owned tracing
+/// `Dispatch` attached to the monitor task itself (not the process-global
+/// default), so a test can capture the monitor's diagnostics regardless of
+/// which other test already claimed the global slot (#1959).
+async fn start_scripted_monitor_with_dispatch(
+    provider: SessionProvider,
+    prior_assistant: bool,
+    queued_events: Vec<StreamEvent>,
+    process_alive: bool,
+    exit_code: i32,
+    dispatch: Option<tracing::Dispatch>,
+) -> ScriptedMonitorFixture {
     use std::sync::atomic::Ordering;
 
     let (mut manager, dir) = manager();
@@ -3038,7 +3418,7 @@ async fn start_scripted_monitor_for_provider(
     tracked.stop_tx = stop_tx;
     manager.active.write().await.insert(session_id, tracked);
 
-    let token = format!("a10-token-{session_id}");
+    let token = crate::test_support::agent_token(&format!("a10-token-{session_id}"));
     manager
         .register_agent_token(token.clone(), session_id)
         .await;
@@ -3082,7 +3462,7 @@ async fn start_scripted_monitor_for_provider(
         provider_tx.send(event).await.expect("queue provider event");
     }
 
-    let monitor = tokio::spawn(SessionManager::monitor_session(
+    let monitor_future = SessionManager::monitor_session(
         session_id,
         generation,
         Box::new(crate::provider::CliProviderSession::new(provider_rx)),
@@ -3113,7 +3493,14 @@ async fn start_scripted_monitor_for_provider(
         std::sync::Arc::clone(&manager.agent_message_arbiter),
         manager.codegraph_handle.clone(),
         manager.custody_execution_runtime(),
-    ));
+    );
+    let monitor = match dispatch {
+        Some(dispatch) => {
+            use tracing::instrument::WithSubscriber;
+            tokio::spawn(monitor_future.with_subscriber(dispatch))
+        }
+        None => tokio::spawn(monitor_future),
+    };
 
     ScriptedMonitorFixture {
         manager,
@@ -3137,7 +3524,7 @@ async fn wait_for_scripted_result_boundary(
     fixture: &ScriptedMonitorFixture,
     required_content: &str,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(SCRIPTED_MONITOR_WAIT, async {
         loop {
             let result_seen = {
                 let active = fixture.manager.active.read().await;
@@ -3517,7 +3904,7 @@ async fn settled_open_producer_recovers_on_later_interrupt() {
         .interrupt_session(fixture.session_id)
         .await
         .expect("later interrupt is accepted for recoverable active ownership");
-    tokio::time::timeout(std::time::Duration::from_secs(2), &mut fixture.monitor)
+    tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut fixture.monitor)
         .await
         .expect("later interrupt advances leaked producer recovery")
         .expect("monitor task");
@@ -3554,11 +3941,11 @@ async fn settled_open_producer_recovers_on_later_interrupt() {
 /// B1 diagnostic capture.
 ///
 /// The monitor emits its unrecognized-type warning from its own tokio task, so
-/// a thread-local `with_default` subscriber cannot observe it. A process-wide
-/// capturing subscriber is installed once instead, filtered to WARN so the rest
-/// of the suite keeps short-circuiting its `debug!`/`trace!` macros, and every
-/// captured record carries the emitting session id so concurrent tests cannot
-/// contaminate one another's assertions.
+/// a thread-local `with_default` subscriber cannot observe it. Each test builds
+/// its own capturing `Dispatch` and attaches it to the monitor task (#1959)
+/// instead of claiming the process-global default, which only the first
+/// claimant in a combined run could ever win. Records still carry the emitting
+/// session id.
 struct UnrecognizedEventCaptureLayer {
     records: UnrecognizedEventLog,
 }
@@ -3614,26 +4001,24 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UnrecognizedEventC
     }
 }
 
-/// Install the capturing subscriber (once) and hand back the shared record log.
-fn unrecognized_event_records() -> UnrecognizedEventLog {
-    static RECORDS: std::sync::OnceLock<UnrecognizedEventLog> = std::sync::OnceLock::new();
-    RECORDS
-        .get_or_init(|| {
-            use tracing_subscriber::Layer;
-            use tracing_subscriber::layer::SubscriberExt;
+/// Build a capturing `Dispatch` owned by one test, plus its record log.
+///
+/// Nothing is installed process-wide: the dispatch is attached to the monitor
+/// task with `WithSubscriber`, so a test that already ran in this process
+/// cannot have claimed a slot this one needs. Installation cannot be refused.
+fn unrecognized_event_capture() -> (tracing::Dispatch, UnrecognizedEventLog) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
 
-            let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let layer = UnrecognizedEventCaptureLayer {
-                records: std::sync::Arc::clone(&records),
-            }
-            .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
-            // `set_global_default` is fallible only because something else may
-            // already own the global slot; nothing in this crate installs one.
-            let _ =
-                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer));
-            records
-        })
-        .clone()
+    let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let layer = UnrecognizedEventCaptureLayer {
+        records: std::sync::Arc::clone(&records),
+    }
+    .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+    (
+        tracing::Dispatch::new(tracing_subscriber::registry().with(layer)),
+        records,
+    )
 }
 
 /// Diagnostics this session emitted, in order, named by the offending type.
@@ -3656,14 +4041,18 @@ fn diagnosed_event_types(records: &UnrecognizedEventLog, session_id: Uuid) -> Ve
 /// were invisible until a manual CLI probe found them. The Codex path warns;
 /// this pins the same signal for every other provider, including the "second
 /// occurrence stays quiet" property that keeps a chatty type off the log.
+///
+/// The example type must be one no consumer maps. `api_retry` is not: the
+/// session-health reader (#2756/#2811) consumes it and writes its own rows
+/// (#2868), so it is the wrong example of an unrecognized type.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_event() {
-    let records = unrecognized_event_records();
+    let (dispatch, records) = unrecognized_event_capture();
 
     let events = vec![
         StreamEvent {
-            event_type: "api_retry".to_string(),
+            event_type: "future_unmapped_event".to_string(),
             data: serde_json::json!({
                 "attempt": 1,
                 "max_retries": 5,
@@ -3674,7 +4063,7 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
         },
         // The SAME unknown type again: one diagnostic total, not two.
         StreamEvent {
-            event_type: "api_retry".to_string(),
+            event_type: "future_unmapped_event".to_string(),
             data: serde_json::json!({
                 "attempt": 2,
                 "max_retries": 5,
@@ -3696,8 +4085,15 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
         },
     ];
 
-    let mut fixture =
-        start_scripted_monitor_for_provider(SessionProvider::Claude, false, events, true, 0).await;
+    let mut fixture = start_scripted_monitor_with_dispatch(
+        SessionProvider::Claude,
+        false,
+        events,
+        true,
+        0,
+        Some(dispatch),
+    )
+    .await;
     wait_for_scripted_result_boundary(&fixture, "assistant text after the unrecognized events")
         .await;
     drop(fixture.provider_tx.take());
@@ -3708,7 +4104,7 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
 
     assert_eq!(
         diagnosed_event_types(&records, fixture.session_id),
-        vec!["api_retry".to_string()],
+        vec!["future_unmapped_event".to_string()],
         "exactly one diagnostic, naming the offending type, for two occurrences"
     );
 
@@ -3733,6 +4129,103 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
             "assistant text after the unrecognized events".to_string()
         )]
     );
+
+    let _ = fixture.scheduler.shutdown().await;
+    fixture.watch_task.abort();
+    fixture.manager.event_bus.unsubscribe();
+}
+
+/// hub #2913: one recorded line of each previously unclassified event goes
+/// through the real monitor loop. `tool_progress` is a known no-op and
+/// `provider_error` becomes a typed `provider_health` row; neither WARNs, while
+/// a genuinely unknown type still does.
+///
+/// Fixture sources (ids and paths are placeholders, nothing is copied from a
+/// session): `tool_progress` is built from the frame schema in the installed
+/// Claude Code CLI 2.1.301 bundle (`type`, `tool_use_id`, `tool_name`,
+/// `parent_tool_use_id`, `elapsed_time_seconds`, `uuid`, `session_id`);
+/// `provider_error` is the `StreamEvent` literal in
+/// `crates/rsid-harness/src/agent_loop.rs` (`class`, `http_status`,
+/// `retry_after_ms`, `detail_code`, `session_id`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_progress_and_provider_error_are_classified_and_an_unknown_type_still_warns() {
+    let (dispatch, records) = unrecognized_event_capture();
+    let recorded_line = |line: &str| -> StreamEvent {
+        let data: serde_json::Value = serde_json::from_str(line).expect("recorded line");
+        StreamEvent {
+            event_type: data["type"].as_str().expect("type").to_string(),
+            data,
+        }
+    };
+    let events = vec![
+        recorded_line(
+            r#"{"type":"tool_progress","tool_use_id":"toolu_PLACEHOLDER","tool_name":"Bash","parent_tool_use_id":null,"elapsed_time_seconds":3,"uuid":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-000000000002"}"#,
+        ),
+        recorded_line(
+            r#"{"type":"provider_error","class":"overloaded","http_status":529,"retry_after_ms":null,"detail_code":"overloaded_error","session_id":"SESSION-TAG"}"#,
+        ),
+        recorded_line(r#"{"type":"future_unmapped_event","detail":"still unknown"}"#),
+        StreamEvent {
+            event_type: "assistant".to_string(),
+            data: serde_json::json!({
+                "role": "assistant",
+                "content": "assistant text after the classified events",
+            }),
+        },
+        StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({"subtype": "success"}),
+        },
+    ];
+
+    let mut fixture = start_scripted_monitor_with_dispatch(
+        SessionProvider::Claude,
+        false,
+        events,
+        true,
+        0,
+        Some(dispatch),
+    )
+    .await;
+    wait_for_scripted_result_boundary(&fixture, "assistant text after the classified events").await;
+    drop(fixture.provider_tx.take());
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.monitor)
+        .await
+        .expect("monitor drains the scripted stream")
+        .expect("monitor task");
+
+    assert_eq!(
+        diagnosed_event_types(&records, fixture.session_id),
+        vec!["future_unmapped_event".to_string()],
+        "only the truly unknown type is diagnosed"
+    );
+
+    let persisted = fixture
+        .manager
+        .store
+        .lock()
+        .await
+        .load_events(fixture.session_id)
+        .expect("load events");
+    let health: Vec<&ConversationEvent> = persisted
+        .iter()
+        .filter(|event| event.is_provider_health_notice())
+        .collect();
+    assert_eq!(health.len(), 1, "one typed row, none for tool_progress");
+    let meta = &health[0].metadata.as_ref().expect("metadata")
+        [rsi_common::types::PROVIDER_HEALTH_METADATA_KEY];
+    assert_eq!(meta["kind"], "provider_error");
+    assert_eq!(meta["class"], "overloaded");
+    assert_eq!(meta["detail"]["http_status"], 529);
+    assert_eq!(
+        health[0].content,
+        "[harness] provider error: overloaded (HTTP 529)"
+    );
+    assert!(persisted.iter().any(|event| {
+        event.event_type == EventType::Message
+            && event.content == "assistant text after the classified events"
+    }));
 
     let _ = fixture.scheduler.shutdown().await;
     fixture.watch_task.abort();
@@ -4062,6 +4555,125 @@ async fn terminal_nonzero_exit_remains_failed() {
     .await;
 }
 
+/// #304 (hub #748 strand 3): a Harness turn whose loop ends in an error is
+/// recorded Failed with the error visible, whatever the error's type. The
+/// `process_error` is the one the Harness task builds from the loop's own
+/// `DaemonError`, driven through the production monitor; a classified
+/// provider failure and an untyped one (policy denial, process fault) both
+/// settle Failed, a normal turn still settles Completed, and ordinary
+/// nonterminal stderr stays nonterminal.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_harness_turn_settles_failed_with_the_error_visible() {
+    use crate::error::DaemonError;
+    use crate::session::harness::errors::{ProviderError, ProviderErrorClass, ProviderErrorExt};
+
+    let failing_turns = [
+        (
+            "untyped policy denial",
+            DaemonError::PolicyDenied("model invocation dedup conflict".into()),
+            "model invocation dedup conflict",
+            "provider_error:unclassified",
+        ),
+        (
+            "untyped process fault",
+            DaemonError::Process("tool registry setup failed".into()),
+            "tool registry setup failed",
+            "provider_error:unclassified",
+        ),
+        (
+            "classified provider failure",
+            ProviderError {
+                class: ProviderErrorClass::Transient,
+                http_status: Some(503),
+                retry_after_ms: None,
+                detail_code: "http_503".into(),
+            }
+            .into_daemon_error(),
+            "provider_error:http_503",
+            "provider_error:unclassified",
+        ),
+    ];
+
+    for (name, loop_error, visible_text, expected_stop_reason) in failing_turns {
+        let mut fixture = start_scripted_monitor(
+            true,
+            vec![crate::session::harness::process_error_event(&loop_error)],
+            false,
+            0,
+        )
+        .await;
+        drop(fixture.provider_tx.take());
+        tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut fixture.monitor)
+            .await
+            .expect("failing harness turn monitor completes")
+            .expect("failing harness turn monitor task");
+        let row = fixture
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(fixture.session_id)
+            .expect("load harness row")
+            .expect("harness row");
+        assert_eq!(row.status, SessionStatus::Failed, "{name}");
+        assert_eq!(
+            row.stop_reason.as_deref(),
+            Some(expected_stop_reason),
+            "{name}"
+        );
+        let events = fixture
+            .manager
+            .store
+            .lock()
+            .await
+            .load_events(fixture.session_id)
+            .expect("load harness error evidence");
+        assert!(
+            events.iter().any(
+                |event| event.content.contains("**Process Error (provider)**")
+                    && event.content.contains(visible_text)
+            ),
+            "{name} keeps the error visible in the transcript"
+        );
+        let _ = fixture.scheduler.shutdown().await;
+        fixture.watch_task.abort();
+        fixture.manager.event_bus.unsubscribe();
+    }
+
+    let mut normal = start_scripted_monitor(
+        true,
+        vec![StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({"subtype": "success"}),
+        }],
+        false,
+        0,
+    )
+    .await;
+    drop(normal.provider_tx.take());
+    tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut normal.monitor)
+        .await
+        .expect("normal harness turn monitor completes")
+        .expect("normal harness turn monitor task");
+    assert_eq!(
+        normal
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(normal.session_id)
+            .expect("load normal row")
+            .expect("normal row")
+            .status,
+        SessionStatus::Completed,
+        "a normal Harness turn still settles Completed"
+    );
+    let _ = normal.scheduler.shutdown().await;
+    normal.watch_task.abort();
+    normal.manager.event_bus.unsubscribe();
+}
+
 /// B-003: terminal normalized provider errors must override carried useful
 /// history, while raw stderr remains a diagnostic and does not manufacture a
 /// terminal failure. The table covers Codex CLI, Local, Harness, and the two
@@ -4150,7 +4762,7 @@ async fn terminal_provider_errors_with_prior_history_fail_after_drain() {
         )
         .await;
         drop(fixture.provider_tx.take());
-        tokio::time::timeout(std::time::Duration::from_secs(2), &mut fixture.monitor)
+        tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut fixture.monitor)
             .await
             .expect("terminal provider error monitor completes")
             .expect("terminal provider error monitor task");
@@ -4205,7 +4817,7 @@ async fn terminal_provider_errors_with_prior_history_fail_after_drain() {
     )
     .await;
     drop(diagnostic.provider_tx.take());
-    tokio::time::timeout(std::time::Duration::from_secs(2), &mut diagnostic.monitor)
+    tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut diagnostic.monitor)
         .await
         .expect("stderr diagnostic monitor completes")
         .expect("stderr diagnostic monitor task");
@@ -5012,6 +5624,7 @@ async fn list_sessions_includes_store_rows_missing_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
 
@@ -5058,6 +5671,7 @@ async fn remote_runtime_candidate_snapshot_is_scalar_and_nonblocking() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     let snapshot = manager.remote_runtime_session_candidates().unwrap();
@@ -5252,6 +5866,7 @@ async fn remote_sessions_owner_merges_runtime_rows_after_store() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     let request: rsi_common::remote_read::ReadRequestV1 =
@@ -5350,6 +5965,7 @@ async fn remote_selected_session_owner_preserves_saved_and_runtime_only_identity
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: false,
+            store_writes: Default::default(),
         },
     );
     let limiter = crate::remote_read::RemoteReadLimiter::new();
@@ -6236,6 +6852,7 @@ async fn remote_selected_question_slot_fences_generation_and_mirror_without_tomb
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     let completed_snapshot = manager
@@ -6345,6 +6962,7 @@ async fn remote_question_slot_list_bounds_three_mirrors_and_rechecks_cache_prese
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     let before = manager.remote_question_slot_list(project, session).unwrap();
@@ -6439,6 +7057,7 @@ async fn list_sessions_omits_hidden_terminal_statuses_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     completed.insert(
@@ -6451,6 +7070,7 @@ async fn list_sessions_omits_hidden_terminal_statuses_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     completed.insert(
@@ -6463,6 +7083,7 @@ async fn list_sessions_omits_hidden_terminal_statuses_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     drop(completed);
@@ -6498,6 +7119,7 @@ async fn list_sessions_by_project_omits_hidden_terminal_statuses_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     completed.insert(
@@ -6510,6 +7132,7 @@ async fn list_sessions_by_project_omits_hidden_terminal_statuses_from_memory() {
             retry_fired_at: None,
             superseded_by_retry: None,
             events_hydrated: true,
+            store_writes: Default::default(),
         },
     );
     drop(completed);
@@ -8463,6 +9086,80 @@ async fn child_watch_fence_refusal_records_retry_and_abandons_typed_at_bound() {
     }
 }
 
+/// #2038: a child watch whose wake target is Archived (or Deleted) can never
+/// deliver; its first fire abandons it with the typed `wake_target_archived`
+/// reason instead of refusing every tick forever.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
+async fn child_watch_with_archived_or_deleted_target_abandons_typed_once() {
+    for dead in [SessionStatus::Archived, SessionStatus::Deleted] {
+        let (manager, _dir) = manager();
+        let child = Uuid::new_v4();
+        let master = Uuid::new_v4();
+        insert_row(&manager, &bare_session(child)).await;
+        let mut master_row = bare_session(master);
+        master_row.status = dead;
+        insert_row(&manager, &master_row).await;
+        let job = mk_watch_job_for(child, master, "");
+        manager
+            .store
+            .lock()
+            .await
+            .insert_scheduled_job(&job)
+            .unwrap();
+        match manager.fire_terminal_watch(&job).await.expect("fire") {
+            crate::issue_tracker::poller::WatchFireOutcome::Abandon { reason } => {
+                assert!(reason.starts_with("wake_target_archived"), "{reason}");
+                assert!(reason.contains(&master.to_string()), "{reason}");
+            }
+            other => panic!("expected typed Abandon for {dead:?}, got {other:?}"),
+        }
+        // Nothing was refused-and-counted: the retirement is the only record.
+        assert!(
+            manager
+                .store
+                .lock()
+                .await
+                .continuation_retry(job.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// #2038: a busy (transient) target keeps the watch armed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::large_futures)]
+async fn child_watch_with_busy_target_stays_armed_not_abandoned() {
+    let (manager, _dir) = manager();
+    let child = Uuid::new_v4();
+    let master = Uuid::new_v4();
+    insert_row(&manager, &bare_session(child)).await;
+    let mut master_row = bare_session(master);
+    master_row.status = SessionStatus::Running;
+    insert_row(&manager, &master_row).await;
+    let mut tracked_session = bare_session(master);
+    tracked_session.status = SessionStatus::Running;
+    manager
+        .active
+        .write()
+        .await
+        .insert(master, TrackedSession::new_for_test(tracked_session));
+    let job = mk_watch_job_for(child, master, "");
+    manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&job)
+        .unwrap();
+    assert_eq!(
+        manager.fire_terminal_watch(&job).await.expect("fire"),
+        crate::issue_tracker::poller::WatchFireOutcome::NotReady
+    );
+}
+
 /// Review round 2 `retry_exhaustion_crash_reset` (child watch): the eighth
 /// retryable refusal returns the typed Abandon while the recorded attempts
 /// stay durable until the scheduler's retirement commits. A daemon that dies
@@ -8511,7 +9208,7 @@ async fn child_watch_retry_exhaustion_survives_crash_before_abandon_settlement()
     exhausted(manager.fire_terminal_watch(&job).await.expect("fire"));
 
     // Crash point: the scheduler's Abandon retirement never ran. Reopen.
-    let reopened = Store::open(&dir.path().join("rsi.db")).expect("reopen store");
+    let reopened = Store::open_test_fixture(&dir.path().join("rsi.db")).expect("reopen store");
     let row = reopened
         .get_scheduled_job(&job.id)
         .unwrap()
@@ -8645,9 +9342,16 @@ async fn bounded_retry_dispatch_caps_concurrency_and_survives_hung_handler() {
 /// interrupt-then-wait branch (`is_active == true`), which no other test in
 /// this file exercises — every other `continue_session` test seeds `completed`
 /// and therefore skips the wait entirely.
-async fn seed_active_running(manager: &SessionManager, session_id: Uuid) {
+async fn seed_active_running(
+    manager: &SessionManager,
+    session_id: Uuid,
+    working_dir: &std::path::Path,
+) {
     let mut session = bare_session(session_id);
     session.status = SessionStatus::Running;
+    session.working_dir = working_dir.to_path_buf();
+    // Continuation admission reads the durable row for the effective cwd.
+    insert_row(manager, &session).await;
     manager
         .active
         .write()
@@ -8690,9 +9394,9 @@ async fn finalize_active_session(manager: &SessionManager, session_id: Uuid) {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn continue_tolerates_teardown_slower_than_the_old_ten_second_deadline() {
-    let (manager, _dir) = manager();
+    let (manager, dir) = manager();
     let session_id = Uuid::new_v4();
-    seed_active_running(&manager, session_id).await;
+    seed_active_running(&manager, session_id, dir.path()).await;
 
     let late = super::reaper::TEARDOWN_TERMINAL_WORST_CASE + std::time::Duration::from_secs(2);
     assert!(
@@ -8728,21 +9432,53 @@ async fn continue_tolerates_teardown_slower_than_the_old_ten_second_deadline() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn continue_still_times_out_when_no_terminal_status_ever_arrives() {
-    let (manager, _dir) = manager();
-    let session_id = Uuid::new_v4();
-    seed_active_running(&manager, session_id).await;
+    // #2346: independent fixtures repeat under the job's CPU quota, without
+    // generating synthetic load or requiring a second verification job.
+    for _ in 0..20 {
+        continue_still_times_out_when_no_terminal_status_ever_arrives_once().await;
+    }
+}
 
+async fn continue_still_times_out_when_no_terminal_status_ever_arrives_once() {
+    let (manager, dir) = manager();
+    let session_id = Uuid::new_v4();
+    seed_active_running(&manager, session_id, dir.path()).await;
+
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
+    manager
+        .active
+        .write()
+        .await
+        .get_mut(&session_id)
+        .unwrap()
+        .stop_tx = stop_tx;
+    let mut continuing = Box::pin(manager.continue_session(session_id, "query".to_string()));
+    tokio::select! {
+        result = &mut continuing => panic!("continue returned before interrupt: {result:?}"),
+        stopped = stop_rx.recv() => assert_eq!(stopped, Some(())),
+    }
+
+    // Start measuring only after the interrupt has reached the fake monitor.
+    // Explicit virtual time checks both sides of the real production deadline.
     let started = tokio::time::Instant::now();
-    let err = manager
-        .continue_session(session_id, "query".to_string())
+    let last_tick = std::time::Duration::from_millis(1);
+    tokio::time::advance(SessionManager::CONTINUE_INTERRUPT_WAIT - last_tick).await;
+    std::future::poll_fn(|cx| {
+        // Exhausting Tokio's cooperative budget must not masquerade as waiting
+        // on the deadline/guard being asserted here.
+        let mut poll = tokio::task::unconstrained(continuing.as_mut());
+        assert!(
+            std::future::Future::poll(std::pin::Pin::new(&mut poll), cx).is_pending(),
+            "continue must still be waiting before the full deadline"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    tokio::time::advance(last_tick).await;
+    let err = continuing
         .await
         .expect_err("no terminal status ever published -> must time out");
-
-    let waited = started.elapsed();
-    assert!(
-        waited >= SessionManager::CONTINUE_INTERRUPT_WAIT,
-        "must wait the full deadline before giving up (waited {waited:?})"
-    );
+    assert_eq!(started.elapsed(), SessionManager::CONTINUE_INTERRUPT_WAIT);
     let msg = err.to_string();
     assert!(
         msg.contains("did not finalize") && msg.contains("wedged"),
@@ -8769,28 +9505,56 @@ async fn continue_still_times_out_when_no_terminal_status_ever_arrives() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(start_paused = true)]
 async fn contended_continue_does_not_silently_drop_the_query() {
-    let (manager, _dir) = manager();
+    // #2346: independent fixtures repeat under the job's CPU quota, without
+    // generating synthetic load or requiring a second verification job.
+    for _ in 0..20 {
+        contended_continue_does_not_silently_drop_the_query_once().await;
+    }
+}
+
+async fn contended_continue_does_not_silently_drop_the_query_once() {
+    let (manager, dir) = manager();
     let session_id = Uuid::new_v4();
 
+    // Continuation admission reads the durable row for the effective cwd.
+    let mut row = bare_session(session_id);
+    row.status = SessionStatus::Running;
+    row.working_dir = dir.path().to_path_buf();
+    insert_row(&manager, &row).await;
+
     // A LIVE tracked child: exactly what `adopt_if_live` keys on.
-    manager
-        .active
-        .write()
+    let mut live = fake_alive_tracked(session_id).await;
+    live.session.working_dir = row.working_dir.clone();
+    manager.active.write().await.insert(session_id, live);
+
+    // Pause exactly before guard acquisition. A timer-based holder can release
+    // before preflight finishes; polling past this barrier while holding the
+    // guard forces genuine contention regardless of scheduler load.
+    let guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+    let (reached, resume) = super::lifecycle::install_continuation_pause_for_test(session_id);
+    let mut continuing =
+        Box::pin(manager.continue_session(session_id, "keep my typed prompt".to_string()));
+    tokio::select! {
+        result = &mut continuing => panic!("continue returned before guard: {result:?}"),
+        reached = reached => reached.expect("continue reached the guard barrier"),
+    }
+    resume.send(()).expect("release the guard barrier");
+    std::future::poll_fn(|cx| {
+        // Exhausting Tokio's cooperative budget must not masquerade as waiting
+        // on the deadline/guard being asserted here.
+        let mut poll = tokio::task::unconstrained(continuing.as_mut());
+        assert!(
+            std::future::Future::poll(std::pin::Pin::new(&mut poll), cx).is_pending(),
+            "continue must wait for the held spawn guard"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(guard);
+
+    let err = continuing
         .await
-        .insert(session_id, fake_alive_tracked(session_id).await);
-
-    // A pure holder forces the contended branch without spawning anything.
-    // `join!` polls left-to-right, so the holder wins the guard first.
-    let ((), result) = tokio::join!(
-        async {
-            let g = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            drop(g);
-        },
-        manager.continue_session(session_id, "keep my typed prompt".to_string()),
-    );
-
-    let err = result.expect_err("a contended continue must not report success by adopting");
+        .expect_err("a contended continue must not report success by adopting");
     assert!(
         err.to_string().contains("did not finalize"),
         "must have proceeded into the interrupt-and-wait path rather than adopting; got: {err}"
@@ -9115,7 +9879,7 @@ async fn capacity_resume_crash_after_admission_before_spawn_reopens_to_one_produ
         let config = Config::from_env();
         SessionManager::new(
             std::sync::Arc::new(EventBus::new(16)),
-            Store::open(&database).expect("open file-backed capacity Store"),
+            Store::open_test_fixture(&database).expect("open file-backed capacity Store"),
             false,
             directory.path().join("daemon.sock"),
             None,
@@ -9604,4 +10368,952 @@ fn test_convert_stream_event_top_level_tool_use_id() {
             .expect("the fixture's event type must stay recognized by the converter");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tool_use_id, Some("call_1".to_string()));
+}
+
+/// #257: a Store metadata write on a terminal session (rename, description,
+/// rating, active task) mirrors the `updated_at` it stamped into the runtime
+/// completed entry, so it is not runtime-completed custody drift however long
+/// after finalization it lands. An entry that already disagreed with the row
+/// (an unmirrored Store change) is left disagreeing.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn completed_metadata_writes_mirror_the_store_stamp_257() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let session = bare_session(session_id);
+    insert_row(&manager, &session).await;
+    let stored_updated_at = async |manager: &SessionManager| {
+        manager
+            .store
+            .lock()
+            .await
+            .get_session(session_id)
+            .expect("read session row")
+            .expect("session row")
+            .updated_at
+    };
+    let runtime_updated_at = async |manager: &SessionManager| {
+        manager.completed.read().await[&session_id]
+            .session
+            .updated_at
+    };
+
+    // The finalizer stamps the runtime copy just before the Store row.
+    let mut finalized = session.clone();
+    finalized.updated_at = stored_updated_at(&manager).await - chrono::Duration::milliseconds(11);
+    manager
+        .completed
+        .write()
+        .await
+        .insert(session_id, CompletedSession::for_test(finalized));
+
+    manager
+        .update_session_description(session_id, "Late refinement".to_string())
+        .await
+        .expect("description write");
+    assert_eq!(
+        runtime_updated_at(&manager).await,
+        stored_updated_at(&manager).await
+    );
+    assert_eq!(
+        manager.completed.read().await[&session_id]
+            .session
+            .description
+            .as_deref(),
+        Some("Late refinement")
+    );
+    manager
+        .update_session_rating(session_id, Some(8))
+        .await
+        .expect("rating write");
+    manager
+        .update_session_title(session_id, "Operator rename".to_string())
+        .await
+        .expect("title write");
+    manager
+        .update_active_task(session_id, Some("follow-up".to_string()))
+        .await
+        .expect("active task write");
+    assert_eq!(
+        runtime_updated_at(&manager).await,
+        stored_updated_at(&manager).await
+    );
+
+    // A runtime copy 5 s behind the row never saw some Store change: a later
+    // metadata write must not paper over it.
+    let unseen = stored_updated_at(&manager).await - chrono::Duration::seconds(5);
+    manager
+        .completed
+        .write()
+        .await
+        .get_mut(&session_id)
+        .expect("completed entry")
+        .session
+        .updated_at = unseen;
+    manager
+        .update_session_rating(session_id, Some(9))
+        .await
+        .expect("rating write");
+    assert_eq!(runtime_updated_at(&manager).await, unseen);
+    assert!(stored_updated_at(&manager).await > unseen);
+}
+
+/// #260: Store metadata writes on a terminal session commit in one order but
+/// their mirrors can reach the `completed` lock in another (the rename path
+/// waits on `active` first; the finalizer's refinement publishes directly).
+/// Real stamps from the #257 and #258 writers (description refinement, rename,
+/// lead pin, parent move), mirrored in reverse commit order through
+/// `apply_completed_store_write`, still converge the entry to the row's
+/// `updated_at` (adapted for #265: at the first arrival, by Store order).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn reordered_metadata_mirrors_converge_to_the_store_stamp_260() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    // Finalized an hour ago, so every later write's prior stamp is far
+    // outside the #252 window from the runtime copy (no sleeps needed).
+    session.updated_at -= chrono::Duration::hours(1);
+    insert_row(&manager, &session).await;
+    let stored_updated_at = async |manager: &SessionManager| {
+        manager
+            .store
+            .lock()
+            .await
+            .get_session(session_id)
+            .expect("read session row")
+            .expect("session row")
+            .updated_at
+    };
+    let mut finalized = session.clone();
+    finalized.updated_at = stored_updated_at(&manager).await - chrono::Duration::milliseconds(11);
+    manager
+        .completed
+        .write()
+        .await
+        .insert(session_id, CompletedSession::for_test(finalized.clone()));
+
+    // Commit order: refinement, rename, lead pin, parent move.
+    let refinement = manager
+        .persistence
+        .update_session_description(session_id, "Late refinement".to_string())
+        .await
+        .expect("description write")
+        .expect("description stamp");
+    let rename = manager
+        .persistence
+        .update_session_title(session_id, "Operator rename".to_string())
+        .await
+        .expect("title write")
+        .expect("title stamp");
+    let (_, pin) = manager
+        .store
+        .lock()
+        .await
+        .pin_session_if_unpinned_stamped(session_id)
+        .expect("lead pin");
+    let pin = pin.expect("pin stamp");
+    let parent_move = manager
+        .store
+        .lock()
+        .await
+        .update_session_parent(session_id, None)
+        .expect("parent move")
+        .expect("parent stamp");
+    let row = stored_updated_at(&manager).await;
+    assert_eq!(parent_move.stamped_at, row);
+
+    // Mirror order: every later write before the refinement it chains from.
+    // #265: the writes are one run of stamped Store writes from the row the
+    // entry was finalized against, so the newest converges the entry at once
+    // and the older ones arriving later change no stamp (nothing is held).
+    for (field, stamp) in [
+        (super::types::CompletedStoreField::Parent, parent_move),
+        (super::types::CompletedStoreField::Title, rename),
+        (super::types::CompletedStoreField::Pin, pin),
+        (super::types::CompletedStoreField::Description, refinement),
+    ] {
+        super::cohort_settlement::apply_completed_store_write(
+            &manager.completed,
+            session_id,
+            field,
+            Some(stamp),
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            manager.completed.read().await[&session_id]
+                .session
+                .updated_at,
+            row
+        );
+    }
+    // Each field still took its own write, the late refinement included.
+    let completed = manager.completed.read().await;
+    let fields = completed[&session_id].store_writes.fields;
+    assert_eq!(
+        fields.applied(super::types::CompletedStoreField::Description),
+        refinement.write_seq
+    );
+    assert_eq!(
+        fields.applied(super::types::CompletedStoreField::Title),
+        rename.write_seq
+    );
+}
+
+/// #263 (hub #2795): two parent moves on a terminal session commit A (to
+/// `first`) then B (to `second`), but B's mirror reaches the `completed` lock
+/// first. A's late mirror must not put its older parent back: the runtime
+/// entry converges to the Store's last committed parent with that write's
+/// stamp. Covered both with links beyond the #252 window (B is held until A
+/// arrives, the reported order) and with real Store stamps milliseconds apart
+/// (B chains from the entry directly, so A arrives behind it).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn reordered_parent_mirrors_keep_the_last_committed_parent_263() {
+    let (manager, _dir) = manager();
+    let container = async |name: &str| {
+        manager
+            .create_container(rsi_common::rpc::CreateContainerParams {
+                kind: SessionKind::Group,
+                name: name.to_string(),
+                parent_id: None,
+                project_id: None,
+                tags: vec!["test".to_string()],
+                topology_id: None,
+            })
+            .await
+            .expect("container")
+    };
+    let first = container("Parent A 263").await.id;
+    let second = container("Parent B 263").await.id;
+    let session_id = Uuid::new_v4();
+    let session = bare_session(session_id);
+    insert_row(&manager, &session).await;
+    let finalize = async |manager: &SessionManager, at: chrono::DateTime<chrono::Utc>| {
+        let mut finalized = session.clone();
+        finalized.updated_at = at;
+        manager
+            .completed
+            .write()
+            .await
+            .insert(session_id, CompletedSession::for_test(finalized));
+    };
+    let mirror =
+        async |manager: &SessionManager, parent: Uuid, stamp: crate::store::SessionWriteStamp| {
+            super::cohort_settlement::apply_completed_store_write(
+                &manager.completed,
+                session_id,
+                super::types::CompletedStoreField::Parent,
+                Some(stamp),
+                move |session| session.parent_id = Some(parent),
+            )
+            .await;
+        };
+    let runtime = async |manager: &SessionManager| {
+        manager.completed.read().await[&session_id].session.clone()
+    };
+
+    // Store commit order: A, then B.
+    let a = manager
+        .store
+        .lock()
+        .await
+        .update_session_parent(session_id, Some(first))
+        .expect("parent move A")
+        .expect("A stamp");
+    let b = manager
+        .store
+        .lock()
+        .await
+        .update_session_parent(session_id, Some(second))
+        .expect("parent move B")
+        .expect("B stamp");
+    let row = manager
+        .store
+        .lock()
+        .await
+        .get_session(session_id)
+        .expect("read session row")
+        .expect("session row");
+    assert_eq!(row.parent_id, Some(second));
+    assert_eq!(row.updated_at, b.stamped_at);
+    let t0 = a.previous_updated_at.expect("A prior stamp");
+
+    // The reported order: A commits t0 -> t0+10 s, B t0+10 s -> t0+13 s; B
+    // mirrors first, then A. Adapted for #265: the stamps keep the Store
+    // order and run of the real writes A and B, so B converges the entry at
+    // once and A, older by Store order, changes nothing.
+    let late_a = crate::store::SessionWriteStamp {
+        previous_updated_at: Some(t0),
+        stamped_at: t0 + chrono::Duration::seconds(10),
+        ..a
+    };
+    let late_b = crate::store::SessionWriteStamp {
+        previous_updated_at: Some(late_a.stamped_at),
+        stamped_at: late_a.stamped_at + chrono::Duration::seconds(3),
+        ..b
+    };
+    finalize(&manager, t0).await;
+    mirror(&manager, second, late_b).await;
+    mirror(&manager, first, late_a).await;
+    let held = runtime(&manager).await;
+    assert_eq!(held.parent_id, Some(second));
+    assert_eq!(held.updated_at, late_b.stamped_at);
+
+    // Real Store stamps milliseconds apart: B chains from the entry within
+    // the #252 window and advances at once; A arrives behind it.
+    finalize(&manager, t0 - chrono::Duration::milliseconds(11)).await;
+    mirror(&manager, second, b).await;
+    mirror(&manager, first, a).await;
+    let direct = runtime(&manager).await;
+    assert_eq!(direct.parent_id, row.parent_id);
+    assert_eq!(direct.updated_at, row.updated_at);
+
+    // In commit order the same entry results.
+    finalize(&manager, t0 - chrono::Duration::milliseconds(11)).await;
+    mirror(&manager, first, a).await;
+    mirror(&manager, second, b).await;
+    let in_order = runtime(&manager).await;
+    assert_eq!(in_order.parent_id, row.parent_id);
+    assert_eq!(in_order.updated_at, row.updated_at);
+}
+
+/// One mirrored title or description write of the #265 tests: its field, the
+/// stamp the real Store writer returned and the value it stored.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[derive(Clone, Copy)]
+struct MirroredWrite265 {
+    field: super::types::CompletedStoreField,
+    stamp: crate::store::SessionWriteStamp,
+    value: &'static str,
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn mirror_write_265(manager: &SessionManager, session_id: Uuid, write: MirroredWrite265) {
+    let field = write.field;
+    let value = write.value.to_string();
+    super::cohort_settlement::apply_completed_store_write(
+        &manager.completed,
+        session_id,
+        field,
+        Some(write.stamp),
+        move |session| match field {
+            super::types::CompletedStoreField::Title => session.title = Some(value),
+            super::types::CompletedStoreField::Description => session.description = Some(value),
+            other => panic!("the #265 mirror tests write titles and descriptions, not {other:?}"),
+        },
+    )
+    .await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn stored_session_265(manager: &SessionManager, session_id: Uuid) -> Session {
+    manager
+        .store
+        .lock()
+        .await
+        .get_session(session_id)
+        .expect("read session row")
+        .expect("session row")
+}
+
+/// Mirror `writes` in the given order into a completed entry finalized just
+/// before the row (the #252 finalizer order), and assert the entry ends equal
+/// to the Store row on every mirrored field and on `updated_at`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn assert_mirrors_converge_265(
+    manager: &SessionManager,
+    finalized: &Session,
+    writes: &[MirroredWrite265],
+    order: &str,
+) {
+    let session_id = finalized.id;
+    manager
+        .completed
+        .write()
+        .await
+        .insert(session_id, CompletedSession::for_test(finalized.clone()));
+    for write in writes {
+        mirror_write_265(manager, session_id, *write).await;
+    }
+    let stored = stored_session_265(manager, session_id).await;
+    let runtime = manager.completed.read().await[&session_id].session.clone();
+    assert_eq!(runtime.title, stored.title, "title, mirrored {order}");
+    assert_eq!(
+        runtime.description, stored.description,
+        "description, mirrored {order}"
+    );
+    assert_eq!(
+        runtime.updated_at, stored.updated_at,
+        "updated_at, mirrored {order}"
+    );
+}
+
+/// #265 (hub #2818): a wall clock that steps back does not give Store commit
+/// order. Title write A reads a clock 10 s ahead, the clock steps back, a
+/// description write X intervenes (so B's prior stamp is not A's), and title
+/// write B commits last with an earlier stamp than A. Mirrored in commit order
+/// or in reverse, the runtime entry ends at the Store's last committed title
+/// and `updated_at`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn clock_rollback_across_an_intervening_write_keeps_the_last_committed_title_265() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let session = bare_session(session_id);
+    insert_row(&manager, &session).await;
+    let r0 = stored_session_265(&manager, session_id).await.updated_at;
+    crate::store::script_session_write_clock_for_test(
+        session_id,
+        [
+            r0 + chrono::Duration::seconds(10),
+            r0 + chrono::Duration::seconds(1),
+            r0 + chrono::Duration::seconds(2),
+        ],
+    );
+    let a = manager
+        .persistence
+        .update_session_title(session_id, "A".to_string())
+        .await
+        .expect("title A")
+        .expect("A stamp");
+    let x = manager
+        .persistence
+        .update_session_description(session_id, "X".to_string())
+        .await
+        .expect("description X")
+        .expect("X stamp");
+    let b = manager
+        .persistence
+        .update_session_title(session_id, "B".to_string())
+        .await
+        .expect("title B")
+        .expect("B stamp");
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.title.as_deref(), Some("B"));
+    assert_eq!(stored.updated_at, b.stamped_at);
+    assert!(
+        b.stamped_at < a.stamped_at,
+        "the clock stepped back after A"
+    );
+
+    let mut finalized = session.clone();
+    finalized.updated_at = r0 - chrono::Duration::milliseconds(11);
+    let a = MirroredWrite265 {
+        field: super::types::CompletedStoreField::Title,
+        stamp: a,
+        value: "A",
+    };
+    let x = MirroredWrite265 {
+        field: super::types::CompletedStoreField::Description,
+        stamp: x,
+        value: "X",
+    };
+    let b = MirroredWrite265 {
+        field: super::types::CompletedStoreField::Title,
+        stamp: b,
+        value: "B",
+    };
+    assert_mirrors_converge_265(&manager, &finalized, &[a, x, b], "in commit order").await;
+    assert_mirrors_converge_265(&manager, &finalized, &[b, x, a], "in reverse").await;
+}
+
+/// #265 (hub #2818): three writes read the same clock instant (description X,
+/// then titles A and B, each replacing a row stamped at that instant). B is
+/// the Store's last committed title; mirrored in reverse, A must not put its
+/// older title back.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn tied_stamps_mirrored_in_reverse_keep_the_last_committed_title_265() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let session = bare_session(session_id);
+    insert_row(&manager, &session).await;
+    let r0 = stored_session_265(&manager, session_id).await.updated_at;
+    let tied = r0 + chrono::Duration::seconds(1);
+    crate::store::script_session_write_clock_for_test(session_id, [tied, tied, tied]);
+    let x = manager
+        .persistence
+        .update_session_description(session_id, "X".to_string())
+        .await
+        .expect("description X")
+        .expect("X stamp");
+    let a = manager
+        .persistence
+        .update_session_title(session_id, "A".to_string())
+        .await
+        .expect("title A")
+        .expect("A stamp");
+    let b = manager
+        .persistence
+        .update_session_title(session_id, "B".to_string())
+        .await
+        .expect("title B")
+        .expect("B stamp");
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.title.as_deref(), Some("B"));
+    assert_eq!(stored.updated_at, tied);
+    assert_eq!(a.stamped_at, b.stamped_at, "A and B are tied");
+    assert_eq!(a.previous_updated_at, b.previous_updated_at);
+
+    let mut finalized = session.clone();
+    finalized.updated_at = r0 - chrono::Duration::milliseconds(11);
+    let writes = [
+        MirroredWrite265 {
+            field: super::types::CompletedStoreField::Title,
+            stamp: b,
+            value: "B",
+        },
+        MirroredWrite265 {
+            field: super::types::CompletedStoreField::Title,
+            stamp: a,
+            value: "A",
+        },
+        MirroredWrite265 {
+            field: super::types::CompletedStoreField::Description,
+            stamp: x,
+            value: "X",
+        },
+    ];
+    assert_mirrors_converge_265(&manager, &finalized, &writes, "in reverse").await;
+}
+
+/// A terminal Claude session under a Group `first`, resumable with the
+/// controller-candidate test process, for the #265 Continue races.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn continue_race_fixture_265(
+    manager: &SessionManager,
+    working_dir: &std::path::Path,
+) -> (Uuid, Uuid) {
+    let first = manager
+        .create_container(rsi_common::rpc::CreateContainerParams {
+            kind: SessionKind::Group,
+            name: "Parent 265".to_string(),
+            parent_id: None,
+            project_id: None,
+            tags: vec!["test".to_string()],
+            topology_id: None,
+        })
+        .await
+        .expect("container")
+        .id;
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.provider = SessionProvider::Claude;
+    session.claude_session_id = Some("provider-session".to_string());
+    session.working_dir = working_dir.to_path_buf();
+    session.parent_id = Some(first);
+    insert_row(manager, &session).await;
+    manager
+        .completed
+        .write()
+        .await
+        .insert(session_id, CompletedSession::for_test(session));
+    (session_id, first)
+}
+
+/// #265 (hub #2819): a parent move that commits while a Continue holds the
+/// session out of both runtime maps finds no entry to mirror into. The
+/// continuation must publish the Store's parent, not the one it took.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn parent_move_racing_continue_publishes_the_stored_parent_265() {
+    let (manager, dir) = manager();
+    let (session_id, first) = continue_race_fixture_265(&manager, dir.path()).await;
+    let _process = super::launch::install_controller_candidate_test_process(session_id);
+    let (reached, resume) = super::lifecycle::install_continuation_seam_pause_for_test(
+        super::lifecycle::ContinuationPauseSeam::AfterCompletedTaken,
+        session_id,
+    );
+    let (continued, ()) = tokio::join!(
+        Box::pin(manager.continue_session(session_id, "continue".to_string())),
+        async {
+            reached
+                .await
+                .expect("continuation took the completed entry");
+            manager
+                .set_session_parent(session_id, None)
+                .await
+                .expect("parent move during the continuation");
+            resume.send(()).expect("resume the continuation");
+        }
+    );
+    continued.expect("continue");
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.parent_id, None, "the move from {first} committed");
+    let published = manager.active.read().await[&session_id].session.parent_id;
+    assert_eq!(published, stored.parent_id);
+    super::lifecycle::interrupt_active_in_maps(&manager.active, session_id)
+        .await
+        .expect("interrupt the continued session");
+    super::launch::drop_controller_candidate_test_stream(session_id);
+}
+
+/// #265 (hub #2819): the same race, but the continuation fails after taking
+/// the entry and rolls back. The restored completed entry must carry the
+/// Store's parent, not the one the continuation took.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn parent_move_racing_a_failed_continue_restores_the_stored_parent_265() {
+    let (manager, dir) = manager();
+    let (session_id, first) = continue_race_fixture_265(&manager, dir.path()).await;
+    super::lifecycle::fail_next_continue_admission_for_test(session_id);
+    let (reached, resume) = super::lifecycle::install_continuation_seam_pause_for_test(
+        super::lifecycle::ContinuationPauseSeam::AfterCompletedTaken,
+        session_id,
+    );
+    let (continued, ()) = tokio::join!(
+        Box::pin(manager.continue_session(session_id, "continue".to_string())),
+        async {
+            reached
+                .await
+                .expect("continuation took the completed entry");
+            manager
+                .set_session_parent(session_id, None)
+                .await
+                .expect("parent move during the continuation");
+            resume.send(()).expect("resume the continuation");
+        }
+    );
+    let error = continued.expect_err("continue fails at model admission");
+    assert!(
+        error
+            .to_string()
+            .contains("injected model admission refusal"),
+        "{error}"
+    );
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.parent_id, None, "the move from {first} committed");
+    let restored = manager.completed.read().await[&session_id]
+        .session
+        .parent_id;
+    assert_eq!(restored, stored.parent_id);
+}
+
+/// #2874: a publisher that loses every optimistic read to a Store write whose
+/// mirror completes in the read-to-map-lock gap (the session is in neither map,
+/// so each mirror is discarded), including the last optimistic attempt and the
+/// serialized fallback, must not publish the stale snapshot. A stand-in Store
+/// holder makes the fallback wait for the Store, which it only tries.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn publication_that_loses_every_read_gap_matches_the_store_2874() {
+    let (manager, dir) = manager();
+    let (session_id, first) = continue_race_fixture_265(&manager, dir.path()).await;
+    let second = manager
+        .create_container(rsi_common::rpc::CreateContainerParams {
+            kind: SessionKind::Group,
+            name: "Second parent 2874".to_string(),
+            parent_id: None,
+            project_id: None,
+            tags: vec!["test".to_string()],
+            topology_id: None,
+        })
+        .await
+        .expect("container")
+        .id;
+    let taken = manager
+        .completed
+        .write()
+        .await
+        .remove(&session_id)
+        .expect("the fixture's completed entry");
+    assert_eq!(taken.session.parent_id, Some(first));
+
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let (manager_ref, attempts_ref) = (&manager, &attempts);
+    let gap = |attempt: usize| -> super::cohort_settlement::Publication<'_> {
+        Box::pin(async move {
+            let manager = manager_ref;
+            attempts_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let parent = if attempt % 2 == 0 { first } else { second };
+            manager
+                .set_session_parent(session_id, Some(parent))
+                .await
+                .expect("parent write in the gap");
+            manager
+                .update_session_title(session_id, format!("title {attempt}"))
+                .await
+                .expect("title write in the gap");
+            assert!(
+                !manager.completed.read().await.contains_key(&session_id)
+                    && !manager.active.read().await.contains_key(&session_id),
+                "the mirrors found no entry at attempt {attempt}"
+            );
+            if attempt == 17 {
+                // The serialized fallback only tries the Store: keep it busy.
+                let store = manager.store.clone();
+                let (held, release) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let _store = store.lock().await;
+                    let _ = held.send(());
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                });
+                release.await.expect("a stand-in Store holder");
+            }
+        })
+    };
+    super::cohort_settlement::publish_from_store_with_gap(
+        &manager.completed,
+        &manager.store,
+        session_id,
+        taken,
+        super::cohort_settlement::StoreFieldSnapshot::reconcile_completed,
+        Some(&gap),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        17,
+        "16 optimistic attempts and the serialized fallback each had a gap"
+    );
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.parent_id, Some(second));
+    assert_eq!(stored.title.as_deref(), Some("title 17"));
+    let runtime = manager.completed.read().await[&session_id].session.clone();
+    assert_eq!(runtime.parent_id, stored.parent_id);
+    assert_eq!(runtime.title, stored.title);
+}
+
+/// #2883: a publisher whose serialized fallback cannot read the session row
+/// for 16 or more attempts, while a parent and a title write committed with the
+/// session in neither runtime map (both mirrors discarded), must not insert the
+/// unreconciled entry. Once the Store is readable again the published entry
+/// carries the committed parent and title.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn publication_with_an_unreadable_row_waits_and_publishes_the_stored_fields_2883() {
+    let (manager, dir) = manager();
+    let (session_id, first) = continue_race_fixture_265(&manager, dir.path()).await;
+    let second = manager
+        .create_container(rsi_common::rpc::CreateContainerParams {
+            kind: SessionKind::Group,
+            name: "Second parent 2883".to_string(),
+            parent_id: None,
+            project_id: None,
+            tags: vec!["test".to_string()],
+            topology_id: None,
+        })
+        .await
+        .expect("container")
+        .id;
+    let taken = manager
+        .completed
+        .write()
+        .await
+        .remove(&session_id)
+        .expect("the fixture's completed entry");
+    assert_eq!(taken.session.parent_id, Some(first));
+
+    // Committed while the session is in neither map: both mirrors are lost.
+    manager
+        .set_session_parent(session_id, Some(second))
+        .await
+        .expect("parent write");
+    manager
+        .update_session_title(session_id, "title 2883".to_string())
+        .await
+        .expect("title write");
+    assert!(
+        !manager.completed.read().await.contains_key(&session_id)
+            && !manager.active.read().await.contains_key(&session_id),
+        "the mirrors found no entry"
+    );
+
+    // Make the row unreadable (an unparsable timestamp).
+    manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET testing_needed_at = 'not a timestamp' WHERE id = ?1",
+            [session_id.to_string()],
+        )
+        .expect("corrupt the row");
+
+    let max_failures = std::sync::atomic::AtomicUsize::new(0);
+    let (manager_ref, max_ref) = (&manager, &max_failures);
+    let read_failed = |failures: usize| -> super::cohort_settlement::Publication<'_> {
+        Box::pin(async move {
+            let manager = manager_ref;
+            max_ref.fetch_max(failures, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                !manager.completed.read().await.contains_key(&session_id),
+                "an unreconciled entry was published after {failures} failed reads"
+            );
+            if failures == 20 {
+                manager
+                    .store
+                    .lock()
+                    .await
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET testing_needed_at = NULL WHERE id = ?1",
+                        [session_id.to_string()],
+                    )
+                    .expect("repair the row");
+            }
+        })
+    };
+    super::cohort_settlement::publish_from_store_with_gap(
+        &manager.completed,
+        &manager.store,
+        session_id,
+        taken,
+        super::cohort_settlement::StoreFieldSnapshot::reconcile_completed,
+        None,
+        Some(&read_failed),
+    )
+    .await;
+
+    assert_eq!(
+        max_failures.load(std::sync::atomic::Ordering::SeqCst),
+        20,
+        "the row was unreadable for 20 serialized attempts"
+    );
+    let stored = stored_session_265(&manager, session_id).await;
+    assert_eq!(stored.parent_id, Some(second));
+    assert_eq!(stored.title.as_deref(), Some("title 2883"));
+    let runtime = manager.completed.read().await[&session_id].session.clone();
+    assert_eq!(runtime.parent_id, stored.parent_id);
+    assert_eq!(runtime.title, stored.title);
+}
+
+/// #258: a parent move, a project attach and a lead pin on a terminal session
+/// mirror the `updated_at` the Store write stamped into the runtime completed
+/// entry (exactly, not a clock of the runtime's own), so the root stays
+/// eligible. An entry that already disagreed with the row is not advanced.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn completed_parent_project_and_pin_writes_mirror_the_store_stamp_258() {
+    let (manager, _dir) = manager();
+    let container = async |name: &str| {
+        manager
+            .create_container(rsi_common::rpc::CreateContainerParams {
+                kind: SessionKind::Group,
+                name: name.to_string(),
+                parent_id: None,
+                project_id: None,
+                tags: vec!["test".to_string()],
+                topology_id: None,
+            })
+            .await
+            .expect("container")
+    };
+    let group = container("Group 258").await;
+    let project = manager
+        .create_project("Project 258".to_string(), None, None, None)
+        .await
+        .expect("project");
+
+    let session_id = Uuid::new_v4();
+    let session = bare_session(session_id);
+    insert_row(&manager, &session).await;
+    let stored_updated_at = async |manager: &SessionManager| {
+        manager
+            .store
+            .lock()
+            .await
+            .get_session(session_id)
+            .expect("read session row")
+            .expect("session row")
+            .updated_at
+    };
+    let runtime = async |manager: &SessionManager| {
+        manager.completed.read().await[&session_id].session.clone()
+    };
+    let finalize = async |manager: &SessionManager, behind: chrono::Duration| {
+        let mut finalized = session.clone();
+        finalized.updated_at = stored_updated_at(manager).await - behind;
+        manager
+            .completed
+            .write()
+            .await
+            .insert(session_id, CompletedSession::for_test(finalized));
+    };
+
+    // Finalized 11 ms before the row: the parent move, the project attach and
+    // the lead pin each leave the entry exactly at the row's stamp.
+    finalize(&manager, chrono::Duration::milliseconds(11)).await;
+    manager
+        .set_session_parent(session_id, Some(group.id))
+        .await
+        .expect("parent move");
+    let moved = runtime(&manager).await;
+    assert_eq!(moved.parent_id, Some(group.id));
+    assert_eq!(moved.updated_at, stored_updated_at(&manager).await);
+
+    manager
+        .update_session_project(session_id, Some(project.id))
+        .await
+        .expect("project attach");
+    let attached = runtime(&manager).await;
+    assert_eq!(attached.project_id, Some(project.id));
+    assert_eq!(attached.updated_at, stored_updated_at(&manager).await);
+
+    manager.mark_lead_session(session_id).await;
+    let pinned = runtime(&manager).await;
+    assert!(pinned.pinned_at.is_some());
+    assert_eq!(pinned.updated_at, stored_updated_at(&manager).await);
+
+    manager
+        .set_session_parent(session_id, None)
+        .await
+        .expect("move to top level");
+    let top_level = runtime(&manager).await;
+    assert_eq!(top_level.parent_id, None);
+    assert_eq!(top_level.updated_at, stored_updated_at(&manager).await);
+
+    // A runtime copy 5 s behind the row never saw some Store change: none of
+    // the writes may paper over it. The field still applies; the stamp does not.
+    let unseen = stored_updated_at(&manager).await - chrono::Duration::seconds(5);
+    let set_runtime_stamp = async |manager: &SessionManager, stamp| {
+        manager
+            .completed
+            .write()
+            .await
+            .get_mut(&session_id)
+            .expect("completed entry")
+            .session
+            .updated_at = stamp;
+    };
+    set_runtime_stamp(&manager, unseen).await;
+    manager
+        .set_session_parent(session_id, Some(group.id))
+        .await
+        .expect("parent move");
+    assert_eq!(runtime(&manager).await.updated_at, unseen);
+    assert_eq!(runtime(&manager).await.parent_id, Some(group.id));
+    manager
+        .update_session_project(session_id, None)
+        .await
+        .expect("project detach");
+    assert_eq!(runtime(&manager).await.updated_at, unseen);
+
+    // A pin that finds the session already pinned writes nothing to mirror.
+    let before = stored_updated_at(&manager).await;
+    manager.mark_lead_session(session_id).await;
+    assert_eq!(stored_updated_at(&manager).await, before);
+    assert_eq!(runtime(&manager).await.updated_at, unseen);
+
+    // And an unseen change before an unpinned session's pin is kept visible.
+    let other_id = Uuid::new_v4();
+    let other = bare_session(other_id);
+    insert_row(&manager, &other).await;
+    let mut stale = other.clone();
+    stale.updated_at = other.updated_at - chrono::Duration::seconds(5);
+    let stale_stamp = stale.updated_at;
+    manager
+        .completed
+        .write()
+        .await
+        .insert(other_id, CompletedSession::for_test(stale));
+    manager.mark_lead_session(other_id).await;
+    let kept = manager.completed.read().await[&other_id].session.clone();
+    assert!(kept.pinned_at.is_some());
+    assert_eq!(kept.updated_at, stale_stamp);
 }

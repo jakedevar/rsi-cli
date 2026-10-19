@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "rows": {
+    "cmd:help": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/actions/settings-run.ts",
+      "note": ":help and :keys open the keybindings help overlay"
+    },
+    "cmd:set": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts, src/actions/settings.ts, src/actions/settings-run.ts",
+      "note": ":set and :settings open the settings pane"
+    },
+    "cmd:theme": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts, src/actions/settings-run.ts",
+      "note": ":theme opens the picker; :theme <name> applies a theme by key or name"
+    },
+    "key:<Space>,": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts, src/actions/settings.ts, src/actions/settings-run.ts",
+      "note": "opens the settings pane"
+    },
+    "key:?": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/actions/settings-run.ts",
+      "note": "opens the keybindings help overlay (Contextual and All Commands views, / search); the command palette stays on Ctrl-K, <Space>; and :commands"
+    },
+    "key:Ctrl-Alt-G": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/actions/settings-run.ts",
+      "note": "opens the keybindings help overlay from anywhere outside a text field; Ctrl-Alt-G closes it again"
+    },
+    "key:T": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "built-in theme picker with live preview"
+    },
+    "module:ui/overlay/keybindings_help.rs": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/overlay-help.generated.ts, scripts/overlay-help.mjs",
+      "note": "see overlay:keybindings-help-overlay"
+    },
+    "module:ui/overlay/theme_picker.rs": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "picker with swatches and live preview"
+    },
+    "module:ui/overlay/theme_role_editor.rs": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "the 17 semantic roles with a WCAG contrast check against the role's background"
+    },
+    "module:ui/settings.rs": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts, src/actions/settings.ts, src/actions/settings-run.ts",
+      "note": "The Claude skills row opens the skills list: Enter previews, e enables or disables and d d deletes the selected skill over SetSkillEnabled / DeleteSkill (#97). Every other Settings row is a real control (local #125): the daemon-config rows stage and apply as one UpdateDaemonConfig; Model control mode stages and applies through UpdateModelControlPolicy after the batch, as the TUI does; Emergency stop, Usage and Stop-all/cancel (src/settings-state.ts), the cold-storage, sandbox-storage, preview/reclaim and warm-pool rows (the same operator methods the TUI row calls), and the settlement, scratch, satellite, remote and MCP rows (the admin overlays, slice 13a) all run from the row; Claude hooks, API providers, the bridges and the model-role routes open the operator-configuration overlays (local #88). The 14 TUI presentation preferences kept in the TUI's state.json show 'TUI only' with their reason and are documented in parity-audit.json (tuiOnlyRows); K/J reorder navigator columns the desktop list does not have. see overlay:settings-pane-space-or-set"
+    },
+    "module:ui/theme.rs": {
+      "status": "substitute",
+      "location": "src/theme-model.ts, src/settings.generated.ts",
+      "note": "the TUI palettes and role baselines (generated) drive the desktop CSS variables; terminal-default and transparent backgrounds use the palette colour since a window has no terminal behind it"
+    },
+    "module:ui/theme_roles.rs": {
+      "status": "done",
+      "location": "src/theme-model.ts, src/settings.generated.ts",
+      "note": "roles, labels, contrast targets and minimums generated from theme_roles.rs; the webview is truecolor, so the ratio is always verifiable"
+    },
+    "overlay-ref:daemon-text-setting": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts, src/actions/settings.ts, src/actions/settings-run.ts",
+      "note": "the TUI's text editors (cold-storage dir, SearXNG URL, launch overrides, subagent and fallback models, spend cap): type, Enter saves at once, an empty value restores the default, Esc cancels"
+    },
+    "overlay-ref:theme-picker": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "j/k, g/G preview, 1-9, Enter, Esc/q revert, Space N / Space ; leave it"
+    },
+    "overlay-ref:theme-role-editor": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "type #RRGGBB, Enter previews then commits (low contrast needs a second Enter), Delete resets the role, Esc restores the opening overrides; ? and Ctrl-Alt-G open the help"
+    },
+    "overlay:keybindings-help-overlay": {
+      "status": "done",
+      "location": "src/keyhelp.ts, src/keyhelp-model.ts, src/overlay-help.generated.ts, scripts/overlay-help.mjs, src/actions/settings-run.ts",
+      "note": "Contextual (the open overlay's own keys first, from the TUI's generated overlay tables, then what can run now, by menu), All Commands (every TUI key and : command with the desktop action or 'not in the desktop yet', then every overlay table) and Symbols (s: the desktop's glyphs by location); Tab/Shift-Tab cycle the three, /, j/k, Ctrl-d/u/f/b, g/G, Esc clears then closes, q/? close; Ctrl-Alt-G opens it from any overlay (G1)"
+    },
+    "overlay:settings-pane-space-or-set": {
+      "status": "done",
+      "location": "src/settings.ts, src/settings-model.ts, src/actions/settings.ts, src/actions/settings-run.ts, src/budgets.ts, src/textbg.ts",
+      "note": "The Claude skills row opens the skills list (preview, e enable/disable, d d delete over rsid, #97). Category rail, section tabs, rows and info card from the TUI registry (generated); j/k, h/l, Tab/]/[, Enter/Space, +/-, w applies one atomic UpdateDaemonConfig (and the staged Model control mode through UpdateModelControlPolicy) and re-reads, R (also reloads the status rows), / n N, Esc/q discard and close, Delete resets a role; > / < / = resize the focused panel (saved); a / d on Budgets, s / r / c / d / i on Provider Keys (values write-only); the text-area background rows. Daemon-state rows (local #125): Emergency stop asks first; Usage opens the stats view (live work cancel and stop-all both ask); Cold-storage status, last run and Run pass; Sandbox storage, Preview reclaim and Reclaim now (asks; the TUI does not); Warm build pools; Source-worktree settlement, Legacy scratch adoption, Satellite registry, Remote access and MCP servers open the admin overlays. Claude hooks, API providers, the bridge rows and the model-role routes open the operator-configuration overlays (local #88). The 14 TUI-only preferences (state.json) show 'TUI only' and are documented in parity-audit.json; K / J reorder navigator columns the desktop list does not have"
+    },
+    "overlay:theme-picker-overlay": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts",
+      "note": "j/k preview, Enter applies, 1-9 pick (the desktop default is row 0), Esc/q roll back"
+    },
+    "section:theme-selection": {
+      "status": "done",
+      "location": "src/themes.ts, src/theme-model.ts, src/settings.generated.ts",
+      "note": "the TUI's 14 built-in themes (generated from ui/theme.rs) plus the desktop's own default"
+    }
+  }
+}

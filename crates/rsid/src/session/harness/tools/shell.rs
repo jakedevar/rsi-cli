@@ -4,7 +4,7 @@
 //! - 1 MB output cap
 //! - Environment scrubbed: only safe vars carried through
 
-use super::{HarnessTool, ToolContext, truncation::truncate_text};
+use super::{HarnessTool, ToolContext, custody_guard, truncation::truncate_text};
 use crate::process_control::{
     CaptureError, CaptureLimits, SESSION_TOOL_MAX_STREAM_BYTES, SESSION_TOOL_TIMEOUT,
     capture_bounded,
@@ -220,6 +220,17 @@ impl ShellTool {
                 error_msg: Some(refusal.to_string()),
             };
         }
+        // S6 (#2256): refuse git commands that break AGENTS.md hard rules 1, 2
+        // and 9 before anything in the command runs.
+        let probe = custody_guard::Probe {
+            session_id: self.session_id,
+            invocation_id: self.invocation_id,
+            working_dir,
+            cancel,
+        };
+        if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
+            return custody_guard::refused_result(refusal);
+        }
 
         let identity = ShellLaunchIdentity {
             session_id: self.session_id,
@@ -381,6 +392,127 @@ mod tests {
             Some(rsi_common::kill_guard::BROAD_KILL_REFUSAL)
         );
         assert_eq!(result.output, "");
+    }
+
+    /// S6 (#2256): custody refusals name the hard rule, run nothing and leave
+    /// the repository exactly as it was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_refuses_custody_git_commands_and_runs_nothing() {
+        use super::custody_guard::test_support::{git, repo};
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.join("sentinel.txt"), "keep\n").unwrap();
+        let head = git(dir, &["rev-parse", "HEAD"]);
+        let tool = ShellTool::default();
+        for (command, rule) in [
+            ("echo ran > ran.txt && git stash", "hard rule 9"),
+            ("git stash pop", "hard rule 9"),
+            ("git stash push -u", "hard rule 9"),
+            ("bash -c 'git stash'", "hard rule 9"),
+            ("\"git\" 'stash'; touch ran.txt", "hard rule 9"),
+            ("touch ran.txt; git checkout -b other", "hard rule 2"),
+            ("git checkout main", "hard rule 2"),
+            ("echo ran > ran.txt && git switch main", "hard rule 2"),
+            ("git reset --hard HEAD; touch ran.txt", "hard rule 2"),
+            ("git push --force origin main", "hard rule 1"),
+            // a.txt is dirty: the probe refuses the discard itself.
+            (
+                "echo ran > ran.txt; git checkout -- a.txt",
+                "hard rules 8 and 9",
+            ),
+            ("git clean -fd; touch ran.txt", "hard rules 8 and 9"),
+            // #2290: b.txt is clean now, but the probe runs before the shell, so
+            // a discard that shares the line with anything is refused.
+            (
+                "echo ran > ran.txt; git checkout -- b.txt",
+                "hard rules 8 and 9",
+            ),
+            ("sleep 0.2; git restore b.txt", "hard rules 8 and 9"),
+            // #2289: `env -C` moves the child, not the probe.
+            ("env -C . git restore b.txt", "hard rules 8 and 9"),
+            // #2287: aliases are refused, whatever they stand for.
+            ("git -c 'alias.x=!git stash' x", "hard rules 1, 2 and 9"),
+            (
+                "touch ran.txt; git -c alias.co=checkout co main",
+                "hard rules 1, 2 and 9",
+            ),
+            ("git config alias.x '!git stash'", "hard rules 1, 2 and 9"),
+            // #2288: substitutions inside double quotes run too.
+            ("printf '%s' \"$(git stash)\"", "hard rule 9"),
+            ("echo \"`git checkout main`\"; touch ran.txt", "hard rule 2"),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"command": command}), dir)
+                .await;
+            assert!(!result.success, "{command}");
+            assert_eq!(result.output, "", "{command}");
+            let message = result.error_msg.unwrap_or_default();
+            assert!(
+                message.starts_with("custody_git_refused: "),
+                "{command}: {message}"
+            );
+            assert!(message.contains(rule), "{command}: {message}");
+        }
+        assert!(!dir.join("ran.txt").exists());
+        assert_eq!(git(dir, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(dir, &["branch", "--show-current"]).trim(), "main");
+        assert_eq!(git(dir, &["stash", "list"]), "");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sentinel.txt")).unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_still_runs_allowed_git_commands() {
+        use super::custody_guard::test_support::{git, repo};
+        let repo = repo();
+        let dir = repo.path();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(
+                serde_json::json!({"command":
+                    "git add new.txt && git -c commit.gpgsign=false commit -q -m added \
+                     && git log --oneline | head -1 \
+                     && echo 'git stash is only text' && git branch --show-current"}),
+                dir,
+            )
+            .await;
+        assert!(result.success, "{:?} {}", result.error_msg, result.output);
+        assert!(result.output.contains("added"), "{}", result.output);
+        assert!(result.output.contains("git stash is only text"));
+        assert!(
+            result.output.lines().any(|line| line == "main"),
+            "{}",
+            result.output
+        );
+        assert!(git(dir, &["log", "--oneline"]).contains("added"));
+
+        // A discard is allowed on a clean path as the only command in the line
+        // (#2290), including through `env` without `-C` and a quoted substitution.
+        for command in [
+            "git checkout -- a.txt",
+            "env GIT_PAGER=cat git restore b.txt",
+            "git -c core.pager=cat restore .",
+            "echo \"$(git rev-parse --abbrev-ref HEAD)\"",
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"command": command}), dir)
+                .await;
+            assert!(
+                result.success,
+                "{command}: {:?} {}",
+                result.error_msg, result.output
+            );
+        }
     }
 
     fn launch_args(egress: EgressMode) -> Vec<String> {

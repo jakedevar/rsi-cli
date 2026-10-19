@@ -5,8 +5,8 @@
 #![allow(clippy::redundant_pub_crate)]
 
 use crate::idea_control::BoundControllerWriteAuthority;
-use crate::session::AgentTokenRegistry;
 use crate::session::types::TrackedSession;
+use crate::session::{AgentTokenRegistry, AgentTransportWitness};
 use crate::store::Store;
 use crate::store::program_runs::{
     ProgramRunExternalReferenceV1, ProgramRunStoreAuthority, ProgramRunStoreError,
@@ -148,7 +148,7 @@ pub(crate) struct BoundProgramRunControllerAuthority {
     session_id: Uuid,
     epoch: u64,
     grant_incarnation: Uuid,
-    a6_token: String,
+    a6_binding: AgentTransportWitness,
 }
 
 #[derive(Clone)]
@@ -160,7 +160,7 @@ pub(crate) struct BoundProgramRunSchedulerAuthority {
     epoch: u64,
     boot_id: Uuid,
     grant_incarnation: Uuid,
-    a6_token: String,
+    a6_binding: AgentTransportWitness,
 }
 
 impl ProgramRunControlHandle {
@@ -215,9 +215,9 @@ impl ProgramRunControlHandle {
         &self,
         grant: &BoundControllerWriteAuthority,
         grant_incarnation: Uuid,
-        a6_token: String,
+        a6_binding: AgentTransportWitness,
     ) -> Result<BoundProgramRunControllerAuthority, ProgramRunControlError> {
-        if grant_incarnation.is_nil() || a6_token.is_empty() || grant.controller_epoch() <= 0 {
+        if grant_incarnation.is_nil() || grant.controller_epoch() <= 0 {
             return Err(ProgramRunControlError::Forbidden);
         }
         Ok(BoundProgramRunControllerAuthority {
@@ -228,7 +228,7 @@ impl ProgramRunControlHandle {
             epoch: u64::try_from(grant.controller_epoch())
                 .map_err(|_| ProgramRunControlError::Forbidden)?,
             grant_incarnation,
-            a6_token,
+            a6_binding,
         })
     }
 
@@ -237,7 +237,7 @@ impl ProgramRunControlHandle {
         grant: &BoundControllerWriteAuthority,
         boot_id: Uuid,
         grant_incarnation: Uuid,
-        a6_token: String,
+        a6_binding: AgentTransportWitness,
     ) -> Result<BoundProgramRunSchedulerAuthority, ProgramRunControlError> {
         let epoch = u64::try_from(grant.controller_epoch())
             .map_err(|_| ProgramRunControlError::Forbidden)?;
@@ -247,7 +247,6 @@ impl ProgramRunControlHandle {
             || epoch == 0
             || boot_id.is_nil()
             || grant_incarnation.is_nil()
-            || a6_token.is_empty()
         {
             return Err(ProgramRunControlError::Forbidden);
         }
@@ -259,7 +258,7 @@ impl ProgramRunControlHandle {
             epoch,
             boot_id,
             grant_incarnation,
-            a6_token,
+            a6_binding,
         })
     }
 }
@@ -418,7 +417,7 @@ impl BoundProgramRunOperatorAuthority {
             .await;
         let mut live_controllers = HashMap::new();
         for session_id in active.keys().copied() {
-            if tokens.token_for_session(session_id).is_some()
+            if tokens.binding_for_session(session_id).is_some()
                 && let Some(grant) = store.controller_grant_v1(session_id)
                 && let Ok(epoch) = u64::try_from(grant.controller_epoch())
             {
@@ -484,7 +483,7 @@ impl BoundProgramRunControllerAuthority {
             .ok_or(ProgramRunControlError::Forbidden)?
             .read()
             .await;
-        if tokens.get(&self.a6_token).copied() != Some(self.session_id) {
+        if !tokens.binding_matches(self.session_id, self.a6_binding) {
             return Err(ProgramRunControlError::Forbidden);
         }
         let run = store
@@ -535,7 +534,7 @@ impl BoundProgramRunControllerAuthority {
             .ok_or(ProgramRunControlError::Forbidden)?
             .read()
             .await;
-        if tokens.get(&self.a6_token).copied() != Some(self.session_id) {
+        if !tokens.binding_matches(self.session_id, self.a6_binding) {
             return Err(ProgramRunControlError::Forbidden);
         }
         store
@@ -590,7 +589,7 @@ impl BoundProgramRunSchedulerAuthority {
             .ok_or(ProgramRunControlError::Forbidden)?
             .read()
             .await;
-        if tokens.get(&self.a6_token).copied() != Some(self.session_id) {
+        if !tokens.binding_matches(self.session_id, self.a6_binding) {
             return Err(ProgramRunControlError::Forbidden);
         }
         Ok((active, store, tokens, grant))

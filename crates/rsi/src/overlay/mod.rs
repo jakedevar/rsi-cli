@@ -5,6 +5,7 @@ pub(crate) mod ai_command;
 pub mod budget_policy_form;
 pub(crate) mod card_editor;
 pub mod create_entity_form;
+pub mod daemon_text_editor;
 mod diagnostics;
 pub(crate) mod dialectic;
 mod esp_square;
@@ -13,6 +14,8 @@ pub mod fleet;
 pub mod global_manager_command;
 pub mod global_manager_workspace;
 pub mod global_manager_workspace_launch;
+pub mod gm_budget;
+pub mod grant_editor;
 pub mod graph;
 pub mod harness_manager;
 pub mod hook_form;
@@ -62,6 +65,7 @@ pub mod terminal;
 pub mod text_area_bg_editor;
 pub mod theme_picker;
 pub mod theme_role_editor;
+pub mod todo_popup;
 pub mod trash_browser;
 
 #[cfg(test)]
@@ -107,11 +111,12 @@ fn selected_prompt_processor_config(
 pub use budget_policy_form::open_budget_policy_form;
 pub use cohort_settlement::open_source_worktree_settlement;
 pub use create_entity_form::open_create_entity_form;
+pub use daemon_text_editor::{daemon_text_field, open_daemon_text_editor};
 pub use hook_form::open_hook_form;
 pub use keybindings_help::{close_keybindings_help, open_keybindings_help};
 pub use label_picker::open_label_picker;
 pub use memory_search::open_memory_search;
-pub use message_bridge_form::open_message_bridge_form;
+pub use message_bridge_form::{open_message_bridge_form, show_message_bridge_form};
 pub use model_switch::open_model_switch_picker;
 pub use parent_picker::open_parent_picker;
 pub use project_form::PROJECT_COLORS;
@@ -174,6 +179,7 @@ const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
             | OverlayState::McpServerSecretForm { .. }
             | OverlayState::MemorySearch { .. }
             | OverlayState::RenameSession { .. }
+            | OverlayState::DaemonTextEditor { .. }
             | OverlayState::LabelForm { .. }
             | OverlayState::AiCommand { .. }
             | OverlayState::AiChat { .. }
@@ -526,6 +532,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             skill_preview::handle_skill_preview_key(app, key);
             return true;
         }
+        OverlayState::TodoPopup(..) => {
+            todo_popup::handle_todo_popup_key(app, key).await;
+            return true;
+        }
         OverlayState::SortPicker { .. } => {
             sort_picker::handle_sort_picker_key(app, key);
             return true;
@@ -680,6 +690,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         OverlayState::Prompt { .. } => {}
         OverlayState::TextAreaBgEditor { .. } => {
             text_area_bg_editor::handle_text_area_bg_editor_key(app, key);
+            return true;
+        }
+        OverlayState::DaemonTextEditor { .. } => {
+            daemon_text_editor::handle_daemon_text_editor_key(app, key).await;
             return true;
         }
     };
@@ -2085,6 +2099,10 @@ fn paste_text_into_overlay(app: &mut App, text: &str) {
             title.push_str(&normalized);
             handled = true;
         }
+        OverlayState::DaemonTextEditor { .. } => {
+            daemon_text_editor::paste_text(app, &normalized);
+            handled = true;
+        }
         OverlayState::LabelForm {
             focused_field,
             name,
@@ -2188,6 +2206,7 @@ fn paste_image_into_overlay(app: &mut App, reference: &str) {
         | OverlayState::ProviderCredentialForm { .. }
         | OverlayState::MemorySearch { .. }
         | OverlayState::RenameSession { .. }
+        | OverlayState::DaemonTextEditor { .. }
         | OverlayState::LabelForm { .. }
         | OverlayState::AiCommand { .. }
         | OverlayState::AiChat { .. }
@@ -2519,6 +2538,7 @@ mod text_entry_leader_tests {
         let mut app = app();
         app.overlay =
             OverlayState::SourceWorktreeSettlement(SourceWorktreeSettlementOverlayState {
+                recent_runs: Vec::new(),
                 cohorts: vec![],
                 selected_index: 0,
                 scroll_offset: 0,

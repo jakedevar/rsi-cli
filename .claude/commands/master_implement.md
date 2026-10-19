@@ -65,7 +65,7 @@ git -C <repo_or_worktree> log <prev_head>..HEAD --oneline
 - Plan → `<ticket>:` (`<ticket> plan…` is common)
 - Implementation → `<ticket> Phase N:` or `<ticket>:`
 
-Any commit that doesn't match (unrelated work, sweeps of a dirty worktree, accidental rebases) is surfaced to Jake before dispatching the next stage. If you cannot determine whether a commit belongs to the stage, ASK — never silently proceed.
+Any commit that doesn't match (unrelated work, sweeps of a dirty worktree, accidental rebases) is surfaced to Jake before dispatching the next stage. If you cannot determine whether a commit belongs to the stage, treat it as out of scope, record it in the report with the reason, and continue; never silently absorb it.
 
 If independently re-running the worker's tests from outside the worker's worktree, force a separate target dir to avoid stale-cache false-negatives: `CARGO_TARGET_DIR=~/.rsi/tmp/cargo-targets/<ticket-id> cargo test ...`. The repo's `.cargo/config.toml` points all worktrees at `~/.cargo/shared-target`, and that cache will otherwise serve binaries built from the parent worktree's source and silently report `0 passed; 0 failed`. NEVER point a scratch `CARGO_TARGET_DIR` at `/tmp` — it is a tmpfs mounted with a per-user quota, and multi-GB cargo target trees there exhaust the quota and fail ALL writes system-wide with `EDQUOT`. `~/.rsi/tmp/cargo-targets/` is disk-backed and reclaimed by `make clean-shared`.
 
@@ -199,7 +199,7 @@ ls thoughts/shared/plans/ 2>/dev/null | grep -i <ticket-id>
 
 **If `status == ready` AND zero artifacts found anywhere** → ticket is virgin. Proceed to Step 1.
 
-**Otherwise** the ticket is non-virgin. HALT and report to Jake:
+**Otherwise** the ticket is non-virgin. Decide the reconciliation yourself (default: option 1, resume; use option 3 when an implementation already exists on disk; option 2 only when the existing artifacts are unusable), record the state, the decision and the reason in the report, and continue. Do not wait for a reply. State summary:
 
 ```
 Ticket [ID] is not in a fresh state.
@@ -213,14 +213,12 @@ Worktree:       [path from frontmatter, or "none recorded"]
 Filesystem / git evidence (drift):
   - [any artifacts found on disk or in git not recorded in frontmatter]
 
-Options:
+Decision: [resume | re-run | skip to verification]
+Reason: [one line]
   1. Resume from <next stage based on last_stage> — thread existing artifacts forward
   2. Force re-run from research stage — existing artifacts archived to .bak before overwrite
   3. Skip pipeline — read existing implementation from disk, jump to Step 4 verification gate
-  4. Abort — let me investigate manually
 ```
-
-Wait for Jake's choice. Do NOT proceed without explicit direction.
 
 **Reconciliation rules:**
 - Option 1 (resume): skip completed stages, dispatch only remaining stages, pass existing artifact paths forward as inputs.
@@ -233,7 +231,7 @@ Wait for Jake's choice. Do NOT proceed without explicit direction.
 
 **Project status writeback (BEFORE):** run the shared procedure with verb-state `researching` — writes `status: researching` and `last_run: <now>` to the ticket frontmatter, regenerates the index via `scripts/render-project-index.sh`, commits with subject `<TICKET>: enter research`. Do this before the spawn.
 
-Spawn a **foreground agent** (do NOT use `run_in_background`) named `"pipeline-research"` with this prompt:
+Dispatch one stage agent named `"pipeline-research"` and wait for it before the next stage. Dispatch it following `.claude/commands/_shared/team_dispatch.md`: RSI controls inside an RSI session (end the turn and resume on its terminal wake), the provider's native agent only outside RSI. With no spawn authority, run the stage yourself and do not claim an agent ran. Prompt:
 
 ```
 PIPELINE MODE: true
@@ -330,7 +328,7 @@ Do not quote, do not summarize, do not retain.
 
 **Project status writeback (BEFORE):** run the shared procedure with verb-state `planning` — commits with subject `<TICKET>: enter plan`.
 
-Spawn a **foreground agent** named `"pipeline-plan"` with this prompt:
+Dispatch one stage agent named `"pipeline-plan"` and wait for it before the next stage. Dispatch it following `.claude/commands/_shared/team_dispatch.md`: RSI controls inside an RSI session (end the turn and resume on its terminal wake), the provider's native agent only outside RSI. With no spawn authority, run the stage yourself and do not claim an agent ran. Prompt:
 
 ```
 PIPELINE MODE: true
@@ -401,7 +399,7 @@ Do not quote, do not summarize, do not retain.
 
 **Project status writeback (BEFORE):** run the shared procedure with verb-state `implementing` — commits with subject `<TICKET>: enter implementation`.
 
-Spawn a **foreground agent** named `"pipeline-implement"` with this prompt:
+Dispatch one stage agent named `"pipeline-implement"` and wait for it before the next stage. Dispatch it following `.claude/commands/_shared/team_dispatch.md`: RSI controls inside an RSI session (end the turn and resume on its terminal wake), the provider's native agent only outside RSI. With no spawn authority, run the stage yourself and do not claim an agent ran. Prompt:
 
 ```
 PIPELINE MODE: true
@@ -597,7 +595,7 @@ cargo run -q -p rsi-common --bin rsi-manifest-validate -- <manifest_path>
 
 **Project status writeback (BEFORE):** run the shared procedure with verb-state `verifying` — commits with subject `<TICKET>: enter verify`. If the manifest has zero daemon-level items, skip the verifier spawn and flip directly to AFTER (done-state `verify-done`, note `n/a — no daemon items`).
 
-Spawn a **foreground agent** named `"pipeline-verify"` with this prompt:
+Dispatch one stage agent named `"pipeline-verify"` and wait for it before the next stage. Dispatch it following `.claude/commands/_shared/team_dispatch.md`: RSI controls inside an RSI session (end the turn and resume on its terminal wake), the provider's native agent only outside RSI. With no spawn authority, run the stage yourself and do not claim an agent ran. Prompt:
 
 ```
 PIPELINE MODE: true
@@ -791,12 +789,12 @@ If the writeback fails, log the intended write and surface it to Jake with a one
 |---|---|---|
 | 0.5 State Reconciliation | Ticket non-virgin (status ≠ ready, or artifacts found on disk/git) | Halt, present discovered state + drift, offer resume / re-run / skip-to-verification / abort |
 | 0.5 State Reconciliation | Frontmatter ↔ filesystem drift | Surface drift in the options report; never silently overwrite |
-| Research | Agent errors or returns blocked | Report to Jake, offer narrowed retry |
+| Research | Agent errors or returns blocked | Retry once with a narrowed scope; if it still fails, stop and report |
 | Research | Open questions block planning | Spawn targeted follow-up researcher, continue |
-| Planning | Worker blocked | Surface to Jake with options from team_plan |
+| Planning | Worker blocked | Decide per team_plan (adapt, defer with an Issue, or re-dispatch), record it, continue |
 | Planning | Plan has unresolved questions | Master resolves via codebase research before continuing |
-| Implementation | Phase FAILED | Surface to Jake with recovery options |
-| Implementation | Worker BLOCKED | Surface to Jake, wait for guidance |
+| Implementation | Phase FAILED | Dispatch one targeted fix; if it still fails, stop and report the branch and worktree |
+| Implementation | Worker BLOCKED | Decide per team_implement (adapt, defer with an Issue, or re-dispatch), record it, continue |
 | 1 / 2 / 3 / 3.5 / 4 / 6.5 | Project status writeback fails (ticket file unwritable, frontmatter malformed) | Log the intended write verbatim, continue pipeline, surface in Step 6 final report for manual apply |
 | 1 / 2 / 3 / 3.5 / 4 / 6.5 | `render-project-index.sh` exits non-zero (script bug, missing project dir) | Commit ticket-file change anyway (canonical source); surface script error to Jake; index will be stale until re-rendered |
 | Any | Unexpected error | Stop, report full context, preserve partial work |

@@ -9,7 +9,7 @@ use super::*;
 use crate::store::manager_reviews::{
     REVIEW_NO_MANAGER_LEDGER, TOPOLOGY_ONCALL_ACCEPTANCE, TopologyExtraRound,
     TopologyExtraRoundQuery, TopologyOncallAcceptance, TopologyReviewOutcome,
-    TopologyReviewRequest, topology_review_work_key,
+    TopologyReviewRequest, TopologyReviewWorkSettled, topology_review_work_key,
 };
 use crate::store::sandbox_custody::{CustodyCause, NewCustodyRoot, SessionCustodyBinding};
 use rsi_common::types::{SandboxCleanupState, SandboxKind, SessionProvider};
@@ -377,6 +377,24 @@ fn submit_accepted_receipt(
     complete: bool,
     findings: Vec<ManagerReviewFindingV1>,
 ) -> crate::error::Result<()> {
+    submit_receipt(
+        f,
+        assignment,
+        sha,
+        complete,
+        ManagerReviewVerdictV1::Accepted,
+        findings,
+    )
+}
+
+fn submit_receipt(
+    f: &mut Fixture,
+    assignment: Uuid,
+    sha: &str,
+    complete: bool,
+    verdict: ManagerReviewVerdictV1,
+    findings: Vec<ManagerReviewFindingV1>,
+) -> crate::error::Result<()> {
     assert!(
         f.store
             .allocate_manager_review_assignment(assignment)
@@ -449,7 +467,7 @@ fn submit_accepted_receipt(
         .unwrap();
     let submission = AgentSubmitReviewReceiptRequestV1 {
         assignment_id: assignment,
-        verdict: ManagerReviewVerdictV1::Accepted,
+        verdict,
         findings,
         idempotency_key: format!("topology-receipt-{assignment}"),
     };
@@ -582,6 +600,89 @@ fn topology_land_admission_needs_an_admitted_acceptance_of_the_exact_commit() {
     assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
 }
 
+/// #3218: an accepted receipt is bound to its own completed invocation. A later
+/// same-session turn (the worker-no-result nudge resumes the reviewer under a
+/// new invocation) that submits no receipt must not revoke the acceptance, and
+/// the reviewer holding its receipt is not a candidate for that nudge.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn a_later_reviewer_turn_does_not_revoke_an_accepted_receipt() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    let assignment = f
+        .store
+        .manager_review_reserve_for_topology(&topology_request(&f, Uuid::new_v4(), &sha, claude()))
+        .unwrap();
+    accept_review(&mut f, assignment, &sha, true);
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+    let reviewer: Uuid = f
+        .store
+        .conn
+        .query_row(
+            "SELECT reviewer_session_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(f.store.worker_submitted_review_receipt(reviewer).unwrap());
+    assert!(
+        !f.store
+            .worker_submitted_review_receipt(Uuid::new_v4())
+            .unwrap()
+    );
+    // The nudge resumes the same session under a new invocation.
+    let later = Uuid::new_v4();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO model_invocations
+            (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+             trigger_source,session_id,project_id,dedup_key,created_at)
+         VALUES(?1,'session_continue','session_lifecycle','foreground','paid_capable',
+                'admitted','running','worker-no-result',?2,?3,?4,?5)",
+            params![
+                later.to_string(),
+                reviewer.to_string(),
+                f.project.to_string(),
+                format!("later:{later}"),
+                now()
+            ],
+        )
+        .unwrap();
+    f.store
+        .set_session_model_invocation(reviewer, Some(later))
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Running' WHERE id=?1",
+            [reviewer.to_string()],
+        )
+        .unwrap();
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+    f.store
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Completed' WHERE id=?1",
+            [reviewer.to_string()],
+        )
+        .unwrap();
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+    // A reviewer that is gone still withdraws the acceptance.
+    f.store
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Failed' WHERE id=?1",
+            [reviewer.to_string()],
+        )
+        .unwrap();
+    assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+}
+
 /// #1740: an on-call `accept` ruling on an exhausted review is recorded as a
 /// review-ledger event that admits exactly that assignment's commit, under the
 /// scope it was reserved in. Without the record (a reject ruling) or for any
@@ -667,6 +768,12 @@ fn topology_oncall_acceptance_admits_only_the_exhausted_assignments_commit() {
     let recorded = events(&f, TOPOLOGY_ONCALL_ACCEPTANCE, &key);
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(recorded[0]["source_commit"], json!(sha));
+    assert_eq!(recorded[0]["assignment_id"], json!(assignment));
+    assert_eq!(recorded[0]["spec_revision"], 1);
+    assert_eq!(
+        recorded[0]["actor"]["attempt_id"],
+        json!(request.attempt_id)
+    );
     assert_eq!(recorded[0]["actor"]["kind"], "topology_executor");
     assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
     assert!(
@@ -684,6 +791,308 @@ fn topology_oncall_acceptance_admits_only_the_exhausted_assignments_commit() {
         )
         .unwrap();
     assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+}
+
+/// #2280: a reviewer that submitted `blocked` (its required checks never ran)
+/// leaves the review unsettled; the owning manager's ruling admits exactly that
+/// assignment's commit, and nothing else changes without it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_oncall_acceptance_admits_a_blocked_review_for_its_commit() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let execution = Uuid::new_v4();
+    let sha = "a".repeat(40);
+    let request = topology_request(&f, execution, &sha, claude());
+    let assignment = f
+        .store
+        .manager_review_reserve_for_topology(&request)
+        .unwrap();
+    submit_receipt(
+        &mut f,
+        assignment,
+        &sha,
+        true,
+        ManagerReviewVerdictV1::Blocked,
+        vec![blocking_finding("tests-not-run")],
+    )
+    .unwrap();
+    assert_eq!(
+        f.store.topology_review_outcome(assignment).unwrap(),
+        TopologyReviewOutcome::Unsettled("manager_review_blocked".into())
+    );
+    assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+
+    let ruling = TopologyOncallAcceptance {
+        execution_id: execution,
+        attempt_id: request.attempt_id,
+        node_id: NODE.into(),
+        decision_key: "resolve:ruling-1".into(),
+    };
+    let error = f
+        .store
+        .topology_record_oncall_acceptance(assignment, &"b".repeat(40), &ruling)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("topology_oncall_acceptance_commit_mismatch"),
+        "{error}"
+    );
+    assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+
+    f.store
+        .topology_record_oncall_acceptance(assignment, &sha, &ruling)
+        .unwrap();
+    f.store
+        .topology_record_oncall_acceptance(assignment, &sha, &ruling)
+        .unwrap();
+    assert_eq!(
+        events(&f, TOPOLOGY_ONCALL_ACCEPTANCE, &assignment.to_string()).len(),
+        1
+    );
+    assert!(matches!(
+        f.store.topology_review_outcome(assignment).unwrap(),
+        TopologyReviewOutcome::Accepted { reviewed_commit, .. } if reviewed_commit == sha
+    ));
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+    assert!(
+        !f.store
+            .topology_land_admitted(assignment, &"b".repeat(40))
+            .unwrap(),
+        "only the exact commit is admitted"
+    );
+}
+
+/// #1766: multiple infra replacements retain the request and attempt, so the
+/// original assignment's on-call ruling admits the exhausted head.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_oncall_acceptance_follows_same_request_infra_retries() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    let request = topology_request(&f, Uuid::new_v4(), &sha, claude());
+    let original = f
+        .store
+        .manager_review_reserve_for_topology(&request)
+        .unwrap();
+    let first = f
+        .store
+        .manager_review_infra_retry_for_test(original)
+        .unwrap();
+    let head = f.store.manager_review_infra_retry_for_test(first).unwrap();
+    submit_accepted_receipt(&mut f, head, &sha, true, vec![blocking_finding("head")]).unwrap();
+    let ruling = TopologyOncallAcceptance {
+        execution_id: request.execution_id,
+        attempt_id: request.attempt_id,
+        node_id: NODE.into(),
+        decision_key: "topology:exhausted-infra-retry".into(),
+    };
+    for id in [original, first, head] {
+        f.store
+            .topology_record_oncall_acceptance(id, &sha, &ruling)
+            .unwrap();
+        assert!(f.store.topology_land_admitted(id, &sha).unwrap());
+        assert!(!f.store.topology_land_admitted(id, &"b".repeat(40)).unwrap());
+    }
+    let recorded = events(&f, TOPOLOGY_ONCALL_ACCEPTANCE, &head.to_string());
+    assert_eq!(recorded.len(), 1, "the ruling admits the retry head once");
+    assert_eq!(recorded[0]["assignment_id"], json!(head));
+    assert_eq!(
+        recorded[0]["actor"]["attempt_id"],
+        json!(request.attempt_id)
+    );
+}
+
+/// #1752 / #1766: a manager re-review changes the request and cannot inherit
+/// an old ruling, including one whose assignment had an infra replacement.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_oncall_acceptance_refuses_a_superseded_exhausted_assignment() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    let request_a = topology_request(&f, Uuid::new_v4(), &sha, claude());
+    let a = f
+        .store
+        .manager_review_reserve_for_topology(&request_a)
+        .unwrap();
+    let retry = f.store.manager_review_infra_retry_for_test(a).unwrap();
+    submit_accepted_receipt(&mut f, retry, &sha, true, vec![blocking_finding("a")]).unwrap();
+    let ruling_a = TopologyOncallAcceptance {
+        execution_id: request_a.execution_id,
+        attempt_id: request_a.attempt_id,
+        node_id: NODE.into(),
+        decision_key: "topology:exhausted-a".into(),
+    };
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let (row, work) = f
+        .store
+        .manager_v2_work(
+            &config,
+            &topology_review_work_key(request_a.execution_id, NODE),
+        )
+        .unwrap();
+    let mut request_b = request(
+        ManagerUpdateV2::RequestReview {
+            key: work.key,
+            expected_row_version: row.row_version,
+            source_commit: sha.clone(),
+            query: "Review the same commit again".into(),
+            launch: claude(),
+            delta_of: None,
+            finding_keys: vec![],
+        },
+        "review-b",
+    );
+    request_b.fence.policy_version = 2;
+    let b = f
+        .store
+        .manager_v2_commit_update(
+            f.manager,
+            &request_b,
+            &LedgerObservation {
+                source_commit: Some(sha.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let b = Uuid::parse_str(&b.key).unwrap();
+    assert_ne!(a, b);
+    submit_accepted_receipt(&mut f, b, &sha, true, vec![blocking_finding("b")]).unwrap();
+    let error = f
+        .store
+        .topology_record_oncall_acceptance(a, &sha, &ruling_a)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("topology_oncall_acceptance_superseded"),
+        "{error}"
+    );
+    for assignment in [a, retry, b] {
+        assert!(events(&f, TOPOLOGY_ONCALL_ACCEPTANCE, &assignment.to_string()).is_empty());
+        assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+    }
+    // Even passing B explicitly cannot rebind A's ruling to another attempt.
+    let error = f
+        .store
+        .topology_record_oncall_acceptance(b, &sha, &ruling_a)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("topology_oncall_acceptance_attempt_mismatch"),
+        "{error}"
+    );
+}
+
+/// #1752 P2: use the real Work mutation, which increments the revision but
+/// retains the source commit. Its old on-call acceptance remains visible in
+/// audit, while admission and a replay of the old ruling both refuse.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_work_revision_withdraws_oncall_acceptance() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    let review = topology_request(&f, Uuid::new_v4(), &sha, claude());
+    let assignment = f
+        .store
+        .manager_review_reserve_for_topology(&review)
+        .unwrap();
+    submit_accepted_receipt(
+        &mut f,
+        assignment,
+        &sha,
+        true,
+        vec![blocking_finding("revise")],
+    )
+    .unwrap();
+    let ruling = TopologyOncallAcceptance {
+        execution_id: review.execution_id,
+        attempt_id: review.attempt_id,
+        node_id: NODE.into(),
+        decision_key: "topology:exhausted-revision".into(),
+    };
+    f.store
+        .topology_record_oncall_acceptance(assignment, &sha, &ruling)
+        .unwrap();
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let (row, work) = f
+        .store
+        .manager_v2_work(
+            &config,
+            &topology_review_work_key(review.execution_id, NODE),
+        )
+        .unwrap();
+
+    // A moved Work source alone also withdraws admission, before any revision.
+    let mut moved = work.clone();
+    moved.source_commit = Some("b".repeat(40));
+    let moved_row = f
+        .store
+        .manager_v2_put_record(
+            &config,
+            "work",
+            &work.key,
+            Some(f.epic),
+            row.row_version,
+            &json!(moved),
+        )
+        .unwrap();
+    assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+    let restored_row = f
+        .store
+        .manager_v2_put_record(
+            &config,
+            "work",
+            &work.key,
+            Some(f.epic),
+            moved_row.row_version,
+            &json!(work),
+        )
+        .unwrap();
+    assert!(f.store.topology_land_admitted(assignment, &sha).unwrap());
+
+    let mut revision = request(
+        ManagerUpdateV2::Work {
+            key: work.key.clone(),
+            expected_row_version: restored_row.row_version,
+            epic_id: f.epic,
+            title: work.title,
+            kind: work.kind,
+            priority: work.priority,
+            weight: work.weight,
+            required_gates: work.required_gates,
+            risk_tier: work.risk_tier,
+        },
+        "revise-topology-work",
+    );
+    revision.fence.policy_version = 2;
+    f.store
+        .manager_v2_commit_update(f.manager, &revision, &LedgerObservation::default())
+        .unwrap();
+    let (_, revised) = f.store.manager_v2_work(&config, &work.key).unwrap();
+    assert_eq!(revised.spec_revision, work.spec_revision + 1);
+    assert_eq!(revised.source_commit.as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        events(&f, TOPOLOGY_ONCALL_ACCEPTANCE, &assignment.to_string()).len(),
+        1
+    );
+    assert!(!f.store.topology_land_admitted(assignment, &sha).unwrap());
+    let error = f
+        .store
+        .topology_record_oncall_acceptance(assignment, &sha, &ruling)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("topology_oncall_acceptance_work_changed"),
+        "{error}"
+    );
 }
 
 fn blocking_finding(key: &str) -> ManagerReviewFindingV1 {
@@ -1062,4 +1471,429 @@ fn topology_extra_round_is_unavailable_without_a_closure_reviewer() {
         extra_round(&f, execution, &revised, &claude()),
         TopologyExtraRound::Unavailable("manager_review_closure_specialist_required".into())
     );
+}
+
+/// Submit a `blocked` receipt with `findings` on a fresh topology review and
+/// return what the executor reads back.
+fn outcome_of_blocked_receipt(findings: Vec<ManagerReviewFindingV1>) -> TopologyReviewOutcome {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    let assignment = f
+        .store
+        .manager_review_reserve_for_topology(&topology_request(&f, Uuid::new_v4(), &sha, claude()))
+        .unwrap();
+    submit_receipt(
+        &mut f,
+        assignment,
+        &sha,
+        true,
+        ManagerReviewVerdictV1::Blocked,
+        findings,
+    )
+    .unwrap();
+    f.store.topology_review_outcome(assignment).unwrap()
+}
+
+/// #2570: a receipt whose only blocking finding says a test run was unavailable
+/// is an infrastructure outcome, not a verdict on the code, so the executor
+/// retries instead of blocking the run. Any real blocking finding keeps it a
+/// plain blocked review.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_review_receipt_with_only_unavailable_tests_is_an_infrastructure_outcome() {
+    let infrastructure = TopologyReviewOutcome::Unsettled(
+        rsi_common::harness_manager_v2::REVIEW_INFRASTRUCTURE_REASON.into(),
+    );
+    for key in [
+        "infra_tests_unavailable",
+        "focused_tests_unavailable",
+        "required_tests_unrun",
+    ] {
+        assert_eq!(
+            outcome_of_blocked_receipt(vec![blocking_finding(key)]),
+            infrastructure,
+            "{key}"
+        );
+    }
+    assert_eq!(
+        outcome_of_blocked_receipt(vec![
+            blocking_finding("infra_tests_unavailable"),
+            blocking_finding("missing-test"),
+        ]),
+        TopologyReviewOutcome::Unsettled("manager_review_blocked".into()),
+        "a real blocking finding keeps the review blocked"
+    );
+    assert_eq!(
+        outcome_of_blocked_receipt(vec![blocking_finding("tests-not-run")]),
+        TopologyReviewOutcome::Unsettled("manager_review_blocked".into()),
+        "an untyped finding is a code finding"
+    );
+}
+
+/// #2570: the review ledger does not count a receipt that only reported an
+/// unavailable check as a spent round, so the retry may use the node's own
+/// reviewer; the same round with a code finding does spend it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_infrastructure_receipt_spends_no_review_round() {
+    for (key, expected) in [
+        ("infra_tests_unavailable", TopologyExtraRound::SameReviewer),
+        (
+            "missing-test",
+            TopologyExtraRound::Unavailable("manager_review_closure_specialist_required".into()),
+        ),
+    ] {
+        let f = fixture();
+        author_is_openai(&f);
+        enable_review_policy(&f);
+        let execution = Uuid::new_v4();
+        let first_sha = "a".repeat(40);
+        let first = f
+            .store
+            .manager_review_reserve_for_topology(&topology_request(
+                &f,
+                execution,
+                &first_sha,
+                claude(),
+            ))
+            .unwrap();
+        submit_review_with_finding(&f, first);
+        let revised = "b".repeat(40);
+        let mut second = topology_request(&f, execution, &revised, claude());
+        second.previous_assignment = Some(first);
+        let second = f
+            .store
+            .manager_review_reserve_for_topology(&second)
+            .unwrap();
+        submit_review(&f, second);
+        let receipt: String = f
+            .store
+            .conn
+            .query_row(
+                "SELECT receipt_id FROM manager_review_receipts WHERE assignment_id=?1",
+                [second.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO manager_review_findings
+                   (receipt_id,finding_key,severity,summary,location,blocking)
+                 VALUES(?1,?2,'error','finding',NULL,1)",
+                params![receipt, key],
+            )
+            .unwrap();
+        assert_eq!(
+            extra_round(&f, execution, &revised, &claude()),
+            expected,
+            "{key}"
+        );
+    }
+}
+
+/// Record a deploy that cut `reviewer` off mid-turn (`interrupt_workers`).
+fn deploy_interrupts(f: &Fixture, reviewer: Uuid) {
+    let deploy = f
+        .store
+        .insert_agent_deploy(
+            &crate::store::agent_deploys::NewDeploy {
+                id: Uuid::new_v4(),
+                owner_session_id: f.lead,
+                idempotency_key: "k2809",
+                sha: &"c".repeat(40),
+                fingerprint: "f".repeat(64),
+                manifest: &[],
+                max_wait_secs: 60,
+                interrupt_workers: true,
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE agent_deploys SET interrupted_sessions=?2 WHERE id=?1",
+            params![
+                deploy.id.to_string(),
+                serde_json::to_string(&[reviewer.to_string()]).unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+fn reviewer_of(f: &Fixture, assignment: Uuid) -> Uuid {
+    let reviewer: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT reviewer_session_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    Uuid::parse_str(&reviewer).unwrap()
+}
+
+/// #2809: a `blocked` receipt from a reviewer a deploy interrupted is no
+/// verdict on the code. The outcome names the interruption (the executor
+/// retries it as an infrastructure loss) and the review ledger does not count
+/// the round, so the retry is not refused `review_round_unavailable`
+/// (`manager_review_closure_specialist_required`); the same receipt from a
+/// reviewer no deploy cut off keeps the round and the review blocked.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_review_interrupted_by_a_deploy_spends_no_review_round() {
+    for interrupted in [false, true] {
+        let mut f = fixture();
+        author_is_openai(&f);
+        enable_review_policy(&f);
+        let execution = Uuid::new_v4();
+        let first_sha = "a".repeat(40);
+        let first = f
+            .store
+            .manager_review_reserve_for_topology(&topology_request(
+                &f,
+                execution,
+                &first_sha,
+                claude(),
+            ))
+            .unwrap();
+        submit_review_with_finding(&f, first);
+        let revised = "b".repeat(40);
+        let mut second = topology_request(&f, execution, &revised, claude());
+        second.previous_assignment = Some(first);
+        let second = f
+            .store
+            .manager_review_reserve_for_topology(&second)
+            .unwrap();
+        submit_receipt(
+            &mut f,
+            second,
+            &revised,
+            true,
+            ManagerReviewVerdictV1::Blocked,
+            vec![blocking_finding("missing-test")],
+        )
+        .unwrap();
+        if interrupted {
+            deploy_interrupts(&f, reviewer_of(&f, second));
+        }
+        let (outcome, round) = (
+            f.store.topology_review_outcome(second).unwrap(),
+            extra_round(&f, execution, &revised, &claude()),
+        );
+        if interrupted {
+            assert_eq!(
+                outcome,
+                TopologyReviewOutcome::Unsettled(
+                    rsi_common::harness_manager_v2::REVIEW_INTERRUPTED_REASON.into()
+                )
+            );
+            assert_eq!(round, TopologyExtraRound::SameReviewer);
+        } else {
+            assert_eq!(
+                outcome,
+                TopologyReviewOutcome::Unsettled("manager_review_blocked".into())
+            );
+            assert_eq!(
+                round,
+                TopologyExtraRound::Unavailable(
+                    "manager_review_closure_specialist_required".into()
+                )
+            );
+        }
+    }
+}
+
+fn work_row(f: &Fixture, key: &str) -> Value {
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    f.store
+        .manager_v2_work_rows(&config, None)
+        .unwrap()
+        .into_iter()
+        .find(|row| row["key"] == key)
+        .unwrap_or_else(|| panic!("work row {key} is listed"))
+}
+
+fn complete_reviewer(f: &Fixture, assignment: Uuid) {
+    let reviewer: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT reviewer_session_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Completed',updated_at=?2 WHERE id=?1",
+            params![reviewer, now()],
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE model_invocations SET status='completed',completed_at=?2
+              WHERE session_id=?1",
+            params![reviewer, now()],
+        )
+        .unwrap();
+}
+
+/// #2607: the land node's publication records integration on the review row
+/// whose accepted source it landed, through the ledger's Integration record.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_review_work_integrates_when_its_accepted_source_landed() {
+    let mut f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let execution = Uuid::new_v4();
+    let sha = "a".repeat(40);
+    let tip = "c".repeat(40);
+    let assignment = f
+        .store
+        .manager_review_reserve_for_topology(&topology_request(&f, execution, &sha, claude()))
+        .unwrap();
+    accept_review(&mut f, assignment, &sha, true);
+    complete_reviewer(&f, assignment);
+    let key = topology_review_work_key(execution, NODE);
+    let row = work_row(&f, &key);
+    assert_eq!(row["source_accepted"], true);
+    assert_eq!(row["integrated"], false);
+
+    let open = f.store.topology_open_review_work(execution).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].work_key, key);
+    // The execution is still running and nothing landed: the row stays open.
+    assert_eq!(
+        f.store
+            .topology_settle_review_work(execution, &open[0], None, false)
+            .unwrap(),
+        TopologyReviewWorkSettled::Open
+    );
+    // The land node published the accepted source.
+    assert_eq!(
+        f.store
+            .topology_settle_review_work(execution, &open[0], Some(&tip), false)
+            .unwrap(),
+        TopologyReviewWorkSettled::Integrated
+    );
+    let row = work_row(&f, &key);
+    assert_eq!(row["integrated"], true);
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let (_, work) = f.store.manager_v2_work(&config, &key).unwrap();
+    let integration = work.integration.unwrap();
+    assert_eq!(integration.source_commit, sha);
+    assert_eq!(integration.target_commit, tip);
+    assert_eq!(events(&f, "topology_review_work_integrated", &key).len(), 1);
+    // Idempotent: a second pass finds nothing to settle.
+    assert!(
+        f.store
+            .topology_open_review_work(execution)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.store
+            .topology_settle_review_work(execution, &open[0], Some(&tip), true)
+            .unwrap(),
+        TopologyReviewWorkSettled::Open
+    );
+}
+
+/// #2607: a row whose execution ended without landing an accepted source is
+/// retired, so it is no longer unfinished work.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_review_work_of_an_unlanded_settled_execution_is_retired() {
+    let f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let execution = Uuid::new_v4();
+    let sha = "a".repeat(40);
+    f.store
+        .manager_review_reserve_for_topology(&topology_request(&f, execution, &sha, claude()))
+        .unwrap();
+    let key = topology_review_work_key(execution, NODE);
+    let open = f.store.topology_open_review_work(execution).unwrap();
+    assert_eq!(open.len(), 1);
+    // A different execution's pass never touches this row.
+    assert!(
+        f.store
+            .topology_settle_review_work(Uuid::new_v4(), &open[0], None, true)
+            .is_err()
+    );
+    // Even a landed source is retired when no accepted review admitted it.
+    assert_eq!(
+        f.store
+            .topology_settle_review_work(execution, &open[0], Some(&"c".repeat(40)), true)
+            .unwrap(),
+        TopologyReviewWorkSettled::Retired
+    );
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    assert!(
+        f.store
+            .manager_v2_record(&config, "work", &key)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    assert_eq!(work_row(&f, &key)["integrated"], false);
+    assert!(
+        f.store
+            .topology_open_review_work(execution)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(events(&f, "topology_review_work_retired", &key).len(), 1);
+}
+
+/// #2607: an Epic whose only unfinished rows are topology-owned has no
+/// unfinished work, so operating-intent recovery never relaunches its lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn topology_owned_review_work_never_triggers_operating_intent_recovery() {
+    let f = fixture();
+    author_is_openai(&f);
+    enable_review_policy(&f);
+    let sha = "a".repeat(40);
+    for _ in 0..3 {
+        f.store
+            .manager_review_reserve_for_topology(&topology_request(
+                &f,
+                Uuid::new_v4(),
+                &sha,
+                claude(),
+            ))
+            .unwrap();
+    }
+    let result = f.store.reconcile_manager_intent(f.project, true).unwrap();
+    assert_eq!(result.unfinished, 0, "topology rows are not lead work");
+    assert_eq!(result.queued, 0, "no lifecycle action is admitted");
+    assert_eq!(result.blocked, 0);
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let intent = f
+        .store
+        .manager_v2_record(&config, "intent", &f.epic.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.payload["state"], "complete");
+    assert_eq!(intent.payload["unfinished_count"], 0);
+    assert_eq!(intent.payload["work_count"], 3);
+    let actions: i64 = f
+        .store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM harness_manager_v2_records WHERE kind='lifecycle_context'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(actions, 0);
 }

@@ -426,7 +426,7 @@ fn check_json(bytes: &[u8]) -> Result<(), LocalApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::test_support::short_tempdir as tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
 
